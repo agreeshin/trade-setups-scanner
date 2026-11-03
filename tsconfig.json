@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": [
+    "eslint.config.mjs",
+    "eslint.guard.mjs",
+    "eslint.guard.d.mts",
+    "scripts/**/*"
+  ]
+}
