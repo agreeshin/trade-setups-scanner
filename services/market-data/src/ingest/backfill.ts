@@ -1,6 +1,7 @@
 import type { Kysely } from "kysely";
 import type { MarketDataDB, BackfillJobStatus } from "../db/schema.js";
 import { insertCandles } from "../storage/candles.js";
+import { getCoverage, type Coverage } from "../storage/coverage.js";
 import type { BybitClient } from "./bybit.js";
 
 const MINUTE_MS = 60_000;
@@ -99,6 +100,52 @@ export interface BackfillWorkerDeps {
   chunkMinutes?: number;
 }
 
+export interface MissingInterval {
+  startMs: number;
+  endMs: number;
+}
+
+/**
+ * Computes minute ranges inside [fromMs, toMs] that are not covered by the
+ * instrument's stored history, so already stored minutes are never refetched.
+ */
+export function missingIntervals(
+  coverage: Coverage,
+  fromMs: number,
+  toMs: number,
+): MissingInterval[] {
+  const covered = coverage.intervals
+    .map((interval) => ({
+      start: new Date(interval.start).getTime(),
+      end: new Date(interval.end).getTime(),
+    }))
+    .sort((a, b) => a.start - b.start);
+
+  const missing: MissingInterval[] = [];
+  let cursor = fromMs;
+
+  for (const interval of covered) {
+    if (interval.end < cursor || interval.start > toMs) {
+      continue;
+    }
+    if (interval.start > cursor) {
+      missing.push({
+        startMs: cursor,
+        endMs: Math.min(interval.start - MINUTE_MS, toMs),
+      });
+    }
+    cursor = Math.max(cursor, interval.end + MINUTE_MS);
+    if (cursor > toMs) {
+      return missing;
+    }
+  }
+
+  if (cursor <= toMs) {
+    missing.push({ startMs: cursor, endMs: toMs });
+  }
+  return missing;
+}
+
 /**
  * Processes at most one queued backfill job. Returns true when a job was
  * picked up (regardless of final status), false when the queue is empty.
@@ -164,25 +211,28 @@ export async function runBackfillJobOnce(deps: BackfillWorkerDeps): Promise<bool
 
     const chunkEndMs = Math.min(endMs, cursorMs + (chunkMinutes - 1) * MINUTE_MS);
     try {
-      const bars = await client.fetchClosedBars(
-        instrument.symbol,
-        cursorMs,
-        chunkEndMs,
-      );
-      const result = await insertCandles(
-        db,
-        job.instrument_id,
-        bars.map((bar) => ({
-          openTime: bar.openTime,
-          open: bar.open,
-          high: bar.high,
-          low: bar.low,
-          close: bar.close,
-          volume: bar.volume,
-          quoteTurnover: bar.quoteTurnover,
-        })),
-      );
-      void result;
+      const coverage = await getCoverage(db, job.instrument_id);
+      const missing = missingIntervals(coverage, cursorMs, chunkEndMs);
+      for (const gap of missing) {
+        const bars = await client.fetchClosedBars(
+          instrument.symbol,
+          gap.startMs,
+          gap.endMs,
+        );
+        await insertCandles(
+          db,
+          job.instrument_id,
+          bars.map((bar) => ({
+            openTime: bar.openTime,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+            quoteTurnover: bar.quoteTurnover,
+          })),
+        );
+      }
       cursorMs = chunkEndMs + MINUTE_MS;
       chunkFailures = 0;
       await db

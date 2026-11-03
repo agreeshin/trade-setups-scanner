@@ -7,6 +7,7 @@ import { createMigrator } from "../../src/db/migrator.js";
 import type { MarketDataDB } from "../../src/db/schema.js";
 import { ensureInstrument } from "../../src/storage/instruments.js";
 import { readCandles } from "../../src/storage/candles.js";
+import { insertCandles } from "../../src/storage/candles.js";
 import { BybitClient } from "../../src/ingest/bybit.js";
 import { AdaptiveGate, DEFAULT_GATE_LIMITS } from "../../src/ingest/gate.js";
 import { FakeClock } from "../../src/ingest/clock.js";
@@ -254,5 +255,74 @@ describe.skipIf(!TEST_DATABASE_URL)("backfill jobs", () => {
       limit: 5000,
     });
     expect(page.candles).toHaveLength(4320);
+  });
+
+  it("does not fetch already covered minutes", async () => {
+    const clock = new FakeClock(T0 + 3 * DAY + MINUTE);
+    const transport = fullHistoryTransport();
+    const client = makeClient(transport, clock);
+    await insertCandles(
+      db,
+      instrumentId,
+      Array.from({ length: 1440 }, (_, index) => ({
+        openTime: minute(index),
+        open: "1",
+        high: "1",
+        low: "1",
+        close: "1",
+        volume: "1",
+        quoteTurnover: "1",
+      })),
+    );
+    await requestBackfill(db, {
+      instrumentId,
+      fromTs: minute(0),
+      toTs: minute(2879),
+      requestedBy: "client-a",
+    });
+    const processed = await runBackfillJobOnce({ db, client, chunkMinutes: 1440 });
+    expect(processed).toBe(true);
+    expect(transport.calls.length).toBeGreaterThan(0);
+    for (const call of transport.calls) {
+      const start = Number(new URL(call).searchParams.get("start"));
+      expect(start).toBeGreaterThanOrEqual(minute(1440).getTime());
+    }
+    const page = await readCandles(db, {
+      instrumentId,
+      from: minute(0),
+      to: minute(2880),
+      limit: 5000,
+    });
+    expect(page.candles).toHaveLength(2880);
+  });
+
+  it("fetches nothing for a fully covered range", async () => {
+    const clock = new FakeClock(T0 + 2 * DAY + MINUTE);
+    const transport = fullHistoryTransport();
+    const client = makeClient(transport, clock);
+    await insertCandles(
+      db,
+      instrumentId,
+      Array.from({ length: 1440 }, (_, index) => ({
+        openTime: minute(index),
+        open: "1",
+        high: "1",
+        low: "1",
+        close: "1",
+        volume: "1",
+        quoteTurnover: "1",
+      })),
+    );
+    await requestBackfill(db, {
+      instrumentId,
+      fromTs: minute(0),
+      toTs: minute(1439),
+      requestedBy: "client-a",
+    });
+    const processed = await runBackfillJobOnce({ db, client, chunkMinutes: 1440 });
+    expect(processed).toBe(true);
+    expect(transport.calls).toHaveLength(0);
+    const job = await db.selectFrom("backfill_jobs").selectAll().executeTakeFirstOrThrow();
+    expect(job.status).toBe("done");
   });
 });
