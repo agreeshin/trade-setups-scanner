@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: trade-setups-dev-postgres
+    environment:
+      POSTGRES_USER: trade_setups
+      POSTGRES_PASSWORD: trade_setups_dev
+      POSTGRES_DB: market_data
+    ports:
+      - "5433:5432"
+    volumes:
+      - trade-setups-pgdata:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trade_setups -d market_data"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  trade-setups-pgdata:

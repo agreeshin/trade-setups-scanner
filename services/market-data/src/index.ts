@@ -1,10 +1,26 @@
+import "dotenv/config";
 import { buildApp } from "./app.js";
-const port = Number(process.env.PORT ?? 8081);
-const host = process.env.HOST ?? "127.0.0.1";
-const app = await buildApp();
+import { createDb } from "./db/db.js";
+import { loadConfig } from "./config.js";
+
+const config = loadConfig();
+const db = createDb(config.databaseUrl);
+const app = await buildApp({ db, apiKeys: config.apiKeys });
+
+async function shutdown(): Promise<void> {
+  await app.close();
+  await db.destroy();
+}
+
+process.once("SIGINT", () => {
+  void shutdown().finally(() => process.exit(0));
+});
+process.once("SIGTERM", () => {
+  void shutdown().finally(() => process.exit(0));
+});
 
 app
-  .listen({ port, host })
+  .listen({ port: config.port, host: config.host })
   .then((address) => {
     app.log.info(`market-data service listening at ${address}`);
   })

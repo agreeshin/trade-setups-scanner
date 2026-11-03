@@ -8,6 +8,20 @@ on:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: trade_setups
+          POSTGRES_PASSWORD: trade_setups_ci
+          POSTGRES_DB: market_data
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U trade_setups"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,7 +33,13 @@ jobs:
       - run: npm rebuild esbuild
       - run: npm run lint
       - run: npm run typecheck
+      - run: npm run db:ensure-test-db -w services/market-data
+        env:
+          TEST_DATABASE_URL: postgres://trade_setups:trade_setups_ci@127.0.0.1:5433/market_data_test
       - run: npm run test
+        env:
+          DATABASE_URL: postgres://trade_setups:trade_setups_ci@127.0.0.1:5433/market_data
+          TEST_DATABASE_URL: postgres://trade_setups:trade_setups_ci@127.0.0.1:5433/market_data_test
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e -w apps/web

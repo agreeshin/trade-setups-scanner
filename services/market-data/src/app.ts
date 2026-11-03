@@ -1,6 +1,10 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import swagger from "@fastify/swagger";
 import { Type, type Static } from "@sinclair/typebox";
+import { sql, type Kysely } from "kysely";
+import type { MarketDataDB } from "./db/schema.js";
+import { createApiKeyGuard } from "./auth.js";
+import { registerV1Routes } from "./routes/v1.js";
 
 export interface ReadinessCheck {
   name: string;
@@ -10,6 +14,8 @@ export interface ReadinessCheck {
 export interface AppOptions {
   readinessChecks?: ReadinessCheck[];
   openApiEnabled?: boolean;
+  db?: Kysely<MarketDataDB>;
+  apiKeys?: string[];
 }
 
 const HealthResponse = Type.Object({
@@ -32,12 +38,14 @@ const ReadinessResponse = Type.Object({
 
 export type HealthResponseBody = Static<typeof HealthResponse>;
 export type ReadinessResponseBody = Static<typeof ReadinessResponse>;
+
 export async function buildApp(options: AppOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
       level: process.env.LOG_LEVEL ?? "info",
     },
   });
+
   if (options.openApiEnabled !== false) {
     await app.register(swagger, {
       openapi: {
@@ -50,6 +58,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       },
     });
   }
+
   app.get(
     "/health",
     {
@@ -63,6 +72,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       time: new Date().toISOString(),
     }),
   );
+
+  const readinessChecks: ReadinessCheck[] = [...(options.readinessChecks ?? [])];
+  if (options.db) {
+    readinessChecks.push({
+      name: "database",
+      check: async () => {
+        await sql`select 1`.execute(options.db!);
+      },
+    });
+  }
+
   app.get(
     "/ready",
     {
@@ -72,7 +92,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     },
     async (_request, reply) => {
       const results: ReadinessResponseBody["checks"] = [];
-      for (const check of options.readinessChecks ?? []) {
+      for (const check of readinessChecks) {
         try {
           await check.check();
           results.push({ name: check.name, ok: true });
@@ -93,5 +113,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       await reply.code(ready ? 200 : 503).send(body);
     },
   );
+
+  if (options.db) {
+    registerV1Routes(app, {
+      db: options.db,
+      requireApiKey: createApiKeyGuard(options.apiKeys ?? []),
+    });
+  }
+
   return app;
 }

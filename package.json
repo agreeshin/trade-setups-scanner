@@ -15,7 +15,9 @@
     "test": "npm run test --workspaces --if-present",
     "test:e2e": "npm run test:e2e --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "lint": "eslint . && node scripts/check-styles.mjs"
+    "lint": "eslint . && node scripts/check-styles.mjs",
+    "dev:db:up": "docker compose -f infra/dev/docker-compose.yml up -d",
+    "dev:db:down": "docker compose -f infra/dev/docker-compose.yml down"
   },
   "allowScripts": {
     "esbuild@0.28.2": true
