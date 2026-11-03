@@ -1,2 +1,21 @@
 # Local editor and agent backup history.
 .backups/
+
+# Dependencies and build artifacts.
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+
+# Local runtime and test configuration.
+.env
+.env.*
+!.env.example
+
+*.log
+npm-debug.log*
+.DS_Store
+.cache/
+.eslintcache
+tsconfig.tsbuildinfo
