@@ -18,6 +18,20 @@ export function AppLayout() {
                 </Button>
               )}
             </NavLink>
+            <NavLink to="/setups">
+              {({ isActive }) => (
+                <Button variant={isActive ? "default" : "ghost"} size="sm">
+                  Сетапы
+                </Button>
+              )}
+            </NavLink>
+            <NavLink to="/runs">
+              {({ isActive }) => (
+                <Button variant={isActive ? "default" : "ghost"} size="sm">
+                  Запуски
+                </Button>
+              )}
+            </NavLink>
             <NavLink to="/settings">
               {({ isActive }) => (
                 <Button variant={isActive ? "default" : "ghost"} size="sm">

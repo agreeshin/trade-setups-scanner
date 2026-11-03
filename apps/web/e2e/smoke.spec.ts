@@ -11,4 +11,17 @@ test.describe("application smoke", () => {
     await expect(page.getByRole("heading", { name: "Настройки" })).toBeVisible();
     await expect(page).toHaveURL(/\/settings$/);
   });
+
+  test("setups page shows an explicit degraded or empty state", async ({ page }) => {
+    await page.goto("/setups");
+    await expect(page.getByRole("heading", { name: "Сетапы" })).toBeVisible();
+    const alert = page.getByRole("alert");
+    await expect(alert.or(page.getByText("Нет сохранённых"))).toBeVisible();
+  });
+
+  test("runs page shows the launch form", async ({ page }) => {
+    await page.goto("/runs");
+    await expect(page.getByRole("heading", { name: "Исторические запуски" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Запустить" })).toBeVisible();
+  });
 });

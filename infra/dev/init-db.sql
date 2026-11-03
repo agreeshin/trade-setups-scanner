@@ -2,3 +2,4 @@
 -- state (signals platform). Two logically independent databases per PRD.
 CREATE DATABASE signals;
 CREATE DATABASE market_data_test;
+CREATE DATABASE signals_test;

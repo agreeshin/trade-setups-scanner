@@ -1,6 +1,11 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import swagger from "@fastify/swagger";
 import { Type, type Static } from "@sinclair/typebox";
+import { sql, type Kysely } from "kysely";
+import type { SignalsDB } from "./db/schema.js";
+import { createApiKeyGuard } from "./auth.js";
+import { registerPlatformV1Routes } from "./routes/v1.js";
+
 export interface ReadinessCheck {
   name: string;
   check: () => Promise<void>;
@@ -8,6 +13,9 @@ export interface ReadinessCheck {
 export interface AppOptions {
   readinessChecks?: ReadinessCheck[];
   openApiEnabled?: boolean;
+  db?: Kysely<SignalsDB>;
+  apiKeys?: string[];
+  marketData?: { url: string; apiKey: string };
 }
 const HealthResponse = Type.Object({
   status: Type.Literal("ok"),
@@ -28,6 +36,16 @@ const ReadinessResponse = Type.Object({
 export type HealthResponseBody = Static<typeof HealthResponse>;
 export type ReadinessResponseBody = Static<typeof ReadinessResponse>;
 export async function buildApp(options: AppOptions = {}): Promise<FastifyInstance> {
+  const readinessChecks: ReadinessCheck[] = [...(options.readinessChecks ?? [])];
+  if (options.db) {
+    const db = options.db;
+    readinessChecks.push({
+      name: "database",
+      check: async () => {
+        await sql`select 1`.execute(db);
+      },
+    });
+  }
   const app = Fastify({
     logger: {
       level: process.env.LOG_LEVEL ?? "info",
@@ -67,7 +85,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     },
     async (_request, reply) => {
       const results: ReadinessResponseBody["checks"] = [];
-      for (const check of options.readinessChecks ?? []) {
+      for (const check of readinessChecks) {
         try {
           await check.check();
           results.push({ name: check.name, ok: true });
@@ -88,5 +106,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       await reply.code(ready ? 200 : 503).send(body);
     },
   );
+
+  if (options.db) {
+    registerPlatformV1Routes(app, {
+      db: options.db,
+      requireApiKey: createApiKeyGuard(options.apiKeys ?? []),
+      marketData: options.marketData ?? { url: "", apiKey: "" },
+    });
+  }
+
   return app;
 }
