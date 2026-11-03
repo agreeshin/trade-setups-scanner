@@ -42,6 +42,9 @@ describe.skipIf(!TEST_DATABASE_URL)("market data v1 api", () => {
     if (migrationResult.error) {
       throw migrationResult.error;
     }
+    await db.deleteFrom("collection_targets").execute();
+    await db.deleteFrom("backfill_jobs").execute();
+    await db.deleteFrom("service_state").execute();
     await db.deleteFrom("candle_conflicts").execute();
     await db.deleteFrom("candles").execute();
     await db.deleteFrom("instruments").execute();

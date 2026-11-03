@@ -2,12 +2,22 @@ import "dotenv/config";
 import { buildApp } from "./app.js";
 import { createDb } from "./db/db.js";
 import { loadConfig } from "./config.js";
+import { startIngestRuntime, type IngestRuntime } from "./ingest/runtime.js";
 
 const config = loadConfig();
 const db = createDb(config.databaseUrl);
 const app = await buildApp({ db, apiKeys: config.apiKeys });
+let ingestRuntime: IngestRuntime | undefined;
+
+if (process.env.BYBIT_INGEST_ENABLED === "1") {
+  ingestRuntime = await startIngestRuntime({ db, databaseUrl: config.databaseUrl });
+  app.log.info("bybit ingest runtime started");
+}
 
 async function shutdown(): Promise<void> {
+  if (ingestRuntime) {
+    await ingestRuntime.stop();
+  }
   await app.close();
   await db.destroy();
 }

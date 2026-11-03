@@ -56,10 +56,51 @@ export interface KyselyMigrationsTable {
   timestamp: string;
 }
 
+export type BackfillJobStatus =
+  | "queued"
+  | "running"
+  | "done"
+  | "cancel_requested"
+  | "cancelled"
+  | "failed";
+
+export interface BackfillJobsTable {
+  id: Generated<number>;
+  instrument_id: number;
+  from_ts: Date;
+  to_ts: Date;
+  status: BackfillJobStatus;
+  checkpoint_ts: Date | null;
+  requested_by: string[];
+  error: string | null;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+
+export interface ServiceStateValue {
+  cooldownUntilIso: string | null;
+}
+
+export interface ServiceStateTable {
+  key: string;
+  value: ServiceStateValue;
+  updated_at: Generated<Date>;
+}
+
+export interface CollectionTargetsTable {
+  instrument_id: number;
+  enabled: boolean;
+  last_collected_ts: Date | null;
+  updated_at: Generated<Date>;
+}
+
 export interface MarketDataDB {
   exchanges: ExchangesTable;
   instruments: InstrumentsTable;
   candles: CandlesTable;
   candle_conflicts: CandleConflictsTable;
+  backfill_jobs: BackfillJobsTable;
+  service_state: ServiceStateTable;
+  collection_targets: CollectionTargetsTable;
   kysely_migration: KyselyMigrationsTable;
 }
