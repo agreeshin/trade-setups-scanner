@@ -480,17 +480,30 @@ export function registerPlatformV1Routes(
     {
       preHandler: [requireApiKey],
       schema: {
-        response: { 200: Type.Object({ setups: Type.Array(SetupDto) }) },
+        querystring: Type.Object({
+          offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 2_147_483_647 })),
+          limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+          snapshotId: Type.Optional(Type.Integer({ minimum: 0, maximum: 2_147_483_647 })),
+          q: Type.Optional(Type.String({ maxLength: 200 })),
+        }),
+        response: { 200: Type.Object({ setups: Type.Array(SetupDto), offset: Type.Integer(),
+          limit: Type.Integer(), total: Type.Integer(), snapshotId: Type.Integer() }) },
       },
     },
-    async (_request, reply) => {
-      const rows = await db
-        .selectFrom("live_setups")
-        .selectAll()
-        .orderBy("close_time", "desc")
-        .limit(500)
-        .execute();
+    async (request, reply) => {
+      const { offset = 0, limit = 500, q = "", snapshotId: requestedSnapshot } = request.query as {
+        offset?: number; limit?: number; q?: string; snapshotId?: number;
+      };
+      // Keep later appends outside an existing page sequence without holding a DB transaction.
+      const snapshotId = requestedSnapshot ?? (await db.selectFrom("live_setups")
+        .select((eb) => eb.fn.max("id").as("id")).executeTakeFirstOrThrow()).id ?? 0;
+      let query = db.selectFrom("live_setups").where("id", "<=", snapshotId);
+      if (q.trim()) query = query.where(sql<boolean>`strpos(lower(concat_ws(' ', symbol, exchange_code, algorithm_id)), lower(${q.trim()})) > 0`);
+      const count = await query.select((eb) => eb.fn.countAll<string>().as("total")).executeTakeFirstOrThrow();
+      const rows = await query.selectAll().orderBy("close_time", "desc").orderBy("id", "desc")
+        .offset(offset).limit(limit).execute();
       await reply.send({
+        offset, limit, total: Number(count.total), snapshotId,
         setups: rows.map((row) => ({
           exchange: row.exchange_code,
           category: row.category,

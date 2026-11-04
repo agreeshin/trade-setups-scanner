@@ -8,7 +8,7 @@ test.beforeEach(async ({ page }) => {
     if (path === "/v1/instruments") return route.fulfill({ json: { instruments: [{ id: 1, exchange: "bybit", category: "linear", symbol: "BTCUSDT", status: "Trading" }] } });
     if (path === "/v1/algorithms") return route.fulfill({ json: { algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "Общие настройки", params: {}, fields: [], enabled: true }] } });
     if (path === "/v1/settings/ui") return route.fulfill({ json: { value: {} } });
-    if (path === "/v1/setups") return route.fulfill({ json: { setups: [] } });
+    if (path === "/v1/setups") return route.fulfill({ json: { setups: [], offset: 0, limit: 25, total: 0, snapshotId: 0 } });
     if (path === "/v1/replay-runs") return route.fulfill({ json: { runs: [] } });
     if (path === "/v1/history/backfill-jobs") return route.fulfill({ json: { jobs: [] } });
     if (path === "/v1/history/collection-targets") return route.fulfill({ json: { targets: [] } });
@@ -17,6 +17,43 @@ test.beforeEach(async ({ page }) => {
   });
 });
 test.describe("application smoke", () => {
+  test("live feed searches older records and requests bounded server pages", async ({ page }) => {
+    let unavailable = false;
+    const queries: URLSearchParams[] = [];
+    await page.route("**/v1/setups?*", async (route) => {
+      if (unavailable) return route.fulfill({ status: 503, json: { error: "unavailable" } });
+      const query = new URL(route.request().url()).searchParams;
+      queries.push(query);
+      const offset = Number(query.get("offset"));
+      const limit = Number(query.get("limit"));
+      const rows = Array.from({ length: 601 }, (_, index) => ({ exchange: "bybit", category: "linear",
+        symbol: index === 600 ? "ARCHIVEUSDT" : `BTC${index}USDT`, algorithmId: "price_volume_spike",
+        openTimeUnix: 1700000000, closeTimeUnix: 1700000060, closePrice: "0.000000001" }));
+      const filtered = rows.filter((row) => row.symbol.includes(query.get("q") ?? ""));
+      await route.fulfill({ json: { setups: filtered.slice(offset, offset + limit), offset, limit, total: filtered.length, snapshotId: 601 } });
+    });
+    await page.setViewportSize({ width: 375, height: 812 });
+    await page.goto("/setups");
+    await expect(page.getByText("Страница 1 из 25 · Найдено: 601")).toBeVisible();
+    await expect(page.locator("tbody tr")).toHaveCount(25);
+    await page.getByRole("button", { name: "Далее", exact: true }).click();
+    await expect(page.getByText("Страница 2 из 25 · Найдено: 601")).toBeVisible();
+    expect(queries.at(-1)?.get("snapshotId")).toBe("601");
+    await page.getByRole("button", { name: "Назад", exact: true }).click();
+    await expect(page.getByText("Страница 1 из 25 · Найдено: 601")).toBeVisible();
+    await page.getByLabel("Инструмент, биржа или алгоритм").fill("ARCHIVE");
+    await expect(page.getByText("bybit · ARCHIVEUSDT", { exact: true })).toBeVisible();
+    await expect(page.getByText("Страница 1 из 1 · Найдено: 1")).toBeVisible();
+    expect(queries.at(-1)?.has("snapshotId")).toBe(false);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    unavailable = true;
+    await page.getByRole("button", { name: "Обновить", exact: true }).click();
+    await expect(page.getByRole("alert")).toContainText("Лента недоступна (HTTP 503)");
+    unavailable = false;
+    await page.getByRole("button", { name: "Обновить", exact: true }).click();
+    await expect(page.getByText("bybit · ARCHIVEUSDT", { exact: true })).toBeVisible();
+  });
+
   test("theme preference supports system changes, explicit override and reload", async ({ page }) => {
     await page.emulateMedia({ colorScheme: "light" });
     await page.goto("/");

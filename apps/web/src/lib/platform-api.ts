@@ -21,9 +21,9 @@ export type PlatformState<T> =
   | { kind: "unreachable"; detail: string }
   | { kind: "ready"; data: T };
 
-export async function fetchPlatform<T>(path: string): Promise<PlatformState<T>> {
+export async function fetchPlatform<T>(path: string, signal?: AbortSignal): Promise<PlatformState<T>> {
   try {
-    const response = await apiFetch(path);
+    const response = await apiFetch(path, signal ? { signal } : {});
     if (!response.ok) {
       return { kind: "unreachable", detail: `HTTP ${response.status}` };
     }

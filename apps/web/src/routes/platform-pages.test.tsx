@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { RunsPage } from "./runs-page";
@@ -42,7 +42,14 @@ beforeEach(() => {
     if (path === "/v1/live/status") data = { enabled: false, running: false, lastScanAt: null, lastError: null };
     if (path === "/v1/replay-cache/stats") data = { entries: 3, bytes: 1024 };
     if (path === "/v1/replay-cache") data = { removed: 3 };
-    if (path === "/v1/setups") data = { setups: Array.from({ length: 30 }, (_, index) => ({ symbol: `BTC${index}`, exchange: "bybit", algorithmId: "price_volume_spike", openTimeUnix: 100, closeTimeUnix: 200 + index, closePrice: "100" })) };
+    if (path.startsWith("/v1/setups?")) {
+      const params = new URL(path, "http://localhost").searchParams;
+      const offset = Number(params.get("offset"));
+      const limit = Number(params.get("limit"));
+      const all = Array.from({ length: 601 }, (_, index) => ({ symbol: `BTC${index}`, exchange: "bybit", algorithmId: "price_volume_spike", openTimeUnix: 100, closeTimeUnix: 200 + index, closePrice: "100" }));
+      const filtered = all.filter((row) => row.symbol.includes(params.get("q") ?? ""));
+      data = { setups: filtered.slice(offset, offset + limit), offset, limit, total: filtered.length, snapshotId: 601 };
+    }
     return Promise.resolve(new Response(JSON.stringify(data), { status: 200 }));
   }));
 });
@@ -91,15 +98,48 @@ describe("platform screens", () => {
     expect(screen.getByRole("button", { name: "Очистить кеш" })).toBeDisabled();
     expect(requests.some((request) => request.path === "/v1/settings/live" && request.method === "PUT")).toBe(false);
   });
-  it("filters and paginates the explicitly bounded latest feed", async () => {
+  it("requests server pages and finds records beyond the former latest-500 cap", async () => {
     render(<SetupsPage />);
-    await screen.findByText("Страница 1 из 2 · Найдено: 30");
+    await screen.findByText("Страница 1 из 25 · Найдено: 601");
     expect(screen.queryByText("bybit · BTC29")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Далее" }));
-    expect(screen.getByText("bybit · BTC29")).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Инструмент, биржа или алгоритм"), { target: { value: "BTC29" } });
-    expect(screen.getByText("Страница 1 из 1 · Найдено: 1")).toBeInTheDocument();
+    await screen.findByText("bybit · BTC29");
+    expect(requests.some((request) => request.path.includes("offset=25&limit=25&q=&snapshotId=601"))).toBe(true);
+    fireEvent.change(screen.getByLabelText("Инструмент, биржа или алгоритм"), { target: { value: "BTC600" } });
+    await screen.findByText("Страница 1 из 1 · Найдено: 1");
+    expect(screen.getByText("bybit · BTC600")).toBeInTheDocument();
+    expect(requests.some((request) => request.path === "/v1/setups?offset=0&limit=25&q=BTC600")).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Обновить" }));
+    await screen.findByText("bybit · BTC600");
     expect(requests.some((request) => request.method === "PUT")).toBe(false);
+  });
+  it("aborts stale feed requests and ignores their late responses", async () => {
+    let resolveSlow: ((response: Response) => void) | undefined;
+    const signals: (AbortSignal | null | undefined)[] = [];
+    vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/v1/settings/ui") return Promise.resolve(new Response(JSON.stringify({ value: {} })));
+      signals.push(init?.signal);
+      if (path.includes("q=slow")) return new Promise<Response>((resolve) => { resolveSlow = resolve; });
+      const symbol = path.includes("q=fast") ? "FAST" : "INITIAL";
+      return Promise.resolve(new Response(JSON.stringify({ setups: [{ symbol, exchange: "bybit", algorithmId: "price_volume_spike", openTimeUnix: 100, closeTimeUnix: 200, closePrice: "100" }], total: 1, limit: 25, offset: 0, snapshotId: 1 })));
+    }));
+    const { unmount } = render(<SetupsPage />);
+    await screen.findByText("bybit · INITIAL");
+    const filter = screen.getByLabelText("Инструмент, биржа или алгоритм");
+    fireEvent.change(filter, { target: { value: "slow" } });
+    await waitFor(() => { expect(resolveSlow).toBeDefined(); });
+    const slowSignal = signals.at(-1);
+    fireEvent.change(filter, { target: { value: "fast" } });
+    await screen.findByText("bybit · FAST");
+    expect(slowSignal?.aborted).toBe(true);
+    await act(async () => {
+      resolveSlow?.(new Response(JSON.stringify({ setups: [], total: 0, limit: 25, offset: 0, snapshotId: 0 })));
+      await Promise.resolve();
+    });
+    expect(screen.getByText("bybit · FAST")).toBeInTheDocument();
+    const lastSignal = signals.at(-1);
+    unmount();
+    expect(lastSignal?.aborted).toBe(true);
   });
   it("reports unavailable algorithms instead of enabling a fabricated run", async () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("{}", { status: 503 }))));
