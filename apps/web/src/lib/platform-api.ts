@@ -1,8 +1,6 @@
 const platformUrlFromEnv: unknown = import.meta.env.VITE_PLATFORM_URL;
 export const PLATFORM_URL: string =
-  typeof platformUrlFromEnv === "string" && platformUrlFromEnv.length > 0
-    ? platformUrlFromEnv
-    : "http://127.0.0.1:8082";
+  typeof platformUrlFromEnv === "string" ? platformUrlFromEnv : "http://127.0.0.1:8082";
 
 export type PlatformState<T> =
   | { kind: "loading" }

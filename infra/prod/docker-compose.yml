@@ -1,0 +1,74 @@
+name: trade-setups
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trade_setups
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: market_data
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trade_setups -d market_data"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  market-data:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: market-data
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://trade_setups:${POSTGRES_PASSWORD}@postgres:5432/market_data
+      TEST_DATABASE_URL: postgres://trade_setups:${POSTGRES_PASSWORD}@postgres:5432/market_data
+      API_KEYS: ${MARKET_DATA_API_KEY:?set MARKET_DATA_API_KEY in .env}
+      PORT: 8080
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      BYBIT_INGEST_ENABLED: ${BYBIT_INGEST_ENABLED:-1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8081:8080"
+
+  signals:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: setups-platform
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://trade_setups:${POSTGRES_PASSWORD}@postgres:5432/signals
+      API_KEYS: ${PLATFORM_API_KEY:?set PLATFORM_API_KEY in .env}
+      MARKET_DATA_URL: http://market-data:8080
+      MARKET_DATA_API_KEY: ${MARKET_DATA_API_KEY}
+      PORT: 8080
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      market-data:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8082:8080"
+
+  web:
+    build:
+      context: ../..
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - signals
+    ports:
+      - "80:80"

@@ -1,0 +1,16 @@
+FROM node:24-alpine
+WORKDIR /app
+
+ARG SERVICE
+ENV NODE_ENV=production
+
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY services/${SERVICE}/package.json services/${SERVICE}/
+RUN npm ci --workspace services/${SERVICE} --include-workspace-root --omit=dev || \
+    npm install --workspace services/${SERVICE}
+
+COPY services/${SERVICE} services/${SERVICE}
+
+WORKDIR /app/services/${SERVICE}
+EXPOSE 8080
+CMD ["npx", "tsx", "src/index.ts"]
