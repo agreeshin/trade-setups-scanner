@@ -109,6 +109,7 @@ describe("platform screens", () => {
     await screen.findByText("Страница 1 из 1 · Найдено: 1");
     expect(screen.getByText("bybit · BTC600")).toBeInTheDocument();
     expect(requests.some((request) => request.path === "/v1/setups?offset=0&limit=25&q=BTC600")).toBe(true);
+    expect(screen.getByRole("link", { name: "Экспорт CSV (без фильтра)" })).toHaveAttribute("href", "/v1/export/setups.csv");
     await userEvent.click(screen.getByRole("button", { name: "Обновить" }));
     await screen.findByText("bybit · BTC600");
     expect(requests.some((request) => request.method === "PUT")).toBe(false);

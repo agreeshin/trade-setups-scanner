@@ -524,21 +524,32 @@ export function registerPlatformV1Routes(
     "/v1/export/setups.csv",
     { preHandler: [requireApiKey] },
     async (_request, reply) => {
-      const rows = await db
-        .selectFrom("live_setups")
-        .selectAll()
-        .orderBy("close_time", "asc")
-        .limit(50_000)
-        .execute();
-      const header =
-        "exchange,category,symbol,algorithmId,algorithmVersion,openTimeUnix,closeTimeUnix,closePrice";
-      const lines = rows.map(
-        (row) =>
-          `${row.exchange_code},${row.category},${row.symbol},${row.algorithm_id},` +
-          `${row.algorithm_version},${Math.floor(row.open_time.getTime() / 1000)},` +
-          `${Math.floor(row.close_time.getTime() / 1000)},${row.close_price}`,
-      );
-      await reply.type("text/csv; charset=utf-8").send(`${[header, ...lines].join("\n")}\n`);
+      const snapshotId = (await db.selectFrom("live_setups")
+        .select((eb) => eb.fn.max("id").as("id")).executeTakeFirstOrThrow()).id ?? 0;
+      const query = db.selectFrom("live_setups")
+        .select(["id", "exchange_code", "category", "symbol", "algorithm_id", "algorithm_version", "open_time", "close_time", "close_price"])
+        .where("id", "<=", snapshotId).orderBy("close_time", "asc").orderBy("id", "asc").limit(500);
+      // Fail before sending headers if the first read fails. No cursor/transaction stays open.
+      let rows = await query.execute();
+      async function* chunks() {
+        yield "exchange,category,symbol,algorithmId,algorithmVersion,openTimeUnix,closeTimeUnix,closePrice\r\n";
+        while (rows.length && !reply.raw.destroyed) {
+          for (const row of rows) {
+            if (reply.raw.destroyed) return;
+            yield [row.exchange_code, row.category, row.symbol, row.algorithm_id, row.algorithm_version,
+              Math.floor(row.open_time.getTime() / 1000), Math.floor(row.close_time.getTime() / 1000), row.close_price]
+              .map(csvCell).join(",") + "\r\n";
+          }
+          if (rows.length < 500 || reply.raw.destroyed) return;
+          const last = rows[rows.length - 1]!;
+          rows = await query.where(sql<boolean>`(close_time, id) > (${last.close_time}, ${last.id})`).execute();
+        }
+      }
+      return reply.type("text/csv; charset=utf-8")
+        .header("Content-Disposition", 'attachment; filename="live-setups.csv"')
+        .header("Cache-Control", "no-store")
+        .header("X-Accel-Buffering", "no")
+        .send(Readable.from(chunks(), { objectMode: false, highWaterMark: 16 * 1024 }));
     },
   );
 

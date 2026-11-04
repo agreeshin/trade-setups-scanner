@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
-import { apiFetch, fetchPlatform, type PlatformState } from "../lib/platform-api";
+import { PLATFORM_URL, fetchPlatform, type PlatformState } from "../lib/platform-api";
 import { errorText, savePreference, type SetupRow } from "./platform-controls";
 import { SetupTable } from "./setup-table";
 
@@ -34,20 +34,6 @@ export function SetupsPage() {
     });
     return () => { cancelled = true; };
   }, []);
-  async function exportCsv() {
-    setBusy(true); setError(null); setMessage(null);
-    try {
-      const response = await apiFetch("/v1/export/setups.csv");
-      if (!response.ok) throw new Error(`Экспорт недоступен: HTTP ${response.status}`);
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url; link.download = "live-setups.csv"; document.body.append(link); link.click(); link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-      setMessage("CSV подготовлен. Экспорт содержит до 50 000 live-сетапов, без фильтра экрана.");
-    } catch (cause) { setError(errorText(cause)); }
-    finally { setBusy(false); }
-  }
   async function saveFilter() {
     setBusy(true); setError(null); setMessage(null);
     try { await savePreference("setupFilter", query.filter); setMessage("Фильтр сохранён в базе сигналов."); }
@@ -68,8 +54,9 @@ export function SetupsPage() {
       <label className="grid gap-1 text-sm">Инструмент, биржа или алгоритм<Input disabled={!preferencesReady} value={query.filter} maxLength={200} onChange={(event) => { setQuery({ filter: event.target.value, offset: 0 }); setState({ kind: "loading" }); setMessage(null); }} /></label>
       <Button variant="outline" disabled={busy || !preferencesReady} onClick={() => { void saveFilter(); }}>Сохранить фильтр</Button>
       <Button variant="outline" disabled={!preferencesReady} onClick={() => { setQuery({ filter: query.filter, offset: 0 }); setState({ kind: "loading" }); }}>Обновить</Button>
-      <Button disabled={busy} onClick={() => { void exportCsv(); }}>Экспорт CSV (без фильтра)</Button>
+      <Button asChild><a href={`${PLATFORM_URL}/v1/export/setups.csv`}>Экспорт CSV (без фильтра)</a></Button>
     </div>
+    <p className="mt-2 text-sm text-muted-foreground">CSV содержит всю сохранённую live-ленту на начало выгрузки, без фильтра экрана и лимита строк. Статус и отмена доступны в загрузках браузера.</p>
     {error && <p role="alert" className="mt-3">{error}</p>}{message && <p role="status" className="mt-3">{message}</p>}
     {state.kind === "loading" && <p role="status">Загрузка…</p>}
     {state.kind === "unreachable" && <p role="alert">Лента недоступна ({state.detail})</p>}

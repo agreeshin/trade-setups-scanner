@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 test.beforeEach(async ({ page }) => {
   await page.emulateMedia({ colorScheme: "dark" });
   await page.route("**/v1/**", async (route) => {
@@ -17,6 +18,26 @@ test.beforeEach(async ({ page }) => {
   });
 });
 test.describe("application smoke", () => {
+  test("live CSV is downloaded by the browser without a fetch Blob", async ({ page }) => {
+    const csv = "exchange,category,symbol,algorithmId,algorithmVersion,openTimeUnix,closeTimeUnix,closePrice\r\nbybit,linear,BTCUSDT,price_volume_spike,1.1.1,100,160,0.000000000123456789\r\n";
+    let resourceType: string | undefined;
+    await page.route("**/v1/export/setups.csv", async (route) => {
+      resourceType = route.request().resourceType();
+      await route.fulfill({ contentType: "text/csv; charset=utf-8", headers: { "content-disposition": 'attachment; filename="live-setups.csv"' }, body: csv });
+    });
+    await page.goto("/setups");
+    const downloaded = page.waitForEvent("download");
+    await page.getByRole("link", { name: "Экспорт CSV (без фильтра)" }).click();
+    const download = await downloaded;
+    expect(await download.failure()).toBeNull();
+    expect(download.suggestedFilename()).toBe("live-setups.csv");
+    const path = await download.path();
+    expect(path).not.toBeNull();
+    expect(await readFile(path, "utf8")).toBe(csv);
+    expect(resourceType).toBe("document");
+    await expect(page.getByRole("heading", { name: "Сетапы", exact: true })).toBeVisible();
+  });
+
   test("live feed searches older records and requests bounded server pages", async ({ page }) => {
     let unavailable = false;
     const queries: URLSearchParams[] = [];
