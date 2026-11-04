@@ -3,7 +3,7 @@
 ## Обновление дизайн-системы (2026-11-04)
 
 - completed: правило PRD-first добавлено в AGENTS.md; проверенная реализация сохранена в коммитах `1521228` и `6fcdbea` (typecheck, lint, unit/integration и 7 Playwright прошли).
-- pending: push; правильный GitHub SSH-ключ найден, но GitHub отвечает `Internal Server Error` / `fatal error in commit_refs`. GitHub Status подтвердил активный инцидент Git Operations. Повторить после локальных работ, без force-push.
+- completed: push проверен повторной попыткой после ошибок GitHub Git Operations: `Everything up-to-date`; `git ls-remote` подтвердил `main` на `6baec152e9b20b050a68c88564523a24f3a94274`, включая реализацию, PRD-first и новый дизайн. Force-push не применялся.
 - completed: восстановлен исходный визуальный референс; решение внесено в `docs/prd/ux.md` до изменения UI. Существующему PRD не противоречит.
 - completed: Tailwind-токены и компоненты UI-библиотеки: угольная основа, лаванда, тонкие разделители, декоративные пятна с интенсивностью 1/3. Вход использует ту же тему; Radix Slot убирает вложенные кнопки из ссылок навигации. API и бизнес-логика не изменены.
 - completed: 48 UI-тестов, 9 Playwright (включая 375/768/1440 px, вход, keyboard navigation и opacity), typecheck/lint/build. Пересобран и обновлён только web на tv; неизменность backend/БД подтверждена image/StartedAt/restart count.
