@@ -3,7 +3,7 @@ import { Type } from "@sinclair/typebox";
 import type { Kysely } from "kysely";
 import type { MarketDataDB } from "../db/schema.js";
 import { readCandles } from "../storage/candles.js";
-import { getCoverage } from "../storage/coverage.js";
+import { COVERAGE_MAX_UNIX, COVERAGE_MIN_UNIX, getCoverage, getCoverageRange, type CoverageRangeInput } from "../storage/coverage.js";
 import { registerManagementRoutes } from "./management.js";
 
 export type ApiKeyGuard = (
@@ -133,6 +133,40 @@ export function registerV1Routes(
       });
     },
   );
+
+  app.get("/v1/instruments/:instrumentId/coverage-range", {
+    preHandler: [requireApiKey],
+    schema: {
+      params: Type.Object({ instrumentId: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }) }),
+      querystring: Type.Object({
+        fromUnix: Type.Integer({ minimum: COVERAGE_MIN_UNIX, maximum: COVERAGE_MAX_UNIX }),
+        toUnix: Type.Integer({ minimum: COVERAGE_MIN_UNIX, maximum: COVERAGE_MAX_UNIX }),
+        splitUnix: Type.Integer({ minimum: COVERAGE_MIN_UNIX, maximum: COVERAGE_MAX_UNIX }),
+        offset: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 50 })),
+      }),
+      response: {
+        200: Type.Object({
+          instrumentId: Type.Integer(), fromUnix: Type.Integer(), toUnix: Type.Integer(), splitUnix: Type.Integer(),
+          expectedMinutes: Type.Integer(), presentMinutes: Type.Integer(), missingMinutes: Type.Integer(),
+          warmupExpectedMinutes: Type.Integer(), warmupPresentMinutes: Type.Integer(),
+          signalExpectedMinutes: Type.Integer(), signalPresentMinutes: Type.Integer(),
+          gaps: Type.Array(Type.Object({ fromUnix: Type.Integer(), toUnix: Type.Integer() }), { maxItems: 100 }),
+          gapCount: Type.Integer(), offset: Type.Integer(), limit: Type.Integer(), checkedAt: Type.String(),
+        }),
+        400: ErrorEnvelope, 401: ErrorEnvelope, 404: ErrorEnvelope,
+      },
+    },
+  }, async (request, reply) => {
+    const { instrumentId } = request.params as { instrumentId: number };
+    const query = request.query as CoverageRangeInput;
+    if (query.fromUnix >= query.toUnix || query.splitUnix < query.fromUnix || query.splitUnix > query.toUnix) {
+      return reply.code(400).send({ error: "invalid coverage range or split" });
+    }
+    const coverage = await getCoverageRange(db, instrumentId, query);
+    if (!coverage) return reply.code(404).send({ error: "instrument not found" });
+    return reply.send(coverage);
+  });
 
   app.get(
     "/v1/candles",

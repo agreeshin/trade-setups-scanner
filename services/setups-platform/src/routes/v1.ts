@@ -3,14 +3,15 @@ import { Readable } from "node:stream";
 import { Type } from "@sinclair/typebox";
 import { sql, type Kysely } from "kysely";
 import type { SignalsDB } from "../db/schema.js";
-import type { SpikeParams, SpikeSetup } from "../detector/price-volume-spike.js";
+import type { SpikeSetup } from "../detector/price-volume-spike.js";
 import { SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION } from "../detector/price-volume-spike.js";
-import { getAlgorithm, SpikeParamsSchema, validateSpikeParams } from "../algorithms.js";
+import { SpikeParamsSchema } from "../algorithms.js";
 import { registerControls } from "./controls.js";
 import { ApiCandleSource } from "../replay/source.js";
 import { replayRun } from "../replay/replay-runner.js";
 import { cancelReplayRun, enqueueReplayRuns, replayRunDto } from "../replay/jobs.js";
 import { saveQualityPage, type QualityInterval } from "../replay/quality.js";
+import { prepareReplayRequest, replayPreflight, type ReplayRequest } from "../replay/preflight.js";
 import {
   cacheClearAll,
   cacheClearByInstrument,
@@ -47,6 +48,7 @@ const ReplayRunRequest = Type.Object({
   fromUnix: Type.Integer({ minimum: 0, maximum: 253_402_300_740 }),
   toUnix: Type.Integer({ minimum: 0, maximum: 253_402_300_740 }),
   algorithmId: Type.Optional(Type.String()),
+  algorithmVersion: Type.Optional(Type.String()),
   params: Type.Optional(Type.Partial(SpikeParamsSchema)),
   async: Type.Optional(Type.Boolean()),
 });
@@ -128,6 +130,22 @@ export function registerPlatformV1Routes(
   const { db, requireApiKey, marketData } = options;
   registerControls(app, options);
 
+  app.post("/v1/replay-preflight", { preHandler: [requireApiKey], schema: { body: ReplayRunRequest } }, async (request, reply) => {
+    const controller = new AbortController();
+    const close = () => controller.abort();
+    reply.raw.once("close", close);
+    if (reply.raw.destroyed) controller.abort();
+    try {
+      const prepared = await prepareReplayRequest(db, request.body as ReplayRequest);
+      if (controller.signal.aborted) return reply;
+      if ("error" in prepared) return reply.code(400).send({ error: prepared.error });
+      return await replayPreflight(db, prepared.request, marketData, controller.signal);
+    } finally {
+      reply.raw.off("close", close);
+      controller.abort();
+    }
+  });
+
   app.post(
     "/v1/replay-runs",
     {
@@ -138,23 +156,10 @@ export function registerPlatformV1Routes(
       },
     },
     async (request, reply) => {
-      const body = request.body as {
-        instruments: { exchange: string; category: string; symbol: string }[];
-        fromUnix: number;
-        toUnix: number;
-        algorithmId?: string;
-        params?: SpikeParams;
-        async?: boolean;
-      };
-      const algorithm = await getAlgorithm(db, body.algorithmId);
-      if (!algorithm) return reply.code(400).send({ error: "unknown_algorithm" });
-      const params = { ...algorithm.params, ...body.params };
-      const error = validateSpikeParams(params);
-      if (error || !Number.isSafeInteger(body.fromUnix) || !Number.isSafeInteger(body.toUnix) ||
-        body.fromUnix < 0 || body.toUnix > 253_402_300_740 ||
-        body.fromUnix >= body.toUnix || body.toUnix - body.fromUnix > 366 * 86400) {
-        return reply.code(400).send({ error: error ?? "invalid_range_max_366_days" });
-      }
+      const prepared = await prepareReplayRequest(db, request.body as ReplayRequest);
+      if ("error" in prepared) return reply.code(400).send({ error: prepared.error });
+      const body = prepared.request;
+      const params = body.params;
 
       if (body.async) {
         const queued = await enqueueReplayRuns(db, { ...body, params });

@@ -9,10 +9,11 @@ export interface CatalogInstrument {
 export async function fetchCatalog(
   marketDataUrl: string,
   apiKey: string,
+  signal?: AbortSignal,
 ): Promise<CatalogInstrument[]> {
   const response = await fetch(`${marketDataUrl}/v1/instruments`, {
     headers: { "x-api-key": apiKey },
-    signal: AbortSignal.timeout(10000),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000),
   });
   if (!response.ok) {
     throw new Error(

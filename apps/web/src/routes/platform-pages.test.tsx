@@ -38,6 +38,7 @@ beforeEach(() => {
     if (path === "/v1/history/instruments/1/coverage") data = { instrumentId: 1, firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, intervals: [], gaps: [] };
     if (path === "/v1/settings/ui") data = { value: { existing: "keep" } };
     if (path === "/v1/replay-runs") data = { runs: [] };
+    if (path === "/v1/replay-preflight") data = { checkedAt: "2026-10-10T10:00:00Z", algorithmVersion: "snapshot-v2", requiredHistoryMinutes: 43200, canRun: true, request: { ...(JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>), async: true, algorithmVersion: "snapshot-v2", params: { priceGrowthPct: "17", windowMinutes: 9 } }, results: [] };
     if (path === "/v1/settings/notifications") data = { maxAgeSeconds: 60 };
     if (path === "/v1/live/status") data = { enabled: false, running: false, lastScanAt: null, lastError: null };
     if (path === "/v1/replay-cache/stats") data = { entries: 3, bytes: 1024 };
@@ -58,14 +59,16 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 describe("platform screens", () => {
   it("submits algorithm and local dates without overriding saved algorithm params", async () => {
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
-    await waitFor(() => expect(screen.getByRole("button", { name: "Запустить" })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Проверить данные" })).toBeEnabled());
     expect(screen.getByRole("checkbox", { name: "BTCUSDT (Trading)" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "ETHUSDT (Delisted)" })).toBeChecked();
     fireEvent.change(screen.getByLabelText("Начало"), { target: { value: "2026-10-10T12:00" } });
     fireEvent.change(screen.getByLabelText("Конец"), { target: { value: "2026-10-10T13:00" } });
-    await userEvent.click(screen.getByRole("button", { name: "Запустить" }));
+    await userEvent.click(screen.getByRole("button", { name: "Проверить данные" }));
+    expect(requests.some((request) => request.path === "/v1/replay-runs" && request.method === "POST")).toBe(false);
+    await userEvent.click(await screen.findByRole("button", { name: "Запустить проверенный расчёт" }));
     await screen.findByText(/Запрос запуска принят/);
-    expect(requests.find((request) => request.method === "POST")?.body).toEqual({ async: true, algorithmId: "price_volume_spike", instruments: [{ exchange: "bybit", category: "linear", symbol: "BTCUSDT" }, { exchange: "bybit", category: "linear", symbol: "ETHUSDT" }], fromUnix: new Date("2026-10-10T12:00").getTime() / 1000, toUnix: new Date("2026-10-10T13:00").getTime() / 1000 });
+    expect(requests.find((request) => request.path === "/v1/replay-runs" && request.method === "POST")?.body).toEqual({ async: true, algorithmVersion: "snapshot-v2", params: { priceGrowthPct: "17", windowMinutes: 9 }, algorithmId: "price_volume_spike", instruments: [{ exchange: "bybit", category: "linear", symbol: "BTCUSDT" }, { exchange: "bybit", category: "linear", symbol: "ETHUSDT" }], fromUnix: new Date("2026-10-10T12:00").getTime() / 1000, toUnix: new Date("2026-10-10T13:00").getTime() / 1000 });
     expect(requests.some((request) => request.method === "PUT")).toBe(false);
     await userEvent.click(screen.getByRole("button", { name: "Сохранить форму" }));
     await screen.findByText("Форма сохранена в базе сигналов.");
@@ -73,10 +76,10 @@ describe("platform screens", () => {
   });
   it("blocks a reversed date range before POST", async () => {
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
-    await waitFor(() => expect(screen.getByRole("button", { name: "Запустить" })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Проверить данные" })).toBeEnabled());
     fireEvent.change(screen.getByLabelText("Начало"), { target: { value: "2026-10-10T13:00" } });
     fireEvent.change(screen.getByLabelText("Конец"), { target: { value: "2026-10-10T12:00" } });
-    await userEvent.click(screen.getByRole("button", { name: "Запустить" }));
+    await userEvent.click(screen.getByRole("button", { name: "Проверить данные" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("конец диапазона должен быть позже начала");
     expect(requests.some((request) => request.method === "POST")).toBe(false);
   });
@@ -146,7 +149,7 @@ describe("platform screens", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("{}", { status: 503 }))));
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
     await screen.findByText("Алгоритмы недоступны (HTTP 503)");
-    expect(screen.getByRole("button", { name: "Запустить" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Проверить данные" })).toBeDisabled();
   });
   it("previews CSV exclusions and duplicates before replacing the catalog selection", async () => {
     render(<MemoryRouter><RunsPage /></MemoryRouter>);

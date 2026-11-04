@@ -195,7 +195,7 @@ test.describe("application smoke", () => {
   test("runs page shows the launch form", async ({ page }) => {
     await page.goto("/runs");
     await expect(page.getByRole("heading", { name: "Исторические запуски" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Запустить" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Проверить данные" })).toBeVisible();
   });
 
   test("mobile history shows explicit empty coverage without automatic jobs", async ({ page }) => {
@@ -218,11 +218,13 @@ test.describe("application smoke", () => {
     await expect(page.getByRole("checkbox", { name: "BTCUSDT (Trading)" })).toBeChecked();
     await page.getByLabel("Начало", { exact: true }).fill("2026-10-10T13:00");
     await page.getByLabel("Конец", { exact: true }).fill("2026-10-10T12:00");
-    await page.getByRole("button", { name: "Запустить", exact: true }).click();
+    await page.getByRole("button", { name: "Проверить данные", exact: true }).click();
     await expect(page.getByRole("alert")).toContainText("конец диапазона должен быть позже начала");
     await page.getByLabel("Конец", { exact: true }).fill("2026-10-10T14:00");
     const request = page.waitForRequest((candidate) => candidate.url().endsWith("/v1/replay-runs") && candidate.method() === "POST");
-    await page.getByRole("button", { name: "Запустить", exact: true }).click();
+    await page.route("**/v1/replay-preflight", async (route) => { const body = route.request().postDataJSON() as Record<string, unknown>; await route.fulfill({ json: { checkedAt: "2026-10-10T10:00:00Z", algorithmVersion: "1", requiredHistoryMinutes: 43200, canRun: true, request: { ...body, algorithmVersion: "1", params: { priceGrowthPct: "12" }, async: true }, results: [] } }); });
+    await page.getByRole("button", { name: "Проверить данные", exact: true }).click();
+    await page.getByRole("button", { name: "Запустить проверенный расчёт", exact: true }).click();
     const body: unknown = (await request).postDataJSON();
     expect(body).toMatchObject({ async: true, algorithmId: "price_volume_spike", instruments: [{ symbol: "BTCUSDT" }] });
     await expect(page.getByRole("status")).toContainText("Запрос запуска принят");

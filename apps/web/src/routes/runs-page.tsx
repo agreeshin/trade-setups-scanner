@@ -9,6 +9,7 @@ import { SetupTable } from "./setup-table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
 import { usePlatformPoll } from "./use-platform-poll";
 import { EmptyReplayResult, ReplayQualitySummary, qualityLabel, type QualityPanelState, type ReplayQuality } from "./replay-quality";
+import { ReplayPreflight, type PreflightResponse, type ReplayInstrument } from "./replay-preflight";
 
 interface RunRow {
   id: number;
@@ -100,6 +101,7 @@ function RunResults({ id, revision }: { id: number; revision: number }) {
 
 export function RunsPage() {
   const [form, setForm] = useState<ReplayForm>({ symbols: "", from: "", to: "", algorithmId: "" });
+  const normalizedSymbols = new Set(form.symbols.split(/[\s,;]+/).map((item) => item.trim().toUpperCase()).filter(Boolean));
   const [algorithms, setAlgorithms] = useState<PlatformState<{ algorithms: Algorithm[] }>>({ kind: "loading" });
   const [catalog, setCatalog] = useState<PlatformState<{ instruments: CatalogInstrument[] }>>({ kind: "loading" });
   const [ready, setReady] = useState(false);
@@ -110,11 +112,19 @@ export function RunsPage() {
   const [reload, setReload] = useState(0);
   const runs = usePlatformPoll<{ runs: RunRow[] }>("/v1/replay-runs", reload);
   const [cancelling, setCancelling] = useState<number | null>(null);
+  const [knownInstruments, setKnownInstruments] = useState<ReplayInstrument[]>([]);
+  const [preview, setPreview] = useState<PreflightResponse | null>(null);
+  const [checking, setChecking] = useState(false);
+  const checkRequest = useRef<AbortController | null>(null);
+  useEffect(() => () => { checkRequest.current?.abort(); }, []);
+  function changeForm(next: ReplayForm) {
+    checkRequest.current?.abort(); setChecking(false); setPreview(null); setError(null); setMessage(null); setForm(next);
+  }
   useEffect(() => {
     let cancelled = false;
     void Promise.all([
       fetchPlatform<{ algorithms: Algorithm[] }>("/v1/algorithms"),
-      fetchPlatform<{ value: { replay?: Partial<ReplayForm> & { fromUnix?: number; toUnix?: number } } }>("/v1/settings/ui"),
+      fetchPlatform<{ value: { replay?: Partial<ReplayForm> & { fromUnix?: number; toUnix?: number; instruments?: ReplayInstrument[] } } }>("/v1/settings/ui"),
       fetchPlatform<{ instruments: CatalogInstrument[] }>("/v1/instruments"),
     ]).then(([algorithmsResult, preferences, instrumentsResult]) => {
       if (cancelled) return;
@@ -122,7 +132,9 @@ export function RunsPage() {
       const instruments = instrumentsResult.kind === "ready" ? instrumentsResult.data.instruments.filter((instrument) => instrument.exchange === "bybit" && instrument.category === "linear") : [];
       setCatalog(instrumentsResult.kind === "ready" ? { kind: "ready", data: { instruments } } : instrumentsResult);
       const saved = preferences.kind === "ready" ? preferences.data.value.replay : undefined;
-      setForm({ symbols: typeof saved?.symbols === "string" ? saved.symbols : instruments.map((instrument) => instrument.symbol).join("\n"), from: typeof saved?.fromUnix === "number" ? localDateInput(saved.fromUnix) : typeof saved?.from === "string" ? saved.from : "", to: typeof saved?.toUnix === "number" ? localDateInput(saved.toUnix) : typeof saved?.to === "string" ? saved.to : "", algorithmId: typeof saved?.algorithmId === "string" ? saved.algorithmId : algorithmsResult.kind === "ready" ? algorithmsResult.data.algorithms[0]?.id ?? "" : "" });
+      const savedIdentities = Array.isArray(saved?.instruments) ? saved.instruments.filter((item) => item.exchange === "bybit" && item.category === "linear" && typeof item.symbol === "string") : [];
+      setKnownInstruments(instrumentsResult.kind === "ready" ? instruments : savedIdentities);
+      setForm({ symbols: typeof saved?.symbols === "string" ? saved.symbols : (instrumentsResult.kind === "ready" ? instruments : savedIdentities).map((instrument) => instrument.symbol).join("\n"), from: typeof saved?.fromUnix === "number" ? localDateInput(saved.fromUnix) : typeof saved?.from === "string" ? saved.from : "", to: typeof saved?.toUnix === "number" ? localDateInput(saved.toUnix) : typeof saved?.to === "string" ? saved.to : "", algorithmId: typeof saved?.algorithmId === "string" ? saved.algorithmId : algorithmsResult.kind === "ready" ? algorithmsResult.data.algorithms[0]?.id ?? "" : "" });
       if (preferences.kind === "unreachable") setError(`Не удалось загрузить сохранённую форму (${preferences.detail})`);
       setReady(true);
     });
@@ -130,24 +142,38 @@ export function RunsPage() {
   }, []);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    checkRequest.current?.abort();
+    const controller = new AbortController(); checkRequest.current = controller;
+    setPreview(null);
     setError(null);
     setMessage(null);
     try {
       const range = replayRange(form.from, form.to);
-      const symbols = [...new Set(form.symbols.split(/[\s,;]+/).map((item) => item.trim().toUpperCase()).filter(Boolean))];
+      const symbols = [...normalizedSymbols];
       if (!symbols.length || symbols.length > 100 || symbols.some((symbol) => !/^[A-Z0-9]{2,40}$/.test(symbol))) throw new Error("Укажите от 1 до 100 корректных символов, например BTCUSDT.");
-      if (catalog.kind !== "ready" || symbols.some((symbol) => !catalog.data.instruments.some((instrument) => instrument.symbol === symbol))) throw new Error("Все выбранные инструменты должны присутствовать в каталоге БД Bybit Linear.");
+      const instruments = symbols.map((symbol) => knownInstruments.find((instrument) => instrument.symbol === symbol));
+      if (instruments.some((instrument) => !instrument)) throw new Error("Нужен каталог либо сохранённые полные идентификаторы выбранных инструментов. По одним символам offline-проверка невозможна.");
       if (algorithms.kind !== "ready" || !algorithms.data.algorithms.some((algorithm) => algorithm.id === form.algorithmId)) throw new Error("Выберите доступный алгоритм.");
-      setBusy(true);
-      await writePlatform("/v1/replay-runs", { async: true, algorithmId: form.algorithmId, instruments: symbols.map((symbol) => ({ exchange: "bybit", category: "linear", symbol })), ...range }, "POST");
-      setMessage("Запрос запуска принят. Результаты и статус обновляются в списке ниже.");
-      setReload((value) => value + 1);
+      setChecking(true);
+      const response = await apiFetch("/v1/replay-preflight", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ algorithmId: form.algorithmId, instruments: instruments.map((item) => ({ exchange: item!.exchange, category: item!.category, symbol: item!.symbol })), ...range }), signal: controller.signal });
+      if (!response.ok) throw new Error(`Проверка данных недоступна: HTTP ${response.status}`);
+      const result = await response.json() as PreflightResponse;
+      if (!controller.signal.aborted) setPreview(result);
+    } catch (cause) { if (!controller.signal.aborted) setError(errorText(cause)); }
+    finally { if (!controller.signal.aborted) setChecking(false); }
+  }
+  async function launch() {
+    if (!preview?.canRun) return;
+    setBusy(true); setError(null); setMessage(null);
+    try {
+      await writePlatform("/v1/replay-runs", preview.request, "POST");
+      setPreview(null); setMessage("Запрос запуска принят. Результаты и статус обновляются в списке ниже."); setReload((value) => value + 1);
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
   async function saveForm() {
     setBusy(true); setError(null); setMessage(null);
-    try { await savePreference("replay", { symbols: form.symbols, algorithmId: form.algorithmId, ...replayRange(form.from, form.to) }); setMessage("Форма сохранена в базе сигналов."); }
+    try { await savePreference("replay", { symbols: [...normalizedSymbols].join("\n"), instruments: knownInstruments.filter((item) => normalizedSymbols.has(item.symbol)).map(({ exchange, category, symbol }) => ({ exchange, category, symbol })), algorithmId: form.algorithmId, ...replayRange(form.from, form.to) }); setMessage("Форма сохранена в базе сигналов."); }
     catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
@@ -160,23 +186,24 @@ export function RunsPage() {
   return <section aria-labelledby="runs-heading">
     <h1 id="runs-heading" className="text-2xl font-semibold">Исторические запуски</h1>
     <form onSubmit={(event) => { void submit(event); }} className="mt-4 grid max-w-2xl gap-4">
-      <label className="grid gap-1 text-sm">Алгоритм<Select required disabled={!ready || algorithms.kind !== "ready"} value={form.algorithmId} onChange={(event) => setForm({ ...form, algorithmId: event.target.value })}>
+      <label className="grid gap-1 text-sm">Алгоритм<Select required disabled={busy || !ready || algorithms.kind !== "ready"} value={form.algorithmId} onChange={(event) => changeForm({ ...form, algorithmId: event.target.value })}>
         <option value="">Выберите алгоритм</option>
         {algorithms.kind === "ready" && algorithms.data.algorithms.map((algorithm) => <option key={algorithm.id} value={algorithm.id}>{algorithm.name} · {algorithm.version}</option>)}
       </Select></label>
       {algorithms.kind === "unreachable" && <p role="alert">Алгоритмы недоступны ({algorithms.detail})</p>}
       <p className="text-sm text-muted-foreground">Запуск использует сохранённый снимок общих параметров. <Link className="underline" to="/settings">Настроить алгоритмы</Link></p>
       {catalog.kind === "loading" && <p>Загрузка инструментов из БД…</p>}
-      {catalog.kind === "unreachable" && <p role="alert">Каталог БД недоступен ({catalog.detail}). Запуск заблокирован.</p>}
-      {catalog.kind === "ready" && <InstrumentPicker catalog={catalog.data.instruments} symbols={form.symbols} onChange={(symbols) => setForm({ ...form, symbols })} disabled={!ready || busy} />}
+      {catalog.kind === "unreachable" && <p role="status">Каталог БД недоступен ({catalog.detail}). Проверка кеша возможна только для ранее сохранённых полных идентификаторов: {knownInstruments.map((item) => `${item.exchange}/${item.category}/${item.symbol}`).join(", ") || "не сохранены"}. Выбор: {form.symbols || "пусто"}.</p>}
+      {catalog.kind === "ready" && <InstrumentPicker catalog={catalog.data.instruments} symbols={form.symbols} onChange={(symbols) => changeForm({ ...form, symbols })} disabled={!ready || busy} />}
       <p id="timezone" className="text-sm text-muted-foreground">Локальное время: {localTimezone}. В API передаются Unix-секунды.</p>
       <div className="grid gap-3 sm:grid-cols-2">
-        <label className="grid gap-1 text-sm">Начало<Input type="datetime-local" required aria-describedby="timezone" disabled={!ready} value={form.from} onChange={(event) => setForm({ ...form, from: event.target.value })} /></label>
-        <label className="grid gap-1 text-sm">Конец<Input type="datetime-local" required aria-describedby="timezone" disabled={!ready} value={form.to} onChange={(event) => setForm({ ...form, to: event.target.value })} /></label>
+        <label className="grid gap-1 text-sm">Начало<Input type="datetime-local" required aria-describedby="timezone" disabled={!ready || busy} value={form.from} onChange={(event) => changeForm({ ...form, from: event.target.value })} /></label>
+        <label className="grid gap-1 text-sm">Конец<Input type="datetime-local" required aria-describedby="timezone" disabled={!ready || busy} value={form.to} onChange={(event) => changeForm({ ...form, to: event.target.value })} /></label>
       </div>
       {error && <p role="alert">{error}</p>}{message && <p role="status">{message}</p>}
       <p className="text-xs text-muted-foreground">Расчёт выполняется в фоне. Список обновляется каждые 3 секунды в видимой вкладке. Закрытие страницы не отменяет расчёт; используйте кнопку отмены.</p>
-      <div className="flex flex-wrap gap-2"><Button type="submit" disabled={busy || !ready || algorithms.kind !== "ready" || catalog.kind !== "ready"}>{busy ? "Выполняется…" : "Запустить"}</Button><Button type="button" variant="outline" disabled={busy || !ready} onClick={() => { void saveForm(); }}>Сохранить форму</Button></div>
+      <div className="flex flex-wrap gap-2"><Button type="submit" disabled={busy || checking || !ready || algorithms.kind !== "ready"}>{checking ? "Проверка…" : "Проверить данные"}</Button><Button type="button" variant="outline" disabled={busy || checking || !ready} onClick={() => { void saveForm(); }}>Сохранить форму</Button></div>
+      {preview && <><ReplayPreflight preview={preview} /><Button type="button" disabled={busy || !preview.canRun} onClick={() => { void launch(); }}>Запустить проверенный расчёт</Button></>}
     </form>
     <div className="mt-8 flex flex-wrap items-center gap-3"><h2 className="text-lg font-semibold">Последние запуски</h2><Button variant="outline" onClick={() => setReload((value) => value + 1)}>Обновить</Button></div>
     {runs.kind === "loading" && <p>Загрузка…</p>}
