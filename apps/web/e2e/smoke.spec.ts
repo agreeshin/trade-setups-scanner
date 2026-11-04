@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 test.beforeEach(async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
   await page.route("**/v1/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/v1/session") return route.fulfill({ json: { authenticated: true, expiresAt: Date.now() + 3600000 } });
@@ -16,6 +17,57 @@ test.beforeEach(async ({ page }) => {
   });
 });
 test.describe("application smoke", () => {
+  test("theme preference supports system changes, explicit override and reload", async ({ page }) => {
+    await page.emulateMedia({ colorScheme: "light" });
+    await page.goto("/");
+    const html = page.locator("html");
+    const theme = page.getByRole("combobox", { name: "Тема интерфейса" });
+    const surface = page.locator('[data-slot="app-surface"]');
+    await expect(theme).toHaveValue("system");
+    await expect(html).toHaveAttribute("data-theme", "system");
+    await expect(surface).toHaveCSS("background-color", "rgb(248, 247, 250)");
+    await page.emulateMedia({ colorScheme: "dark" });
+    await expect(surface).toHaveCSS("background-color", "rgb(16, 17, 19)");
+    await theme.selectOption("light");
+    await expect(html).toHaveAttribute("data-theme", "light");
+    await expect(surface).toHaveCSS("background-color", "rgb(248, 247, 250)");
+    await page.reload();
+    await expect(theme).toHaveValue("light");
+    await expect(surface).toHaveCSS("background-color", "rgb(248, 247, 250)");
+    await theme.selectOption("dark");
+    await page.emulateMedia({ colorScheme: "light" });
+    await expect(surface).toHaveCSS("background-color", "rgb(16, 17, 19)");
+    await theme.selectOption("system");
+    await expect(html).toHaveAttribute("data-theme", "system");
+    await expect(surface).toHaveCSS("background-color", "rgb(248, 247, 250)");
+    await page.reload();
+    await expect(theme).toHaveValue("system");
+    await page.getByRole("link", { name: "Настройки", exact: true }).click();
+    for (const width of [375, 1440]) {
+      await page.setViewportSize({ width, height: 900 });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      await page.screenshot({ path: test.info().outputPath(`light-${width}.png`) });
+    }
+  });
+
+  test("theme works on login when storage is denied", async ({ page }) => {
+    await page.addInitScript(() => {
+      Object.defineProperty(window, "localStorage", { get() { throw new DOMException("Storage denied", "SecurityError"); } });
+    });
+    await page.route("**/v1/session", (route) => route.fulfill({ status: 401, json: { error: "unauthorized" } }));
+    await page.setViewportSize({ width: 375, height: 812 });
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "Вход в платформу" })).toBeVisible();
+    const theme = page.getByRole("combobox", { name: "Тема интерфейса" });
+    await expect(theme).toHaveValue("system");
+    await theme.selectOption("light");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+    await expect(page.locator('[data-slot="app-surface"]')).toHaveCSS("background-color", "rgb(248, 247, 250)");
+    await expect(theme).toHaveCSS("background-color", "rgb(248, 247, 250)");
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: test.info().outputPath("light-login-mobile.png") });
+  });
+
   test("shared terminal theme keeps decoration subdued and navigation accessible", async ({ page }) => {
     await page.goto("/");
     const surface = page.locator('[data-slot="app-surface"]');

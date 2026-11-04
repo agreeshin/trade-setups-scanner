@@ -1,28 +1,24 @@
 @import "tailwindcss";
 
 @theme {
-  --color-background: #101113;
-  --color-foreground: #eeedf2;
-  --color-card: #19181e;
-  --color-card-foreground: #eeedf2;
-  --color-primary: #c7abe7;
-  --color-primary-foreground: #201627;
-  --color-muted: #242329;
-  --color-muted-foreground: #aaa6b2;
-  --color-accent: #44364f;
-  --color-accent-foreground: #f3eafa;
-  --color-input: #39363f;
-  --color-ring: #c7abe7;
-  --color-success: #16cf98;
-  --color-success-foreground: #08271e;
-  --color-ambient-violet: #6e40dc;
-  --color-ambient-rose: #bd6d9f;
+  --color-background: light-dark(#f8f7fa, #101113);
+  --color-foreground: light-dark(#24212b, #eeedf2);
+  --color-card: light-dark(#ffffff, #19181e);
+  --color-card-foreground: light-dark(#24212b, #eeedf2);
+  --color-primary: light-dark(#704593, #c7abe7);
+  --color-primary-foreground: light-dark(#ffffff, #201627);
+  --color-muted: light-dark(#ebe7f0, #242329);
+  --color-muted-foreground: light-dark(#615a6d, #aaa6b2);
+  --color-accent: light-dark(#e6daef, #44364f);
+  --color-accent-foreground: light-dark(#43295a, #f3eafa);
+  --color-input: light-dark(#b9afc5, #39363f);
+  --color-ring: light-dark(#704593, #c7abe7);
+  --color-success: light-dark(#087f5c, #16cf98);
+  --color-success-foreground: light-dark(#ffffff, #08271e);
+  --color-ambient-violet: light-dark(#c2acec, #6e40dc);
+  --color-ambient-rose: light-dark(#e6b9d2, #bd6d9f);
   --opacity-ambient: 0.333333;
   --radius-md: 0.5rem;
-}
-
-html {
-  color-scheme: dark;
 }
 
 body {

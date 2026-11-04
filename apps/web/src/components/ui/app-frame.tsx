@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { ThemeSelect } from "./theme-select";
 
 export function AppSurface({ children }: { children: ReactNode }) {
   return <div data-slot="app-surface" className="relative isolate min-h-dvh bg-background font-sans text-sm text-foreground antialiased">
@@ -16,7 +17,7 @@ export function SessionBar({ children }: { children: ReactNode }) {
       <span aria-hidden="true" className="size-3.5 rounded-full border-2 border-primary" />
       Trade Setups
     </span>
-    <div className="flex items-center gap-4">{children}</div>
+    <div className="flex flex-wrap items-center gap-3"><ThemeSelect />{children}</div>
   </div>;
 }
 
@@ -33,5 +34,8 @@ export function AppFrame({ navigation, status, children }: { navigation: ReactNo
 }
 
 export function AuthFrame({ children }: { children: ReactNode }) {
-  return <main className="flex min-h-dvh items-center justify-center p-6">{children}</main>;
+  return <main className="flex min-h-dvh flex-col items-center justify-center gap-4 p-6">
+    <div className="flex w-full max-w-sm justify-end"><ThemeSelect /></div>
+    {children}
+  </main>;
 }
