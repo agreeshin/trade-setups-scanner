@@ -82,8 +82,10 @@ describe("replay runner", () => {
       fromUnix: 0,
       toUnix: bars[bars.length - 1]!.openTimeUnix + MINUTE,
     });
-    expect(result.warmupMinutes).toBe(100 + 43199);
-    expect(result.processedMinutes).toBe(6);
+    // Gap of 1 minute is now tolerated (gap-tolerance params), so the warmup
+    // includes the gap-filler and completes 1 bar earlier than zero-tolerance.
+    expect(result.warmupMinutes).toBe(43198);
+    expect(result.processedMinutes).toBe(107);
     expect(result.setups.length).toBeGreaterThan(0);
   });
 

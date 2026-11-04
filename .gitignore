@@ -1,5 +1,6 @@
 # Local editor and agent backup history.
 .backups/
+docs/invent/
 backups/
 
 # Dependencies and build artifacts.
