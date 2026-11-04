@@ -1,23 +1,31 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { Readable } from "node:stream";
 import { Type } from "@sinclair/typebox";
-import type { Kysely } from "kysely";
+import { sql, type Kysely } from "kysely";
 import type { SignalsDB } from "../db/schema.js";
 import type { SpikeParams, SpikeSetup } from "../detector/price-volume-spike.js";
-import { DEFAULT_SPIKE_PARAMS, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION } from "../detector/price-volume-spike.js";
+import { SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION } from "../detector/price-volume-spike.js";
+import { getAlgorithm, SpikeParamsSchema, validateSpikeParams } from "../algorithms.js";
+import { registerControls } from "./controls.js";
 import { ApiCandleSource } from "../replay/source.js";
 import { replayRun } from "../replay/replay-runner.js";
+import { cancelReplayRun, enqueueReplayRuns, replayRunDto } from "../replay/jobs.js";
 import {
   cacheClearAll,
   cacheClearByInstrument,
   cacheLookup,
   cacheStats,
   cacheStore,
+  cacheGeneration,
+  lockReplayCache,
   type CacheQuery,
 } from "../replay/cache.js";
 import { fetchCatalog } from "../platform-catalog.js";
 import {
   getNotificationMaxAgeSeconds,
   setNotificationMaxAgeSeconds,
+  getSetting,
+  setSetting,
 } from "../settings.js";
 
 export type ApiKeyGuard = (
@@ -35,9 +43,11 @@ const InstrumentInput = Type.Object({
 
 const ReplayRunRequest = Type.Object({
   instruments: Type.Array(InstrumentInput, { minItems: 1, maxItems: 100 }),
-  fromUnix: Type.Integer(),
-  toUnix: Type.Integer(),
-  params: Type.Optional(Type.Object({})),
+  fromUnix: Type.Integer({ minimum: 0, maximum: 253_402_300_740 }),
+  toUnix: Type.Integer({ minimum: 0, maximum: 253_402_300_740 }),
+  algorithmId: Type.Optional(Type.String()),
+  params: Type.Optional(Type.Partial(SpikeParamsSchema)),
+  async: Type.Optional(Type.Boolean()),
 });
 
 const SetupDto = Type.Object({
@@ -45,7 +55,16 @@ const SetupDto = Type.Object({
   category: Type.String(),
   symbol: Type.String(),
   algorithmId: Type.String(),
-  algorithmVersion: Type.String(),
+  algorithmVersion: Type.Optional(Type.String()),
+  params: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+  details: Type.Optional(Type.Union([Type.Null(), Type.Object({
+    growthPct: Type.Union([Type.String(), Type.Null()]),
+    volumeLongRatio: Type.Union([Type.String(), Type.Null()]),
+    volumeShortRatio: Type.Union([Type.String(), Type.Null()]),
+    overLong: Type.Boolean(),
+    overShort: Type.Boolean(),
+    missingMinutes: Type.Integer(),
+  })])),
   openTimeUnix: Type.Integer(),
   closeTimeUnix: Type.Integer(),
   closePrice: Type.String(),
@@ -62,9 +81,35 @@ const RunDto = Type.Object({
   warmupMinutes: Type.Union([Type.Integer(), Type.Null()]),
   processedMinutes: Type.Union([Type.Integer(), Type.Null()]),
   error: Type.Union([Type.String(), Type.Null()]),
+  algorithmId: Type.Optional(Type.String()),
+  algorithmVersion: Type.Optional(Type.String()),
+  fromUnix: Type.Optional(Type.Integer()),
+  toUnix: Type.Optional(Type.Integer()),
+  createdAt: Type.Optional(Type.String()),
+  params: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 });
 
 const toJsonArray = <T>(value: T[]): T[] => JSON.stringify(value) as unknown as T[];
+
+function replayResultPage(db: Kysely<SignalsDB>, id: number, offset: number, limit: number) {
+  // PostgreSQL jsonpath indices are int32; larger offsets are necessarily past the array end.
+  const path = `$[${offset} to ${Math.min(offset + limit - 1, 2_147_483_647)}]`;
+  const page = offset > 2_147_483_647 ? sql<SpikeSetup[]>`'[]'::jsonb`
+    : sql<SpikeSetup[]>`jsonb_path_query_array(coalesce(setups, '[]'::jsonb), ${path}::jsonpath)`;
+  return db.selectFrom("replay_runs")
+    .select(["id", "exchange_code", "category", "symbol", "status", "cache_hit", "warmup_minutes",
+      "processed_minutes", "error", "algorithm_id", "algorithm_version", "from_ts", "to_ts", "created_at", "params"])
+    .select(sql<number>`coalesce(jsonb_array_length(setups), 0)`.as("setup_count"))
+    .select(page.as("setups"))
+    .where("id", "=", id).executeTakeFirst();
+}
+
+function csvCell(value: string | number | boolean | null | undefined): string {
+  let text = value === null || value === undefined ? "" : String(value);
+  // Quoting alone does not stop spreadsheet formula execution.
+  if (/^[\s\p{Cc}]*[=+@-]/u.test(text) || /^[\t\r\n]/u.test(text)) text = `'${text}`;
+  return `"${text.replaceAll('"', '""')}"`;
+}
 
 export interface PlatformV1Options {
   db: Kysely<SignalsDB>;
@@ -77,6 +122,7 @@ export function registerPlatformV1Routes(
   options: PlatformV1Options,
 ): void {
   const { db, requireApiKey, marketData } = options;
+  registerControls(app, options);
 
   app.post(
     "/v1/replay-runs",
@@ -84,7 +130,7 @@ export function registerPlatformV1Routes(
       preHandler: [requireApiKey],
       schema: {
         body: ReplayRunRequest,
-        response: { 200: Type.Object({ runs: Type.Array(RunDto) }), 401: ErrorEnvelope },
+        response: { 200: Type.Object({ runs: Type.Array(RunDto) }), 202: Type.Object({ runs: Type.Array(RunDto) }), 400: ErrorEnvelope, 401: ErrorEnvelope, 429: ErrorEnvelope },
       },
     },
     async (request, reply) => {
@@ -92,9 +138,26 @@ export function registerPlatformV1Routes(
         instruments: { exchange: string; category: string; symbol: string }[];
         fromUnix: number;
         toUnix: number;
+        algorithmId?: string;
         params?: SpikeParams;
+        async?: boolean;
       };
-      const params = { ...DEFAULT_SPIKE_PARAMS, ...body.params };
+      const algorithm = await getAlgorithm(db, body.algorithmId);
+      if (!algorithm) return reply.code(400).send({ error: "unknown_algorithm" });
+      const params = { ...algorithm.params, ...body.params };
+      const error = validateSpikeParams(params);
+      if (error || !Number.isSafeInteger(body.fromUnix) || !Number.isSafeInteger(body.toUnix) ||
+        body.fromUnix < 0 || body.toUnix > 253_402_300_740 ||
+        body.fromUnix >= body.toUnix || body.toUnix - body.fromUnix > 366 * 86400) {
+        return reply.code(400).send({ error: error ?? "invalid_range_max_366_days" });
+      }
+
+      if (body.async) {
+        const queued = await enqueueReplayRuns(db, { ...body, params });
+        if (!queued) return reply.code(429).send({ error: "replay_queue_full_max_100" });
+        return reply.code(202).send({ runs: queued.map(replayRunDto) });
+      }
+      const generation = await cacheGeneration(db);
 
       const catalog = await fetchCatalog(marketData.url, marketData.apiKey);
       const byIdentity = new Map(
@@ -169,10 +232,12 @@ export function registerPlatformV1Routes(
 
         const cached = await cacheLookup(db, cacheQuery);
         if (cached !== null) {
-          await db
+          const completed = await db.transaction().execute(async (tx) => {
+          const current = await tx.selectFrom("replay_runs").select("status").where("id", "=", run.id).forUpdate().executeTakeFirstOrThrow();
+          return tx
             .updateTable("replay_runs")
             .set({
-              status: "done",
+              status: current.status === "cancel_requested" ? "cancelled" : "done",
               cache_hit: true,
               setups: toJsonArray(cached.setups),
               warmup_minutes: cached.warmupMinutes,
@@ -180,19 +245,9 @@ export function registerPlatformV1Routes(
               updated_at: new Date(),
             })
             .where("id", "=", run.id)
-            .execute();
-          runs.push({
-            id: run.id,
-            exchange: run.exchange_code,
-            category: run.category,
-            symbol: run.symbol,
-            status: "done",
-            cacheHit: true,
-            setupCount: cached.setups.length,
-            warmupMinutes: cached.warmupMinutes,
-            processedMinutes: cached.processedMinutes,
-            error: null,
+            .returningAll().executeTakeFirstOrThrow();
           });
+          runs.push(replayRunDto(completed));
           continue;
         }
 
@@ -203,33 +258,40 @@ export function registerPlatformV1Routes(
             catalogEntry.id,
           );
           const result = await replayRun({
-            source,
+            source: { async read(query) {
+              const current = await db.selectFrom("replay_runs").select("status").where("id", "=", run.id).executeTakeFirstOrThrow();
+              if (current.status === "cancel_requested") return { bars: [], nextCursorUnix: null };
+              return source.read(query);
+            } },
             fromUnix: body.fromUnix,
             toUnix: body.toUnix,
             params,
           });
-          await cacheStore(db, cacheQuery, {
-            setups: result.setups,
-            warmupMinutes: result.warmupMinutes,
-            processedMinutes: result.processedMinutes,
-          });
-          await db
+          const completed = await db.transaction().execute(async (tx) => {
+            const current = await tx.selectFrom("replay_runs").select("status").where("id", "=", run.id).forUpdate().executeTakeFirstOrThrow();
+            const cancelled = current.status === "cancel_requested";
+            if (!cancelled) {
+              await lockReplayCache(tx);
+              if (await cacheGeneration(tx) === generation) await cacheStore(tx, cacheQuery, result);
+            }
+          return tx
             .updateTable("replay_runs")
             .set({
-              status: "done",
+              status: cancelled ? "cancelled" : "done",
               setups: toJsonArray(result.setups),
               warmup_minutes: result.warmupMinutes,
               processed_minutes: result.processedMinutes,
               updated_at: new Date(),
             })
             .where("id", "=", run.id)
-            .execute();
+            .returningAll().executeTakeFirstOrThrow();
+          });
           runs.push({
             id: run.id,
             exchange: run.exchange_code,
             category: run.category,
             symbol: run.symbol,
-            status: "done",
+            status: completed.status,
             cacheHit: false,
             setupCount: result.setups.length,
             warmupMinutes: result.warmupMinutes,
@@ -240,7 +302,7 @@ export function registerPlatformV1Routes(
           await db
             .updateTable("replay_runs")
             .set({
-              status: "failed",
+              status: sql<string>`case when status = 'cancel_requested' then 'cancelled' else 'failed' end`,
               error: error instanceof Error ? error.message : String(error),
               updated_at: new Date(),
             })
@@ -264,6 +326,24 @@ export function registerPlatformV1Routes(
     },
   );
 
+  app.post("/v1/replay-runs/:id/cancel", {
+    preHandler: [requireApiKey],
+    schema: { params: Type.Object({ id: Type.Integer({ minimum: 1 }) }) },
+  }, async (request, reply) => {
+    const run = await cancelReplayRun(db, (request.params as { id: number }).id);
+    if (!run) return reply.code(404).send({ error: "run not found" });
+    return reply.send({ run: replayRunDto(run) });
+  });
+
+  app.get("/v1/settings/replay", { preHandler: [requireApiKey] }, async () => ({ paused: (await getSetting(db, "replay")).paused === true }));
+  app.put("/v1/settings/replay", {
+    preHandler: [requireApiKey], schema: { body: Type.Object({ paused: Type.Boolean() }) },
+  }, async (request) => {
+    const body = request.body as { paused: boolean };
+    await setSetting(db, "replay", body);
+    return body;
+  });
+
   app.get(
     "/v1/replay-runs",
     {
@@ -273,7 +353,9 @@ export function registerPlatformV1Routes(
     async (_request, reply) => {
       const rows = await db
         .selectFrom("replay_runs")
-        .selectAll()
+        .select(["id", "exchange_code", "category", "symbol", "status", "cache_hit", "warmup_minutes",
+          "processed_minutes", "error", "algorithm_id", "algorithm_version", "from_ts", "to_ts", "created_at"])
+        .select(sql<number>`coalesce(jsonb_array_length(setups), 0)`.as("setup_count"))
         .orderBy("id", "desc")
         .limit(200)
         .execute();
@@ -285,10 +367,15 @@ export function registerPlatformV1Routes(
           symbol: row.symbol,
           status: row.status,
           cacheHit: row.cache_hit,
-          setupCount: Array.isArray(row.setups) ? row.setups.length : 0,
+          setupCount: row.setup_count,
           warmupMinutes: row.warmup_minutes,
           processedMinutes: row.processed_minutes,
           error: row.error,
+          algorithmId: row.algorithm_id,
+          algorithmVersion: row.algorithm_version,
+          fromUnix: Math.floor(row.from_ts.getTime() / 1000),
+          toUnix: Math.floor(row.to_ts.getTime() / 1000),
+          createdAt: row.created_at.toISOString(),
         })),
       });
     },
@@ -300,25 +387,29 @@ export function registerPlatformV1Routes(
       preHandler: [requireApiKey],
       schema: {
         params: Type.Object({ id: Type.Integer() }),
+        querystring: Type.Object({
+          offset: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER - 500, default: 0 })),
+          limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, default: 100 })),
+        }),
         response: {
-          200: Type.Object({ run: RunDto, setups: Type.Array(SetupDto) }),
+          200: Type.Object({ run: RunDto, setups: Type.Array(SetupDto), offset: Type.Integer(), limit: Type.Integer(), total: Type.Integer() }),
           404: ErrorEnvelope,
         },
       },
     },
     async (request, reply) => {
       const { id } = request.params as { id: number };
-      const row = await db
-        .selectFrom("replay_runs")
-        .where("id", "=", id)
-        .selectAll()
-        .executeTakeFirst();
+      const { offset = 0, limit = 100 } = request.query as { offset?: number; limit?: number };
+      const row = await replayResultPage(db, id, offset, limit);
       if (row === undefined) {
         await reply.code(404).send({ error: "run not found" });
         return;
       }
       const setups = Array.isArray(row.setups) ? row.setups : [];
       await reply.send({
+        offset,
+        limit,
+        total: row.setup_count,
         run: {
           id: row.id,
           exchange: row.exchange_code,
@@ -326,10 +417,16 @@ export function registerPlatformV1Routes(
           symbol: row.symbol,
           status: row.status,
           cacheHit: row.cache_hit,
-          setupCount: setups.length,
+          setupCount: row.setup_count,
           warmupMinutes: row.warmup_minutes,
           processedMinutes: row.processed_minutes,
           error: row.error,
+          algorithmId: row.algorithm_id,
+          algorithmVersion: row.algorithm_version,
+          fromUnix: Math.floor(row.from_ts.getTime() / 1000),
+          toUnix: Math.floor(row.to_ts.getTime() / 1000),
+          createdAt: row.created_at.toISOString(),
+          params: row.params,
         },
         setups: setups.map((setup: SpikeSetup) => ({
           exchange: row.exchange_code,
@@ -337,6 +434,8 @@ export function registerPlatformV1Routes(
           symbol: row.symbol,
           algorithmId: setup.algorithmId,
           algorithmVersion: setup.algorithmVersion,
+          params: setup.params,
+          details: setup.details ?? null,
           openTimeUnix: setup.openTimeUnix,
           closeTimeUnix: setup.closeTimeUnix,
           closePrice: setup.closePrice,
@@ -344,6 +443,37 @@ export function registerPlatformV1Routes(
       });
     },
   );
+
+  app.get("/v1/replay-runs/:id/export.csv", {
+    preHandler: [requireApiKey],
+    schema: { params: Type.Object({ id: Type.Integer({ minimum: 1 }) }) },
+  }, async (request, reply) => {
+    const { id } = request.params as { id: number };
+    const first = await replayResultPage(db, id, 0, 500);
+    if (!first) return reply.code(404).send({ error: "run not found" });
+    // Freeze the initial count: an active run can append results during export.
+    const total = first.setup_count;
+    async function* chunks() {
+      yield "signal,exchange,category,symbol,algorithmId,algorithmVersion,openTimeUnix,closeTimeUnix,closePrice,growthPct,volumeLongRatio,volumeShortRatio,overLong,overShort,missingMinutes,params\r\n";
+      let page = first;
+      for (let offset = 0; offset < total; offset += 500) {
+        if (offset > 0) page = await replayResultPage(db, id, offset, Math.min(500, total - offset));
+        if (!page) throw new Error("saved replay disappeared during export");
+        for (const setup of page.setups) {
+          const details = setup.details;
+          yield ["WATCH", first!.exchange_code, first!.category, first!.symbol,
+            setup.algorithmId ?? first!.algorithm_id, setup.algorithmVersion ?? first!.algorithm_version,
+            setup.openTimeUnix, setup.closeTimeUnix, setup.closePrice,
+            details?.growthPct, details?.volumeLongRatio, details?.volumeShortRatio,
+            details?.overLong, details?.overShort, details?.missingMinutes,
+            JSON.stringify(setup.params ?? first!.params)].map(csvCell).join(",") + "\r\n";
+        }
+      }
+    }
+    return reply.type("text/csv; charset=utf-8")
+      .header("content-disposition", `attachment; filename="replay-${id}.csv"`)
+      .send(Readable.from(chunks(), { objectMode: false, highWaterMark: 64 * 1024 }));
+  });
 
   app.get(
     "/v1/setups",
@@ -368,6 +498,8 @@ export function registerPlatformV1Routes(
           algorithmId: row.algorithm_id,
           algorithmVersion: row.algorithm_version,
           openTimeUnix: Math.floor(row.open_time.getTime() / 1000),
+          params: row.params,
+          details: row.details ?? null,
           closeTimeUnix: Math.floor(row.close_time.getTime() / 1000),
           closePrice: row.close_price,
         })),

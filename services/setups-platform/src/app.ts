@@ -3,7 +3,7 @@ import swagger from "@fastify/swagger";
 import { Type, type Static } from "@sinclair/typebox";
 import { sql, type Kysely } from "kysely";
 import type { SignalsDB } from "./db/schema.js";
-import { createApiKeyGuard } from "./auth.js";
+import { createSessionAuth } from "./auth.js";
 import { registerPlatformV1Routes } from "./routes/v1.js";
 
 export interface ReadinessCheck {
@@ -49,6 +49,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   const app = Fastify({
     logger: {
       level: process.env.LOG_LEVEL ?? "info",
+      redact: ["req.headers.cookie", "req.headers.x-api-key", "req.body.apiKey", "res.headers.set-cookie"],
     },
   });
   if (options.openApiEnabled !== false) {
@@ -107,10 +108,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     },
   );
 
+  const auth = createSessionAuth(options.apiKeys ?? []);
+  auth.register(app);
   if (options.db) {
     registerPlatformV1Routes(app, {
       db: options.db,
-      requireApiKey: createApiKeyGuard(options.apiKeys ?? []),
+      requireApiKey: auth.requireApiKey,
       marketData: options.marketData ?? { url: "", apiKey: "" },
     });
   }

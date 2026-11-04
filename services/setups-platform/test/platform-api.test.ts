@@ -1,5 +1,5 @@
  
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import type { Kysely } from "kysely";
 import { createDb } from "../src/db/db.js";
@@ -9,6 +9,8 @@ import { buildApp } from "../src/app.js";
 import { ArrayCandleSource, type CandleBarDto } from "../src/replay/source.js";
 import { liveScanOnce } from "../src/live/live-scanner.js";
 import { DEFAULT_SPIKE_PARAMS } from "../src/detector/price-volume-spike.js";
+import { startLiveRuntime } from "../src/live/runtime.js";
+import { getSetting, setSetting } from "../src/settings.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const PLATFORM_KEY = "platform-key";
@@ -143,11 +145,57 @@ describe.skipIf(!TEST_DATABASE_URL)("platform api", () => {
     await db.deleteFrom("replay_runs").execute();
     await db.deleteFrom("live_setups").execute();
     await db.deleteFrom("settings").execute();
+    await db.deleteFrom("instrument_lists").execute();
   });
 
   it("requires an api key", async () => {
     const response = await app.inject({ method: "GET", url: "/v1/replay-runs" });
     expect(response.statusCode).toBe(401);
+  });
+
+  it("persists shared algorithm and UI settings and snapshots them in replay", async () => {
+    const headers = { "x-api-key": PLATFORM_KEY };
+    const algorithms = await app.inject({ method: "GET", url: "/v1/algorithms", headers });
+    expect(algorithms.statusCode).toBe(200);
+    const params = { ...DEFAULT_SPIKE_PARAMS, priceGrowthPct: "12.5", volumeMultiplier: "2.5" };
+    const saved = await app.inject({ method: "PUT", url: "/v1/algorithms/price_volume_spike", headers, payload: { params, enabled: false } });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.json<{ params: typeof params }>().params).toEqual(params);
+    const ui = { replay: { symbols: SYMBOL, algorithmId: "price_volume_spike" }, setupsSymbol: SYMBOL };
+    expect((await app.inject({ method: "PUT", url: "/v1/settings/ui", headers, payload: { value: ui } })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/v1/settings/ui", headers })).json()).toEqual({ value: ui });
+    const response = await app.inject({ method: "POST", url: "/v1/replay-runs", headers, payload: {
+      instruments: [{ exchange: "bybit", category: "linear", symbol: SYMBOL }], fromUnix, toUnix, algorithmId: "price_volume_spike",
+    } });
+    expect(response.statusCode).toBe(200);
+    const id = response.json<{ runs: { id: number }[] }>().runs[0]!.id;
+    const detail = (await app.inject({ method: "GET", url: `/v1/replay-runs/${id}`, headers })).json<{ run: { params: typeof params; algorithmId: string } }>();
+    expect(detail.run.params).toEqual(params);
+    expect(detail.run.algorithmId).toBe("price_volume_spike");
+    await setSetting(db, "webpush-vapid", { privateKey: "must-not-export" });
+    const exported = await app.inject({ method: "GET", url: "/v1/export/config.json", headers });
+    expect(exported.statusCode).toBe(200);
+    expect(exported.body).not.toContain("must-not-export");
+    expect(exported.json<{ algorithms: { params: typeof params }[] }>().algorithms[0]!.params).toEqual(params);
+    const reopened = await buildApp({ db, apiKeys: [PLATFORM_KEY], openApiEnabled: false });
+    expect((await reopened.inject({ method: "GET", url: "/v1/settings/ui", headers })).json()).toEqual({ value: ui });
+    await reopened.close();
+  });
+
+  it("rejects unknown algorithms, invalid ranges and unsafe parameter combinations", async () => {
+    const headers = { "x-api-key": PLATFORM_KEY };
+    for (const params of [
+      { ...DEFAULT_SPIKE_PARAMS, baselineShortDays: 31 },
+      { ...DEFAULT_SPIKE_PARAMS, volumeMultiplier: "0" },
+      { ...DEFAULT_SPIKE_PARAMS, maxGapPercent: "101" },
+      { ...DEFAULT_SPIKE_PARAMS, windowMinutes: -1 },
+      { ...DEFAULT_SPIKE_PARAMS, priceGrowthPct: "NaN" },
+    ]) {
+      expect((await app.inject({ method: "PUT", url: "/v1/algorithms/price_volume_spike", headers, payload: { params, enabled: true } })).statusCode).toBe(400);
+    }
+    const payload = { instruments: [{ exchange: "bybit", category: "linear", symbol: SYMBOL }], fromUnix, toUnix };
+    expect((await app.inject({ method: "POST", url: "/v1/replay-runs", headers, payload: { ...payload, algorithmId: "unknown" } })).statusCode).toBe(400);
+    expect((await app.inject({ method: "POST", url: "/v1/replay-runs", headers, payload: { ...payload, toUnix: fromUnix } })).statusCode).toBe(400);
   });
 
   it("computes a replay end to end and reuses the cache on repeat", async () => {
@@ -317,5 +365,47 @@ describe.skipIf(!TEST_DATABASE_URL)("platform api", () => {
     const setups = await db.selectFrom("live_setups").selectAll().execute();
     expect(setups.length).toBeGreaterThanOrEqual(1);
     expect(setups[0]?.params).toEqual(DEFAULT_SPIKE_PARAMS);
+  });
+
+  it("restores live cooldown across consecutive scans and restart", async () => {
+    const params = { ...DEFAULT_SPIKE_PARAMS, baselineLongDays: 1, baselineShortDays: 1, priceGrowthPct: "0", volumeMultiplier: "0.5" };
+    await setSetting(db, "algorithm:price_volume_spike", { params, enabled: true });
+    const data = Array.from({ length: 1450 }, (_, i) => ({ openTimeUnix: T0 + i * 60, close: "100", volume: "100", quoteTurnover: "100" }));
+    const source = new ArrayCandleSource(data);
+    const instruments = [{ exchangeCode: "bybit", category: "linear", symbol: SYMBOL }];
+    const first = await liveScanOnce({ db, source, instruments, nowUnix: T0 + 1440 * 60, maxAgeSeconds: 60 });
+    expect(first.newSetups).toHaveLength(1);
+    const second = await liveScanOnce({ db, source: new ArrayCandleSource(data), instruments, nowUnix: T0 + 1441 * 60, maxAgeSeconds: 60 });
+    expect(second.newSetups).toHaveLength(0);
+    const next = await liveScanOnce({ db, source, instruments, nowUnix: T0 + 1445 * 60, maxAgeSeconds: 60 });
+    expect(next.newSetups).toHaveLength(1);
+    expect(next.newSetups[0]!.openTimeUnix - first.newSetups[0]!.openTimeUnix).toBe(300);
+  });
+
+  it("runtime catches up delayed closed candles without enabling itself or duplicating signals", async () => {
+    const delayedBars = buildBars().slice(0, LONG_MINUTES + 4);
+    const fake = await startFakeMarketData(delayedBars);
+    const runtimeApp = Fastify({ logger: false });
+    const runtime = startLiveRuntime(runtimeApp, db, { url: fake.url, apiKey: "fake" });
+    const time = vi.spyOn(Date, "now").mockReturnValue((T0 + (LONG_MINUTES + 6) * 60) * 1000);
+    try {
+      await runtime.runOnce();
+      expect(await getSetting(db, "live-status")).toEqual({});
+      await setSetting(db, "live", { enabled: true });
+      await runtime.runOnce();
+      expect((await db.selectFrom("live_setups").selectAll().execute())).toHaveLength(0);
+      delayedBars.push(buildBars()[LONG_MINUTES + 4]!);
+      time.mockReturnValue((T0 + (LONG_MINUTES + 7) * 60) * 1000);
+      await runtime.runOnce();
+      expect((await db.selectFrom("live_setups").selectAll().execute())).toHaveLength(1);
+      time.mockReturnValue((T0 + (LONG_MINUTES + 8) * 60) * 1000);
+      await runtime.runOnce();
+      expect((await db.selectFrom("live_setups").selectAll().execute())).toHaveLength(1);
+      expect((await getSetting(db, "live-status")).stale).toBe(1);
+    } finally {
+      time.mockRestore();
+      await runtimeApp.close();
+      await fake.app.close();
+    }
   });
 });

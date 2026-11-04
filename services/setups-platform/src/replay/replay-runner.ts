@@ -19,6 +19,7 @@ export interface ReplayRunOptions {
   fromUnix: number;
   toUnix: number;
   params?: SpikeParams | undefined;
+  lastSetupUnix?: number | undefined;
   /** Warmup start; defaults to fromUnix minus the required history. */
   warmupUnix?: number | undefined;
   cancel?: CancelToken | undefined;
@@ -31,6 +32,7 @@ export interface ReplayRunResult {
   warmupMinutes: number;
   lastProcessedUnix: number | null;
   cancelled: boolean;
+  lastStatus?: "warmup" | "evaluated" | undefined;
 }
 
 /**
@@ -43,7 +45,8 @@ export interface ReplayRunResult {
 export async function replayRun(options: ReplayRunOptions): Promise<ReplayRunResult> {
   const params = options.params ?? DEFAULT_SPIKE_PARAMS;
   const requiredMinutes = params.baselineLongDays * 1440;
-  const detector = new PriceVolumeSpikeDetector(params);
+  const detector = new PriceVolumeSpikeDetector(params, options.lastSetupUnix);
+  let lastStatus: "warmup" | "evaluated" | undefined;
   const warmupUnix =
     options.warmupUnix ?? options.fromUnix - requiredMinutes * MINUTE_SECONDS;
 
@@ -81,6 +84,7 @@ export async function replayRun(options: ReplayRunOptions): Promise<ReplayRunRes
         close: bar.close,
         quoteTurnover: bar.quoteTurnover,
       });
+      lastStatus = result.status;
       if (result.status === "warmup") {
         warmupMinutes += 1;
       } else {
@@ -104,5 +108,6 @@ export async function replayRun(options: ReplayRunOptions): Promise<ReplayRunRes
     warmupMinutes,
     lastProcessedUnix,
     cancelled: options.cancel?.cancelled === true,
+    lastStatus,
   };
 }

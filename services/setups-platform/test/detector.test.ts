@@ -64,6 +64,17 @@ function collectSetups(bars: DetectorBar[], params = DEFAULT_SPIKE_PARAMS) {
 }
 
 describe("PriceVolumeSpikeDetector", () => {
+  it("uses exact fractional thresholds without decimal-scale inflation", () => {
+    const params = { ...DEFAULT_SPIKE_PARAMS, priceGrowthPct: "12.5", volumeMultiplier: "2.5" };
+    expect(collectSetups(series([...flat(LONG_MINUTES - 5, "100", "100"), ...flat(5, "112.5", "251")]), params)).toHaveLength(1);
+    expect(collectSetups(series([...flat(LONG_MINUTES - 5, "100", "100"), ...flat(5, "112.49", "251")]), params)).toHaveLength(0);
+  });
+
+  it("keeps equal baseline rolling sums accurate after eviction", () => {
+    const params = { ...DEFAULT_SPIKE_PARAMS, baselineLongDays: 1, baselineShortDays: 1 };
+    const bars = series([...flat(4000, "100", "100"), ...flat(5, "112", "310")]);
+    expect(collectSetups(bars, params)).toHaveLength(1);
+  });
   it("emits a setup on exactly 12% growth with strictly higher volume", () => {
     const bars = series([
       ...flat(LONG_MINUTES - 5, "100", "100"),
@@ -217,8 +228,8 @@ describe("PriceVolumeSpikeDetector gap tolerance", () => {
     for (const bar of bars) {
       lastResult = detector.push(bar);
     }
-    // Status will be evaluated (window full) but no setup because recent gap
-    expect(lastResult?.status).toBe("evaluated");
+    // A full window is insufficient while recent candles are missing.
+    expect(lastResult?.status).toBe("warmup");
     expect(lastResult?.setup).toBeUndefined();
   });
 

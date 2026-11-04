@@ -4,6 +4,7 @@ import type { Kysely } from "kysely";
 import type { MarketDataDB } from "../db/schema.js";
 import { readCandles } from "../storage/candles.js";
 import { getCoverage } from "../storage/coverage.js";
+import { registerManagementRoutes } from "./management.js";
 
 export type ApiKeyGuard = (
   request: FastifyRequest,
@@ -68,6 +69,7 @@ export function registerV1Routes(
   options: V1RouteOptions,
 ): void {
   const { db, requireApiKey } = options;
+  registerManagementRoutes(app, options);
 
   app.get(
     "/v1/instruments",

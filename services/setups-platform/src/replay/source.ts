@@ -86,6 +86,7 @@ export class ApiCandleSource implements CandleSource {
     }
     const response = await fetch(`${this.baseUrl}/v1/candles?${params.toString()}`, {
       headers: { "x-api-key": this.apiKey },
+      signal: AbortSignal.timeout(15000),
     });
     if (!response.ok) {
       throw new Error(

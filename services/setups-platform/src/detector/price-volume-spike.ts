@@ -1,6 +1,7 @@
 import {
   addDecimals,
   compareScaled,
+  decimalRatio,
   mulByBigInt,
   parseDecimal,
   subDecimals,
@@ -9,7 +10,7 @@ import {
 } from "./decimal.js";
 
 export const SPIKE_ALGORITHM_ID = "price_volume_spike";
-export const SPIKE_ALGORITHM_VERSION = "1.1.0";
+export const SPIKE_ALGORITHM_VERSION = "1.1.1";
 
 export interface SpikeParams {
   priceGrowthPct: string;
@@ -52,6 +53,14 @@ export interface SpikeSetup {
   closeTimeUnix: number;
   closePrice: string;
   params: SpikeParams;
+  details?: {
+    growthPct: string | null;
+    volumeLongRatio: string | null;
+    volumeShortRatio: string | null;
+    overLong: boolean;
+    overShort: boolean;
+    missingMinutes: number;
+  };
 }
 
 export interface PushResult {
@@ -81,9 +90,10 @@ export class PriceVolumeSpikeDetector {
   private readonly shortMinutes: number;
   private readonly windowMinutes: number;
   private readonly cooldownSeconds: number;
-  private readonly growthDenominator = 100n;
+  private readonly growthDenominator: bigint;
   private readonly growthNumerator: bigint;
   private readonly multiplier: bigint;
+  private readonly multiplierDenominator: bigint;
   private readonly maxConsecutiveGapMinutes: number;
   private readonly requiredRecentMinutes: number;
   private readonly maxMissingCount: number;
@@ -98,7 +108,8 @@ export class PriceVolumeSpikeDetector {
   private prevTime: number | null = null;
   private lastSetupTime: number | null = null;
 
-  constructor(public readonly params: SpikeParams = DEFAULT_SPIKE_PARAMS) {
+  constructor(public readonly params: SpikeParams = DEFAULT_SPIKE_PARAMS, lastSetupTime: number | null = null) {
+    this.lastSetupTime = lastSetupTime;
     this.requiredMinutes = params.baselineLongDays * 1440;
     this.shortMinutes = params.baselineShortDays * 1440;
     this.windowMinutes = params.windowMinutes;
@@ -108,18 +119,16 @@ export class PriceVolumeSpikeDetector {
 
     // maxMissingCount = floor(requiredMinutes * maxGapPercent / 100)
     const gapPercent = parseDecimal(params.maxGapPercent);
-    const gapPercentNumber =
-      Number(gapPercent.int) / 10 ** gapPercent.scale;
-    this.maxMissingCount = Math.floor(
-      this.requiredMinutes * gapPercentNumber / 100,
-    );
+    this.maxMissingCount = Number(BigInt(this.requiredMinutes) * gapPercent.int / (100n * 10n ** BigInt(gapPercent.scale)));
 
     const pct = parseDecimal(params.priceGrowthPct);
     const hundred = { int: 100n, scale: 0 };
     const growth = addDecimals(hundred, pct);
-    this.growthNumerator = growth.int * 10n ** BigInt(growth.scale);
+    this.growthNumerator = growth.int;
+    this.growthDenominator = 100n * 10n ** BigInt(growth.scale);
     const multiplier = parseDecimal(params.volumeMultiplier);
-    this.multiplier = multiplier.int * 10n ** BigInt(multiplier.scale);
+    this.multiplier = multiplier.int;
+    this.multiplierDenominator = 10n ** BigInt(multiplier.scale);
   }
 
   push(bar: DetectorBar): PushResult {
@@ -155,6 +164,9 @@ export class PriceVolumeSpikeDetector {
     if (this.volumes.length < this.requiredMinutes) {
       return { status: "warmup", continuousMinutes: this.volumes.length };
     }
+    if (this.volumes.slice(-this.requiredRecentMinutes || this.volumes.length).some((volume) => volume === null)) {
+      return { status: "warmup", continuousMinutes: this.volumes.length };
+    }
 
     const setup = this.evaluate(bar);
     return { status: "evaluated", continuousMinutes: this.volumes.length, setup };
@@ -175,16 +187,6 @@ export class PriceVolumeSpikeDetector {
     this.sumShort = addDecimals(this.sumShort, vol);
     this.sumLong = addDecimals(this.sumLong, vol);
 
-    // Evict from long window (shift from the front)
-    if (this.volumes.length > this.requiredMinutes) {
-      const leaving = this.volumes.shift();
-      if (leaving !== undefined) {
-        if (leaving === null) {
-          this.missingInWindow -= 1;
-        }
-        this.sumLong = subDecimals(this.sumLong, leaving ?? ZERO_DECIMAL);
-      }
-    }
     // Evict from short window (position from the end)
     if (this.volumes.length > this.shortMinutes) {
       const leaving = this.volumes[this.volumes.length - 1 - this.shortMinutes];
@@ -198,6 +200,13 @@ export class PriceVolumeSpikeDetector {
       if (leaving !== undefined) {
         this.sumWindow = subDecimals(this.sumWindow, leaving ?? ZERO_DECIMAL);
       }
+    }
+
+    // Retain the outgoing position until all rolling sums have consumed it.
+    if (this.volumes.length > this.requiredMinutes) {
+      const leaving = this.volumes.shift();
+      if (leaving === null) this.missingInWindow -= 1;
+      this.sumLong = subDecimals(this.sumLong, leaving ?? ZERO_DECIMAL);
     }
 
     this.closes.push({ time: entry.time, close: entry.close });
@@ -251,14 +260,14 @@ export class PriceVolumeSpikeDetector {
     const overLong =
       compareScaled(
         this.sumWindow,
-        longFactor,
+        longFactor * this.multiplierDenominator,
         mulByBigInt(this.sumLong, this.multiplier * windowFactor),
         1n,
       ) > 0;
     const overShort =
       compareScaled(
         this.sumWindow,
-        shortFactor,
+        shortFactor * this.multiplierDenominator,
         mulByBigInt(this.sumShort, this.multiplier * windowFactor),
         1n,
       ) > 0;
@@ -281,6 +290,12 @@ export class PriceVolumeSpikeDetector {
       closeTimeUnix: bar.openTimeUnix + MINUTE_SECONDS,
       closePrice: bar.close,
       params: this.params,
+      details: {
+        growthPct: decimalRatio(mulByBigInt(subDecimals(current.close, previous.close), 100n), previous.close),
+        volumeLongRatio: decimalRatio(mulByBigInt(this.sumWindow, longFactor), mulByBigInt(this.sumLong, windowFactor)),
+        volumeShortRatio: decimalRatio(mulByBigInt(this.sumWindow, shortFactor), mulByBigInt(this.sumShort, windowFactor)),
+        overLong, overShort, missingMinutes: this.missingInWindow,
+      },
     };
   }
 
@@ -291,6 +306,5 @@ export class PriceVolumeSpikeDetector {
     this.sumShort = ZERO_DECIMAL;
     this.sumLong = ZERO_DECIMAL;
     this.closes = [];
-    this.lastSetupTime = null;
   }
 }

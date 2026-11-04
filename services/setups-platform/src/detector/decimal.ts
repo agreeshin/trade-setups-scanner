@@ -51,6 +51,16 @@ export function mulByBigInt(a: Decimal, factor: bigint): Decimal {
   return { int: a.int * factor, scale: a.scale };
 }
 
+/** Display-only ratio, truncated to four decimals; decisions use compareScaled. */
+export function decimalRatio(a: Decimal, b: Decimal): string | null {
+  const [ai, bi] = align(a, b);
+  if (bi === 0n) return null;
+  const scaled = ai * 10000n / bi;
+  const negative = scaled < 0n;
+  const magnitude = negative ? -scaled : scaled;
+  return `${negative ? "-" : ""}${magnitude / 10000n}.${String(magnitude % 10000n).padStart(4, "0")}`;
+}
+
 /**
  * Compares `a * aMul` versus `b * bMul` where multipliers are positive
  * integers. Returns -1, 0 or 1. Keeps full precision by scaling to a common

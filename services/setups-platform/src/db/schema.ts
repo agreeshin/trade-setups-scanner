@@ -54,6 +54,7 @@ export interface LiveSetupsTable {
   open_time: Date;
   close_time: Date;
   close_price: string;
+  details: Generated<NonNullable<SpikeSetup["details"]> | null>;
   notified_at: Date | null;
   created_at: Generated<Date>;
 }

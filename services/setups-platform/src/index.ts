@@ -3,6 +3,9 @@ import { buildApp } from "./app.js";
 import { createDb } from "./db/db.js";
 import { createMigrator } from "./db/migrator.js";
 import { loadConfig } from "./config.js";
+import { startLiveRuntime } from "./live/runtime.js";
+import { setSetting } from "./settings.js";
+import { startReplayJobs } from "./replay/jobs.js";
 
 const config = loadConfig();
 const db = createDb(config.databaseUrl);
@@ -19,6 +22,12 @@ const app = await buildApp({
   apiKeys: config.apiKeys,
   marketData: { url: config.marketDataUrl, apiKey: config.marketDataApiKey },
 });
+await setSetting(db, "live-status", { running: false, lastScanAt: null, lastError: null });
+startLiveRuntime(app, db, { url: config.marketDataUrl, apiKey: config.marketDataApiKey });
+const replayJobs = await startReplayJobs(db, { url: config.marketDataUrl, apiKey: config.marketDataApiKey }, {
+  onError: () => app.log.error("replay job failed; inspect job status"),
+});
+app.addHook("onClose", () => replayJobs.stop());
 
 async function shutdown(): Promise<void> {
   await app.close();

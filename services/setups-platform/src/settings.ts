@@ -4,6 +4,15 @@ import type { SignalsDB } from "./db/schema.js";
 const NOTIFICATION_MAX_AGE_KEY = "notifications";
 export const DEFAULT_NOTIFICATION_MAX_AGE_SECONDS = 60;
 
+export async function getSetting(db: Kysely<SignalsDB>, key: string): Promise<Record<string, unknown>> {
+  const row = await db.selectFrom("settings").where("key", "=", key).select("value").executeTakeFirst();
+  return row?.value ?? {};
+}
+
+export async function setSetting(db: Kysely<SignalsDB>, key: string, value: Record<string, unknown>): Promise<void> {
+  await db.insertInto("settings").values({ key, value }).onConflict((oc) => oc.column("key").doUpdateSet({ value, updated_at: new Date() })).execute();
+}
+
 export async function getNotificationMaxAgeSeconds(
   db: Kysely<SignalsDB>,
 ): Promise<number> {

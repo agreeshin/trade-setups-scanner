@@ -1,4 +1,5 @@
 import { sql, type Kysely } from "kysely";
+import { randomUUID } from "node:crypto";
 import type { SignalsDB } from "../db/schema.js";
 import type { SpikeParams, SpikeSetup } from "../detector/price-volume-spike.js";
 
@@ -6,6 +7,22 @@ export interface CacheIdentity {
   exchangeCode: string;
   category: string;
   symbol: string;
+}
+
+// Clears and guarded publications serialize on the same transaction lock.
+export async function lockReplayCache(db: Kysely<SignalsDB>): Promise<void> {
+  await sql`select pg_advisory_xact_lock(72423411)`.execute(db);
+}
+
+export async function cacheGeneration(db: Kysely<SignalsDB>): Promise<string> {
+  const row = await db.selectFrom("settings").select("value").where("key", "=", "replay-cache-generation").executeTakeFirst();
+  return typeof row?.value.generation === "string" ? row.value.generation : "initial";
+}
+
+async function advanceGeneration(db: Kysely<SignalsDB>): Promise<void> {
+  const value = { generation: randomUUID() };
+  await db.insertInto("settings").values({ key: "replay-cache-generation", value })
+    .onConflict((oc) => oc.column("key").doUpdateSet({ value, updated_at: new Date() })).execute();
 }
 
 export interface CacheQuery extends CacheIdentity {
@@ -129,7 +146,10 @@ export async function cacheClearByInstrument(
   db: Kysely<SignalsDB>,
   identity: CacheIdentity,
 ): Promise<number> {
-  const result = await db
+  return db.transaction().execute(async (tx) => {
+  await lockReplayCache(tx);
+  await advanceGeneration(tx);
+  const result = await tx
     .deleteFrom("replay_cache")
     .where((eb) =>
       eb.and([
@@ -140,11 +160,16 @@ export async function cacheClearByInstrument(
     )
     .executeTakeFirst();
   return Number(result?.numDeletedRows ?? 0n);
+  });
 }
 
 export async function cacheClearAll(db: Kysely<SignalsDB>): Promise<number> {
-  const result = await db.deleteFrom("replay_cache").executeTakeFirst();
-  return Number(result?.numDeletedRows ?? 0n);
+  return db.transaction().execute(async (tx) => {
+    await lockReplayCache(tx);
+    await advanceGeneration(tx);
+    const result = await tx.deleteFrom("replay_cache").executeTakeFirst();
+    return Number(result?.numDeletedRows ?? 0n);
+  });
 }
 
 export interface CacheStats {

@@ -12,6 +12,7 @@ export async function fetchCatalog(
 ): Promise<CatalogInstrument[]> {
   const response = await fetch(`${marketDataUrl}/v1/instruments`, {
     headers: { "x-api-key": apiKey },
+    signal: AbortSignal.timeout(10000),
   });
   if (!response.ok) {
     throw new Error(
