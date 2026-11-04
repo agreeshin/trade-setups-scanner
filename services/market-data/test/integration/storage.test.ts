@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access --
-   kysely/migration types resolve in tsc but not in the ESLint project service. */
+ 
 import { sql, type Kysely } from "kysely";
 import { createDb } from "../../src/db/db.js";
 import { createMigrator } from "../../src/db/migrator.js";
@@ -36,7 +35,7 @@ describe.skipIf(!TEST_DATABASE_URL)("market data storage", () => {
     const migrator = createMigrator(db);
     const result = await migrator.migrateToLatest();
     if (result.error) {
-      throw result.error;
+      throw new Error(`migration failed: ${JSON.stringify(result.error)}`);
     }
   });
 

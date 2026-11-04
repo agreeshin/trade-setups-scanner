@@ -66,7 +66,7 @@ export class BybitClient {
     fromMs: number,
     toMs: number,
   ): Promise<KlineBar[]> {
-    const collected = new Map<number, KlineBar>();
+    const collected = new Map<number, RawPageBar>();
     const windowMinutes = MAX_LIMIT - 1;
     let cursor = fromMs;
 

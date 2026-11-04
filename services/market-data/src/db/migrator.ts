@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { MarketDataDB } from "./schema.js";
 
-export function createMigrator(db: Kysely<MarketDataDB>): Migrator<MarketDataDB> {
+export function createMigrator(db: Kysely<MarketDataDB>): Migrator {
   return new Migrator({
     db,
     provider: new FileMigrationProvider({

@@ -1,6 +1,6 @@
 export interface AppConfig {
   databaseUrl: string;
-  testDatabaseUrl?: string;
+  testDatabaseUrl?: string | undefined;
   apiKeys: string[];
   port: number;
   host: string;

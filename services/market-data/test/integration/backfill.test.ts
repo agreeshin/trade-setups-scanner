@@ -1,5 +1,4 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access --
-   kysely/migration types resolve in tsc but not in the ESLint project service. */
+ 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { sql, type Kysely } from "kysely";
 import { createDb } from "../../src/db/db.js";
@@ -72,7 +71,7 @@ describe.skipIf(!TEST_DATABASE_URL)("backfill jobs", () => {
     const migrator = createMigrator(db);
     const migrationResult = await migrator.migrateToLatest();
     if (migrationResult.error) {
-      throw migrationResult.error;
+      throw new Error(`migration failed: ${JSON.stringify(migrationResult.error)}`);
     }
   });
 

@@ -1,6 +1,5 @@
 import "dotenv/config";
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access --
-   kysely/migration types resolve in tsc but not in the ESLint project service. */
+ 
 import { createDb } from "./db.js";
 import { createMigrator } from "./migrator.js";
 import { loadConfig } from "../config.js";
@@ -8,6 +7,10 @@ import { loadConfig } from "../config.js";
 const config = loadConfig();
 const useTestDatabase = process.argv.includes("--test");
 const databaseUrl = useTestDatabase ? config.testDatabaseUrl : config.databaseUrl;
+if (!databaseUrl) {
+  console.error("TEST_DATABASE_URL is required when --test is used");
+  process.exit(1);
+}
 
 const db = createDb(databaseUrl);
 const migrator = createMigrator(db);

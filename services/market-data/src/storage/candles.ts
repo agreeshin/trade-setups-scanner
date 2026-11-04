@@ -51,6 +51,7 @@ function candleValues(instrumentId: number, candle: CandleInsert) {
     close: candle.close,
     volume: candle.volume,
     quote_turnover: candle.quoteTurnover,
+    source: "bybit",
   };
 }
 
@@ -174,8 +175,8 @@ export interface ReadCandlesQuery {
   instrumentId: number;
   from: Date;
   to: Date;
-  limit?: number;
-  afterUnix?: number;
+  limit?: number | undefined;
+  afterUnix?: number | undefined;
 }
 
 export interface ReadCandlesPage {

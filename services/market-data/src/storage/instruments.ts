@@ -32,6 +32,9 @@ export async function ensureInstrument(
       exchange_id: exchangeId,
       category: identity.category,
       symbol: identity.symbol,
+      status: "active",
+      listed_at: null,
+      delisted_at: null,
     })
     .onConflict((oc) =>
       oc
