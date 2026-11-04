@@ -10,6 +10,7 @@ import { registerControls } from "./controls.js";
 import { ApiCandleSource } from "../replay/source.js";
 import { replayRun } from "../replay/replay-runner.js";
 import { cancelReplayRun, enqueueReplayRuns, replayRunDto } from "../replay/jobs.js";
+import { saveQualityPage, type QualityInterval } from "../replay/quality.js";
 import {
   cacheClearAll,
   cacheClearByInstrument,
@@ -71,6 +72,9 @@ const SetupDto = Type.Object({
 });
 
 const RunDto = Type.Object({
+  quality: Type.Optional(Type.Union([Type.Record(Type.String(), Type.Unknown()), Type.Null()])),
+  qualitySourceRunId: Type.Optional(Type.Union([Type.Integer(), Type.Null()])),
+  qualityComputedAt: Type.Optional(Type.Union([Type.String(), Type.Null()])),
   id: Type.Integer(),
   exchange: Type.String(),
   category: Type.String(),
@@ -98,7 +102,7 @@ function replayResultPage(db: Kysely<SignalsDB>, id: number, offset: number, lim
     : sql<SpikeSetup[]>`jsonb_path_query_array(coalesce(setups, '[]'::jsonb), ${path}::jsonpath)`;
   return db.selectFrom("replay_runs")
     .select(["id", "exchange_code", "category", "symbol", "status", "cache_hit", "warmup_minutes",
-      "processed_minutes", "error", "algorithm_id", "algorithm_version", "from_ts", "to_ts", "created_at", "params"])
+      "processed_minutes", "error", "algorithm_id", "algorithm_version", "from_ts", "to_ts", "created_at", "params", "quality", "quality_source_run_id", "quality_computed_at"])
     .select(sql<number>`coalesce(jsonb_array_length(setups), 0)`.as("setup_count"))
     .select(page.as("setups"))
     .where("id", "=", id).executeTakeFirst();
@@ -239,6 +243,9 @@ export function registerPlatformV1Routes(
             .set({
               status: current.status === "cancel_requested" ? "cancelled" : "done",
               cache_hit: true,
+              quality: cached.quality,
+              quality_source_run_id: cached.qualitySourceRunId,
+              quality_computed_at: new Date(cached.computedAt),
               setups: toJsonArray(cached.setups),
               warmup_minutes: cached.warmupMinutes,
               processed_minutes: cached.processedMinutes,
@@ -257,10 +264,24 @@ export function registerPlatformV1Routes(
             marketData.apiKey,
             catalogEntry.id,
           );
+          const cancel = { cancelled: false };
+          let finalIntervals: QualityInterval[] = [];
           const result = await replayRun({
+            cancel,
+            onQualityPage: async (quality, intervals, checkpoint) => {
+              if (quality.state !== "in_progress") { finalIntervals = intervals; return; }
+              await db.transaction().execute(async (tx) => {
+                await saveQualityPage(tx, run.id, quality, intervals);
+                await tx.updateTable("replay_runs").set({
+                  setups: sql<SpikeSetup[]>`coalesce(setups, '[]'::jsonb) || ${JSON.stringify(checkpoint.setups)}::jsonb`,
+                  warmup_minutes: checkpoint.warmupMinutes, processed_minutes: checkpoint.processedMinutes,
+                  updated_at: new Date(),
+                }).where("id", "=", run.id).execute();
+              });
+            },
             source: { async read(query) {
               const current = await db.selectFrom("replay_runs").select("status").where("id", "=", run.id).executeTakeFirstOrThrow();
-              if (current.status === "cancel_requested") return { bars: [], nextCursorUnix: null };
+              if (current.status === "cancel_requested") { cancel.cancelled = true; return { bars: [], nextCursorUnix: null }; }
               return source.read(query);
             } },
             fromUnix: body.fromUnix,
@@ -270,9 +291,11 @@ export function registerPlatformV1Routes(
           const completed = await db.transaction().execute(async (tx) => {
             const current = await tx.selectFrom("replay_runs").select("status").where("id", "=", run.id).forUpdate().executeTakeFirstOrThrow();
             const cancelled = current.status === "cancel_requested";
+            const computedAt = new Date();
             if (!cancelled) {
+              await saveQualityPage(tx, run.id, result.quality, finalIntervals);
               await lockReplayCache(tx);
-              if (await cacheGeneration(tx) === generation) await cacheStore(tx, cacheQuery, result);
+              if (await cacheGeneration(tx) === generation) await cacheStore(tx, cacheQuery, { ...result, qualitySourceRunId: run.id, computedAt });
             }
           return tx
             .updateTable("replay_runs")
@@ -281,25 +304,15 @@ export function registerPlatformV1Routes(
               setups: toJsonArray(result.setups),
               warmup_minutes: result.warmupMinutes,
               processed_minutes: result.processedMinutes,
+              quality_computed_at: cancelled ? null : computedAt,
               updated_at: new Date(),
             })
             .where("id", "=", run.id)
             .returningAll().executeTakeFirstOrThrow();
           });
-          runs.push({
-            id: run.id,
-            exchange: run.exchange_code,
-            category: run.category,
-            symbol: run.symbol,
-            status: completed.status,
-            cacheHit: false,
-            setupCount: result.setups.length,
-            warmupMinutes: result.warmupMinutes,
-            processedMinutes: result.processedMinutes,
-            error: null,
-          });
+          runs.push(replayRunDto(completed));
         } catch (error) {
-          await db
+          const failed = await db
             .updateTable("replay_runs")
             .set({
               status: sql<string>`case when status = 'cancel_requested' then 'cancelled' else 'failed' end`,
@@ -307,19 +320,8 @@ export function registerPlatformV1Routes(
               updated_at: new Date(),
             })
             .where("id", "=", run.id)
-            .execute();
-          runs.push({
-            id: run.id,
-            exchange: run.exchange_code,
-            category: run.category,
-            symbol: run.symbol,
-            status: "failed",
-            cacheHit: false,
-            setupCount: 0,
-            warmupMinutes: null,
-            processedMinutes: null,
-            error: error instanceof Error ? error.message : String(error),
-          });
+            .returningAll().executeTakeFirstOrThrow();
+          runs.push(replayRunDto(failed));
         }
       }
       await reply.send({ runs });
@@ -354,13 +356,15 @@ export function registerPlatformV1Routes(
       const rows = await db
         .selectFrom("replay_runs")
         .select(["id", "exchange_code", "category", "symbol", "status", "cache_hit", "warmup_minutes",
-          "processed_minutes", "error", "algorithm_id", "algorithm_version", "from_ts", "to_ts", "created_at"])
+          "processed_minutes", "error", "algorithm_id", "algorithm_version", "from_ts", "to_ts", "created_at", "quality", "quality_source_run_id", "quality_computed_at"])
         .select(sql<number>`coalesce(jsonb_array_length(setups), 0)`.as("setup_count"))
         .orderBy("id", "desc")
         .limit(200)
         .execute();
       await reply.send({
         runs: rows.map((row) => ({
+          quality: row.quality, qualitySourceRunId: row.quality_source_run_id,
+          qualityComputedAt: row.quality_computed_at?.toISOString() ?? null,
           id: row.id,
           exchange: row.exchange_code,
           category: row.category,
@@ -411,6 +415,8 @@ export function registerPlatformV1Routes(
         limit,
         total: row.setup_count,
         run: {
+          quality: row.quality, qualitySourceRunId: row.quality_source_run_id,
+          qualityComputedAt: row.quality_computed_at?.toISOString() ?? null,
           id: row.id,
           exchange: row.exchange_code,
           category: row.category,
@@ -443,6 +449,31 @@ export function registerPlatformV1Routes(
       });
     },
   );
+
+  app.get("/v1/replay-runs/:id/quality-intervals", {
+    preHandler: [requireApiKey],
+    schema: {
+      params: Type.Object({ id: Type.Integer({ minimum: 1 }) }),
+      querystring: Type.Object({ offset: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })) }),
+    },
+  }, async (request, reply) => {
+    const { id } = request.params as { id: number };
+    const { offset = 0, limit = 100 } = request.query as { offset?: number; limit?: number };
+    // One snapshot keeps counts, ownership and page consistent during cancellation/deletion.
+    return db.transaction().setIsolationLevel("repeatable read").execute(async (tx) => {
+      const run = await tx.selectFrom("replay_runs").select(["quality", "quality_source_run_id"])
+        .where("id", "=", id).executeTakeFirst();
+      if (!run) return reply.code(404).send({ error: "run not found" });
+      if (!run.quality || run.quality_source_run_id === null) return { intervals: [], offset, limit, total: 0, available: false };
+      const base = tx.selectFrom("replay_quality_intervals").where("run_id", "=", run.quality_source_run_id);
+      const count = await base.select((eb) => eb.fn.countAll().as("count")).executeTakeFirstOrThrow();
+      const intervals = await base.select(["from_unix", "to_unix", "reason"])
+        .orderBy("from_unix").offset(offset).limit(limit).execute();
+      return { intervals: intervals.map((interval) => ({ fromUnix: Number(interval.from_unix),
+        toUnix: Number(interval.to_unix), reason: interval.reason })), offset, limit, total: Number(count.count), available: true };
+    });
+  });
 
   app.get("/v1/replay-runs/:id/export.csv", {
     preHandler: [requireApiKey],

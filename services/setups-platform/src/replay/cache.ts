@@ -2,6 +2,7 @@ import { sql, type Kysely } from "kysely";
 import { randomUUID } from "node:crypto";
 import type { SignalsDB } from "../db/schema.js";
 import type { SpikeParams, SpikeSetup } from "../detector/price-volume-spike.js";
+import type { ReplayQuality } from "./quality.js";
 
 export interface CacheIdentity {
   exchangeCode: string;
@@ -34,6 +35,8 @@ export interface CacheQuery extends CacheIdentity {
 }
 
 export interface CachedReplayResult {
+  quality: ReplayQuality | null;
+  qualitySourceRunId: number | null;
   cacheKey: string;
   setups: SpikeSetup[];
   warmupMinutes: number;
@@ -65,6 +68,9 @@ export function canonicalCacheKey(query: CacheQuery): string {
 }
 
 export interface FinishedReplay {
+  quality?: ReplayQuality;
+  qualitySourceRunId?: number;
+  computedAt?: Date;
   setups: SpikeSetup[];
   warmupMinutes: number;
   processedMinutes: number;
@@ -94,13 +100,18 @@ export async function cacheStore(
       setups: setupsJson,
       warmup_minutes: result.warmupMinutes,
       processed_minutes: result.processedMinutes,
+      quality: result.quality ?? null,
+      quality_source_run_id: result.qualitySourceRunId ?? null,
+      computed_at: result.computedAt ?? new Date(),
     })
     .onConflict((oc) =>
       oc.column("cache_key").doUpdateSet({
         setups: setupsJson,
         warmup_minutes: result.warmupMinutes,
         processed_minutes: result.processedMinutes,
-        computed_at: new Date(),
+        quality: result.quality ?? null,
+        quality_source_run_id: result.qualitySourceRunId ?? null,
+        computed_at: result.computedAt ?? new Date(),
       }),
     )
     .execute();
@@ -121,6 +132,8 @@ export async function cacheLookup(
   }
   return {
     cacheKey,
+    quality: row.quality,
+    qualitySourceRunId: row.quality_source_run_id,
     setups: row.setups,
     warmupMinutes: row.warmup_minutes,
     processedMinutes: row.processed_minutes,

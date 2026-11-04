@@ -63,11 +63,15 @@ export interface SpikeSetup {
   };
 }
 
+export type SkipReason = "insufficient_warmup" | "recent_gap" | "price_reference_missing" | "gap_tolerance_exceeded";
+
 export interface PushResult {
   status: "warmup" | "evaluated";
   /** Length of the current window (real + tolerated missing minutes). */
   continuousMinutes: number;
   setup?: SpikeSetup | undefined;
+  skipReason?: SkipReason;
+  missingMinutes?: number;
 }
 
 const MINUTE_SECONDS = 60;
@@ -162,14 +166,13 @@ export class PriceVolumeSpikeDetector {
     });
 
     if (this.volumes.length < this.requiredMinutes) {
-      return { status: "warmup", continuousMinutes: this.volumes.length };
+      return { status: "warmup", continuousMinutes: this.volumes.length, skipReason: "insufficient_warmup" };
     }
     if (this.volumes.slice(-this.requiredRecentMinutes || this.volumes.length).some((volume) => volume === null)) {
-      return { status: "warmup", continuousMinutes: this.volumes.length };
+      return { status: "warmup", continuousMinutes: this.volumes.length, skipReason: "recent_gap" };
     }
 
-    const setup = this.evaluate(bar);
-    return { status: "evaluated", continuousMinutes: this.volumes.length, setup };
+    return { status: "evaluated", continuousMinutes: this.volumes.length, missingMinutes: this.missingInWindow, ...this.evaluate(bar) };
   }
 
   private pushEntry(entry: {
@@ -215,29 +218,29 @@ export class PriceVolumeSpikeDetector {
     }
   }
 
-  private evaluate(bar: DetectorBar): SpikeSetup | undefined {
+  private evaluate(bar: DetectorBar): Pick<PushResult, "setup" | "skipReason"> {
     // The last requiredRecentMinutes entries must be real (non-gap) candles.
     const recentStart = this.volumes.length - this.requiredRecentMinutes;
     for (let i = Math.max(recentStart, 0); i < this.volumes.length; i += 1) {
       if (this.volumes[i] === null) {
-        return undefined;
+        return { skipReason: "recent_gap" };
       }
     }
 
     // Total missing must stay within threshold.
     if (this.missingInWindow > this.maxMissingCount) {
-      return undefined;
+      return { skipReason: "gap_tolerance_exceeded" };
     }
 
     // Price: find the close at exactly W minutes back.
     const targetTime = bar.openTimeUnix - this.windowMinutes * MINUTE_SECONDS;
     const previous = this.closes.find((c) => c.time === targetTime);
     if (previous === undefined || previous.close === null) {
-      return undefined;
+      return { skipReason: "price_reference_missing" };
     }
     const current = this.closes[this.closes.length - 1];
     if (current === undefined || current.close === null) {
-      return undefined;
+      return { skipReason: "price_reference_missing" };
     }
 
     // close(t) * 100 >= close(t-W) * (100 + growthPct)
@@ -248,7 +251,7 @@ export class PriceVolumeSpikeDetector {
       this.growthNumerator,
     );
     if (priceGrowth < 0) {
-      return undefined;
+      return {};
     }
 
     // Volume condition (strict): sumWindow > multiplier * avg baseline volume.
@@ -272,18 +275,18 @@ export class PriceVolumeSpikeDetector {
         1n,
       ) > 0;
     if (!overLong && !overShort) {
-      return undefined;
+      return {};
     }
 
     if (
       this.lastSetupTime !== null &&
       bar.openTimeUnix - this.lastSetupTime < this.cooldownSeconds
     ) {
-      return undefined;
+      return {};
     }
     this.lastSetupTime = bar.openTimeUnix;
 
-    return {
+    return { setup: {
       algorithmId: SPIKE_ALGORITHM_ID,
       algorithmVersion: SPIKE_ALGORITHM_VERSION,
       openTimeUnix: bar.openTimeUnix,
@@ -296,7 +299,7 @@ export class PriceVolumeSpikeDetector {
         volumeShortRatio: decimalRatio(mulByBigInt(this.sumWindow, shortFactor), mulByBigInt(this.sumShort, windowFactor)),
         overLong, overShort, missingMinutes: this.missingInWindow,
       },
-    };
+    } };
   }
 
   private resetSeries(): void {

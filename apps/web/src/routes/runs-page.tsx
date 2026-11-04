@@ -8,6 +8,7 @@ import { errorText, localDateInput, localTime, localTimezone, replayRange, saveP
 import { SetupTable } from "./setup-table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
 import { usePlatformPoll } from "./use-platform-poll";
+import { EmptyReplayResult, ReplayQualitySummary, qualityLabel, type QualityPanelState, type ReplayQuality } from "./replay-quality";
 
 interface RunRow {
   id: number;
@@ -22,6 +23,9 @@ interface RunRow {
   toUnix: number;
   createdAt: string;
   params: Record<string, string | number>;
+  quality?: ReplayQuality | null;
+  qualityComputedAt?: string | null;
+  qualitySourceRunId?: number | null;
 }
 interface ReplayForm { symbols: string; from: string; to: string; algorithmId: string }
 interface RunDetail { run: RunRow; setups: SetupRow[]; offset: number; limit: number; total: number }
@@ -31,7 +35,7 @@ const parameterLabels: Record<string, string> = {
   maxGapPercent: "Допустимые пропуски (%)", maxConsecutiveGapMinutes: "Пропуски подряд (мин)", requiredRecentMinutes: "Непрерывная недавняя история (мин)",
 };
 
-function RunResultPage({ id, offset, revision, onPage }: { id: number; offset: number; revision: number; onPage: (offset: number) => void }) {
+function RunResultPage({ id, offset, revision, onPage, qualityPanel, onQualityPanel }: { id: number; offset: number; revision: number; onPage: (offset: number) => void; qualityPanel: QualityPanelState; onQualityPanel: (value: QualityPanelState) => void }) {
   const state = usePlatformPoll<RunDetail>(`/v1/replay-runs/${id}?offset=${offset}&limit=100`, revision);
   return <>
     {state.kind === "loading" && <p role="status">Загрузка результатов…</p>}
@@ -41,7 +45,8 @@ function RunResultPage({ id, offset, revision, onPage }: { id: number; offset: n
       <p className="text-sm text-muted-foreground">{localTime(state.data.run.fromUnix)} – {localTime(state.data.run.toUnix)} ({localTimezone})</p>
       <details className="mt-3"><summary className="cursor-pointer font-medium">Снимок параметров запуска</summary><dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">{Object.entries(state.data.run.params).map(([key, value]) => <div key={key} className="break-words"><dt className="text-muted-foreground">{parameterLabels[key] ?? key}</dt><dd>{value}</dd></div>)}</dl></details>
       {state.data.run.error && <p role="alert">{state.data.run.error}</p>}
-      <SetupTable setups={state.data.setups.slice(0, 100)} />
+      <ReplayQualitySummary run={state.data.run} panel={qualityPanel} onPanel={onQualityPanel} revision={revision} />
+      {state.data.total === 0 ? <EmptyReplayResult quality={state.data.run.quality} /> : <SetupTable setups={state.data.setups.slice(0, 100)} />}
       <nav aria-label="Страницы результатов запуска" className="mt-4 flex flex-wrap items-center gap-3">
         <Button variant="outline" disabled={offset === 0} onClick={() => onPage(Math.max(0, offset - 100))}>Предыдущая страница</Button>
         <span aria-live="polite">Всего сетапов: {state.data.total}. Страница {Math.floor(offset / 100) + 1} из {Math.max(1, Math.ceil(state.data.total / 100))}</span>
@@ -53,6 +58,7 @@ function RunResultPage({ id, offset, revision, onPage }: { id: number; offset: n
 
 function RunResults({ id, revision }: { id: number; revision: number }) {
   const [offset, setOffset] = useState(0);
+  const [qualityPanel, setQualityPanel] = useState<QualityPanelState>({ open: false, offset: 0 });
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const download = useRef<{ controller?: AbortController; url?: string | undefined; timer?: ReturnType<typeof setTimeout> }>({});
@@ -88,7 +94,7 @@ function RunResults({ id, revision }: { id: number; revision: number }) {
     <Button className="mt-3" variant="outline" disabled={downloading} onClick={() => { void exportCsv(); }}>{downloading ? "Подготовка CSV…" : "Скачать CSV запуска"}</Button>
     <p className="mt-2 text-xs text-muted-foreground">CSV содержит все результаты запуска, не только текущую страницу. Большой файл потребует времени и памяти браузера.</p>
     {error && <p role="alert">{error}</p>}
-    <RunResultPage key={offset} id={id} offset={offset} revision={revision} onPage={setOffset} />
+    <RunResultPage key={offset} id={id} offset={offset} revision={revision} onPage={setOffset} qualityPanel={qualityPanel} onQualityPanel={setQualityPanel} />
   </section>;
 }
 
@@ -180,7 +186,7 @@ export function RunsPage() {
       <thead><tr className="border-b border-input text-left"><th className="p-2">ID</th><th className="p-2">Инструмент</th><th className="p-2">Алгоритм</th><th className="p-2">Статус</th><th className="p-2">Кеш</th><th className="p-2">Сетапов</th><th className="p-2">Действие</th></tr></thead>
       <tbody>{runs.data.runs.slice(0, 200).map((run) => <tr key={run.id} className="border-b border-input">
         <td className="p-2"><Button variant="outline" onClick={() => setSelected(run.id)} aria-label={`Результаты запуска ${run.id}`}>#{run.id}</Button></td><td className="p-2">{run.symbol}</td><td className="p-2">{run.algorithmId} · {run.algorithmVersion}</td>
-        <td className="p-2">{({ queued: "В очереди", running: "Выполняется", cancel_requested: "Отмена запрошена" } as Record<string, string>)[run.status] ?? run.status}</td><td className="p-2">{run.cacheHit ? "да" : "нет"}</td><td className="p-2">{run.setupCount}</td>
+        <td className="p-2">{({ queued: "В очереди", running: "Выполняется", cancel_requested: "Отмена запрошена" } as Record<string, string>)[run.status] ?? run.status}<p className="mt-1 text-xs text-muted-foreground">{qualityLabel(run.quality)}</p></td><td className="p-2">{run.cacheHit ? "да" : "нет"}</td><td className="p-2">{run.setupCount}</td>
         <td className="p-2">{["queued", "running", "cancel_requested"].includes(run.status) && <Button variant="outline" disabled={cancelling !== null || run.status === "cancel_requested"} onClick={() => { void cancelRun(run.id); }} aria-label={`Отменить запуск ${run.id}`}>Отменить</Button>}</td>
       </tr>)}</tbody></table>{runs.data.runs.length === 0 && <p>Запусков пока нет.</p>}</div>}
     {selected !== null && <RunResults key={selected} id={selected} revision={reload} />}

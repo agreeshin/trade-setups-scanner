@@ -7,6 +7,7 @@ import { fetchCatalog } from "../platform-catalog.js";
 import { getSetting } from "../settings.js";
 import { ApiCandleSource, type CandleSource, type CandleBarDto } from "./source.js";
 import { cacheGeneration, canonicalCacheKey, lockReplayCache, type CacheQuery } from "./cache.js";
+import { ReplayQualityTracker, saveQualityPage, type ReplayQuality, type QualityInterval } from "./quality.js";
 
 type Run = Selectable<ReplayRunsTable>;
 export const MAX_PENDING_REPLAYS = 100;
@@ -15,6 +16,8 @@ const pending = ["queued", "running", "cancel_requested"];
 export function replayRunDto(row: Run) {
   return { id: row.id, exchange: row.exchange_code, category: row.category, symbol: row.symbol,
     status: row.status, cacheHit: row.cache_hit, setupCount: row.setups?.length ?? 0,
+    quality: row.quality, qualitySourceRunId: row.quality_source_run_id,
+    qualityComputedAt: row.quality_computed_at?.toISOString() ?? null,
     warmupMinutes: row.warmup_minutes, processedMinutes: row.processed_minutes, error: row.error,
     algorithmId: row.algorithm_id, algorithmVersion: row.algorithm_version, params: row.params,
     fromUnix: row.from_ts.getTime() / 1000, toUnix: row.to_ts.getTime() / 1000,
@@ -78,10 +81,11 @@ export async function startReplayJobs(db: Kysely<SignalsDB>, marketData: { url: 
       const cacheKey = canonicalCacheKey(query);
       const cacheHit = await db.transaction().execute(async (tx) => {
         await lockReplayCache(tx);
-        const cached = await tx.selectFrom("replay_cache").select(["warmup_minutes", "processed_minutes"])
+        const cached = await tx.selectFrom("replay_cache").select(["warmup_minutes", "processed_minutes", "quality", "quality_source_run_id", "computed_at"])
           .where("cache_key", "=", cacheKey).executeTakeFirst();
         if (!cached) return false;
         await tx.updateTable("replay_runs").set({ status: "done", cache_hit: true,
+          quality: cached.quality, quality_source_run_id: cached.quality_source_run_id, quality_computed_at: cached.computed_at,
           setups: sql<SpikeSetup[]>`(select setups from replay_cache where cache_key = ${cacheKey})`,
           warmup_minutes: cached.warmup_minutes, processed_minutes: cached.processed_minutes, updated_at: new Date() })
           .where("id", "=", run.id).where("status", "=", "running").execute();
@@ -91,6 +95,8 @@ export async function startReplayJobs(db: Kysely<SignalsDB>, marketData: { url: 
       if (run.algorithm_id !== SPIKE_ALGORITHM_ID || run.algorithm_version !== SPIKE_ALGORITHM_VERSION) {
         throw new Error("unsupported_algorithm_version: create a new run using the current algorithm");
       }
+      await saveQualityPage(db, run.id, new ReplayQualityTracker(query.fromUnix, query.toUnix,
+        run.params.baselineLongDays * 1440).quality, []);
       let source: CandleSource;
       if (options.sourceForRun) source = await options.sourceForRun(run);
       else {
@@ -101,20 +107,21 @@ export async function startReplayJobs(db: Kysely<SignalsDB>, marketData: { url: 
       }
       const isTs = import.meta.url.endsWith(".ts");
       worker = new Worker(new URL(isTs ? "./job-worker.ts" : "./job-worker.js", import.meta.url), {
-        workerData: { params: run.params, fromUnix: query.fromUnix },
+        workerData: { params: run.params, fromUnix: query.fromUnix, toUnix: query.toUnix },
         ...(isTs ? { execArgv: ["--import", "tsx"] } : {}),
       });
       let workerError: Error | undefined;
       worker.on("error", (error) => { workerError = error instanceof Error ? error : new Error(String(error)); });
       worker.on("exit", (code) => { workerError ??= new Error(`replay worker exited (${code})`); });
-      const processPage = (bars: CandleBarDto[]) => new Promise<{ setups: SpikeSetup[]; warmupMinutes: number; processedMinutes: number }>((resolve, reject) => {
+      interface PageResult { setups: SpikeSetup[]; warmupMinutes: number; processedMinutes: number; quality: ReplayQuality; intervals: QualityInterval[] }
+      const processPage = (bars: CandleBarDto[], finished = false) => new Promise<PageResult>((resolve, reject) => {
         if (workerError) { reject(workerError); return; }
         const cleanup = () => { worker!.off("message", message); worker!.off("error", error); worker!.off("exit", exit); };
-        const message = (value: { setups: SpikeSetup[]; warmupMinutes: number; processedMinutes: number }) => { cleanup(); resolve(value); };
+        const message = (value: PageResult) => { cleanup(); resolve(value); };
         const error = (value: Error) => { cleanup(); reject(value); };
         const exit = (code: number) => error(new Error(`replay worker exited (${code})`));
         worker!.once("message", message); worker!.once("error", error); worker!.once("exit", exit);
-        worker!.postMessage(bars);
+      worker!.postMessage({ bars, finished });
       });
       let cursor: number | undefined;
       let warmupMinutes = 0;
@@ -130,30 +137,37 @@ export async function startReplayJobs(db: Kysely<SignalsDB>, marketData: { url: 
         const result = await processPage(page.bars);
         warmupMinutes += result.warmupMinutes;
         processedMinutes += result.processedMinutes;
-        await db.updateTable("replay_runs").set({
+        await db.transaction().execute(async (tx) => {
+        await saveQualityPage(tx, run.id, result.quality, result.intervals);
+        await tx.updateTable("replay_runs").set({
           setups: sql<SpikeSetup[]>`coalesce(setups, '[]'::jsonb) || ${JSON.stringify(result.setups)}::jsonb`,
           warmup_minutes: warmupMinutes, processed_minutes: processedMinutes, updated_at: new Date(),
         }).where("id", "=", run.id).where("status", "in", ["running", "cancel_requested"]).execute();
+        });
         if (page.nextCursorUnix === null) break;
         if (page.nextCursorUnix <= (cursor ?? Number.NEGATIVE_INFINITY)) throw new Error("replay source cursor did not advance");
         cursor = page.nextCursorUnix;
       }
+      const report = await processPage([], true);
       await db.transaction().execute(async (tx) => {
         const final = await tx.selectFrom("replay_runs").select("status").where("id", "=", run.id).forUpdate().executeTakeFirstOrThrow();
         if (final.status !== "running" || stopped) return;
-        await tx.updateTable("replay_runs").set({ status: "done", updated_at: new Date() }).where("id", "=", run.id).execute();
+        await saveQualityPage(tx, run.id, report.quality, report.intervals);
+        const computedAt = new Date();
+        await tx.updateTable("replay_runs").set({ status: "done", quality_computed_at: computedAt, updated_at: computedAt }).where("id", "=", run.id).execute();
         await lockReplayCache(tx);
         if (await cacheGeneration(tx) === generation) {
           // A savepoint keeps a cache disk/quota failure from destroying the completed result.
           await sql`savepoint replay_cache_publish`.execute(tx);
           try {
             await sql`insert into replay_cache
-              (cache_key, exchange_code, category, symbol, algorithm_id, algorithm_version, params, from_ts, to_ts, setups, warmup_minutes, processed_minutes)
+              (cache_key, exchange_code, category, symbol, algorithm_id, algorithm_version, params, from_ts, to_ts, setups, warmup_minutes, processed_minutes, quality, quality_source_run_id, computed_at)
               select ${cacheKey}, exchange_code, category, symbol, algorithm_id, algorithm_version, params, from_ts, to_ts,
-                coalesce(setups, '[]'::jsonb), ${warmupMinutes}, ${processedMinutes}
+                coalesce(setups, '[]'::jsonb), ${warmupMinutes}, ${processedMinutes}, quality, quality_source_run_id, ${computedAt}
               from replay_runs where id = ${run.id}
               on conflict (cache_key) do update set setups = excluded.setups,
-                warmup_minutes = excluded.warmup_minutes, processed_minutes = excluded.processed_minutes, computed_at = now()`.execute(tx);
+                warmup_minutes = excluded.warmup_minutes, processed_minutes = excluded.processed_minutes,
+                quality = excluded.quality, quality_source_run_id = excluded.quality_source_run_id, computed_at = excluded.computed_at`.execute(tx);
           } catch (error) {
             await sql`rollback to savepoint replay_cache_publish`.execute(tx);
             await tx.updateTable("replay_runs").set({ error: `cache write failed: ${String(error).slice(0, 300)}` }).where("id", "=", run.id).execute();

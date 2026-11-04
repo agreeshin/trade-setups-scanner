@@ -1,7 +1,11 @@
 import type { Generated } from "kysely";
 import type { SpikeParams, SpikeSetup } from "../detector/price-volume-spike.js";
+import type { QualityReason, ReplayQuality } from "../replay/quality.js";
 
 export interface ReplayRunsTable {
+  quality: Generated<ReplayQuality | null>;
+  quality_source_run_id: Generated<number | null>;
+  quality_computed_at: Generated<Date | null>;
   id: Generated<number>;
   exchange_code: string;
   category: string;
@@ -22,6 +26,8 @@ export interface ReplayRunsTable {
 }
 
 export interface ReplayCacheTable {
+  quality: Generated<ReplayQuality | null>;
+  quality_source_run_id: Generated<number | null>;
   cache_key: string;
   exchange_code: string;
   category: string;
@@ -74,6 +80,7 @@ export interface KyselyMigrationsTable {
 }
 
 export interface SignalsDB {
+  replay_quality_intervals: { run_id: number; from_unix: number; to_unix: number; reason: QualityReason };
   replay_runs: ReplayRunsTable;
   replay_cache: ReplayCacheTable;
   settings: SettingsTable;
