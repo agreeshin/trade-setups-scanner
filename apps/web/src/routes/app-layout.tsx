@@ -1,16 +1,26 @@
 import { NavLink, Outlet } from "react-router";
+import { useEffect, useState } from "react";
 import { Button } from "../components/ui/button";
-import { cn } from "../lib/utils";
-import { marketDataStatusChanged } from "../store/app-slice";
-import { useAppDispatch, useAppSelector } from "../store/hooks";
+import { fetchPlatform, type PlatformState } from "../lib/platform-api";
+
+export interface ServiceStatus { platform: "ready"; marketData: "ready" | "not_ready" | "unreachable" }
+export interface StatusContext { status: PlatformState<ServiceStatus>; refresh: () => void }
+export const marketDataLabel = (value: ServiceStatus["marketData"]): string => ({ ready: "готов", not_ready: "не готов", unreachable: "недоступен" })[value];
+
 export function AppLayout() {
-  const dispatch = useAppDispatch();
-  const marketDataStatus = useAppSelector((state) => state.app.marketDataStatus);
+  const [status, setStatus] = useState<PlatformState<ServiceStatus>>({ kind: "loading" });
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPlatform<ServiceStatus>("/v1/status").then((result) => { if (!cancelled) setStatus(result); });
+    return () => { cancelled = true; };
+  }, [revision]);
+  const refresh = () => { setStatus({ kind: "loading" }); setRevision((value) => value + 1); };
   return (
     <div className="flex min-h-screen flex-col">
       <header className="border-b border-input">
-        <div className="mx-auto flex w-full max-w-5xl items-center justify-between px-4 py-3">
-          <nav className="flex items-center gap-2" aria-label="Основная навигация">
+        <div className="mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-2 px-4 py-3">
+          <nav className="flex flex-wrap items-center gap-2" aria-label="Основная навигация">
             <NavLink to="/" end>
               {({ isActive }) => (
                 <Button variant={isActive ? "default" : "ghost"} size="sm">
@@ -39,29 +49,15 @@ export function AppLayout() {
                 </Button>
               )}
             </NavLink>
+            <NavLink to="/history">{({ isActive }) => <Button variant={isActive ? "default" : "ghost"} size="sm">История и сбор</Button>}</NavLink>
           </nav>
-          <button
-            type="button"
-            className={cn(
-              "rounded-md px-2 py-1 text-xs",
-              marketDataStatus === "ready"
-                ? "bg-muted text-muted-foreground"
-                : "bg-muted text-muted-foreground",
-            )}
-            onClick={() =>
-              dispatch(
-                marketDataStatusChanged(
-                  marketDataStatus === "ready" ? "degraded" : "ready",
-                ),
-              )
-            }
-          >
-            Сервис данных: {marketDataStatus === "ready" ? "готов" : "неизвестно"}
-          </button>
+          <span className="rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground">
+            Сервис данных: {status.kind === "ready" ? marketDataLabel(status.data.marketData) : status.kind === "loading" ? "проверка…" : "статус недоступен"}
+          </span>
         </div>
       </header>
       <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-6">
-        <Outlet />
+        <Outlet context={{ status, refresh } satisfies StatusContext} />
       </main>
     </div>
   );

@@ -5,6 +5,7 @@ import { Provider } from "react-redux";
 import "./styles/global.css";
 import { AppRoutes } from "./app-routes";
 import { store } from "./store";
+import { AuthGate } from "./components/auth-gate";
 const rootElement = document.getElementById("root");
 if (!rootElement) {
   throw new Error("root element not found");
@@ -14,7 +15,7 @@ createRoot(rootElement).render(
   <StrictMode>
     <Provider store={store}>
       <BrowserRouter>
-        <AppRoutes />
+        <AuthGate><AppRoutes /></AuthGate>
       </BrowserRouter>
     </Provider>
   </StrictMode>,

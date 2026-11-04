@@ -4,6 +4,7 @@ import { OverviewPage } from "./routes/overview-page";
 import { SettingsPage } from "./routes/settings-page";
 import { SetupsPage } from "./routes/setups-page";
 import { RunsPage } from "./routes/runs-page";
+import { HistoryPage } from "./routes/history-page";
 export function AppRoutes() {
   return (
     <Routes>
@@ -11,6 +12,7 @@ export function AppRoutes() {
         <Route index element={<OverviewPage />} />
         <Route path="setups" element={<SetupsPage />} />
         <Route path="runs" element={<RunsPage />} />
+        <Route path="history" element={<HistoryPage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
     </Routes>
