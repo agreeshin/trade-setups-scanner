@@ -6,6 +6,7 @@ import "./styles/global.css";
 import { AppRoutes } from "./app-routes";
 import { store } from "./store";
 import { AuthGate } from "./components/auth-gate";
+import { AppSurface } from "./components/ui/app-frame";
 const rootElement = document.getElementById("root");
 if (!rootElement) {
   throw new Error("root element not found");
@@ -15,7 +16,7 @@ createRoot(rootElement).render(
   <StrictMode>
     <Provider store={store}>
       <BrowserRouter>
-        <AuthGate><AppRoutes /></AuthGate>
+        <AppSurface><AuthGate><AppRoutes /></AuthGate></AppSurface>
       </BrowserRouter>
     </Provider>
   </StrictMode>,

@@ -1,6 +1,9 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { apiFetch, SESSION_EXPIRED_EVENT } from "../lib/platform-api";
 import { Button } from "./ui/button";
+import { Input } from "./ui/input";
+import { Card } from "./ui/card";
+import { AuthFrame, SessionBar } from "./ui/app-frame";
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const [state, setState] = useState<"checking" | "anonymous" | "authenticated">("checking");
@@ -75,23 +78,22 @@ export function AuthGate({ children }: { children: ReactNode }) {
   }
   if (state === "checking") return <p role="status" className="p-6 text-muted-foreground">Проверка сессии...</p>;
   if (state === "authenticated") return <>
-    <div className="flex items-center justify-end gap-4 border-b border-input px-6 py-2">
+    <SessionBar>
       {error && <p role="alert">{error}</p>}
       <Button variant="ghost" disabled={busy} onClick={() => { void logout(); }}>Выйти</Button>
-    </div>
+    </SessionBar>
     {children}
   </>;
-  return <main className="flex min-h-screen items-center justify-center p-6">
-    <form onSubmit={(event) => { void login(event); }} className="w-full max-w-sm space-y-4 rounded-md border border-input bg-card p-6">
+  return <AuthFrame>
+    <Card asChild><form onSubmit={(event) => { void login(event); }} className="w-full max-w-sm space-y-4">
       <h1 className="text-xl font-semibold">Вход в платформу</h1>
       <p className="text-sm text-muted-foreground">Используйте API-ключ администратора. Ключ не сохраняется в браузере.</p>
       {window.location.protocol !== "https:" && <p className="text-sm text-muted-foreground">HTTP не шифрует ключ и сессию. Используйте только доверенную сеть; для защиты соединения нужен HTTPS.</p>}
       <label className="block space-y-2"><span>API-ключ</span>
-        <input type="password" autoComplete="off" required value={apiKey} onChange={(event) => setApiKey(event.target.value)}
-          className="h-9 w-full rounded-md border border-input bg-background px-3" />
+        <Input type="password" autoComplete="off" required value={apiKey} onChange={(event) => setApiKey(event.target.value)} />
       </label>
       {error && <p role="alert" className="text-sm">{error}</p>}
-      <Button type="submit" disabled={busy}>{busy ? "Вход..." : "Войти"}</Button>
-    </form>
-  </main>;
+      <Button type="submit" variant="success" disabled={busy}>{busy ? "Вход..." : "Войти"}</Button>
+    </form></Card>
+  </AuthFrame>;
 }

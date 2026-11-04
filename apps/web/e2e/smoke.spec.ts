@@ -16,15 +16,49 @@ test.beforeEach(async ({ page }) => {
   });
 });
 test.describe("application smoke", () => {
+  test("shared terminal theme keeps decoration subdued and navigation accessible", async ({ page }) => {
+    await page.goto("/");
+    const surface = page.locator('[data-slot="app-surface"]');
+    await expect(surface).toHaveCSS("background-color", "rgb(16, 17, 19)");
+    const ambient = page.locator('[data-slot="ambient"]');
+    await expect(ambient).toHaveAttribute("aria-hidden", "true");
+    await expect(ambient).toHaveCSS("pointer-events", "none");
+    expect(Number(await ambient.evaluate((element) => getComputedStyle(element).opacity))).toBeCloseTo(1 / 3, 3);
+    const nav = page.getByRole("navigation", { name: "Основная навигация" });
+    await expect(nav.locator("a button")).toHaveCount(0);
+    await expect(nav.getByRole("link", { name: "Обзор", exact: true })).toHaveAttribute("aria-current", "page");
+    const settings = nav.getByRole("link", { name: "Настройки", exact: true });
+    await settings.focus();
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(/\/settings$/);
+    await expect(settings).toHaveAttribute("aria-current", "page");
+    for (const width of [375, 768, 1440]) {
+      await page.setViewportSize({ width, height: 900 });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      await page.screenshot({ path: test.info().outputPath(`theme-${width}.png`) });
+    }
+  });
+
+  test("login uses the same theme and library controls", async ({ page }) => {
+    await page.route("**/v1/session", (route) => route.fulfill({ status: 401, json: { error: "unauthorized" } }));
+    await page.setViewportSize({ width: 375, height: 812 });
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "Вход в платформу" })).toBeVisible();
+    await expect(page.locator('[data-slot="app-surface"]')).toHaveCSS("background-color", "rgb(16, 17, 19)");
+    await expect(page.getByLabel("API-ключ", { exact: true })).toHaveAttribute("data-slot", "input");
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: test.info().outputPath("login-mobile.png") });
+  });
+
   test("overview page renders navigation and content", async ({ page }) => {
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "Обзор" })).toBeVisible();
     await expect(page.getByText("Сервис данных: не готов", { exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Настройки" })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Настройки", exact: true })).toBeVisible();
   });
   test("navigation leads to the settings page", async ({ page }) => {
     await page.goto("/");
-    await page.getByRole("button", { name: "Настройки" }).click();
+    await page.getByRole("link", { name: "Настройки", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Настройки" })).toBeVisible();
     await expect(page).toHaveURL(/\/settings$/);
   });
@@ -59,7 +93,7 @@ test.describe("application smoke", () => {
     const writes: string[] = [];
     page.on("request", (request) => { if (request.method() !== "GET") writes.push(request.url()); });
     await page.goto("/");
-    await page.getByRole("button", { name: "История и сбор", exact: true }).click();
+    await page.getByRole("link", { name: "История и сбор", exact: true }).click();
     await expect(page).toHaveURL(/\/history$/);
     await page.getByLabel("Инструмент БД").selectOption("1");
     await expect(page.getByText("В БД нет свечей этого инструмента.")).toBeVisible();

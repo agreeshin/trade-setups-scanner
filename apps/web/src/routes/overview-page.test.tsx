@@ -17,7 +17,7 @@ describe("application routing shell", () => {
   it("shows overview heading and navigation on the index route", () => {
     renderAppAt("/");
     expect(screen.getByRole("heading", { name: "Обзор" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Настройки" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Настройки" })).toHaveAttribute("href", "/settings");
   });
   it("shows settings page on /settings", () => {
     renderAppAt("/settings");
