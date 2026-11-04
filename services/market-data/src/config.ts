@@ -1,6 +1,6 @@
 export interface AppConfig {
   databaseUrl: string;
-  testDatabaseUrl: string;
+  testDatabaseUrl?: string;
   apiKeys: string[];
   port: number;
   host: string;
@@ -18,7 +18,7 @@ function required(env: Record<string, string | undefined>, key: string): string 
 export function loadConfig(env: Record<string, string | undefined> = process.env): AppConfig {
   return {
     databaseUrl: required(env, "DATABASE_URL"),
-    testDatabaseUrl: required(env, "TEST_DATABASE_URL"),
+    testDatabaseUrl: env.TEST_DATABASE_URL,
     apiKeys: (env.API_KEYS ?? "")
       .split(",")
       .map((key) => key.trim())

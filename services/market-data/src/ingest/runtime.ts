@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access --
    pg-boss types resolve in tsc but not in the ESLint project service. */
-import PgBoss from "pg-boss";
+import { PgBoss } from "pg-boss";
 import type { Kysely } from "kysely";
 import type { MarketDataDB } from "../db/schema.js";
 import { AdaptiveGate, DEFAULT_GATE_LIMITS } from "./gate.js";

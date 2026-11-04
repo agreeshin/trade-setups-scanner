@@ -1,11 +1,20 @@
 import "dotenv/config";
 import { buildApp } from "./app.js";
 import { createDb } from "./db/db.js";
+import { createMigrator } from "./db/migrator.js";
 import { loadConfig } from "./config.js";
 import { startIngestRuntime, type IngestRuntime } from "./ingest/runtime.js";
 
 const config = loadConfig();
 const db = createDb(config.databaseUrl);
+
+const migrator = createMigrator(db);
+const migration = await migrator.migrateToLatest();
+if (migration.error) {
+  console.error("startup migration failed:", migration.error);
+  process.exit(1);
+}
+
 const app = await buildApp({ db, apiKeys: config.apiKeys });
 let ingestRuntime: IngestRuntime | undefined;
 
