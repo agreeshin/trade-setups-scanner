@@ -5,6 +5,8 @@ import { sql, type Kysely } from "kysely";
 import type { SignalsDB } from "./db/schema.js";
 import { createSessionAuth } from "./auth.js";
 import { registerPlatformV1Routes } from "./routes/v1.js";
+import type { ReplayAdmissionLimits } from "./replay/jobs.js";
+import { registerBackupRoutes, registerMarketBackupProxy, type BackupManager } from "./backup/routes.js";
 
 export interface ReadinessCheck {
   name: string;
@@ -16,6 +18,9 @@ export interface AppOptions {
   db?: Kysely<SignalsDB>;
   apiKeys?: string[];
   marketData?: { url: string; apiKey: string };
+  replayLimits?: ReplayAdmissionLimits;
+  backupManager?: BackupManager;
+  marketBackupMaxUploadBytes?: number;
 }
 const HealthResponse = Type.Object({
   status: Type.Literal("ok"),
@@ -110,11 +115,21 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
 
   const auth = createSessionAuth(options.apiKeys ?? []);
   auth.register(app);
+  if (options.backupManager) {
+    registerBackupRoutes(app, auth.requireApiKey, options.backupManager);
+    if (options.marketData) {
+      registerMarketBackupProxy(app, auth.requireApiKey, {
+        ...options.marketData,
+        maxUploadBytes: options.marketBackupMaxUploadBytes ?? 120 * 1024 ** 3,
+      });
+    }
+  }
   if (options.db) {
     registerPlatformV1Routes(app, {
       db: options.db,
       requireApiKey: auth.requireApiKey,
       marketData: options.marketData ?? { url: "", apiKey: "" },
+      ...(options.replayLimits ? { replayLimits: options.replayLimits } : {}),
     });
   }
 

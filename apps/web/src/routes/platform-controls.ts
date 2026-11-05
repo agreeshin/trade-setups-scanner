@@ -58,7 +58,21 @@ export function replayRange(from: string, to: string): { fromUnix: number; toUni
 
 export async function writePlatform(path: string, body: unknown, method = "PUT"): Promise<void> {
   const response = await apiFetch(path, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-  if (!response.ok) throw new Error(`Не удалось сохранить: HTTP ${response.status}`);
+  if (response.ok) return;
+  if (response.status === 429) {
+    const detail = await response.json().catch(() => null) as {
+      resource?: string; requested?: number; limit?: number;
+    } | null;
+    if (detail?.resource && Number.isFinite(detail.requested) && Number.isFinite(detail.limit)) {
+      const labels: Record<string, string> = {
+        queue_jobs: "очередь задач",
+        work_minutes: "объём обработки",
+        database_bytes: "бюджет базы данных",
+      };
+      throw new Error(`Операция отклонена: ${labels[detail.resource] ?? detail.resource} (${detail.requested} > ${detail.limit}). Уменьшите диапазон или повторите позже.`);
+    }
+  }
+  throw new Error(`Не удалось сохранить: HTTP ${response.status}`);
 }
 
 export async function savePreference(key: string, value: unknown): Promise<void> {

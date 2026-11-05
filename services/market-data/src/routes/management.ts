@@ -3,13 +3,19 @@ import { Type } from "@sinclair/typebox";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { Selectable } from "kysely";
 import type { BackfillJobsTable } from "../db/schema.js";
-import { cancelBackfillRequest, requestBackfill } from "../ingest/backfill.js";
+import { BackfillAdmissionError, cancelBackfillRequest, requestBackfill } from "../ingest/backfill.js";
 import { setCollectionTarget } from "../ingest/continuous.js";
 import type { V1RouteOptions } from "./v1.js";
 
 const Id = Type.Integer({ minimum: 1, maximum: 2147483647 });
 const Unix = Type.Integer({ minimum: 0, maximum: 253402300740, multipleOf: 60 });
 const ErrorResponse = Type.Object({ error: Type.String() });
+const ResourceLimitResponse = Type.Object({
+  error: Type.String(),
+  resource: Type.Union([Type.Literal("queue_jobs"), Type.Literal("work_minutes"), Type.Literal("database_bytes")]),
+  requested: Type.Number(),
+  limit: Type.Number(),
+});
 const Job = Type.Object({
   id: Id,
   instrumentId: Id,
@@ -49,7 +55,7 @@ function jobDto(row: Selectable<BackfillJobsTable>, requestedBy: string) {
   };
 }
 
-export function registerManagementRoutes(app: FastifyInstance, { db, requireApiKey }: V1RouteOptions): void {
+export function registerManagementRoutes(app: FastifyInstance, { db, requireApiKey, backfillLimits }: V1RouteOptions): void {
   app.get<{ Querystring: { limit?: number; beforeId?: number; instrumentId?: number } }>("/v1/backfill-jobs", {
     onRequest: [requireApiKey],
     schema: {
@@ -70,7 +76,7 @@ export function registerManagementRoutes(app: FastifyInstance, { db, requireApiK
     onRequest: [requireApiKey],
     schema: {
       body: Type.Object({ instrumentId: Id, fromUnix: Unix, toUnix: Unix }, { additionalProperties: false }),
-      response: { 202: Type.Object({ job: Job }), 400: ErrorResponse, 401: ErrorResponse, 404: ErrorResponse },
+      response: { 202: Type.Object({ job: Job }), 400: ErrorResponse, 401: ErrorResponse, 404: ErrorResponse, 429: ResourceLimitResponse },
     },
   }, async (request, reply) => {
     const { instrumentId, fromUnix, toUnix } = request.body;
@@ -80,7 +86,20 @@ export function registerManagementRoutes(app: FastifyInstance, { db, requireApiK
     const instrument = await db.selectFrom("instruments").select("id").where("id", "=", instrumentId).executeTakeFirst();
     if (!instrument) return reply.code(404).send({ error: "instrument_not_found" });
     const requestedBy = caller(request);
-    const id = await requestBackfill(db, { instrumentId, fromTs: new Date(fromUnix * 1000), toTs: new Date((toUnix - 60) * 1000), requestedBy });
+    let id: number;
+    try {
+      id = await requestBackfill(db, { instrumentId, fromTs: new Date(fromUnix * 1000), toTs: new Date((toUnix - 60) * 1000), requestedBy }, backfillLimits);
+    } catch (error) {
+      if (error instanceof BackfillAdmissionError) {
+        return reply.code(429).send({
+          error: `resource_limit_exceeded:${error.resource}:${error.requested}:${error.limit}`,
+          resource: error.resource,
+          requested: error.requested,
+          limit: error.limit,
+        });
+      }
+      throw error;
+    }
     const row = await db.selectFrom("backfill_jobs").selectAll().where("id", "=", id).executeTakeFirstOrThrow();
     return reply.code(202).send({ job: jobDto(row, requestedBy) });
   });

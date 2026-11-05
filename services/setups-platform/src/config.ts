@@ -6,6 +6,15 @@ export interface PlatformConfig {
   port: number;
   host: string;
   logLevel: string;
+  backupDir: string;
+  backupMaxUploadBytes: number;
+  marketBackupMaxUploadBytes: number;
+  replayLimits: {
+    maxPendingRuns: number;
+    maxWorkMinutes: number;
+    maxDatabaseBytes: number;
+    estimatedBytesPerWorkMinute: number;
+  };
 }
 
 function required(env: Record<string, string | undefined>, key: string): string {
@@ -13,6 +22,12 @@ function required(env: Record<string, string | undefined>, key: string): string 
   if (value === undefined || value.trim() === "") {
     throw new Error(`Missing required environment variable: ${key}`);
   }
+  return value;
+}
+
+function positiveInteger(env: Record<string, string | undefined>, key: string, fallback: number): number {
+  const value = Number(env[key] ?? fallback);
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${key} must be a positive safe integer`);
   return value;
 }
 
@@ -30,5 +45,14 @@ export function loadConfig(
     port: Number(env.PORT ?? 8082),
     host: env.HOST ?? "127.0.0.1",
     logLevel: env.LOG_LEVEL ?? "info",
+    backupDir: env.BACKUP_DIR ?? "./backups",
+    backupMaxUploadBytes: positiveInteger(env, "BACKUP_MAX_UPLOAD_BYTES", 60 * 1024 ** 3),
+    marketBackupMaxUploadBytes: positiveInteger(env, "MARKET_DATA_BACKUP_MAX_UPLOAD_BYTES", 120 * 1024 ** 3),
+    replayLimits: {
+      maxPendingRuns: positiveInteger(env, "REPLAY_MAX_PENDING_RUNS", 100),
+      maxWorkMinutes: positiveInteger(env, "REPLAY_MAX_WORK_MINUTES", 52_704_000),
+      maxDatabaseBytes: positiveInteger(env, "REPLAY_MAX_DATABASE_BYTES", 50 * 1024 ** 3),
+      estimatedBytesPerWorkMinute: positiveInteger(env, "REPLAY_ESTIMATED_BYTES_PER_MINUTE", 128),
+    },
   };
 }

@@ -1,7 +1,7 @@
 import type { Kysely } from "kysely";
 import type { MarketDataDB } from "../db/schema.js";
 import { getCoverage } from "../storage/coverage.js";
-import { requestBackfill, runBackfillJobOnce, type BackfillWorkerDeps } from "./backfill.js";
+import { BackfillAdmissionError, requestBackfill, runBackfillJobOnce, type BackfillAdmissionLimits, type BackfillWorkerDeps } from "./backfill.js";
 import type { Clock } from "./clock.js";
 
 const MINUTE_MS = 60_000;
@@ -31,6 +31,7 @@ export async function setCollectionTarget(
 export async function collectOnce(
   db: Kysely<MarketDataDB>,
   clock: Clock,
+  limits?: BackfillAdmissionLimits,
 ): Promise<number> {
   const targets = await db
     .selectFrom("collection_targets")
@@ -55,13 +56,17 @@ export async function collectOnce(
     if (from.getTime() > lastClosedMinute.getTime()) {
       continue;
     }
-    await requestBackfill(db, {
-      instrumentId: target.instrument_id,
-      fromTs: from,
-      toTs: lastClosedMinute,
-      requestedBy: CONTINUOUS_CLIENT,
-    });
-    scheduled += 1;
+    try {
+      await requestBackfill(db, {
+        instrumentId: target.instrument_id,
+        fromTs: from,
+        toTs: lastClosedMinute,
+        requestedBy: CONTINUOUS_CLIENT,
+      }, limits);
+      scheduled += 1;
+    } catch (error) {
+      if (!(error instanceof BackfillAdmissionError)) throw error;
+    }
   }
   return scheduled;
 }

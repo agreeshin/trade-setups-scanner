@@ -136,6 +136,25 @@ describe.skipIf(!TEST_DATABASE_URL)("continuous collection", () => {
     expect(jobs).toHaveLength(0);
   });
 
+  it("keeps accepted work drainable when a later target reaches the queue limit", async () => {
+    await insertCandles(db, instrumentId, [candle(minute(0))]);
+    await insertCandles(db, noHistoryInstrumentId, [candle(minute(0))]);
+    await setCollectionTarget(db, instrumentId, true);
+    await setCollectionTarget(db, noHistoryInstrumentId, true);
+    const clock = new FakeClock(T0 + 5 * MINUTE + 1);
+
+    const scheduled = await collectOnce(db, clock, {
+      maxPendingJobs: 1,
+      maxWorkMinutes: 10,
+      maxDatabaseBytes: Number.MAX_SAFE_INTEGER,
+      estimatedBytesPerWorkMinute: 1,
+    });
+
+    expect(scheduled).toBe(1);
+    expect(await db.selectFrom("backfill_jobs").selectAll().execute()).toHaveLength(1);
+    expect(await drainBackfills({ db, client: makeClient(clock) })).toBe(1);
+  });
+
   it("schedules nothing when already up to date", async () => {
     await insertCandles(
       db,

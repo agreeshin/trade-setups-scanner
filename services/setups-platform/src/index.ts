@@ -6,6 +6,7 @@ import { loadConfig } from "./config.js";
 import { startLiveRuntime } from "./live/runtime.js";
 import { setSetting } from "./settings.js";
 import { startReplayJobs } from "./replay/jobs.js";
+import { BackupManager } from "./backup/routes.js";
 
 const config = loadConfig();
 const db = createDb(config.databaseUrl);
@@ -21,11 +22,20 @@ const app = await buildApp({
   db,
   apiKeys: config.apiKeys,
   marketData: { url: config.marketDataUrl, apiKey: config.marketDataApiKey },
+  replayLimits: config.replayLimits,
+  backupManager: new BackupManager({
+    scope: "platform",
+    databaseUrl: config.databaseUrl,
+    backupDir: config.backupDir,
+    maxUploadBytes: config.backupMaxUploadBytes,
+  }),
+  marketBackupMaxUploadBytes: config.marketBackupMaxUploadBytes,
 });
 await setSetting(db, "live-status", { running: false, lastScanAt: null, lastError: null });
 startLiveRuntime(app, db, { url: config.marketDataUrl, apiKey: config.marketDataApiKey });
 const replayJobs = await startReplayJobs(db, { url: config.marketDataUrl, apiKey: config.marketDataApiKey }, {
   onError: () => app.log.error("replay job failed; inspect job status"),
+  admissionLimits: config.replayLimits,
 });
 app.addHook("onClose", () => replayJobs.stop());
 

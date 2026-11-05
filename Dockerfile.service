@@ -1,6 +1,8 @@
 FROM node:24-alpine
 WORKDIR /app
 
+RUN apk add --no-cache postgresql-client
+
 ARG SERVICE
 ENV NODE_ENV=production
 
@@ -10,7 +12,11 @@ RUN npm ci --workspace services/${SERVICE} --include-workspace-root --omit=dev |
     npm install --workspace services/${SERVICE}
 
 COPY services/${SERVICE} services/${SERVICE}
+COPY scripts/postgres-backup.mjs /app/scripts/postgres-backup.mjs
+COPY infra/container/service-entrypoint.sh /usr/local/bin/service-entrypoint
+RUN chmod 0555 /app/scripts/postgres-backup.mjs /usr/local/bin/service-entrypoint
 
 WORKDIR /app/services/${SERVICE}
 EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/service-entrypoint"]
 CMD ["npx", "tsx", "src/index.ts"]

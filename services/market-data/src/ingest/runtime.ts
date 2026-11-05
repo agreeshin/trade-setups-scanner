@@ -8,6 +8,7 @@ import { BybitClient } from "./bybit.js";
 import { FetchTransport } from "./transport.js";
 import { RealClock, type Clock } from "./clock.js";
 import { collectOnce, drainBackfills } from "./continuous.js";
+import type { BackfillAdmissionLimits } from "./backfill.js";
 
 const BACKFILL_QUEUE = "backfill";
 
@@ -16,6 +17,7 @@ export interface IngestRuntimeOptions {
   databaseUrl: string;
   clock?: Clock;
   collectionIntervalMs?: number;
+  backfillLimits?: BackfillAdmissionLimits;
 }
 
 export interface IngestRuntime {
@@ -45,7 +47,7 @@ export async function startIngestRuntime(
   const timer = setInterval(() => {
     void (async () => {
       try {
-        const scheduled = await collectOnce(options.db, clock);
+        const scheduled = await collectOnce(options.db, clock, options.backfillLimits);
         const pending = await options.db
           .selectFrom("backfill_jobs")
           .where("status", "=", "queued")

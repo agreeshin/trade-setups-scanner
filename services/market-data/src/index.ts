@@ -4,6 +4,7 @@ import { createDb } from "./db/db.js";
 import { createMigrator } from "./db/migrator.js";
 import { loadConfig } from "./config.js";
 import { startIngestRuntime, type IngestRuntime } from "./ingest/runtime.js";
+import { BackupManager } from "./backup/routes.js";
 
 const config = loadConfig();
 const db = createDb(config.databaseUrl);
@@ -15,11 +16,21 @@ if (migration.error) {
   process.exit(1);
 }
 
-const app = await buildApp({ db, apiKeys: config.apiKeys });
+const app = await buildApp({
+  db,
+  apiKeys: config.apiKeys,
+  backfillLimits: config.backfillLimits,
+  backupManager: new BackupManager({
+    scope: "market-data",
+    databaseUrl: config.databaseUrl,
+    backupDir: config.backupDir,
+    maxUploadBytes: config.backupMaxUploadBytes,
+  }),
+});
 let ingestRuntime: IngestRuntime | undefined;
 
 if (process.env.BYBIT_INGEST_ENABLED === "1") {
-  ingestRuntime = await startIngestRuntime({ db, databaseUrl: config.databaseUrl });
+  ingestRuntime = await startIngestRuntime({ db, databaseUrl: config.databaseUrl, backfillLimits: config.backfillLimits });
   app.log.info("bybit ingest runtime started");
 }
 

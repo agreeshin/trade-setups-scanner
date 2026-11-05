@@ -10,8 +10,31 @@ import { cacheGeneration, canonicalCacheKey, lockReplayCache, type CacheQuery } 
 import { ReplayQualityTracker, saveQualityPage, type ReplayQuality, type QualityInterval } from "./quality.js";
 
 type Run = Selectable<ReplayRunsTable>;
-export const MAX_PENDING_REPLAYS = 100;
 const pending = ["queued", "running", "cancel_requested"];
+
+export interface ReplayAdmissionLimits {
+  maxPendingRuns: number;
+  maxWorkMinutes: number;
+  maxDatabaseBytes: number;
+  estimatedBytesPerWorkMinute: number;
+}
+
+export const DEFAULT_REPLAY_ADMISSION_LIMITS: ReplayAdmissionLimits = {
+  maxPendingRuns: 100,
+  maxWorkMinutes: 52_704_000,
+  maxDatabaseBytes: 50 * 1024 ** 3,
+  estimatedBytesPerWorkMinute: 128,
+};
+
+export class ReplayAdmissionError extends Error {
+  constructor(
+    readonly resource: "queue_jobs" | "work_minutes" | "database_bytes",
+    readonly limit: number,
+    readonly requested: number,
+  ) {
+    super(`replay ${resource} limit exceeded: requested ${requested}, limit ${limit}`);
+  }
+}
 
 export function replayRunDto(row: Run) {
   return { id: row.id, exchange: row.exchange_code, category: row.category, symbol: row.symbol,
@@ -24,21 +47,118 @@ export function replayRunDto(row: Run) {
     createdAt: row.created_at.toISOString() };
 }
 
-export async function enqueueReplayRuns(db: Kysely<SignalsDB>, input: {
+interface ReplayAdmissionInput {
   instruments: { exchange: string; category: string; symbol: string }[];
   fromUnix: number; toUnix: number; params: SpikeParams;
-}): Promise<Run[] | null> {
+}
+
+function replayWorkMinutes(input: Pick<ReplayAdmissionInput, "fromUnix" | "toUnix" | "params">): number {
+  return Math.ceil((input.toUnix - input.fromUnix) / 60)
+    + input.params.baselineLongDays * 24 * 60;
+}
+
+async function activeReplayReservationBytes(
+  db: Kysely<SignalsDB>, limits: ReplayAdmissionLimits, excludeRunId?: number,
+): Promise<number> {
+  let query = db.selectFrom("replay_runs")
+    .select(["id", "from_ts", "to_ts", "params"])
+    .where("status", "in", pending)
+    .where("cache_hit", "=", false);
+  if (excludeRunId !== undefined) query = query.where("id", "!=", excludeRunId);
+  const rows = await query.execute();
+  return rows.reduce((total, row) => total + replayWorkMinutes({
+    fromUnix: row.from_ts.getTime() / 1000,
+    toUnix: row.to_ts.getTime() / 1000,
+    params: row.params,
+  }) * limits.estimatedBytesPerWorkMinute + 4096, 0);
+}
+
+export async function reserveReplayRuns(
+  db: Kysely<SignalsDB>, input: ReplayAdmissionInput,
+  limits: ReplayAdmissionLimits = DEFAULT_REPLAY_ADMISSION_LIMITS,
+  status: "queued" | "running" = "queued",
+): Promise<Run[]> {
   return db.transaction().execute(async (tx) => {
     await sql`select pg_advisory_xact_lock(72423412)`.execute(tx);
     const count = await tx.selectFrom("replay_runs").select((eb) => eb.fn.countAll<string>().as("n"))
       .where("status", "in", pending).executeTakeFirstOrThrow();
-    if (Number(count.n) + input.instruments.length > MAX_PENDING_REPLAYS) return null;
-    return tx.insertInto("replay_runs").values(input.instruments.map((instrument) => ({
+    const requestedRuns = Number(count.n) + input.instruments.length;
+    if (requestedRuns > limits.maxPendingRuns) {
+      throw new ReplayAdmissionError("queue_jobs", limits.maxPendingRuns, requestedRuns);
+    }
+
+    const cacheKeys = input.instruments.map((instrument) => canonicalCacheKey({
+      exchangeCode: instrument.exchange,
+      category: instrument.category,
+      symbol: instrument.symbol,
+      algorithmId: SPIKE_ALGORITHM_ID,
+      algorithmVersion: SPIKE_ALGORITHM_VERSION,
+      params: input.params,
+      fromUnix: input.fromUnix,
+      toUnix: input.toUnix,
+    }));
+    const cached = new Set((await tx.selectFrom("replay_cache").select("cache_key")
+      .where("cache_key", "in", cacheKeys).execute()).map((row) => row.cache_key));
+    const missingRuns = cacheKeys.reduce((count, key) => count + Number(!cached.has(key)), 0);
+    const workMinutes = replayWorkMinutes(input) * missingRuns;
+    if (!Number.isSafeInteger(workMinutes) || workMinutes > limits.maxWorkMinutes) {
+      throw new ReplayAdmissionError("work_minutes", limits.maxWorkMinutes, workMinutes);
+    }
+
+    const size = await sql<{ bytes: string }>`select pg_database_size(current_database())::text as bytes`.execute(tx);
+    const databaseBytes = Number(size.rows[0]?.bytes ?? 0);
+    const estimatedBytes = workMinutes * limits.estimatedBytesPerWorkMinute + missingRuns * 4096;
+    const reservedBytes = await activeReplayReservationBytes(tx, limits);
+    const requestedBytes = databaseBytes + reservedBytes + estimatedBytes;
+    if (!Number.isSafeInteger(requestedBytes) || requestedBytes > limits.maxDatabaseBytes) {
+      throw new ReplayAdmissionError("database_bytes", limits.maxDatabaseBytes, requestedBytes);
+    }
+    return tx.insertInto("replay_runs").values(input.instruments.map((instrument, index) => ({
       exchange_code: instrument.exchange, category: instrument.category, symbol: instrument.symbol,
       from_ts: new Date(input.fromUnix * 1000), to_ts: new Date(input.toUnix * 1000),
       algorithm_id: SPIKE_ALGORITHM_ID, algorithm_version: SPIKE_ALGORITHM_VERSION,
-      params: input.params, status: "queued", cache_hit: false,
+      params: input.params, status, cache_hit: cached.has(cacheKeys[index]!),
     }))).returningAll().execute();
+  });
+}
+
+export async function enqueueReplayRuns(
+  db: Kysely<SignalsDB>, input: ReplayAdmissionInput,
+  limits: ReplayAdmissionLimits = DEFAULT_REPLAY_ADMISSION_LIMITS,
+): Promise<Run[]> {
+  return reserveReplayRuns(db, input, limits, "queued");
+}
+
+export async function admitReplayCacheMiss(
+  db: Kysely<SignalsDB>, run: Run, limits: ReplayAdmissionLimits,
+): Promise<void> {
+  await db.transaction().execute(async (tx) => {
+    await sql`select pg_advisory_xact_lock(72423412)`.execute(tx);
+    const current = await tx.selectFrom("replay_runs")
+      .select(["cache_hit", "status"])
+      .where("id", "=", run.id)
+      .forUpdate()
+      .executeTakeFirstOrThrow();
+    if (!current.cache_hit || !pending.includes(current.status)) return;
+
+    const workMinutes = replayWorkMinutes({
+      fromUnix: run.from_ts.getTime() / 1000,
+      toUnix: run.to_ts.getTime() / 1000,
+      params: run.params,
+    });
+    if (workMinutes > limits.maxWorkMinutes) {
+      throw new ReplayAdmissionError("work_minutes", limits.maxWorkMinutes, workMinutes);
+    }
+    const size = await sql<{ bytes: string }>`select pg_database_size(current_database())::text as bytes`.execute(tx);
+    const databaseBytes = Number(size.rows[0]?.bytes ?? 0);
+    const reservedBytes = await activeReplayReservationBytes(tx, limits, run.id);
+    const requestedBytes = databaseBytes + reservedBytes
+      + workMinutes * limits.estimatedBytesPerWorkMinute + 4096;
+    if (!Number.isSafeInteger(requestedBytes) || requestedBytes > limits.maxDatabaseBytes) {
+      throw new ReplayAdmissionError("database_bytes", limits.maxDatabaseBytes, requestedBytes);
+    }
+    await tx.updateTable("replay_runs").set({ cache_hit: false, updated_at: new Date() })
+      .where("id", "=", run.id).execute();
   });
 }
 
@@ -56,6 +176,7 @@ export async function startReplayJobs(db: Kysely<SignalsDB>, marketData: { url: 
   pollIntervalMs?: number;
   onError?: (error: unknown) => void;
   sourceForRun?: (run: Run) => Promise<CandleSource>;
+  admissionLimits?: ReplayAdmissionLimits;
 } = {}): Promise<{ stop(): Promise<void> }> {
   // Explicit interruption preserves partial evidence without pretending to resume detector state.
   await db.updateTable("replay_runs").set({ status: "failed", error: "interrupted by application restart", updated_at: new Date() })
@@ -92,6 +213,9 @@ export async function startReplayJobs(db: Kysely<SignalsDB>, marketData: { url: 
         return true;
       });
       if (cacheHit) return;
+      if (run.cache_hit) {
+        await admitReplayCacheMiss(db, run, options.admissionLimits ?? DEFAULT_REPLAY_ADMISSION_LIMITS);
+      }
       if (run.algorithm_id !== SPIKE_ALGORITHM_ID || run.algorithm_version !== SPIKE_ALGORITHM_VERSION) {
         throw new Error("unsupported_algorithm_version: create a new run using the current algorithm");
       }

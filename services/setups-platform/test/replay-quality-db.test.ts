@@ -45,7 +45,7 @@ describe.skipIf(!url)("persisted replay quality", () => {
     return get(id);
   }
   async function launch(source: CandleSource) {
-    const [run] = (await enqueueReplayRuns(db, input))!;
+    const [run] = (await enqueueReplayRuns(db, input));
     runtime = await startReplayJobs(db, marketData, { pollIntervalMs: 10, sourceForRun: () => Promise.resolve(source) });
     return run!.id;
   }
@@ -61,7 +61,7 @@ describe.skipIf(!url)("persisted replay quality", () => {
     expect(intervals.json()).toMatchObject({ available: true, total: 1,
       intervals: [{ fromUnix: start, toUnix: start + 600, reason: "evaluated" }] });
     const initialReads = reads;
-    const [hit] = (await enqueueReplayRuns(db, input))!;
+    const [hit] = (await enqueueReplayRuns(db, input));
     const cached = await until(hit!.id, "done");
     expect(cached.cache_hit).toBe(true);
     expect(reads).toBe(initialReads);
@@ -81,7 +81,7 @@ describe.skipIf(!url)("persisted replay quality", () => {
     const done = await until(id, "done");
     expect(done.quality).toMatchObject({ state: "no_eligible_data", skippedMinutes: 10, unassessedMinutes: 0,
       reasonCounts: { missing_candle: 3, recent_gap: 7 } });
-    const [hit] = (await enqueueReplayRuns(db, input))!;
+    const [hit] = (await enqueueReplayRuns(db, input));
     expect((await until(hit!.id, "done")).quality).toEqual(done.quality);
   });
 
@@ -116,7 +116,7 @@ describe.skipIf(!url)("persisted replay quality", () => {
   });
 
   it("paginates exact intervals, protects access and marks legacy quality unknown", async () => {
-    const [run] = (await enqueueReplayRuns(db, input))!;
+    const [run] = (await enqueueReplayRuns(db, input));
     const endpoint = `/v1/replay-runs/${run!.id}/quality-intervals`;
     expect((await app.inject({ url: endpoint, headers })).json()).toMatchObject({ available: false });
     const tracker = new ReplayQualityTracker(start, start + 600, 1440);

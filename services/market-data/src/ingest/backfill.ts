@@ -1,7 +1,7 @@
-import type { Kysely } from "kysely";
+import { sql, type Kysely } from "kysely";
 import type { MarketDataDB, BackfillJobStatus } from "../db/schema.js";
 import { insertCandles } from "../storage/candles.js";
-import { getCoverage, type Coverage } from "../storage/coverage.js";
+import { getCoverage, getCoverageRange, type Coverage } from "../storage/coverage.js";
 import type { BybitClient } from "./bybit.js";
 
 const MINUTE_MS = 60_000;
@@ -16,49 +16,103 @@ export interface BackfillRequest {
   requestedBy: string;
 }
 
+export interface BackfillAdmissionLimits {
+  maxPendingJobs: number;
+  maxWorkMinutes: number;
+  maxDatabaseBytes: number;
+  estimatedBytesPerWorkMinute: number;
+}
+
+export const DEFAULT_BACKFILL_ADMISSION_LIMITS: BackfillAdmissionLimits = {
+  maxPendingJobs: 100,
+  maxWorkMinutes: 2_635_200,
+  maxDatabaseBytes: 100 * 1024 ** 3,
+  estimatedBytesPerWorkMinute: 512,
+};
+
+export class BackfillAdmissionError extends Error {
+  constructor(
+    readonly resource: "queue_jobs" | "work_minutes" | "database_bytes",
+    readonly limit: number,
+    readonly requested: number,
+  ) {
+    super(`backfill ${resource} limit exceeded: requested ${requested}, limit ${limit}`);
+  }
+}
+
 export async function requestBackfill(
   db: Kysely<MarketDataDB>,
   request: BackfillRequest,
+  limits: BackfillAdmissionLimits = DEFAULT_BACKFILL_ADMISSION_LIMITS,
 ): Promise<number> {
-  const existing = await db
-    .selectFrom("backfill_jobs")
-    .where("instrument_id", "=", request.instrumentId)
-    .where("status", "in", ACTIVE_STATUSES)
-    .where("from_ts", "<=", request.fromTs)
-    .where("to_ts", ">=", request.toTs)
-    .orderBy("id", "asc")
-    .limit(1)
-    .selectAll()
-    .executeTakeFirst();
+  return db.transaction().execute(async (tx) => {
+    await sql`select pg_advisory_xact_lock(72423413)`.execute(tx);
+    const existing = await tx
+      .selectFrom("backfill_jobs")
+      .where("instrument_id", "=", request.instrumentId)
+      .where("status", "in", ACTIVE_STATUSES)
+      .where("from_ts", "<=", request.fromTs)
+      .where("to_ts", ">=", request.toTs)
+      .orderBy("id", "asc")
+      .limit(1)
+      .selectAll()
+      .executeTakeFirst();
 
-  if (existing) {
-    const requestedBy = existing.requested_by.includes(request.requestedBy)
-      ? existing.requested_by
-      : [...existing.requested_by, request.requestedBy];
-    await db
-      .updateTable("backfill_jobs")
-      .set({
+    if (existing) {
+      const requestedBy = existing.requested_by.includes(request.requestedBy)
+        ? existing.requested_by
+        : [...existing.requested_by, request.requestedBy];
+      await tx.updateTable("backfill_jobs").set({
         requested_by: requestedBy,
         status: existing.status === "cancel_requested" ? "queued" : existing.status,
         updated_at: new Date(),
-      })
-      .where("id", "=", existing.id)
-      .execute();
-    return existing.id;
-  }
+      }).where("id", "=", existing.id).execute();
+      return existing.id;
+    }
 
-  const created = await db
-    .insertInto("backfill_jobs")
-    .values({
+    const count = await tx.selectFrom("backfill_jobs").select((eb) => eb.fn.countAll<string>().as("n"))
+      .where("status", "in", ACTIVE_STATUSES).executeTakeFirstOrThrow();
+    const requestedJobs = Number(count.n) + 1;
+    if (requestedJobs > limits.maxPendingJobs) {
+      throw new BackfillAdmissionError("queue_jobs", limits.maxPendingJobs, requestedJobs);
+    }
+
+    const coverage = await getCoverageRange(tx, request.instrumentId, {
+      fromUnix: request.fromTs.getTime() / 1000,
+      toUnix: request.toTs.getTime() / 1000 + 60,
+      splitUnix: request.fromTs.getTime() / 1000,
+      limit: 1,
+    });
+    if (!coverage) throw new Error(`instrument ${request.instrumentId} not found`);
+    const workMinutes = coverage.missingMinutes;
+    if (!Number.isSafeInteger(workMinutes) || workMinutes > limits.maxWorkMinutes) {
+      throw new BackfillAdmissionError("work_minutes", limits.maxWorkMinutes, workMinutes);
+    }
+
+    const size = await sql<{ bytes: string }>`select pg_database_size(current_database())::text as bytes`.execute(tx);
+    const databaseBytes = Number(size.rows[0]?.bytes ?? 0);
+    const active = await tx.selectFrom("backfill_jobs")
+      .select(["from_ts", "to_ts"])
+      .where("status", "in", ACTIVE_STATUSES)
+      .execute();
+    const reservedBytes = active.reduce((sum, job) => sum
+      + ((job.to_ts.getTime() - job.from_ts.getTime()) / MINUTE_MS + 1)
+      * limits.estimatedBytesPerWorkMinute + 4096, 0);
+    const requestedBytes = databaseBytes + reservedBytes
+      + workMinutes * limits.estimatedBytesPerWorkMinute + 4096;
+    if (!Number.isSafeInteger(requestedBytes) || requestedBytes > limits.maxDatabaseBytes) {
+      throw new BackfillAdmissionError("database_bytes", limits.maxDatabaseBytes, requestedBytes);
+    }
+
+    const created = await tx.insertInto("backfill_jobs").values({
       instrument_id: request.instrumentId,
       from_ts: request.fromTs,
       to_ts: request.toTs,
       status: "queued",
       requested_by: [request.requestedBy],
-    })
-    .returning("id")
-    .executeTakeFirstOrThrow();
-  return created.id;
+    }).returning("id").executeTakeFirstOrThrow();
+    return created.id;
+  });
 }
 
 export async function cancelBackfillRequest(

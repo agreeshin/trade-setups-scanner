@@ -5,6 +5,8 @@ import { sql, type Kysely } from "kysely";
 import type { MarketDataDB } from "./db/schema.js";
 import { createApiKeyGuard } from "./auth.js";
 import { registerV1Routes } from "./routes/v1.js";
+import type { BackfillAdmissionLimits } from "./ingest/backfill.js";
+import { registerBackupRoutes, type BackupManager } from "./backup/routes.js";
 
 export interface ReadinessCheck {
   name: string;
@@ -16,6 +18,8 @@ export interface AppOptions {
   openApiEnabled?: boolean;
   db?: Kysely<MarketDataDB>;
   apiKeys?: string[];
+  backfillLimits?: BackfillAdmissionLimits;
+  backupManager?: BackupManager;
 }
 
 const HealthResponse = Type.Object({
@@ -115,9 +119,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   );
 
   if (options.db) {
+    const requireApiKey = createApiKeyGuard(options.apiKeys ?? []);
+    if (options.backupManager) registerBackupRoutes(app, requireApiKey, options.backupManager);
     registerV1Routes(app, {
       db: options.db,
-      requireApiKey: createApiKeyGuard(options.apiKeys ?? []),
+      requireApiKey,
+      ...(options.backfillLimits ? { backfillLimits: options.backfillLimits } : {}),
     });
   }
 

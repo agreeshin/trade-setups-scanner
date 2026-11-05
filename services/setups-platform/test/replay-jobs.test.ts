@@ -1,13 +1,13 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import type { Kysely } from "kysely";
+import { sql, type Kysely } from "kysely";
 import { createDb } from "../src/db/db.js";
 import { createMigrator } from "../src/db/migrator.js";
 import type { SignalsDB } from "../src/db/schema.js";
 import { buildApp } from "../src/app.js";
-import { DEFAULT_SPIKE_PARAMS } from "../src/detector/price-volume-spike.js";
+import { DEFAULT_SPIKE_PARAMS, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION } from "../src/detector/price-volume-spike.js";
 import type { SpikeSetup } from "../src/detector/price-volume-spike.js";
-import { cancelReplayRun, enqueueReplayRuns, startReplayJobs } from "../src/replay/jobs.js";
-import { cacheClearAll, cacheStats } from "../src/replay/cache.js";
+import { DEFAULT_REPLAY_ADMISSION_LIMITS, cancelReplayRun, enqueueReplayRuns, startReplayJobs } from "../src/replay/jobs.js";
+import { cacheClearAll, cacheStats, cacheStore } from "../src/replay/cache.js";
 import { ArrayCandleSource, type CandleSource } from "../src/replay/source.js";
 import { setSetting } from "../src/settings.js";
 
@@ -43,7 +43,7 @@ describe.skipIf(!url)("persistent replay jobs", () => {
   }
 
   it("streams pages, persists progress/results and serves cache on a later run", async () => {
-    const [run] = (await enqueueReplayRuns(db, input))!;
+    const [run] = (await enqueueReplayRuns(db, input));
     let reads = 0;
     const source = new ArrayCandleSource(bars);
     await start({ async read(query) { reads++; expect(query.limit).toBe(5000); return source.read(query); } });
@@ -51,13 +51,13 @@ describe.skipIf(!url)("persistent replay jobs", () => {
     expect(reads).toBe(2);
     expect((done.warmup_minutes ?? 0) + (done.processed_minutes ?? 0)).toBe(6000);
     expect((await cacheStats(db)).entries).toBe(1);
-    const [next] = (await enqueueReplayRuns(db, input))!;
+    const [next] = (await enqueueReplayRuns(db, input));
     expect((await until(next!.id, "done")).cache_hit).toBe(true);
     expect(reads).toBe(2);
   });
 
   it("honors cancellation during a page fetch and never publishes its cache", async () => {
-    const [run] = (await enqueueReplayRuns(db, input))!;
+    const [run] = (await enqueueReplayRuns(db, input));
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let reading = false;
@@ -71,7 +71,7 @@ describe.skipIf(!url)("persistent replay jobs", () => {
   });
 
   it("does not restore a cache cleared while a page was in flight", async () => {
-    const [run] = (await enqueueReplayRuns(db, input))!;
+    const [run] = (await enqueueReplayRuns(db, input));
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let reading = false;
@@ -87,16 +87,91 @@ describe.skipIf(!url)("persistent replay jobs", () => {
   it("pauses queued work, cancels queued work and bounds pending submissions", async () => {
     await setSetting(db, "replay", { paused: true });
     const batch = { ...input, instruments: Array.from({ length: 100 }, () => input.instruments[0]!) };
-    const runs = (await enqueueReplayRuns(db, batch))!;
-    expect(await enqueueReplayRuns(db, input)).toBeNull();
+    const runs = (await enqueueReplayRuns(db, batch));
+    await expect(enqueueReplayRuns(db, input)).rejects.toMatchObject({ resource: "queue_jobs", limit: 100, requested: 101 });
     await start();
     expect((await get(runs[0]!.id)).status).toBe("queued");
     expect((await cancelReplayRun(db, runs[0]!.id))!.status).toBe("cancelled");
     expect(await enqueueReplayRuns(db, input)).toHaveLength(1);
   });
 
+  it("rejects excessive new work atomically but admits an exact cache hit", async () => {
+    const limits = { ...DEFAULT_REPLAY_ADMISSION_LIMITS, maxWorkMinutes: 1 };
+    await expect(enqueueReplayRuns(db, input, limits)).rejects.toMatchObject({
+      resource: "work_minutes", limit: 1,
+    });
+    expect(await db.selectFrom("replay_runs").select((eb) => eb.fn.countAll().as("n")).executeTakeFirstOrThrow()).toMatchObject({ n: "0" });
+
+    await cacheStore(db, {
+      exchangeCode: input.instruments[0]!.exchange,
+      category: input.instruments[0]!.category,
+      symbol: input.instruments[0]!.symbol,
+      algorithmId: SPIKE_ALGORITHM_ID,
+      algorithmVersion: SPIKE_ALGORITHM_VERSION,
+      params: input.params,
+      fromUnix: input.fromUnix,
+      toUnix: input.toUnix,
+    }, { setups: [], warmupMinutes: 0, processedMinutes: 0 });
+    expect(await enqueueReplayRuns(db, input, limits)).toHaveLength(1);
+  });
+
+  it("rechecks admission before computing when an admitted cache entry disappears", async () => {
+    const limits = { ...DEFAULT_REPLAY_ADMISSION_LIMITS, maxWorkMinutes: 1 };
+    await cacheStore(db, {
+      exchangeCode: input.instruments[0]!.exchange,
+      category: input.instruments[0]!.category,
+      symbol: input.instruments[0]!.symbol,
+      algorithmId: SPIKE_ALGORITHM_ID,
+      algorithmVersion: SPIKE_ALGORITHM_VERSION,
+      params: input.params,
+      fromUnix: input.fromUnix,
+      toUnix: input.toUnix,
+    }, { setups: [], warmupMinutes: 0, processedMinutes: 0 });
+    const [run] = await enqueueReplayRuns(db, input, limits);
+    expect(run!.cache_hit).toBe(true);
+    await cacheClearAll(db);
+    let sourceReads = 0;
+    runtime = await startReplayJobs(db, marketData, {
+      pollIntervalMs: 10,
+      admissionLimits: limits,
+      sourceForRun: () => {
+        sourceReads += 1;
+        return Promise.resolve(new ArrayCandleSource(bars));
+      },
+    });
+    const failed = await until(run!.id, "failed");
+    expect(failed.error).toContain("work_minutes limit exceeded");
+    expect(sourceReads).toBe(0);
+  });
+
+  it("serializes database reservations across concurrent submissions", async () => {
+    const size = await sql<{ bytes: string }>`select pg_database_size(current_database())::text as bytes`.execute(db);
+    const workMinutes = Math.ceil((input.toUnix - input.fromUnix) / 60)
+      + input.params.baselineLongDays * 24 * 60;
+    const limits = {
+      ...DEFAULT_REPLAY_ADMISSION_LIMITS,
+      estimatedBytesPerWorkMinute: 1,
+      maxDatabaseBytes: Number(size.rows[0]!.bytes) + workMinutes + 4096,
+    };
+
+    const results = await Promise.allSettled([
+      enqueueReplayRuns(db, input, limits),
+      enqueueReplayRuns(db, input, limits),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.find((result) => result.status === "rejected"))
+      .toMatchObject({ reason: { resource: "database_bytes" } });
+  });
+
+  it("rejects a replay when the configured database budget has no headroom", async () => {
+    await expect(enqueueReplayRuns(db, input, { ...DEFAULT_REPLAY_ADMISSION_LIMITS, maxDatabaseBytes: 1 }))
+      .rejects.toMatchObject({ resource: "database_bytes", limit: 1 });
+    expect(await db.selectFrom("replay_runs").select((eb) => eb.fn.countAll().as("n")).executeTakeFirstOrThrow()).toMatchObject({ n: "0" });
+  });
+
   it("does not execute a persisted unsupported algorithm version under a new engine", async () => {
-    const [run] = (await enqueueReplayRuns(db, input))!;
+    const [run] = (await enqueueReplayRuns(db, input));
     await db.updateTable("replay_runs").set({ algorithm_version: "0.0.0" }).where("id", "=", run!.id).execute();
     await start();
     await until(run!.id, "failed");
@@ -105,7 +180,7 @@ describe.skipIf(!url)("persistent replay jobs", () => {
   });
 
   it("marks stale running jobs interrupted and acknowledges pending cancellation on startup", async () => {
-    const runs = (await enqueueReplayRuns(db, { ...input, instruments: [input.instruments[0]!, input.instruments[0]!] }))!;
+    const runs = (await enqueueReplayRuns(db, { ...input, instruments: [input.instruments[0]!, input.instruments[0]!] }));
     await db.updateTable("replay_runs").set({ status: "running" }).where("id", "=", runs[0]!.id).execute();
     await db.updateTable("replay_runs").set({ status: "cancel_requested" }).where("id", "=", runs[1]!.id).execute();
     await start();
@@ -115,7 +190,7 @@ describe.skipIf(!url)("persistent replay jobs", () => {
   });
 
   it("pauses an active job at a page checkpoint and resumes without replaying that page", async () => {
-    const [run] = (await enqueueReplayRuns(db, input))!;
+    const [run] = (await enqueueReplayRuns(db, input));
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let reads = 0;
@@ -133,7 +208,7 @@ describe.skipIf(!url)("persistent replay jobs", () => {
   });
 
   it("stops a paused active worker and leaves an explicit interrupted result", async () => {
-    const [run] = (await enqueueReplayRuns(db, input))!;
+    const [run] = (await enqueueReplayRuns(db, input));
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let reading = false;
@@ -173,8 +248,68 @@ describe.skipIf(!url)("persistent replay jobs", () => {
     } finally { await app.close(); }
   });
 
+  it("applies configured work admission to synchronous and asynchronous API requests", async () => {
+    const app = await buildApp({
+      db,
+      apiKeys: ["secret"],
+      marketData,
+      replayLimits: { ...DEFAULT_REPLAY_ADMISSION_LIMITS, maxWorkMinutes: 1 },
+    });
+    try {
+      for (const async of [false, true]) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/v1/replay-runs",
+          headers: { "x-api-key": "secret" },
+          payload: { ...input, async },
+        });
+        expect(response.statusCode).toBe(429);
+        expect(response.json()).toMatchObject({ resource: "work_minutes", limit: 1 });
+      }
+      const count = await db.selectFrom("replay_runs")
+        .select((eb) => eb.fn.countAll<string>().as("n"))
+        .executeTakeFirstOrThrow();
+      expect(count.n).toBe("0");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("releases synchronous reservations when catalog lookup fails", async () => {
+    const app = await buildApp({
+      db,
+      apiKeys: ["secret"],
+      marketData,
+      replayLimits: { ...DEFAULT_REPLAY_ADMISSION_LIMITS, maxPendingRuns: 1 },
+    });
+    try {
+      const failed = await app.inject({
+        method: "POST",
+        url: "/v1/replay-runs",
+        headers: { "x-api-key": "secret" },
+        payload: { ...input, async: false },
+      });
+      expect(failed.statusCode).toBe(500);
+      const active = await db.selectFrom("replay_runs")
+        .select((eb) => eb.fn.countAll<string>().as("n"))
+        .where("status", "in", ["queued", "running", "cancel_requested"])
+        .executeTakeFirstOrThrow();
+      expect(active.n).toBe("0");
+
+      const accepted = await app.inject({
+        method: "POST",
+        url: "/v1/replay-runs",
+        headers: { "x-api-key": "secret" },
+        payload: { ...input, async: true },
+      });
+      expect(accepted.statusCode).toBe(202);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("returns optional trigger details and parameter snapshots for replay and live setups", async () => {
-    const [run] = (await enqueueReplayRuns(db, input))!;
+    const [run] = (await enqueueReplayRuns(db, input));
     const details = { growthPct: "12", volumeLongRatio: "3.01", volumeShortRatio: null,
       overLong: true, overShort: false, missingMinutes: 0 };
     const setup: SpikeSetup = { algorithmId: "price_volume_spike", algorithmVersion: "1.0.0",

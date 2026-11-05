@@ -1,5 +1,17 @@
 # План разработки продукта
 
+## Незакрытые обязательства PRD (2026-11-05)
+
+- completed: настраиваемые ресурсные лимиты replay/backfill. Проверяются pending-задачи, warmup-inclusive объём новой работы и консервативно зарезервированный бюджет БД; sync/async/cache-miss/continuous пути закрыты одним контрактом, параллельная admission сериализована, HTTP 429 диагностируем и показан в UI. Полные регрессии: platform 108, market-data 67, web 71; typecheck/lint/build и независимый аудит пройдены.
+- completed: безопасный backup/restore двух независимых БД через административные API и Web UI. Реализованы self-describing backup, streaming download/upload, scope/SHA-256/version/space validation, pending restore, pre-start apply с pre-restore копией и rollback, bounded retention и отдельные platform/market-data controls. Изолированный Docker E2E реальными `pg_dump`/`pg_restore` подтвердил platform и market-data backup/apply/restart, возврат исходных данных, отклонение truncated/scope-mismatch payload, failed restore с `failed_rolled_back` и сохранением текущего состояния; replay-регрессии входят в полный platform suite. Production restore не запускался.
+- pending: сохраняемая история доставки по каждому каналу и сетапу: попытка, время, исход, причина пропуска/ошибки и задержка отдельно от времени сигнала; bounded retention/пагинация и отсутствие секретных endpoint в UI/логах.
+- pending: журнал существенных административных действий: изменения настроек и списков, live/replay/backfill, отмена, очистка кеша, backup/restore; автор/время/операция/результат без секретов и больших payload, с ограниченным хранением и серверной пагинацией.
+- pending: полный архивный CSV v1 из `docs/prd/signals.md` для live и replay при сохранении совместимого восьмиколоночного endpoint; стабильная идентичность инструмента, версия схемы, параметры/признаки/качество, времена сигнала/сохранения/доставки, потоковая выдача и точные decimal-строки.
+- pending: CLI-паритет основных административных операций API/Web: статус, списки, live, backfill, replay, отмена, кеш и уведомления. CLI использует публичный авторизованный API, не обходит сервис прямым доступом к БД.
+- pending: HTTPS и реальная приёмка Web Push на поддерживаемом окружении: permissions, TTL, late/offline/provider cases и fallback при недоступности. Telegram остаётся опциональным.
+- pending: масштабная приёмка примерно на 500 live-парах с пачкой закрытий минуты и одновременными live/replay/backfill; измерить CPU/RAM/disk/WAL/latency, проверить SLO, bounded cleanup и отсутствие изменения семантики.
+- pending: аварийная приёмка на отдельном разрешённом стенде: reboot, завершение процессов, поздние DB/network, активные задания и cooldown; исключить двойных владельцев/сетапы, сохранить намеренно выключенные режимы и сроки уведомлений.
+
 ## Preflight replay (2026-11-04)
 
 - completed: CSV и качество replay опубликованы (`1e8599e`, `168c4df`), main синхронизирован с origin.

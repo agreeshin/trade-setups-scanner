@@ -34,6 +34,16 @@ services:
       HOST: 0.0.0.0
       LOG_LEVEL: info
       BYBIT_INGEST_ENABLED: ${BYBIT_INGEST_ENABLED:-1}
+      BACKFILL_MAX_PENDING_JOBS: ${BACKFILL_MAX_PENDING_JOBS:-100}
+      BACKFILL_MAX_WORK_MINUTES: ${BACKFILL_MAX_WORK_MINUTES:-2635200}
+      MARKET_DATA_MAX_DATABASE_BYTES: ${MARKET_DATA_MAX_DATABASE_BYTES:-107374182400}
+      BACKFILL_ESTIMATED_BYTES_PER_MINUTE: ${BACKFILL_ESTIMATED_BYTES_PER_MINUTE:-512}
+      BACKUP_SCOPE: market-data
+      BACKUP_DIR: /var/lib/trade-setups/backups
+      BACKUP_MAX_UPLOAD_BYTES: ${MARKET_DATA_BACKUP_MAX_UPLOAD_BYTES:-128849018880}
+      BACKUP_ROLLBACK_RETENTION: ${BACKUP_ROLLBACK_RETENTION:-3}
+    volumes:
+      - ./backups/market-data:/var/lib/trade-setups/backups
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,6 +65,16 @@ services:
       PORT: 8080
       HOST: 0.0.0.0
       LOG_LEVEL: info
+      REPLAY_MAX_PENDING_RUNS: ${REPLAY_MAX_PENDING_RUNS:-100}
+      REPLAY_MAX_WORK_MINUTES: ${REPLAY_MAX_WORK_MINUTES:-52704000}
+      REPLAY_MAX_DATABASE_BYTES: ${REPLAY_MAX_DATABASE_BYTES:-53687091200}
+      REPLAY_ESTIMATED_BYTES_PER_MINUTE: ${REPLAY_ESTIMATED_BYTES_PER_MINUTE:-128}
+      BACKUP_SCOPE: platform
+      BACKUP_DIR: /var/lib/trade-setups/backups
+      BACKUP_MAX_UPLOAD_BYTES: ${PLATFORM_BACKUP_MAX_UPLOAD_BYTES:-64424509440}
+      BACKUP_ROLLBACK_RETENTION: ${BACKUP_ROLLBACK_RETENTION:-3}
+    volumes:
+      - ./backups/platform:/var/lib/trade-setups/backups
     depends_on:
       postgres:
         condition: service_healthy

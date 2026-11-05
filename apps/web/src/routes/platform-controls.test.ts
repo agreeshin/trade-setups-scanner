@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { replayRange } from "./platform-controls";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { replayRange, writePlatform } from "./platform-controls";
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("local replay time", () => {
   it("converts local wall time to Unix seconds", () => {
@@ -16,5 +18,19 @@ describe("local replay time", () => {
     ["not-a-date", "2026-10-10T13:00"],
   ])("rejects invalid or reversed range %s to %s", (from, to) => {
     expect(() => replayRange(from, to)).toThrow("корректные даты");
+  });
+});
+
+describe("platform mutation errors", () => {
+  it("shows actionable resource admission details", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      error: "resource_limit_exceeded:work_minutes:120:60",
+      resource: "work_minutes",
+      requested: 120,
+      limit: 60,
+    }), { status: 429, headers: { "content-type": "application/json" } })));
+
+    await expect(writePlatform("/v1/replay-runs", {}, "POST"))
+      .rejects.toThrow("объём обработки (120 > 60)");
   });
 });

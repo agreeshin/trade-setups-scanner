@@ -5,6 +5,7 @@ import type { MarketDataDB } from "../db/schema.js";
 import { readCandles } from "../storage/candles.js";
 import { COVERAGE_MAX_UNIX, COVERAGE_MIN_UNIX, getCoverage, getCoverageRange, type CoverageRangeInput } from "../storage/coverage.js";
 import { registerManagementRoutes } from "./management.js";
+import type { BackfillAdmissionLimits } from "../ingest/backfill.js";
 
 export type ApiKeyGuard = (
   request: FastifyRequest,
@@ -62,6 +63,7 @@ const unixSeconds = (iso: string | null): number | null =>
 export interface V1RouteOptions {
   db: Kysely<MarketDataDB>;
   requireApiKey: ApiKeyGuard;
+  backfillLimits?: BackfillAdmissionLimits;
 }
 
 export function registerV1Routes(

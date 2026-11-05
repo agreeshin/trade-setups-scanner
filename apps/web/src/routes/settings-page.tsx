@@ -7,6 +7,7 @@ import { errorText, localTime, writePlatform } from "./platform-controls";
 import { LiveInstruments } from "./live-instruments";
 import { OperationSettings } from "./operation-settings";
 import { PushSettings } from "../components/push-settings";
+import { BackupSettings } from "./backup-settings";
 
 interface LiveStatus { enabled: boolean; running: boolean; lastScanAt: string | null; lastError: string | null; stale?: boolean; scanned?: number; setupCount?: number; instruments?: { symbol: string; state: string; lastClosedUnix?: number; error?: string }[] }
 const instrumentStateLabels: Record<string, string> = { ready: "Готов", waiting_data: "Ожидание данных", insufficient_history: "Недостаточно истории", stale: "Устаревшие данные", error: "Ошибка" };
@@ -124,5 +125,6 @@ export function SettingsPage() {
     <PushSettings />
     <CacheSettings />
     <OperationSettings />
+    <BackupSettings />
   </section>;
 }

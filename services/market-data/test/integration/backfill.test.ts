@@ -12,6 +12,7 @@ import { AdaptiveGate, DEFAULT_GATE_LIMITS } from "../../src/ingest/gate.js";
 import { FakeClock } from "../../src/ingest/clock.js";
 import type { Transport, TransportResponse } from "../../src/ingest/transport.js";
 import {
+  DEFAULT_BACKFILL_ADMISSION_LIMITS,
   cancelBackfillRequest,
   requestBackfill,
   runBackfillJobOnce,
@@ -121,6 +122,52 @@ describe.skipIf(!TEST_DATABASE_URL)("backfill jobs", () => {
     const jobs = await db.selectFrom("backfill_jobs").selectAll().execute();
     const reused = jobs.find((job) => job.id === firstId);
     expect(reused?.requested_by).toEqual(["client-a", "client-b"]);
+  });
+
+  it("applies admission limits only to new missing work", async () => {
+    const limits = { ...DEFAULT_BACKFILL_ADMISSION_LIMITS, maxWorkMinutes: 1 };
+    await expect(requestBackfill(db, {
+      instrumentId, fromTs: minute(0), toTs: minute(2), requestedBy: "client-a",
+    }, limits)).rejects.toMatchObject({ resource: "work_minutes", limit: 1 });
+    expect(await db.selectFrom("backfill_jobs").select((eb) => eb.fn.countAll().as("n")).executeTakeFirstOrThrow()).toMatchObject({ n: "0" });
+
+    const id = await requestBackfill(db, {
+      instrumentId, fromTs: minute(0), toTs: minute(2), requestedBy: "client-a",
+    });
+    expect(await requestBackfill(db, {
+      instrumentId, fromTs: minute(1), toTs: minute(1), requestedBy: "client-b",
+    }, { ...limits, maxDatabaseBytes: 1 })).toBe(id);
+  });
+
+  it("rejects queue and database budget overflow without partial jobs", async () => {
+    await requestBackfill(db, { instrumentId, fromTs: minute(0), toTs: minute(0), requestedBy: "client-a" });
+    await expect(requestBackfill(db, {
+      instrumentId, fromTs: minute(2), toTs: minute(2), requestedBy: "client-a",
+    }, { ...DEFAULT_BACKFILL_ADMISSION_LIMITS, maxPendingJobs: 1 })).rejects.toMatchObject({ resource: "queue_jobs", limit: 1 });
+    expect(await db.selectFrom("backfill_jobs").select((eb) => eb.fn.countAll().as("n")).executeTakeFirstOrThrow()).toMatchObject({ n: "1" });
+
+    await db.deleteFrom("backfill_jobs").execute();
+    await expect(requestBackfill(db, {
+      instrumentId, fromTs: minute(0), toTs: minute(0), requestedBy: "client-a",
+    }, { ...DEFAULT_BACKFILL_ADMISSION_LIMITS, maxDatabaseBytes: 1 })).rejects.toMatchObject({ resource: "database_bytes", limit: 1 });
+    expect(await db.selectFrom("backfill_jobs").select((eb) => eb.fn.countAll().as("n")).executeTakeFirstOrThrow()).toMatchObject({ n: "0" });
+  });
+
+  it("serializes database reservations across concurrent submissions", async () => {
+    const size = await sql<{ bytes: string }>`select pg_database_size(current_database())::text as bytes`.execute(db);
+    const limits = {
+      ...DEFAULT_BACKFILL_ADMISSION_LIMITS,
+      estimatedBytesPerWorkMinute: 1,
+      maxDatabaseBytes: Number(size.rows[0]!.bytes) + 4097,
+    };
+    const results = await Promise.allSettled([
+      requestBackfill(db, { instrumentId, fromTs: minute(0), toTs: minute(0), requestedBy: "client-a" }, limits),
+      requestBackfill(db, { instrumentId, fromTs: minute(2), toTs: minute(2), requestedBy: "client-b" }, limits),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.find((result) => result.status === "rejected"))
+      .toMatchObject({ reason: { resource: "database_bytes" } });
   });
 
   it("fills candles across chunks with checkpoints and completes", async () => {

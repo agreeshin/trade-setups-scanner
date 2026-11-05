@@ -9,7 +9,7 @@ import { SpikeParamsSchema } from "../algorithms.js";
 import { registerControls } from "./controls.js";
 import { ApiCandleSource } from "../replay/source.js";
 import { replayRun } from "../replay/replay-runner.js";
-import { cancelReplayRun, enqueueReplayRuns, replayRunDto } from "../replay/jobs.js";
+import { admitReplayCacheMiss, cancelReplayRun, DEFAULT_REPLAY_ADMISSION_LIMITS, replayRunDto, ReplayAdmissionError, reserveReplayRuns, type ReplayAdmissionLimits } from "../replay/jobs.js";
 import { saveQualityPage, type QualityInterval } from "../replay/quality.js";
 import { prepareReplayRequest, replayPreflight, type ReplayRequest } from "../replay/preflight.js";
 import {
@@ -36,6 +36,12 @@ export type ApiKeyGuard = (
 ) => Promise<void>;
 
 const ErrorEnvelope = Type.Object({ error: Type.String() });
+const ResourceLimitEnvelope = Type.Object({
+  error: Type.String(),
+  resource: Type.Union([Type.Literal("queue_jobs"), Type.Literal("work_minutes"), Type.Literal("database_bytes")]),
+  requested: Type.Number(),
+  limit: Type.Number(),
+});
 
 const InstrumentInput = Type.Object({
   exchange: Type.String(),
@@ -121,13 +127,14 @@ export interface PlatformV1Options {
   db: Kysely<SignalsDB>;
   requireApiKey: ApiKeyGuard;
   marketData: { url: string; apiKey: string };
+  replayLimits?: ReplayAdmissionLimits;
 }
 
 export function registerPlatformV1Routes(
   app: FastifyInstance,
   options: PlatformV1Options,
 ): void {
-  const { db, requireApiKey, marketData } = options;
+  const { db, requireApiKey, marketData, replayLimits = DEFAULT_REPLAY_ADMISSION_LIMITS } = options;
   registerControls(app, options);
 
   app.post("/v1/replay-preflight", { preHandler: [requireApiKey], schema: { body: ReplayRunRequest } }, async (request, reply) => {
@@ -152,7 +159,7 @@ export function registerPlatformV1Routes(
       preHandler: [requireApiKey],
       schema: {
         body: ReplayRunRequest,
-        response: { 200: Type.Object({ runs: Type.Array(RunDto) }), 202: Type.Object({ runs: Type.Array(RunDto) }), 400: ErrorEnvelope, 401: ErrorEnvelope, 429: ErrorEnvelope },
+        response: { 200: Type.Object({ runs: Type.Array(RunDto) }), 202: Type.Object({ runs: Type.Array(RunDto) }), 400: ErrorEnvelope, 401: ErrorEnvelope, 429: ResourceLimitEnvelope },
       },
     },
     async (request, reply) => {
@@ -161,39 +168,45 @@ export function registerPlatformV1Routes(
       const body = prepared.request;
       const params = body.params;
 
-      if (body.async) {
-        const queued = await enqueueReplayRuns(db, { ...body, params });
-        if (!queued) return reply.code(429).send({ error: "replay_queue_full_max_100" });
-        return reply.code(202).send({ runs: queued.map(replayRunDto) });
+      let admitted;
+      try {
+        admitted = await reserveReplayRuns(
+          db,
+          { ...body, params },
+          replayLimits,
+          body.async ? "queued" : "running",
+        );
+      } catch (error) {
+        if (error instanceof ReplayAdmissionError) {
+          return reply.code(429).send({
+            error: `resource_limit_exceeded:${error.resource}:${error.requested}:${error.limit}`,
+            resource: error.resource,
+            requested: error.requested,
+            limit: error.limit,
+          });
+        }
+        throw error;
       }
-      const generation = await cacheGeneration(db);
+      if (body.async) return reply.code(202).send({ runs: admitted.map(replayRunDto) });
+      try {
+        const generation = await cacheGeneration(db);
 
-      const catalog = await fetchCatalog(marketData.url, marketData.apiKey);
-      const byIdentity = new Map(
-        catalog.map((item) => [`${item.exchange}/${item.category}/${item.symbol}`, item]),
-      );
+        const catalog = await fetchCatalog(marketData.url, marketData.apiKey);
+        const byIdentity = new Map(
+          catalog.map((item) => [`${item.exchange}/${item.category}/${item.symbol}`, item]),
+        );
 
-      const runs: Record<string, unknown>[] = [];
-      for (const instrument of body.instruments) {
+        const runs: Record<string, unknown>[] = [];
+        for (const [index, instrument] of body.instruments.entries()) {
+        const run = admitted[index]!;
         const catalogEntry = byIdentity.get(
           `${instrument.exchange}/${instrument.category}/${instrument.symbol}`,
         );
         if (catalogEntry === undefined) {
           const failed = await db
-            .insertInto("replay_runs")
-            .values({
-              exchange_code: instrument.exchange,
-              category: instrument.category,
-              symbol: instrument.symbol,
-              from_ts: new Date(body.fromUnix * 1000),
-              to_ts: new Date(body.toUnix * 1000),
-              algorithm_id: SPIKE_ALGORITHM_ID,
-              algorithm_version: SPIKE_ALGORITHM_VERSION,
-              params,
-              status: "failed",
-              cache_hit: false,
-              error: "instrument not found in market data catalog",
-            })
+            .updateTable("replay_runs")
+            .set({ status: "failed", error: "instrument not found in market data catalog", updated_at: new Date() })
+            .where("id", "=", run.id)
             .returningAll()
             .executeTakeFirstOrThrow();
           runs.push({
@@ -222,23 +235,6 @@ export function registerPlatformV1Routes(
           toUnix: body.toUnix,
         };
 
-        const run = await db
-          .insertInto("replay_runs")
-          .values({
-            exchange_code: instrument.exchange,
-            category: instrument.category,
-            symbol: instrument.symbol,
-            from_ts: new Date(body.fromUnix * 1000),
-            to_ts: new Date(body.toUnix * 1000),
-            algorithm_id: SPIKE_ALGORITHM_ID,
-            algorithm_version: SPIKE_ALGORITHM_VERSION,
-            params,
-            status: "running",
-            cache_hit: false,
-          })
-          .returningAll()
-          .executeTakeFirstOrThrow();
-
         const cached = await cacheLookup(db, cacheQuery);
         if (cached !== null) {
           const completed = await db.transaction().execute(async (tx) => {
@@ -264,6 +260,7 @@ export function registerPlatformV1Routes(
         }
 
         try {
+          if (run.cache_hit) await admitReplayCacheMiss(db, run, replayLimits);
           const source = new ApiCandleSource(
             marketData.url,
             marketData.apiKey,
@@ -328,8 +325,21 @@ export function registerPlatformV1Routes(
             .returningAll().executeTakeFirstOrThrow();
           runs.push(replayRunDto(failed));
         }
+        }
+        await reply.send({ runs });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await db.updateTable("replay_runs")
+          .set({
+            status: sql<string>`case when status = 'cancel_requested' then 'cancelled' else 'failed' end`,
+            error: sql<string | null>`case when status = 'cancel_requested' then error else ${message} end`,
+            updated_at: new Date(),
+          })
+          .where("id", "in", admitted.map((run) => run.id))
+          .where("status", "in", ["running", "cancel_requested"])
+          .execute();
+        throw error;
       }
-      await reply.send({ runs });
     },
   );
 
