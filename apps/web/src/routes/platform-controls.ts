@@ -40,6 +40,15 @@ export function localDateInput(unix: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/** When the picked date changes, reset the time to 00:00 UTC of that date, shown in the user's local time. */
+export function utcMidnightOnDateChange(previous: string, next: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(next) || previous.slice(0, 10) === next.slice(0, 10)) return next;
+  const [year, month, day] = next.slice(0, 10).split("-").map(Number);
+  const midnight = new Date(Date.UTC(year, month - 1, day));
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${midnight.getFullYear()}-${pad(midnight.getMonth() + 1)}-${pad(midnight.getDate())}T${pad(midnight.getHours())}:${pad(midnight.getMinutes())}`;
+}
+
 export function replayRange(from: string, to: string): { fromUnix: number; toUnix: number } {
   const parse = (value: string): number => {
     if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) return NaN;

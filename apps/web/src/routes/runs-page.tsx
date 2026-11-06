@@ -4,7 +4,7 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Select } from "../components/ui/select";
 import { apiFetch, fetchPlatform, type PlatformState } from "../lib/platform-api";
-import { errorText, localDateInput, localTime, localTimezone, replayRange, savePreference, writePlatform, type Algorithm, type SetupRow } from "./platform-controls";
+import { errorText, localDateInput, localTime, localTimezone, replayRange, savePreference, utcMidnightOnDateChange, writePlatform, type Algorithm, type SetupRow } from "./platform-controls";
 import { SetupTable } from "./setup-table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
 import { usePlatformPoll } from "./use-platform-poll";
@@ -197,8 +197,8 @@ export function RunsPage() {
       {catalog.kind === "ready" && <InstrumentPicker catalog={catalog.data.instruments} symbols={form.symbols} onChange={(symbols) => changeForm({ ...form, symbols })} disabled={!ready || busy} />}
       <p id="timezone" className="text-sm text-muted-foreground">Локальное время: {localTimezone}. В API передаются Unix-секунды.</p>
       <div className="grid gap-3 sm:grid-cols-2">
-        <label className="grid gap-1 text-sm">Начало<Input type="datetime-local" required aria-describedby="timezone" disabled={!ready || busy} value={form.from} onChange={(event) => changeForm({ ...form, from: event.target.value })} /></label>
-        <label className="grid gap-1 text-sm">Конец<Input type="datetime-local" required aria-describedby="timezone" disabled={!ready || busy} value={form.to} onChange={(event) => changeForm({ ...form, to: event.target.value })} /></label>
+        <label className="grid gap-1 text-sm">Начало<Input type="datetime-local" required aria-describedby="timezone" disabled={!ready || busy} value={form.from} onChange={(event) => changeForm({ ...form, from: utcMidnightOnDateChange(form.from, event.target.value) })} /></label>
+        <label className="grid gap-1 text-sm">Конец<Input type="datetime-local" required aria-describedby="timezone" disabled={!ready || busy} value={form.to} onChange={(event) => changeForm({ ...form, to: utcMidnightOnDateChange(form.to, event.target.value) })} /></label>
       </div>
       {error && <p role="alert">{error}</p>}{message && <p role="status">{message}</p>}
       <p className="text-xs text-muted-foreground">Расчёт выполняется в фоне. Список обновляется каждые 3 секунды в видимой вкладке. Закрытие страницы не отменяет расчёт; используйте кнопку отмены.</p>

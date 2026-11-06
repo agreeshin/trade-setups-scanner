@@ -84,6 +84,22 @@ it("shows the coverage overview table with data-only default and symbol filter",
   expect(await screen.findByText("Нет инструментов по текущему фильтру.")).toBeInTheDocument();
 });
 
+it("resets the time to UTC midnight of the newly picked date", () => {
+  stubFetch();
+  render(<HistoryPage />);
+  const from = screen.getByLabelText("Начало загрузки");
+  const local = (date: Date) => {
+    const pad = (part: number) => String(part).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  };
+  fireEvent.change(from, { target: { value: "2026-01-30T14:30" } });
+  expect(from).toHaveValue(local(new Date(Date.UTC(2026, 0, 30))));
+  fireEvent.change(from, { target: { value: "2026-01-30T09:15" } });
+  expect(from).toHaveValue("2026-01-30T09:15");
+  fireEvent.change(from, { target: { value: "2026-02-01T09:15" } });
+  expect(from).toHaveValue(local(new Date(Date.UTC(2026, 1, 1))));
+});
+
 it("groups long lists into separate tabs", async () => {
   stubFetch();
   render(<HistoryPage />);

@@ -4,7 +4,7 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Select } from "../components/ui/select";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
-import { errorText, localTime, localTimezone, replayRange, writePlatform } from "./platform-controls";
+import { errorText, localTime, localTimezone, replayRange, utcMidnightOnDateChange, writePlatform } from "./platform-controls";
 import { usePlatformPoll } from "./use-platform-poll";
 
 interface Coverage { instrumentId: number; firstMinuteUnix: number | null; lastMinuteUnix: number | null; totalCandles: number; intervals: { startUnix: number; endUnix: number }[]; gaps: { startUnix: number; endUnix: number }[] }
@@ -142,7 +142,7 @@ export function HistoryPage() {
       </div>
       <InstrumentPicker catalog={instruments} symbols={symbols} onChange={(value) => { setSymbols(value); setMessage(null); }} disabled={busy || catalog.kind !== "ready"} />
       <form className="grid max-w-2xl gap-3 rounded-md border border-input p-4" onSubmit={(event) => { void enqueue(event); }}>
-        <div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-sm">Начало загрузки<Input type="datetime-local" required value={from} onChange={(event) => setFrom(event.target.value)} /></label><label className="grid gap-1 text-sm">Конец загрузки<Input type="datetime-local" required value={to} onChange={(event) => setTo(event.target.value)} /></label></div>
+        <div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-sm">Начало загрузки<Input type="datetime-local" required value={from} onChange={(event) => setFrom(utcMidnightOnDateChange(from, event.target.value))} /></label><label className="grid gap-1 text-sm">Конец загрузки<Input type="datetime-local" required value={to} onChange={(event) => setTo(utcMidnightOnDateChange(to, event.target.value))} /></label></div>
         <p className="text-sm text-muted-foreground">Выбрано инструментов: {pickedInstruments.length}.</p>
         <Button type="submit" disabled={busy || pickedInstruments.length === 0}>Поставить загрузку в очередь ({pickedInstruments.length})</Button>
       </form>

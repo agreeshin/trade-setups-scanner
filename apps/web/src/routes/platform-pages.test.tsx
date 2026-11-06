@@ -65,12 +65,12 @@ describe("platform screens", () => {
     expect(screen.getByRole("checkbox", { name: "BTCUSDT (Trading)" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "ETHUSDT (Delisted)" })).toBeChecked();
     fireEvent.change(screen.getByLabelText("Начало"), { target: { value: "2026-10-10T12:00" } });
-    fireEvent.change(screen.getByLabelText("Конец"), { target: { value: "2026-10-10T13:00" } });
+    fireEvent.change(screen.getByLabelText("Конец"), { target: { value: "2026-10-11T13:00" } });
     await userEvent.click(screen.getByRole("button", { name: "Проверить данные" }));
     expect(requests.some((request) => request.path === "/v1/replay-runs" && request.method === "POST")).toBe(false);
     await userEvent.click(await screen.findByRole("button", { name: "Запустить проверенный расчёт" }));
     await screen.findByText(/Запрос запуска принят/);
-    expect(requests.find((request) => request.path === "/v1/replay-runs" && request.method === "POST")?.body).toEqual({ async: true, algorithmVersion: "snapshot-v2", params: { priceGrowthPct: "17", windowMinutes: 9 }, algorithmId: "price_volume_spike", instruments: [{ exchange: "bybit", category: "linear", symbol: "BTCUSDT" }, { exchange: "bybit", category: "linear", symbol: "ETHUSDT" }], fromUnix: new Date("2026-10-10T12:00").getTime() / 1000, toUnix: new Date("2026-10-10T13:00").getTime() / 1000 });
+    expect(requests.find((request) => request.path === "/v1/replay-runs" && request.method === "POST")?.body).toEqual({ async: true, algorithmVersion: "snapshot-v2", params: { priceGrowthPct: "17", windowMinutes: 9 }, algorithmId: "price_volume_spike", instruments: [{ exchange: "bybit", category: "linear", symbol: "BTCUSDT" }, { exchange: "bybit", category: "linear", symbol: "ETHUSDT" }], fromUnix: Date.UTC(2026, 9, 10) / 1000, toUnix: Date.UTC(2026, 9, 11) / 1000 });
     expect(requests.some((request) => request.method === "PUT")).toBe(false);
     await userEvent.click(screen.getByRole("button", { name: "Сохранить форму" }));
     await screen.findByText("Форма сохранена в базе сигналов.");
@@ -196,10 +196,10 @@ describe("platform screens", () => {
     await userEvent.click(screen.getByRole("tab", { name: "Загрузка истории" }));
     await userEvent.click(await screen.findByRole("checkbox", { name: "BTCUSDT (Trading)" }));
     fireEvent.change(screen.getByLabelText("Начало загрузки"), { target: { value: "2026-10-10T12:00" } });
-    fireEvent.change(screen.getByLabelText("Конец загрузки"), { target: { value: "2026-10-10T13:00" } });
+    fireEvent.change(screen.getByLabelText("Конец загрузки"), { target: { value: "2026-10-11T13:00" } });
     await userEvent.click(screen.getByRole("button", { name: "Поставить загрузку в очередь (1)" }));
     await screen.findByText(/Создано заданий: 1/);
-    expect(requests.find((request) => request.path === "/v1/history/backfill-jobs/batch" && request.method === "POST")?.body).toMatchObject({ instrumentIds: [1], fromUnix: new Date("2026-10-10T12:00").getTime() / 1000 });
+    expect(requests.find((request) => request.path === "/v1/history/backfill-jobs/batch" && request.method === "POST")?.body).toMatchObject({ instrumentIds: [1], fromUnix: Date.UTC(2026, 9, 10) / 1000 });
     await userEvent.click(screen.getByRole("tab", { name: "Задания загрузки" }));
     await userEvent.click(screen.getByRole("button", { name: "Отменить загрузку 9" }));
     await screen.findByText("Отмена задания #9 запрошена.");
