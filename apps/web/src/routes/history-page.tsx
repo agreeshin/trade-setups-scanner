@@ -30,6 +30,31 @@ function InstrumentCoverage({ id, revision }: { id: number; revision: number }) 
   </section>;
 }
 
+interface CoverageSummaryRow { instrumentId: number; exchange: string; category: string; symbol: string; status: string; firstMinuteUnix: number | null; lastMinuteUnix: number | null; totalCandles: number; missingMinutes: number }
+
+function CoverageOverview({ revision }: { revision: number }) {
+  const state = usePlatformPoll<{ instruments: CoverageSummaryRow[] }>("/v1/history/instruments/coverage-summary", revision, 0);
+  const [filter, setFilter] = useState("");
+  const [withDataOnly, setWithDataOnly] = useState(true);
+  if (state.kind === "loading") return <p>Загрузка обзора покрытия…</p>;
+  if (state.kind === "unreachable") return <p role="alert">Обзор покрытия неизвестен: API недоступен ({state.detail}). Это не означает отсутствие данных.</p>;
+  const all = state.data.instruments;
+  const withData = all.filter((row) => row.totalCandles > 0).length;
+  const needle = filter.trim().toLowerCase();
+  const rows = all.filter((row) => (!withDataOnly || row.totalCandles > 0) && row.symbol.toLowerCase().includes(needle));
+  return <section aria-labelledby="coverage-overview-heading" className="grid gap-3">
+    <h2 id="coverage-overview-heading" className="text-lg font-semibold">Обзор покрытия истории</h2>
+    <p className="text-xs text-muted-foreground">Инструментов со свечами: {withData} из {all.length}. «Пропущено минут» — суммарные разрывы между первой и последней сохранённой минутой инструмента; точные интервалы — в детальном покрытии ниже.</p>
+    <div className="flex flex-wrap items-end gap-3">
+      <label className="grid gap-1 text-sm">Фильтр по символу<Input value={filter} onChange={(event) => setFilter(event.target.value)} /></label>
+      <label className="flex items-center gap-2 pb-1 text-sm"><input type="checkbox" checked={withDataOnly} onChange={(event) => setWithDataOnly(event.target.checked)} /> Только инструменты со свечами</label>
+    </div>
+    <div className="max-h-96 overflow-auto rounded-md border border-input"><table className="w-full text-sm"><thead className="sticky top-0 bg-background"><tr className="text-left"><th className="p-2">Инструмент</th><th className="p-2">Статус</th><th className="p-2">Первая минута</th><th className="p-2">Последняя минута</th><th className="p-2">Свечей</th><th className="p-2">Пропущено минут</th></tr></thead><tbody>{rows.slice(0, 200).map((row) => <tr key={row.instrumentId} className="border-b border-input"><td className="p-2">{row.symbol}</td><td className="p-2">{row.status}</td><td className="p-2">{row.firstMinuteUnix === null ? "нет" : localTime(row.firstMinuteUnix)}</td><td className="p-2">{row.lastMinuteUnix === null ? "нет" : localTime(row.lastMinuteUnix)}</td><td className="p-2">{row.totalCandles}</td><td className="p-2">{row.totalCandles === 0 ? "—" : row.missingMinutes}</td></tr>)}</tbody></table></div>
+    {rows.length > 200 && <p className="text-sm text-muted-foreground">Показаны первые 200 из {rows.length}.</p>}
+    {rows.length === 0 && <p>Нет инструментов по текущему фильтру.</p>}
+  </section>;
+}
+
 export function HistoryPage() {
   const [revision, setRevision] = useState(0);
   const [tab, setTab] = useState<HistoryTab>("upload");
@@ -125,6 +150,7 @@ export function HistoryPage() {
 
     {tab === "collection" && <section className="grid gap-3" aria-labelledby="collection-heading">
       <h2 id="collection-heading" className="text-lg font-semibold">Текущий сбор свечей</h2>
+      <CoverageOverview revision={revision} />
       <div className="flex flex-wrap items-end gap-3"><label className="grid min-w-0 gap-1 text-sm">Инструмент БД<Select value={instrumentId} disabled={catalog.kind !== "ready" || busy} onChange={(event) => setInstrumentId(event.target.value)}><option value="">Выберите инструмент</option>{instruments.map((instrument) => <option key={instrument.id} value={instrument.id}>{instrument.exchange} / {instrument.category} / {instrument.symbol} ({instrument.status})</option>)}</Select></label><Button variant="outline" disabled={busy} onClick={() => setRevision((value) => value + 1)}>Обновить историю</Button></div>
       {catalog.kind === "loading" && <p>Загрузка каталога…</p>}{catalog.kind === "unreachable" && <p role="alert">Каталог недоступен ({catalog.detail})</p>}
       {selected && <InstrumentCoverage key={selected.id} id={selected.id} revision={revision} />}

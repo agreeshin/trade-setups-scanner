@@ -13,6 +13,13 @@ const catalog = {
   ],
 };
 const emptyCounts = { queued: 0, running: 0, done: 0, cancel_requested: 0, cancelled: 0, failed: 0 };
+const coverageSummary = {
+  instruments: [
+    { instrumentId: 1, exchange: "bybit", category: "linear", symbol: "BTCUSDT", status: "active", firstMinuteUnix: 1767225600, lastMinuteUnix: 1767312000, totalCandles: 1440, missingMinutes: 5 },
+    { instrumentId: 2, exchange: "bybit", category: "linear", symbol: "ETHUSDT", status: "active", firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, missingMinutes: 0 },
+    { instrumentId: 3, exchange: "bybit", category: "linear", symbol: "OLDUSDT", status: "delisted", firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, missingMinutes: 0 },
+  ],
+};
 
 function stubFetch(options: { counts?: typeof emptyCounts } = {}) {
   const posts: { url: string; body: unknown }[] = [];
@@ -23,6 +30,7 @@ function stubFetch(options: { counts?: typeof emptyCounts } = {}) {
       return Promise.resolve(new Response(JSON.stringify({ jobs: [], created: 2, declined: 0 }), { status: 202 }));
     }
     if (path === "/v1/instruments") return Promise.resolve(new Response(JSON.stringify(catalog), { status: 200 }));
+    if (path === "/v1/history/instruments/coverage-summary") return Promise.resolve(new Response(JSON.stringify(coverageSummary), { status: 200 }));
     if (path === "/v1/history/instruments/listing") return Promise.resolve(new Response(JSON.stringify({ instruments: catalog.instruments.slice(0, 2) }), { status: 200 }));
     if (path === "/v1/history/backfill-jobs") return Promise.resolve(new Response(JSON.stringify({ jobs: [], nextBeforeId: null, counts: options.counts ?? emptyCounts }), { status: 200 }));
     if (path === "/v1/history/collection-targets") return Promise.resolve(new Response(JSON.stringify({ targets: [] }), { status: 200 }));
@@ -59,6 +67,21 @@ it("imports the bybit listing, keeps the list editable and submits one confirmed
   const batch = posts[0] as { url: string; body: { instrumentIds: number[]; fromUnix: number; toUnix: number } };
   expect(batch.url).toBe("/v1/history/backfill-jobs/batch");
   expect(batch.body.instrumentIds).toEqual([1, 2]);
+});
+
+it("shows the coverage overview table with data-only default and symbol filter", async () => {
+  stubFetch();
+  render(<HistoryPage />);
+  await userEvent.click(screen.getByRole("tab", { name: "Текущий сбор свечей" }));
+  expect(await screen.findByRole("heading", { name: "Обзор покрытия истории" })).toBeInTheDocument();
+  expect(screen.getByText(/Инструментов со свечами: 1 из 3/)).toBeInTheDocument();
+  expect(screen.getByText("1440")).toBeInTheDocument();
+  expect(screen.getByText("5")).toBeInTheDocument();
+  expect(screen.queryByText("—")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByLabelText("Только инструменты со свечами"));
+  expect(await screen.findAllByText("—")).toHaveLength(2);
+  fireEvent.change(screen.getByLabelText("Фильтр по символу"), { target: { value: "zzz" } });
+  expect(await screen.findByText("Нет инструментов по текущему фильтру.")).toBeInTheDocument();
 });
 
 it("groups long lists into separate tabs", async () => {

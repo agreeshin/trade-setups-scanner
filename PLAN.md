@@ -19,6 +19,7 @@
 - completed: UI «История и сбор»: вкладки загрузка истории / текущий сбор свечей / задания загрузки, InstrumentPicker (ручной выбор/CSV по одноколоночному контракту), импорт листинга, подтверждённый batch, summary активных заданий по серверным counts.
 - completed: регрессии web 75, market-data 70, platform 108, typecheck/lint/build; production restore и массовая загрузка в тестах не выполнялись.
 - completed: развёрнуто на tv 6 ноября: pre-deploy dumps обеих БД, поочерёдный recreate application-контейнеров без рестарта PostgreSQL, readiness 200, listing import импортировал 819 active-инструментов, proxy и counts подтверждены, batch не запускался. Детали — `docs/invent/tv.md`.
+- completed: обзорная таблица «Обзор покрытия истории» на вкладке «Текущий сбор свечей»: read-only `GET /v1/instruments/coverage-summary` (один SQL-агрегат по всем инструментам), platform proxy и UI с фильтром по символу и переключателем «только со свечами». Регрессии market-data 71 / platform 108 / web 76, typecheck/lint/build; развёрнуто на tv 6 ноября, smoke подтвердил 819 инструментов и 4 со свечами.
 
 ## Preflight replay (2026-11-04)
 

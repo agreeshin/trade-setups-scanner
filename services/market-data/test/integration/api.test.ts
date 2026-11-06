@@ -139,6 +139,46 @@ describe.skipIf(!TEST_DATABASE_URL)("market data v1 api", () => {
     ]);
   });
 
+  it("returns coverage summaries for all instruments with derived missing minutes", async () => {
+    const emptyId = await ensureInstrument(db, {
+      exchangeCode: "bybit",
+      category: "linear",
+      symbol: "EMPTYUSDT",
+    });
+    const unauthenticated = await app.inject({ method: "GET", url: "/v1/instruments/coverage-summary" });
+    expect(unauthenticated.statusCode).toBe(401);
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/instruments/coverage-summary",
+      headers: { "x-api-key": API_KEY },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json<{
+      instruments: {
+        instrumentId: number;
+        symbol: string;
+        firstMinuteUnix: number | null;
+        lastMinuteUnix: number | null;
+        totalCandles: number;
+        missingMinutes: number;
+      }[];
+    }>();
+    expect(body.instruments.find((row) => row.instrumentId === instrumentId)).toMatchObject({
+      symbol: "APIUSDT",
+      firstMinuteUnix: unix(minute(0)),
+      lastMinuteUnix: unix(minute(6)),
+      totalCandles: 4,
+      missingMinutes: 3,
+    });
+    expect(body.instruments.find((row) => row.instrumentId === emptyId)).toMatchObject({
+      symbol: "EMPTYUSDT",
+      firstMinuteUnix: null,
+      lastMinuteUnix: null,
+      totalCandles: 0,
+      missingMinutes: 0,
+    });
+  });
+
   it("reads candles as decimal strings with unix-second timestamps", async () => {
     const response = await app.inject({
       method: "GET",

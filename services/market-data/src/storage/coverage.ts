@@ -105,6 +105,45 @@ export async function getCoverageRange(
   };
 }
 
+export interface CoverageSummaryRow {
+  instrumentId: number;
+  exchange: string;
+  category: string;
+  symbol: string;
+  status: string;
+  firstMinute: Date | null;
+  lastMinute: Date | null;
+  totalCandles: number;
+  missingMinutes: number;
+}
+
+/** One statement snapshot across all instruments; only aggregate values reach Node. */
+export async function getCoverageSummaries(
+  db: Kysely<MarketDataDB>,
+): Promise<CoverageSummaryRow[]> {
+  const result = await sql<CoverageSummaryRow>`
+    WITH ordered AS (
+      SELECT instrument_id, open_time,
+        lag(open_time) OVER (PARTITION BY instrument_id ORDER BY open_time) AS prev
+      FROM candles
+    ), per_instrument AS (
+      SELECT instrument_id, count(*)::int AS total,
+        min(open_time) AS first_minute, max(open_time) AS last_minute,
+        coalesce(sum(floor(extract(epoch FROM (open_time - prev)) / 60 - 1))
+          FILTER (WHERE prev IS NOT NULL AND open_time > prev + interval '1 minute'), 0)::int AS missing_minutes
+      FROM ordered GROUP BY instrument_id
+    )
+    SELECT i.id AS "instrumentId", e.code AS exchange, i.category, i.symbol, i.status,
+      p.first_minute AS "firstMinute", p.last_minute AS "lastMinute",
+      coalesce(p.total, 0)::int AS "totalCandles", coalesce(p.missing_minutes, 0) AS "missingMinutes"
+    FROM instruments i
+    JOIN exchanges e ON e.id = i.exchange_id
+    LEFT JOIN per_instrument p ON p.instrument_id = i.id
+    ORDER BY i.symbol
+  `.execute(db);
+  return result.rows;
+}
+
 export async function getCoverage(
   db: Kysely<MarketDataDB>,
   instrumentId: number,

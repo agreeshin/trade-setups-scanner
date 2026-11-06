@@ -3,7 +3,7 @@ import { Type } from "@sinclair/typebox";
 import type { Kysely } from "kysely";
 import type { MarketDataDB } from "../db/schema.js";
 import { readCandles } from "../storage/candles.js";
-import { COVERAGE_MAX_UNIX, COVERAGE_MIN_UNIX, getCoverage, getCoverageRange, type CoverageRangeInput } from "../storage/coverage.js";
+import { COVERAGE_MAX_UNIX, COVERAGE_MIN_UNIX, getCoverage, getCoverageRange, getCoverageSummaries, type CoverageRangeInput } from "../storage/coverage.js";
 import { registerManagementRoutes } from "./management.js";
 import type { BackfillAdmissionLimits } from "../ingest/backfill.js";
 
@@ -27,6 +27,20 @@ const InstrumentsResponse = Type.Object({
 const IntervalDto = Type.Object({
   startUnix: Type.Integer(),
   endUnix: Type.Integer(),
+});
+
+const CoverageSummaryResponse = Type.Object({
+  instruments: Type.Array(Type.Object({
+    instrumentId: Type.Integer(),
+    exchange: Type.String(),
+    category: Type.String(),
+    symbol: Type.String(),
+    status: Type.String(),
+    firstMinuteUnix: Type.Union([Type.Integer(), Type.Null()]),
+    lastMinuteUnix: Type.Union([Type.Integer(), Type.Null()]),
+    totalCandles: Type.Integer(),
+    missingMinutes: Type.Integer(),
+  })),
 });
 
 const CoverageResponse = Type.Object({
@@ -103,6 +117,32 @@ export function registerV1Routes(
           category: row.category,
           symbol: row.symbol,
           status: row.status,
+        })),
+      });
+    },
+  );
+
+  app.get(
+    "/v1/instruments/coverage-summary",
+    {
+      preHandler: [requireApiKey],
+      schema: {
+        response: { 200: CoverageSummaryResponse, 401: ErrorEnvelope },
+      },
+    },
+    async (_request, reply) => {
+      const rows = await getCoverageSummaries(db);
+      await reply.send({
+        instruments: rows.map((row) => ({
+          instrumentId: row.instrumentId,
+          exchange: row.exchange,
+          category: row.category,
+          symbol: row.symbol,
+          status: row.status,
+          firstMinuteUnix: row.firstMinute === null ? null : Math.floor(row.firstMinute.getTime() / 1000),
+          lastMinuteUnix: row.lastMinute === null ? null : Math.floor(row.lastMinute.getTime() / 1000),
+          totalCandles: row.totalCandles,
+          missingMinutes: row.missingMinutes,
         })),
       });
     },

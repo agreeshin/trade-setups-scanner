@@ -99,6 +99,7 @@ export function registerControls(app: FastifyInstance, options: PlatformV1Option
   });
   const historyRoutes = [
     { method: "GET", path: "/instruments/:instrumentId/coverage", params: Type.Object({ instrumentId: Type.Integer({ minimum: 1 }) }) },
+    { method: "GET", path: "/instruments/coverage-summary" },
     { method: "GET", path: "/instruments/listing" },
     { method: "GET", path: "/backfill-jobs" },
     { method: "POST", path: "/backfill-jobs", body: Type.Object({ instrumentId: Type.Integer({ minimum: 1 }), fromUnix: Type.Integer({ minimum: 0 }), toUnix: Type.Integer({ minimum: 0 }) }, { additionalProperties: false }) },
