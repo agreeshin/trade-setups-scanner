@@ -35,6 +35,8 @@ beforeEach(() => {
     if (path === "/v1/instrument-lists/live") data = { configured: false, instruments: [] };
     if (path === "/v1/history/backfill-jobs") data = { jobs: [{ id: 9, instrumentId: 1, fromUnix: 100, toUnix: 200, checkpointUnix: 150, status: "running", error: null }], counts: { queued: 0, running: 1, done: 0, cancel_requested: 0, cancelled: 0, failed: 0 } };
     if (path === "/v1/history/backfill-jobs/batch") data = { jobs: [], created: 1, declined: 0 };
+    if (path === "/v1/history/backfill-plans" && method === "POST") data = { plan: { id: 3, fromUnix: 100, toUnix: 200, status: "active", counts: { total: 1, pending: 0, enqueued: 1, failed: 0, cancelled: 0 }, activeJobs: 1, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" } };
+    if (path === "/v1/history/backfill-plans" && method === "GET") data = { plans: [] };
     if (path === "/v1/history/collection-targets") data = { targets: [] };
     if (path === "/v1/history/instruments/1/coverage") data = { instrumentId: 1, firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, intervals: [], gaps: [] };
     if (path === "/v1/history/instruments/coverage-summary") data = { instruments: instruments.map((instrument) => ({ instrumentId: instrument.id, exchange: instrument.exchange, category: instrument.category, symbol: instrument.symbol, status: instrument.status, firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, missingMinutes: 0 })) };
@@ -197,9 +199,9 @@ describe("platform screens", () => {
     await userEvent.click(await screen.findByRole("checkbox", { name: "BTCUSDT (Trading)" }));
     fireEvent.change(screen.getByLabelText("Начало загрузки"), { target: { value: "2026-10-10T12:00" } });
     fireEvent.change(screen.getByLabelText("Конец загрузки"), { target: { value: "2026-10-11T13:00" } });
-    await userEvent.click(screen.getByRole("button", { name: "Поставить загрузку в очередь (1)" }));
-    await screen.findByText(/Создано заданий: 1/);
-    expect(requests.find((request) => request.path === "/v1/history/backfill-jobs/batch" && request.method === "POST")?.body).toMatchObject({ instrumentIds: [1], fromUnix: Date.UTC(2026, 9, 10) / 1000 });
+    await userEvent.click(screen.getByRole("button", { name: "Создать план загрузки (1)" }));
+    await screen.findByText(/Создан план загрузки #3: 1 инструментов/);
+    expect(requests.find((request) => request.path === "/v1/history/backfill-plans" && request.method === "POST")?.body).toMatchObject({ instrumentIds: [1], fromUnix: Date.UTC(2026, 9, 10) / 1000 });
     await userEvent.click(screen.getByRole("tab", { name: "Задания загрузки" }));
     await userEvent.click(screen.getByRole("button", { name: "Отменить загрузку 9" }));
     await screen.findByText("Отмена задания #9 запрошена.");

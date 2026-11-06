@@ -22,6 +22,13 @@
 - completed: обзорная таблица «Обзор покрытия истории» на вкладке «Текущий сбор свечей»: read-only `GET /v1/instruments/coverage-summary` (один SQL-агрегат по всем инструментам), platform proxy и UI с фильтром по символу и переключателем «только со свечами». Регрессии market-data 71 / platform 108 / web 76, typecheck/lint/build; развёрнуто на tv 6 ноября, smoke подтвердил 819 инструментов и 4 со свечами.
 - completed: во всех интервальных полях (загрузка истории, исторические запуски) смена даты сбрасывает время к 00:00 UTC выбранной даты в локальном отображении; ручной ввод времени сохраняется до следующей смены даты. Web 77 тестов, typecheck/lint/build; фронт развёрнут на tv 6 ноября (только web-контейнер).
 
+## Планы массовой догрузки с авто-продолжением (2026-11-06)
+
+- completed: PRD data.md §7.4 и ux.md описывают план загрузки до реализации: подтверждение создаёт сохраняемый план, сервер ставит задания порциями в пределах admission limits, остаток ожидает освобождения очереди, отмена плана останавливает постановку и запрашивает отмену активных заданий.
+- completed: миграция 003 (`backfill_plans`, `backfill_plan_items`), домен планов (`createBackfillPlan`/`topUpBackfillPlans`/`cancelBackfillPlan`), API `GET|POST /v1/backfill-plans` + cancel, platform proxy, периодический top-up в интервале сбора runtime.
+- completed: UI «Создать план загрузки» вместо прямого batch, таблица планов с прогрессом и отменой, сводка активных планов; попутно исправлена ошибка типов platform-controls из предыдущего коммита.
+- completed: регрессии market-data 74 / platform 108 / web 78, typecheck/lint/build; развёрнуто на tv 6 ноября с pre-deploy dumps обеих БД, миграция 003 применена при старте, smoke подтвердил plans API напрямую и через proxy. Production restore не выполнялся.
+
 ## Preflight replay (2026-11-04)
 
 - completed: CSV и качество replay опубликованы (`1e8599e`, `168c4df`), main синхронизирован с origin.

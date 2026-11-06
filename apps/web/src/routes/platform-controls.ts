@@ -44,6 +44,7 @@ export function localDateInput(unix: number): string {
 export function utcMidnightOnDateChange(previous: string, next: string): string {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(next) || previous.slice(0, 10) === next.slice(0, 10)) return next;
   const [year, month, day] = next.slice(0, 10).split("-").map(Number);
+  if (year === undefined || month === undefined || day === undefined) return next;
   const midnight = new Date(Date.UTC(year, month - 1, day));
   const pad = (part: number) => String(part).padStart(2, "0");
   return `${midnight.getFullYear()}-${pad(midnight.getMonth() + 1)}-${pad(midnight.getDate())}T${pad(midnight.getHours())}:${pad(midnight.getMinutes())}`;

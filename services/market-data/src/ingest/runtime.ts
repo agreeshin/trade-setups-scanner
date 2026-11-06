@@ -8,6 +8,7 @@ import { BybitClient } from "./bybit.js";
 import { FetchTransport } from "./transport.js";
 import { RealClock, type Clock } from "./clock.js";
 import { collectOnce, drainBackfills } from "./continuous.js";
+import { topUpBackfillPlans } from "./plans.js";
 import type { BackfillAdmissionLimits } from "./backfill.js";
 
 const BACKFILL_QUEUE = "backfill";
@@ -48,13 +49,19 @@ export async function startIngestRuntime(
     void (async () => {
       try {
         const scheduled = await collectOnce(options.db, clock, options.backfillLimits);
+        let toppedUp = 0;
+        try {
+          toppedUp = (await topUpBackfillPlans(options.db, options.backfillLimits)).enqueued;
+        } catch (error) {
+          console.error("backfill plan top-up failed", error);
+        }
         const pending = await options.db
           .selectFrom("backfill_jobs")
           .where("status", "=", "queued")
           .limit(1)
           .select("id")
           .executeTakeFirst();
-        if (scheduled > 0 || pending !== undefined) {
+        if (scheduled > 0 || toppedUp > 0 || pending !== undefined) {
           await boss.send({ name: BACKFILL_QUEUE, data: {} });
         }
       } catch (error) {

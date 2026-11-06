@@ -4,6 +4,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { sql, type Selectable } from "kysely";
 import type { BackfillJobsTable } from "../db/schema.js";
 import { BackfillAdmissionError, cancelBackfillRequest, requestBackfill } from "../ingest/backfill.js";
+import { createBackfillPlan, cancelBackfillPlan, getBackfillPlan, listBackfillPlans, type BackfillPlan } from "../ingest/plans.js";
 import { setCollectionTarget } from "../ingest/continuous.js";
 import { ensureInstruments } from "../storage/instruments.js";
 import type { V1RouteOptions } from "./v1.js";
@@ -61,6 +62,30 @@ function jobDto(row: Selectable<BackfillJobsTable>, requestedBy: string) {
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
     requestedByCaller: row.requested_by.includes(requestedBy),
+  };
+}
+
+const Plan = Type.Object({
+  id: Id,
+  fromUnix: Type.Integer(),
+  toUnix: Type.Integer(),
+  status: Type.Union([Type.Literal("active"), Type.Literal("completed"), Type.Literal("cancelled")]),
+  counts: Type.Object({ total: Type.Integer(), pending: Type.Integer(), enqueued: Type.Integer(), failed: Type.Integer(), cancelled: Type.Integer() }),
+  activeJobs: Type.Integer(),
+  createdAt: Type.String(),
+  updatedAt: Type.String(),
+});
+
+function planDto(plan: BackfillPlan) {
+  return {
+    id: plan.id,
+    fromUnix: plan.fromTs.getTime() / 1000,
+    toUnix: plan.toTs.getTime() / 1000 + 60,
+    status: plan.status as "active" | "completed" | "cancelled",
+    counts: plan.counts,
+    activeJobs: plan.activeJobs,
+    createdAt: plan.createdAt.toISOString(),
+    updatedAt: plan.updatedAt.toISOString(),
   };
 }
 
@@ -181,6 +206,46 @@ export function registerManagementRoutes(app: FastifyInstance, { db, requireApiK
       declined: instrumentIds.length - jobs.length,
       ...(admission ? { limit: { error: `resource_limit_exceeded:${admission.resource}:${admission.requested}:${admission.limit}`, resource: admission.resource, requested: admission.requested, limit: admission.limit } } : {}),
     });
+  });
+
+  app.get("/v1/backfill-plans", {
+    onRequest: [requireApiKey],
+    schema: { response: { 200: Type.Object({ plans: Type.Array(Plan) }), 401: ErrorResponse } },
+  }, async () => {
+    const plans = await listBackfillPlans(db);
+    return { plans: plans.map(planDto) };
+  });
+
+  app.post<{ Body: { instrumentIds: number[]; fromUnix: number; toUnix: number } }>("/v1/backfill-plans", {
+    onRequest: [requireApiKey],
+    schema: {
+      body: Type.Object({ instrumentIds: Type.Array(Id, { minItems: 1, maxItems: 1000, uniqueItems: true }), fromUnix: Unix, toUnix: Unix }, { additionalProperties: false }),
+      response: { 202: Type.Object({ plan: Plan }), 400: ErrorResponse, 401: ErrorResponse, 404: ErrorResponse },
+    },
+  }, async (request, reply) => {
+    const { instrumentIds, fromUnix, toUnix } = request.body;
+    if (toUnix <= fromUnix || toUnix - fromUnix > 5 * 366 * 86400 || toUnix > Math.floor(Date.now() / 60000) * 60) {
+      return reply.code(400).send({ error: "invalid_range: require closed minutes in [fromUnix,toUnix), maximum 1830 days" });
+    }
+    const found = await db.selectFrom("instruments").select("id").where("id", "in", instrumentIds).execute();
+    if (found.length !== instrumentIds.length) return reply.code(404).send({ error: "instrument_not_found" });
+    const id = await createBackfillPlan(
+      db,
+      { instrumentIds, fromTs: new Date(fromUnix * 1000), toTs: new Date((toUnix - 60) * 1000), requestedBy: caller(request) },
+      backfillLimits,
+    );
+    const plan = await getBackfillPlan(db, id);
+    return reply.code(202).send({ plan: planDto(plan!) });
+  });
+
+  app.post<{ Params: { id: number } }>("/v1/backfill-plans/:id/cancel", {
+    onRequest: [requireApiKey],
+    schema: { params: Type.Object({ id: Id }), response: { 200: Type.Object({ plan: Plan }), 401: ErrorResponse, 404: ErrorResponse } },
+  }, async (request, reply) => {
+    const cancelled = await cancelBackfillPlan(db, request.params.id);
+    if (!cancelled) return reply.code(404).send({ error: "plan_not_found" });
+    const plan = await getBackfillPlan(db, request.params.id);
+    return { plan: planDto(plan!) };
   });
 
   app.post<{ Params: { id: number } }>("/v1/backfill-jobs/:id/cancel", {

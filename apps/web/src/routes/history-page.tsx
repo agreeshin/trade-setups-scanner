@@ -11,6 +11,7 @@ interface Coverage { instrumentId: number; firstMinuteUnix: number | null; lastM
 interface BackfillJob { id: string | number; instrumentId: number; fromUnix: number; toUnix: number; status: string; checkpointUnix: number | null; error: string | null }
 interface CollectionTarget { instrumentId: number; enabled: boolean; lastCollectedUnix: number | null }
 interface JobCounts { queued: number; running: number; done: number; cancel_requested: number; cancelled: number; failed: number }
+interface BackfillPlanRow { id: number; fromUnix: number; toUnix: number; status: "active" | "completed" | "cancelled"; counts: { total: number; pending: number; enqueued: number; failed: number; cancelled: number }; activeJobs: number; createdAt: string; updatedAt: string }
 
 const HISTORY_TABS = [
   { id: "upload", label: "Загрузка истории" },
@@ -61,6 +62,7 @@ export function HistoryPage() {
   const catalog = usePlatformPoll<{ instruments: CatalogInstrument[] }>("/v1/instruments", revision, 0);
   const jobs = usePlatformPoll<{ jobs: BackfillJob[]; counts: JobCounts }>("/v1/history/backfill-jobs", revision);
   const targets = usePlatformPoll<{ targets: CollectionTarget[] }>("/v1/history/collection-targets", revision);
+  const plans = usePlatformPoll<{ plans: BackfillPlanRow[] }>("/v1/history/backfill-plans", revision);
   const [instrumentId, setInstrumentId] = useState("");
   const [symbols, setSymbols] = useState("");
   const [from, setFrom] = useState("");
@@ -76,6 +78,8 @@ export function HistoryPage() {
     .filter((instrument): instrument is CatalogInstrument => instrument !== undefined);
   const counts = jobs.kind === "ready" ? jobs.data.counts : null;
   const activeJobs = counts === null ? 0 : counts.queued + counts.running + counts.cancel_requested;
+  const activePlans = plans.kind === "ready" ? plans.data.plans.filter((plan) => plan.status === "active") : [];
+  const pendingPlanItems = activePlans.reduce((sum, plan) => sum + plan.counts.pending, 0);
   const instrumentName = (id: number) => instruments.find((instrument) => instrument.id === id)?.symbol ?? `ID ${id}`;
 
   async function importListing() {
@@ -106,17 +110,16 @@ export function HistoryPage() {
       if (pickedInstruments.length === 0) throw new Error("Выберите хотя бы один инструмент: вручную, импортом CSV или текущим листингом.");
       const range = replayRange(from, to);
       setBusy(true);
-      const response = await apiFetch("/v1/history/backfill-jobs/batch", {
+      const response = await apiFetch("/v1/history/backfill-plans", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ instrumentIds: pickedInstruments.map((instrument) => instrument.id), ...range }),
       });
-      const payload = await response.json() as { created?: number; declined?: number; error?: string };
-      if (!response.ok) throw new Error(payload.error ?? `HTTP ${response.status}`);
+      const payload = await response.json() as { plan?: BackfillPlanRow; error?: string };
+      if (!response.ok || !payload.plan) throw new Error(payload.error ?? `HTTP ${response.status}`);
+      const plan = payload.plan;
       setRevision((value) => value + 1);
-      setMessage((payload.declined ?? 0) > 0
-        ? `Создано заданий: ${payload.created}. Отклонено по ресурсным лимитам: ${payload.declined}. Остальные инструменты можно догрузить позже, когда очередь освободится.`
-        : `Создано заданий: ${payload.created}. Прогресс и отмена — на вкладке «Задания загрузки».`);
+      setMessage(`Создан план загрузки #${plan.id}: ${plan.counts.total} инструментов. Сервер сам ставит задания в очередь по мере освобождения лимитов — сейчас поставлено ${plan.counts.enqueued}, ожидает ${plan.counts.pending}${plan.counts.failed > 0 ? `, с невыполнимым объёмом: ${plan.counts.failed}` : ""}.`);
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
@@ -125,6 +128,8 @@ export function HistoryPage() {
     <h1 id="history-heading" className="text-2xl font-semibold">История и сбор</h1>
     <p className="text-sm text-muted-foreground">Загрузка истории и текущий сбор независимы от replay и live-сканера. Действия выполняются только по вашей команде. Время: {localTimezone}.</p>
     {jobs.kind === "unreachable" && <p role="alert" className="text-sm">Статус массовых загрузок неизвестен ({jobs.detail}). Это не означает, что загрузок нет.</p>}
+    {plans.kind === "unreachable" && <p role="alert" className="text-sm">Планы загрузки неизвестны ({plans.detail}). Это не означает, что планов нет.</p>}
+    {activePlans.length > 0 && <p role="status" className="text-sm text-muted-foreground">Активных планов загрузки: {activePlans.length}. Инструментов ожидают освобождения лимитов очереди: {pendingPlanItems}.</p>}
     {counts !== null && (activeJobs > 0
       ? <p role="status" className="rounded-md border border-input p-3 text-sm">Идёт массовая загрузка истории: активных заданий {activeJobs} (в очереди {counts.queued}, выполняется {counts.running}, запрошена отмена {counts.cancel_requested}). Статус хранится на сервере и виден после перезагрузки страницы.</p>
       : <p role="status" className="text-sm text-muted-foreground">Массовых загрузок, запущенных пользователем, сейчас нет. Постоянный ежеминутный сбор закрытых минут работает отдельно и здесь не учитывается.</p>)}
@@ -144,8 +149,9 @@ export function HistoryPage() {
       <form className="grid max-w-2xl gap-3 rounded-md border border-input p-4" onSubmit={(event) => { void enqueue(event); }}>
         <div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-sm">Начало загрузки<Input type="datetime-local" required value={from} onChange={(event) => setFrom(utcMidnightOnDateChange(from, event.target.value))} /></label><label className="grid gap-1 text-sm">Конец загрузки<Input type="datetime-local" required value={to} onChange={(event) => setTo(utcMidnightOnDateChange(to, event.target.value))} /></label></div>
         <p className="text-sm text-muted-foreground">Выбрано инструментов: {pickedInstruments.length}.</p>
-        <Button type="submit" disabled={busy || pickedInstruments.length === 0}>Поставить загрузку в очередь ({pickedInstruments.length})</Button>
+        <Button type="submit" disabled={busy || pickedInstruments.length === 0}>Создать план загрузки ({pickedInstruments.length})</Button>
       </form>
+      {plans.kind === "ready" && plans.data.plans.length > 0 && <div className="overflow-x-auto"><table className="w-full text-sm"><caption className="text-left text-muted-foreground">Планы загрузки</caption><thead><tr className="text-left"><th className="p-2">План</th><th className="p-2">Диапазон</th><th className="p-2">Статус</th><th className="p-2">Поставлено / ждёт / ошибки</th><th className="p-2">Активных заданий</th><th className="p-2">Действие</th></tr></thead><tbody>{plans.data.plans.map((plan) => <tr key={plan.id} className="border-b border-input"><td className="p-2">#{plan.id}</td><td className="p-2">{localTime(plan.fromUnix)} – {localTime(plan.toUnix)}</td><td className="p-2">{plan.status === "active" ? "активен" : plan.status === "completed" ? "все поставлены в очередь" : "отменён"}</td><td className="p-2">{plan.counts.enqueued} / {plan.counts.pending} / {plan.counts.failed}</td><td className="p-2">{plan.activeJobs}</td><td className="p-2">{plan.status === "active" && <Button variant="outline" disabled={busy} onClick={() => { void mutation(`/v1/history/backfill-plans/${plan.id}/cancel`, {}, "POST", `Отмена плана #${plan.id} запрошена: новые задания больше не ставятся, активные получают запрос отмены.`); }}>Отменить план {plan.id}</Button>}</td></tr>)}</tbody></table></div>}
     </section>}
 
     {tab === "collection" && <section className="grid gap-3" aria-labelledby="collection-heading">

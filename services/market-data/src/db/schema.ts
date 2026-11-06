@@ -94,6 +94,29 @@ export interface CollectionTargetsTable {
   updated_at: Generated<Date>;
 }
 
+export type BackfillPlanStatus = "active" | "completed" | "cancelled";
+
+export interface BackfillPlansTable {
+  id: Generated<number>;
+  from_ts: Date;
+  to_ts: Date;
+  status: BackfillPlanStatus;
+  requested_by: string;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+
+export type BackfillPlanItemStatus = "pending" | "enqueued" | "failed" | "cancelled";
+
+export interface BackfillPlanItemsTable {
+  plan_id: number;
+  instrument_id: number;
+  status: BackfillPlanItemStatus;
+  job_id: number | null;
+  error: string | null;
+  updated_at: Generated<Date>;
+}
+
 export interface MarketDataDB {
   exchanges: ExchangesTable;
   instruments: InstrumentsTable;
@@ -102,5 +125,7 @@ export interface MarketDataDB {
   backfill_jobs: BackfillJobsTable;
   service_state: ServiceStateTable;
   collection_targets: CollectionTargetsTable;
+  backfill_plans: BackfillPlansTable;
+  backfill_plan_items: BackfillPlanItemsTable;
   kysely_migration: KyselyMigrationsTable;
 }

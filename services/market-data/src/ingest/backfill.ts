@@ -5,7 +5,7 @@ import { getCoverage, getCoverageRange, type Coverage } from "../storage/coverag
 import type { BybitClient } from "./bybit.js";
 
 const MINUTE_MS = 60_000;
-const ACTIVE_STATUSES: BackfillJobStatus[] = ["queued", "running", "cancel_requested"];
+export const ACTIVE_STATUSES: BackfillJobStatus[] = ["queued", "running", "cancel_requested"];
 const DEFAULT_CHUNK_MINUTES = 1440;
 const MAX_CHUNK_FAILURES = 3;
 

@@ -13,6 +13,7 @@ const catalog = {
   ],
 };
 const emptyCounts = { queued: 0, running: 0, done: 0, cancel_requested: 0, cancelled: 0, failed: 0 };
+const planFixture = { id: 5, fromUnix: 1767225600, toUnix: 1767312000, status: "active", counts: { total: 2, pending: 1, enqueued: 1, failed: 0, cancelled: 0 }, activeJobs: 1, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
 const coverageSummary = {
   instruments: [
     { instrumentId: 1, exchange: "bybit", category: "linear", symbol: "BTCUSDT", status: "active", firstMinuteUnix: 1767225600, lastMinuteUnix: 1767312000, totalCandles: 1440, missingMinutes: 5 },
@@ -21,18 +22,20 @@ const coverageSummary = {
   ],
 };
 
-function stubFetch(options: { counts?: typeof emptyCounts } = {}) {
+function stubFetch(options: { counts?: typeof emptyCounts; plans?: typeof planFixture[] } = {}) {
   const posts: { url: string; body: unknown }[] = [];
   vi.stubGlobal("fetch", vi.fn((url: string, init?: RequestInit) => {
     const path = url.replace(/^https?:\/\/[^/]+/, "");
     if (init?.method === "POST") {
       posts.push({ url: path, body: typeof init.body === "string" ? (JSON.parse(init.body) as unknown) : null });
+      if (path === "/v1/history/backfill-plans") return Promise.resolve(new Response(JSON.stringify({ plan: planFixture }), { status: 202 }));
       return Promise.resolve(new Response(JSON.stringify({ jobs: [], created: 2, declined: 0 }), { status: 202 }));
     }
     if (path === "/v1/instruments") return Promise.resolve(new Response(JSON.stringify(catalog), { status: 200 }));
     if (path === "/v1/history/instruments/coverage-summary") return Promise.resolve(new Response(JSON.stringify(coverageSummary), { status: 200 }));
     if (path === "/v1/history/instruments/listing") return Promise.resolve(new Response(JSON.stringify({ instruments: catalog.instruments.slice(0, 2) }), { status: 200 }));
     if (path === "/v1/history/backfill-jobs") return Promise.resolve(new Response(JSON.stringify({ jobs: [], nextBeforeId: null, counts: options.counts ?? emptyCounts }), { status: 200 }));
+    if (path === "/v1/history/backfill-plans") return Promise.resolve(new Response(JSON.stringify({ plans: options.plans ?? [] }), { status: 200 }));
     if (path === "/v1/history/collection-targets") return Promise.resolve(new Response(JSON.stringify({ targets: [] }), { status: 200 }));
     return Promise.resolve(new Response(JSON.stringify({}), { status: 200 }));
   }));
@@ -61,12 +64,12 @@ it("imports the bybit listing, keeps the list editable and submits one confirmed
   expect(await screen.findByText(/Выбрано инструментов: 2/)).toBeInTheDocument();
   fireEvent.change(screen.getByLabelText("Начало загрузки"), { target: { value: "2026-01-01T00:00" } });
   fireEvent.change(screen.getByLabelText("Конец загрузки"), { target: { value: "2026-01-02T00:00" } });
-  await userEvent.click(screen.getByRole("button", { name: "Поставить загрузку в очередь (2)" }));
-  expect(await screen.findByText(/Создано заданий: 2/)).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Создать план загрузки (2)" }));
+  expect(await screen.findByText(/Создан план загрузки #5: 2 инструментов/)).toBeInTheDocument();
   expect(posts).toHaveLength(1);
-  const batch = posts[0] as { url: string; body: { instrumentIds: number[]; fromUnix: number; toUnix: number } };
-  expect(batch.url).toBe("/v1/history/backfill-jobs/batch");
-  expect(batch.body.instrumentIds).toEqual([1, 2]);
+  const plan = posts[0] as { url: string; body: { instrumentIds: number[]; fromUnix: number; toUnix: number } };
+  expect(plan.url).toBe("/v1/history/backfill-plans");
+  expect(plan.body.instrumentIds).toEqual([1, 2]);
 });
 
 it("shows the coverage overview table with data-only default and symbol filter", async () => {
@@ -98,6 +101,16 @@ it("resets the time to UTC midnight of the newly picked date", () => {
   expect(from).toHaveValue("2026-01-30T09:15");
   fireEvent.change(from, { target: { value: "2026-02-01T09:15" } });
   expect(from).toHaveValue(local(new Date(Date.UTC(2026, 1, 1))));
+});
+
+it("lists active plans with pending items and cancels a plan", async () => {
+  const posts = stubFetch({ plans: [planFixture] });
+  render(<HistoryPage />);
+  expect(await screen.findByText(/Активных планов загрузки: 1/)).toBeInTheDocument();
+  expect(screen.getByText(/Инструментов ожидают освобождения лимитов очереди: 1/)).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Отменить план 5" }));
+  expect(await screen.findByText(/Отмена плана #5 запрошена/)).toBeInTheDocument();
+  expect(posts.some((post) => post.url === "/v1/history/backfill-plans/5/cancel")).toBe(true);
 });
 
 it("groups long lists into separate tabs", async () => {

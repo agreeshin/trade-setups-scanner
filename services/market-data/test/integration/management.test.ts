@@ -6,6 +6,7 @@ import { createDb } from "../../src/db/db.js";
 import { createMigrator } from "../../src/db/migrator.js";
 import type { MarketDataDB } from "../../src/db/schema.js";
 import { requestBackfill } from "../../src/ingest/backfill.js";
+import { topUpBackfillPlans } from "../../src/ingest/plans.js";
 import { ensureInstrument } from "../../src/storage/instruments.js";
 
 const url = process.env.TEST_DATABASE_URL;
@@ -17,6 +18,7 @@ describe.skipIf(!url)("history management API", () => {
   let db: Kysely<MarketDataDB>;
   let app: FastifyInstance;
   let instrumentId: number;
+  const planInstrumentIds: number[] = [];
 
   beforeAll(async () => {
     if (!/test/i.test(new URL(url!).pathname)) throw new Error("Management tests require an isolated test database");
@@ -24,23 +26,30 @@ describe.skipIf(!url)("history management API", () => {
     const migration = await createMigrator(db).migrateToLatest();
     if (migration.error) throw new Error("Management test migration failed", { cause: migration.error });
     instrumentId = await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `MGMT${Date.now()}USDT` });
+    planInstrumentIds.push(
+      await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `PLNBASE${Date.now()}A` }),
+      await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `PLNBASE${Date.now()}B` }),
+    );
     app = await buildApp({ db, apiKeys: [headers["x-api-key"], "other-management-key"], openApiEnabled: true });
   });
   afterAll(async () => {
     await app?.close();
     if (db) {
-      if (instrumentId) {
-        await db.deleteFrom("collection_targets").where("instrument_id", "=", instrumentId).execute();
-        await db.deleteFrom("backfill_jobs").where("instrument_id", "=", instrumentId).execute();
-        await db.deleteFrom("instruments").where("id", "=", instrumentId).execute();
+      const ids = [instrumentId, ...planInstrumentIds].filter((id) => typeof id === "number");
+      await db.deleteFrom("backfill_plan_items").execute();
+      await db.deleteFrom("backfill_plans").execute();
+      for (const id of ids) {
+        await db.deleteFrom("collection_targets").where("instrument_id", "=", id).execute();
+        await db.deleteFrom("backfill_jobs").where("instrument_id", "=", id).execute();
       }
+      await db.deleteFrom("instruments").where("id", "in", ids).execute();
       await db.destroy();
     }
   });
 
   it("protects every management route before validation", async () => {
     for (const method of ["GET", "POST", "PUT"] as const) {
-      const paths = method === "GET" ? ["/v1/backfill-jobs", "/v1/collection-targets", "/v1/instruments/listing"] : method === "POST" ? ["/v1/backfill-jobs", "/v1/backfill-jobs/1/cancel", "/v1/backfill-jobs/batch"] : ["/v1/collection-targets/1"];
+      const paths = method === "GET" ? ["/v1/backfill-jobs", "/v1/collection-targets", "/v1/instruments/listing", "/v1/backfill-plans"] : method === "POST" ? ["/v1/backfill-jobs", "/v1/backfill-jobs/1/cancel", "/v1/backfill-jobs/batch", "/v1/backfill-plans", "/v1/backfill-plans/1/cancel"] : ["/v1/collection-targets/1"];
       for (const path of paths) {
         for (const auth of [{}, { "x-api-key": "invalid" }]) {
           expect((await app.inject({ method, url: path, headers: auth })).statusCode).toBe(401);
@@ -159,6 +168,107 @@ describe.skipIf(!url)("history management API", () => {
       expect(body.limit.resource).toBe("queue_jobs");
     } finally {
       await limited.close();
+    }
+  });
+
+  it("creates a plan, defers beyond queue limits and auto-continues when the queue drains", async () => {
+    const counts = (await app.inject({ method: "GET", url: "/v1/backfill-jobs", headers })).json<{ counts: { queued: number; running: number; cancel_requested: number } }>().counts;
+    const activeBefore = counts.queued + counts.running + counts.cancel_requested;
+    const limits = { maxPendingJobs: activeBefore + 2, maxWorkMinutes: 100_000_000, maxDatabaseBytes: 1_000_000_000_000, estimatedBytesPerWorkMinute: 1 };
+    const limited = await buildApp({ db, apiKeys: [headers["x-api-key"]], openApiEnabled: false, backfillLimits: limits });
+    try {
+      expect((await limited.inject({ method: "POST", url: "/v1/backfill-plans", headers, payload: { instrumentIds: [planInstrumentIds[0]!, 2147483000], fromUnix, toUnix: fromUnix + 3600 } })).statusCode).toBe(404);
+      expect((await limited.inject({ method: "POST", url: "/v1/backfill-plans", headers, payload: { instrumentIds: planInstrumentIds, fromUnix, toUnix: fromUnix } })).statusCode).toBe(400);
+      const created = await limited.inject({ method: "POST", url: "/v1/backfill-plans", headers, payload: { instrumentIds: planInstrumentIds, fromUnix, toUnix: fromUnix + 3600 } });
+      expect(created.statusCode).toBe(202);
+      const plan = created.json<{ plan: { id: number; status: string; counts: { total: number; enqueued: number; pending: number; failed: number }; activeJobs: number } }>().plan;
+      expect(plan.status).toBe("completed");
+      expect(plan.counts).toMatchObject({ total: 2, enqueued: 2, pending: 0, failed: 0 });
+      expect(plan.activeJobs).toBe(2);
+
+      const thirdId = await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `PLNEXT${Date.now()}` });
+      const bigger = { ...limits, maxPendingJobs: activeBefore + 2 };
+      const extended = await buildApp({ db, apiKeys: [headers["x-api-key"]], openApiEnabled: false, backfillLimits: bigger });
+      try {
+        const grown = await extended.inject({ method: "POST", url: "/v1/backfill-plans", headers, payload: { instrumentIds: [thirdId], fromUnix, toUnix: fromUnix + 3600 } });
+        expect(grown.json<{ plan: { counts: { enqueued: number; pending: number } } }>().plan.counts).toMatchObject({ enqueued: 0, pending: 1 });
+        await db.updateTable("backfill_jobs").set({ status: "done", updated_at: new Date() })
+          .where("instrument_id", "in", [...planInstrumentIds])
+          .where("status", "in", ["queued", "running", "cancel_requested"])
+          .execute();
+        const topUp = await topUpBackfillPlans(db, bigger);
+        expect(topUp.enqueued).toBeGreaterThanOrEqual(1);
+        const listed = (await extended.inject({ method: "GET", url: "/v1/backfill-plans", headers })).json<{ plans: { id: number; status: string; counts: { enqueued: number; pending: number } }[] }>().plans;
+        const first = listed.find((row) => row.id === plan.id);
+        const second = listed.find((row) => row.id !== plan.id);
+        expect(first?.status).toBe("completed");
+        expect(second?.status).toBe("completed");
+        expect(second?.counts.pending).toBe(0);
+        await db.deleteFrom("backfill_jobs").where("instrument_id", "=", thirdId).execute();
+        await db.deleteFrom("instruments").where("id", "=", thirdId).execute();
+      } finally {
+        await extended.close();
+      }
+    } finally {
+      await limited.close();
+      await db.deleteFrom("backfill_plan_items").execute();
+      await db.deleteFrom("backfill_plans").execute();
+      await db.deleteFrom("backfill_jobs").where("instrument_id", "in", planInstrumentIds).execute();
+    }
+  });
+
+  it("cancels a plan: stops enqueueing and requests cancellation of its active jobs", async () => {
+    const stamp = Date.now();
+    const ids = [
+      await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `PLC${stamp}A` }),
+      await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `PLC${stamp}B` }),
+    ];
+    const counts = (await app.inject({ method: "GET", url: "/v1/backfill-jobs", headers })).json<{ counts: { queued: number; running: number; cancel_requested: number } }>().counts;
+    const activeBefore = counts.queued + counts.running + counts.cancel_requested;
+    const limited = await buildApp({ db, apiKeys: [headers["x-api-key"]], openApiEnabled: false, backfillLimits: { maxPendingJobs: activeBefore + 1, maxWorkMinutes: 100_000_000, maxDatabaseBytes: 1_000_000_000_000, estimatedBytesPerWorkMinute: 1 } });
+    try {
+      const created = await limited.inject({ method: "POST", url: "/v1/backfill-plans", headers, payload: { instrumentIds: ids, fromUnix, toUnix: fromUnix + 3600 } });
+      expect(created.json<{ plan: { counts: { enqueued: number; pending: number } } }>().plan.counts).toMatchObject({ enqueued: 1, pending: 1 });
+      const planId = created.json<{ plan: { id: number } }>().plan.id;
+      expect((await limited.inject({ method: "POST", url: "/v1/backfill-plans/2147483647/cancel", headers })).statusCode).toBe(404);
+      const cancelled = await limited.inject({ method: "POST", url: `/v1/backfill-plans/${planId}/cancel`, headers });
+      expect(cancelled.statusCode).toBe(200);
+      const after = cancelled.json<{ plan: { status: string; counts: { enqueued: number; pending: number; cancelled: number }; activeJobs: number } }>().plan;
+      expect(after.status).toBe("cancelled");
+      expect(after.counts).toMatchObject({ enqueued: 1, pending: 0, cancelled: 1 });
+      expect(after.activeJobs).toBe(1);
+      const jobs = await db.selectFrom("backfill_jobs").selectAll().where("instrument_id", "in", ids).execute();
+      expect(jobs.filter((job) => job.status === "cancel_requested")).toHaveLength(1);
+    } finally {
+      await limited.close();
+      await db.deleteFrom("backfill_plan_items").execute();
+      await db.deleteFrom("backfill_plans").execute();
+      await db.deleteFrom("backfill_jobs").where("instrument_id", "in", ids).execute();
+      await db.deleteFrom("instruments").where("id", "in", ids).execute();
+    }
+  });
+
+  it("marks items with oversized work failed and completes the plan without jobs", async () => {
+    const stamp = Date.now();
+    const ids = [
+      await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `PLW${stamp}A` }),
+      await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `PLW${stamp}B` }),
+    ];
+    const limited = await buildApp({ db, apiKeys: [headers["x-api-key"]], openApiEnabled: false, backfillLimits: { maxPendingJobs: 1000, maxWorkMinutes: 60, maxDatabaseBytes: 1_000_000_000_000, estimatedBytesPerWorkMinute: 1 } });
+    try {
+      const created = await limited.inject({ method: "POST", url: "/v1/backfill-plans", headers, payload: { instrumentIds: ids, fromUnix, toUnix: fromUnix + 7200 } });
+      expect(created.statusCode).toBe(202);
+      const plan = created.json<{ plan: { id: number; status: string; counts: { failed: number; pending: number; enqueued: number } } }>().plan;
+      expect(plan.status).toBe("completed");
+      expect(plan.counts).toMatchObject({ failed: 2, pending: 0, enqueued: 0 });
+      expect(await db.selectFrom("backfill_jobs").select("id").where("instrument_id", "in", ids).execute()).toEqual([]);
+      const items = await db.selectFrom("backfill_plan_items").selectAll().where("plan_id", "=", plan.id).execute();
+      expect(items.every((item) => item.status === "failed" && item.error?.startsWith("work_minutes_exceeded"))).toBe(true);
+    } finally {
+      await limited.close();
+      await db.deleteFrom("backfill_plan_items").execute();
+      await db.deleteFrom("backfill_plans").execute();
+      await db.deleteFrom("instruments").where("id", "in", ids).execute();
     }
   });
 
