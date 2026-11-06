@@ -32,10 +32,6 @@ export class BybitApiError extends Error {
   }
 }
 
-interface BybitKlineRow {
-  list?: [string, string, string, string, string, string, string][];
-}
-
 const MAX_LIMIT = 1000;
 const MINUTE_MS = 60_000;
 const MAX_ATTEMPTS_PER_PAGE = 6;
@@ -100,13 +96,50 @@ export class BybitClient {
     startMs: number,
     endMs: number,
   ): Promise<RawPageBar[]> {
+    const url =
+      `${this.baseUrl}/v5/market/kline?category=linear&symbol=${encodeURIComponent(symbol)}` +
+      `&interval=1&start=${startMs}&end=${endMs}&limit=${MAX_LIMIT}`;
+    const { list } = await this.fetchResult<[string, string, string, string, string, string, string]>(url);
+    return list.map((row) => ({
+      openTimeMs: Number(row[0]),
+      open: row[1],
+      high: row[2],
+      low: row[3],
+      close: row[4],
+      volume: row[5],
+      quoteTurnover: row[6],
+    }));
+  }
+
+  async fetchLinearPerpetualUsdtSymbols(): Promise<string[]> {
+    const symbols = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < 10; page += 1) {
+      const url: string =
+        `${this.baseUrl}/v5/market/instruments-info?category=linear&limit=1000` +
+        (cursor === null ? "" : `&cursor=${encodeURIComponent(cursor)}`);
+      const { list, nextPageCursor } = await this.fetchResult<{
+        symbol: string;
+        contractType?: string;
+        quoteCoin?: string;
+        status: string;
+      }>(url);
+      for (const row of list) {
+        if (row.status === "Trading" && row.contractType === "LinearPerpetual" && row.quoteCoin === "USDT") {
+          symbols.add(row.symbol);
+        }
+      }
+      if (!nextPageCursor) break;
+      cursor = nextPageCursor;
+    }
+    return [...symbols].sort();
+  }
+
+  private async fetchResult<TRow>(url: string): Promise<{ list: TRow[]; nextPageCursor: string | undefined }> {
     let lastError: unknown = undefined;
     for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_PAGE; attempt += 1) {
       await this.gate.acquire();
       try {
-        const url =
-          `${this.baseUrl}/v5/market/kline?category=linear&symbol=${encodeURIComponent(symbol)}` +
-          `&interval=1&start=${startMs}&end=${endMs}&limit=${MAX_LIMIT}`;
         const response = await this.transport.fetch(url);
 
         if (response.status === 429) {
@@ -138,7 +171,7 @@ export class BybitClient {
         const payload = JSON.parse(response.bodyText) as {
           retCode: number;
           retMsg: string;
-          result?: BybitKlineRow;
+          result?: { list?: TRow[]; nextPageCursor?: string };
         };
 
         if (payload.retCode === 10006) {
@@ -155,16 +188,7 @@ export class BybitClient {
         }
 
         this.gate.reportSuccess();
-        const list = payload.result?.list ?? [];
-        return list.map((row) => ({
-          openTimeMs: Number(row[0]),
-          open: row[1],
-          high: row[2],
-          low: row[3],
-          close: row[4],
-          volume: row[5],
-          quoteTurnover: row[6],
-        }));
+        return { list: payload.result?.list ?? [], nextPageCursor: payload.result?.nextPageCursor };
       } catch (error) {
         if (error instanceof BybitApiError && error.kind !== "network") {
           throw error;

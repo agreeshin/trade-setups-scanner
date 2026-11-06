@@ -40,7 +40,7 @@ describe.skipIf(!url)("history management API", () => {
 
   it("protects every management route before validation", async () => {
     for (const method of ["GET", "POST", "PUT"] as const) {
-      const paths = method === "GET" ? ["/v1/backfill-jobs", "/v1/collection-targets"] : method === "POST" ? ["/v1/backfill-jobs", "/v1/backfill-jobs/1/cancel"] : ["/v1/collection-targets/1"];
+      const paths = method === "GET" ? ["/v1/backfill-jobs", "/v1/collection-targets", "/v1/instruments/listing"] : method === "POST" ? ["/v1/backfill-jobs", "/v1/backfill-jobs/1/cancel", "/v1/backfill-jobs/batch"] : ["/v1/collection-targets/1"];
       for (const path of paths) {
         for (const auth of [{}, { "x-api-key": "invalid" }]) {
           expect((await app.inject({ method, url: path, headers: auth })).statusCode).toBe(401);
@@ -113,5 +113,69 @@ describe.skipIf(!url)("history management API", () => {
     }
     const response = await app.inject({ method: "GET", url: `/v1/collection-targets?afterInstrumentId=${instrumentId - 1}&limit=1`, headers });
     expect(response.json<{ targets: { instrumentId: number; enabled: boolean; lastCollectedUnix: null }[] }>().targets[0]).toMatchObject({ instrumentId, enabled: false, lastCollectedUnix: null });
+  });
+
+  it("creates one job per instrument in a batch and exposes status counts", async () => {
+    const stamp = Date.now();
+    const ids = [
+      await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `BATCH${stamp}A` }),
+      await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `BATCH${stamp}B` }),
+      await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `BATCH${stamp}C` }),
+    ];
+    const response = await app.inject({ method: "POST", url: "/v1/backfill-jobs/batch", headers, payload: { instrumentIds: ids, fromUnix, toUnix: fromUnix + 3600 } });
+    expect(response.statusCode).toBe(202);
+    const body = response.json<{ jobs: Job[]; created: number; declined: number; limit?: unknown }>();
+    expect(body.created).toBe(3);
+    expect(body.declined).toBe(0);
+    expect(body.jobs).toHaveLength(3);
+    expect(body.limit).toBeUndefined();
+    const missing = await app.inject({ method: "POST", url: "/v1/backfill-jobs/batch", headers, payload: { instrumentIds: [ids[0]!, 2147483000], fromUnix, toUnix: fromUnix + 3600 } });
+    expect(missing.statusCode).toBe(404);
+    const counts = (await app.inject({ method: "GET", url: "/v1/backfill-jobs", headers })).json<{ counts: Record<string, number> }>().counts;
+    expect(counts.queued).toBeGreaterThanOrEqual(3);
+  });
+
+  it("stops a batch at admission limits and reports created and declined counts", async () => {
+    const before = (await app.inject({ method: "GET", url: "/v1/backfill-jobs", headers })).json<{ counts: { queued: number; running: number; cancel_requested: number } }>().counts;
+    const activeBefore = before.queued + before.running + before.cancel_requested;
+    const limited = await buildApp({
+      db,
+      apiKeys: [headers["x-api-key"]],
+      openApiEnabled: false,
+      backfillLimits: { maxPendingJobs: activeBefore + 2, maxWorkMinutes: 100_000_000, maxDatabaseBytes: 1_000_000_000_000, estimatedBytesPerWorkMinute: 1 },
+    });
+    try {
+      const stamp = Date.now();
+      const ids = [
+        await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `LIM${stamp}A` }),
+        await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `LIM${stamp}B` }),
+        await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `LIM${stamp}C` }),
+      ];
+      const response = await limited.inject({ method: "POST", url: "/v1/backfill-jobs/batch", headers, payload: { instrumentIds: ids, fromUnix, toUnix: fromUnix + 3600 } });
+      expect(response.statusCode).toBe(202);
+      const body = response.json<{ created: number; declined: number; limit: { resource: string } }>();
+      expect(body.created).toBe(2);
+      expect(body.declined).toBe(1);
+      expect(body.limit.resource).toBe("queue_jobs");
+    } finally {
+      await limited.close();
+    }
+  });
+
+  it("imports the current exchange listing into the instrument catalog on demand", async () => {
+    const symbol = `LIST${Date.now()}USDT`;
+    const withListing = await buildApp({ db, apiKeys: [headers["x-api-key"]], openApiEnabled: false, exchangeListing: () => Promise.resolve(["BTCUSDT", symbol]) });
+    try {
+      const response = await withListing.inject({ method: "GET", url: "/v1/instruments/listing", headers });
+      expect(response.statusCode).toBe(200);
+      const body = response.json<{ instruments: { exchange: string; category: string; symbol: string }[] }>();
+      expect(body.instruments.map((entry) => entry.symbol)).toEqual(["BTCUSDT", symbol]);
+      expect(body.instruments.every((entry) => entry.exchange === "bybit" && entry.category === "linear")).toBe(true);
+      const persisted = await db.selectFrom("instruments").select("symbol").where("symbol", "=", symbol).executeTakeFirst();
+      expect(persisted?.symbol).toBe(symbol);
+    } finally {
+      await withListing.close();
+    }
+    expect((await app.inject({ method: "GET", url: "/v1/instruments/listing", headers })).statusCode).toBe(503);
   });
 });

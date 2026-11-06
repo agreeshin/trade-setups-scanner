@@ -33,7 +33,8 @@ beforeEach(() => {
     if (path === "/v1/algorithms") data = { algorithms: [algorithm] };
     if (path === "/v1/instruments") data = { instruments };
     if (path === "/v1/instrument-lists/live") data = { configured: false, instruments: [] };
-    if (path === "/v1/history/backfill-jobs") data = { jobs: [{ id: 9, instrumentId: 1, fromUnix: 100, toUnix: 200, checkpointUnix: 150, status: "running", error: null }] };
+    if (path === "/v1/history/backfill-jobs") data = { jobs: [{ id: 9, instrumentId: 1, fromUnix: 100, toUnix: 200, checkpointUnix: 150, status: "running", error: null }], counts: { queued: 0, running: 1, done: 0, cancel_requested: 0, cancelled: 0, failed: 0 } };
+    if (path === "/v1/history/backfill-jobs/batch") data = { jobs: [], created: 1, declined: 0 };
     if (path === "/v1/history/collection-targets") data = { targets: [] };
     if (path === "/v1/history/instruments/1/coverage") data = { instrumentId: 1, firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, intervals: [], gaps: [] };
     if (path === "/v1/settings/ui") data = { value: { existing: "keep" } };
@@ -185,18 +186,24 @@ describe("platform screens", () => {
   });
   it("loads history without enqueuing and only mutates on explicit actions", async () => {
     render(<HistoryPage />);
+    await userEvent.click(screen.getByRole("tab", { name: "Задания загрузки" }));
     await screen.findByRole("button", { name: "Отменить загрузку 9" });
     expect(requests.every((request) => request.method === "GET")).toBe(true);
+    await userEvent.click(screen.getByRole("tab", { name: "Текущий сбор свечей" }));
     await userEvent.selectOptions(screen.getByLabelText("Инструмент БД"), "1");
     await screen.findByText("В БД нет свечей этого инструмента.");
+    await userEvent.click(screen.getByRole("tab", { name: "Загрузка истории" }));
+    await userEvent.click(await screen.findByRole("checkbox", { name: "BTCUSDT (Trading)" }));
     fireEvent.change(screen.getByLabelText("Начало загрузки"), { target: { value: "2026-10-10T12:00" } });
     fireEvent.change(screen.getByLabelText("Конец загрузки"), { target: { value: "2026-10-10T13:00" } });
-    await userEvent.click(screen.getByRole("button", { name: "Поставить загрузку в очередь" }));
-    await screen.findByText("Запрос загрузки истории принят. Проверяйте статус задания ниже.");
-    expect(requests.find((request) => request.path === "/v1/history/backfill-jobs" && request.method === "POST")?.body).toMatchObject({ instrumentId: 1, fromUnix: new Date("2026-10-10T12:00").getTime() / 1000 });
+    await userEvent.click(screen.getByRole("button", { name: "Поставить загрузку в очередь (1)" }));
+    await screen.findByText(/Создано заданий: 1/);
+    expect(requests.find((request) => request.path === "/v1/history/backfill-jobs/batch" && request.method === "POST")?.body).toMatchObject({ instrumentIds: [1], fromUnix: new Date("2026-10-10T12:00").getTime() / 1000 });
+    await userEvent.click(screen.getByRole("tab", { name: "Задания загрузки" }));
     await userEvent.click(screen.getByRole("button", { name: "Отменить загрузку 9" }));
     await screen.findByText("Отмена задания #9 запрошена.");
     expect(requests.some((request) => request.path === "/v1/history/backfill-jobs/9/cancel" && request.method === "POST")).toBe(true);
+    await userEvent.click(screen.getByRole("tab", { name: "Текущий сбор свечей" }));
     await userEvent.click(screen.getByRole("button", { name: "Включить сбор" }));
     await screen.findByText("Настройка сбора сохранена.");
     expect(requests.find((request) => request.path === "/v1/history/collection-targets/1")?.body).toEqual({ enabled: true });
@@ -205,6 +212,7 @@ describe("platform screens", () => {
     const original = globalThis.fetch;
     vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => path.includes("/coverage") ? Promise.resolve(new Response("{}", { status: 503 })) : original(path, init)));
     render(<HistoryPage />);
+    await userEvent.click(screen.getByRole("tab", { name: "Текущий сбор свечей" }));
     await waitFor(() => expect(screen.getByLabelText("Инструмент БД")).toBeEnabled());
     await userEvent.selectOptions(screen.getByLabelText("Инструмент БД"), "1");
     await screen.findByText(/Покрытие неизвестно: API недоступен/);

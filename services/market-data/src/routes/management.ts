@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import type { Selectable } from "kysely";
+import { sql, type Selectable } from "kysely";
 import type { BackfillJobsTable } from "../db/schema.js";
 import { BackfillAdmissionError, cancelBackfillRequest, requestBackfill } from "../ingest/backfill.js";
 import { setCollectionTarget } from "../ingest/continuous.js";
+import { ensureInstruments } from "../storage/instruments.js";
 import type { V1RouteOptions } from "./v1.js";
 
 const Id = Type.Integer({ minimum: 1, maximum: 2147483647 });
@@ -27,6 +28,14 @@ const Job = Type.Object({
   createdAt: Type.String(),
   updatedAt: Type.String(),
   requestedByCaller: Type.Boolean(),
+});
+const JobCounts = Type.Object({
+  queued: Type.Integer(),
+  running: Type.Integer(),
+  done: Type.Integer(),
+  cancel_requested: Type.Integer(),
+  cancelled: Type.Integer(),
+  failed: Type.Integer(),
 });
 const Target = Type.Object({
   instrumentId: Id,
@@ -55,12 +64,12 @@ function jobDto(row: Selectable<BackfillJobsTable>, requestedBy: string) {
   };
 }
 
-export function registerManagementRoutes(app: FastifyInstance, { db, requireApiKey, backfillLimits }: V1RouteOptions): void {
+export function registerManagementRoutes(app: FastifyInstance, { db, requireApiKey, backfillLimits, exchangeListing }: V1RouteOptions): void {
   app.get<{ Querystring: { limit?: number; beforeId?: number; instrumentId?: number } }>("/v1/backfill-jobs", {
     onRequest: [requireApiKey],
     schema: {
       querystring: Type.Object({ limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })), beforeId: Type.Optional(Id), instrumentId: Type.Optional(Id) }),
-      response: { 200: Type.Object({ jobs: Type.Array(Job), nextBeforeId: Type.Union([Id, Type.Null()]) }), 401: ErrorResponse },
+      response: { 200: Type.Object({ jobs: Type.Array(Job), nextBeforeId: Type.Union([Id, Type.Null()]), counts: JobCounts }), 401: ErrorResponse },
     },
   }, async (request) => {
     const limit = request.query.limit ?? 50;
@@ -69,7 +78,35 @@ export function registerManagementRoutes(app: FastifyInstance, { db, requireApiK
     if (request.query.instrumentId !== undefined) query = query.where("instrument_id", "=", request.query.instrumentId);
     const rows = await query.execute();
     const page = rows.slice(0, limit);
-    return { jobs: page.map((row) => jobDto(row, caller(request))), nextBeforeId: rows.length > limit ? page.at(-1)!.id : null };
+    const countRows = await db.selectFrom("backfill_jobs").select(["status", sql<number>`count(*)::int`.as("count")]).groupBy("status").execute();
+    const counts = { queued: 0, running: 0, done: 0, cancel_requested: 0, cancelled: 0, failed: 0 };
+    for (const row of countRows) {
+      if (row.status in counts) counts[row.status] = Number(row.count);
+    }
+    return { jobs: page.map((row) => jobDto(row, caller(request))), nextBeforeId: rows.length > limit ? page.at(-1)!.id : null, counts };
+  });
+
+  app.get("/v1/instruments/listing", {
+    onRequest: [requireApiKey],
+    schema: {
+      response: {
+        200: Type.Object({ instruments: Type.Array(Type.Object({ id: Id, exchange: Type.String(), category: Type.String(), symbol: Type.String(), status: Type.String() })) }),
+        401: ErrorResponse,
+        502: ErrorResponse,
+        503: ErrorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    if (!exchangeListing) return reply.code(503).send({ error: "exchange_listing_unavailable" });
+    let symbols: string[];
+    try {
+      symbols = await exchangeListing();
+    } catch (error) {
+      request.log.error(error, "exchange listing fetch failed");
+      return reply.code(502).send({ error: "exchange_listing_failed" });
+    }
+    const rows = await ensureInstruments(db, { exchangeCode: "bybit", category: "linear" }, symbols);
+    return { instruments: rows.map((row) => ({ id: row.id, exchange: "bybit", category: "linear", symbol: row.symbol, status: row.status })) };
   });
 
   app.post<{ Body: { instrumentId: number; fromUnix: number; toUnix: number } }>("/v1/backfill-jobs", {
@@ -102,6 +139,48 @@ export function registerManagementRoutes(app: FastifyInstance, { db, requireApiK
     }
     const row = await db.selectFrom("backfill_jobs").selectAll().where("id", "=", id).executeTakeFirstOrThrow();
     return reply.code(202).send({ job: jobDto(row, requestedBy) });
+  });
+
+  app.post<{ Body: { instrumentIds: number[]; fromUnix: number; toUnix: number } }>("/v1/backfill-jobs/batch", {
+    onRequest: [requireApiKey],
+    schema: {
+      body: Type.Object({ instrumentIds: Type.Array(Id, { minItems: 1, maxItems: 1000, uniqueItems: true }), fromUnix: Unix, toUnix: Unix }, { additionalProperties: false }),
+      response: {
+        202: Type.Object({ jobs: Type.Array(Job), created: Type.Integer(), declined: Type.Integer(), limit: Type.Optional(ResourceLimitResponse) }),
+        400: ErrorResponse,
+        401: ErrorResponse,
+        404: ErrorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    const { instrumentIds, fromUnix, toUnix } = request.body;
+    if (toUnix <= fromUnix || toUnix - fromUnix > 5 * 366 * 86400 || toUnix > Math.floor(Date.now() / 60000) * 60) {
+      return reply.code(400).send({ error: "invalid_range: require closed minutes in [fromUnix,toUnix), maximum 1830 days" });
+    }
+    const found = await db.selectFrom("instruments").select("id").where("id", "in", instrumentIds).execute();
+    if (found.length !== instrumentIds.length) return reply.code(404).send({ error: "instrument_not_found" });
+    const requestedBy = caller(request);
+    const jobs: ReturnType<typeof jobDto>[] = [];
+    let admission: BackfillAdmissionError | null = null;
+    for (const instrumentId of instrumentIds) {
+      try {
+        const id = await requestBackfill(db, { instrumentId, fromTs: new Date(fromUnix * 1000), toTs: new Date((toUnix - 60) * 1000), requestedBy }, backfillLimits);
+        const row = await db.selectFrom("backfill_jobs").selectAll().where("id", "=", id).executeTakeFirstOrThrow();
+        jobs.push(jobDto(row, requestedBy));
+      } catch (error) {
+        if (error instanceof BackfillAdmissionError) {
+          admission = error;
+          break;
+        }
+        throw error;
+      }
+    }
+    return reply.code(202).send({
+      jobs,
+      created: jobs.length,
+      declined: instrumentIds.length - jobs.length,
+      ...(admission ? { limit: { error: `resource_limit_exceeded:${admission.resource}:${admission.requested}:${admission.limit}`, resource: admission.resource, requested: admission.requested, limit: admission.limit } } : {}),
+    });
   });
 
   app.post<{ Params: { id: number } }>("/v1/backfill-jobs/:id/cancel", {

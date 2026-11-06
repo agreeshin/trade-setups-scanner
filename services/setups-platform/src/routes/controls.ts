@@ -99,8 +99,10 @@ export function registerControls(app: FastifyInstance, options: PlatformV1Option
   });
   const historyRoutes = [
     { method: "GET", path: "/instruments/:instrumentId/coverage", params: Type.Object({ instrumentId: Type.Integer({ minimum: 1 }) }) },
+    { method: "GET", path: "/instruments/listing" },
     { method: "GET", path: "/backfill-jobs" },
     { method: "POST", path: "/backfill-jobs", body: Type.Object({ instrumentId: Type.Integer({ minimum: 1 }), fromUnix: Type.Integer({ minimum: 0 }), toUnix: Type.Integer({ minimum: 0 }) }, { additionalProperties: false }) },
+    { method: "POST", path: "/backfill-jobs/batch", body: Type.Object({ instrumentIds: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, maxItems: 1000, uniqueItems: true }), fromUnix: Type.Integer({ minimum: 0 }), toUnix: Type.Integer({ minimum: 0 }) }, { additionalProperties: false }) },
     { method: "POST", path: "/backfill-jobs/:id/cancel", params: Type.Object({ id: Type.Integer({ minimum: 1 }) }) },
     { method: "GET", path: "/collection-targets" },
     { method: "PUT", path: "/collection-targets/:instrumentId", params: Type.Object({ instrumentId: Type.Integer({ minimum: 1 }) }), body: Type.Object({ enabled: Type.Boolean() }, { additionalProperties: false }) },

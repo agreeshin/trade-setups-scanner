@@ -4,6 +4,10 @@ import { createDb } from "./db/db.js";
 import { createMigrator } from "./db/migrator.js";
 import { loadConfig } from "./config.js";
 import { startIngestRuntime, type IngestRuntime } from "./ingest/runtime.js";
+import { BybitClient } from "./ingest/bybit.js";
+import { AdaptiveGate, DEFAULT_GATE_LIMITS } from "./ingest/gate.js";
+import { RealClock } from "./ingest/clock.js";
+import { FetchTransport } from "./ingest/transport.js";
 import { BackupManager } from "./backup/routes.js";
 
 const config = loadConfig();
@@ -26,6 +30,11 @@ const app = await buildApp({
     backupDir: config.backupDir,
     maxUploadBytes: config.backupMaxUploadBytes,
   }),
+  exchangeListing: () => new BybitClient(
+    new FetchTransport(),
+    new AdaptiveGate(DEFAULT_GATE_LIMITS, new RealClock()),
+    new RealClock(),
+  ).fetchLinearPerpetualUsdtSymbols(),
 });
 let ingestRuntime: IngestRuntime | undefined;
 

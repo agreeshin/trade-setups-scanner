@@ -64,6 +64,7 @@ export interface V1RouteOptions {
   db: Kysely<MarketDataDB>;
   requireApiKey: ApiKeyGuard;
   backfillLimits?: BackfillAdmissionLimits;
+  exchangeListing?: () => Promise<string[]>;
 }
 
 export function registerV1Routes(

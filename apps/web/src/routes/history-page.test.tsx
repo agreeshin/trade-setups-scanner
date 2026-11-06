@@ -1,0 +1,74 @@
+import { afterEach, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { HistoryPage } from "./history-page";
+
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+
+const catalog = {
+  instruments: [
+    { id: 1, exchange: "bybit", category: "linear", symbol: "BTCUSDT", status: "active" },
+    { id: 2, exchange: "bybit", category: "linear", symbol: "ETHUSDT", status: "active" },
+    { id: 3, exchange: "bybit", category: "linear", symbol: "OLDUSDT", status: "delisted" },
+  ],
+};
+const emptyCounts = { queued: 0, running: 0, done: 0, cancel_requested: 0, cancelled: 0, failed: 0 };
+
+function stubFetch(options: { counts?: typeof emptyCounts } = {}) {
+  const posts: { url: string; body: unknown }[] = [];
+  vi.stubGlobal("fetch", vi.fn((url: string, init?: RequestInit) => {
+    const path = url.replace(/^https?:\/\/[^/]+/, "");
+    if (init?.method === "POST") {
+      posts.push({ url: path, body: typeof init.body === "string" ? (JSON.parse(init.body) as unknown) : null });
+      return Promise.resolve(new Response(JSON.stringify({ jobs: [], created: 2, declined: 0 }), { status: 202 }));
+    }
+    if (path === "/v1/instruments") return Promise.resolve(new Response(JSON.stringify(catalog), { status: 200 }));
+    if (path === "/v1/history/instruments/listing") return Promise.resolve(new Response(JSON.stringify({ instruments: catalog.instruments.slice(0, 2) }), { status: 200 }));
+    if (path === "/v1/history/backfill-jobs") return Promise.resolve(new Response(JSON.stringify({ jobs: [], nextBeforeId: null, counts: options.counts ?? emptyCounts }), { status: 200 }));
+    if (path === "/v1/history/collection-targets") return Promise.resolve(new Response(JSON.stringify({ targets: [] }), { status: 200 }));
+    return Promise.resolve(new Response(JSON.stringify({}), { status: 200 }));
+  }));
+  return posts;
+}
+
+it("shows the server-side bulk load status that survives page reloads", async () => {
+  stubFetch({ counts: { ...emptyCounts, queued: 2, running: 1 } });
+  render(<HistoryPage />);
+  expect(await screen.findByText(/Идёт массовая загрузка истории: активных заданий 3/)).toBeInTheDocument();
+  expect(screen.getByText(/в очереди 2, выполняется 1/)).toBeInTheDocument();
+});
+
+it("reports absence of user bulk loads separately from routine collection", async () => {
+  stubFetch();
+  render(<HistoryPage />);
+  expect(await screen.findByText(/Массовых загрузок, запущенных пользователем, сейчас нет/)).toBeInTheDocument();
+});
+
+it("imports the bybit listing, keeps the list editable and submits one confirmed batch", async () => {
+  const posts = stubFetch();
+  render(<HistoryPage />);
+  await screen.findByText(/Выбрано инструментов: 0/);
+  await userEvent.click(screen.getByRole("button", { name: "Импортировать текущий листинг Bybit (линейные USDT perpetual)" }));
+  expect(await screen.findByText(/Импортирован текущий листинг Bybit: 2/)).toBeInTheDocument();
+  expect(await screen.findByText(/Выбрано инструментов: 2/)).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Начало загрузки"), { target: { value: "2026-01-01T00:00" } });
+  fireEvent.change(screen.getByLabelText("Конец загрузки"), { target: { value: "2026-01-02T00:00" } });
+  await userEvent.click(screen.getByRole("button", { name: "Поставить загрузку в очередь (2)" }));
+  expect(await screen.findByText(/Создано заданий: 2/)).toBeInTheDocument();
+  expect(posts).toHaveLength(1);
+  const batch = posts[0] as { url: string; body: { instrumentIds: number[]; fromUnix: number; toUnix: number } };
+  expect(batch.url).toBe("/v1/history/backfill-jobs/batch");
+  expect(batch.body.instrumentIds).toEqual([1, 2]);
+});
+
+it("groups long lists into separate tabs", async () => {
+  stubFetch();
+  render(<HistoryPage />);
+  expect(await screen.findByRole("heading", { name: "Загрузить историю" })).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Текущий сбор свечей" })).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("tab", { name: "Текущий сбор свечей" }));
+  expect(await screen.findByRole("heading", { name: "Текущий сбор свечей" })).toBeInTheDocument();
+  expect(screen.getByText("Выберите инструмент для управления сбором.")).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("tab", { name: "Задания загрузки" }));
+  expect(await screen.findByText("Заданий загрузки пока нет.")).toBeInTheDocument();
+});

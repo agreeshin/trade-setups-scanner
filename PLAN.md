@@ -12,6 +12,14 @@
 - pending: масштабная приёмка примерно на 500 live-парах с пачкой закрытий минуты и одновременными live/replay/backfill; измерить CPU/RAM/disk/WAL/latency, проверить SLO, bounded cleanup и отсутствие изменения семантики.
 - pending: аварийная приёмка на отдельном разрешённом стенде: reboot, завершение процессов, поздние DB/network, активные задания и cooldown; исключить двойных владельцев/сетапы, сохранить намеренно выключенные режимы и сроки уведомлений.
 
+## Массовая догрузка истории (2026-11-06)
+
+- completed: PRD дополнен (data.md §7.4, ux.md вкладки «История и сбор») до реализации; противоречий с действующим PRD нет.
+- completed: `GET /v1/instruments/listing` — импорт актуального листинга Bybit USDT Linear Perpetual (только статус Trading, до 10 страниц по 1000) с batch ensure в каталог; `POST /v1/backfill-jobs/batch` — подтверждённая постановка до 1000 заданий с admission limits и честным `created/declined/limit`; `GET /v1/backfill-jobs` возвращает персистентные `counts` по статусам. Platform proxy маршруты `/v1/history/instruments/listing` и `/v1/history/backfill-jobs/batch`.
+- completed: UI «История и сбор»: вкладки загрузка истории / текущий сбор свечей / задания загрузки, InstrumentPicker (ручной выбор/CSV по одноколоночному контракту), импорт листинга, подтверждённый batch, summary активных заданий по серверным counts.
+- completed: регрессии web 75, market-data 70, platform 108, typecheck/lint/build; production restore и массовая загрузка в тестах не выполнялись.
+- completed: развёрнуто на tv 6 ноября: pre-deploy dumps обеих БД, поочерёдный recreate application-контейнеров без рестарта PostgreSQL, readiness 200, listing import импортировал 819 active-инструментов, proxy и counts подтверждены, batch не запускался. Детали — `docs/invent/tv.md`.
+
 ## Preflight replay (2026-11-04)
 
 - completed: CSV и качество replay опубликованы (`1e8599e`, `168c4df`), main синхронизирован с origin.

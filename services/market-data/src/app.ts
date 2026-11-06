@@ -20,6 +20,7 @@ export interface AppOptions {
   apiKeys?: string[];
   backfillLimits?: BackfillAdmissionLimits;
   backupManager?: BackupManager;
+  exchangeListing?: () => Promise<string[]>;
 }
 
 const HealthResponse = Type.Object({
@@ -125,6 +126,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       db: options.db,
       requireApiKey,
       ...(options.backfillLimits ? { backfillLimits: options.backfillLimits } : {}),
+      ...(options.exchangeListing ? { exchangeListing: options.exchangeListing } : {}),
     });
   }
 
