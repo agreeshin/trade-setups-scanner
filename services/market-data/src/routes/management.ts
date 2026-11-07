@@ -5,7 +5,7 @@ import { sql, type Selectable } from "kysely";
 import type { BackfillJobsTable } from "../db/schema.js";
 import { BackfillAdmissionError, cancelBackfillRequest, requestBackfill } from "../ingest/backfill.js";
 import { createBackfillPlan, cancelBackfillPlan, getBackfillPlan, listBackfillPlans, type BackfillPlan } from "../ingest/plans.js";
-import { setCollectionTarget } from "../ingest/continuous.js";
+import { setCollectionTarget, setCollectionTargets } from "../ingest/continuous.js";
 import { ensureInstruments } from "../storage/instruments.js";
 import type { V1RouteOptions } from "./v1.js";
 
@@ -287,5 +287,19 @@ export function registerManagementRoutes(app: FastifyInstance, { db, requireApiK
     if (!instrument) return reply.code(404).send({ error: "instrument_not_found" });
     await setCollectionTarget(db, instrumentId, request.body.enabled);
     return { instrumentId, enabled: request.body.enabled };
+  });
+
+  app.put<{ Body: { instrumentIds: number[]; enabled: boolean } }>("/v1/collection-targets", {
+    onRequest: [requireApiKey],
+    schema: {
+      body: Type.Object({ instrumentIds: Type.Array(Id, { minItems: 1, maxItems: 1000, uniqueItems: true }), enabled: Type.Boolean() }, { additionalProperties: false }),
+      response: { 200: Type.Object({ updated: Type.Integer(), enabled: Type.Boolean() }), 400: ErrorResponse, 401: ErrorResponse, 404: ErrorResponse },
+    },
+  }, async (request, reply) => {
+    const { instrumentIds, enabled } = request.body;
+    const found = await db.selectFrom("instruments").select("id").where("id", "in", instrumentIds).execute();
+    if (found.length !== instrumentIds.length) return reply.code(404).send({ error: "instrument_not_found" });
+    await setCollectionTargets(db, instrumentIds, enabled);
+    return { updated: instrumentIds.length, enabled };
   });
 }

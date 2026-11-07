@@ -22,7 +22,7 @@ export function previewSymbols(text: string, catalog: CatalogInstrument[]): Impo
   return { accepted: [...accepted], excluded, duplicates };
 }
 
-export function InstrumentPicker({ catalog, symbols, onChange, disabled, live = false }: { catalog: CatalogInstrument[]; symbols: string; onChange: (symbols: string) => void; disabled: boolean; live?: boolean }) {
+export function InstrumentPicker({ catalog, symbols, onChange, disabled, live = false, limit = 100 }: { catalog: CatalogInstrument[]; symbols: string; onChange: (symbols: string) => void; disabled: boolean; live?: boolean; limit?: number | null }) {
   const [search, setSearch] = useState("");
   const [csv, setCsv] = useState("");
   const [preview, setPreview] = useState<ImportPreview | null>(null);
@@ -52,8 +52,8 @@ export function InstrumentPicker({ catalog, symbols, onChange, disabled, live = 
       {visible.slice(0, 200).map((instrument) => <label key={instrument.id} className="flex items-center gap-2 text-sm"><Input type="checkbox" className="h-4 w-4" checked={selected.has(instrument.symbol)} onChange={() => toggle(instrument.symbol)} /><span>{instrument.symbol} <span className="text-muted-foreground">({instrument.status})</span></span></label>)}
     </div>
     {visible.length > 200 && <p className="text-sm text-muted-foreground">Показаны первые 200 совпадений. Уточните поиск.</p>}
-    <p className="text-sm" aria-live="polite">Выбрано: {selected.size} из {catalog.length}.{!live && " Лимит одного запуска: 100."}</p>
-    {!live && selected.size > 100 && <p role="alert">Уменьшите список до 100 инструментов перед запуском. Список не усечён.</p>}
+    <p className="text-sm" aria-live="polite">Выбрано: {selected.size} из {catalog.length}.{!live && limit !== null && ` Лимит одного запуска: ${limit}.`}</p>
+    {!live && limit !== null && selected.size > limit && <p role="alert">Уменьшите список до {limit} инструментов перед запуском. Список не усечён.</p>}
     {unavailable.length > 0 && <div className="grid gap-2"><p role="alert">Сохранённые символы отсутствуют в текущем каталоге: {unavailable.join(", ")}</p><Button type="button" variant="outline" onClick={() => onChange([...selected].filter((symbol) => !unavailable.includes(symbol)).join("\n"))}>Убрать отсутствующие</Button></div>}
     <label className="grid gap-1 text-sm">Импорт CSV без заголовка<Input type="file" accept=".csv,text/csv,text/plain" onChange={(event) => { void readFile(event.target.files?.[0]); }} /></label>
     <label className="grid gap-1 text-sm">CSV: один символ на строку<Textarea maxLength={262144} value={csv} placeholder={"BTCUSDT\nETHUSDT"} onChange={(event) => { setCsv(event.target.value); setPreview(null); }} /></label>

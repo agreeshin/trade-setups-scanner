@@ -64,6 +64,7 @@ export function HistoryPage() {
   const targets = usePlatformPoll<{ targets: CollectionTarget[] }>("/v1/history/collection-targets", revision);
   const plans = usePlatformPoll<{ plans: BackfillPlanRow[] }>("/v1/history/backfill-plans", revision);
   const [instrumentId, setInstrumentId] = useState("");
+  const [collectionSymbols, setCollectionSymbols] = useState("");
   const [symbols, setSymbols] = useState("");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
@@ -81,6 +82,48 @@ export function HistoryPage() {
   const activePlans = plans.kind === "ready" ? plans.data.plans.filter((plan) => plan.status === "active") : [];
   const pendingPlanItems = activePlans.reduce((sum, plan) => sum + plan.counts.pending, 0);
   const instrumentName = (id: number) => instruments.find((instrument) => instrument.id === id)?.symbol ?? `ID ${id}`;
+
+  const collectionSelection = collectionSymbols.split(/[\s,;]+/).filter(Boolean);
+  const collectionSelectionIds = instruments.filter((instrument) => collectionSelection.includes(instrument.symbol)).map((instrument) => instrument.id);
+
+  async function importListingToCollection() {
+    setBusy(true); setError(null);
+    try {
+      const response = await apiFetch("/v1/history/instruments/listing");
+      const payload = await response.json() as { instruments?: { id: number; symbol: string }[]; error?: string };
+      if (!response.ok || !payload.instruments) throw new Error(payload.error ?? `HTTP ${response.status}`);
+      const merged = new Set(collectionSelection);
+      for (const instrument of payload.instruments) merged.add(instrument.symbol);
+      setCollectionSymbols([...merged].join("\n"));
+      setRevision((value) => value + 1);
+      setMessage(`Листинг Bybit загружен: ${payload.instruments.length} инструментов. Выбрано: ${merged.size}.`);
+    } catch (cause) { setError(errorText(cause)); }
+    finally { setBusy(false); }
+  }
+
+  async function bulkSetCollection(enabled: boolean) {
+    setBusy(true); setError(null); setMessage(null);
+    try {
+      if (collectionSelectionIds.length === 0) throw new Error("Выберите хотя бы один инструмент.");
+      let updated = 0;
+      for (let index = 0; index < collectionSelectionIds.length; index += 1000) {
+        const chunk = collectionSelectionIds.slice(index, index + 1000);
+        const response = await apiFetch("/v1/history/collection-targets", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ instrumentIds: chunk, enabled }),
+        });
+        const payload = await response.json() as { updated?: number; error?: string };
+        if (!response.ok) throw new Error(payload.error ?? `HTTP ${response.status}`);
+        updated += payload.updated ?? 0;
+      }
+      setRevision((value) => value + 1);
+      setMessage(enabled
+        ? `Сбор включён для ${updated} инструментов. Инструменты с историей сначала дозаполнят хвост от последней свечи до текущей закрытой минуты (задания видны во вкладке «Задания загрузки»), затем перейдут к поминутному сбору. Инструменты без сохранённой истории ждут явной догрузки.`
+        : `Сбор выключен для ${updated} инструментов.`);
+    } catch (cause) { setError(errorText(cause)); }
+    finally { setBusy(false); }
+  }
 
   async function importListing() {
     setBusy(true); setError(null); setMessage(null);
@@ -157,6 +200,15 @@ export function HistoryPage() {
     {tab === "collection" && <section className="grid gap-3" aria-labelledby="collection-heading">
       <h2 id="collection-heading" className="text-lg font-semibold">Текущий сбор свечей</h2>
       <CoverageOverview revision={revision} />
+      <div className="grid max-w-2xl gap-3 rounded-md border border-input p-4">
+        <p className="text-sm text-muted-foreground">Массовое управление сбором: выберите инструменты чек-боксами, «Все из БД» выбирает весь каталог, импорт листинга Bybit обновляет каталог биржи и добавляет её символы в выбор. Лимита на количество нет.</p>
+        <Button type="button" variant="outline" disabled={busy} onClick={() => { void importListingToCollection(); }}>Импортировать листинг для сбора</Button>
+        <InstrumentPicker catalog={instruments} symbols={collectionSymbols} onChange={(value) => { setCollectionSymbols(value); setMessage(null); }} disabled={busy || catalog.kind !== "ready"} limit={null} />
+        <div className="flex flex-wrap gap-2">
+          <Button type="button" disabled={busy || collectionSelectionIds.length === 0} onClick={() => { void bulkSetCollection(true); }}>Включить сбор для выбранных ({collectionSelectionIds.length})</Button>
+          <Button type="button" variant="outline" disabled={busy || collectionSelectionIds.length === 0} onClick={() => { void bulkSetCollection(false); }}>Выключить сбор для выбранных</Button>
+        </div>
+      </div>
       <div className="flex flex-wrap items-end gap-3"><label className="grid min-w-0 gap-1 text-sm">Инструмент БД<Select value={instrumentId} disabled={catalog.kind !== "ready" || busy} onChange={(event) => setInstrumentId(event.target.value)}><option value="">Выберите инструмент</option>{instruments.map((instrument) => <option key={instrument.id} value={instrument.id}>{instrument.exchange} / {instrument.category} / {instrument.symbol} ({instrument.status})</option>)}</Select></label><Button variant="outline" disabled={busy} onClick={() => setRevision((value) => value + 1)}>Обновить историю</Button></div>
       {catalog.kind === "loading" && <p>Загрузка каталога…</p>}{catalog.kind === "unreachable" && <p role="alert">Каталог недоступен ({catalog.detail})</p>}
       {selected && <InstrumentCoverage key={selected.id} id={selected.id} revision={revision} />}

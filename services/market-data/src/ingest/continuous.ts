@@ -23,6 +23,23 @@ export async function setCollectionTarget(
     .execute();
 }
 
+/** Upserts collection targets for many instruments in one statement. */
+export async function setCollectionTargets(
+  db: Kysely<MarketDataDB>,
+  instrumentIds: number[],
+  enabled: boolean,
+): Promise<void> {
+  await db
+    .insertInto("collection_targets")
+    .values(instrumentIds.map((instrument_id) => ({ instrument_id, enabled })))
+    .onConflict((oc) =>
+      oc
+        .column("instrument_id")
+        .doUpdateSet({ enabled, updated_at: new Date() }),
+    )
+    .execute();
+}
+
 /**
  * Creates catch-up backfill jobs for every enabled collection target that has
  * history but lags behind the last closed minute. Internal gaps require

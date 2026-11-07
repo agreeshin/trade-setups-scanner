@@ -49,7 +49,7 @@ describe.skipIf(!url)("history management API", () => {
 
   it("protects every management route before validation", async () => {
     for (const method of ["GET", "POST", "PUT"] as const) {
-      const paths = method === "GET" ? ["/v1/backfill-jobs", "/v1/collection-targets", "/v1/instruments/listing", "/v1/backfill-plans"] : method === "POST" ? ["/v1/backfill-jobs", "/v1/backfill-jobs/1/cancel", "/v1/backfill-jobs/batch", "/v1/backfill-plans", "/v1/backfill-plans/1/cancel"] : ["/v1/collection-targets/1"];
+      const paths = method === "GET" ? ["/v1/backfill-jobs", "/v1/collection-targets", "/v1/instruments/listing", "/v1/backfill-plans"] : method === "POST" ? ["/v1/backfill-jobs", "/v1/backfill-jobs/1/cancel", "/v1/backfill-jobs/batch", "/v1/backfill-plans", "/v1/backfill-plans/1/cancel"] : ["/v1/collection-targets", "/v1/collection-targets/1"];
       for (const path of paths) {
         for (const auth of [{}, { "x-api-key": "invalid" }]) {
           expect((await app.inject({ method, url: path, headers: auth })).statusCode).toBe(401);
@@ -122,6 +122,30 @@ describe.skipIf(!url)("history management API", () => {
     }
     const response = await app.inject({ method: "GET", url: `/v1/collection-targets?afterInstrumentId=${instrumentId - 1}&limit=1`, headers });
     expect(response.json<{ targets: { instrumentId: number; enabled: boolean; lastCollectedUnix: null }[] }>().targets[0]).toMatchObject({ instrumentId, enabled: false, lastCollectedUnix: null });
+  });
+
+  it("bulk-updates collection targets for many instruments", async () => {
+    const stamp = Date.now();
+    const ids = [
+      await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `TGT${stamp}A` }),
+      await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `TGT${stamp}B` }),
+    ];
+    try {
+      expect((await app.inject({ method: "PUT", url: "/v1/collection-targets", headers, payload: { instrumentIds: [ids[0]!, 2147483000], enabled: true } })).statusCode).toBe(404);
+      const enabled = await app.inject({ method: "PUT", url: "/v1/collection-targets", headers, payload: { instrumentIds: ids, enabled: true } });
+      expect(enabled.statusCode).toBe(200);
+      expect(enabled.json()).toEqual({ updated: 2, enabled: true });
+      let rows = await db.selectFrom("collection_targets").selectAll().where("instrument_id", "in", ids).orderBy("instrument_id", "asc").execute();
+      expect(rows).toHaveLength(2);
+      expect(rows.every((row) => row.enabled)).toBe(true);
+      expect((await app.inject({ method: "PUT", url: "/v1/collection-targets", headers, payload: { instrumentIds: [ids[0]!], enabled: false } })).statusCode).toBe(200);
+      rows = await db.selectFrom("collection_targets").selectAll().where("instrument_id", "in", ids).orderBy("instrument_id", "asc").execute();
+      expect(rows[0]).toMatchObject({ instrument_id: ids[0], enabled: false });
+      expect(rows[1]).toMatchObject({ instrument_id: ids[1], enabled: true });
+    } finally {
+      await db.deleteFrom("collection_targets").where("instrument_id", "in", ids).execute();
+      await db.deleteFrom("instruments").where("id", "in", ids).execute();
+    }
   });
 
   it("creates one job per instrument in a batch and exposes status counts", async () => {

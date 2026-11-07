@@ -31,6 +31,11 @@ function stubFetch(options: { counts?: typeof emptyCounts; plans?: typeof planFi
       if (path === "/v1/history/backfill-plans") return Promise.resolve(new Response(JSON.stringify({ plan: planFixture }), { status: 202 }));
       return Promise.resolve(new Response(JSON.stringify({ jobs: [], created: 2, declined: 0 }), { status: 202 }));
     }
+    if (init?.method === "PUT") {
+      posts.push({ url: path, body: typeof init.body === "string" ? (JSON.parse(init.body) as unknown) : null });
+      if (path === "/v1/history/collection-targets") return Promise.resolve(new Response(JSON.stringify({ updated: 2, enabled: true }), { status: 200 }));
+      return Promise.resolve(new Response(JSON.stringify({}), { status: 200 }));
+    }
     if (path === "/v1/instruments") return Promise.resolve(new Response(JSON.stringify(catalog), { status: 200 }));
     if (path === "/v1/history/instruments/coverage-summary") return Promise.resolve(new Response(JSON.stringify(coverageSummary), { status: 200 }));
     if (path === "/v1/history/instruments/listing") return Promise.resolve(new Response(JSON.stringify({ instruments: catalog.instruments.slice(0, 2) }), { status: 200 }));
@@ -111,6 +116,17 @@ it("lists active plans with pending items and cancels a plan", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Отменить план 5" }));
   expect(await screen.findByText(/Отмена плана #5 запрошена/)).toBeInTheDocument();
   expect(posts.some((post) => post.url === "/v1/history/backfill-plans/5/cancel")).toBe(true);
+});
+
+it("bulk-enables collection for listing-imported instruments", async () => {
+  const posts = stubFetch();
+  render(<HistoryPage />);
+  await userEvent.click(screen.getByRole("tab", { name: "Текущий сбор свечей" }));
+  await userEvent.click(screen.getByRole("button", { name: "Импортировать листинг для сбора" }));
+  expect(await screen.findByText(/Листинг Bybit загружен: 2 инструментов/)).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Включить сбор для выбранных (2)" }));
+  expect(await screen.findByText(/Сбор включён для 2 инструментов/)).toBeInTheDocument();
+  expect(posts.find((post) => post.url === "/v1/history/collection-targets")?.body).toEqual({ instrumentIds: [1, 2], enabled: true });
 });
 
 it("groups long lists into separate tabs", async () => {

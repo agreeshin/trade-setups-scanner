@@ -110,6 +110,7 @@ export function registerControls(app: FastifyInstance, options: PlatformV1Option
     { method: "POST", path: "/backfill-jobs/:id/cancel", params: Type.Object({ id: Type.Integer({ minimum: 1 }) }) },
     { method: "GET", path: "/collection-targets" },
     { method: "PUT", path: "/collection-targets/:instrumentId", params: Type.Object({ instrumentId: Type.Integer({ minimum: 1 }) }), body: Type.Object({ enabled: Type.Boolean() }, { additionalProperties: false }) },
+    { method: "PUT", path: "/collection-targets", body: Type.Object({ instrumentIds: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, maxItems: 1000, uniqueItems: true }), enabled: Type.Boolean() }, { additionalProperties: false }) },
   ] as const;
   for (const route of historyRoutes) {
     app.route({
