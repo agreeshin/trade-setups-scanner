@@ -9,6 +9,7 @@ import { FetchTransport } from "./transport.js";
 import { RealClock, type Clock } from "./clock.js";
 import { collectOnce, drainBackfills } from "./continuous.js";
 import { topUpBackfillPlans } from "./plans.js";
+import { drainGapRepairs } from "./gap-repairs.js";
 import type { BackfillAdmissionLimits } from "./backfill.js";
 
 const BACKFILL_QUEUE = "backfill";
@@ -45,6 +46,7 @@ export async function startIngestRuntime(
     await drainBackfills({ db: options.db, client });
   });
   const intervalMs = options.collectionIntervalMs ?? 30_000;
+  let repairing = false;
   const timer = setInterval(() => {
     void (async () => {
       try {
@@ -54,6 +56,16 @@ export async function startIngestRuntime(
           toppedUp = (await topUpBackfillPlans(options.db, options.backfillLimits)).enqueued;
         } catch (error) {
           console.error("backfill plan top-up failed", error);
+        }
+        if (!repairing) {
+          repairing = true;
+          try {
+            await drainGapRepairs({ db: options.db, client });
+          } catch (error) {
+            console.error("gap repair failed", error);
+          } finally {
+            repairing = false;
+          }
         }
         const pending = await options.db
           .selectFrom("backfill_jobs")

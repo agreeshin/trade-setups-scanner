@@ -127,6 +127,48 @@ describe.skipIf(!TEST_DATABASE_URL)("continuous collection", () => {
     );
   });
 
+  it("covers minutes that closed while the previous catch-up was still running", async () => {
+    await insertCandles(
+      db,
+      instrumentId,
+      Array.from({ length: 10 }, (_, index) => candle(minute(index))),
+    );
+    await setCollectionTarget(db, instrumentId, true);
+
+    const clock15 = new FakeClock(T0 + 15 * MINUTE + 30_000);
+    expect(await collectOnce(db, clock15)).toBe(1);
+    await drainBackfills({ db, client: makeClient(clock15) });
+    const first = await readCandles(db, {
+      instrumentId,
+      from: minute(0),
+      to: minute(20),
+      limit: 5000,
+    });
+    expect(first.candles).toHaveLength(15);
+
+    const clock75 = new FakeClock(T0 + 75 * MINUTE + 30_000);
+    expect(await collectOnce(db, clock75)).toBe(1);
+    await drainBackfills({ db, client: makeClient(clock75) });
+
+    const page = await readCandles(db, {
+      instrumentId,
+      from: minute(0),
+      to: minute(80),
+      limit: 5000,
+    });
+    expect(page.candles).toHaveLength(75);
+    expect(page.candles.at(-1)?.openTimeUnix).toBe(
+      Math.floor(minute(74).getTime() / 1000),
+    );
+    const gaps = page.candles.flatMap((row, index) => {
+      if (index === 0) return [];
+      return row.openTimeUnix === page.candles[index - 1]!.openTimeUnix + 60
+        ? []
+        : [row.openTimeUnix];
+    });
+    expect(gaps).toEqual([]);
+  });
+
   it("skips targets without stored history", async () => {
     await setCollectionTarget(db, noHistoryInstrumentId, true);
     const clock = new FakeClock(T0 + 100 * MINUTE);

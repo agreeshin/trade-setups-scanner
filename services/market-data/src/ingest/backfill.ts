@@ -2,6 +2,7 @@ import { sql, type Kysely } from "kysely";
 import type { MarketDataDB, BackfillJobStatus } from "../db/schema.js";
 import { insertCandles } from "../storage/candles.js";
 import { getCoverage, getCoverageRange, type Coverage } from "../storage/coverage.js";
+import { getNoTradeRanges, insertNoTradeVerification, subtractRanges, uncoveredRanges } from "../storage/verifications.js";
 import type { BybitClient } from "./bybit.js";
 
 const MINUTE_MS = 60_000;
@@ -241,6 +242,8 @@ export async function runBackfillJobOnce(deps: BackfillWorkerDeps): Promise<bool
     .select(["exchanges.code as exchange", "instruments.symbol as symbol"])
     .executeTakeFirstOrThrow();
 
+  const verified = await getNoTradeRanges(db, job.instrument_id, job.from_ts, job.to_ts);
+
   let cursorMs =
     job.checkpoint_ts !== null
       ? job.checkpoint_ts.getTime() + MINUTE_MS
@@ -266,12 +269,14 @@ export async function runBackfillJobOnce(deps: BackfillWorkerDeps): Promise<bool
     const chunkEndMs = Math.min(endMs, cursorMs + (chunkMinutes - 1) * MINUTE_MS);
     try {
       const coverage = await getCoverage(db, job.instrument_id);
-      const missing = missingIntervals(coverage, cursorMs, chunkEndMs);
+      let missing = missingIntervals(coverage, cursorMs, chunkEndMs)
+        .map((gap) => ({ fromMs: gap.startMs, toMs: gap.endMs }));
+      if (verified.length > 0) missing = subtractRanges(missing, verified);
       for (const gap of missing) {
         const bars = await client.fetchClosedBars(
           instrument.symbol,
-          gap.startMs,
-          gap.endMs,
+          gap.fromMs,
+          gap.toMs,
         );
         await insertCandles(
           db,
@@ -286,6 +291,14 @@ export async function runBackfillJobOnce(deps: BackfillWorkerDeps): Promise<bool
             quoteTurnover: bar.quoteTurnover,
           })),
         );
+        for (const range of uncoveredRanges(gap.fromMs, gap.toMs, bars.map((bar) => bar.openTime))) {
+          await insertNoTradeVerification(db, {
+            instrumentId: job.instrument_id,
+            fromTs: new Date(range.fromMs),
+            toTs: new Date(range.toMs),
+            source: "download",
+          });
+        }
       }
       cursorMs = chunkEndMs + MINUTE_MS;
       chunkFailures = 0;

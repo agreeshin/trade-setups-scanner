@@ -117,6 +117,30 @@ export interface BackfillPlanItemsTable {
   updated_at: Generated<Date>;
 }
 
+export interface GapVerificationsTable {
+  id: Generated<number>;
+  instrument_id: number;
+  from_ts: Date;
+  to_ts: Date;
+  kind: string;
+  source: string;
+  verified_at: Generated<Date>;
+}
+
+export type GapRepairJobStatus = "queued" | "running" | "done" | "failed";
+
+export interface GapRepairJobsTable {
+  id: Generated<number>;
+  instrument_id: number;
+  status: GapRepairJobStatus;
+  gaps_processed: number;
+  filled_minutes: number;
+  verified_minutes: number;
+  error: string | null;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+
 export interface MarketDataDB {
   exchanges: ExchangesTable;
   instruments: InstrumentsTable;
@@ -127,5 +151,7 @@ export interface MarketDataDB {
   collection_targets: CollectionTargetsTable;
   backfill_plans: BackfillPlansTable;
   backfill_plan_items: BackfillPlanItemsTable;
+  gap_verifications: GapVerificationsTable;
+  gap_repair_jobs: GapRepairJobsTable;
   kysely_migration: KyselyMigrationsTable;
 }

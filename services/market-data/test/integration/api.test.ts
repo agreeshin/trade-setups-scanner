@@ -147,6 +147,13 @@ describe.skipIf(!TEST_DATABASE_URL)("market data v1 api", () => {
     });
     const unauthenticated = await app.inject({ method: "GET", url: "/v1/instruments/coverage-summary" });
     expect(unauthenticated.statusCode).toBe(401);
+    await db.insertInto("gap_verifications").values({
+      instrument_id: instrumentId,
+      from_ts: minute(3),
+      to_ts: minute(3),
+      kind: "no_trade",
+      source: "repair",
+    }).execute();
     const response = await app.inject({
       method: "GET",
       url: "/v1/instruments/coverage-summary",
@@ -161,6 +168,7 @@ describe.skipIf(!TEST_DATABASE_URL)("market data v1 api", () => {
         lastMinuteUnix: number | null;
         totalCandles: number;
         missingMinutes: number;
+        verifiedMinutes: number;
       }[];
     }>();
     expect(body.instruments.find((row) => row.instrumentId === instrumentId)).toMatchObject({
@@ -169,6 +177,7 @@ describe.skipIf(!TEST_DATABASE_URL)("market data v1 api", () => {
       lastMinuteUnix: unix(minute(6)),
       totalCandles: 4,
       missingMinutes: 3,
+      verifiedMinutes: 1,
     });
     expect(body.instruments.find((row) => row.instrumentId === emptyId)).toMatchObject({
       symbol: "EMPTYUSDT",

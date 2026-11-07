@@ -36,6 +36,8 @@ describe.skipIf(!url)("history management API", () => {
     await app?.close();
     if (db) {
       const ids = [instrumentId, ...planInstrumentIds].filter((id) => typeof id === "number");
+      await db.deleteFrom("gap_repair_jobs").execute();
+      await db.deleteFrom("gap_verifications").execute();
       await db.deleteFrom("backfill_plan_items").execute();
       await db.deleteFrom("backfill_plans").execute();
       for (const id of ids) {
@@ -49,13 +51,39 @@ describe.skipIf(!url)("history management API", () => {
 
   it("protects every management route before validation", async () => {
     for (const method of ["GET", "POST", "PUT"] as const) {
-      const paths = method === "GET" ? ["/v1/backfill-jobs", "/v1/collection-targets", "/v1/instruments/listing", "/v1/backfill-plans"] : method === "POST" ? ["/v1/backfill-jobs", "/v1/backfill-jobs/1/cancel", "/v1/backfill-jobs/batch", "/v1/backfill-plans", "/v1/backfill-plans/1/cancel"] : ["/v1/collection-targets", "/v1/collection-targets/1"];
+      const paths = method === "GET" ? ["/v1/backfill-jobs", "/v1/collection-targets", "/v1/instruments/listing", "/v1/backfill-plans", "/v1/gap-repairs"] : method === "POST" ? ["/v1/backfill-jobs", "/v1/backfill-jobs/1/cancel", "/v1/backfill-jobs/batch", "/v1/backfill-plans", "/v1/backfill-plans/1/cancel", "/v1/gap-repairs"] : ["/v1/collection-targets", "/v1/collection-targets/1"];
       for (const path of paths) {
         for (const auth of [{}, { "x-api-key": "invalid" }]) {
           expect((await app.inject({ method, url: path, headers: auth })).statusCode).toBe(401);
         }
       }
     }
+  });
+
+  it("creates and lists gap repair jobs", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: "/v1/gap-repairs",
+      headers,
+      payload: { instrumentIds: [instrumentId] },
+    });
+    expect(created.statusCode).toBe(202);
+    expect(created.json()).toEqual({ created: 1 });
+    const missing = await app.inject({
+      method: "POST",
+      url: "/v1/gap-repairs",
+      headers,
+      payload: { instrumentIds: [2_147_483_000] },
+    });
+    expect(missing.statusCode).toBe(404);
+    const listed = await app.inject({ method: "GET", url: "/v1/gap-repairs", headers });
+    expect(listed.statusCode).toBe(200);
+    const body = listed.json<{
+      jobs: { id: number; instrumentId: number; symbol: string; status: string; gapsProcessed: number; filledMinutes: number; verifiedMinutes: number; error: string | null }[];
+    }>();
+    const job = body.jobs.find((row) => row.instrumentId === instrumentId);
+    expect(job).toMatchObject({ status: "queued", gapsProcessed: 0, filledMinutes: 0, verifiedMinutes: 0, error: null });
+    expect(job?.symbol).toContain("USDT");
   });
 
   it("rejects invalid ids, limits and non-closed/non-minute/oversized ranges", async () => {

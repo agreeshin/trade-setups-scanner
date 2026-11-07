@@ -31,7 +31,8 @@ function InstrumentCoverage({ id, revision }: { id: number; revision: number }) 
   </section>;
 }
 
-interface CoverageSummaryRow { instrumentId: number; exchange: string; category: string; symbol: string; status: string; firstMinuteUnix: number | null; lastMinuteUnix: number | null; totalCandles: number; missingMinutes: number }
+interface CoverageSummaryRow { instrumentId: number; exchange: string; category: string; symbol: string; status: string; firstMinuteUnix: number | null; lastMinuteUnix: number | null; totalCandles: number; missingMinutes: number; verifiedMinutes: number }
+interface GapRepairRow { id: number; instrumentId: number; symbol: string; status: "queued" | "running" | "done" | "failed"; gapsProcessed: number; filledMinutes: number; verifiedMinutes: number; error: string | null; createdAt: string; updatedAt: string }
 
 function CoverageOverview({ revision }: { revision: number }) {
   const state = usePlatformPoll<{ instruments: CoverageSummaryRow[] }>("/v1/history/instruments/coverage-summary", revision, 0);
@@ -50,7 +51,7 @@ function CoverageOverview({ revision }: { revision: number }) {
       <label className="grid gap-1 text-sm">Фильтр по символу<Input value={filter} onChange={(event) => setFilter(event.target.value)} /></label>
       <label className="flex items-center gap-2 pb-1 text-sm"><input type="checkbox" checked={withDataOnly} onChange={(event) => setWithDataOnly(event.target.checked)} /> Только инструменты со свечами</label>
     </div>
-    <div className="max-h-96 overflow-auto rounded-md border border-input"><table className="w-full text-sm"><thead className="sticky top-0 bg-background"><tr className="text-left"><th className="p-2">Инструмент</th><th className="p-2">Статус</th><th className="p-2">Первая минута</th><th className="p-2">Последняя минута</th><th className="p-2">Свечей</th><th className="p-2">Пропущено минут</th></tr></thead><tbody>{rows.slice(0, 200).map((row) => <tr key={row.instrumentId} className="border-b border-input"><td className="p-2">{row.symbol}</td><td className="p-2">{row.status}</td><td className="p-2">{row.firstMinuteUnix === null ? "нет" : localTime(row.firstMinuteUnix)}</td><td className="p-2">{row.lastMinuteUnix === null ? "нет" : localTime(row.lastMinuteUnix)}</td><td className="p-2">{row.totalCandles}</td><td className="p-2">{row.totalCandles === 0 ? "—" : row.missingMinutes}</td></tr>)}</tbody></table></div>
+    <div className="max-h-96 overflow-auto rounded-md border border-input"><table className="w-full text-sm"><thead className="sticky top-0 bg-background"><tr className="text-left"><th className="p-2">Инструмент</th><th className="p-2">Статус</th><th className="p-2">Первая минута</th><th className="p-2">Последняя минута</th><th className="p-2">Свечей</th><th className="p-2">Пропущено минут</th><th className="p-2">Из них без торговли</th></tr></thead><tbody>{rows.slice(0, 200).map((row) => <tr key={row.instrumentId} className="border-b border-input"><td className="p-2">{row.symbol}</td><td className="p-2">{row.status}</td><td className="p-2">{row.firstMinuteUnix === null ? "нет" : localTime(row.firstMinuteUnix)}</td><td className="p-2">{row.lastMinuteUnix === null ? "нет" : localTime(row.lastMinuteUnix)}</td><td className="p-2">{row.totalCandles}</td><td className="p-2">{row.totalCandles === 0 ? "—" : row.missingMinutes}</td><td className="p-2">{row.totalCandles === 0 ? "—" : row.verifiedMinutes}</td></tr>)}</tbody></table></div>
     {rows.length > 200 && <p className="text-sm text-muted-foreground">Показаны первые 200 из {rows.length}.</p>}
     {rows.length === 0 && <p>Нет инструментов по текущему фильтру.</p>}
   </section>;
@@ -63,6 +64,7 @@ export function HistoryPage() {
   const jobs = usePlatformPoll<{ jobs: BackfillJob[]; counts: JobCounts }>("/v1/history/backfill-jobs", revision);
   const targets = usePlatformPoll<{ targets: CollectionTarget[] }>("/v1/history/collection-targets", revision);
   const plans = usePlatformPoll<{ plans: BackfillPlanRow[] }>("/v1/history/backfill-plans", revision);
+  const repairs = usePlatformPoll<{ jobs: GapRepairRow[] }>("/v1/history/gap-repairs", revision);
   const [instrumentId, setInstrumentId] = useState("");
   const [collectionSymbols, setCollectionSymbols] = useState("");
   const [symbols, setSymbols] = useState("");
@@ -121,6 +123,28 @@ export function HistoryPage() {
       setMessage(enabled
         ? `Сбор включён для ${updated} инструментов. Инструменты с историей сначала дозаполнят хвост от последней свечи до текущей закрытой минуты (задания видны во вкладке «Задания загрузки»), затем перейдут к поминутному сбору. Инструменты без сохранённой истории ждут явной догрузки.`
         : `Сбор выключен для ${updated} инструментов.`);
+    } catch (cause) { setError(errorText(cause)); }
+    finally { setBusy(false); }
+  }
+
+  async function startGapRepairs() {
+    setBusy(true); setError(null); setMessage(null);
+    try {
+      if (collectionSelectionIds.length === 0) throw new Error("Выберите хотя бы один инструмент.");
+      let created = 0;
+      for (let index = 0; index < collectionSelectionIds.length; index += 1000) {
+        const chunk = collectionSelectionIds.slice(index, index + 1000);
+        const response = await apiFetch("/v1/history/gap-repairs", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ instrumentIds: chunk }),
+        });
+        const payload = await response.json() as { created?: number; error?: string };
+        if (!response.ok) throw new Error(payload.error ?? `HTTP ${response.status}`);
+        created += payload.created ?? 0;
+      }
+      setRevision((value) => value + 1);
+      setMessage(`Создано операций ремонта пропусков: ${created}. Заполняются только реальные пропуски между сохранёнными свечами; минуты без торговли подтверждаются маркерами.`);
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
@@ -207,6 +231,7 @@ export function HistoryPage() {
         <div className="flex flex-wrap gap-2">
           <Button type="button" disabled={busy || collectionSelectionIds.length === 0} onClick={() => { void bulkSetCollection(true); }}>Включить сбор для выбранных ({collectionSelectionIds.length})</Button>
           <Button type="button" variant="outline" disabled={busy || collectionSelectionIds.length === 0} onClick={() => { void bulkSetCollection(false); }}>Выключить сбор для выбранных</Button>
+          <Button type="button" variant="outline" disabled={busy || collectionSelectionIds.length === 0} onClick={() => { void startGapRepairs(); }}>Проверить и заполнить пропуски ({collectionSelectionIds.length})</Button>
         </div>
       </div>
       <div className="flex flex-wrap items-end gap-3"><label className="grid min-w-0 gap-1 text-sm">Инструмент БД<Select value={instrumentId} disabled={catalog.kind !== "ready" || busy} onChange={(event) => setInstrumentId(event.target.value)}><option value="">Выберите инструмент</option>{instruments.map((instrument) => <option key={instrument.id} value={instrument.id}>{instrument.exchange} / {instrument.category} / {instrument.symbol} ({instrument.status})</option>)}</Select></label><Button variant="outline" disabled={busy} onClick={() => setRevision((value) => value + 1)}>Обновить историю</Button></div>
@@ -214,7 +239,8 @@ export function HistoryPage() {
       {selected && <InstrumentCoverage key={selected.id} id={selected.id} revision={revision} />}
       {targets.kind === "loading" && <p>Загрузка состояния сбора…</p>}{targets.kind === "unreachable" && <p role="alert">Состояние сбора неизвестно ({targets.detail}). Управление недоступно.</p>}
       {targets.kind === "ready" && <><p>{selected ? `Выбранный инструмент: ${target?.enabled ? "сбор включён" : "сбор выключен"}.` : "Выберите инструмент для управления сбором."}</p><Button variant="outline" disabled={busy || !selected} onClick={() => { if (selected) void mutation(`/v1/history/collection-targets/${selected.id}`, { enabled: !target?.enabled }, "PUT", "Настройка сбора сохранена."); }}>{target?.enabled ? "Отключить сбор" : "Включить сбор"}</Button>
-        <div className="overflow-x-auto"><table className="w-full text-sm"><caption className="text-left text-muted-foreground">Первые 100 целей сбора из ответа API</caption><thead><tr className="text-left"><th className="p-2">Инструмент</th><th className="p-2">Включён</th><th className="p-2">Последняя собранная минута</th></tr></thead><tbody>{targets.data.targets.slice(0, 100).map((item) => <tr key={item.instrumentId} className="border-b border-input"><td className="p-2">{instrumentName(item.instrumentId)}</td><td className="p-2">{item.enabled ? "да" : "нет"}</td><td className="p-2">{item.lastCollectedUnix === null ? "нет данных" : localTime(item.lastCollectedUnix)}</td></tr>)}</tbody></table>{targets.data.targets.length === 0 && <p>Цели сбора ещё не настроены.</p>}</div></>}
+        <div className="overflow-x-auto"><table className="w-full text-sm"><caption className="text-left text-muted-foreground">Первые 100 целей сбора из ответа API</caption><thead><tr className="text-left"><th className="p-2">Инструмент</th><th className="p-2">Включён</th><th className="p-2">Последняя собранная минута</th></tr></thead><tbody>{targets.data.targets.slice(0, 100).map((item) => <tr key={item.instrumentId} className="border-b border-input"><td className="p-2">{instrumentName(item.instrumentId)}</td><td className="p-2">{item.enabled ? "да" : "нет"}</td><td className="p-2">{item.lastCollectedUnix === null ? "нет данных" : localTime(item.lastCollectedUnix)}</td></tr>)}</tbody></table>{targets.data.targets.length === 0 && <p>Цели сбора ещё не настроены.</p>}</div>
+        {repairs.kind === "ready" && repairs.data.jobs.length > 0 && <div className="overflow-x-auto"><table className="w-full text-sm"><caption className="text-left text-muted-foreground">Операции ремонта пропусков (последние 100)</caption><thead><tr className="text-left"><th className="p-2">ID / инструмент</th><th className="p-2">Статус</th><th className="p-2">Пропусков обработано</th><th className="p-2">Заполнено минут</th><th className="p-2">Подтверждено без торговли</th><th className="p-2">Ошибка</th></tr></thead><tbody>{repairs.data.jobs.slice(0, 100).map((job) => <tr key={job.id} className="border-b border-input"><td className="p-2">#{job.id} · {job.symbol}</td><td className="p-2">{job.status === "queued" ? "в очереди" : job.status === "running" ? "выполняется" : job.status === "done" ? "завершено" : "ошибка"}</td><td className="p-2">{job.gapsProcessed}</td><td className="p-2">{job.filledMinutes}</td><td className="p-2">{job.verifiedMinutes}</td><td className="p-2">{job.error && <span role="alert" className="block max-w-sm break-words">{job.error}</span>}</td></tr>)}</tbody></table></div>}</>}
     </section>}
 
     {tab === "jobs" && <section className="grid gap-3" aria-labelledby="backfill-heading">

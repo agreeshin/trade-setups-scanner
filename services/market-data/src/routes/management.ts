@@ -6,6 +6,7 @@ import type { BackfillJobsTable } from "../db/schema.js";
 import { BackfillAdmissionError, cancelBackfillRequest, requestBackfill } from "../ingest/backfill.js";
 import { createBackfillPlan, cancelBackfillPlan, getBackfillPlan, listBackfillPlans, type BackfillPlan } from "../ingest/plans.js";
 import { setCollectionTarget, setCollectionTargets } from "../ingest/continuous.js";
+import { createGapRepairJobs, listGapRepairJobs } from "../ingest/gap-repairs.js";
 import { ensureInstruments } from "../storage/instruments.js";
 import type { V1RouteOptions } from "./v1.js";
 
@@ -246,6 +247,50 @@ export function registerManagementRoutes(app: FastifyInstance, { db, requireApiK
     if (!cancelled) return reply.code(404).send({ error: "plan_not_found" });
     const plan = await getBackfillPlan(db, request.params.id);
     return { plan: planDto(plan!) };
+  });
+
+  const GapRepair = Type.Object({
+    id: Id,
+    instrumentId: Id,
+    symbol: Type.String(),
+    status: Type.Union([Type.Literal("queued"), Type.Literal("running"), Type.Literal("done"), Type.Literal("failed")]),
+    gapsProcessed: Type.Integer(),
+    filledMinutes: Type.Integer(),
+    verifiedMinutes: Type.Integer(),
+    error: Type.Union([Type.String(), Type.Null()]),
+    createdAt: Type.String(),
+    updatedAt: Type.String(),
+  });
+
+  app.get("/v1/gap-repairs", {
+    onRequest: [requireApiKey],
+    schema: {
+      querystring: Type.Object({ limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200, default: 100 })) }),
+      response: { 200: Type.Object({ jobs: Type.Array(GapRepair) }), 401: ErrorResponse },
+    },
+  }, async (request) => {
+    const query = request.query as { limit?: number };
+    const jobs = await listGapRepairJobs(db, query.limit ?? 100);
+    return {
+      jobs: jobs.map((job) => ({
+        ...job,
+        createdAt: job.createdAt.toISOString(),
+        updatedAt: job.updatedAt.toISOString(),
+      })),
+    };
+  });
+
+  app.post<{ Body: { instrumentIds: number[] } }>("/v1/gap-repairs", {
+    onRequest: [requireApiKey],
+    schema: {
+      body: Type.Object({ instrumentIds: Type.Array(Id, { minItems: 1, maxItems: 1000, uniqueItems: true }) }, { additionalProperties: false }),
+      response: { 202: Type.Object({ created: Type.Integer() }), 400: ErrorResponse, 401: ErrorResponse, 404: ErrorResponse },
+    },
+  }, async (request, reply) => {
+    const found = await db.selectFrom("instruments").select("id").where("id", "in", request.body.instrumentIds).execute();
+    if (found.length !== request.body.instrumentIds.length) return reply.code(404).send({ error: "instrument_not_found" });
+    const ids = await createGapRepairJobs(db, request.body.instrumentIds);
+    return reply.code(202).send({ created: ids.length });
   });
 
   app.post<{ Params: { id: number } }>("/v1/backfill-jobs/:id/cancel", {

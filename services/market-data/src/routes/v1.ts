@@ -40,6 +40,7 @@ const CoverageSummaryResponse = Type.Object({
     lastMinuteUnix: Type.Union([Type.Integer(), Type.Null()]),
     totalCandles: Type.Integer(),
     missingMinutes: Type.Integer(),
+    verifiedMinutes: Type.Integer(),
   })),
 });
 
@@ -143,6 +144,7 @@ export function registerV1Routes(
           lastMinuteUnix: row.lastMinute === null ? null : Math.floor(row.lastMinute.getTime() / 1000),
           totalCandles: row.totalCandles,
           missingMinutes: row.missingMinutes,
+          verifiedMinutes: row.verifiedMinutes,
         })),
       });
     },
@@ -191,7 +193,7 @@ export function registerV1Routes(
       response: {
         200: Type.Object({
           instrumentId: Type.Integer(), fromUnix: Type.Integer(), toUnix: Type.Integer(), splitUnix: Type.Integer(),
-          expectedMinutes: Type.Integer(), presentMinutes: Type.Integer(), missingMinutes: Type.Integer(),
+          expectedMinutes: Type.Integer(), presentMinutes: Type.Integer(), missingMinutes: Type.Integer(), verifiedMinutes: Type.Integer(),
           warmupExpectedMinutes: Type.Integer(), warmupPresentMinutes: Type.Integer(),
           signalExpectedMinutes: Type.Integer(), signalPresentMinutes: Type.Integer(),
           gaps: Type.Array(Type.Object({ fromUnix: Type.Integer(), toUnix: Type.Integer() }), { maxItems: 100 }),

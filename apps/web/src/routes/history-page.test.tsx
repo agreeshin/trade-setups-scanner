@@ -16,9 +16,9 @@ const emptyCounts = { queued: 0, running: 0, done: 0, cancel_requested: 0, cance
 const planFixture = { id: 5, fromUnix: 1767225600, toUnix: 1767312000, status: "active", counts: { total: 2, pending: 1, enqueued: 1, failed: 0, cancelled: 0 }, activeJobs: 1, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
 const coverageSummary = {
   instruments: [
-    { instrumentId: 1, exchange: "bybit", category: "linear", symbol: "BTCUSDT", status: "active", firstMinuteUnix: 1767225600, lastMinuteUnix: 1767312000, totalCandles: 1440, missingMinutes: 5 },
-    { instrumentId: 2, exchange: "bybit", category: "linear", symbol: "ETHUSDT", status: "active", firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, missingMinutes: 0 },
-    { instrumentId: 3, exchange: "bybit", category: "linear", symbol: "OLDUSDT", status: "delisted", firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, missingMinutes: 0 },
+    { instrumentId: 1, exchange: "bybit", category: "linear", symbol: "BTCUSDT", status: "active", firstMinuteUnix: 1767225600, lastMinuteUnix: 1767312000, totalCandles: 1440, missingMinutes: 5, verifiedMinutes: 2 },
+    { instrumentId: 2, exchange: "bybit", category: "linear", symbol: "ETHUSDT", status: "active", firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, missingMinutes: 0, verifiedMinutes: 0 },
+    { instrumentId: 3, exchange: "bybit", category: "linear", symbol: "OLDUSDT", status: "delisted", firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, missingMinutes: 0, verifiedMinutes: 0 },
   ],
 };
 
@@ -29,6 +29,7 @@ function stubFetch(options: { counts?: typeof emptyCounts; plans?: typeof planFi
     if (init?.method === "POST") {
       posts.push({ url: path, body: typeof init.body === "string" ? (JSON.parse(init.body) as unknown) : null });
       if (path === "/v1/history/backfill-plans") return Promise.resolve(new Response(JSON.stringify({ plan: planFixture }), { status: 202 }));
+      if (path === "/v1/history/gap-repairs") return Promise.resolve(new Response(JSON.stringify({ created: 2 }), { status: 202 }));
       return Promise.resolve(new Response(JSON.stringify({ jobs: [], created: 2, declined: 0 }), { status: 202 }));
     }
     if (init?.method === "PUT") {
@@ -41,6 +42,7 @@ function stubFetch(options: { counts?: typeof emptyCounts; plans?: typeof planFi
     if (path === "/v1/history/instruments/listing") return Promise.resolve(new Response(JSON.stringify({ instruments: catalog.instruments.slice(0, 2) }), { status: 200 }));
     if (path === "/v1/history/backfill-jobs") return Promise.resolve(new Response(JSON.stringify({ jobs: [], nextBeforeId: null, counts: options.counts ?? emptyCounts }), { status: 200 }));
     if (path === "/v1/history/backfill-plans") return Promise.resolve(new Response(JSON.stringify({ plans: options.plans ?? [] }), { status: 200 }));
+    if (path === "/v1/history/gap-repairs") return Promise.resolve(new Response(JSON.stringify({ jobs: [] }), { status: 200 }));
     if (path === "/v1/history/collection-targets") return Promise.resolve(new Response(JSON.stringify({ targets: [] }), { status: 200 }));
     return Promise.resolve(new Response(JSON.stringify({}), { status: 200 }));
   }));
@@ -85,9 +87,11 @@ it("shows the coverage overview table with data-only default and symbol filter",
   expect(screen.getByText(/Инструментов со свечами: 1 из 3/)).toBeInTheDocument();
   expect(screen.getByText("1440")).toBeInTheDocument();
   expect(screen.getByText("5")).toBeInTheDocument();
+  expect(screen.getAllByRole("columnheader", { name: "Из них без торговли" })).toHaveLength(1);
+  expect(screen.getByText("2")).toBeInTheDocument();
   expect(screen.queryByText("—")).not.toBeInTheDocument();
   fireEvent.click(screen.getByLabelText("Только инструменты со свечами"));
-  expect(await screen.findAllByText("—")).toHaveLength(2);
+  expect(await screen.findAllByText("—")).toHaveLength(4);
   fireEvent.change(screen.getByLabelText("Фильтр по символу"), { target: { value: "zzz" } });
   expect(await screen.findByText("Нет инструментов по текущему фильтру.")).toBeInTheDocument();
 });
@@ -127,6 +131,17 @@ it("bulk-enables collection for listing-imported instruments", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Включить сбор для выбранных (2)" }));
   expect(await screen.findByText(/Сбор включён для 2 инструментов/)).toBeInTheDocument();
   expect(posts.find((post) => post.url === "/v1/history/collection-targets")?.body).toEqual({ instrumentIds: [1, 2], enabled: true });
+});
+
+it("starts gap repairs for listing-imported instruments", async () => {
+  const posts = stubFetch();
+  render(<HistoryPage />);
+  await userEvent.click(screen.getByRole("tab", { name: "Текущий сбор свечей" }));
+  await userEvent.click(screen.getByRole("button", { name: "Импортировать листинг для сбора" }));
+  expect(await screen.findByText(/Листинг Bybit загружен: 2 инструментов/)).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Проверить и заполнить пропуски (2)" }));
+  expect(await screen.findByText(/Создано операций ремонта пропусков: 2/)).toBeInTheDocument();
+  expect(posts.find((post) => post.url === "/v1/history/gap-repairs")?.body).toEqual({ instrumentIds: [1, 2] });
 });
 
 it("groups long lists into separate tabs", async () => {
