@@ -34,7 +34,9 @@ it("checks cache offline using persisted identities and launches only the exact 
   const { writes } = mockApi({ offline: true });
   await openForm();
   await userEvent.click(screen.getByRole("button", { name: "Проверить данные" }));
-  await screen.findByText(/Качество: Качество не сохранено/);
+  await userEvent.click(await screen.findByRole("button", { name: "Показать проверенные наборы свечей" }));
+  expect(await screen.findByText(/Качество: Качество не сохранено/)).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Закрыть" }));
   expect(writes.map((item) => item.path)).toEqual(["/v1/replay-preflight"]);
   expect(writes[0]?.body).toMatchObject({ instruments: [identity] });
   expect(screen.queryByText(/Прогрев:/)).not.toBeInTheDocument();
@@ -69,7 +71,9 @@ it("saves lowercase symbols with full identities and reopens them for offline ca
   first.unmount(); offline = true;
   await openForm();
   await userEvent.click(screen.getByRole("button", { name: "Проверить данные" }));
-  await screen.findByText(/Качество: Качество не сохранено/);
+  await userEvent.click(await screen.findByRole("button", { name: "Показать проверенные наборы свечей" }));
+  expect(await screen.findByText(/Качество: Качество не сохранено/)).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Закрыть" }));
   expect(writes.find((item) => item.path === "/v1/replay-preflight")?.body).toMatchObject({ instruments: [identity] });
   expect(writes.some((item) => item.path === "/v1/replay-runs")).toBe(false);
 });
@@ -83,6 +87,7 @@ it("aborts preflight on edits and ignores an aborted late response", async () =>
   expect(signal?.aborted).toBe(true);
   await act(async () => { resolveLate?.(new Response(JSON.stringify(preview))); await Promise.resolve(); });
   expect(screen.queryByRole("button", { name: "Запустить проверенный расчёт" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Показать проверенные наборы свечей" })).not.toBeInTheDocument();
   expect(writes).toHaveLength(1);
 });
 it("invalidates a ready preview on selection change", async () => {
@@ -105,6 +110,7 @@ it("shows an HTTP preflight failure without restoring confirmation", async () =>
   await openForm(); await userEvent.click(screen.getByRole("button", { name: "Проверить данные" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("Проверка данных недоступна: HTTP 502");
   expect(screen.queryByRole("button", { name: "Запустить проверенный расчёт" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Показать проверенные наборы свечей" })).not.toBeInTheDocument();
   expect(writes).toHaveLength(1);
 });
 it("keeps honest preview when launch fails and blocks canRun false", async () => {
@@ -120,10 +126,12 @@ it.each(["unavailable", "not_found"] as const)("blocks confirmation for %s witho
   expect(screen.queryByText(/в этом входном диапазоне истории нет/)).not.toBeInTheDocument();
   expect(writes).toHaveLength(1);
 });
-it("reports known empty history separately and bounds the gap preview", () => {
+it("reports known empty history in the dialog and bounds the gap preview", async () => {
   render(<ReplayPreflight preview={{ ...preview, results: [{ ...identity, cacheHit: false, status: "ready", coverage: { instrumentId: 1, fromUnix: 0, toUnix: 6000, splitUnix: 3000, expectedMinutes: 100, presentMinutes: 0, missingMinutes: 100, warmupExpectedMinutes: 50, warmupPresentMinutes: 0, signalExpectedMinutes: 50, signalPresentMinutes: 0, gaps: Array.from({ length: 51 }, (_, index) => ({ fromUnix: index * 60, toUnix: (index + 1) * 60 })), gapCount: 200, offset: 0, limit: 50, checkedAt: "2026-11-01T00:00:00Z" } }] }} />);
+  expect(screen.queryByText(/в этом входном диапазоне истории нет/)).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Показать проверенные наборы свечей" }));
   expect(screen.getByText(/Проверено: в этом входном диапазоне истории нет/)).toBeVisible();
   expect(screen.getByText("Пропуски: показано 50 из 200 интервалов")).toBeVisible();
-  expect(screen.getAllByRole("listitem", { hidden: true })).toHaveLength(50);
+  expect(screen.getAllByRole("listitem")).toHaveLength(50);
   expect(screen.queryByText(/Запуск недоступен:/)).not.toBeInTheDocument();
 });

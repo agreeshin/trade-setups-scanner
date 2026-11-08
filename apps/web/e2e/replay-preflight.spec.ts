@@ -17,7 +17,11 @@ test("mobile preflight requires explicit snapshot confirmation and invalidates o
   });
   await page.goto("/runs");
   await page.getByRole("button", { name: "Проверить данные" }).click();
+  await page.getByRole("button", { name: "Показать проверенные наборы свечей" }).click();
   await expect(page.getByText(/Проверено: в этом входном диапазоне истории нет/)).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByText(/Проверено: в этом входном диапазоне истории нет/)).toHaveCount(0);
+  expect(await page.evaluate(() => document.body.hasAttribute("data-scroll-locked"))).toBe(false);
   expect(writes.map((item) => item.path)).toEqual(["/v1/replay-preflight"]);
   await page.getByLabel("Конец", { exact: true }).fill("2026-10-01T14:00");
   await expect(page.getByRole("button", { name: "Запустить проверенный расчёт" })).toHaveCount(0);
