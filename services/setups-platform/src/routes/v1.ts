@@ -137,6 +137,7 @@ export function registerPlatformV1Routes(
   const { db, requireApiKey, marketData, replayLimits = DEFAULT_REPLAY_ADMISSION_LIMITS } = options;
   registerControls(app, options);
 
+  // TODO: preflight cost grows linearly with instruments × range (819 × 90d ≈ 64s, proxied via nginx with 600s timeout); batch or parallelize coverage checks if larger launches need faster checks.
   app.post("/v1/replay-preflight", { preHandler: [requireApiKey], schema: { body: ReplayRunRequest } }, async (request, reply) => {
     const controller = new AbortController();
     const close = () => controller.abort();
