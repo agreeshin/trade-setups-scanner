@@ -85,7 +85,7 @@ export async function getReplayBatch(db: Kysely<SignalsDB>, batchId: number): Pr
     from replay_batches b join replay_runs r on r.batch_id = b.id
     where b.id = ${batchId}
     group by b.id`.execute(db);
-  return result.rows[0] === undefined ? undefined : toSummary(result.rows[0]!);
+  return result.rows[0] === undefined ? undefined : toSummary(result.rows[0]);
 }
 
 export async function replayBatchResultPage(
