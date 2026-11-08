@@ -146,7 +146,7 @@ describe.skipIf(!TEST_DATABASE_URL)("gap verification and repair", () => {
     const { transport, requests } = recordingTransport((ms) => minute(7).getTime() <= ms && ms <= minute(8).getTime());
     const [jobId] = await createGapRepairJobs(db, [instrumentId]);
     expect(await drainGapRepairs({ db, client: makeClient(transport, clock) })).toBeGreaterThanOrEqual(1);
-    const job = await db.selectFrom("gap_repair_jobs").selectAll().where("id", "=", jobId).executeTakeFirstOrThrow();
+    const job = await db.selectFrom("gap_repair_jobs").selectAll().where("id", "=", jobId!).executeTakeFirstOrThrow();
     expect(job.status).toBe("done");
     expect(job.filled_minutes).toBe(2);
     expect(job.verified_minutes).toBe(8);
@@ -169,7 +169,7 @@ describe.skipIf(!TEST_DATABASE_URL)("gap verification and repair", () => {
     const { transport } = recordingTransport(() => false);
     const [jobId] = await createGapRepairJobs(db, [instrumentId]);
     await drainGapRepairs({ db, client: makeClient(transport, new FakeClock(T0 + 30 * MINUTE + 30_000)) });
-    const job = await db.selectFrom("gap_repair_jobs").selectAll().where("id", "=", jobId).executeTakeFirstOrThrow();
+    const job = await db.selectFrom("gap_repair_jobs").selectAll().where("id", "=", jobId!).executeTakeFirstOrThrow();
     expect(job.status).toBe("failed");
     expect(job.error).toContain("no candles");
     expect(await verificationRanges()).toEqual([]);
@@ -186,7 +186,7 @@ describe.skipIf(!TEST_DATABASE_URL)("gap verification and repair", () => {
     const { transport, requests } = recordingTransport(() => true);
     const [jobId] = await createGapRepairJobs(db, [instrumentId]);
     expect(await drainGapRepairs({ db, client: makeClient(transport, clock) })).toBeGreaterThanOrEqual(1);
-    const job = await db.selectFrom("gap_repair_jobs").selectAll().where("id", "=", jobId).executeTakeFirstOrThrow();
+    const job = await db.selectFrom("gap_repair_jobs").selectAll().where("id", "=", jobId!).executeTakeFirstOrThrow();
     expect(job.status).toBe("done");
     expect(job.filled_minutes).toBe(5);
     expect(job.verified_minutes).toBe(0);

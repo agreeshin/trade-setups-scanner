@@ -23,7 +23,7 @@ export async function createGapRepairJobs(db: Kysely<MarketDataDB>, instrumentId
     for (const instrumentId of instrumentIds) {
       const row = await tx
         .insertInto("gap_repair_jobs")
-        .values({ instrument_id: instrumentId, status: "queued" })
+        .values({ instrument_id: instrumentId, status: "queued", gaps_processed: 0, filled_minutes: 0, verified_minutes: 0, error: null })
         .returning("id")
         .executeTakeFirstOrThrow();
       ids.push(row.id);
