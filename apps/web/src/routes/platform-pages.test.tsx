@@ -23,6 +23,7 @@ const algorithm = {
     { key: "volumeMultiplier", label: "Множитель объёма", type: "decimal", min: 1, max: 100, unit: "×" },
   ],
 };
+let purgeResponse: { status: number; body: unknown } = { status: 200, body: { runsDeleted: 2, cacheDeleted: 1, qualityIntervalsDeleted: 0 } };
 const requests: { path: string; method: string; body: unknown }[] = [];
 beforeEach(() => {
   requests.length = 0;
@@ -56,12 +57,32 @@ beforeEach(() => {
       const filtered = all.filter((row) => row.symbol.includes(params.get("q") ?? ""));
       data = { setups: filtered.slice(offset, offset + limit), offset, limit, total: filtered.length, snapshotId: 601 };
     }
+    if (path === "/v1/replay-runs/purge") return Promise.resolve(new Response(JSON.stringify(purgeResponse.body), { status: purgeResponse.status }));
     return Promise.resolve(new Response(JSON.stringify(data), { status: 200 }));
   }));
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("platform screens", () => {
+  it("purges all replay runs after two-step confirmation", async () => {
+    purgeResponse = { status: 200, body: { runsDeleted: 2, cacheDeleted: 1, qualityIntervalsDeleted: 0 } };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole("button", { name: "Очистить все прогоны" }));
+    expect(screen.getByRole("button", { name: "Подтвердить очистку всего" })).toBeInTheDocument();
+    expect(requests.some((request) => request.path === "/v1/replay-runs/purge")).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: "Подтвердить очистку всего" }));
+    await waitFor(() => expect(screen.getByText(/Удалено: прогонов 2/)).toBeInTheDocument());
+    expect(requests.some((request) => request.path === "/v1/replay-runs/purge" && request.method === "POST")).toBe(true);
+  });
+
+  it("reports stopping runs on purge conflict", async () => {
+    purgeResponse = { status: 409, body: { error: "active_runs", active: 1, queuedCancelled: 5, runningCancelRequested: 1 } };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole("button", { name: "Очистить все прогоны" }));
+    await userEvent.click(screen.getByRole("button", { name: "Подтвердить очистку всего" }));
+    await waitFor(() => expect(screen.getByText(/Повторите очистку через несколько секунд/)).toBeInTheDocument());
+  });
+
   it("submits algorithm and local dates without overriding saved algorithm params", async () => {
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
     await waitFor(() => expect(screen.getByRole("button", { name: "Проверить данные" })).toBeEnabled());

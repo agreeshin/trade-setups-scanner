@@ -9,7 +9,7 @@ import { SpikeParamsSchema } from "../algorithms.js";
 import { registerControls } from "./controls.js";
 import { ApiCandleSource } from "../replay/source.js";
 import { replayRun } from "../replay/replay-runner.js";
-import { admitReplayCacheMiss, cancelReplayRun, DEFAULT_REPLAY_ADMISSION_LIMITS, replayRunDto, ReplayAdmissionError, reserveReplayRuns, type ReplayAdmissionLimits } from "../replay/jobs.js";
+import { admitReplayCacheMiss, cancelReplayRun, DEFAULT_REPLAY_ADMISSION_LIMITS, purgeReplayRuns, replayRunDto, ReplayAdmissionError, reserveReplayRuns, type ReplayAdmissionLimits } from "../replay/jobs.js";
 import { saveQualityPage, type QualityInterval } from "../replay/quality.js";
 import { prepareReplayRequest, replayPreflight, type ReplayRequest } from "../replay/preflight.js";
 import {
@@ -351,6 +351,22 @@ export function registerPlatformV1Routes(
     const run = await cancelReplayRun(db, (request.params as { id: number }).id);
     if (!run) return reply.code(404).send({ error: "run not found" });
     return reply.send({ run: replayRunDto(run) });
+  });
+
+  app.post("/v1/replay-runs/purge", {
+    preHandler: [requireApiKey],
+    schema: {
+      response: {
+        200: Type.Object({ runsDeleted: Type.Integer(), cacheDeleted: Type.Integer(), qualityIntervalsDeleted: Type.Integer() }),
+        409: Type.Object({ error: Type.String(), active: Type.Integer(), queuedCancelled: Type.Integer(), runningCancelRequested: Type.Integer() }),
+      },
+    },
+  }, async (_request, reply) => {
+    const outcome = await purgeReplayRuns(db);
+    if (outcome.status === "active") {
+      return reply.code(409).send({ error: "active_runs", active: outcome.active, queuedCancelled: outcome.queuedCancelled, runningCancelRequested: outcome.runningCancelRequested });
+    }
+    return reply.send({ runsDeleted: outcome.runsDeleted, cacheDeleted: outcome.cacheDeleted, qualityIntervalsDeleted: outcome.qualityIntervalsDeleted });
   });
 
   app.get("/v1/settings/replay", { preHandler: [requireApiKey] }, async () => ({ paused: (await getSetting(db, "replay")).paused === true }));

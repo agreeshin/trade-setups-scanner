@@ -171,6 +171,29 @@ export async function cancelReplayRun(db: Kysely<SignalsDB>, id: number): Promis
   });
 }
 
+export type ReplayPurgeOutcome =
+  | { status: "purged"; runsDeleted: number; cacheDeleted: number; qualityIntervalsDeleted: number }
+  | { status: "active"; active: number; queuedCancelled: number; runningCancelRequested: number };
+
+export async function purgeReplayRuns(db: Kysely<SignalsDB>): Promise<ReplayPurgeOutcome> {
+  return db.transaction().execute(async (tx) => {
+    await sql`select pg_advisory_xact_lock(72423412)`.execute(tx);
+    const active = Number((await tx.selectFrom("replay_runs").select((eb) => eb.fn.countAll<string>().as("n"))
+      .where("status", "in", ["running", "cancel_requested"]).executeTakeFirstOrThrow()).n);
+    if (active > 0) {
+      const queued = await tx.updateTable("replay_runs").set({ status: "cancelled", updated_at: new Date() })
+        .where("status", "=", "queued").returning("id").execute();
+      const running = await tx.updateTable("replay_runs").set({ status: "cancel_requested", updated_at: new Date() })
+        .where("status", "=", "running").returning("id").execute();
+      return { status: "active", active, queuedCancelled: queued.length, runningCancelRequested: running.length };
+    }
+    const quality = await tx.deleteFrom("replay_quality_intervals").returning("run_id").execute();
+    const cache = await tx.deleteFrom("replay_cache").returning("cache_key").execute();
+    const runs = await tx.deleteFrom("replay_runs").returning("id").execute();
+    return { status: "purged", runsDeleted: runs.length, cacheDeleted: cache.length, qualityIntervalsDeleted: quality.length };
+  });
+}
+
 /** One runtime per application process; stop before destroying the DB pool. */
 export async function startReplayJobs(db: Kysely<SignalsDB>, marketData: { url: string; apiKey: string }, options: {
   pollIntervalMs?: number;

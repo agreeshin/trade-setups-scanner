@@ -153,6 +153,21 @@ describe.skipIf(!TEST_DATABASE_URL)("platform api", () => {
     expect(response.statusCode).toBe(401);
   });
 
+  it("purges replay runs via the API and reports active-run conflicts", async () => {
+    const headers = { "x-api-key": PLATFORM_KEY };
+    await db.deleteFrom("replay_runs").execute();
+    const seed = { exchange_code: "bybit", category: "linear", symbol: "PURGEUSDT", from_ts: new Date(0), to_ts: new Date(60_000), algorithm_id: "price_volume_spike", algorithm_version: "1", params: DEFAULT_SPIKE_PARAMS, cache_hit: false, setups: [] };
+    await db.insertInto("replay_runs").values({ ...seed, status: "done" }).execute();
+    const purged = await app.inject({ method: "POST", url: "/v1/replay-runs/purge", headers });
+    expect(purged.statusCode).toBe(200);
+    expect(purged.json<{ runsDeleted: number }>().runsDeleted).toBeGreaterThanOrEqual(1);
+    await db.insertInto("replay_runs").values({ ...seed, status: "running" }).execute();
+    const conflict = await app.inject({ method: "POST", url: "/v1/replay-runs/purge", headers });
+    expect(conflict.statusCode).toBe(409);
+    expect(conflict.json<{ error: string; active: number }>()).toMatchObject({ error: "active_runs", active: 1 });
+    await db.deleteFrom("replay_runs").execute();
+  });
+
   it("persists shared algorithm and UI settings and snapshots them in replay", async () => {
     const headers = { "x-api-key": PLATFORM_KEY };
     const algorithms = await app.inject({ method: "GET", url: "/v1/algorithms", headers });

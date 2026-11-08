@@ -6,7 +6,7 @@ import type { SignalsDB } from "../src/db/schema.js";
 import { buildApp } from "../src/app.js";
 import { DEFAULT_SPIKE_PARAMS, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION } from "../src/detector/price-volume-spike.js";
 import type { SpikeSetup } from "../src/detector/price-volume-spike.js";
-import { DEFAULT_REPLAY_ADMISSION_LIMITS, cancelReplayRun, enqueueReplayRuns, startReplayJobs } from "../src/replay/jobs.js";
+import { DEFAULT_REPLAY_ADMISSION_LIMITS, cancelReplayRun, enqueueReplayRuns, purgeReplayRuns, reserveReplayRuns, startReplayJobs } from "../src/replay/jobs.js";
 import { cacheClearAll, cacheStats, cacheStore } from "../src/replay/cache.js";
 import { ArrayCandleSource, type CandleSource } from "../src/replay/source.js";
 import { setSetting } from "../src/settings.js";
@@ -29,6 +29,7 @@ describe.skipIf(!url)("persistent replay jobs", () => {
   beforeEach(async () => {
     await db.deleteFrom("replay_runs").execute();
     await db.deleteFrom("replay_cache").execute();
+    await db.deleteFrom("replay_quality_intervals").execute();
     await db.deleteFrom("settings").where("key", "in", ["replay", "replay-cache-generation"]).execute();
   });
   afterEach(async () => { await runtime?.stop(); runtime = undefined; });
@@ -102,6 +103,32 @@ describe.skipIf(!url)("persistent replay jobs", () => {
     expect(runs).toHaveLength(150);
     for (const run of runs) await cancelReplayRun(db, run.id);
     expect((await get(runs[0]!.id)).status).toBe("cancelled");
+  });
+
+  it("purges all runs, cache and quality intervals when none are active", async () => {
+    const runs = await enqueueReplayRuns(db, { ...input, instruments: [{ ...input.instruments[0]!, symbol: "PURGE1USDT" }, { ...input.instruments[0]!, symbol: "PURGE2USDT" }] });
+    const seed = runs[0]!;
+    await db.insertInto("replay_cache").values({ cache_key: `purge:${seed.id}`, exchange_code: seed.exchange_code, category: seed.category, symbol: seed.symbol, algorithm_id: seed.algorithm_id, algorithm_version: seed.algorithm_version, params: seed.params, from_ts: seed.from_ts, to_ts: seed.to_ts, setups: [], warmup_minutes: 0, processed_minutes: 0 }).execute();
+    await db.insertInto("replay_quality_intervals").values({ run_id: seed.id, from_unix: input.fromUnix, to_unix: input.fromUnix + 60, reason: "evaluated" }).execute();
+    const outcome = await purgeReplayRuns(db);
+    expect(outcome).toEqual({ status: "purged", runsDeleted: 2, cacheDeleted: 1, qualityIntervalsDeleted: 1 });
+    expect(await db.selectFrom("replay_runs").selectAll().execute()).toEqual([]);
+    expect(await db.selectFrom("replay_cache").selectAll().execute()).toEqual([]);
+    expect(await db.selectFrom("replay_quality_intervals").selectAll().execute()).toEqual([]);
+  });
+
+  it("stops the queue and reports active runs before purging", async () => {
+    await enqueueReplayRuns(db, { ...input, instruments: [{ ...input.instruments[0]!, symbol: "PURGEQ1USDT" }, { ...input.instruments[0]!, symbol: "PURGEQ2USDT" }] });
+    await reserveReplayRuns(db, input, DEFAULT_REPLAY_ADMISSION_LIMITS, "running");
+    const outcome = await purgeReplayRuns(db);
+    expect(outcome).toEqual({ status: "active", active: 1, queuedCancelled: 2, runningCancelRequested: 1 });
+    const statuses = new Map((await db.selectFrom("replay_runs").selectAll().execute()).map((row) => [row.symbol, row.status]));
+    expect(statuses.get("PURGEQ1USDT")).toBe("cancelled");
+    expect(statuses.get("PURGEQ2USDT")).toBe("cancelled");
+    expect(statuses.get("ASYNCUSDT")).toBe("cancel_requested");
+    await db.updateTable("replay_runs").set({ status: "done", updated_at: new Date() }).where("status", "=", "cancel_requested").execute();
+    const done = await purgeReplayRuns(db);
+    expect(done).toEqual({ status: "purged", runsDeleted: 3, cacheDeleted: 0, qualityIntervalsDeleted: 0 });
   });
 
   it("rejects excessive new work atomically but admits an exact cache hit", async () => {
