@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { AuthGate } from "./auth-gate";
+import { SessionSlot } from "./ui/app-frame";
 import { apiFetch, fetchPlatform, SESSION_EXPIRED_EVENT } from "../lib/platform-api";
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
@@ -13,7 +14,7 @@ describe("browser authentication", () => {
       .mockImplementationOnce(() => Promise.resolve(session()))
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
     vi.stubGlobal("fetch", fetch);
-    render(<AuthGate><p>Protected content</p></AuthGate>);
+    render(<AuthGate><><p>Protected content</p><SessionSlot /></></AuthGate>);
     expect(screen.queryByText("Protected content")).not.toBeInTheDocument();
     const input = await screen.findByLabelText("API-ключ");
     fireEvent.change(input, { target: { value: "wrong" } });

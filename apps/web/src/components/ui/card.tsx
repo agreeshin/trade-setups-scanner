@@ -6,7 +6,7 @@ type DivAttributes = HTMLAttributes<HTMLDivElement>;
 
 export function Card({ asChild = false, className, ...props }: DivAttributes & { asChild?: boolean }) {
   const Comp = asChild ? Slot : "div";
-  return <Comp data-slot="card" className={cn("rounded-xl border border-input/60 bg-card p-5 text-card-foreground shadow-card", className)} {...props} />;
+  return <Comp data-slot="card" className={cn("rounded-xl border border-input/60 bg-muted/40 p-5 text-card-foreground", className)} {...props} />;
 }
 
 export function CardHeader({ className, ...props }: DivAttributes) {

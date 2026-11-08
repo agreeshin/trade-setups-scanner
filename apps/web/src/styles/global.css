@@ -2,18 +2,18 @@
 
 @theme {
   /* palette:begin — сгенерировано scripts/generate-palette.mjs из BRAND_HEX; меняй параметры генератора, не этот блок */
-  --color-background: light-dark(#f8f7fa, #111012);
-  --color-foreground: light-dark(#25202a, #efedf1);
-  --color-card: light-dark(#ffffff, #1a181d);
-  --color-card-foreground: light-dark(#25202a, #efedf1);
-  --color-primary: light-dark(#704593, #c9aae6);
-  --color-primary-foreground: light-dark(#ffffff, #1f1627);
-  --color-muted: light-dark(#ebe7f0, #252328);
-  --color-muted-foreground: light-dark(#63596c, #aba5b1);
-  --color-accent: light-dark(#e5daf0, #433650);
-  --color-accent-foreground: light-dark(#432959, #f2eafa);
-  --color-input: light-dark(#d9d2df, #3a363e);
-  --color-ring: light-dark(#704593, #c9aae6);
+  --color-background: light-dark(#fbfbfd, #121314);
+  --color-foreground: light-dark(#202329, #eceef0);
+  --color-card: light-dark(#ffffff, #16171a);
+  --color-card-foreground: light-dark(#202329, #eceef0);
+  --color-primary: light-dark(#3b3f46, #b9bec6);
+  --color-primary-foreground: light-dark(#ffffff, #151619);
+  --color-muted: light-dark(#f3f4f7, #1c1d20);
+  --color-muted-foreground: light-dark(#5a5e65, #a5a8af);
+  --color-accent: light-dark(#ebeff4, #2a2e35);
+  --color-accent-foreground: light-dark(#282e38, #ebeff4);
+  --color-input: light-dark(#d2d6dc, #303238);
+  --color-ring: light-dark(#3b3f46, #b9bec6);
   --color-success: light-dark(#0a7f5c, #18cf98);
   --color-success-foreground: light-dark(#ffffff, #0b271c);
   --color-warning: light-dark(#966300, #f5b041);

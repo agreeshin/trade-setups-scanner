@@ -8,6 +8,7 @@ import { Checkbox } from "../components/ui/checkbox";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { PageHeader, SectionHeader } from "../components/ui/page-header";
+import { SegmentedList, SegmentedTrigger } from "../components/ui/segmented";
 import { Select } from "../components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
@@ -217,9 +218,9 @@ export function HistoryPage() {
     {counts !== null && (activeJobs > 0
       ? <Alert variant="info" role="status">Идёт массовая загрузка истории: активных заданий {activeJobs} (в очереди {counts.queued}, выполняется {counts.running}, запрошена отмена {counts.cancel_requested}). Статус хранится на сервере и виден после перезагрузки страницы.</Alert>
       : <p role="status" className="text-sm text-muted-foreground">Массовых загрузок, запущенных пользователем, сейчас нет. Постоянный ежеминутный сбор закрытых минут работает отдельно и здесь не учитывается.</p>)}
-    <div role="tablist" aria-label="Разделы «История и сбор»" className="flex flex-wrap gap-2">
-      {HISTORY_TABS.map((item) => <Button key={item.id} type="button" variant={tab === item.id ? "default" : "outline"} role="tab" aria-selected={tab === item.id} onClick={() => setTab(item.id)}>{item.label}</Button>)}
-    </div>
+    <SegmentedList role="tablist" aria-label="Разделы «История и сбор»">
+      {HISTORY_TABS.map((item) => <SegmentedTrigger key={item.id} role="tab" aria-selected={tab === item.id} onClick={() => setTab(item.id)}>{item.label}</SegmentedTrigger>)}
+    </SegmentedList>
     {error && <Alert variant="destructive" role="alert">{error}</Alert>}
     {message && <Alert variant="success" role="status">{message}</Alert>}
 

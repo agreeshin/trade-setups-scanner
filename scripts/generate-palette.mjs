@@ -6,7 +6,7 @@
 
 import { readFile, writeFile } from "node:fs/promises";
 
-const BRAND_HEX = "#704593";
+const BRAND_HEX = "#3B3F46";
 const ROSE_HUE = 344;
 const FUNCTIONAL_HUES = { success: 165, warning: 75, danger: 27, info: 279 };
 const AMBIENT_VIOLET_HUE = 300;
@@ -16,18 +16,18 @@ const AMBIENT_VIOLET_HUE = 300;
 // Решение владельца 2026-11-08: бордеры светлой темы вдвое слабее прежних
 // (L между фоном 0.978 и прежним input 0.769), тёмная тема не менялась.
 const TOKENS = [
-  { name: "background", light: [0.978, 0.004], dark: [0.177, 0.004] },
-  { name: "foreground", light: [0.255, 0.019], dark: [0.948, 0.007] },
-  { name: "card", light: [1.0, 0.0], dark: [0.213, 0.012] },
-  { name: "card-foreground", light: [0.255, 0.019], dark: [0.948, 0.007] },
-  { name: "primary", light: "brand", dark: [0.786, 0.089] },
-  { name: "primary-foreground", light: [1.0, 0.0], dark: [0.221, 0.035] },
-  { name: "muted", light: [0.934, 0.013], dark: [0.26, 0.011] },
-  { name: "muted-foreground", light: [0.481, 0.031], dark: [0.732, 0.018] },
-  { name: "accent", light: [0.904, 0.031], dark: [0.359, 0.046] },
-  { name: "accent-foreground", light: [0.337, 0.087], dark: [0.949, 0.023] },
-  { name: "input", light: [0.874, 0.019], dark: [0.339, 0.016] },
-  { name: "ring", light: "brand", dark: [0.786, 0.089] },
+  { name: "background", light: [0.989, 0.002], dark: [0.185, 0.003] },
+  { name: "foreground", light: [0.255, 0.012], dark: [0.948, 0.004] },
+  { name: "card", light: [1.0, 0.0], dark: [0.206, 0.006] },
+  { name: "card-foreground", light: [0.255, 0.012], dark: [0.948, 0.004] },
+  { name: "primary", light: "brand", dark: [0.8, 0.012] },
+  { name: "primary-foreground", light: [1.0, 0.0], dark: [0.2, 0.006] },
+  { name: "muted", light: [0.967, 0.004], dark: [0.232, 0.006] },
+  { name: "muted-foreground", light: [0.481, 0.012], dark: [0.732, 0.01] },
+  { name: "accent", light: [0.95, 0.008], dark: [0.3, 0.014] },
+  { name: "accent-foreground", light: [0.3, 0.02], dark: [0.95, 0.008] },
+  { name: "input", light: [0.874, 0.01], dark: [0.318, 0.01] },
+  { name: "ring", light: "brand", dark: [0.8, 0.012] },
   { name: "success", hue: FUNCTIONAL_HUES.success, light: [0.53, 0.109], dark: [0.759, 0.156] },
   { name: "success-foreground", hue: FUNCTIONAL_HUES.success, light: [1.0, 0.0], dark: [0.247, 0.04] },
   { name: "warning", hue: FUNCTIONAL_HUES.warning, light: [0.542, 0.117], dark: [0.804, 0.146] },

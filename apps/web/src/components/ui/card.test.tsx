@@ -22,10 +22,11 @@ describe("Card", () => {
     expect(screen.getByText("обновлено")).toBeInTheDocument();
   });
 
-  it("keeps the bordered card surface", () => {
+  it("keeps the bordered inset card surface", () => {
     render(<Card data-testid="card">тело</Card>);
     const card = screen.getByTestId("card");
     expect(card.className).toContain("border");
-    expect(card.className).toContain("bg-card");
+    expect(card.className).toContain("bg-muted/40");
+    expect(card.className).not.toContain("shadow");
   });
 });

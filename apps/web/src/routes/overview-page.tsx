@@ -39,10 +39,10 @@ export function OverviewPage() {
       </CardFooter>
     </Card>
     <nav aria-label="Работа с платформой" className="flex flex-wrap gap-3 text-sm">
-      <Link className="inline-flex items-center rounded-lg border border-input/70 bg-card/60 px-4 py-2.5 font-medium text-foreground shadow-sm transition-colors hover:border-primary/50 hover:bg-accent/40 hover:text-primary" to="/setups">Лента live-сетапов</Link>
-      <Link className="inline-flex items-center rounded-lg border border-input/70 bg-card/60 px-4 py-2.5 font-medium text-foreground shadow-sm transition-colors hover:border-primary/50 hover:bg-accent/40 hover:text-primary" to="/runs">Исторические запуски</Link>
-      <Link className="inline-flex items-center rounded-lg border border-input/70 bg-card/60 px-4 py-2.5 font-medium text-foreground shadow-sm transition-colors hover:border-primary/50 hover:bg-accent/40 hover:text-primary" to="/settings">Алгоритмы и live-сканирование</Link>
-      <Link className="inline-flex items-center rounded-lg border border-input/70 bg-card/60 px-4 py-2.5 font-medium text-foreground shadow-sm transition-colors hover:border-primary/50 hover:bg-accent/40 hover:text-primary" to="/history">История и сбор свечей</Link>
+      <Link className="inline-flex items-center rounded-lg border border-input/70 bg-muted/40 px-4 py-2.5 font-medium text-foreground transition-colors hover:border-primary/50 hover:bg-accent/40 hover:text-primary" to="/setups">Лента live-сетапов</Link>
+      <Link className="inline-flex items-center rounded-lg border border-input/70 bg-muted/40 px-4 py-2.5 font-medium text-foreground transition-colors hover:border-primary/50 hover:bg-accent/40 hover:text-primary" to="/runs">Исторические запуски</Link>
+      <Link className="inline-flex items-center rounded-lg border border-input/70 bg-muted/40 px-4 py-2.5 font-medium text-foreground transition-colors hover:border-primary/50 hover:bg-accent/40 hover:text-primary" to="/settings">Алгоритмы и live-сканирование</Link>
+      <Link className="inline-flex items-center rounded-lg border border-input/70 bg-muted/40 px-4 py-2.5 font-medium text-foreground transition-colors hover:border-primary/50 hover:bg-accent/40 hover:text-primary" to="/history">История и сбор свечей</Link>
     </nav>
   </section>;
 }

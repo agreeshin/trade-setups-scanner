@@ -5,7 +5,7 @@ import { Button } from "./ui/button";
 import { Card, CardContent, CardDescription, CardHeader } from "./ui/card";
 import { Field } from "./ui/field";
 import { Input } from "./ui/input";
-import { AuthFrame, SessionBar } from "./ui/app-frame";
+import { AuthFrame, SessionSlotProvider } from "./ui/app-frame";
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const [state, setState] = useState<"checking" | "anonymous" | "authenticated">("checking");
@@ -79,13 +79,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
     finally { setBusy(false); }
   }
   if (state === "checking") return <p role="status" className="p-6 text-muted-foreground">Проверка сессии...</p>;
-  if (state === "authenticated") return <>
-    <SessionBar>
-      {error && <Alert variant="destructive" role="alert">{error}</Alert>}
-      <Button variant="ghost" disabled={busy} onClick={() => { void logout(); }}>Выйти</Button>
-    </SessionBar>
-    {children}
-  </>;
+  if (state === "authenticated") return <SessionSlotProvider value={<>
+    {error && <Alert variant="destructive" role="alert">{error}</Alert>}
+    <Button variant="ghost" disabled={busy} onClick={() => { void logout(); }}>Выйти</Button>
+  </>}>{children}</SessionSlotProvider>;
   return <AuthFrame>
     <Card asChild><form onSubmit={(event) => { void login(event); }} className="w-full max-w-sm">
       <CardHeader>
