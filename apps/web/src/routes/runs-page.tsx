@@ -150,7 +150,7 @@ export function RunsPage() {
     try {
       const range = replayRange(form.from, form.to);
       const symbols = [...normalizedSymbols];
-      if (!symbols.length || symbols.length > 100 || symbols.some((symbol) => !/^[A-Z0-9]{2,40}$/.test(symbol))) throw new Error("Укажите от 1 до 100 корректных символов, например BTCUSDT.");
+      if (!symbols.length || symbols.some((symbol) => !/^[A-Z0-9]{2,40}$/.test(symbol))) throw new Error("Укажите хотя бы один корректный символ, например BTCUSDT.");
       const instruments = symbols.map((symbol) => knownInstruments.find((instrument) => instrument.symbol === symbol));
       if (instruments.some((instrument) => !instrument)) throw new Error("Нужен каталог либо сохранённые полные идентификаторы выбранных инструментов. По одним символам offline-проверка невозможна.");
       if (algorithms.kind !== "ready" || !algorithms.data.algorithms.some((algorithm) => algorithm.id === form.algorithmId)) throw new Error("Выберите доступный алгоритм.");
