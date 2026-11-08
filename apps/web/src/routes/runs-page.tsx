@@ -113,6 +113,7 @@ export function RunsPage() {
   const runs = usePlatformPoll<{ runs: RunRow[] }>("/v1/replay-runs", reload);
   const [cancelling, setCancelling] = useState<number | null>(null);
   const [purgeArmed, setPurgeArmed] = useState(false);
+  const [purging, setPurging] = useState(false);
   const [knownInstruments, setKnownInstruments] = useState<ReplayInstrument[]>([]);
   const [preview, setPreview] = useState<PreflightResponse | null>(null);
   const [checking, setChecking] = useState(false);
@@ -194,20 +195,25 @@ export function RunsPage() {
     void purgeAll();
   }
   async function purgeAll() {
-    setBusy(true); setError(null); setMessage(null);
+    setPurging(true); setError(null); setMessage(null);
     try {
-      const response = await apiFetch("/v1/replay-runs/purge", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-      const body = await response.json() as { runsDeleted?: number; cacheDeleted?: number; qualityIntervalsDeleted?: number; active?: number; queuedCancelled?: number };
-      if (response.status === 409) {
-        setMessage(`Прогоны останавливаются: активных ${body.active ?? "?"}, из очереди отменено ${body.queuedCancelled ?? 0}. Повторите очистку через несколько секунд.`);
-      } else if (!response.ok) {
-        throw new Error(`Очистка недоступна: HTTP ${response.status}`);
-      } else {
-        setMessage(`Удалено: прогонов ${body.runsDeleted ?? 0}, записей кеша ${body.cacheDeleted ?? 0}, интервалов качества ${body.qualityIntervalsDeleted ?? 0}.`);
-        setSelected(null); setPreview(null); setReload((value) => value + 1);
+      for (let attempt = 0; attempt < 16; attempt += 1) {
+        const response = await apiFetch("/v1/replay-runs/purge", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+        const body = await response.json() as { runsDeleted?: number; cacheDeleted?: number; qualityIntervalsDeleted?: number; active?: number; queuedCancelled?: number };
+        if (response.status === 409) {
+          setMessage(`Останавливаю активные прогоны (${body.active ?? "?"}) и очищаю…`);
+        } else if (!response.ok) {
+          throw new Error(`Очистка недоступна: HTTP ${response.status}`);
+        } else {
+          setMessage(`Удалено: прогонов ${body.runsDeleted ?? 0}, записей кеша ${body.cacheDeleted ?? 0}, интервалов качества ${body.qualityIntervalsDeleted ?? 0}.`);
+          setSelected(null); setPreview(null); setReload((value) => value + 1);
+          return;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 4000));
       }
+      setError("Очистка не завершилась: активные прогоны слишком долго останавливались. Повторите позже.");
     } catch (cause) { setError(errorText(cause)); }
-    finally { setBusy(false); }
+    finally { setPurging(false); }
   }
   return <section aria-labelledby="runs-heading">
     <h1 id="runs-heading" className="text-2xl font-semibold">Исторические запуски</h1>
@@ -231,7 +237,7 @@ export function RunsPage() {
       <div className="flex flex-wrap gap-2"><Button type="submit" disabled={busy || checking || !ready || algorithms.kind !== "ready"}>{checking ? "Проверка…" : "Проверить данные"}</Button><Button type="button" variant="outline" disabled={busy || checking || !ready} onClick={() => { void saveForm(); }}>Сохранить форму</Button></div>
       {preview && <><ReplayPreflight preview={preview} /><Button type="button" disabled={busy || !preview.canRun} onClick={() => { void launch(); }}>Запустить проверенный расчёт</Button></>}
     </form>
-    <div className="mt-8 flex flex-wrap items-center gap-3"><h2 className="text-lg font-semibold">Последние запуски</h2><Button variant="outline" onClick={() => setReload((value) => value + 1)}>Обновить</Button><Button variant="outline" disabled={busy || checking} onClick={armPurge}>{purgeArmed ? "Подтвердить очистку всего" : "Очистить все прогоны"}</Button></div>
+    <div className="mt-8 flex flex-wrap items-center gap-3"><h2 className="text-lg font-semibold">Последние запуски</h2><Button variant="outline" onClick={() => setReload((value) => value + 1)}>Обновить</Button><Button variant="outline" disabled={busy || checking || purging} onClick={armPurge}>{purging ? "Очищаю…" : purgeArmed ? "Подтвердить очистку всего" : "Очистить все прогоны"}</Button></div>
     {runs.kind === "loading" && <p>Загрузка…</p>}
     {runs.kind === "unreachable" && <p role="alert">Запуски недоступны ({runs.detail})</p>}
     {runs.kind === "ready" && <div className="mt-3 overflow-x-auto"><table className="w-full text-sm">
