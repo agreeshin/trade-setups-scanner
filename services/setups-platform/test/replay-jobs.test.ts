@@ -7,6 +7,7 @@ import { buildApp } from "../src/app.js";
 import { DEFAULT_SPIKE_PARAMS, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION } from "../src/detector/price-volume-spike.js";
 import type { SpikeSetup } from "../src/detector/price-volume-spike.js";
 import { DEFAULT_REPLAY_ADMISSION_LIMITS, cancelReplayRun, enqueueReplayRuns, purgeReplayRuns, reserveReplayRuns, startReplayJobs } from "../src/replay/jobs.js";
+import { cancelReplayBatch, listReplayBatches, replayBatchResultPage } from "../src/replay/batches.js";
 import { cacheClearAll, cacheStats, cacheStore } from "../src/replay/cache.js";
 import { ArrayCandleSource, type CandleSource } from "../src/replay/source.js";
 import { setSetting } from "../src/settings.js";
@@ -28,6 +29,7 @@ describe.skipIf(!url)("persistent replay jobs", () => {
   });
   beforeEach(async () => {
     await db.deleteFrom("replay_runs").execute();
+    await db.deleteFrom("replay_batches").execute();
     await db.deleteFrom("replay_cache").execute();
     await db.deleteFrom("replay_quality_intervals").execute();
     await db.deleteFrom("settings").where("key", "in", ["replay", "replay-cache-generation"]).execute();
@@ -111,7 +113,7 @@ describe.skipIf(!url)("persistent replay jobs", () => {
     await db.insertInto("replay_cache").values({ cache_key: `purge:${seed.id}`, exchange_code: seed.exchange_code, category: seed.category, symbol: seed.symbol, algorithm_id: seed.algorithm_id, algorithm_version: seed.algorithm_version, params: seed.params, from_ts: seed.from_ts, to_ts: seed.to_ts, setups: [], warmup_minutes: 0, processed_minutes: 0 }).execute();
     await db.insertInto("replay_quality_intervals").values({ run_id: seed.id, from_unix: input.fromUnix, to_unix: input.fromUnix + 60, reason: "evaluated" }).execute();
     const outcome = await purgeReplayRuns(db);
-    expect(outcome).toEqual({ status: "purged", runsDeleted: 2, cacheDeleted: 1, qualityIntervalsDeleted: 1 });
+    expect(outcome).toEqual({ status: "purged", runsDeleted: 2, batchesDeleted: 1, cacheDeleted: 1, qualityIntervalsDeleted: 1 });
     expect(await db.selectFrom("replay_runs").selectAll().execute()).toEqual([]);
     expect(await db.selectFrom("replay_cache").selectAll().execute()).toEqual([]);
     expect(await db.selectFrom("replay_quality_intervals").selectAll().execute()).toEqual([]);
@@ -128,7 +130,43 @@ describe.skipIf(!url)("persistent replay jobs", () => {
     expect(statuses.get("ASYNCUSDT")).toBe("cancel_requested");
     await db.updateTable("replay_runs").set({ status: "done", updated_at: new Date() }).where("status", "=", "cancel_requested").execute();
     const done = await purgeReplayRuns(db);
-    expect(done).toEqual({ status: "purged", runsDeleted: 3, cacheDeleted: 0, qualityIntervalsDeleted: 0 });
+    expect(done).toEqual({ status: "purged", runsDeleted: 3, batchesDeleted: 1, cacheDeleted: 0, qualityIntervalsDeleted: 0 });
+  });
+
+  it("groups multi-instrument launches into one batch and keeps single runs standalone", async () => {
+    const multi = await enqueueReplayRuns(db, { ...input, instruments: [{ ...input.instruments[0]!, symbol: "BATCHAUSDT" }, { ...input.instruments[0]!, symbol: "BATCHBUSDT" }] });
+    const [solo] = await enqueueReplayRuns(db, { ...input, instruments: [{ ...input.instruments[0]!, symbol: "SOLOUSDT" }] });
+    const batchId = multi[0]!.batch_id;
+    expect(batchId).not.toBeNull();
+    expect(multi.map((run) => run.batch_id)).toEqual([batchId, batchId]);
+    expect(solo!.batch_id).toBeNull();
+    const batches = await listReplayBatches(db);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]).toMatchObject({ instrument_count: 2, active_instruments: 2, status: "running" });
+  });
+
+  it("serves unified batch result pages across instruments", async () => {
+    const setupOf = (closeTimeUnix: number): SpikeSetup => ({ algorithmId: SPIKE_ALGORITHM_ID, algorithmVersion: SPIKE_ALGORITHM_VERSION, openTimeUnix: closeTimeUnix - 60, closeTimeUnix, closePrice: "100", params: DEFAULT_SPIKE_PARAMS });
+    const runs = await enqueueReplayRuns(db, { ...input, instruments: [{ ...input.instruments[0]!, symbol: "PAGEAUSDT" }, { ...input.instruments[0]!, symbol: "PAGEBUSDT" }] });
+    const batchId = runs[0]!.batch_id!;
+    await db.updateTable("replay_runs").set({ status: "done", setups: JSON.stringify([setupOf(160)]) as unknown as SpikeSetup[] }).where("symbol", "=", "PAGEAUSDT").execute();
+    await db.updateTable("replay_runs").set({ status: "done", setups: JSON.stringify([setupOf(260)]) as unknown as SpikeSetup[] }).where("symbol", "=", "PAGEBUSDT").execute();
+    const page = await replayBatchResultPage(db, batchId, 0, 10);
+    expect(page?.total).toBe(2);
+    expect(page?.setups.map((row) => row.symbol).sort()).toEqual(["PAGEAUSDT", "PAGEBUSDT"]);
+    expect(page?.setups[0]?.setup.closeTimeUnix).toBe(260);
+    const tailPage = await replayBatchResultPage(db, batchId, 1, 10);
+    expect(tailPage?.setups.map((row) => row.symbol)).toEqual(["PAGEAUSDT"]);
+    expect(await replayBatchResultPage(db, batchId + 1000, 0, 10)).toBeUndefined();
+  });
+
+  it("cancels every instrument of a batch", async () => {
+    const runs = await enqueueReplayRuns(db, { ...input, instruments: [
+      { ...input.instruments[0]!, symbol: "CANCELAUSDT" }, { ...input.instruments[0]!, symbol: "CANCELBUSDT" }] });
+    const result = await cancelReplayBatch(db, runs[0]!.batch_id!);
+    expect(result).toEqual({ cancelled: 2, cancelRequested: 0 });
+    const statuses = await db.selectFrom("replay_runs").select(["symbol", "status"]).where("batch_id", "=", runs[0]!.batch_id!).execute();
+    expect(statuses.every((row) => row.status === "cancelled")).toBe(true);
   });
 
   it("rejects excessive new work atomically but admits an exact cache hit", async () => {

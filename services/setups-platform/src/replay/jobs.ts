@@ -113,11 +113,19 @@ export async function reserveReplayRuns(
     if (!Number.isSafeInteger(requestedBytes) || requestedBytes > limits.maxDatabaseBytes) {
       throw new ReplayAdmissionError("database_bytes", limits.maxDatabaseBytes, requestedBytes);
     }
+    const batchId = input.instruments.length > 1
+      ? (await tx.insertInto("replay_batches").values({
+          exchange_code: input.instruments[0]!.exchange, category: input.instruments[0]!.category,
+          algorithm_id: SPIKE_ALGORITHM_ID, algorithm_version: SPIKE_ALGORITHM_VERSION, params: input.params,
+          from_ts: new Date(input.fromUnix * 1000), to_ts: new Date(input.toUnix * 1000),
+          instrument_count: input.instruments.length,
+        }).returning("id").executeTakeFirstOrThrow()).id
+      : null;
     return tx.insertInto("replay_runs").values(input.instruments.map((instrument, index) => ({
       exchange_code: instrument.exchange, category: instrument.category, symbol: instrument.symbol,
       from_ts: new Date(input.fromUnix * 1000), to_ts: new Date(input.toUnix * 1000),
       algorithm_id: SPIKE_ALGORITHM_ID, algorithm_version: SPIKE_ALGORITHM_VERSION,
-      params: input.params, status, cache_hit: cached.has(cacheKeys[index]!),
+      params: input.params, status, cache_hit: cached.has(cacheKeys[index]!), batch_id: batchId,
     }))).returningAll().execute();
   });
 }
@@ -172,7 +180,7 @@ export async function cancelReplayRun(db: Kysely<SignalsDB>, id: number): Promis
 }
 
 export type ReplayPurgeOutcome =
-  | { status: "purged"; runsDeleted: number; cacheDeleted: number; qualityIntervalsDeleted: number }
+  | { status: "purged"; runsDeleted: number; batchesDeleted: number; cacheDeleted: number; qualityIntervalsDeleted: number }
   | { status: "active"; active: number; queuedCancelled: number; runningCancelRequested: number };
 
 export async function purgeReplayRuns(db: Kysely<SignalsDB>): Promise<ReplayPurgeOutcome> {
@@ -190,7 +198,8 @@ export async function purgeReplayRuns(db: Kysely<SignalsDB>): Promise<ReplayPurg
     const quality = await tx.deleteFrom("replay_quality_intervals").returning("run_id").execute();
     const cache = await tx.deleteFrom("replay_cache").returning("cache_key").execute();
     const runs = await tx.deleteFrom("replay_runs").returning("id").execute();
-    return { status: "purged", runsDeleted: runs.length, cacheDeleted: cache.length, qualityIntervalsDeleted: quality.length };
+    const batches = await tx.deleteFrom("replay_batches").returning("id").execute();
+    return { status: "purged", runsDeleted: runs.length, batchesDeleted: batches.length, cacheDeleted: cache.length, qualityIntervalsDeleted: quality.length };
   });
 }
 

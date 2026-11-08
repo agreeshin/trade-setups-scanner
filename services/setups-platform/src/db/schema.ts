@@ -7,6 +7,7 @@ export interface ReplayRunsTable {
   quality_source_run_id: Generated<number | null>;
   quality_computed_at: Generated<Date | null>;
   id: Generated<number>;
+  batch_id: number | null;
   exchange_code: string;
   category: string;
   symbol: string;
@@ -23,6 +24,19 @@ export interface ReplayRunsTable {
   error: string | null;
   created_at: Generated<Date>;
   updated_at: Generated<Date>;
+}
+
+export interface ReplayBatchesTable {
+  id: Generated<number>;
+  exchange_code: string;
+  category: string;
+  algorithm_id: string;
+  algorithm_version: string | null;
+  params: SpikeParams;
+  from_ts: Date;
+  to_ts: Date;
+  instrument_count: number;
+  created_at: Generated<Date>;
 }
 
 export interface ReplayCacheTable {
@@ -82,6 +96,7 @@ export interface KyselyMigrationsTable {
 export interface SignalsDB {
   replay_quality_intervals: { run_id: number; from_unix: number; to_unix: number; reason: QualityReason };
   replay_runs: ReplayRunsTable;
+  replay_batches: ReplayBatchesTable;
   replay_cache: ReplayCacheTable;
   settings: SettingsTable;
   live_setups: LiveSetupsTable;

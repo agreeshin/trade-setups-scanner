@@ -24,6 +24,7 @@ const algorithm = {
   ],
 };
 let purgeResponses: { status: number; body: unknown }[] = [];
+let replayRunsResponse: unknown = { runs: [] };
 const requests: { path: string; method: string; body: unknown }[] = [];
 beforeEach(() => {
   requests.length = 0;
@@ -43,7 +44,12 @@ beforeEach(() => {
     if (path === "/v1/history/instruments/1/coverage") data = { instrumentId: 1, firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, intervals: [], gaps: [] };
     if (path === "/v1/history/instruments/coverage-summary") data = { instruments: instruments.map((instrument) => ({ instrumentId: instrument.id, exchange: instrument.exchange, category: instrument.category, symbol: instrument.symbol, status: instrument.status, firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, missingMinutes: 0, verifiedMinutes: 0 })) };
     if (path === "/v1/settings/ui") data = { value: { existing: "keep" } };
-    if (path === "/v1/replay-runs") data = { runs: [] };
+    if (path === "/v1/replay-runs") data = replayRunsResponse;
+    if (path.startsWith("/v1/replay-batches/")) {
+      if (path.endsWith("/cancel")) data = { cancelled: 1, cancelRequested: 0 };
+      else if (path.endsWith("/export.csv")) return Promise.resolve(new Response("signal,exchange,category,symbol\r\n", { status: 200, headers: { "content-type": "text/csv; charset=utf-8" } }));
+      else data = { run: { id: 7, isBatch: true, exchange: "bybit", category: "linear", symbol: "2 инструментов", status: "running", cacheHit: false, setupCount: 1, warmupMinutes: null, processedMinutes: null, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z", params: {}, instrumentCount: 2, activeInstruments: 1, doneInstruments: 1, failedInstruments: 0, cancelledInstruments: 0 }, setups: [{ exchange: "bybit", category: "linear", symbol: "AAAUSDT", algorithmId: "price_volume_spike", openTimeUnix: 1, closeTimeUnix: 2, closePrice: "3" }], offset: 0, limit: 100, total: 1 };
+    }
     if (path === "/v1/replay-preflight") data = { checkedAt: "2026-10-10T10:00:00Z", algorithmVersion: "snapshot-v2", requiredHistoryMinutes: 43200, canRun: true, request: { ...(JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>), async: true, algorithmVersion: "snapshot-v2", params: { priceGrowthPct: "17", windowMinutes: 9 } }, results: [] };
     if (path === "/v1/settings/notifications") data = { maxAgeSeconds: 60 };
     if (path === "/v1/live/status") data = { enabled: false, running: false, lastScanAt: null, lastError: null };
@@ -323,5 +329,18 @@ describe("platform screens", () => {
     expect(screen.getByText("ITEM994")).toBeInTheDocument();
     expect(screen.queryByText("ITEM995")).not.toBeInTheDocument();
     expect(requests.some((request) => request.method === "PUT")).toBe(false);
+  });
+
+  it("shows a multi-instrument launch as one row with unified detail and batch cancel", async () => {
+    replayRunsResponse = { runs: [{ id: 7, isBatch: true, symbol: "2 инструментов", status: "running", cacheHit: false, setupCount: 3, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z", instrumentCount: 2, doneInstruments: 1, activeInstruments: 1, failedInstruments: 0 }] };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    expect(await screen.findByText("2 инструментов")).toBeInTheDocument();
+    expect(screen.getByText(/Выполняется \(1\/2\)/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Результаты запуска 7" }));
+    await waitFor(() => expect(screen.getByText(/Всего сетапов: 1/)).toBeInTheDocument());
+    expect(requests.some((request) => request.path === "/v1/replay-batches/7?offset=0&limit=100")).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Отменить запуск 7" }));
+    await waitFor(() => expect(requests.some((request) => request.path === "/v1/replay-batches/7/cancel" && request.method === "POST")).toBe(true));
+    await screen.findByText(/Отмена запуска #7 запрошена для всех инструментов/);
   });
 });

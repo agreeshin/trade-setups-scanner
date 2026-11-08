@@ -10,6 +10,7 @@ import { registerControls } from "./controls.js";
 import { ApiCandleSource } from "../replay/source.js";
 import { replayRun } from "../replay/replay-runner.js";
 import { admitReplayCacheMiss, cancelReplayRun, DEFAULT_REPLAY_ADMISSION_LIMITS, purgeReplayRuns, replayRunDto, ReplayAdmissionError, reserveReplayRuns, type ReplayAdmissionLimits } from "../replay/jobs.js";
+import { cancelReplayBatch, getReplayBatch, listReplayBatches, replayBatchResultPage, type ReplayBatchSummary } from "../replay/batches.js";
 import { saveQualityPage, type QualityInterval } from "../replay/quality.js";
 import { prepareReplayRequest, replayPreflight, type ReplayRequest } from "../replay/preflight.js";
 import {
@@ -99,6 +100,12 @@ const RunDto = Type.Object({
   toUnix: Type.Optional(Type.Integer()),
   createdAt: Type.Optional(Type.String()),
   params: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+  isBatch: Type.Optional(Type.Boolean()),
+  instrumentCount: Type.Optional(Type.Integer()),
+  activeInstruments: Type.Optional(Type.Integer()),
+  doneInstruments: Type.Optional(Type.Integer()),
+  failedInstruments: Type.Optional(Type.Integer()),
+  cancelledInstruments: Type.Optional(Type.Integer()),
 });
 
 const toJsonArray = <T>(value: T[]): T[] => JSON.stringify(value) as unknown as T[];
@@ -114,6 +121,24 @@ function replayResultPage(db: Kysely<SignalsDB>, id: number, offset: number, lim
     .select(sql<number>`coalesce(jsonb_array_length(setups), 0)`.as("setup_count"))
     .select(page.as("setups"))
     .where("id", "=", id).executeTakeFirst();
+}
+
+function batchRunDto(batch: ReplayBatchSummary) {
+  return {
+    id: batch.id, isBatch: true,
+    exchange: batch.exchange_code, category: batch.category,
+    symbol: `${batch.instrument_count} инструментов`,
+    status: batch.status, cacheHit: batch.cache_hit, setupCount: batch.setup_count,
+    warmupMinutes: null, processedMinutes: null,
+    error: batch.failed_instruments > 0 ? `Инструментов с ошибкой: ${batch.failed_instruments}` : null,
+    algorithmId: batch.algorithm_id, algorithmVersion: batch.algorithm_version ?? undefined,
+    fromUnix: Math.floor(batch.from_ts.getTime() / 1000), toUnix: Math.floor(batch.to_ts.getTime() / 1000),
+    createdAt: batch.created_at.toISOString(),
+    params: batch.params,
+    instrumentCount: batch.instrument_count, activeInstruments: batch.active_instruments,
+    doneInstruments: batch.done_instruments, failedInstruments: batch.failed_instruments,
+    cancelledInstruments: batch.cancelled_instruments,
+  };
 }
 
 function csvCell(value: string | number | boolean | null | undefined): string {
@@ -357,7 +382,7 @@ export function registerPlatformV1Routes(
     preHandler: [requireApiKey],
     schema: {
       response: {
-        200: Type.Object({ runsDeleted: Type.Integer(), cacheDeleted: Type.Integer(), qualityIntervalsDeleted: Type.Integer() }),
+        200: Type.Object({ runsDeleted: Type.Integer(), batchesDeleted: Type.Integer(), cacheDeleted: Type.Integer(), qualityIntervalsDeleted: Type.Integer() }),
         409: Type.Object({ error: Type.String(), active: Type.Integer(), queuedCancelled: Type.Integer(), runningCancelRequested: Type.Integer() }),
       },
     },
@@ -366,7 +391,83 @@ export function registerPlatformV1Routes(
     if (outcome.status === "active") {
       return reply.code(409).send({ error: "active_runs", active: outcome.active, queuedCancelled: outcome.queuedCancelled, runningCancelRequested: outcome.runningCancelRequested });
     }
-    return reply.send({ runsDeleted: outcome.runsDeleted, cacheDeleted: outcome.cacheDeleted, qualityIntervalsDeleted: outcome.qualityIntervalsDeleted });
+    return reply.send({ runsDeleted: outcome.runsDeleted, batchesDeleted: outcome.batchesDeleted, cacheDeleted: outcome.cacheDeleted, qualityIntervalsDeleted: outcome.qualityIntervalsDeleted });
+  });
+
+  app.get("/v1/replay-batches/:id", {
+    preHandler: [requireApiKey],
+    schema: {
+      params: Type.Object({ id: Type.Integer({ minimum: 1 }) }),
+      querystring: Type.Object({
+        offset: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER - 500, default: 0 })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, default: 100 })),
+      }),
+      response: {
+        200: Type.Object({ run: RunDto, setups: Type.Array(SetupDto), offset: Type.Integer(), limit: Type.Integer(), total: Type.Integer() }),
+        404: ErrorEnvelope,
+      },
+    },
+  }, async (request, reply) => {
+    const { id } = request.params as { id: number };
+    const { offset = 0, limit = 100 } = request.query as { offset?: number; limit?: number };
+    const batch = await getReplayBatch(db, id);
+    const page = batch === undefined ? undefined : await replayBatchResultPage(db, id, offset, limit);
+    if (batch === undefined || page === undefined) {
+      await reply.code(404).send({ error: "batch not found" });
+      return;
+    }
+    await reply.send({
+      offset, limit, total: page.total,
+      run: batchRunDto(batch),
+      setups: page.setups.map((row) => ({
+        exchange: row.exchange_code, category: row.category, symbol: row.symbol,
+        algorithmId: row.setup.algorithmId ?? row.algorithm_id,
+        algorithmVersion: row.setup.algorithmVersion ?? row.algorithm_version ?? undefined,
+        params: row.setup.params ?? row.params,
+        details: row.setup.details ?? null,
+        openTimeUnix: row.setup.openTimeUnix, closeTimeUnix: row.setup.closeTimeUnix, closePrice: row.setup.closePrice,
+      })),
+    });
+  });
+
+  app.post("/v1/replay-batches/:id/cancel", {
+    preHandler: [requireApiKey],
+    schema: { params: Type.Object({ id: Type.Integer({ minimum: 1 }) }) },
+  }, async (request, reply) => {
+    const { id } = request.params as { id: number };
+    const result = await cancelReplayBatch(db, id);
+    if (result === undefined) return reply.code(404).send({ error: "batch not found" });
+    return reply.send(result);
+  });
+
+  app.get("/v1/replay-batches/:id/export.csv", {
+    preHandler: [requireApiKey],
+    schema: { params: Type.Object({ id: Type.Integer({ minimum: 1 }) }) },
+  }, async (request, reply) => {
+    const { id } = request.params as { id: number };
+    const first = await replayBatchResultPage(db, id, 0, 500);
+    if (!first) return reply.code(404).send({ error: "batch not found" });
+    const total = first.total;
+    async function* chunks() {
+      yield "signal,exchange,category,symbol,algorithmId,algorithmVersion,openTimeUnix,closeTimeUnix,closePrice,growthPct,volumeLongRatio,volumeShortRatio,overLong,overShort,missingMinutes,params\r\n";
+      let page = first;
+      for (let offset = 0; offset < total; offset += 500) {
+        if (offset > 0) page = await replayBatchResultPage(db, id, offset, Math.min(500, total - offset));
+        if (!page) throw new Error("saved replay batch disappeared during export");
+        for (const row of page.setups) {
+          const details = row.setup.details;
+          yield ["WATCH", row.exchange_code, row.category, row.symbol,
+            row.setup.algorithmId ?? row.algorithm_id, row.setup.algorithmVersion ?? row.algorithm_version,
+            row.setup.openTimeUnix, row.setup.closeTimeUnix, row.setup.closePrice,
+            details?.growthPct, details?.volumeLongRatio, details?.volumeShortRatio,
+            details?.overLong, details?.overShort, details?.missingMinutes,
+            JSON.stringify(row.setup.params ?? row.params)].map(csvCell).join(",") + "\r\n";
+        }
+      }
+    }
+    return reply.type("text/csv; charset=utf-8")
+      .header("content-disposition", `attachment; filename="replay-batch-${id}.csv"`)
+      .send(Readable.from(chunks(), { objectMode: false, highWaterMark: 64 * 1024 }));
   });
 
   app.get("/v1/settings/replay", { preHandler: [requireApiKey] }, async () => ({ paused: (await getSetting(db, "replay")).paused === true }));
@@ -390,11 +491,14 @@ export function registerPlatformV1Routes(
         .select(["id", "exchange_code", "category", "symbol", "status", "cache_hit", "warmup_minutes",
           "processed_minutes", "error", "algorithm_id", "algorithm_version", "from_ts", "to_ts", "created_at", "quality", "quality_source_run_id", "quality_computed_at"])
         .select(sql<number>`coalesce(jsonb_array_length(setups), 0)`.as("setup_count"))
+        .where("batch_id", "is", null)
         .orderBy("id", "desc")
         .limit(200)
         .execute();
-      await reply.send({
-        runs: rows.map((row) => ({
+      const batches = await listReplayBatches(db);
+      const entries = [
+        ...batches.map((batch) => batchRunDto(batch)),
+        ...rows.map((row) => ({
           quality: row.quality, qualitySourceRunId: row.quality_source_run_id,
           qualityComputedAt: row.quality_computed_at?.toISOString() ?? null,
           id: row.id,
@@ -413,7 +517,8 @@ export function registerPlatformV1Routes(
           toUnix: Math.floor(row.to_ts.getTime() / 1000),
           createdAt: row.created_at.toISOString(),
         })),
-      });
+      ].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, 200);
+      await reply.send({ runs: entries });
     },
   );
 

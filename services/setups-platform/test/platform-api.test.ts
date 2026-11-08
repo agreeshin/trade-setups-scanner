@@ -8,7 +8,7 @@ import type { SignalsDB } from "../src/db/schema.js";
 import { buildApp } from "../src/app.js";
 import { ArrayCandleSource, type CandleBarDto } from "../src/replay/source.js";
 import { liveScanOnce } from "../src/live/live-scanner.js";
-import { DEFAULT_SPIKE_PARAMS } from "../src/detector/price-volume-spike.js";
+import { DEFAULT_SPIKE_PARAMS, type SpikeSetup } from "../src/detector/price-volume-spike.js";
 import { startLiveRuntime } from "../src/live/runtime.js";
 import { getSetting, setSetting } from "../src/settings.js";
 
@@ -143,6 +143,7 @@ describe.skipIf(!TEST_DATABASE_URL)("platform api", () => {
   beforeEach(async () => {
     await db.deleteFrom("replay_cache").execute();
     await db.deleteFrom("replay_runs").execute();
+    await db.deleteFrom("replay_batches").execute();
     await db.deleteFrom("live_setups").execute();
     await db.deleteFrom("settings").execute();
     await db.deleteFrom("instrument_lists").execute();
@@ -166,6 +167,37 @@ describe.skipIf(!TEST_DATABASE_URL)("platform api", () => {
     expect(conflict.statusCode).toBe(409);
     expect(conflict.json<{ error: string; active: number }>()).toMatchObject({ error: "active_runs", active: 1 });
     await db.deleteFrom("replay_runs").execute();
+  });
+
+  it("serves batch grouping, unified detail, cancel and CSV via the API", async () => {
+    const headers = { "x-api-key": PLATFORM_KEY };
+    await db.deleteFrom("replay_batches").execute();
+    const batch = await db.insertInto("replay_batches").values({ exchange_code: "bybit", category: "linear", algorithm_id: "price_volume_spike", algorithm_version: "1", params: DEFAULT_SPIKE_PARAMS, from_ts: new Date(0), to_ts: new Date(60_000), instrument_count: 2 }).returning("id").executeTakeFirstOrThrow();
+    const setup = { algorithmId: "price_volume_spike", algorithmVersion: "1", openTimeUnix: 60, closeTimeUnix: 120, closePrice: "101", params: DEFAULT_SPIKE_PARAMS };
+    const seed = { exchange_code: "bybit", category: "linear", from_ts: new Date(0), to_ts: new Date(60_000), algorithm_id: "price_volume_spike", algorithm_version: "1", params: DEFAULT_SPIKE_PARAMS, cache_hit: false, batch_id: batch.id };
+    await db.insertInto("replay_runs").values([
+      { ...seed, symbol: "BATCHAAUSDT", status: "done", setups: JSON.stringify([setup]) as unknown as SpikeSetup[] },
+      { ...seed, symbol: "BATCHBBUSDT", status: "queued", setups: JSON.stringify([]) as unknown as SpikeSetup[] },
+    ]).execute();
+    const list = await app.inject({ method: "GET", url: "/v1/replay-runs", headers });
+    const listBody = list.json<{ runs: { id: number; isBatch?: boolean; symbol: string; status: string; setupCount: number }[] }>();
+    const row = listBody.runs.find((item) => item.isBatch === true);
+    expect(row).toMatchObject({ symbol: "2 инструментов", status: "running", setupCount: 1 });
+    expect(listBody.runs.some((item) => item.symbol === "BATCHAAUSDT")).toBe(false);
+    const detail = await app.inject({ method: "GET", url: `/v1/replay-batches/${batch.id}?offset=0&limit=10`, headers });
+    expect(detail.statusCode).toBe(200);
+    const detailBody = detail.json<{ run: { instrumentCount: number }; setups: { symbol: string }[]; total: number }>();
+    expect(detailBody.run.instrumentCount).toBe(2);
+    expect(detailBody.total).toBe(1);
+    expect(detailBody.setups.map((item) => item.symbol)).toEqual(["BATCHAAUSDT"]);
+    const cancel = await app.inject({ method: "POST", url: `/v1/replay-batches/${batch.id}/cancel`, headers });
+    expect(cancel.statusCode).toBe(200);
+    expect(cancel.json()).toEqual({ cancelled: 1, cancelRequested: 0 });
+    const csv = await app.inject({ method: "GET", url: `/v1/replay-batches/${batch.id}/export.csv`, headers });
+    expect(csv.statusCode).toBe(200);
+    expect(csv.body).toContain("BATCHAAUSDT");
+    await db.deleteFrom("replay_runs").execute();
+    await db.deleteFrom("replay_batches").execute();
   });
 
   it("persists shared algorithm and UI settings and snapshots them in replay", async () => {
