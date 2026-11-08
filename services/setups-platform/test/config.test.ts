@@ -9,7 +9,7 @@ const required = {
 
 describe("platform resource config", () => {
   it("loads bounded defaults and explicit replay limits", () => {
-    expect(loadConfig(required).replayLimits).toMatchObject({ maxPendingRuns: 100, maxWorkMinutes: 52_704_000 });
+    expect(loadConfig(required).replayLimits).toMatchObject({ maxPendingRuns: 10_000, maxWorkMinutes: 5_270_400_000 });
     expect(loadConfig({ ...required, REPLAY_MAX_PENDING_RUNS: "7", REPLAY_MAX_DATABASE_BYTES: "9000" }).replayLimits)
       .toMatchObject({ maxPendingRuns: 7, maxDatabaseBytes: 9000 });
   });

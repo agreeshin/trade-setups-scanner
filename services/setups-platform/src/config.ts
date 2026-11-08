@@ -1,3 +1,5 @@
+import { DEFAULT_REPLAY_ADMISSION_LIMITS } from "./replay/jobs.js";
+
 export interface PlatformConfig {
   databaseUrl: string;
   apiKeys: string[];
@@ -49,10 +51,10 @@ export function loadConfig(
     backupMaxUploadBytes: positiveInteger(env, "BACKUP_MAX_UPLOAD_BYTES", 60 * 1024 ** 3),
     marketBackupMaxUploadBytes: positiveInteger(env, "MARKET_DATA_BACKUP_MAX_UPLOAD_BYTES", 120 * 1024 ** 3),
     replayLimits: {
-      maxPendingRuns: positiveInteger(env, "REPLAY_MAX_PENDING_RUNS", 100),
-      maxWorkMinutes: positiveInteger(env, "REPLAY_MAX_WORK_MINUTES", 52_704_000),
-      maxDatabaseBytes: positiveInteger(env, "REPLAY_MAX_DATABASE_BYTES", 50 * 1024 ** 3),
-      estimatedBytesPerWorkMinute: positiveInteger(env, "REPLAY_ESTIMATED_BYTES_PER_MINUTE", 128),
+      maxPendingRuns: positiveInteger(env, "REPLAY_MAX_PENDING_RUNS", DEFAULT_REPLAY_ADMISSION_LIMITS.maxPendingRuns),
+      maxWorkMinutes: positiveInteger(env, "REPLAY_MAX_WORK_MINUTES", DEFAULT_REPLAY_ADMISSION_LIMITS.maxWorkMinutes),
+      maxDatabaseBytes: positiveInteger(env, "REPLAY_MAX_DATABASE_BYTES", DEFAULT_REPLAY_ADMISSION_LIMITS.maxDatabaseBytes),
+      estimatedBytesPerWorkMinute: positiveInteger(env, "REPLAY_ESTIMATED_BYTES_PER_MINUTE", DEFAULT_REPLAY_ADMISSION_LIMITS.estimatedBytesPerWorkMinute),
     },
   };
 }
