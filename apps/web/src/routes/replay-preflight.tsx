@@ -1,3 +1,5 @@
+import { Alert } from "../components/ui/alert";
+import { Card } from "../components/ui/card";
 import { localTime, localTimezone } from "./platform-controls";
 import { qualityLabel, type ReplayQuality } from "./replay-quality";
 
@@ -13,13 +15,13 @@ export interface PreflightResponse {
 }
 
 export function ReplayPreflight({ preview }: { preview: PreflightResponse }) {
-  return <section aria-label="Предварительная проверка" className="grid gap-3 rounded-md border border-input p-4">
+  return <Card asChild><section aria-label="Предварительная проверка" className="grid gap-3">
     <h2 className="text-lg font-semibold">Предварительная проверка данных</h2>
     <p className="text-sm">Проверено: {new Date(preview.checkedAt).toLocaleString("ru-RU")}. Версия алгоритма: {preview.algorithmVersion}. Требуемая история: {preview.requiredHistoryMinutes} мин.</p>
     <p className="text-sm">Период расчёта: {localTime(preview.request.fromUnix)} – {localTime(preview.request.toUnix)} ({localTimezone}).</p>
     <details><summary className="cursor-pointer">Снимок параметров для подтверждения</summary><dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">{Object.entries(preview.request.params).map(([key, value]) => <div key={key}><dt className="break-words text-muted-foreground">{key}</dt><dd>{value}</dd></div>)}</dl></details>
     <p className="text-sm text-muted-foreground">Это снимок на момент проверки. Кеш и покрытие могут измениться до исполнения; исполнитель повторно проверяет кеш. Покрытие минут не гарантирует пригодность по допускам алгоритма. Частичный расчёт по имеющимся данным разрешён; история автоматически не догружается.</p>
-    {preview.results.map((item) => <article key={`${item.exchange}/${item.category}/${item.symbol}`} className="grid gap-2 rounded-md border border-input p-3 text-sm">
+    {preview.results.map((item) => <article key={`${item.exchange}/${item.category}/${item.symbol}`} className="grid gap-2 rounded-md border border-input/80 bg-background/40 p-3 text-sm">
       <h3 className="font-semibold">{item.exchange} / {item.category} / {item.symbol}</h3>
       {item.status === "cached" ? <>
         <p>Из кеша · Сетапов: {item.setupCount ?? "не сообщено"}</p>
@@ -35,8 +37,8 @@ export function ReplayPreflight({ preview }: { preview: PreflightResponse }) {
           <p className="mt-2 text-xs text-muted-foreground">Ограниченный предварительный список. Интервалы [начало, конец), на UTC-сетке открытия минут; показаны в {localTimezone}.</p>
           <ul className="mt-2 max-h-64 overflow-y-auto">{item.coverage.gaps.slice(0, 50).map((gap) => <li key={`${gap.fromUnix}-${gap.toUnix}`}>{localTime(gap.fromUnix)} – {localTime(gap.toUnix)}</li>)}</ul>
         </details>
-      </> : <p role="alert">{item.status === "not_found" ? "Инструмент не найден" : "Покрытие недоступно или не получено"}{item.error ? `: ${item.error}` : ". Это не означает пустую историю."}</p>}
+      </> : <Alert variant="warning" role="alert">{item.status === "not_found" ? "Инструмент не найден" : "Покрытие недоступно или не получено"}{item.error ? `: ${item.error}` : ". Это не означает пустую историю."}</Alert>}
     </article>)}
-    {!preview.canRun && <p role="alert">Запуск недоступен: устраните ошибки проверки и проверьте данные снова.</p>}
-  </section>;
+    {!preview.canRun && <Alert variant="destructive" role="alert">Запуск недоступен: устраните ошибки проверки и проверьте данные снова.</Alert>}
+  </section></Card>;
 }

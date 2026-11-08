@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { apiFetch, fetchPlatform, type PlatformState } from "../lib/platform-api";
+import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
+import { Card } from "../components/ui/card";
+import { SectionHeader } from "../components/ui/page-header";
 import { errorText, writePlatform } from "./platform-controls";
 
 export function OperationSettings() {
@@ -34,14 +37,16 @@ export function OperationSettings() {
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section aria-labelledby="operations-heading" className="mt-8 grid max-w-3xl gap-3">
-    <h2 id="operations-heading" className="text-xl font-semibold">Выполнение и конфигурация</h2>
-    {state.kind === "loading" && <p>Загрузка состояния очереди…</p>}
-    {state.kind === "unreachable" && <p role="alert">Очередь недоступна ({state.detail})</p>}
-    {state.kind === "ready" && <><p>{state.data.paused ? "Исторические расчёты приостановлены" : "Очередь исторических расчётов работает"}</p><Button variant="outline" disabled={busy} onClick={() => { void toggle(); }}>{state.data.paused ? "Продолжить расчёты" : "Приостановить расчёты"}</Button></>}
-    <p className="text-sm text-muted-foreground">Пауза сохраняется в БД; выполняющийся расчёт остановится между страницами. Уже рассчитанные результаты не удаляются. При перезапуске сервиса прерванные расчёты отмечаются ошибкой и требуют нового запуска.</p>
-    <Button variant="outline" disabled={busy} onClick={() => { void download(); }}>Экспорт конфигурации без секретов</Button>
-    <p className="text-sm text-muted-foreground">Экспорт включает параметры алгоритма, списки инструментов и режимы работы. Это не резервная копия БД: история свечей и данные платформы резервируются отдельно администратором.</p>
-    {error && <p role="alert">{error}</p>}
+  return <section aria-labelledby="operations-heading" className="mt-10 grid max-w-3xl gap-3">
+    <SectionHeader id="operations-heading" title="Выполнение и конфигурация" />
+    <Card className="grid gap-3">
+      {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка состояния очереди…</p>}
+      {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Очередь недоступна ({state.detail})</Alert>}
+      {state.kind === "ready" && <><p>{state.data.paused ? "Исторические расчёты приостановлены" : "Очередь исторических расчётов работает"}</p><div><Button variant="outline" disabled={busy} onClick={() => { void toggle(); }}>{state.data.paused ? "Продолжить расчёты" : "Приостановить расчёты"}</Button></div></>}
+      <p className="text-sm text-muted-foreground">Пауза сохраняется в БД; выполняющийся расчёт остановится между страницами. Уже рассчитанные результаты не удаляются. При перезапуске сервиса прерванные расчёты отмечаются ошибкой и требуют нового запуска.</p>
+      <div><Button variant="outline" disabled={busy} onClick={() => { void download(); }}>Экспорт конфигурации без секретов</Button></div>
+      <p className="text-sm text-muted-foreground">Экспорт включает параметры алгоритма, списки инструментов и режимы работы. Это не резервная копия БД: история свечей и данные платформы резервируются отдельно администратором.</p>
+      {error && <Alert variant="destructive" role="alert">{error}</Alert>}
+    </Card>
   </section>;
 }

@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
+import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
+import { Card } from "../components/ui/card";
+import { SectionHeader } from "../components/ui/page-header";
 import { fetchPlatform } from "../lib/platform-api";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
 import { errorText, writePlatform } from "./platform-controls";
@@ -39,11 +42,14 @@ export function LiveInstruments() {
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section className="mt-8 grid max-w-3xl gap-3" aria-labelledby="live-instruments-heading">
-    <h2 id="live-instruments-heading" className="text-xl font-semibold">Отдельный список live-инструментов</h2>
-    {!ready && !error && <p>Загрузка live-списка…</p>}
-    {ready && <><p className="text-sm text-muted-foreground">{configured ? "Загружен сохранённый выбор." : "Список ещё не настроен: используются все активные инструменты каталога. Сохраните, чтобы зафиксировать выбор."}</p><InstrumentPicker live catalog={catalog} symbols={symbols} onChange={(value) => { setSymbols(value); setMessage(null); }} disabled={busy} /></>}
-    {error && <p role="alert">{error}</p>}{message && <p role="status">{message}</p>}
-    <Button disabled={!ready || busy} onClick={() => { void save(); }}>Сохранить live-список</Button>
+  return <section className="mt-10 grid max-w-3xl gap-3" aria-labelledby="live-instruments-heading">
+    <SectionHeader id="live-instruments-heading" title="Отдельный список live-инструментов" />
+    <Card className="grid gap-3">
+      {!ready && !error && <p className="text-sm text-muted-foreground">Загрузка live-списка…</p>}
+      {ready && <><p className="text-sm text-muted-foreground">{configured ? "Загружен сохранённый выбор." : "Список ещё не настроен: используются все активные инструменты каталога. Сохраните, чтобы зафиксировать выбор."}</p><InstrumentPicker live catalog={catalog} symbols={symbols} onChange={(value) => { setSymbols(value); setMessage(null); }} disabled={busy} /></>}
+      {error && <Alert variant="destructive" role="alert">{error}</Alert>}
+      {message && <Alert variant="success" role="status">{message}</Alert>}
+      <div><Button disabled={!ready || busy} onClick={() => { void save(); }}>Сохранить live-список</Button></div>
+    </Card>
   </section>;
 }

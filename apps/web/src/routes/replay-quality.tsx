@@ -1,4 +1,8 @@
+import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
+import { Card } from "../components/ui/card";
+import { Pagination } from "../components/ui/pagination";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { localTime, localTimezone } from "./platform-controls";
 import { usePlatformPoll } from "./use-platform-poll";
 
@@ -39,13 +43,32 @@ interface QualityIntervalPage {
 function QualityIntervals({ id, offset, revision, onPage }: { id: number; offset: number; revision: number; onPage: (value: number) => void }) {
   const state = usePlatformPoll<QualityIntervalPage>(`/v1/replay-runs/${id}/quality-intervals?offset=${offset}&limit=50`, revision);
   if (state.kind === "loading") return <p role="status">Загрузка интервалов качества…</p>;
-  if (state.kind === "unreachable") return <p role="alert">Интервалы качества недоступны ({state.detail}). Это не означает отсутствие пропусков.</p>;
+  if (state.kind === "unreachable") return <Alert variant="destructive" role="alert">Интервалы качества недоступны ({state.detail}). Это не означает отсутствие пропусков.</Alert>;
   if (!state.data.available) return <p>Интервалы качества не сохранены или исходный расчёт удалён. Если сводка качества сохранена, она продолжает описывать исходный расчёт.</p>;
   return <div className="mt-3 grid gap-3">
     <p className="text-xs text-muted-foreground">Интервалы [начало, конец): правая граница не включена. Время: {localTimezone}. Пригодные интервалы могут содержать допускаемые настройками пропуски входного окна.</p>
-    <div className="overflow-x-auto"><table className="w-full text-sm"><caption className="text-left">Интервалы оценки и пропусков</caption><thead><tr className="text-left"><th className="p-2">Начало</th><th className="p-2">Конец (не включая)</th><th className="p-2">Результат оценки</th></tr></thead><tbody>{state.data.intervals.slice(0, 50).map((interval, index) => <tr key={`${interval.fromUnix}-${index}`} className="border-b border-input"><td className="p-2">{localTime(interval.fromUnix)}</td><td className="p-2">{localTime(interval.toUnix)}</td><td className="p-2">{interval.reason === "evaluated" ? "Пригодно для оценки" : qualityReasonLabels[interval.reason]}</td></tr>)}</tbody></table></div>
+    <div className="overflow-x-auto"><Table>
+      <caption className="text-left">Интервалы оценки и пропусков</caption>
+      <TableHeader><TableRow><TableHead>Начало</TableHead><TableHead>Конец (не включая)</TableHead><TableHead>Результат оценки</TableHead></TableRow></TableHeader>
+      <TableBody>{state.data.intervals.slice(0, 50).map((interval, index) => <TableRow key={`${interval.fromUnix}-${index}`}>
+        <TableCell>{localTime(interval.fromUnix)}</TableCell>
+        <TableCell>{localTime(interval.toUnix)}</TableCell>
+        <TableCell>{interval.reason === "evaluated" ? "Пригодно для оценки" : qualityReasonLabels[interval.reason]}</TableCell>
+      </TableRow>)}</TableBody>
+    </Table></div>
     {state.data.total === 0 && <p>Сохранённых интервалов пока нет.</p>}
-    <nav aria-label="Страницы интервалов качества" className="flex flex-wrap items-center gap-3"><Button variant="outline" disabled={offset === 0} onClick={() => onPage(Math.max(0, offset - 50))}>Предыдущие интервалы</Button><span aria-live="polite">Интервалов: {state.data.total}. Страница {Math.floor(offset / 50) + 1} из {Math.max(1, Math.ceil(state.data.total / 50))}</span><Button variant="outline" disabled={offset + 50 >= state.data.total} onClick={() => onPage(offset + 50)}>Следующие интервалы</Button></nav>
+    <Pagination
+      page={Math.floor(offset / 50) + 1}
+      pages={Math.max(1, Math.ceil(state.data.total / 50))}
+      onPrev={() => onPage(Math.max(0, offset - 50))}
+      onNext={() => onPage(offset + 50)}
+      prevDisabled={offset === 0}
+      nextDisabled={offset + 50 >= state.data.total}
+      summary={`Интервалов: ${state.data.total}. Страница ${Math.floor(offset / 50) + 1} из ${Math.max(1, Math.ceil(state.data.total / 50))}`}
+      label="Страницы интервалов качества"
+      prevLabel="Предыдущие интервалы"
+      nextLabel="Следующие интервалы"
+    />
   </div>;
 }
 
@@ -55,7 +78,7 @@ export function ReplayQualitySummary({ run, panel, onPanel, revision }: {
   panel: QualityPanelState; onPanel: (value: QualityPanelState) => void; revision: number;
 }) {
   const quality = run.quality;
-  return <section className="mt-4 grid gap-3 rounded-md border border-input p-4" aria-label="Качество расчёта">
+  return <Card asChild><section className="mt-4 grid gap-3" aria-label="Качество расчёта">
     <h3 className="font-semibold">Качество расчёта: {qualityLabel(quality)}</h3>
     <p className="text-sm">{run.cacheHit ? "Из кеша" : "Результат этого запуска"}. Исходное вычисление завершено: {run.qualityComputedAt ? new Date(run.qualityComputedAt).toLocaleString("ru-RU") : "время не сохранено или расчёт не завершён"}.{run.qualitySourceRunId != null && ` Исходный запуск: #${run.qualitySourceRunId}.`}</p>
     {run.cacheHit && <p className="text-xs text-muted-foreground">Качество относится к исходным данным кешированного расчёта. Последующая дозагрузка истории не обновляет эту сводку.</p>}
@@ -68,9 +91,9 @@ export function ReplayQualitySummary({ run, panel, onPanel, revision }: {
       {quality.unassessedMinutes > 0 && <p className="text-sm">Нерассмотренный остаток не является пропуском данных. Для отменённого или ошибочного запуска показан только сохранённый результат обработанной части.</p>}
       <details><summary className="cursor-pointer font-medium">Причины пропуска минут ({quality.skippedMinutes})</summary><dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">{(Object.keys(qualityReasonLabels) as (keyof typeof qualityReasonLabels)[]).map((reason) => <div key={reason}><dt className="text-muted-foreground">{qualityReasonLabels[reason]}</dt><dd>{quality.reasonCounts[reason]}</dd></div>)}</dl></details>
     </> : <p>Качество не сохранено для этого запуска. Нулевое число сетапов не доказывает полноту анализа или пригодность данных.</p>}
-    <Button variant="outline" aria-expanded={panel.open} onClick={() => onPanel({ ...panel, open: !panel.open })}>{panel.open ? "Скрыть интервалы качества" : "Показать интервалы качества"}</Button>
+    <div><Button variant="outline" size="sm" aria-expanded={panel.open} onClick={() => onPanel({ ...panel, open: !panel.open })}>{panel.open ? "Скрыть интервалы качества" : "Показать интервалы качества"}</Button></div>
     {panel.open && <QualityIntervals key={`${run.id}-${panel.offset}`} id={run.id} offset={panel.offset} revision={revision} onPage={(offset) => onPanel({ open: true, offset })} />}
-  </section>;
+  </section></Card>;
 }
 
 export function EmptyReplayResult({ quality }: { quality: ReplayQuality | null | undefined }) {

@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { apiFetch } from "../lib/platform-api";
+import { Alert } from "./ui/alert";
 import { Button } from "./ui/button";
+import { Card } from "./ui/card";
+import { SectionHeader } from "./ui/page-header";
 
 function applicationKey(value: string): Uint8Array<ArrayBuffer> {
   const decoded = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
@@ -67,8 +70,8 @@ export function PushSettings() {
     finally { setBusy(false); }
   }
 
-  return <section className="space-y-3 rounded-md border border-input bg-card p-4" aria-label="Web Push">
-    <h2 className="text-lg font-semibold">Web Push</h2>
+  return <Card asChild><section className="mt-10 grid gap-3" aria-label="Web Push">
+    <SectionHeader title="Web Push" />
     <p className="text-sm text-muted-foreground">Возраст уведомления ограничивает доставку, но сам по себе не включает её. Подключите этот браузер отдельно.</p>
     {!supported ? <p role="status" className="text-sm">Web Push недоступен: нужны HTTPS, Service Worker и поддержка Push API. На HTTP-адресе сервера подключение заблокировано.</p> : <>
       <p className="text-sm text-muted-foreground">{subscription
@@ -79,7 +82,7 @@ export function PushSettings() {
         <Button variant="outline" disabled={busy || !subscription} onClick={() => { void unsubscribe(); }}>Отключить уведомления</Button>
       </div>
     </>}
-    {message && <p role="status" className="text-sm">{message}</p>}
-    {error && <p role="alert" className="text-sm">{error}</p>}
-  </section>;
+    {message && <Alert variant="success" role="status">{message}</Alert>}
+    {error && <Alert variant="destructive" role="alert">{error}</Alert>}
+  </section></Card>;
 }

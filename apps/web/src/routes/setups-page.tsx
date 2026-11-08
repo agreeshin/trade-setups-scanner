@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
+import { Alert, AlertDescription } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
+import { Card, CardContent } from "../components/ui/card";
+import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
+import { PageHeader } from "../components/ui/page-header";
+import { Pagination } from "../components/ui/pagination";
+import { Spinner } from "../components/ui/spinner";
 import { PLATFORM_URL, fetchPlatform, type PlatformState } from "../lib/platform-api";
 import { errorText, savePreference, type SetupRow } from "./platform-controls";
 import { SetupTable } from "./setup-table";
@@ -47,19 +53,37 @@ export function SetupsPage() {
   }
   const pages = state.kind === "ready" ? Math.max(1, Math.ceil(state.data.total / state.data.limit)) : 1;
   const currentPage = state.kind === "ready" ? Math.floor(state.data.offset / state.data.limit) : 0;
-  return <section aria-labelledby="setups-heading">
-    <h1 id="setups-heading" className="text-2xl font-semibold">Сетапы</h1>
-    <p className="mt-2 text-sm text-muted-foreground">Поиск по всей сохранённой live-ленте. Загрузка по 25 записей; новые поступления появятся после «Обновить» или изменения фильтра.</p>
-    <div className="mt-4 flex flex-wrap items-end gap-3">
-      <label className="grid gap-1 text-sm">Инструмент, биржа или алгоритм<Input disabled={!preferencesReady} value={query.filter} maxLength={200} onChange={(event) => { setQuery({ filter: event.target.value, offset: 0 }); setState({ kind: "loading" }); setMessage(null); }} /></label>
-      <Button variant="outline" disabled={busy || !preferencesReady} onClick={() => { void saveFilter(); }}>Сохранить фильтр</Button>
-      <Button variant="outline" disabled={!preferencesReady} onClick={() => { setQuery({ filter: query.filter, offset: 0 }); setState({ kind: "loading" }); }}>Обновить</Button>
-      <Button asChild><a href={`${PLATFORM_URL}/v1/export/setups.csv`}>Экспорт CSV (без фильтра)</a></Button>
-    </div>
-    <p className="mt-2 text-sm text-muted-foreground">CSV содержит всю сохранённую live-ленту на начало выгрузки, без фильтра экрана и лимита строк. Статус и отмена доступны в загрузках браузера.</p>
-    {error && <p role="alert" className="mt-3">{error}</p>}{message && <p role="status" className="mt-3">{message}</p>}
-    {state.kind === "loading" && <p role="status">Загрузка…</p>}
-    {state.kind === "unreachable" && <p role="alert">Лента недоступна ({state.detail})</p>}
-    {state.kind === "ready" && <><SetupTable setups={state.data.setups} /><nav aria-label="Страницы сетапов" className="mt-4 flex flex-wrap items-center gap-3"><Button variant="outline" disabled={currentPage === 0} onClick={() => loadPage(state.data.offset - state.data.limit)}>Назад</Button><span aria-live="polite">Страница {currentPage + 1} из {pages} · Найдено: {state.data.total}</span><Button variant="outline" disabled={currentPage + 1 >= pages} onClick={() => loadPage(state.data.offset + state.data.limit)}>Далее</Button></nav></>}
+  return <section aria-labelledby="setups-heading" className="grid gap-4">
+    <PageHeader id="setups-heading" title="Сетапы" description="Поиск по всей сохранённой live-ленте. Загрузка по 25 записей; новые поступления появятся после «Обновить» или изменения фильтра." />
+    <Card>
+      <CardContent className="flex flex-wrap items-end gap-3">
+        <Field label="Инструмент, биржа или алгоритм" className="w-full max-w-sm">
+          {(control) => <Input {...control} disabled={!preferencesReady} value={query.filter} maxLength={200} onChange={(event) => { setQuery({ filter: event.target.value, offset: 0 }); setState({ kind: "loading" }); setMessage(null); }} />}
+        </Field>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" disabled={busy || !preferencesReady} onClick={() => { void saveFilter(); }}>Сохранить фильтр</Button>
+          <Button variant="outline" disabled={!preferencesReady} onClick={() => { setQuery({ filter: query.filter, offset: 0 }); setState({ kind: "loading" }); }}>Обновить</Button>
+          <Button asChild variant="outline"><a href={`${PLATFORM_URL}/v1/export/setups.csv`}>Экспорт CSV (без фильтра)</a></Button>
+        </div>
+        <p className="w-full text-xs text-muted-foreground">CSV содержит всю сохранённую live-ленту на начало выгрузки, без фильтра экрана и лимита строк. Статус и отмена доступны в загрузках браузера.</p>
+      </CardContent>
+    </Card>
+    {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
+    {message && <Alert variant="success" role="status"><AlertDescription>{message}</AlertDescription></Alert>}
+    {state.kind === "loading" && <Spinner label="Загрузка…" />}
+    {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Лента недоступна ({state.detail})</Alert>}
+    {state.kind === "ready" && <>
+      <SetupTable setups={state.data.setups} />
+      <Pagination
+        label="Страницы сетапов"
+        page={currentPage + 1}
+        pages={pages}
+        prevDisabled={currentPage === 0}
+        nextDisabled={currentPage + 1 >= pages}
+        onPrev={() => loadPage(state.data.offset - state.data.limit)}
+        onNext={() => loadPage(state.data.offset + state.data.limit)}
+        summary={`Страница ${currentPage + 1} из ${pages} · Найдено: ${state.data.total}`}
+      />
+    </>}
   </section>;
 }

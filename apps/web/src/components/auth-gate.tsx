@@ -1,8 +1,10 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { apiFetch, SESSION_EXPIRED_EVENT } from "../lib/platform-api";
+import { Alert } from "./ui/alert";
 import { Button } from "./ui/button";
+import { Card, CardContent, CardDescription, CardHeader } from "./ui/card";
+import { Field } from "./ui/field";
 import { Input } from "./ui/input";
-import { Card } from "./ui/card";
 import { AuthFrame, SessionBar } from "./ui/app-frame";
 
 export function AuthGate({ children }: { children: ReactNode }) {
@@ -79,21 +81,25 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (state === "checking") return <p role="status" className="p-6 text-muted-foreground">Проверка сессии...</p>;
   if (state === "authenticated") return <>
     <SessionBar>
-      {error && <p role="alert">{error}</p>}
+      {error && <Alert variant="destructive" role="alert">{error}</Alert>}
       <Button variant="ghost" disabled={busy} onClick={() => { void logout(); }}>Выйти</Button>
     </SessionBar>
     {children}
   </>;
   return <AuthFrame>
-    <Card asChild><form onSubmit={(event) => { void login(event); }} className="w-full max-w-sm space-y-4">
-      <h1 className="text-xl font-semibold">Вход в платформу</h1>
-      <p className="text-sm text-muted-foreground">Используйте API-ключ администратора. Ключ не сохраняется в браузере.</p>
-      {window.location.protocol !== "https:" && <p className="text-sm text-muted-foreground">HTTP не шифрует ключ и сессию. Используйте только доверенную сеть; для защиты соединения нужен HTTPS.</p>}
-      <label className="block space-y-2"><span>API-ключ</span>
-        <Input type="password" autoComplete="off" required value={apiKey} onChange={(event) => setApiKey(event.target.value)} />
-      </label>
-      {error && <p role="alert" className="text-sm">{error}</p>}
-      <Button type="submit" variant="success" disabled={busy}>{busy ? "Вход..." : "Войти"}</Button>
+    <Card asChild><form onSubmit={(event) => { void login(event); }} className="w-full max-w-sm">
+      <CardHeader>
+        <h1 className="text-base font-semibold leading-tight tracking-tight">Вход в платформу</h1>
+        <CardDescription>Используйте API-ключ администратора. Ключ не сохраняется в браузере.</CardDescription>
+      </CardHeader>
+      <CardContent className="gap-4">
+        {window.location.protocol !== "https:" && <p className="text-xs text-muted-foreground">HTTP не шифрует ключ и сессию. Используйте только доверенную сеть; для защиты соединения нужен HTTPS.</p>}
+        <Field label="API-ключ">
+          {(control) => <Input type="password" autoComplete="off" required value={apiKey} onChange={(event) => setApiKey(event.target.value)} {...control} />}
+        </Field>
+        {error && <Alert variant="destructive" role="alert">{error}</Alert>}
+        <Button type="submit" variant="success" disabled={busy}>{busy ? "Вход..." : "Войти"}</Button>
+      </CardContent>
     </form></Card>
   </AuthFrame>;
 }

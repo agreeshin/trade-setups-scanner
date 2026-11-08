@@ -1,6 +1,12 @@
 import { useEffect, useState, type FormEvent } from "react";
+import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
+import { Card } from "../components/ui/card";
+import { Checkbox } from "../components/ui/checkbox";
+import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
+import { PageHeader, SectionHeader } from "../components/ui/page-header";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { apiFetch, fetchPlatform, type PlatformState } from "../lib/platform-api";
 import { AlgorithmSettings } from "./algorithm-settings";
 import { errorText, localTime, writePlatform } from "./platform-controls";
@@ -28,25 +34,36 @@ function LiveSettings() {
     catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section className="mt-8 grid max-w-xl gap-3" aria-labelledby="live-heading">
-    <h2 id="live-heading" className="text-xl font-semibold">Live-сканирование</h2>
-    {state.kind === "loading" && <p>Загрузка…</p>}
-    {state.kind === "unreachable" && <p role="alert">Статус недоступен ({state.detail})</p>}
-    {state.kind === "ready" && <>
-      <p role="status">{state.data.enabled ? "Включено" : "Выключено"} · {state.data.running ? "Сканирование выполняется" : "Сканирование не выполняется"}</p>
-      <p className="text-sm text-muted-foreground">Последнее сканирование: {state.data.lastScanAt ? new Date(state.data.lastScanAt).toLocaleString("ru-RU") : "ещё не выполнялось"}</p>
-      {state.data.lastError && <p role="alert">{state.data.lastError}</p>}
-      {state.data.stale === true && <p role="alert">Статус live устарел; текущее выполнение не подтверждено.</p>}
-      {state.data.scanned !== undefined && <p className="text-sm">Проверено инструментов: {state.data.scanned}</p>}
-      {state.data.setupCount !== undefined && <p className="text-sm">Сетапов в последнем отчёте: {state.data.setupCount}</p>}
-      {state.data.instruments !== undefined && <details><summary className="cursor-pointer font-medium">Состояния live-инструментов ({state.data.instruments.length})</summary>
-        <div className="mt-2 max-h-80 overflow-auto"><table className="w-full text-sm"><caption className="text-left text-muted-foreground">До 1000 строк из последнего ответа сервера</caption><thead><tr className="text-left"><th className="p-2">Инструмент</th><th className="p-2">Состояние</th><th className="p-2">Последняя закрытая минута</th><th className="p-2">Ошибка сервера</th></tr></thead><tbody>{state.data.instruments.slice(0, 1000).map((instrument, index) => <tr key={`${instrument.symbol}-${index}`} className="border-b border-input"><td className="p-2">{instrument.symbol}</td><td className="p-2">{instrumentStateLabels[instrument.state] ?? instrument.state}</td><td className="p-2">{instrument.lastClosedUnix === undefined ? "не сообщено" : localTime(instrument.lastClosedUnix)}</td><td className="max-w-sm break-words p-2">{instrument.error ?? "не сообщена"}</td></tr>)}</tbody></table></div>
-        {state.data.instruments.length === 0 && <p className="text-sm">Сервер вернул пустой список состояний.</p>}
-      </details>}
-      <Button disabled={busy} onClick={() => { void toggle(!state.data.enabled); }}>{state.data.enabled ? "Отключить live" : "Включить live"}</Button>
-    </>}
-    {error && <p role="alert">{error}</p>}
-    <Button variant="outline" disabled={busy} onClick={() => setReload((value) => value + 1)}>Обновить статус live</Button>
+  return <section className="mt-10 grid max-w-xl gap-3" aria-labelledby="live-heading">
+    <SectionHeader id="live-heading" title="Live-сканирование" />
+    <Card className="grid gap-3">
+      {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка…</p>}
+      {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Статус недоступен ({state.detail})</Alert>}
+      {state.kind === "ready" && <>
+        <p role="status">{state.data.enabled ? "Включено" : "Выключено"} · {state.data.running ? "Сканирование выполняется" : "Сканирование не выполняется"}</p>
+        <p className="text-sm text-muted-foreground">Последнее сканирование: {state.data.lastScanAt ? new Date(state.data.lastScanAt).toLocaleString("ru-RU") : "ещё не выполнялось"}</p>
+        {state.data.lastError && <Alert variant="destructive" role="alert">{state.data.lastError}</Alert>}
+        {state.data.stale === true && <Alert variant="warning" role="alert">Статус live устарел; текущее выполнение не подтверждено.</Alert>}
+        {state.data.scanned !== undefined && <p className="text-sm">Проверено инструментов: {state.data.scanned}</p>}
+        {state.data.setupCount !== undefined && <p className="text-sm">Сетапов в последнем отчёте: {state.data.setupCount}</p>}
+        {state.data.instruments !== undefined && <details><summary className="cursor-pointer font-medium">Состояния live-инструментов ({state.data.instruments.length})</summary>
+          <div className="mt-2 max-h-80 overflow-auto"><Table>
+            <caption className="text-left text-muted-foreground">До 1000 строк из последнего ответа сервера</caption>
+            <TableHeader><TableRow><TableHead>Инструмент</TableHead><TableHead>Состояние</TableHead><TableHead>Последняя закрытая минута</TableHead><TableHead>Ошибка сервера</TableHead></TableRow></TableHeader>
+            <TableBody>{state.data.instruments.slice(0, 1000).map((instrument, index) => <TableRow key={`${instrument.symbol}-${index}`}>
+              <TableCell className="font-medium">{instrument.symbol}</TableCell>
+              <TableCell>{instrumentStateLabels[instrument.state] ?? instrument.state}</TableCell>
+              <TableCell>{instrument.lastClosedUnix === undefined ? "не сообщено" : localTime(instrument.lastClosedUnix)}</TableCell>
+              <TableCell className="max-w-sm break-words">{instrument.error ?? "не сообщена"}</TableCell>
+            </TableRow>)}</TableBody>
+          </Table></div>
+          {state.data.instruments.length === 0 && <p className="text-sm">Сервер вернул пустой список состояний.</p>}
+        </details>}
+        <div><Button disabled={busy} onClick={() => { void toggle(!state.data.enabled); }}>{state.data.enabled ? "Отключить live" : "Включить live"}</Button></div>
+      </>}
+      {error && <Alert variant="destructive" role="alert">{error}</Alert>}
+      <div><Button variant="outline" disabled={busy} onClick={() => setReload((value) => value + 1)}>Обновить статус live</Button></div>
+    </Card>
   </section>;
 }
 
@@ -72,15 +89,18 @@ function CacheSettings() {
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section className="mt-8 grid max-w-xl gap-3" aria-labelledby="cache-heading">
-    <h2 id="cache-heading" className="text-xl font-semibold">Кеш исторических запусков</h2>
-    {state.kind === "loading" && <p>Загрузка…</p>}
-    {state.kind === "unreachable" && <p role="alert">Кеш недоступен ({state.detail})</p>}
-    {state.kind === "ready" && <p>Записей: {state.data.entries} · Размер таблицы: {(state.data.bytes / 1024 / 1024).toFixed(2)} МиБ</p>}
-    <p className="text-sm text-muted-foreground">Очистка удаляет только кеш расчётов. Сохранённые запуски и рыночная история остаются; повторный расчёт может занять больше времени.</p>
-    <label className="flex items-center gap-2 text-sm"><Input type="checkbox" className="h-4 w-4" checked={confirm} onChange={(event) => setConfirm(event.target.checked)} />Подтверждаю очистку всего кеша</label>
-    <Button variant="outline" disabled={busy || !confirm || state.kind !== "ready"} onClick={() => { void clear(); }}>Очистить кеш</Button>
-    {message && <p role="status">{message}</p>}{error && <p role="alert">{error}</p>}
+  return <section className="mt-10 grid max-w-xl gap-3" aria-labelledby="cache-heading">
+    <SectionHeader id="cache-heading" title="Кеш исторических запусков" />
+    <Card className="grid gap-3">
+      {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка…</p>}
+      {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Кеш недоступен ({state.detail})</Alert>}
+      {state.kind === "ready" && <p>Записей: {state.data.entries} · Размер таблицы: {(state.data.bytes / 1024 / 1024).toFixed(2)} МиБ</p>}
+      <p className="text-sm text-muted-foreground">Очистка удаляет только кеш расчётов. Сохранённые запуски и рыночная история остаются; повторный расчёт может занять больше времени.</p>
+      <label className="flex items-center gap-2 text-sm"><Checkbox checked={confirm} onCheckedChange={(checked) => setConfirm(checked === true)} />Подтверждаю очистку всего кеша</label>
+      <div><Button variant="outline" disabled={busy || !confirm || state.kind !== "ready"} onClick={() => { void clear(); }}>Очистить кеш</Button></div>
+      {message && <Alert variant="success" role="status">{message}</Alert>}
+      {error && <Alert variant="destructive" role="alert">{error}</Alert>}
+    </Card>
   </section>;
 }
 
@@ -109,18 +129,23 @@ export function SettingsPage() {
     finally { setSaving(false); }
   }
   return <section aria-labelledby="settings-heading">
-    <h1 id="settings-heading" className="text-2xl font-semibold">Настройки</h1>
+    <PageHeader id="settings-heading" title="Настройки" />
     <AlgorithmSettings />
     <LiveSettings />
     <LiveInstruments />
-    <form className="mt-8 grid max-w-xl gap-3" onSubmit={(event) => { void save(event); }}>
-      <h2 className="text-xl font-semibold">Уведомления</h2>
-      <p className="text-sm text-muted-foreground">Telegram не подключён. Настройка возраста задаёт порог свежести; подписка Web Push включается отдельно ниже и только по вашему действию.</p>
-      <p className="text-sm text-muted-foreground">Web Push недоступен по обычному HTTP: требуется HTTPS (исключение — localhost). Сохранение порога не запрашивает разрешение на уведомления.</p>
-      <label className="grid gap-1 text-sm">Максимальный возраст уведомления (секунд)<Input type="number" min="1" step="1" required disabled={!ready} value={maxAge} onChange={(event) => { setMaxAge(event.target.value); setMessage(null); }} /></label>
-      <p className="text-xs text-muted-foreground">Просроченные сетапы остаются в ленте, но не рассылаются как свежие.</p>
-      {error && <p role="alert">{error}</p>}{message && <p role="status">{message}</p>}
-      <Button type="submit" disabled={saving || !ready}>{saving ? "Сохранение…" : "Сохранить уведомления"}</Button>
+    <form className="mt-10 grid max-w-xl gap-3" onSubmit={(event) => { void save(event); }} aria-labelledby="notifications-heading">
+      <SectionHeader id="notifications-heading" title="Уведомления" />
+      <Card className="grid gap-3">
+        <p className="text-sm text-muted-foreground">Telegram не подключён. Настройка возраста задаёт порог свежести; подписка Web Push включается отдельно ниже и только по вашему действию.</p>
+        <p className="text-sm text-muted-foreground">Web Push недоступен по обычному HTTP: требуется HTTPS (исключение — localhost). Сохранение порога не запрашивает разрешение на уведомления.</p>
+        <Field label="Максимальный возраст уведомления (секунд)">
+          {(control) => <Input type="number" min="1" step="1" required disabled={!ready} value={maxAge} onChange={(event) => { setMaxAge(event.target.value); setMessage(null); }} {...control} />}
+        </Field>
+        <p className="text-xs text-muted-foreground">Просроченные сетапы остаются в ленте, но не рассылаются как свежие.</p>
+        {error && <Alert variant="destructive" role="alert">{error}</Alert>}
+        {message && <Alert variant="success" role="status">{message}</Alert>}
+        <div><Button type="submit" disabled={saving || !ready}>{saving ? "Сохранение…" : "Сохранить уведомления"}</Button></div>
+      </Card>
     </form>
     <PushSettings />
     <CacheSettings />

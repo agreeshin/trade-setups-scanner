@@ -85,7 +85,7 @@ test.describe("application smoke", () => {
     await expect(html).toHaveAttribute("data-theme", "system");
     await expect(surface).toHaveCSS("background-color", "rgb(248, 247, 250)");
     await page.emulateMedia({ colorScheme: "dark" });
-    await expect(surface).toHaveCSS("background-color", "rgb(16, 17, 19)");
+    await expect(surface).toHaveCSS("background-color", "rgb(17, 16, 18)");
     await theme.selectOption("light");
     await expect(html).toHaveAttribute("data-theme", "light");
     await expect(surface).toHaveCSS("background-color", "rgb(248, 247, 250)");
@@ -94,7 +94,7 @@ test.describe("application smoke", () => {
     await expect(surface).toHaveCSS("background-color", "rgb(248, 247, 250)");
     await theme.selectOption("dark");
     await page.emulateMedia({ colorScheme: "light" });
-    await expect(surface).toHaveCSS("background-color", "rgb(16, 17, 19)");
+    await expect(surface).toHaveCSS("background-color", "rgb(17, 16, 18)");
     await theme.selectOption("system");
     await expect(html).toHaveAttribute("data-theme", "system");
     await expect(surface).toHaveCSS("background-color", "rgb(248, 247, 250)");
@@ -129,7 +129,7 @@ test.describe("application smoke", () => {
   test("shared terminal theme keeps decoration subdued and navigation accessible", async ({ page }) => {
     await page.goto("/");
     const surface = page.locator('[data-slot="app-surface"]');
-    await expect(surface).toHaveCSS("background-color", "rgb(16, 17, 19)");
+    await expect(surface).toHaveCSS("background-color", "rgb(17, 16, 18)");
     const ambient = page.locator('[data-slot="ambient"]');
     await expect(ambient).toHaveAttribute("aria-hidden", "true");
     await expect(ambient).toHaveCSS("pointer-events", "none");
@@ -154,7 +154,7 @@ test.describe("application smoke", () => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "Вход в платформу" })).toBeVisible();
-    await expect(page.locator('[data-slot="app-surface"]')).toHaveCSS("background-color", "rgb(16, 17, 19)");
+    await expect(page.locator('[data-slot="app-surface"]')).toHaveCSS("background-color", "rgb(17, 16, 18)");
     await expect(page.getByLabel("API-ключ", { exact: true })).toHaveAttribute("data-slot", "input");
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     await page.screenshot({ path: test.info().outputPath("login-mobile.png") });
@@ -205,8 +205,10 @@ test.describe("application smoke", () => {
     await page.goto("/");
     await page.getByRole("link", { name: "История и сбор", exact: true }).click();
     await expect(page).toHaveURL(/\/history$/);
+    await page.getByRole("tab", { name: "Текущий сбор свечей" }).click();
     await page.getByLabel("Инструмент БД").selectOption("1");
     await expect(page.getByText("В БД нет свечей этого инструмента.")).toBeVisible();
+    await page.getByRole("tab", { name: "Задания загрузки" }).click();
     await expect(page.getByText("Заданий загрузки пока нет.")).toBeVisible();
     expect(writes).toEqual([]);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
