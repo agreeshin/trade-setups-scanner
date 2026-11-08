@@ -181,7 +181,7 @@ describe.skipIf(!databaseUrl)("read-only replay preflight", () => {
     expect((await app.inject({ method: "POST", url: "/v1/replay-preflight", payload: input })).statusCode).toBe(401);
     expect((await preview({ ...input, toUnix: input.fromUnix })).statusCode).toBe(400);
     expect((await preview({ ...input, algorithmId: "unknown" })).statusCode).toBe(400);
-    expect((await preview({ ...input, instruments: Array.from({ length: 101 }, () => input.instruments[0]!) })).statusCode).toBe(400);
+    expect((await preview({ ...input, instruments: [] })).statusCode).toBe(400);
     expect(fetch).not.toHaveBeenCalled();
   });
 

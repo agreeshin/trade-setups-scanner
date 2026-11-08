@@ -194,7 +194,7 @@ export function RunsPage() {
       <p className="text-sm text-muted-foreground">Запуск использует сохранённый снимок общих параметров. <Link className="underline" to="/settings">Настроить алгоритмы</Link></p>
       {catalog.kind === "loading" && <p>Загрузка инструментов из БД…</p>}
       {catalog.kind === "unreachable" && <p role="status">Каталог БД недоступен ({catalog.detail}). Проверка кеша возможна только для ранее сохранённых полных идентификаторов: {knownInstruments.map((item) => `${item.exchange}/${item.category}/${item.symbol}`).join(", ") || "не сохранены"}. Выбор: {form.symbols || "пусто"}.</p>}
-      {catalog.kind === "ready" && <InstrumentPicker catalog={catalog.data.instruments} symbols={form.symbols} onChange={(symbols) => changeForm({ ...form, symbols })} disabled={!ready || busy} />}
+      {catalog.kind === "ready" && <InstrumentPicker catalog={catalog.data.instruments} symbols={form.symbols} onChange={(symbols) => changeForm({ ...form, symbols })} disabled={!ready || busy} limit={null} />}
       <p id="timezone" className="text-sm text-muted-foreground">Локальное время: {localTimezone}. В API передаются Unix-секунды.</p>
       <div className="grid gap-3 sm:grid-cols-2">
         <label className="grid gap-1 text-sm">Начало<Input type="datetime-local" required aria-describedby="timezone" disabled={!ready || busy} value={form.from} onChange={(event) => changeForm({ ...form, from: utcMidnightOnDateChange(form.from, event.target.value) })} /></label>

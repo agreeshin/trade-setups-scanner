@@ -87,12 +87,21 @@ describe.skipIf(!url)("persistent replay jobs", () => {
   it("pauses queued work, cancels queued work and bounds pending submissions", async () => {
     await setSetting(db, "replay", { paused: true });
     const batch = { ...input, instruments: Array.from({ length: 100 }, () => input.instruments[0]!) };
-    const runs = (await enqueueReplayRuns(db, batch));
-    await expect(enqueueReplayRuns(db, input)).rejects.toMatchObject({ resource: "queue_jobs", limit: 100, requested: 101 });
+    const queueLimits = { ...DEFAULT_REPLAY_ADMISSION_LIMITS, maxPendingRuns: 100 };
+    const runs = (await enqueueReplayRuns(db, batch, queueLimits));
+    await expect(enqueueReplayRuns(db, input, queueLimits)).rejects.toMatchObject({ resource: "queue_jobs", limit: 100, requested: 101 });
     await start();
     expect((await get(runs[0]!.id)).status).toBe("queued");
     expect((await cancelReplayRun(db, runs[0]!.id))!.status).toBe("cancelled");
-    expect(await enqueueReplayRuns(db, input)).toHaveLength(1);
+    expect(await enqueueReplayRuns(db, input, queueLimits)).toHaveLength(1);
+  });
+
+  it("admits large instrument batches with default limits", async () => {
+    const batch = { ...input, instruments: Array.from({ length: 150 }, () => input.instruments[0]!) };
+    const runs = await enqueueReplayRuns(db, batch);
+    expect(runs).toHaveLength(150);
+    for (const run of runs) await cancelReplayRun(db, run.id);
+    expect((await get(runs[0]!.id)).status).toBe("cancelled");
   });
 
   it("rejects excessive new work atomically but admits an exact cache hit", async () => {

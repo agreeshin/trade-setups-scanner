@@ -50,7 +50,7 @@ const InstrumentInput = Type.Object({
 });
 
 const ReplayRunRequest = Type.Object({
-  instruments: Type.Array(InstrumentInput, { minItems: 1, maxItems: 100 }),
+  instruments: Type.Array(InstrumentInput, { minItems: 1 }),
   fromUnix: Type.Integer({ minimum: 0, maximum: 253_402_300_740 }),
   toUnix: Type.Integer({ minimum: 0, maximum: 253_402_300_740 }),
   algorithmId: Type.Optional(Type.String()),

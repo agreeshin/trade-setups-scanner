@@ -20,8 +20,8 @@ export interface ReplayAdmissionLimits {
 }
 
 export const DEFAULT_REPLAY_ADMISSION_LIMITS: ReplayAdmissionLimits = {
-  maxPendingRuns: 100,
-  maxWorkMinutes: 52_704_000,
+  maxPendingRuns: 10_000,
+  maxWorkMinutes: 5_270_400_000,
   maxDatabaseBytes: 50 * 1024 ** 3,
   estimatedBytesPerWorkMinute: 128,
 };
