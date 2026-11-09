@@ -7,7 +7,8 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use setups_db::runs::{
     BatchDeleteOutcome, BatchSetupRow, cancel_replay_batch, delete_replay_batch, get_replay_batch,
-    get_run_page, live_setups_page, live_setups_snapshot, replay_batch_result_page,
+    get_run_page, live_setups_page, live_setups_search, live_setups_snapshot,
+    replay_batch_result_page,
 };
 use setups_db::{settings_get, settings_set};
 use std::collections::HashMap;
@@ -462,6 +463,80 @@ async fn put_web_analytics_settings(
     Json(json!({ "settings": value })).into_response()
 }
 
+async fn get_live_setups(
+    State(state): State<Arc<ReplayState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(response) = guard(&state, &headers, false) {
+        return response;
+    }
+    let offset = match params.get("offset") {
+        Some(value) => match value.parse::<i64>() {
+            Ok(parsed) if (0..=2_147_483_647).contains(&parsed) => parsed,
+            _ => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
+        },
+        None => 0,
+    };
+    let limit = match params.get("limit") {
+        Some(value) => match value.parse::<i64>() {
+            Ok(parsed) if (1..=500).contains(&parsed) => parsed,
+            _ => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
+        },
+        None => 500,
+    };
+    let snapshot_id = match params.get("snapshotId") {
+        Some(value) => match value.parse::<i64>() {
+            Ok(parsed) if (0..=2_147_483_647).contains(&parsed) => parsed,
+            _ => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
+        },
+        None => match live_setups_snapshot(&state.pool).await {
+            Ok(value) => value,
+            Err(_) => return internal_error(),
+        },
+    };
+    let query = params.get("q").map(String::as_str).unwrap_or("");
+    if query.len() > 200 {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_query");
+    }
+    let search = query.trim();
+    let search = if search.is_empty() {
+        None
+    } else {
+        Some(search)
+    };
+    let (total, rows) =
+        match live_setups_search(&state.pool, snapshot_id, search, offset, limit).await {
+            Ok(value) => value,
+            Err(_) => return internal_error(),
+        };
+    let setups: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "exchange": row.exchange_code,
+                "category": row.category,
+                "symbol": row.symbol,
+                "algorithmId": row.algorithm_id,
+                "algorithmVersion": row.algorithm_version,
+                "openTimeUnix": row.open_time.timestamp(),
+                "params": row.params,
+                "details": row.details.clone().unwrap_or(Value::Null),
+                "closeTimeUnix": row.close_time.timestamp(),
+                "closePrice": row.close_price,
+            })
+        })
+        .collect();
+    Json(json!({
+        "setups": setups,
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+        "snapshotId": snapshot_id,
+    }))
+    .into_response()
+}
+
 pub fn batches_router(state: Arc<ReplayState>) -> Router {
     Router::new()
         .route(
@@ -475,6 +550,7 @@ pub fn batches_router(state: Arc<ReplayState>) -> Router {
         .route("/v1/replay-batches/{id}/export.csv", get(export_batch_csv))
         .route("/v1/replay-runs/{id}/export.csv", get(export_run_csv))
         .route("/v1/export/setups.csv", get(export_live_setups_csv))
+        .route("/v1/setups", get(get_live_setups))
         .route(
             "/v1/settings/notifications",
             get(get_notifications_settings).put(put_notifications_settings),

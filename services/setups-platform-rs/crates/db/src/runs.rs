@@ -632,6 +632,118 @@ pub async fn live_setups_snapshot(pool: &PgPool) -> Result<i64, DbError> {
     Ok(i64::from(row.try_get::<i32, _>("id")?))
 }
 
+pub async fn complete_run_from_cache_by_key(
+    pool: &PgPool,
+    run_id: i64,
+    cache_key: &str,
+) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(CACHE_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+    let cached = sqlx::query(
+        "select warmup_minutes, processed_minutes, quality, quality_source_run_id, computed_at \
+         from replay_cache where cache_key = $1",
+    )
+    .bind(cache_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(cached) = cached else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+    let warmup_minutes: i32 = cached.try_get("warmup_minutes")?;
+    let processed_minutes: i32 = cached.try_get("processed_minutes")?;
+    let quality: Option<Value> = cached.try_get("quality")?;
+    let quality_source_run_id: Option<i32> = cached.try_get("quality_source_run_id")?;
+    let computed_at: DateTime<Utc> = cached.try_get("computed_at")?;
+    sqlx::query(
+        "update replay_runs set status = 'done', cache_hit = true, quality = $2, \
+         quality_source_run_id = $3, quality_computed_at = $4, \
+         setups = (select setups from replay_cache where cache_key = $5), \
+         warmup_minutes = $6, processed_minutes = $7, updated_at = now() \
+         where id = $1 and status = 'running'",
+    )
+    .bind(run_id as i32)
+    .bind(&quality)
+    .bind(quality_source_run_id)
+    .bind(computed_at)
+    .bind(cache_key)
+    .bind(warmup_minutes)
+    .bind(processed_minutes)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveSetupFull {
+    pub id: i64,
+    pub exchange_code: String,
+    pub category: String,
+    pub symbol: String,
+    pub algorithm_id: String,
+    pub algorithm_version: Option<String>,
+    pub open_time: DateTime<Utc>,
+    pub close_time: DateTime<Utc>,
+    pub close_price: String,
+    pub params: Value,
+    pub details: Option<Value>,
+}
+
+pub async fn live_setups_search(
+    pool: &PgPool,
+    snapshot_id: i64,
+    q: Option<&str>,
+    offset: i64,
+    limit: i64,
+) -> Result<(i64, Vec<LiveSetupFull>), DbError> {
+    let filter = match q {
+        Some(_) => {
+            "id <= $1 and strpos(lower(concat_ws(' ', symbol, exchange_code, algorithm_id)), lower($2)) > 0"
+        }
+        None => "id <= $1",
+    };
+    let count_sql = format!("select count(*)::bigint as total from live_setups where {filter}");
+    let count = sqlx::query(&count_sql).bind(snapshot_id as i32);
+    let count = if let Some(q) = q {
+        count.bind(q)
+    } else {
+        count
+    };
+    let count_row = count.fetch_one(pool).await?;
+    let total: i64 = count_row.try_get("total")?;
+    let page_sql = format!(
+        "select id, exchange_code, category, symbol, algorithm_id, algorithm_version, \
+         open_time, close_time, close_price, params, details from live_setups where {filter} \
+         order by close_time desc, id desc offset $3 limit $4"
+    );
+    let page = sqlx::query(&page_sql).bind(snapshot_id as i32);
+    let page = if let Some(q) = q { page.bind(q) } else { page };
+    let rows = page.bind(offset).bind(limit).fetch_all(pool).await?;
+    let setups = rows
+        .iter()
+        .map(|row| {
+            Ok(LiveSetupFull {
+                id: i64::from(row.try_get::<i32, _>("id")?),
+                exchange_code: row.try_get("exchange_code")?,
+                category: row.try_get("category")?,
+                symbol: row.try_get("symbol")?,
+                algorithm_id: row.try_get("algorithm_id")?,
+                algorithm_version: row.try_get("algorithm_version")?,
+                open_time: row.try_get("open_time")?,
+                close_time: row.try_get("close_time")?,
+                close_price: row.try_get("close_price")?,
+                params: row.try_get("params")?,
+                details: row.try_get("details")?,
+            })
+        })
+        .collect::<Result<Vec<_>, DbError>>()?;
+    Ok((total, setups))
+}
+
 pub async fn live_setups_page(
     pool: &PgPool,
     snapshot_id: i64,

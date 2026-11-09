@@ -1,14 +1,21 @@
 use serde_json::Value;
+use setups_db::admission::{ReplayAdmissionLimits, admit_replay_cache_miss, interrupt_queued_runs};
+use setups_db::runs::complete_run_from_cache_by_key;
 use setups_db::{DbError, ReplayRun, settings_get};
+use setups_db::{canonical_cache_key, claim_next_queued_run, fail_interrupted_runs, run_query};
 use setups_detector::PriceVolumeSpikeDetector;
 use setups_detector::quality::{QualityInterval, ReplayQuality, ReplayQualityTracker};
 use setups_domain::decimal::DecimalError;
-use setups_domain::{DetectorBar, PushStatus};
+use setups_domain::{DetectorBar, PushStatus, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION};
+use setups_mdclient::{ApiCandleSource, MarketDataClient};
 use setups_replay::{CandleSource, CandleSourceQuery, PAGE_LIMIT};
 use sqlx::Row;
 use sqlx::postgres::PgPool;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 const CACHE_LOCK_KEY: i64 = 72_423_411;
 const PAUSE_POLL: Duration = Duration::from_secs(1);
@@ -61,6 +68,15 @@ impl From<sqlx::Error> for WorkerError {
 impl From<serde_json::Error> for WorkerError {
     fn from(error: serde_json::Error) -> Self {
         WorkerError::Json(error.to_string())
+    }
+}
+
+impl From<setups_db::admission::QueueError> for WorkerError {
+    fn from(error: setups_db::admission::QueueError) -> Self {
+        match error {
+            setups_db::admission::QueueError::Db(db) => WorkerError::Db(db),
+            other => WorkerError::Source(other.to_string()),
+        }
     }
 }
 
@@ -372,4 +388,174 @@ async fn mark_run_failed(pool: &PgPool, run_id: i64, message: &str) -> Result<()
     .execute(pool)
     .await?;
     Ok(())
+}
+
+const SHUTDOWN_ERROR: &str = "interrupted by application shutdown";
+const UNSUPPORTED_ALGORITHM: &str =
+    "unsupported_algorithm_version: create a new run using the current algorithm";
+
+pub struct JobsHandle {
+    stopped: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl JobsHandle {
+    pub async fn stop(mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
+
+pub async fn start_replay_jobs(
+    pool: PgPool,
+    market_url: String,
+    market_key: String,
+    workers: usize,
+    poll: Duration,
+) -> Result<JobsHandle, WorkerError> {
+    fail_interrupted_runs(&pool).await?;
+    interrupt_queued_runs(&pool).await?;
+    sqlx::query(
+        "update replay_runs set status = 'cancelled', updated_at = now() \
+         where status = 'cancel_requested'",
+    )
+    .execute(&pool)
+    .await?;
+    let stopped = Arc::new(AtomicBool::new(false));
+    let notify = Arc::new(Notify::new());
+    let mut tasks = Vec::new();
+    for _ in 0..workers.max(1) {
+        let worker_pool = pool.clone();
+        let worker_market_url = market_url.clone();
+        let worker_market_key = market_key.clone();
+        let worker_stopped = stopped.clone();
+        let worker_notify = notify.clone();
+        tasks.push(tokio::spawn(async move {
+            worker_loop(
+                worker_pool,
+                worker_market_url,
+                worker_market_key,
+                worker_stopped,
+                worker_notify,
+                poll,
+            )
+            .await;
+        }));
+    }
+    Ok(JobsHandle {
+        stopped,
+        notify,
+        tasks,
+    })
+}
+
+async fn worker_loop(
+    pool: PgPool,
+    market_url: String,
+    market_key: String,
+    stopped: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    poll: Duration,
+) {
+    loop {
+        if stopped.load(Ordering::SeqCst) {
+            break;
+        }
+        let paused = replay_paused(&pool).await.unwrap_or(false);
+        let claimed = if paused {
+            None
+        } else {
+            claim_next_queued_run(&pool).await.ok().flatten()
+        };
+        if let Some(run) = claimed {
+            execute_queued_run(&pool, &run, &market_url, &market_key, &stopped).await;
+            continue;
+        }
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = tokio::time::sleep(poll) => {}
+        }
+    }
+}
+
+pub async fn execute_queued_run(
+    pool: &PgPool,
+    run: &ReplayRun,
+    market_url: &str,
+    market_key: &str,
+    stopped: &AtomicBool,
+) {
+    let outcome = execute_inner(pool, run, market_url, market_key).await;
+    if let Err(message) = &outcome {
+        let truncated: String = message.chars().take(500).collect();
+        let _ = sqlx::query(
+            "update replay_runs set status = 'failed', error = $2, updated_at = now() \
+             where id = $1 and status = 'running'",
+        )
+        .bind(run.id as i32)
+        .bind(&truncated)
+        .execute(pool)
+        .await;
+    }
+    let _ = sqlx::query(
+        "update replay_runs set status = 'cancelled', updated_at = now() \
+         where id = $1 and status = 'cancel_requested'",
+    )
+    .bind(run.id as i32)
+    .execute(pool)
+    .await;
+    if stopped.load(Ordering::SeqCst) {
+        let _ = sqlx::query(
+            "update replay_runs set status = 'failed', error = $2, updated_at = now() \
+             where id = $1 and status = 'running'",
+        )
+        .bind(run.id as i32)
+        .bind(SHUTDOWN_ERROR)
+        .execute(pool)
+        .await;
+    }
+}
+
+async fn execute_inner(
+    pool: &PgPool,
+    run: &ReplayRun,
+    market_url: &str,
+    market_key: &str,
+) -> Result<(), String> {
+    let cache_key = canonical_cache_key(&run_query(run));
+    if complete_run_from_cache_by_key(pool, run.id, &cache_key)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
+    if run.cache_hit {
+        admit_replay_cache_miss(pool, run, &ReplayAdmissionLimits::default())
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    if run.algorithm_id != SPIKE_ALGORITHM_ID || run.algorithm_version != SPIKE_ALGORITHM_VERSION {
+        return Err(UNSUPPORTED_ALGORITHM.to_string());
+    }
+    let catalog = MarketDataClient::new(market_url, market_key)
+        .instruments()
+        .await
+        .map_err(|error| error.to_string())?;
+    let instrument = catalog
+        .iter()
+        .find(|item| {
+            item.exchange == run.exchange_code
+                && item.category == run.category
+                && item.symbol == run.symbol
+        })
+        .ok_or_else(|| "instrument not found in market data catalog".to_string())?;
+    let source = ApiCandleSource::new(market_url, market_key, instrument.id);
+    run_one(pool, run, &source)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }

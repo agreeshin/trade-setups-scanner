@@ -1557,6 +1557,7 @@ dependencies = [
  "setups-db",
  "setups-detector",
  "setups-domain",
+ "setups-mdclient",
  "setups-replay",
  "sqlx",
  "tokio",

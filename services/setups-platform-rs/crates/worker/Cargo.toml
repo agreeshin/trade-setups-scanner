@@ -7,6 +7,7 @@ edition.workspace = true
 setups-domain.workspace = true
 setups-detector.workspace = true
 setups-replay.workspace = true
+setups-mdclient.workspace = true
 setups-db.workspace = true
 serde.workspace = true
 serde_json.workspace = true
