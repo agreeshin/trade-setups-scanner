@@ -28,6 +28,7 @@ interface StubOptions {
   sets?: typeof setFixture[];
   shortBulk?: { tpPct: number; slPct: number; avgMovePct: number | null; riskExpectancy: number | null }[];
   longBulk?: { tpPct: number; slPct: number; avgMovePct: number | null; riskExpectancy: number | null }[];
+  interceptMatrixCell?: (tpPct: number, slPct: number) => Promise<Response> | undefined;
 }
 
 function stubFetch(options: StubOptions = {}) {
@@ -51,6 +52,10 @@ function stubFetch(options: StubOptions = {}) {
     if (path.startsWith("/v1/analytics/matrix-cell")) {
       const tpPct = Number(query.get("tpPct"));
       const slPct = Number(query.get("slPct"));
+      if (options.interceptMatrixCell !== undefined) {
+        const intercepted = options.interceptMatrixCell(tpPct, slPct);
+        if (intercepted !== undefined) return intercepted;
+      }
       return json({ ...matrixCell(tpPct, slPct, tpPct / slPct), cached: false, cachedSelection: true, closedCount: 4, tpCount: 3, slCount: 1 });
     }
     if (path.startsWith("/v1/analytics/trades/")) {
@@ -117,6 +122,41 @@ it("computes missing matrix cells sequentially after the bulk cache read", async
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
   await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument(), { timeout: 15_000 });
 }, 30_000);
+
+it("shows a per-cell loader and stops the matrix run on demand", async () => {
+  let cellCalls = 0;
+  const firstCellResolve: { fn: ((response: Response) => void) | null } = { fn: null };
+  stubFetch({
+    shortBulk: fullShortGrid.slice(0, 1),
+    interceptMatrixCell: () => {
+      cellCalls += 1;
+      if (cellCalls === 1) {
+        return new Promise<Response>((resolve) => { firstCellResolve.fn = resolve; });
+      }
+      return undefined;
+    },
+  });
+  render(<AnalyticsPage />);
+  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  expect(await screen.findByRole("button", { name: "Остановить" })).toBeInTheDocument();
+  expect(await screen.findByRole("status", { name: "Расчёт ячейки" })).toBeInTheDocument();
+  expect(screen.getAllByText("0.05").length).toBeGreaterThan(0);
+
+  await userEvent.click(screen.getByRole("button", { name: "Остановить" }));
+  await waitFor(() => expect(screen.getAllByRole("button", { name: "Рассчитать" })).toHaveLength(2));
+  expect(screen.queryByRole("status", { name: "Расчёт ячейки" })).not.toBeInTheDocument();
+  expect(screen.getAllByText("0.05").length).toBeGreaterThan(0);
+
+  firstCellResolve.fn?.(new Response(
+    JSON.stringify({ ...matrixCell(4, 6, 0.9), cached: false, cachedSelection: true, closedCount: 4, tpCount: 3, slCount: 1 }),
+    { status: 200 },
+  ));
+  await new Promise((resolve) => { setTimeout(resolve, 50); });
+  expect(cellCalls).toBe(1);
+  expect(screen.queryByText("0.90")).not.toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: "Рассчитать" })).toHaveLength(2);
+}, 10_000);
 
 it("runs the SHORT trade list cache-first and builds the daily expectancy chart", async () => {
   stubFetch();

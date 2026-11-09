@@ -61,8 +61,8 @@ function formatDuration(minutes: number | null): string {
   return `${(minutes / (60 * 24)).toFixed(1)} дн`;
 }
 
-/** Quantizes the cell fill to one of 21 gradient steps between the slider thresholds. */
-function matrixCellFillStep(value: number, min: number, max: number): number {
+/** Quantizes the value color to one of 21 gradient steps between the slider thresholds. */
+function matrixCellTextStep(value: number, min: number, max: number): number {
   const span = max - min;
   const t = span > 0 ? Math.min(1, Math.max(0, (value - min) / span)) : value >= max ? 1 : 0;
   return Math.round(t * 20);
@@ -98,17 +98,25 @@ function MatrixSection({
   const [cells, setCells] = useState<Map<string, MatrixCellRef>>(new Map());
   const [metrics, setMetrics] = useState<SelectionMetrics | null>(null);
   const [running, setRunning] = useState(false);
+  const [pendingCell, setPendingCell] = useState<string | null>(null);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [error, setError] = useState<string | null>(null);
   const runIdRef = useRef(0);
 
   const totalCells = tpLevels.length * slLevels.length;
 
+  const stop = useCallback(() => {
+    runIdRef.current += 1;
+    setRunning(false);
+    setPendingCell(null);
+  }, []);
+
   const run = useCallback(async (shiftMinutes: number, priceChangePct: number | null) => {
     const runId = runIdRef.current + 1;
     runIdRef.current = runId;
     setRunning(true);
     setError(null);
+    setPendingCell(null);
     const stale = () => runIdRef.current !== runId;
     const baseParams = {
       set: setId,
@@ -129,6 +137,7 @@ function MatrixSection({
         for (const slPct of slLevels) {
           const key = `${tpPct}:${slPct}`;
           if (nextCells.has(key)) continue;
+          setPendingCell(key);
           const cell = await fetchMatrixCell({ ...baseParams, tpPct, slPct });
           if (stale()) return;
           nextCells.set(key, { tpPct, slPct, avgMovePct: cell.avgMovePct, riskExpectancy: cell.riskExpectancy });
@@ -139,7 +148,10 @@ function MatrixSection({
     } catch (cause) {
       if (!stale()) setError(cause instanceof Error ? cause.message : "ошибка расчёта");
     } finally {
-      if (!stale()) setRunning(false);
+      if (!stale()) {
+        setRunning(false);
+        setPendingCell(null);
+      }
     }
   }, [setId, direction, month, maturity, enableMonth, enableMaturity, tpLevels, slLevels, totalCells]);
 
@@ -191,7 +203,9 @@ function MatrixSection({
             </Field>
           </>
         )}
-        <Button disabled={running || setId === ""} onClick={() => { void run(appliedShift, appliedPriceChange); }}>{running ? "Расчёт…" : "Рассчитать"}</Button>
+        {running
+          ? <Button variant="outline" onClick={stop}>Остановить</Button>
+          : <Button disabled={setId === ""} onClick={() => { void run(appliedShift, appliedPriceChange); }}>Рассчитать</Button>}
         {progress.total > 0 && <Badge variant={progress.done >= progress.total ? "success" : "info"}>Ячеек: {progress.done} / {progress.total}</Badge>}
       </div>
       <div className="flex flex-wrap items-center gap-6 text-sm">
@@ -254,15 +268,18 @@ function MatrixSection({
                 {slLevels.map((sl) => {
                   const cell = cells.get(`${tp}:${sl}`);
                   if (cell === undefined) {
-                    return <TableCell key={sl} numeric className="bg-muted/20 text-muted-foreground">{running ? "…" : "·"}</TableCell>;
+                    if (running && pendingCell === `${tp}:${sl}`) {
+                      return <TableCell key={sl} numeric className="text-muted-foreground"><Spinner label="Расчёт ячейки" /></TableCell>;
+                    }
+                    return <TableCell key={sl} numeric className="text-muted-foreground/60">{running ? "…" : "·"}</TableCell>;
                   }
                   if (cell.riskExpectancy === null) {
-                    return <TableCell key={sl} numeric className="bg-muted/40 text-muted-foreground" title={`avg —% · R —`}>—</TableCell>;
+                    return <TableCell key={sl} numeric className="text-muted-foreground" title="avg —% · R —">—</TableCell>;
                   }
                   return <TableCell
                     key={sl}
                     numeric
-                    className={`tabular-nums analytics-cell-fill-${matrixCellFillStep(cell.riskExpectancy, gradientMin, gradientMax)}`}
+                    className={`tabular-nums font-bold analytics-cell-text-${matrixCellTextStep(cell.riskExpectancy, gradientMin, gradientMax)}`}
                     title={`avg ${cell.avgMovePct?.toFixed(2) ?? "—"}% · R ${cell.riskExpectancy.toFixed(3)}`}
                   >
                     {cell.riskExpectancy.toFixed(2)}
@@ -273,7 +290,7 @@ function MatrixSection({
           </TableBody>
         </Table>
       </div>
-      <p className="text-xs text-muted-foreground">Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок. Спорная свеча считается Stop Loss. Заливка интерполируется от красного к зелёному между порогами ползунков.</p>
+      <p className="text-xs text-muted-foreground">Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок. Спорная свеча считается Stop Loss. Цвет жирных значений интерполируется от красного к зелёному между порогами ползунков.</p>
     </CardContent>
   </Card>;
 }
@@ -610,7 +627,9 @@ function TradesSection({ setId, description, direction, enableMaturity, enablePr
         <Field label="По дату" className="w-40">
           {(control) => <Input {...control} type="date" value={toDate} onChange={(event) => setToDate(event.target.value)} />}
         </Field>
-        <Button disabled={running || setId === ""} onClick={() => { void run(); }}>{running ? "Расчёт…" : "Рассчитать"}</Button>
+        {running
+          ? <Button variant="outline" onClick={() => { runIdRef.current += 1; setRunning(false); }}>Остановить</Button>
+          : <Button disabled={setId === ""} onClick={() => { void run(); }}>Рассчитать</Button>}
         {progress.total > 0 && <Badge variant={progress.done >= progress.total ? "success" : "info"}>Сделок: {progress.done} / {progress.total}</Badge>}
       </div>
       {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
