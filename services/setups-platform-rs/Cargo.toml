@@ -18,18 +18,20 @@ edition = "2024"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "sync", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "sync", "signal", "process"] }
 web-push = { version = "0.11", default-features = false, features = ["hyper-client"] }
 setups-analytics = { path = "crates/analytics" }
 p256 = "0.13"
 base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["now", "serde"] }
 axum = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.9"
+tokio-util = { version = "0.7", features = ["io"] }
+futures-core = "0.3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 setups-domain = { path = "crates/domain" }

@@ -12,6 +12,7 @@ pub struct PlatformConfig {
     pub backup_dir: String,
     pub backup_max_upload_bytes: i64,
     pub market_backup_max_upload_bytes: i64,
+    pub backup_script: String,
     pub replay_limits: ReplayAdmissionLimits,
     pub replay_workers: usize,
 }
@@ -68,6 +69,8 @@ impl PlatformConfig {
         let host = get("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
         let log_level = get("LOG_LEVEL").unwrap_or_else(|| "info".to_string());
         let backup_dir = get("BACKUP_DIR").unwrap_or_else(|| "./backups".to_string());
+        let backup_script = get("BACKUP_SCRIPT_PATH")
+            .unwrap_or_else(|| "./scripts/postgres-backup.mjs".to_string());
         let backup_max_upload_bytes =
             positive_integer(&mut get, "BACKUP_MAX_UPLOAD_BYTES", 60 * 1024 * 1024 * 1024)?;
         let market_backup_max_upload_bytes = positive_integer(
@@ -122,6 +125,7 @@ impl PlatformConfig {
             backup_dir,
             backup_max_upload_bytes,
             market_backup_max_upload_bytes,
+            backup_script,
             replay_limits,
             replay_workers,
         })

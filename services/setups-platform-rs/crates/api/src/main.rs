@@ -84,12 +84,27 @@ async fn main() {
             &config.market_data_api_key,
         ),
     });
+    let backup_state = std::sync::Arc::new(setups_api::backup::BackupState {
+        auth: auth.clone(),
+        manager: setups_api::backup::BackupManager {
+            scope: "platform".to_string(),
+            max_upload_bytes: config.backup_max_upload_bytes,
+            database_url: config.database_url.clone(),
+            backup_dir: config.backup_dir.clone(),
+            script_path: config.backup_script.clone(),
+        },
+        market_url: config.market_data_url.clone(),
+        market_key: config.market_data_api_key.clone(),
+        market_max_upload_bytes: config.market_backup_max_upload_bytes,
+        http: reqwest::Client::new(),
+    });
     let app = axum::Router::new()
         .merge(setups_api::session_router(auth))
         .merge(replay_router(replay_state.clone()))
         .merge(controls_router(controls_state))
         .merge(batches_router(replay_state))
-        .merge(setups_api::analytics::analytics_router(analytics_state));
+        .merge(setups_api::analytics::analytics_router(analytics_state))
+        .merge(setups_api::backup::backup_router(backup_state));
     let listener = match tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await {
         Ok(value) => value,
         Err(error) => {
