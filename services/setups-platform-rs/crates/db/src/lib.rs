@@ -6,6 +6,8 @@ use setups_domain::{SpikeParams, SpikeSetup};
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+pub mod admission;
+
 #[derive(Debug)]
 pub enum DbError {
     Sqlx(sqlx::Error),
@@ -127,7 +129,7 @@ pub struct ReplayRun {
     pub cache_hit: bool,
 }
 
-fn unix_to_ts(unix: i64) -> DateTime<Utc> {
+pub(crate) fn unix_to_ts(unix: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(unix, 0).expect("unix seconds within range")
 }
 
@@ -235,7 +237,7 @@ pub async fn settings_set(pool: &PgPool, key: &str, value: &Value) -> Result<(),
     Ok(())
 }
 
-fn replay_run_from_row(row: &sqlx::postgres::PgRow) -> Result<ReplayRun, DbError> {
+pub(crate) fn replay_run_from_row(row: &sqlx::postgres::PgRow) -> Result<ReplayRun, DbError> {
     let params: Value = row.try_get("params")?;
     Ok(ReplayRun {
         id: i64::from(row.try_get::<i32, _>("id")?),
