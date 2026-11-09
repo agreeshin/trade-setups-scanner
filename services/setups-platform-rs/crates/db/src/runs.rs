@@ -434,3 +434,239 @@ pub async fn get_replay_params(pool: &PgPool) -> Result<SpikeParams, DbError> {
     }
     Ok(params)
 }
+
+pub async fn get_replay_batch(
+    pool: &PgPool,
+    batch_id: i64,
+) -> Result<Option<BatchSummary>, DbError> {
+    let rows = sqlx::query(&format!(
+        "{BATCH_SELECT} from replay_batches b join replay_runs r on r.batch_id = b.id \
+         where b.id = $1 group by b.id"
+    ))
+    .bind(batch_id as i32)
+    .fetch_optional(pool)
+    .await?;
+    Ok(rows.as_ref().map(batch_from_row))
+}
+
+const QUEUE_LOCK_KEY: i64 = 72_423_412;
+
+pub async fn cancel_replay_batch(
+    pool: &PgPool,
+    batch_id: i64,
+) -> Result<Option<(u64, u64)>, DbError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(QUEUE_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+    let batch = sqlx::query("select id from replay_batches where id = $1")
+        .bind(batch_id as i32)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if batch.is_none() {
+        tx.commit().await?;
+        return Ok(None);
+    }
+    let cancelled = sqlx::query(
+        "update replay_runs set status = 'cancelled', updated_at = now() \
+         where batch_id = $1 and status = 'queued'",
+    )
+    .bind(batch_id as i32)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let cancel_requested = sqlx::query(
+        "update replay_runs set status = 'cancel_requested', updated_at = now() \
+         where batch_id = $1 and status = 'running'",
+    )
+    .bind(batch_id as i32)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(Some((cancelled, cancel_requested)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchDeleteOutcome {
+    Deleted {
+        runs_deleted: u64,
+        quality_intervals_deleted: u64,
+    },
+    Active,
+}
+
+pub async fn delete_replay_batch(
+    pool: &PgPool,
+    batch_id: i64,
+) -> Result<Option<BatchDeleteOutcome>, DbError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(QUEUE_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+    let batch = sqlx::query("select id from replay_batches where id = $1")
+        .bind(batch_id as i32)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if batch.is_none() {
+        tx.commit().await?;
+        return Ok(None);
+    }
+    let children = sqlx::query("select status from replay_runs where batch_id = $1")
+        .bind(batch_id as i32)
+        .fetch_all(&mut *tx)
+        .await?;
+    if children.iter().any(|row| {
+        row.try_get::<String, _>("status")
+            .is_ok_and(|status| status != "done" && status != "failed" && status != "cancelled")
+    }) {
+        tx.commit().await?;
+        return Ok(Some(BatchDeleteOutcome::Active));
+    }
+    let quality_intervals_deleted = sqlx::query(
+        "delete from replay_quality_intervals where run_id in \
+         (select id from replay_runs where batch_id = $1)",
+    )
+    .bind(batch_id as i32)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let runs_deleted = sqlx::query("delete from replay_runs where batch_id = $1")
+        .bind(batch_id as i32)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    sqlx::query("delete from replay_batches where id = $1")
+        .bind(batch_id as i32)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(BatchDeleteOutcome::Deleted {
+        runs_deleted,
+        quality_intervals_deleted,
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchSetupRow {
+    pub setup: Value,
+    pub exchange_code: String,
+    pub category: String,
+    pub symbol: String,
+    pub algorithm_id: String,
+    pub algorithm_version: Option<String>,
+    pub params: Value,
+}
+
+fn batch_setup_from_row(row: &PgRow) -> BatchSetupRow {
+    BatchSetupRow {
+        setup: row.try_get("setup").unwrap_or(Value::Null),
+        exchange_code: row.try_get("exchange_code").unwrap_or_default(),
+        category: row.try_get("category").unwrap_or_default(),
+        symbol: row.try_get("symbol").unwrap_or_default(),
+        algorithm_id: row.try_get("algorithm_id").unwrap_or_default(),
+        algorithm_version: row.try_get("algorithm_version").unwrap(),
+        params: row.try_get("params").unwrap_or(Value::Null),
+    }
+}
+
+pub async fn replay_batch_result_page(
+    pool: &PgPool,
+    batch_id: i64,
+    offset: i64,
+    limit: i64,
+) -> Result<Option<(Vec<BatchSetupRow>, i64)>, DbError> {
+    let batch = sqlx::query("select id from replay_batches where id = $1")
+        .bind(batch_id as i32)
+        .fetch_optional(pool)
+        .await?;
+    if batch.is_none() {
+        return Ok(None);
+    }
+    let total_row = sqlx::query(
+        "select coalesce(sum(case when jsonb_typeof(setups) = 'array' \
+         then jsonb_array_length(setups) else 0 end), 0)::bigint as total \
+         from replay_runs where batch_id = $1",
+    )
+    .bind(batch_id as i32)
+    .fetch_one(pool)
+    .await?;
+    let total: i64 = total_row.try_get("total")?;
+    let rows = sqlx::query(
+        "select s.value as setup, r.exchange_code, r.category, r.symbol, r.algorithm_id, r.algorithm_version, r.params \
+         from replay_runs r \
+         cross join lateral jsonb_array_elements(case when jsonb_typeof(r.setups) = 'array' \
+         then r.setups else '[]'::jsonb end) with ordinality as s(value, ordinality) \
+         where r.batch_id = $1 \
+         order by (s.value->>'closeTimeUnix')::bigint desc, r.id asc, s.ordinality asc \
+         limit $2 offset $3",
+    )
+    .bind(batch_id as i32)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    let setups = rows.iter().map(batch_setup_from_row).collect();
+    Ok(Some((setups, total)))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveSetupRow {
+    pub id: i64,
+    pub exchange_code: String,
+    pub category: String,
+    pub symbol: String,
+    pub algorithm_id: String,
+    pub algorithm_version: Option<String>,
+    pub open_time: DateTime<Utc>,
+    pub close_time: DateTime<Utc>,
+    pub close_price: String,
+}
+
+pub async fn live_setups_snapshot(pool: &PgPool) -> Result<i64, DbError> {
+    let row = sqlx::query("select coalesce(max(id), 0)::int as id from live_setups")
+        .fetch_one(pool)
+        .await?;
+    Ok(i64::from(row.try_get::<i32, _>("id")?))
+}
+
+pub async fn live_setups_page(
+    pool: &PgPool,
+    snapshot_id: i64,
+    after: Option<(DateTime<Utc>, i64)>,
+    limit: i64,
+) -> Result<Vec<LiveSetupRow>, DbError> {
+    let query = if after.is_some() {
+        "select id, exchange_code, category, symbol, algorithm_id, algorithm_version, open_time, close_time, close_price \
+         from live_setups where id <= $1 and (close_time, id) > ($3, $4) \
+         order by close_time asc, id asc limit $2"
+    } else {
+        "select id, exchange_code, category, symbol, algorithm_id, algorithm_version, open_time, close_time, close_price \
+         from live_setups where id <= $1 \
+         order by close_time asc, id asc limit $2"
+    };
+    let mut statement = sqlx::query(query)
+        .bind(snapshot_id as i32)
+        .bind(limit as i32);
+    if let Some((close_time, id)) = after {
+        statement = statement.bind(close_time).bind(id as i32);
+    }
+    let rows = statement.fetch_all(pool).await?;
+    rows.iter()
+        .map(|row| {
+            Ok(LiveSetupRow {
+                id: i64::from(row.try_get::<i32, _>("id")?),
+                exchange_code: row.try_get("exchange_code")?,
+                category: row.try_get("category")?,
+                symbol: row.try_get("symbol")?,
+                algorithm_id: row.try_get("algorithm_id")?,
+                algorithm_version: row.try_get("algorithm_version")?,
+                open_time: row.try_get("open_time")?,
+                close_time: row.try_get("close_time")?,
+                close_price: row.try_get("close_price")?,
+            })
+        })
+        .collect()
+}

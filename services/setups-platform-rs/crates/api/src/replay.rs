@@ -102,7 +102,7 @@ fn run_dto(run: &ReplayRunFull) -> Value {
     })
 }
 
-fn batch_dto(batch: &BatchSummary) -> Value {
+pub(crate) fn batch_dto(batch: &BatchSummary) -> Value {
     let mut value = json!({
         "id": batch.id,
         "isBatch": true,
@@ -453,11 +453,11 @@ async fn list_replay_runs(State(state): State<Arc<ReplayState>>, headers: Header
     Json(json!({ "runs": runs })).into_response()
 }
 
-fn parse_id(value: &str) -> Option<i64> {
+pub(crate) fn parse_id(value: &str) -> Option<i64> {
     value.parse::<i64>().ok().filter(|id| *id >= 1)
 }
 
-fn parse_paging(params: &HashMap<String, String>, limit_max: i64) -> Option<(i64, i64)> {
+pub(crate) fn parse_paging(params: &HashMap<String, String>, limit_max: i64) -> Option<(i64, i64)> {
     let offset = match params.get("offset") {
         Some(value) => value.parse::<i64>().ok()?,
         None => 0,
