@@ -1541,6 +1541,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "setups-worker"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "setups-db",
+ "setups-detector",
+ "setups-domain",
+ "setups-replay",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,15 @@
+[package]
+name = "setups-worker"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+setups-domain.workspace = true
+setups-detector.workspace = true
+setups-replay.workspace = true
+setups-db.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+tokio.workspace = true

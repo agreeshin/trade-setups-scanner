@@ -8,6 +8,7 @@ members = [
     "crates/mdclient",
     "crates/db",
     "crates/api",
+    "crates/worker",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ http-body-util = "0.1"
 setups-domain = { path = "crates/domain" }
 setups-detector = { path = "crates/detector" }
 setups-replay = { path = "crates/replay" }
+setups-db = { path = "crates/db" }
 
 [profile.release]
 lto = "thin"
