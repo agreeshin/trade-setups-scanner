@@ -479,6 +479,17 @@ export function registerPlatformV1Routes(
     return body;
   });
 
+  /** Web analytics user settings: opaque JSON document saved/restored by the analytics tab. */
+  app.get("/v1/settings/web-analytics", { preHandler: [requireApiKey] }, async () => ({ settings: await getSetting(db, "web-analytics") }));
+  app.put("/v1/settings/web-analytics", {
+    preHandler: [requireApiKey],
+    schema: { body: Type.Record(Type.String(), Type.Unknown()) },
+  }, async (request) => {
+    const body = request.body as Record<string, unknown>;
+    await setSetting(db, "web-analytics", body);
+    return { settings: body };
+  });
+
   app.get(
     "/v1/replay-runs",
     {
