@@ -134,7 +134,7 @@ export function RunsPage() {
   const [reload, setReload] = useState(0);
   const runs = usePlatformPoll<{ runs: RunRow[] }>("/v1/replay-runs", reload);
   const [cancelling, setCancelling] = useState<number | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<{ id: number; symbol: string } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ id: number; symbol: string; isBatch: boolean } | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [purgeArmed, setPurgeArmed] = useState(false);
@@ -247,10 +247,10 @@ export function RunsPage() {
     if (deleteTarget === null) return;
     setDeleting(true); setDeleteError(null);
     try {
-      const response = await apiFetch(`/v1/replay-runs/${deleteTarget.id}`, { method: "DELETE" });
+      const response = await apiFetch(deleteTarget.isBatch ? `/v1/replay-batches/${deleteTarget.id}` : `/v1/replay-runs/${deleteTarget.id}`, { method: "DELETE" });
       if (!response.ok) throw new Error(response.status === 409 ? "Запуск ещё активен: сначала отмените его." : `Не удалось удалить запуск: HTTP ${response.status}`);
       setMessage(`Запуск #${deleteTarget.id} удалён.`);
-      if (selected?.id === deleteTarget.id && !selected.isBatch) setSelected(null);
+      if (selected?.id === deleteTarget.id && selected.isBatch === deleteTarget.isBatch) setSelected(null);
       setDeleteTarget(null);
       setReload((value) => value + 1);
     } catch (cause) { setDeleteError(cause instanceof Error ? cause.message : "Ошибка соединения"); }
@@ -303,7 +303,7 @@ export function RunsPage() {
               <TableCell>
                 <div className="flex items-center justify-end gap-1">
                   {["queued", "running", "cancel_requested"].includes(run.status) && <Button variant="outline" size="sm" disabled={cancelling !== null || run.status === "cancel_requested"} onClick={() => { void cancelRun(run.id, run.isBatch === true); }} aria-label={`Отменить запуск ${run.id}`}>Отменить</Button>}
-                  {run.isBatch !== true && !["queued", "running", "cancel_requested"].includes(run.status) && <Button variant="outline" size="sm" disabled={deleting} aria-label={`Удалить запуск ${run.id}`} onClick={() => { setDeleteError(null); setDeleteTarget({ id: run.id, symbol: run.symbol }); }}><TrashIcon /></Button>}
+                  {!["queued", "running", "cancel_requested"].includes(run.status) && <Button variant="outline" size="sm" disabled={deleting} aria-label={`Удалить запуск ${run.id}`} onClick={() => { setDeleteError(null); setDeleteTarget({ id: run.id, symbol: run.symbol, isBatch: run.isBatch === true }); }}><TrashIcon /></Button>}
                 </div>
               </TableCell>
         </TableRow>)}</TableBody>
@@ -316,7 +316,9 @@ export function RunsPage() {
           <DialogContent>
             <DialogHeader>
               <DialogTitle>Удалить запуск #{deleteTarget.id}?</DialogTitle>
-              <DialogDescription>Запуск {deleteTarget.symbol} и связанные интервалы качества будут полностью удалены из базы. Кеш вычислений не затрагивается. Действие необратимо.</DialogDescription>
+              <DialogDescription>{deleteTarget.isBatch
+                ? `Пакетный запуск #${deleteTarget.id} (${deleteTarget.symbol}) будет полностью удалён из базы вместе со всеми дочерними прогонами и их интервалами качества. Кеш вычислений не затрагивается. Действие необратимо.`
+                : `Запуск ${deleteTarget.symbol} и связанные интервалы качества будут полностью удалены из базы. Кеш вычислений не затрагивается. Действие необратимо.`}</DialogDescription>
             </DialogHeader>
             {deleteError && <Alert variant="destructive" role="alert">{deleteError}</Alert>}
             <div className="flex justify-end gap-2">

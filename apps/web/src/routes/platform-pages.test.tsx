@@ -153,14 +153,22 @@ describe("platform screens", () => {
     expect(put?.body).toEqual({ value: { existing: "keep", interface: { dateOrder: "ymd", dateSeparator: "-", yearDigits: 4, time24: false, timezone: "auto" } } });
   });
 
-  it("deletes a single finished run from the recent runs table", async () => {
-    replayRunsResponse = { runs: [{ id: 7, symbol: "BTCUSDT", status: "done", cacheHit: false, setupCount: 3, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z" }] };
+  it("deletes single and batch finished runs from the recent runs table", async () => {
+    replayRunsResponse = { runs: [
+      { id: 7, symbol: "BTCUSDT", status: "done", cacheHit: false, setupCount: 3, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z" },
+      { id: 8, isBatch: true, symbol: "2 инструментов", status: "done", cacheHit: false, setupCount: 5, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-02T00:00:00.000Z", instrumentCount: 2, activeInstruments: 0, doneInstruments: 2, failedInstruments: 0, cancelledInstruments: 0 },
+    ] };
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
     await userEvent.click(await screen.findByRole("button", { name: "Удалить запуск 7" }));
     expect(await screen.findByText("Удалить запуск #7?")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Удалить" }));
     await waitFor(() => expect(screen.getByText("Запуск #7 удалён.")).toBeInTheDocument());
     expect(requests.some((request) => request.path === "/v1/replay-runs/7" && request.method === "DELETE")).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Удалить запуск 8" }));
+    expect(await screen.findByText("Удалить запуск #8?")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Удалить" }));
+    await waitFor(() => expect(screen.getByText("Запуск #8 удалён.")).toBeInTheDocument());
+    expect(requests.some((request) => request.path === "/v1/replay-batches/8" && request.method === "DELETE")).toBe(true);
   });
   it("requests server pages and finds records beyond the former latest-500 cap", async () => {
     render(<SetupsPage />);

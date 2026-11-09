@@ -10,7 +10,7 @@ import { registerControls } from "./controls.js";
 import { ApiCandleSource } from "../replay/source.js";
 import { replayRun } from "../replay/replay-runner.js";
 import { admitReplayCacheMiss, cancelReplayRun, DEFAULT_REPLAY_ADMISSION_LIMITS, deleteReplayRun, purgeReplayRuns, replayRunDto, ReplayAdmissionError, reserveReplayRuns, type ReplayAdmissionLimits } from "../replay/jobs.js";
-import { cancelReplayBatch, getReplayBatch, listReplayBatches, replayBatchResultPage, type ReplayBatchSummary } from "../replay/batches.js";
+import { cancelReplayBatch, deleteReplayBatch, getReplayBatch, listReplayBatches, replayBatchResultPage, type ReplayBatchSummary } from "../replay/batches.js";
 import { saveQualityPage, type QualityInterval } from "../replay/quality.js";
 import { prepareReplayRequest, replayPreflight, type ReplayRequest } from "../replay/preflight.js";
 import {
@@ -409,6 +409,23 @@ export function registerPlatformV1Routes(
     if (outcome === null) return reply.code(404).send({ error: "run not found" });
     if (outcome.status === "active") return reply.code(409).send({ error: "run active" });
     return reply.send({ deleted: true, qualityIntervalsDeleted: outcome.qualityIntervalsDeleted });
+  });
+
+  app.delete("/v1/replay-batches/:id", {
+    preHandler: [requireApiKey],
+    schema: {
+      params: Type.Object({ id: Type.Integer({ minimum: 1 }) }),
+      response: {
+        200: Type.Object({ deleted: Type.Boolean(), runsDeleted: Type.Integer(), qualityIntervalsDeleted: Type.Integer() }),
+        404: Type.Object({ error: Type.String() }),
+        409: Type.Object({ error: Type.String() }),
+      },
+    },
+  }, async (request, reply) => {
+    const outcome = await deleteReplayBatch(db, (request.params as { id: number }).id);
+    if (outcome === undefined) return reply.code(404).send({ error: "batch not found" });
+    if (outcome.status === "active") return reply.code(409).send({ error: "batch active" });
+    return reply.send({ deleted: true, runsDeleted: outcome.runsDeleted, qualityIntervalsDeleted: outcome.qualityIntervalsDeleted });
   });
 
   app.get("/v1/replay-batches/:id", {

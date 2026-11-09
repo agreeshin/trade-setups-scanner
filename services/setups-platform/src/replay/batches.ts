@@ -120,3 +120,29 @@ export async function cancelReplayBatch(
     return { cancelled: queued.length, cancelRequested: running.length };
   });
 }
+
+export type ReplayBatchDeleteOutcome =
+  | { status: "deleted"; runsDeleted: number; qualityIntervalsDeleted: number }
+  | { status: "active" };
+
+/** Fully removes one finished batch with its child runs and their quality intervals; shared computation cache is untouched. */
+export async function deleteReplayBatch(
+  db: Kysely<SignalsDB>, batchId: number,
+): Promise<ReplayBatchDeleteOutcome | undefined> {
+  return db.transaction().execute(async (tx) => {
+    await sql`select pg_advisory_xact_lock(72423412)`.execute(tx);
+    const batch = await tx.selectFrom("replay_batches").select("id").where("id", "=", batchId).executeTakeFirst();
+    if (batch === undefined) return undefined;
+    const children = await tx.selectFrom("replay_runs").select(["id", "status"]).where("batch_id", "=", batchId).execute();
+    if (children.some((row) => row.status === "queued" || row.status === "running" || row.status === "cancel_requested")) {
+      return { status: "active" };
+    }
+    const childIds = children.map((row) => row.id);
+    const quality = childIds.length > 0
+      ? await tx.deleteFrom("replay_quality_intervals").where("run_id", "in", childIds).returning("run_id").execute()
+      : [];
+    const runs = await tx.deleteFrom("replay_runs").where("batch_id", "=", batchId).returning("id").execute();
+    await tx.deleteFrom("replay_batches").where("id", "=", batchId).execute();
+    return { status: "deleted", runsDeleted: runs.length, qualityIntervalsDeleted: quality.length };
+  });
+}

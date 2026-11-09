@@ -186,6 +186,29 @@ describe.skipIf(!TEST_DATABASE_URL)("platform api", () => {
     await db.deleteFrom("replay_runs").execute();
   });
 
+  it("deletes a finished batch with its child runs and rejects batches with active children", async () => {
+    const headers = { "x-api-key": PLATFORM_KEY };
+    const batchSeed = { exchange_code: "bybit", category: "linear", algorithm_id: "price_volume_spike", algorithm_version: "1", params: DEFAULT_SPIKE_PARAMS, from_ts: new Date(0), to_ts: new Date(60_000), instrument_count: 2 };
+    const runSeed = { exchange_code: "bybit", category: "linear", from_ts: new Date(0), to_ts: new Date(60_000), algorithm_id: "price_volume_spike", algorithm_version: "1", params: DEFAULT_SPIKE_PARAMS, cache_hit: false, setups: JSON.stringify([]) as unknown as SpikeSetup[] };
+    const finished = await db.insertInto("replay_batches").values(batchSeed).returning("id").executeTakeFirstOrThrow();
+    await db.insertInto("replay_runs").values([
+      { ...runSeed, symbol: "DELBAUSDT", status: "done", batch_id: finished.id },
+      { ...runSeed, symbol: "DELBBUSDT", status: "failed", batch_id: finished.id },
+    ]).execute();
+    const active = await db.insertInto("replay_batches").values(batchSeed).returning("id").executeTakeFirstOrThrow();
+    await db.insertInto("replay_runs").values({ ...runSeed, symbol: "DELBCUSDT", status: "queued", batch_id: active.id }).execute();
+    const conflict = await app.inject({ method: "DELETE", url: `/v1/replay-batches/${active.id}`, headers });
+    expect(conflict.statusCode).toBe(409);
+    const deleted = await app.inject({ method: "DELETE", url: `/v1/replay-batches/${finished.id}`, headers });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toEqual({ deleted: true, runsDeleted: 2, qualityIntervalsDeleted: 0 });
+    const orphan = await db.selectFrom("replay_runs").select("id").where("batch_id", "=", finished.id).execute();
+    expect(orphan).toHaveLength(0);
+    expect((await app.inject({ method: "DELETE", url: `/v1/replay-batches/${finished.id}`, headers })).statusCode).toBe(404);
+    await db.deleteFrom("replay_runs").execute();
+    await db.deleteFrom("replay_batches").execute();
+  });
+
   it("serves batch grouping, unified detail, cancel and CSV via the API", async () => {
     const headers = { "x-api-key": PLATFORM_KEY };
     await db.deleteFrom("replay_batches").execute();
