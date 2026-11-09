@@ -8,6 +8,24 @@ import {
   type PushResult,
 } from "../../setups-platform/src/detector/price-volume-spike.js";
 import { ReplayQualityTracker } from "../../setups-platform/src/replay/quality.js";
+import { replayRun } from "../../setups-platform/src/replay/replay-runner.js";
+import { ArrayCandleSource } from "../../setups-platform/src/replay/source.js";
+import {
+  selectByMaturity,
+  setupMonths,
+  setupClustersCount,
+  filterByMonth,
+  filterByDayRange,
+  evaluateLimit,
+  aggregateLimitOutcomes,
+  passesPriceChange,
+  riskReturn,
+  DEFAULT_CLUSTER_GAP_HOURS,
+  type AnalyticsSetup,
+  type OhlcCandle,
+  type TradeDirection,
+  type LimitEvaluation,
+} from "../../setups-platform/src/analytics/engine.js";
 
 type BarSpec = { t: number; close: string; turnover: string };
 type SpikeEvent = {
@@ -297,11 +315,264 @@ const SPECS: ScenarioSpec[] = [
   },
 ];
 
+function buildAnalyticsSection() {
+  const boundary = 1_701_384_000;
+  const setup = (symbol: string, closeTimeUnix: number): AnalyticsSetup => ({
+    exchangeCode: "bybit",
+    category: "linear",
+    symbol,
+    openTimeUnix: closeTimeUnix - MINUTE,
+    closeTimeUnix,
+    closePrice: "100.00000000",
+  });
+  const setups: AnalyticsSetup[] = [
+    setup("BTCUSDT", boundary),
+    setup("BTCUSDT", boundary + 3600),
+    setup("BTCUSDT", boundary + 11 * 3600),
+    setup("BTCUSDT", boundary + 11 * 3600 + 1800),
+    setup("BTCUSDT", boundary + 11 * 3600 + 3600),
+    setup("ETHUSDT", boundary + 1800),
+    setup("ETHUSDT", boundary + 3600),
+    setup("ETHUSDT", boundary + 5400),
+    setup("ETHUSDT", boundary + 7200),
+    setup("ETHUSDT", boundary + 9000),
+  ];
+  const defaultGap = DEFAULT_CLUSTER_GAP_HOURS * 3600;
+  const selections = [0, 0.3, 0.7, 1].flatMap((maturity) =>
+    [defaultGap, 1800].map((maxGapSeconds) => ({
+      maturity,
+      maxGapSeconds,
+      result: selectByMaturity(setups, maturity, maxGapSeconds),
+    })),
+  );
+  const clustering = {
+    setups,
+    months: setupMonths(setups),
+    clusterCounts: [
+      { maxGapSeconds: defaultGap, count: setupClustersCount(setups, defaultGap) },
+      { maxGapSeconds: 1800, count: setupClustersCount(setups, 1800) },
+    ],
+    selections,
+    monthFilters: [
+      { month: "2023-11", rows: filterByMonth(setups, "2023-11") },
+      { month: "2023-10", rows: filterByMonth(setups, "2023-10") },
+    ],
+    dayRangeFilters: [
+      { fromDay: "2023-11-30", toDay: "2023-12-01", rows: filterByDayRange(setups, "2023-11-30", "2023-12-01") },
+      { fromDay: "2023-12-02", toDay: "2023-12-31", rows: filterByDayRange(setups, "2023-12-02", "2023-12-31") },
+    ],
+  };
+
+  const TA = 1_701_384_000;
+  const mkSetup = (symbol: string, openTimeUnix: number): AnalyticsSetup => ({
+    exchangeCode: "bybit",
+    category: "linear",
+    symbol,
+    openTimeUnix,
+    closeTimeUnix: openTimeUnix + MINUTE,
+    closePrice: "100.00000000",
+  });
+  const candle = (openTimeUnix: number, open: number, high: number, low: number, close: number): OhlcCandle => ({
+    openTimeUnix,
+    open,
+    high,
+    low,
+    close,
+  });
+  const flatBars = (from: number, count: number, base: number): OhlcCandle[] =>
+    Array.from({ length: count }, (_, i) => candle(from + i * MINUTE, base, base + 0.5, base - 0.5, base));
+
+  const caseList: {
+    name: string;
+    candles: OhlcCandle[];
+    setup: AnalyticsSetup;
+    direction: TradeDirection;
+    tpPct: number;
+    slPct: number;
+    timeShiftMinutes: number;
+    horizonMinutes: number;
+  }[] = [
+    {
+      name: "short_sl_hit",
+      candles: [candle(TA, 100, 100.5, 99.5, 100), candle(TA + 60, 100, 120, 99, 110)],
+      setup: mkSetup("AAAUSDT", TA),
+      direction: "short",
+      tpPct: 10,
+      slPct: 10,
+      timeShiftMinutes: 0,
+      horizonMinutes: 60,
+    },
+    {
+      name: "short_tp_hit",
+      candles: [
+        candle(TA, 100, 100.5, 99.5, 100),
+        ...flatBars(TA + 60, 4, 99),
+        candle(TA + 300, 99, 99.5, 89.5, 90),
+      ],
+      setup: mkSetup("BBBUSDT", TA),
+      direction: "short",
+      tpPct: 10,
+      slPct: 10,
+      timeShiftMinutes: 0,
+      horizonMinutes: 60,
+    },
+    {
+      name: "double_touch_prefers_sl",
+      candles: [candle(TA, 100, 100.5, 99.5, 100), candle(TA + 60, 100, 115, 89, 100)],
+      setup: mkSetup("CCCUSDT", TA),
+      direction: "short",
+      tpPct: 10,
+      slPct: 10,
+      timeShiftMinutes: 0,
+      horizonMinutes: 60,
+    },
+    {
+      name: "no_data_missing_entry",
+      candles: [
+        candle(TA, 100, 100.5, 99.5, 100),
+        candle(TA + 60, 100, 100.5, 99.5, 100),
+        candle(TA + 420, 100, 100.5, 99.5, 100),
+      ],
+      setup: mkSetup("DDDUSDT", TA),
+      direction: "short",
+      tpPct: 10,
+      slPct: 10,
+      timeShiftMinutes: 5,
+      horizonMinutes: 60,
+    },
+    {
+      name: "unclosed_far_levels",
+      candles: flatBars(TA, 10, 100),
+      setup: mkSetup("EEEUSDT", TA),
+      direction: "short",
+      tpPct: 30,
+      slPct: 30,
+      timeShiftMinutes: 0,
+      horizonMinutes: 9,
+    },
+    {
+      name: "long_tp_hit",
+      candles: [
+        candle(TA, 100, 100.5, 99.5, 100),
+        ...flatBars(TA + 60, 2, 101),
+        candle(TA + 180, 101, 111.5, 100.5, 111),
+      ],
+      setup: mkSetup("FFFUSDT", TA),
+      direction: "long",
+      tpPct: 10,
+      slPct: 10,
+      timeShiftMinutes: 0,
+      horizonMinutes: 60,
+    },
+    {
+      name: "long_sl_hit",
+      candles: [candle(TA, 100, 100.5, 99.5, 100), candle(TA + 60, 100, 100.5, 89, 92)],
+      setup: mkSetup("GGGUSDT", TA),
+      direction: "long",
+      tpPct: 10,
+      slPct: 10,
+      timeShiftMinutes: 0,
+      horizonMinutes: 60,
+    },
+    {
+      name: "shift_3_entry",
+      candles: [
+        candle(TA, 100, 100.5, 99.5, 100),
+        candle(TA + 60, 100, 100.5, 99.5, 100),
+        candle(TA + 120, 100, 100.5, 99.5, 100),
+        candle(TA + 180, 104, 104.5, 103.5, 105),
+        candle(TA + 240, 105, 116, 104, 110),
+      ],
+      setup: mkSetup("HHHUSDT", TA),
+      direction: "short",
+      tpPct: 10,
+      slPct: 10,
+      timeShiftMinutes: 3,
+      horizonMinutes: 30,
+    },
+  ];
+  const evaluations: LimitEvaluation[] = caseList.map((testCase) =>
+    evaluateLimit(testCase),
+  );
+  const evaluation = {
+    cases: caseList.map((testCase, index) => ({
+      name: testCase.name,
+      setup: testCase.setup,
+      direction: testCase.direction,
+      tpPct: testCase.tpPct,
+      slPct: testCase.slPct,
+      timeShiftMinutes: testCase.timeShiftMinutes,
+      horizonMinutes: testCase.horizonMinutes,
+      candles: testCase.candles,
+      evaluation: evaluations[index],
+    })),
+    aggregate: aggregateLimitOutcomes(evaluations, 10),
+    riskReturns: [
+      riskReturn("tp", 2, 1),
+      riskReturn("sl", 2, 1),
+      riskReturn("unclosed", 2, 1),
+      riskReturn("no_data", 2, 1),
+    ],
+  };
+
+  const priceGate = {
+    cases: (["short", "long"] as TradeDirection[]).flatMap((direction) =>
+      [-5, 0, 3].flatMap((pct) =>
+        [95, 100, 103].map((shifted) => ({
+          direction,
+          pct,
+          shifted,
+          setupClose: 100,
+          passed: passesPriceChange(100, shifted, direction, pct),
+        })),
+      ),
+    ),
+  };
+
+  return { clustering, evaluation, priceGate };
+}
+
+async function buildReplaySection() {
+  const spec: ScenarioSpec = {
+    name: "runner",
+    params: oneDay,
+    count: 1500,
+    baseTurnover: "1000000.00000000",
+    gaps: [{ at: 1450, minutes: 2 }],
+    spikes: [
+      {
+        at: 1470,
+        dur: 11,
+        closes: steppedCloses(["113.00000000", "127.69000000", "144.28970000"], 11, 5),
+        refClose: "100.00000000",
+        turnover: "10000000.00000000",
+        turnoverLeadBars: 5,
+      },
+    ],
+    trackFromIndex: 1440,
+    trackToIndex: 1500,
+  };
+  const bars = buildBars(spec).map((bar) => ({
+    openTimeUnix: bar.t,
+    close: bar.close,
+    volume: "1.00000000",
+    quoteTurnover: bar.turnover,
+  }));
+  const fromUnix = bars[1440].openTimeUnix;
+  const toUnix = bars[bars.length - 1].openTimeUnix + MINUTE;
+  const result = await replayRun({ source: new ArrayCandleSource(bars), fromUnix, toUnix, params: spec.params });
+  return { params: spec.params, fromUnix, toUnix, bars, result };
+}
+
 const scenarios = SPECS.map(runScenario);
+const analytics = buildAnalyticsSection();
+const replay = await buildReplaySection();
 const fixture = {
   algorithmId: "price_volume_spike",
   algorithmVersion: "1.1.1",
   scenarios,
+  analytics,
+  replay,
 };
 const outPath = join(dirname(fileURLToPath(import.meta.url)), "parity.json");
 writeFileSync(outPath, `${JSON.stringify(fixture, null, 1)}\n`);
@@ -310,4 +581,6 @@ for (const scenario of scenarios) {
     `${scenario.name}: bars=${scenario.digest.pushCount} setups=${scenario.digest.setupCount} interesting=${scenario.digest.interestingCount} state=${scenario.quality.state}`,
   );
 }
+console.log(`analytics: selections=${analytics.clustering.selections.length} evalCases=${analytics.evaluation.cases.length} gate=${analytics.priceGate.cases.length}`);
+console.log(`replay runner: setups=${replay.result.setups.length} processed=${replay.result.processedMinutes} warmup=${replay.result.warmupMinutes}`);
 console.log(`written: ${outPath}`);

@@ -1,0 +1,13 @@
+[package]
+name = "setups-replay"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+setups-domain.workspace = true
+setups-detector.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio.workspace = true

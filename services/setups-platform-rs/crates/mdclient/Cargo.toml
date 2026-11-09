@@ -1,0 +1,12 @@
+[package]
+name = "setups-mdclient"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio.workspace = true
