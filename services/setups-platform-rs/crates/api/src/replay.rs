@@ -729,6 +729,7 @@ pub fn replay_router(state: Arc<ReplayState>) -> Router {
             post(create_replay_runs).get(list_replay_runs),
         )
         .route("/v1/replay-runs/purge", post(purge_runs))
+        .route("/v1/replay-preflight", post(preflight_replay))
         .route(
             "/v1/replay-runs/{id}",
             get(get_replay_run).delete(delete_run),
@@ -751,9 +752,410 @@ pub fn replay_router(state: Arc<ReplayState>) -> Router {
         .with_state(state)
 }
 
+fn ceil_to_minute(value: i64) -> i64 {
+    (value + 59) / 60 * 60
+}
+
+fn validate_coverage(
+    coverage: &setups_mdclient::CoverageRangeDto,
+    instrument_id: i64,
+    from_unix: i64,
+    to_unix: i64,
+    split_unix: i64,
+) -> bool {
+    let counters = [
+        coverage.expected_minutes,
+        coverage.present_minutes,
+        coverage.missing_minutes,
+        coverage.warmup_expected_minutes,
+        coverage.warmup_present_minutes,
+        coverage.signal_expected_minutes,
+        coverage.signal_present_minutes,
+        coverage.gap_count,
+    ];
+    coverage.instrument_id == instrument_id
+        && coverage.from_unix == ceil_to_minute(from_unix)
+        && coverage.to_unix == ceil_to_minute(to_unix)
+        && coverage.split_unix == ceil_to_minute(split_unix)
+        && coverage.gaps.len() <= 50
+        && counters.iter().all(|value| *value >= 0)
+        && coverage.expected_minutes == (coverage.to_unix - coverage.from_unix) / 60
+        && coverage.missing_minutes == coverage.expected_minutes - coverage.present_minutes
+        && coverage.warmup_expected_minutes == (coverage.split_unix - coverage.from_unix) / 60
+        && coverage.signal_expected_minutes == (coverage.to_unix - coverage.split_unix) / 60
+        && coverage.warmup_present_minutes <= coverage.warmup_expected_minutes
+        && coverage.signal_present_minutes <= coverage.signal_expected_minutes
+        && coverage.present_minutes
+            == coverage.warmup_present_minutes + coverage.signal_present_minutes
+        && coverage.offset == 0
+        && coverage.limit == 50
+        && coverage.gaps.len() as i64 == coverage.gap_count.min(50)
+        && (coverage.gap_count == 0) == (coverage.missing_minutes == 0)
+        && chrono::DateTime::parse_from_rfc3339(&coverage.checked_at).is_ok()
+        && coverage.gaps.iter().enumerate().all(|(index, gap)| {
+            gap.from_unix % 60 == 0
+                && gap.to_unix % 60 == 0
+                && gap.from_unix >= coverage.from_unix
+                && gap.to_unix <= coverage.to_unix
+                && gap.from_unix < gap.to_unix
+                && (index == 0 || gap.from_unix >= coverage.gaps[index - 1].to_unix)
+        })
+}
+
+struct PreflightItem {
+    exchange: String,
+    category: String,
+    symbol: String,
+    cache_hit: bool,
+    status: &'static str,
+    computed_at: Option<String>,
+    quality: Option<Value>,
+    setup_count: Option<i64>,
+    coverage: Option<Value>,
+    error: Option<&'static str>,
+}
+
+enum PreflightOutcome {
+    NotFound,
+    Ready(setups_mdclient::CoverageRangeDto),
+    Invalid,
+    Unavailable,
+}
+
+async fn preflight_replay(
+    State(state): State<Arc<ReplayState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(response) = guard(&state, &headers, true) {
+        return response;
+    }
+    let parsed: ReplayRequestBody = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_body"),
+    };
+    if parsed.instruments.len() > 100 {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_body");
+    }
+    let prepared = match prepare_replay_request(&state.pool, &parsed).await {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(message)) => return error_response(StatusCode::BAD_REQUEST, &message),
+        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+    };
+    match run_preflight(&state, &prepared).await {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+    }
+}
+
+async fn run_preflight(state: &ReplayState, prepared: &PreparedReplay) -> Result<Value, DbError> {
+    let required_history_minutes = i64::from(prepared.params.baseline_long_days) * 1440;
+    let keys: Vec<String> = prepared
+        .instruments
+        .iter()
+        .map(|instrument| {
+            setups_db::canonical_cache_key(&setups_db::CacheQuery {
+                exchange_code: instrument.exchange.clone(),
+                category: instrument.category.clone(),
+                symbol: instrument.symbol.clone(),
+                algorithm_id: SPIKE_ALGORITHM_ID.to_string(),
+                algorithm_version: SPIKE_ALGORITHM_VERSION.to_string(),
+                params: prepared.params.clone(),
+                from_unix: prepared.from_unix,
+                to_unix: prepared.to_unix,
+            })
+        })
+        .collect();
+    let cached = setups_db::runs::preflight_cache_metadata(&state.pool, &keys).await?;
+    let by_key: HashMap<String, &setups_db::runs::PreflightCacheEntry> = cached
+        .iter()
+        .map(|entry| (entry.cache_key.clone(), entry))
+        .collect();
+    let mut items: Vec<PreflightItem> = prepared
+        .instruments
+        .iter()
+        .enumerate()
+        .map(|(index, instrument)| {
+            let instrument_item =
+                |cache_hit, status, computed_at, quality, setup_count, coverage, error| {
+                    PreflightItem {
+                        exchange: instrument.exchange.clone(),
+                        category: instrument.category.clone(),
+                        symbol: instrument.symbol.clone(),
+                        cache_hit,
+                        status,
+                        computed_at,
+                        quality,
+                        setup_count,
+                        coverage,
+                        error,
+                    }
+                };
+            match by_key.get(&keys[index]) {
+                Some(entry) => instrument_item(
+                    true,
+                    "cached",
+                    Some(iso8601(&entry.computed_at)),
+                    entry.quality.clone(),
+                    Some(entry.setup_count),
+                    None,
+                    None,
+                ),
+                None => instrument_item(
+                    false,
+                    "unavailable",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("market_data_unavailable"),
+                ),
+            }
+        })
+        .collect();
+    let miss_indices: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !item.cache_hit)
+        .map(|(index, _)| index)
+        .collect();
+    if !miss_indices.is_empty() {
+        let catalog_result = MarketDataClient::new(&state.market_url, &state.market_key)
+            .instruments()
+            .await;
+        if let Ok(catalog) = catalog_result {
+            let identities: HashMap<(String, String, String), i64> = catalog
+                .iter()
+                .map(|item| {
+                    (
+                        (
+                            item.exchange.clone(),
+                            item.category.clone(),
+                            item.symbol.clone(),
+                        ),
+                        item.id,
+                    )
+                })
+                .collect();
+            let from_unix = prepared.from_unix - required_history_minutes * 60;
+            let to_unix = prepared.to_unix;
+            let split_unix = prepared.from_unix;
+            let chunk_count = miss_indices.len().min(4);
+            let chunk_size = miss_indices.len().div_ceil(chunk_count);
+            let mut handles = Vec::new();
+            for chunk in miss_indices.chunks(chunk_size) {
+                let market_url = state.market_url.clone();
+                let market_key = state.market_key.clone();
+                let identities = identities.clone();
+                let requests: Vec<(usize, (String, String, String))> = chunk
+                    .iter()
+                    .map(|&index| {
+                        let item = &items[index];
+                        (
+                            index,
+                            (
+                                item.exchange.clone(),
+                                item.category.clone(),
+                                item.symbol.clone(),
+                            ),
+                        )
+                    })
+                    .collect();
+                handles.push(tokio::spawn(async move {
+                    let client = MarketDataClient::new(&market_url, &market_key);
+                    let mut outcomes = Vec::new();
+                    for (index, identity) in requests {
+                        let outcome = match identities.get(&identity) {
+                            None => PreflightOutcome::NotFound,
+                            Some(&instrument_id) => match client
+                                .coverage_range(
+                                    instrument_id,
+                                    from_unix,
+                                    to_unix,
+                                    split_unix,
+                                    0,
+                                    50,
+                                )
+                                .await
+                            {
+                                Ok(coverage) => {
+                                    if validate_coverage(
+                                        &coverage,
+                                        instrument_id,
+                                        from_unix,
+                                        to_unix,
+                                        split_unix,
+                                    ) {
+                                        PreflightOutcome::Ready(coverage)
+                                    } else {
+                                        PreflightOutcome::Invalid
+                                    }
+                                }
+                                Err(setups_mdclient::MdClientError::Http {
+                                    status: 404, ..
+                                }) => PreflightOutcome::NotFound,
+                                Err(_) => PreflightOutcome::Unavailable,
+                            },
+                        };
+                        outcomes.push((index, outcome));
+                    }
+                    outcomes
+                }));
+            }
+            for handle in handles {
+                let Ok(outcomes) = handle.await else {
+                    continue;
+                };
+                for (index, outcome) in outcomes {
+                    let item = &mut items[index];
+                    match outcome {
+                        PreflightOutcome::NotFound => {
+                            item.status = "not_found";
+                            item.error = Some("instrument_not_found");
+                        }
+                        PreflightOutcome::Ready(coverage) => {
+                            item.status = "ready";
+                            item.coverage =
+                                Some(serde_json::to_value(&coverage).unwrap_or(Value::Null));
+                            item.error = None;
+                        }
+                        PreflightOutcome::Invalid => {
+                            item.error = Some("invalid_coverage_response");
+                        }
+                        PreflightOutcome::Unavailable => {}
+                    }
+                }
+            }
+        }
+    }
+    let can_run = items
+        .iter()
+        .all(|item| item.status == "cached" || item.status == "ready");
+    let results: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            let mut value = json!({
+                "exchange": item.exchange,
+                "category": item.category,
+                "symbol": item.symbol,
+                "cacheHit": item.cache_hit,
+                "status": item.status,
+            });
+            let object = value.as_object_mut().expect("object literal");
+            if let Some(computed_at) = &item.computed_at {
+                object.insert("computedAt".into(), json!(computed_at));
+            }
+            if item.cache_hit {
+                object.insert(
+                    "quality".into(),
+                    item.quality.clone().unwrap_or(Value::Null),
+                );
+            }
+            if let Some(setup_count) = item.setup_count {
+                object.insert("setupCount".into(), json!(setup_count));
+            }
+            if let Some(coverage) = &item.coverage {
+                object.insert("coverage".into(), coverage.clone());
+            }
+            if let Some(error) = item.error {
+                object.insert("error".into(), json!(error));
+            }
+            value
+        })
+        .collect();
+    Ok(json!({
+        "checkedAt": iso8601(&Utc::now()),
+        "algorithmVersion": SPIKE_ALGORITHM_VERSION,
+        "requiredHistoryMinutes": required_history_minutes,
+        "canRun": can_run,
+        "request": {
+            "instruments": prepared.instruments.iter().map(|instrument| json!({
+                "exchange": instrument.exchange,
+                "category": instrument.category,
+                "symbol": instrument.symbol,
+            })).collect::<Vec<_>>(),
+            "fromUnix": prepared.from_unix,
+            "toUnix": prepared.to_unix,
+            "algorithmId": SPIKE_ALGORITHM_ID,
+            "algorithmVersion": SPIKE_ALGORITHM_VERSION,
+            "params": serde_json::to_value(&prepared.params).unwrap_or(Value::Null),
+            "async": true,
+        },
+        "results": results,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_coverage() -> setups_mdclient::CoverageRangeDto {
+        setups_mdclient::CoverageRangeDto {
+            instrument_id: 7,
+            from_unix: 0,
+            to_unix: 600,
+            split_unix: 300,
+            expected_minutes: 10,
+            present_minutes: 8,
+            missing_minutes: 2,
+            warmup_expected_minutes: 5,
+            warmup_present_minutes: 4,
+            signal_expected_minutes: 5,
+            signal_present_minutes: 4,
+            gaps: vec![setups_mdclient::CoverageGap {
+                from_unix: 120,
+                to_unix: 240,
+            }],
+            gap_count: 1,
+            offset: 0,
+            limit: 50,
+            checked_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn coverage_validation_accepts_consistent_response() {
+        let coverage = sample_coverage();
+        assert!(validate_coverage(&coverage, 7, 0, 600, 300));
+    }
+
+    #[test]
+    fn coverage_validation_rejects_invariant_violations() {
+        let mut coverage = sample_coverage();
+        coverage.from_unix = 1;
+        assert!(!validate_coverage(&coverage, 7, 0, 600, 300));
+
+        let mut coverage = sample_coverage();
+        coverage.missing_minutes = 3;
+        assert!(!validate_coverage(&coverage, 7, 0, 600, 300));
+
+        let mut coverage = sample_coverage();
+        coverage.gaps = vec![
+            setups_mdclient::CoverageGap {
+                from_unix: 120,
+                to_unix: 300,
+            },
+            setups_mdclient::CoverageGap {
+                from_unix: 240,
+                to_unix: 360,
+            },
+        ];
+        assert!(!validate_coverage(&coverage, 7, 0, 600, 300));
+
+        let mut coverage = sample_coverage();
+        coverage.gap_count = 0;
+        assert!(!validate_coverage(&coverage, 7, 0, 600, 300));
+
+        let mut coverage = sample_coverage();
+        coverage.instrument_id = 8;
+        assert!(!validate_coverage(&coverage, 7, 0, 600, 300));
+
+        let mut coverage = sample_coverage();
+        coverage.present_minutes = 9;
+        coverage.warmup_present_minutes = 5;
+        coverage.signal_present_minutes = 4;
+        assert!(!validate_coverage(&coverage, 7, 0, 600, 300));
+    }
 
     fn params_with(overlay: Value) -> SpikeParams {
         let mut value = serde_json::to_value(SpikeParams::default()).expect("default params");

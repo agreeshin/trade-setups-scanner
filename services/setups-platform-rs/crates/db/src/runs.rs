@@ -744,6 +744,36 @@ pub async fn live_setups_search(
     Ok((total, setups))
 }
 
+pub struct PreflightCacheEntry {
+    pub cache_key: String,
+    pub computed_at: DateTime<Utc>,
+    pub quality: Option<Value>,
+    pub setup_count: i64,
+}
+
+pub async fn preflight_cache_metadata(
+    pool: &PgPool,
+    keys: &[String],
+) -> Result<Vec<PreflightCacheEntry>, DbError> {
+    let rows = sqlx::query(
+        "select cache_key, computed_at, quality, jsonb_array_length(setups) as setup_count \
+         from replay_cache where cache_key = any($1)",
+    )
+    .bind(keys)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(PreflightCacheEntry {
+                cache_key: row.try_get("cache_key")?,
+                computed_at: row.try_get("computed_at")?,
+                quality: row.try_get("quality")?,
+                setup_count: i64::from(row.try_get::<i32, _>("setup_count")?),
+            })
+        })
+        .collect()
+}
+
 pub async fn live_setups_page(
     pool: &PgPool,
     snapshot_id: i64,

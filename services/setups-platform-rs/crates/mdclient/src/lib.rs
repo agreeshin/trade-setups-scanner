@@ -42,6 +42,34 @@ pub struct CandlesResponse {
     pub next_cursor_unix: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageGap {
+    pub from_unix: i64,
+    pub to_unix: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageRangeDto {
+    pub instrument_id: i64,
+    pub from_unix: i64,
+    pub to_unix: i64,
+    pub split_unix: i64,
+    pub expected_minutes: i64,
+    pub present_minutes: i64,
+    pub missing_minutes: i64,
+    pub warmup_expected_minutes: i64,
+    pub warmup_present_minutes: i64,
+    pub signal_expected_minutes: i64,
+    pub signal_present_minutes: i64,
+    pub gaps: Vec<CoverageGap>,
+    pub gap_count: i64,
+    pub offset: i64,
+    pub limit: i64,
+    pub checked_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CandlesQuery {
     pub instrument_id: i64,
@@ -168,6 +196,30 @@ impl MarketDataClient {
         }
         let payload = response.json::<Value>().await.ok();
         Ok((status, payload))
+    }
+
+    pub async fn coverage_range(
+        &self,
+        instrument_id: i64,
+        from_unix: i64,
+        to_unix: i64,
+        split_unix: i64,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CoverageRangeDto, MdClientError> {
+        let url = format!(
+            "{}/v1/instruments/{instrument_id}/coverage-range?fromUnix={from_unix}&toUnix={to_unix}&splitUnix={split_unix}&offset={offset}&limit={limit}",
+            self.base_url
+        );
+        let response = self
+            .http
+            .get(url)
+            .header("x-api-key", &self.api_key)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|error| MdClientError::Network(error.to_string()))?;
+        Self::decode(response).await
     }
 
     async fn decode<T: serde::de::DeserializeOwned>(
