@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 
+pub mod source;
+
+pub use source::ApiCandleSource;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogInstrument {
@@ -43,7 +47,7 @@ pub struct CandlesQuery {
     pub from_unix: i64,
     pub to_unix: i64,
     pub after_unix: Option<i64>,
-    pub limit: u32,
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -95,18 +99,24 @@ impl MarketDataClient {
         Ok(body.instruments)
     }
 
-    pub async fn candles(&self, query: &CandlesQuery) -> Result<CandlesResponse, MdClientError> {
+    pub async fn candles(
+        &self,
+        query: &CandlesQuery,
+        timeout: Duration,
+    ) -> Result<CandlesResponse, MdClientError> {
         let mut request = self
             .http
             .get(format!("{}/v1/candles", self.base_url))
             .header("x-api-key", &self.api_key)
-            .timeout(Duration::from_secs(30))
+            .timeout(timeout)
             .query(&[
                 ("instrumentId", query.instrument_id.to_string()),
                 ("fromUnix", query.from_unix.to_string()),
                 ("toUnix", query.to_unix.to_string()),
-                ("limit", query.limit.to_string()),
             ]);
+        if let Some(limit) = query.limit {
+            request = request.query(&[("limit", limit.to_string())]);
+        }
         if let Some(after) = query.after_unix {
             request = request.query(&[("afterUnix", after.to_string())]);
         }
