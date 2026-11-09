@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 use std::time::Duration;
 
@@ -125,6 +126,48 @@ impl MarketDataClient {
             .await
             .map_err(|error| MdClientError::Network(error.to_string()))?;
         Self::decode(response).await
+    }
+
+    pub async fn ready(&self) -> Result<bool, MdClientError> {
+        let response = self
+            .http
+            .get(format!("{}/ready", self.base_url))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|error| MdClientError::Network(error.to_string()))?;
+        Ok(response.status().is_success())
+    }
+
+    pub async fn proxy(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<(u16, Option<Value>), MdClientError> {
+        let url = format!("{}/v1{path}", self.base_url);
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|error| MdClientError::Network(error.to_string()))?;
+        let mut request = self
+            .http
+            .request(method, url)
+            .header("x-api-key", &self.api_key)
+            .timeout(Duration::from_secs(30));
+        if let Some(payload) = body {
+            request = request
+                .header("content-type", "application/json")
+                .json(payload);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| MdClientError::Network(error.to_string()))?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            return Ok((status, None));
+        }
+        let payload = response.json::<Value>().await.ok();
+        Ok((status, payload))
     }
 
     async fn decode<T: serde::de::DeserializeOwned>(

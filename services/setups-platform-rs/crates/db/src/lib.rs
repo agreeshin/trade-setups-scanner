@@ -7,6 +7,7 @@ use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 pub mod admission;
+pub mod controls;
 pub mod runs;
 
 #[derive(Debug)]

@@ -44,8 +44,12 @@ fn error_response(status: StatusCode, code: &str) -> Response {
 }
 
 #[allow(clippy::result_large_err)]
-fn guard(state: &ReplayState, headers: &HeaderMap, mutation: bool) -> Result<(), Response> {
-    if state.auth.valid_key(
+pub(crate) fn guard_auth(
+    auth: &SessionAuth,
+    headers: &HeaderMap,
+    mutation: bool,
+) -> Result<(), Response> {
+    if auth.valid_key(
         headers
             .get("x-api-key")
             .and_then(|value| value.to_str().ok()),
@@ -53,7 +57,7 @@ fn guard(state: &ReplayState, headers: &HeaderMap, mutation: bool) -> Result<(),
         return Ok(());
     }
     let cookie = headers.get("cookie").and_then(|value| value.to_str().ok());
-    if state.auth.session_expiry(cookie, now_ms()).is_none() {
+    if auth.session_expiry(cookie, now_ms()).is_none() {
         return Err(error_response(StatusCode::UNAUTHORIZED, "unauthorized"));
     }
     if mutation && !browser_request(headers) {
@@ -63,6 +67,11 @@ fn guard(state: &ReplayState, headers: &HeaderMap, mutation: bool) -> Result<(),
         ));
     }
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn guard(state: &ReplayState, headers: &HeaderMap, mutation: bool) -> Result<(), Response> {
+    guard_auth(&state.auth, headers, mutation)
 }
 
 fn iso8601(value: &DateTime<Utc>) -> String {
@@ -178,7 +187,7 @@ pub fn validate_spike_params(params: &SpikeParams) -> Option<&'static str> {
     None
 }
 
-fn merge_objects(base: &mut Value, overlay: &Value) {
+pub(crate) fn merge_objects(base: &mut Value, overlay: &Value) {
     if let (Some(target), Some(source)) = (base.as_object_mut(), overlay.as_object()) {
         for (key, value) in source {
             target.insert(key.clone(), value.clone());
