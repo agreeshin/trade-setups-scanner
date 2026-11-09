@@ -253,6 +253,27 @@ it("restores saved analytics settings and autosaves on commit", async () => {
   expect(sections["short-trades"]).toMatchObject({ tpInput: "4", slInput: "4" });
 }, 10_000);
 
+it("autoruns matrices only for matrix-relevant changes", async () => {
+  const calls = stubFetch({
+    shortBulk: fullShortGrid,
+    longBulk: fullLongGrid,
+    savedSettings: { autoCalc: true },
+  });
+  render(<AnalyticsPage />);
+  expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument(), { timeout: 15_000 });
+  await waitFor(() => expect(screen.getByText("Ячеек: 550 / 550")).toBeInTheDocument(), { timeout: 15_000 });
+  const matrixCallsAfterEntry = calls.filter((call) => call.path.startsWith("/v1/analytics/matrix")).length;
+  fireEvent.change(screen.getAllByLabelText("TP, %")[0]!, { target: { value: "5" } });
+  fireEvent.blur(screen.getAllByLabelText("TP, %")[0]!);
+  await waitFor(() => expect(calls.filter((call) => call.method === "PUT" && call.path === "/v1/settings/web-analytics")).toHaveLength(1), { timeout: 3000 });
+  expect(calls.filter((call) => call.path.startsWith("/v1/analytics/matrix")).length).toBe(matrixCallsAfterEntry);
+  expect(calls.every((call) => !call.path.startsWith("/v1/analytics/setups") && !call.path.startsWith("/v1/analytics/trades"))).toBe(true);
+  await waitFor(() => expect(screen.getAllByText("2024-02")).toHaveLength(4), { timeout: 5000 });
+  fireEvent.change(screen.getAllByLabelText("Период")[0]!, { target: { value: "2024-01" } });
+  await waitFor(() => expect(calls.filter((call) => call.path.startsWith("/v1/analytics/matrix")).length).toBeGreaterThan(matrixCallsAfterEntry), { timeout: 5000 });
+}, 30_000);
+
 it("auto-calculates matrices on entry when enabled", async () => {
   const calls = stubFetch({
     shortBulk: fullShortGrid,

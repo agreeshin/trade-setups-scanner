@@ -911,19 +911,20 @@ export function AnalyticsPage() {
   const collectRef = useRef(collectSettings);
   useEffect(() => { collectRef.current = collectSettings; }, [collectSettings]);
 
-  /** Debounced autosave: coalesces slider commits and rapid consecutive changes. */
+  /** Debounced autosave: coalesces slider commits and rapid consecutive changes.
+   * matrixRelevant=false (edits inside the trade-list sections) saves without re-running matrices. */
   const commitTimerRef = useRef<number | null>(null);
   useEffect(() => () => {
     if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
   }, []);
-  const onSettingsCommit = useCallback(() => {
+  const onSettingsCommit = useCallback((matrixRelevant = true) => {
     if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
     commitTimerRef.current = window.setTimeout(() => {
       commitTimerRef.current = null;
       void saveAnalyticsSettings(collectRef.current())
         .then(() => setSaveStatus("saved"))
         .catch(() => setSaveStatus("error"));
-      if (collectRef.current().autoCalc) setRunToken((token) => token + 1);
+      if (matrixRelevant && collectRef.current().autoCalc) setRunToken((token) => token + 1);
     }, 800);
   }, []);
 
@@ -1044,7 +1045,7 @@ export function AnalyticsPage() {
         setBounds={setBounds}
         initial={savedSettings?.sections["short-trades"]}
         reportState={reportShortTrades}
-        onCommit={onSettingsCommit}
+        onCommit={() => onSettingsCommit(false)}
       />
     </div>
     <div hidden={section !== "long"} className="grid gap-4">
@@ -1077,7 +1078,7 @@ export function AnalyticsPage() {
         setBounds={setBounds}
         initial={savedSettings?.sections["long-trades"]}
         reportState={reportLongTrades}
-        onCommit={onSettingsCommit}
+        onCommit={() => onSettingsCommit(false)}
       />
     </div>
     <div hidden={section !== "cache"} className="grid gap-4">
