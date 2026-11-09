@@ -7,8 +7,8 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 const setFixture = {
   setId: "run-12", kind: "run", numericId: 12, label: "#12 - Всплеск цены и оборота · 1.1.1",
-  algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", exchange: "bybit", category: "linear",
-  symbol: "BTCUSDT", setupCount: 42, fromUnix: 1_700_000_000, toUnix: 1_700_086_400, createdAt: "2024-01-15T00:00:00Z",
+  algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", params: { priceGrowthPct: "2.5", windowMinutes: 30, volumeMultiplier: "3" },
+  exchange: "bybit", category: "linear", symbol: "BTCUSDT", setupCount: 42, fromUnix: 1_700_000_000, toUnix: 1_700_086_400, createdAt: "2024-01-15T00:00:00Z",
 };
 
 const setupA = { exchange: "bybit", category: "linear", symbol: "BTCUSDT", openTimeUnix: 1_700_000_000, closeTimeUnix: 1_700_000_060, closePrice: "100" };
@@ -96,6 +96,9 @@ it("computes matrices only after the button press and honours subsections", asyn
   const calls = stubFetch({ shortBulk: fullShortGrid, longBulk: fullLongGrid });
   render(<AnalyticsPage />);
   expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
+  expect(screen.getByText("Снимок параметров запуска")).toBeInTheDocument();
+  expect(screen.getByText("Рост цены (%)")).toBeInTheDocument();
+  expect(screen.getByText("2.5")).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "Среднее матожидание сетапов" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "Матожидание по сетапам" })).toBeInTheDocument();
   expect(screen.queryByRole("heading", { name: "Кеш аналитики" })).not.toBeInTheDocument();

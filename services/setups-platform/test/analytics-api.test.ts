@@ -95,6 +95,7 @@ interface SetSummary {
   label: string;
   setupCount: number;
   kind: string;
+  params: Record<string, string | number>;
 }
 
 interface MatrixCellBody {
@@ -202,6 +203,7 @@ describe.skipIf(!TEST_DATABASE_URL)("analytics api", () => {
     expect(set).toBeDefined();
     expect(set!.label).toBe(`#${runId} - Всплеск цены и оборота · 1.1.1`);
     expect(set!.setupCount).toBe(4);
+    expect(set!.params).toEqual(DEFAULT_SPIKE_PARAMS);
   });
 
   it("returns setup months", async () => {

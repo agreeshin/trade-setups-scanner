@@ -19,6 +19,8 @@ export interface AnalyticsSetInfo {
   label: string;
   algorithmId: string;
   algorithmVersion: string | null;
+  /** Algorithm parameter snapshot of the launch, shown in the analytics UI. */
+  params: Record<string, string | number>;
   exchange: string;
   category: string;
   symbol: string | null;
@@ -51,7 +53,7 @@ export async function listAnalyticsSets(db: Kysely<SignalsDB>): Promise<Analytic
   const batches = (await listReplayBatches(db, 200)).filter((batch) => batch.status === "done");
   const standaloneRuns = await db
     .selectFrom("replay_runs")
-    .select(["id", "exchange_code", "category", "symbol", "algorithm_id", "algorithm_version", "from_ts", "to_ts", "created_at", "setups"])
+    .select(["id", "exchange_code", "category", "symbol", "algorithm_id", "algorithm_version", "params", "from_ts", "to_ts", "created_at", "setups"])
     .where("batch_id", "is", null)
     .where("status", "=", "done")
     .orderBy("id", "desc")
@@ -78,6 +80,7 @@ export async function listAnalyticsSets(db: Kysely<SignalsDB>): Promise<Analytic
       label: await labelFor(batch.id, batch.algorithm_id, batch.algorithm_version),
       algorithmId: batch.algorithm_id,
       algorithmVersion: batch.algorithm_version,
+      params: batch.params as unknown as Record<string, string | number>,
       exchange: batch.exchange_code,
       category: batch.category,
       symbol: null,
@@ -96,6 +99,7 @@ export async function listAnalyticsSets(db: Kysely<SignalsDB>): Promise<Analytic
       label: await labelFor(run.id, run.algorithm_id, run.algorithm_version),
       algorithmId: run.algorithm_id,
       algorithmVersion: run.algorithm_version,
+      params: run.params as unknown as Record<string, string | number>,
       exchange: run.exchange_code,
       category: run.category,
       symbol: run.symbol,

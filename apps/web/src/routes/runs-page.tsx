@@ -11,6 +11,7 @@ import { Pagination } from "../components/ui/pagination";
 import { Select } from "../components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { apiFetch, fetchPlatform, type PlatformState } from "../lib/platform-api";
+import { parameterLabels } from "../lib/parameter-labels";
 import { errorText, localDateInput, localTime, localTimezone, replayRange, savePreference, utcMidnightOnDateChange, writePlatform, type Algorithm, type SetupRow } from "./platform-controls";
 import { SetupTable } from "./setup-table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
@@ -42,11 +43,6 @@ interface RunRow {
 }
 interface ReplayForm { symbols: string; from: string; to: string; algorithmId: string }
 interface RunDetail { run: RunRow; setups: SetupRow[]; offset: number; limit: number; total: number }
-const parameterLabels: Record<string, string> = {
-  priceGrowthPct: "Рост цены (%)", windowMinutes: "Окно (мин)", volumeMultiplier: "Множитель объёма (×)",
-  baselineLongDays: "Длинная база (дни)", baselineShortDays: "Короткая база (дни)", cooldownMinutes: "Пауза между сигналами (мин)",
-  maxGapPercent: "Допустимые пропуски (%)", maxConsecutiveGapMinutes: "Пропуски подряд (мин)", requiredRecentMinutes: "Непрерывная недавняя история (мин)",
-};
 const RUN_STATUS_LABELS: Record<string, string> = { queued: "В очереди", running: "Выполняется", cancel_requested: "Отмена запрошена" };
 
 function RunResultPage({ id, isBatch, offset, revision, onPage, qualityPanel, onQualityPanel }: { id: number; isBatch: boolean; offset: number; revision: number; onPage: (offset: number) => void; qualityPanel: QualityPanelState; onQualityPanel: (value: QualityPanelState) => void }) {

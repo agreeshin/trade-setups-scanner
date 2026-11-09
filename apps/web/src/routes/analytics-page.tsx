@@ -11,6 +11,7 @@ import { PageHeader } from "../components/ui/page-header";
 import { SegmentedList, SegmentedTrigger } from "../components/ui/segmented";
 import { Select } from "../components/ui/select";
 import { Spinner } from "../components/ui/spinner";
+import { parameterLabels } from "../lib/parameter-labels";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import {
   clearAnalyticsCache,
@@ -793,9 +794,22 @@ export function AnalyticsPage() {
         {setsState === "ready" && setId !== "" && (() => {
           const active = sets.find((set) => set.setId === setId);
           if (active === undefined) return null;
-          return <div className="flex flex-wrap gap-2 text-xs">
-            <Badge>Сетапов: {active.setupCount}</Badge>
-            <Badge>{active.exchange} · {active.category}{active.symbol === null ? "" : ` · ${active.symbol}`}</Badge>
+          return <div className="grid gap-2">
+            <div className="flex flex-wrap gap-2 text-xs">
+              <Badge>Сетапов: {active.setupCount}</Badge>
+              <Badge>{active.exchange} · {active.category}{active.symbol === null ? "" : ` · ${active.symbol}`}</Badge>
+            </div>
+            <details>
+              <summary className="cursor-pointer font-medium">Снимок параметров запуска</summary>
+              <dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">
+                {Object.entries(active.params).map(([key, value]) => (
+                  <div key={key} className="break-words">
+                    <dt className="text-muted-foreground">{parameterLabels[key] ?? key}</dt>
+                    <dd>{value}</dd>
+                  </div>
+                ))}
+              </dl>
+            </details>
           </div>;
         })()}
       </CardContent>

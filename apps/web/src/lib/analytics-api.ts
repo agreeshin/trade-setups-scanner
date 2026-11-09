@@ -7,6 +7,7 @@ export interface AnalyticsSet {
   label: string;
   algorithmId: string;
   algorithmVersion: string | null;
+  params: Record<string, string | number>;
   exchange: string;
   category: string;
   symbol: string | null;
