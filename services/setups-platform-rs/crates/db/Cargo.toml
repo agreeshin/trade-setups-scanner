@@ -11,6 +11,8 @@ serde_json.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
 rand.workspace = true
+p256.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

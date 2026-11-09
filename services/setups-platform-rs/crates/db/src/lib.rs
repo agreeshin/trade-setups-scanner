@@ -8,6 +8,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 
 pub mod admission;
 pub mod controls;
+pub mod push;
 pub mod runs;
 
 #[derive(Debug)]

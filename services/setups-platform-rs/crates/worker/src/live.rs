@@ -1,6 +1,10 @@
 use crate::WorkerError;
 use serde_json::{Value, json};
 use setups_db::controls::instrument_list_by_kind;
+use setups_db::push::{
+    delete_push_subscription, get_or_create_vapid_keys, list_push_subscriptions,
+    valid_push_endpoint,
+};
 use setups_db::runs::{get_replay_params, insert_live_setup, last_live_setup_open_time};
 use setups_db::{settings_get, settings_set};
 use setups_domain::{
@@ -15,6 +19,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
+use web_push::{
+    ContentEncoding, HyperWebPushClient, SubscriptionInfo, VapidSignatureBuilder, WebPushClient,
+    WebPushError, WebPushMessageBuilder,
+};
 
 pub fn evaluate_delivery_age(
     close_time_unix: i64,
@@ -30,6 +38,7 @@ pub fn evaluate_delivery_age(
 
 pub struct LiveScanResult {
     pub new_setups: Vec<SpikeSetup>,
+    pub notified: u64,
     pub last_processed_unix: Option<i64>,
     pub ready: bool,
 }
@@ -53,6 +62,7 @@ pub async fn live_scan_once<S: CandleSource>(
     let params_value = serde_json::to_value(params).unwrap_or(Value::Null);
     let mut result = LiveScanResult {
         new_setups: Vec::new(),
+        notified: 0,
         last_processed_unix: None,
         ready: false,
     };
@@ -89,13 +99,21 @@ pub async fn live_scan_once<S: CandleSource>(
         for setup in &run.setups {
             let inserted = insert_live_setup(pool, exchange, category, symbol, setup).await?;
             if inserted.is_some() {
-                // Web Push delivery arrives with the push slice; the delivery
-                // age check keeps this port observable until then.
-                let _ = evaluate_delivery_age(
+                let (_, eligible) = evaluate_delivery_age(
                     setup.close_time_unix,
                     delivery_now_unix.unwrap_or(now_unix),
                     max_age_seconds,
                 );
+                if eligible {
+                    send_web_push_notifications(
+                        pool,
+                        symbol,
+                        setup.close_time_unix,
+                        max_age_seconds,
+                    )
+                    .await;
+                    result.notified += 1;
+                }
                 result.new_setups.push(setup.clone());
             }
         }
@@ -477,6 +495,70 @@ async fn scan_instrument(
             checkpoint_next: result.last_processed_unix.map(|value| value + 60),
         },
         Err(_) => ScanOutcome::Failed,
+    }
+}
+
+pub async fn send_web_push_notifications(
+    pool: &PgPool,
+    symbol: &str,
+    close_time_unix: i64,
+    max_age_seconds: i64,
+) {
+    if max_age_seconds <= 0 {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    if now < close_time_unix || max_age_seconds - (now - close_time_unix) < 0 {
+        return;
+    }
+    let Ok((_, private_key)) = get_or_create_vapid_keys(pool).await else {
+        eprintln!("[web-push] delivery unavailable");
+        return;
+    };
+    let Ok(subscriptions) = list_push_subscriptions(pool, 100).await else {
+        eprintln!("[web-push] delivery unavailable");
+        return;
+    };
+    if subscriptions.is_empty() {
+        return;
+    }
+    let payload = serde_json::to_vec(&json!({
+        "symbol": symbol.chars().take(80).collect::<String>(),
+        "timestamp": close_time_unix * 1000,
+        "expiresAt": (close_time_unix + max_age_seconds) * 1000,
+    }))
+    .unwrap_or_default();
+    let client = HyperWebPushClient::new();
+    for row in &subscriptions {
+        let remaining = max_age_seconds - (chrono::Utc::now().timestamp() - close_time_unix);
+        if remaining < 0 || !valid_push_endpoint(&row.endpoint) {
+            continue;
+        }
+        let info =
+            SubscriptionInfo::new(row.endpoint.clone(), row.p256dh.clone(), row.auth.clone());
+        let Ok(mut signature_builder) = VapidSignatureBuilder::from_base64(&private_key, &info)
+        else {
+            eprintln!("[web-push] delivery failed: invalid_keys");
+            continue;
+        };
+        signature_builder.add_claim("sub", "mailto:admin@example.invalid");
+        let Ok(signature) = signature_builder.build() else {
+            continue;
+        };
+        let mut builder = WebPushMessageBuilder::new(&info);
+        builder.set_payload(ContentEncoding::Aes128Gcm, &payload);
+        builder.set_ttl(remaining.min(28 * 24 * 60 * 60) as u32);
+        builder.set_vapid_signature(signature);
+        let Ok(message) = builder.build() else {
+            continue;
+        };
+        match client.send(message).await {
+            Ok(()) => {}
+            Err(WebPushError::EndpointNotFound(_)) | Err(WebPushError::EndpointNotValid(_)) => {
+                let _ = delete_push_subscription(pool, &row.endpoint).await;
+            }
+            Err(_) => eprintln!("[web-push] delivery failed: network"),
+        }
     }
 }
 

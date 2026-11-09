@@ -9,6 +9,10 @@ use serde_json::{Value, json};
 use setups_db::controls::{
     instrument_list_by_kind, list_instrument_lists, replace_instrument_list,
 };
+use setups_db::push::{
+    count_push_subscriptions, delete_push_subscription, get_or_create_vapid_keys,
+    save_push_subscription, valid_push_endpoint, valid_push_subscription,
+};
 use setups_db::{DbError, settings_get, settings_set};
 use setups_domain::{SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION, SpikeParams};
 use setups_mdclient::MarketDataClient;
@@ -780,6 +784,99 @@ async fn h_gap_repairs_post(
     .await
 }
 
+#[derive(serde::Deserialize)]
+struct PushSubscriptionBody {
+    endpoint: String,
+    keys: PushKeysBody,
+}
+
+#[derive(serde::Deserialize)]
+struct PushKeysBody {
+    p256dh: String,
+    auth: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PushDeleteBody {
+    endpoint: String,
+}
+
+async fn push_info(State(state): State<Arc<ControlsState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = guard(&state, &headers, false) {
+        return response;
+    }
+    let (public_key, _) = match get_or_create_vapid_keys(&state.pool).await {
+        Ok(value) => value,
+        Err(_) => return internal_error(),
+    };
+    let subscriptions = match count_push_subscriptions(&state.pool).await {
+        Ok(value) => value,
+        Err(_) => return internal_error(),
+    };
+    (
+        [("cache-control", "no-store")],
+        Json(json!({
+            "publicKey": public_key,
+            "subscriptions": subscriptions,
+            "maxSubscriptions": 100,
+        })),
+    )
+        .into_response()
+}
+
+async fn create_push_subscription(
+    State(state): State<Arc<ControlsState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(response) = guard(&state, &headers, true) {
+        return response;
+    }
+    let parsed: PushSubscriptionBody = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_body"),
+    };
+    if !valid_push_subscription(&parsed.endpoint, &parsed.keys.p256dh, &parsed.keys.auth) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_push_subscription");
+    }
+    match save_push_subscription(
+        &state.pool,
+        &parsed.endpoint,
+        &parsed.keys.p256dh,
+        &parsed.keys.auth,
+    )
+    .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error_response(StatusCode::CONFLICT, "subscription_limit"),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn remove_push_subscription(
+    State(state): State<Arc<ControlsState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(response) = guard(&state, &headers, true) {
+        return response;
+    }
+    let parsed: PushDeleteBody = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_body"),
+    };
+    if !valid_push_endpoint(&parsed.endpoint) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_push_endpoint");
+    }
+    if delete_push_subscription(&state.pool, &parsed.endpoint)
+        .await
+        .is_err()
+    {
+        return internal_error();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 pub fn controls_router(state: Arc<ControlsState>) -> Router {
     Router::new()
         .route("/v1/algorithms", get(list_algorithms))
@@ -801,6 +898,13 @@ pub fn controls_router(state: Arc<ControlsState>) -> Router {
             get(get_instrument_list).put(put_instrument_list),
         )
         .route("/v1/status", get(platform_status))
+        .route("/v1/push", get(push_info))
+        .route(
+            "/v1/push/subscriptions",
+            axum::routing::post(create_push_subscription)
+                .delete(remove_push_subscription)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
         .route(
             "/v1/history/instruments/{instrumentId}/coverage",
             get(h_coverage),
