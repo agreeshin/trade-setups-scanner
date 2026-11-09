@@ -419,6 +419,17 @@ pub async fn start_replay_jobs(
     workers: usize,
     poll: Duration,
 ) -> Result<JobsHandle, WorkerError> {
+    if workers == 0 {
+        // Shadow mode: serve the API without claiming replay work or
+        // mutating run state during startup recovery.
+        let stopped = Arc::new(AtomicBool::new(true));
+        let notify = Arc::new(Notify::new());
+        return Ok(JobsHandle {
+            stopped,
+            notify,
+            tasks: Vec::new(),
+        });
+    }
     fail_interrupted_runs(&pool).await?;
     interrupt_queued_runs(&pool).await?;
     sqlx::query(

@@ -17,7 +17,7 @@ edition = "2024"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["arbitrary_precision"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "sync", "signal", "process"] }
 web-push = { version = "0.11", default-features = false, features = ["hyper-client"] }
 setups-analytics = { path = "crates/analytics" }

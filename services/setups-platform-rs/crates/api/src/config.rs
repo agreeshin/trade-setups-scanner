@@ -102,16 +102,10 @@ impl PlatformConfig {
             )?,
         };
         let replay_workers = match get("REPLAY_WORKERS") {
-            Some(text) if !text.trim().is_empty() => {
-                let value = text
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| "REPLAY_WORKERS must be a positive safe integer".to_string())?;
-                if value < 1 {
-                    return Err("REPLAY_WORKERS must be a positive safe integer".to_string());
-                }
-                value
-            }
+            Some(text) if !text.trim().is_empty() => text
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "REPLAY_WORKERS must be a non-negative integer".to_string())?,
             _ => 2,
         };
         Ok(PlatformConfig {

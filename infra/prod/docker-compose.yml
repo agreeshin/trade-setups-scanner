@@ -83,6 +83,32 @@ services:
     ports:
       - "127.0.0.1:8082:8080"
 
+  signals-rust:
+    build:
+      context: ../..
+      dockerfile: services/setups-platform-rs/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://trade_setups:${POSTGRES_PASSWORD}@postgres:5432/signals
+      API_KEYS: ${PLATFORM_API_KEY:?set PLATFORM_API_KEY in .env}
+      MARKET_DATA_URL: http://market-data:8080
+      MARKET_DATA_API_KEY: ${MARKET_DATA_API_KEY}
+      PORT: 8082
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      REPLAY_WORKERS: "0"
+      BACKUP_DIR: /var/lib/trade-setups/backups
+      BACKUP_MAX_UPLOAD_BYTES: ${PLATFORM_BACKUP_MAX_UPLOAD_BYTES:-64424509440}
+    volumes:
+      - ./backups/platform-rust:/var/lib/trade-setups/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+      market-data:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8083:8082"
+
   web:
     build:
       context: ../..

@@ -1258,7 +1258,7 @@ pub fn analytics_router(state: Arc<AnalyticsState>) -> Router {
         .route("/v1/analytics/matrix-cell", get(analytics_matrix_cell))
         .route("/v1/analytics/trades", get(analytics_trades))
         .route(
-            "/v1/analytics/trades/:symbol/:closeTimeUnix",
+            "/v1/analytics/trades/{symbol}/{closeTimeUnix}",
             get(analytics_trade_detail),
         )
         .route(

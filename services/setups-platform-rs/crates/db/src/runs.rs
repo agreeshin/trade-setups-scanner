@@ -700,11 +700,13 @@ pub async fn live_setups_search(
     offset: i64,
     limit: i64,
 ) -> Result<(i64, Vec<LiveSetupFull>), DbError> {
-    let filter = match q {
-        Some(_) => {
-            "id <= $1 and strpos(lower(concat_ws(' ', symbol, exchange_code, algorithm_id)), lower($2)) > 0"
-        }
-        None => "id <= $1",
+    let (filter, offset_ph, limit_ph) = match q {
+        Some(_) => (
+            "id <= $1 and strpos(lower(concat_ws(' ', symbol, exchange_code, algorithm_id)), lower($2)) > 0",
+            "$3",
+            "$4",
+        ),
+        None => ("id <= $1", "$2", "$3"),
     };
     let count_sql = format!("select count(*)::bigint as total from live_setups where {filter}");
     let count = sqlx::query(&count_sql).bind(snapshot_id as i32);
@@ -718,7 +720,7 @@ pub async fn live_setups_search(
     let page_sql = format!(
         "select id, exchange_code, category, symbol, algorithm_id, algorithm_version, \
          open_time, close_time, close_price, params, details from live_setups where {filter} \
-         order by close_time desc, id desc offset $3 limit $4"
+         order by close_time desc, id desc offset {offset_ph} limit {limit_ph}"
     );
     let page = sqlx::query(&page_sql).bind(snapshot_id as i32);
     let page = if let Some(q) = q { page.bind(q) } else { page };

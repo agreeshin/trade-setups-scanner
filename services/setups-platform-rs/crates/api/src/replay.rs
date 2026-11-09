@@ -103,9 +103,8 @@ fn run_dto(run: &ReplayRunFull) -> Value {
 }
 
 pub(crate) fn batch_dto(batch: &BatchSummary) -> Value {
-    let mut value = json!({
+    json!({
         "id": batch.id,
-        "isBatch": true,
         "exchange": batch.exchange_code,
         "category": batch.category,
         "symbol": format!("{} инструментов", batch.instrument_count),
@@ -120,20 +119,18 @@ pub(crate) fn batch_dto(batch: &BatchSummary) -> Value {
             Value::Null
         },
         "algorithmId": batch.algorithm_id,
+        "algorithmVersion": batch.algorithm_version,
         "fromUnix": batch.from_ts.timestamp(),
         "toUnix": batch.to_ts.timestamp(),
         "createdAt": iso8601(&batch.created_at),
         "params": batch.params.clone(),
+        "isBatch": true,
         "instrumentCount": batch.instrument_count,
         "activeInstruments": batch.active_instruments,
         "doneInstruments": batch.done_instruments,
         "failedInstruments": batch.failed_instruments,
         "cancelledInstruments": batch.cancelled_instruments,
-    });
-    if let Some(version) = &batch.algorithm_version {
-        value["algorithmVersion"] = json!(version);
-    }
-    value
+    })
 }
 
 fn failed_stub_dto(run: &ReplayRunFull) -> Value {
