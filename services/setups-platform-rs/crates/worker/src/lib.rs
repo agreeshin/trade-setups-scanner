@@ -242,6 +242,64 @@ fn interval_columns(intervals: &[QualityInterval]) -> Result<IntervalColumns, Wo
     Ok((from_unix, to_unix, reasons))
 }
 
+/// Persist drained quality intervals with TS `saveQualityPage` semantics: if the
+/// run's last stored interval is adjacent to the first drained one and carries
+/// the same reason, extend it instead of inserting a new row.
+async fn insert_intervals_merged(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: i64,
+    intervals: &[QualityInterval],
+) -> Result<(), WorkerError> {
+    if intervals.is_empty() {
+        return Ok(());
+    }
+    let first = &intervals[0];
+    let first_reason = serde_json::to_value(first.reason)?
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_default();
+    let last = sqlx::query(
+        "select from_unix::bigint as from_unix, to_unix::bigint as to_unix, reason \
+         from replay_quality_intervals where run_id = $1 \
+         order by from_unix desc limit 1",
+    )
+    .bind(run_id as i32)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let mut start = 0;
+    if let Some(last) = last {
+        let last_from: i64 = last.try_get("from_unix")?;
+        let last_to: i64 = last.try_get("to_unix")?;
+        let last_reason: String = last.try_get("reason")?;
+        if last_reason == first_reason && last_to == first.from_unix {
+            sqlx::query(
+                "update replay_quality_intervals set to_unix = $2::bigint \
+                 where run_id = $1 and from_unix = $3::bigint",
+            )
+            .bind(run_id as i32)
+            .bind(first.to_unix)
+            .bind(last_from)
+            .execute(&mut **tx)
+            .await?;
+            start = 1;
+        }
+    }
+    if start < intervals.len() {
+        let (from_unix, to_unix, reasons) = interval_columns(&intervals[start..])?;
+        sqlx::query(
+            "insert into replay_quality_intervals (run_id, from_unix, to_unix, reason) \
+             select $1, f, t, r from unnest($2::bigint[], $3::bigint[], $4::text[]) as x(f, t, r)",
+        )
+        .bind(run_id as i32)
+        .bind(&from_unix)
+        .bind(&to_unix)
+        .bind(&reasons)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn save_page(
     pool: &PgPool,
     run_id: i64,
@@ -253,23 +311,12 @@ async fn save_page(
 ) -> Result<(), WorkerError> {
     let setups_json = Value::Array(setups.to_vec());
     let quality_json = serde_json::to_value(quality)?;
-    let (from_unix, to_unix, reasons) = interval_columns(intervals)?;
     let mut tx = pool.begin().await?;
-    if !intervals.is_empty() {
-        sqlx::query(
-            "insert into replay_quality_intervals (run_id, from_unix, to_unix, reason) \
-             select $1, f, t, r from unnest($2::bigint[], $3::bigint[], $4::text[]) as x(f, t, r)",
-        )
-        .bind(run_id as i32)
-        .bind(&from_unix)
-        .bind(&to_unix)
-        .bind(&reasons)
-        .execute(&mut *tx)
-        .await?;
-    }
+    insert_intervals_merged(&mut tx, run_id, intervals).await?;
     sqlx::query(
         "update replay_runs set setups = coalesce(setups, '[]'::jsonb) || $2::jsonb, \
-         warmup_minutes = $3, processed_minutes = $4, quality = $5, updated_at = now() \
+         warmup_minutes = $3, processed_minutes = $4, quality = $5, \
+         quality_source_run_id = $1, updated_at = now() \
          where id = $1 and status in ('running', 'cancel_requested')",
     )
     .bind(run_id as i32)
@@ -294,7 +341,6 @@ async fn publish_run(
 ) -> Result<(), WorkerError> {
     let quality_json = serde_json::to_value(quality)?;
     let cache_key = setups_db::canonical_cache_key(&setups_db::run_query(run));
-    let (from_unix, to_unix, reasons) = interval_columns(intervals)?;
     let mut tx = pool.begin().await?;
     let row = sqlx::query("select status from replay_runs where id = $1 for update")
         .bind(run.id as i32)
@@ -304,18 +350,7 @@ async fn publish_run(
         tx.commit().await?;
         return Ok(());
     }
-    if !intervals.is_empty() {
-        sqlx::query(
-            "insert into replay_quality_intervals (run_id, from_unix, to_unix, reason) \
-             select $1, f, t, r from unnest($2::bigint[], $3::bigint[], $4::text[]) as x(f, t, r)",
-        )
-        .bind(run.id as i32)
-        .bind(&from_unix)
-        .bind(&to_unix)
-        .bind(&reasons)
-        .execute(&mut *tx)
-        .await?;
-    }
+    insert_intervals_merged(&mut tx, run.id, intervals).await?;
     sqlx::query(
         "update replay_runs set status = 'done', quality = $2, quality_source_run_id = id, \
          quality_computed_at = now(), updated_at = now() where id = $1",
