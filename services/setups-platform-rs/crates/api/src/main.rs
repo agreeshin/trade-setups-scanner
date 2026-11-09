@@ -74,11 +74,22 @@ async fn main() {
         config.market_data_url.clone(),
         config.market_data_api_key.clone(),
     );
+    let analytics_state = std::sync::Arc::new(setups_api::analytics::AnalyticsState {
+        pool: pool.clone(),
+        auth: auth.clone(),
+        market_url: config.market_data_url.clone(),
+        market_key: config.market_data_api_key.clone(),
+        reader: setups_api::analytics::AnalyticsCandleReader::new(
+            &config.market_data_url,
+            &config.market_data_api_key,
+        ),
+    });
     let app = axum::Router::new()
         .merge(setups_api::session_router(auth))
         .merge(replay_router(replay_state.clone()))
         .merge(controls_router(controls_state))
-        .merge(batches_router(replay_state));
+        .merge(batches_router(replay_state))
+        .merge(setups_api::analytics::analytics_router(analytics_state));
     let listener = match tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await {
         Ok(value) => value,
         Err(error) => {

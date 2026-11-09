@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod auth;
 
 pub use auth::{API_KEY_HEADER, COOKIE_NAME, SESSION_SECONDS, SessionAuth, cookie_string, now_ms};

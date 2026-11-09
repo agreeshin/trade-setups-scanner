@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 setups-domain.workspace = true
+setups-analytics.workspace = true
 setups-db.workspace = true
 setups-mdclient.workspace = true
 setups-worker.workspace = true

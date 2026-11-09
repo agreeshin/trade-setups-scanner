@@ -2313,6 +2313,7 @@ dependencies = [
  "rand 0.9.5",
  "serde",
  "serde_json",
+ "setups-analytics",
  "setups-db",
  "setups-domain",
  "setups-mdclient",
