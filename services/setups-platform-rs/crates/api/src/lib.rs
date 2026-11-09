@@ -4,6 +4,7 @@ pub use auth::{API_KEY_HEADER, COOKIE_NAME, SESSION_SECONDS, SessionAuth, cookie
 
 use auth::PostSessionResult;
 pub mod batches;
+pub mod config;
 pub mod controls;
 pub mod replay;
 

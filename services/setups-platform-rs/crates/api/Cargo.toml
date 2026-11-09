@@ -16,8 +16,12 @@ axum.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 rand.workspace = true
+tokio.workspace = true
+
+[[bin]]
+name = "setups-platform-server"
+path = "src/main.rs"
 
 [dev-dependencies]
-tokio.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
