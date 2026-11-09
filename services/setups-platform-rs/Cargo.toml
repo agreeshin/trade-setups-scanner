@@ -31,7 +31,9 @@ http-body-util = "0.1"
 setups-domain = { path = "crates/domain" }
 setups-detector = { path = "crates/detector" }
 setups-replay = { path = "crates/replay" }
+setups-mdclient = { path = "crates/mdclient" }
 setups-db = { path = "crates/db" }
+setups-worker = { path = "crates/worker" }
 
 [profile.release]
 lto = "thin"

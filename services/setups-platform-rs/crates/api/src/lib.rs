@@ -3,6 +3,8 @@ pub mod auth;
 pub use auth::{API_KEY_HEADER, COOKIE_NAME, SESSION_SECONDS, SessionAuth, cookie_string, now_ms};
 
 use auth::PostSessionResult;
+pub mod replay;
+
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};

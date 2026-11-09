@@ -1478,12 +1478,18 @@ name = "setups-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "hmac",
  "http-body-util",
  "rand 0.9.5",
  "serde",
  "serde_json",
+ "setups-db",
+ "setups-domain",
+ "setups-mdclient",
+ "setups-worker",
  "sha2",
+ "sqlx",
  "tokio",
  "tower",
 ]
@@ -1493,6 +1499,7 @@ name = "setups-db"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "setups-detector",
