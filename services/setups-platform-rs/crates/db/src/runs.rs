@@ -744,6 +744,76 @@ pub async fn live_setups_search(
     Ok((total, setups))
 }
 
+pub async fn last_live_setup_open_time(
+    pool: &PgPool,
+    exchange: &str,
+    category: &str,
+    symbol: &str,
+    algorithm_id: &str,
+    algorithm_version: &str,
+    params: &Value,
+) -> Result<Option<i64>, DbError> {
+    let row = sqlx::query(
+        "select open_time from live_setups where exchange_code = $1 and category = $2 \
+         and symbol = $3 and algorithm_id = $4 and algorithm_version = $5 \
+         and params = $6::jsonb order by open_time desc limit 1",
+    )
+    .bind(exchange)
+    .bind(category)
+    .bind(symbol)
+    .bind(algorithm_id)
+    .bind(algorithm_version)
+    .bind(params)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(row) => Ok(Some(
+            row.try_get::<DateTime<Utc>, _>("open_time")?.timestamp(),
+        )),
+        None => Ok(None),
+    }
+}
+
+pub async fn insert_live_setup(
+    pool: &PgPool,
+    exchange: &str,
+    category: &str,
+    symbol: &str,
+    setup: &setups_domain::SpikeSetup,
+) -> Result<Option<i64>, DbError> {
+    let params = serde_json::to_value(&setup.params).unwrap_or(Value::Null);
+    let details = setup
+        .details
+        .as_ref()
+        .map(|value| serde_json::to_value(value).unwrap_or(Value::Null));
+    let open_time =
+        DateTime::<Utc>::from_timestamp(setup.open_time_unix, 0).unwrap_or_else(Utc::now);
+    let close_time =
+        DateTime::<Utc>::from_timestamp(setup.close_time_unix, 0).unwrap_or_else(Utc::now);
+    let row = sqlx::query(
+        "insert into live_setups (exchange_code, category, symbol, algorithm_id, algorithm_version, \
+         params, open_time, close_time, close_price, details) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+         on conflict (exchange_code, category, symbol, algorithm_id, algorithm_version, open_time) \
+         do nothing returning id",
+    )
+    .bind(exchange)
+    .bind(category)
+    .bind(symbol)
+    .bind(&setup.algorithm_id)
+    .bind(&setup.algorithm_version)
+    .bind(&params)
+    .bind(open_time)
+    .bind(close_time)
+    .bind(&setup.close_price)
+    .bind(details)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(row) => Ok(Some(i64::from(row.try_get::<i32, _>("id")?))),
+        None => Ok(None),
+    }
+}
+
 pub struct PreflightCacheEntry {
     pub cache_key: String,
     pub computed_at: DateTime<Utc>,

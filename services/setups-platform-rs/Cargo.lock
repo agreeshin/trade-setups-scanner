@@ -1569,6 +1569,7 @@ dependencies = [
  "setups-domain",
  "setups-mdclient",
  "setups-replay",
+ "sha2",
  "sqlx",
  "tokio",
 ]

@@ -69,6 +69,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let live_runtime = setups_worker::live::start_live_runtime(
+        pool.clone(),
+        config.market_data_url.clone(),
+        config.market_data_api_key.clone(),
+    );
     let app = axum::Router::new()
         .merge(setups_api::session_router(auth))
         .merge(replay_router(replay_state.clone()))
@@ -86,7 +91,7 @@ async fn main() {
         config.host, config.port
     );
     if let Err(error) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(jobs))
+        .with_graceful_shutdown(shutdown_signal(jobs, live_runtime))
         .await
     {
         eprintln!("server error: {error}");
@@ -94,7 +99,7 @@ async fn main() {
     }
 }
 
-async fn shutdown_signal(jobs: setups_worker::JobsHandle) {
+async fn shutdown_signal(jobs: setups_worker::JobsHandle, live: setups_worker::live::LiveHandle) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -113,5 +118,6 @@ async fn shutdown_signal(jobs: setups_worker::JobsHandle) {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+    let _ = live.stop().await;
     let _ = jobs.stop().await;
 }
