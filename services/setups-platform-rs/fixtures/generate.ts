@@ -1,4 +1,5 @@
 import { writeFileSync } from "node:fs";
+import { createHmac } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -623,6 +624,16 @@ const cacheKeyQueries = [
 const cacheKeys = {
   cases: cacheKeyQueries.map((query) => ({ query, key: canonicalCacheKey(query) })),
 };
+const authSignKey = Buffer.alloc(32, 7);
+const auth = {
+  signCases: [
+    "1700000000000.0123456789abcdef0123456789abcdef",
+    "9999999999999.ffffffffffffffffffffffffffffffff",
+  ].map((payload) => ({
+    payload,
+    hmac: createHmac("sha256", authSignKey).update(payload).digest("hex"),
+  })),
+};
 const fixture = {
   algorithmId: "price_volume_spike",
   algorithmVersion: "1.1.1",
@@ -630,6 +641,7 @@ const fixture = {
   analytics,
   replay,
   cacheKeys,
+  auth,
 };
 const outPath = join(dirname(fileURLToPath(import.meta.url)), "parity.json");
 writeFileSync(outPath, `${JSON.stringify(fixture, null, 1)}\n`);

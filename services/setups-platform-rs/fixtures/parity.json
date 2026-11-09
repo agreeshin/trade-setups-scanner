@@ -95633,5 +95633,17 @@
     "key": "price_volume_spike@1.1.1|bybit/linear/BTCUSDT|1699920000-1700006400|baselineLongDays:2,baselineShortDays:1,cooldownMinutes:5,maxConsecutiveGapMinutes:5,maxGapPercent:1,priceGrowthPct:12,requiredRecentMinutes:10,volumeMultiplier:3,windowMinutes:5"
    }
   ]
+ },
+ "auth": {
+  "signCases": [
+   {
+    "payload": "1700000000000.0123456789abcdef0123456789abcdef",
+    "hmac": "c487b1237f76fef52d7ff6a31a46cf32902d0b38b2206337d994c44140a26960"
+   },
+   {
+    "payload": "9999999999999.ffffffffffffffffffffffffffffffff",
+    "hmac": "352e38db86dc522bb819506f4fa655e22e8cf6ffacd13054dbff8c67f764c5f1"
+   }
+  ]
  }
 }

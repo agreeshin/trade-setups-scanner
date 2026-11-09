@@ -7,6 +7,7 @@ members = [
     "crates/replay",
     "crates/mdclient",
     "crates/db",
+    "crates/api",
 ]
 
 [workspace.package]
@@ -20,6 +21,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["now", "serde"] }
+axum = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.9"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 setups-domain = { path = "crates/domain" }
 setups-detector = { path = "crates/detector" }
 
