@@ -10,6 +10,7 @@ import { Input } from "../components/ui/input";
 import { PageHeader } from "../components/ui/page-header";
 import { SegmentedList, SegmentedTrigger } from "../components/ui/segmented";
 import { Select } from "../components/ui/select";
+import { Separator } from "../components/ui/separator";
 import { Spinner } from "../components/ui/spinner";
 import { parameterLabels } from "../lib/parameter-labels";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
@@ -968,66 +969,73 @@ export function AnalyticsPage() {
   return <section aria-labelledby="analytics-heading" className="grid gap-4">
     <PageHeader id="analytics-heading" title="Аналитика" description="Backtest наборов сетапов из завершённых исторических запусков: матожидание TP/SL, зрелость кластеров, построчные закрытия. Расчёты читают минутные свечи через сервис данных; результаты кешируются." />
     <Card>
-      <CardContent className="grid gap-3">
-        <div className="flex flex-wrap items-end gap-3">
-          <Field label="Набор сетапов" className="w-full max-w-md">
-            {(control) => (
-              <Select {...control} value={setId} disabled={setsState !== "ready"} onChange={(event) => { setSetId(event.target.value); onSettingsCommit(); }}>
-                {sets.length === 0 && <option value="">Нет завершённых запусков</option>}
-                {sets.map((set) => <option key={set.setId} value={set.setId}>{set.label}</option>)}
-              </Select>
-            )}
-          </Field>
-          {setsState === "ready" && activeSet !== undefined && (
-            <div className="grid gap-2">
-              <div className="flex flex-wrap gap-2 text-xs">
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3">
+          <h3 className="text-sm font-semibold text-muted-foreground">Набор и параметры запуска</h3>
+          <div className="flex flex-wrap items-end gap-3">
+            <Field label="Набор сетапов" className="w-full max-w-md">
+              {(control) => (
+                <Select {...control} value={setId} disabled={setsState !== "ready"} onChange={(event) => { setSetId(event.target.value); onSettingsCommit(); }}>
+                  {sets.length === 0 && <option value="">Нет завершённых запусков</option>}
+                  {sets.map((set) => <option key={set.setId} value={set.setId}>{set.label}</option>)}
+                </Select>
+              )}
+            </Field>
+            {setsState === "ready" && activeSet !== undefined && (
+              <div className="flex flex-wrap gap-2 text-xs self-center">
                 <Badge>Сетапов: {activeSet.setupCount}</Badge>
                 <Badge>{activeSet.exchange} · {activeSet.category}{activeSet.symbol === null ? "" : ` · ${activeSet.symbol}`}</Badge>
               </div>
-              <details>
-                <summary className="cursor-pointer font-medium">Снимок параметров запуска</summary>
-                <dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">
-                  {Object.entries(activeSet.params).map(([key, value]) => (
-                    <div key={key} className="break-words">
-                      <dt className="text-muted-foreground">{parameterLabels[key] ?? key}</dt>
-                      <dd>{value}</dd>
-                    </div>
-                  ))}
-                </dl>
-              </details>
-            </div>
+            )}
+            <label className="flex items-center gap-2 text-sm self-center">
+              <Checkbox checked={autoCalc} onCheckedChange={(checked) => { setAutoCalc(checked === true); onSettingsCommit(); }} />
+              Авторасчёт матриц
+            </label>
+          </div>
+          {setsState === "ready" && activeSet !== undefined && (
+            <details>
+              <summary className="cursor-pointer font-medium">Снимок параметров запуска</summary>
+              <dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">
+                {Object.entries(activeSet.params).map(([key, value]) => (
+                  <div key={key} className="break-words">
+                    <dt className="text-muted-foreground">{parameterLabels[key] ?? key}</dt>
+                    <dd>{value}</dd>
+                  </div>
+                ))}
+              </dl>
+            </details>
           )}
         </div>
-        <div className="flex flex-wrap items-end gap-3">
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={clusterize} onCheckedChange={(checked) => { setClusterize(checked === true); onSettingsCommit(); }} />
-            Кластеризовать сетапы
-          </label>
-          <Field label={`Зрелость сетапа в кластере: ${maturityDraft.toFixed(1)}`} className="w-64">
-            {(control) => <Input
-              {...control}
-              type="range"
-              min={0}
-              max={1}
-              step={0.1}
-              disabled={!clusterize}
-              value={maturityDraft}
-              onChange={(event) => setMaturityDraft(Number(event.target.value))}
-              onPointerUp={commitMaturity}
-              onKeyUp={commitMaturity}
-              onBlur={commitMaturity}
-            />}
-          </Field>
-          <Field label="Разрыв кластера, ч" className="w-32">
-            {(control) => <Input {...control} inputMode="decimal" disabled={!clusterize} value={clusterGapInput} onBlur={() => onSettingsCommit()} onChange={(event) => setClusterGapInput(event.target.value)} />}
-          </Field>
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={autoCalc} onCheckedChange={(checked) => { setAutoCalc(checked === true); onSettingsCommit(); }} />
-            Авторасчёт матриц
-          </label>
-          {saveStatus === "error" && <span className="self-center text-xs text-danger">Не удалось сохранить настройки</span>}
+        <Separator />
+        <div className="grid gap-3">
+          <h3 className="text-sm font-semibold text-muted-foreground">Кластеризация</h3>
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="flex items-center gap-2 text-sm">
+              <Checkbox checked={clusterize} onCheckedChange={(checked) => { setClusterize(checked === true); onSettingsCommit(); }} />
+              Кластеризовать сетапы
+            </label>
+            <Field label={`Зрелость сетапа в кластере: ${maturityDraft.toFixed(1)}`} className="w-64">
+              {(control) => <Input
+                {...control}
+                type="range"
+                min={0}
+                max={1}
+                step={0.1}
+                disabled={!clusterize}
+                value={maturityDraft}
+                onChange={(event) => setMaturityDraft(Number(event.target.value))}
+                onPointerUp={commitMaturity}
+                onKeyUp={commitMaturity}
+                onBlur={commitMaturity}
+              />}
+            </Field>
+            <Field label="Разрыв кластера, ч" className="w-32">
+              {(control) => <Input {...control} inputMode="decimal" disabled={!clusterize} value={clusterGapInput} onBlur={() => onSettingsCommit()} onChange={(event) => setClusterGapInput(event.target.value)} />}
+            </Field>
+          </div>
+          <p className="text-xs text-muted-foreground">Настройки кластеризации действуют одновременно на все разделы SHORT и LONG. 0 — первый сетап кластера, 1 — последний, 0.5 — середина; соседние сигналы одной монеты с разрывом до {(appliedClusterGapHours ?? 8).toString()} часов образуют кластер. При выключенной галочке кластеризация не выполняется — в расчёт входят все сетапы.</p>
         </div>
-        <p className="text-xs text-muted-foreground">Настройки кластеризации действуют одновременно на все разделы SHORT и LONG. 0 — первый сетап кластера, 1 — последний, 0.5 — середина; соседние сигналы одной монеты с разрывом до {(appliedClusterGapHours ?? 8).toString()} часов образуют кластер. При выключенной галочке кластеризация не выполняется — в расчёт входят все сетапы.</p>
+        {saveStatus === "error" && <p role="status" className="text-xs text-danger">Не удалось сохранить настройки</p>}
       </CardContent>
     </Card>
     <SegmentedList role="tablist" aria-label="Подразделы аналитики">
