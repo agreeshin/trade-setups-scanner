@@ -20,7 +20,8 @@ export function AppLayout() {
   return (
     <AppFrame navigation={<>
       <Button asChild variant="navigation" size="sm"><NavLink to="/" end>Обзор</NavLink></Button>
-      <Button asChild variant="navigation" size="sm"><NavLink to="/setups">Сетапы</NavLink></Button>
+      <Button asChild variant="navigation" size="sm"><NavLink to="/setups" end>Сетапы</NavLink></Button>
+      <Button asChild variant="navigation" size="sm"><NavLink to="/analytics" end>Аналитика</NavLink></Button>
       <Button asChild variant="navigation" size="sm"><NavLink to="/runs">Запуски</NavLink></Button>
       <Button asChild variant="navigation" size="sm"><NavLink to="/settings">Настройки</NavLink></Button>
       <Button asChild variant="navigation" size="sm"><NavLink to="/history">История и сбор</NavLink></Button>

@@ -93,6 +93,48 @@ export interface KyselyMigrationsTable {
   timestamp: string;
 }
 
+export interface AnalyticsMatrixCacheRow {
+  scope_key: string;
+  direction: string;
+  maturity_tenths: number;
+  month_key: string;
+  tp_pct: string;
+  sl_pct: string;
+  horizon_minutes: number;
+  time_shift_minutes: number;
+  price_change_ppm: number;
+  algorithm_version: number;
+  result_json: Record<string, unknown>;
+  created_at: Generated<Date>;
+}
+
+export interface AnalyticsTradesCacheRow {
+  scope_key: string;
+  direction: string;
+  maturity_tenths: number;
+  exchange_code: string;
+  category: string;
+  symbol: string;
+  close_time_unix: string | number | bigint;
+  tp_pct: string;
+  sl_pct: string;
+  horizon_minutes: number;
+  time_shift_minutes: number;
+  price_change_ppm: number;
+  algorithm_version: number;
+  result_json: Record<string, unknown>;
+  created_at: Generated<Date>;
+}
+
+export interface AnalyticsSelectionCacheRow {
+  scope_key: string;
+  maturity_tenths: number;
+  month_key: string;
+  algorithm_version: number;
+  result_json: Record<string, unknown>;
+  created_at: Generated<Date>;
+}
+
 export interface SignalsDB {
   replay_quality_intervals: { run_id: number; from_unix: number; to_unix: number; reason: QualityReason };
   replay_runs: ReplayRunsTable;
@@ -101,5 +143,8 @@ export interface SignalsDB {
   settings: SettingsTable;
   live_setups: LiveSetupsTable;
   instrument_lists: InstrumentListsTable;
+  analytics_matrix_cache: AnalyticsMatrixCacheRow;
+  analytics_trades_cache: AnalyticsTradesCacheRow;
+  analytics_selection_cache: AnalyticsSelectionCacheRow;
   kysely_migration: KyselyMigrationsTable;
 }

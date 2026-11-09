@@ -5,6 +5,7 @@ import { sql, type Kysely } from "kysely";
 import type { SignalsDB } from "./db/schema.js";
 import { createSessionAuth } from "./auth.js";
 import { registerPlatformV1Routes } from "./routes/v1.js";
+import { registerAnalyticsRoutes } from "./analytics/routes.js";
 import type { ReplayAdmissionLimits } from "./replay/jobs.js";
 import { registerBackupRoutes, registerMarketBackupProxy, type BackupManager } from "./backup/routes.js";
 
@@ -130,6 +131,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       requireApiKey: auth.requireApiKey,
       marketData: options.marketData ?? { url: "", apiKey: "" },
       ...(options.replayLimits ? { replayLimits: options.replayLimits } : {}),
+    });
+    registerAnalyticsRoutes(app, {
+      db: options.db,
+      requireApiKey: auth.requireApiKey,
+      marketData: options.marketData ?? { url: "", apiKey: "" },
     });
   }
 
