@@ -28,6 +28,12 @@ import {
   type SelectionMetrics,
   type TradeRow,
 } from "../lib/analytics-api";
+import {
+  fetchAnalyticsSettings,
+  saveAnalyticsSettings,
+  type AnalyticsSectionKey,
+  type AnalyticsUserSettings,
+} from "../lib/analytics-settings";
 
 const SHORT_MATRIX_LEVELS = Array.from({ length: 14 }, (_, index) => 4 + index * 2);
 const LONG_TP_LEVELS = [1, 2, 3, ...SHORT_MATRIX_LEVELS, 35, 40, 45, 50, 60];
@@ -82,20 +88,25 @@ interface MatrixSectionProps {
   maturity: number;
   clusterGapHours: number | null;
   setBounds: { from: string; to: string } | null;
+  initial?: Record<string, unknown> | undefined;
+  reportState?: ((snapshot: Record<string, unknown>) => void) | undefined;
+  onCommit?: (() => void) | undefined;
+  runToken: number;
 }
 
 function MatrixSection({
   setId, description, direction, tpLevels, slLevels, enablePriceChange,
   gradientMinDefault, gradientMaxDefault, clusterize, maturity, clusterGapHours, setBounds,
+  initial, reportState, onCommit, runToken,
 }: MatrixSectionProps) {
-  const [timeRange, setTimeRange] = useState<TimeRangeValue>({ mode: "all", month: "all", fromDay: null, toDay: null });
-  const [timeShiftInput, setTimeShiftInput] = useState("0");
-  const [considerPriceChange, setConsiderPriceChange] = useState(false);
-  const [priceChangeInput, setPriceChangeInput] = useState("0");
-  const [gradientMinDraft, setGradientMinDraft] = useState(gradientMinDefault);
-  const [gradientMaxDraft, setGradientMaxDraft] = useState(gradientMaxDefault);
-  const [gradientMin, setGradientMin] = useState(gradientMinDefault);
-  const [gradientMax, setGradientMax] = useState(gradientMaxDefault);
+  const [timeRange, setTimeRange] = useState<TimeRangeValue>(() => normalizeTimeRange(initial?.timeRange));
+  const [timeShiftInput, setTimeShiftInput] = useState(() => savedString(initial?.timeShiftInput, "0"));
+  const [considerPriceChange, setConsiderPriceChange] = useState(() => initial?.considerPriceChange === true);
+  const [priceChangeInput, setPriceChangeInput] = useState(() => savedString(initial?.priceChangeInput, "0"));
+  const [gradientMinDraft, setGradientMinDraft] = useState(() => savedNumber(initial?.gradientMin, gradientMinDefault));
+  const [gradientMaxDraft, setGradientMaxDraft] = useState(() => savedNumber(initial?.gradientMax, gradientMaxDefault));
+  const [gradientMin, setGradientMin] = useState(() => savedNumber(initial?.gradientMin, gradientMinDefault));
+  const [gradientMax, setGradientMax] = useState(() => savedNumber(initial?.gradientMax, gradientMaxDefault));
   const [cells, setCells] = useState<Map<string, MatrixCellRef>>(new Map());
   const [metrics, setMetrics] = useState<SelectionMetrics | null>(null);
   const [running, setRunning] = useState(false);
@@ -103,6 +114,10 @@ function MatrixSection({
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [error, setError] = useState<string | null>(null);
   const runIdRef = useRef(0);
+
+  useEffect(() => {
+    reportState?.({ timeRange, timeShiftInput, considerPriceChange, priceChangeInput, gradientMin, gradientMax });
+  }, [reportState, timeRange, timeShiftInput, considerPriceChange, priceChangeInput, gradientMin, gradientMax]);
 
   const totalCells = tpLevels.length * slLevels.length;
 
@@ -162,6 +177,18 @@ function MatrixSection({
   const appliedShift = Math.max(0, Math.round(parseNumberInput(timeShiftInput) ?? 0));
   const appliedPriceChange = enablePriceChange && considerPriceChange ? (parseNumberInput(priceChangeInput) ?? 0) : null;
 
+  const autoRunRef = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    autoRunRef.current = () => { void run(appliedShift, appliedPriceChange); };
+  });
+  useEffect(() => {
+    if (runToken === 0) return;
+    autoRunRef.current();
+  }, [runToken]);
+
+  const commitGradientMin = () => { setGradientMin(gradientMinDraft); onCommit?.(); };
+  const commitGradientMax = () => { setGradientMax(gradientMaxDraft); onCommit?.(); };
+
   return <Card>
     <CardContent className="grid gap-4">
       <div className="grid gap-1">
@@ -169,18 +196,18 @@ function MatrixSection({
         <p className="text-xs text-muted-foreground">{description}</p>
       </div>
       <div className="flex flex-wrap items-end gap-3">
-        <TimeRangeControls setId={setId} setBounds={setBounds} value={timeRange} onChange={setTimeRange} />
+        <TimeRangeControls setId={setId} setBounds={setBounds} value={timeRange} onChange={setTimeRange} onCommit={onCommit} />
         <Field label="Time-shift, мин" className="w-32">
-          {(control) => <Input {...control} inputMode="numeric" value={timeShiftInput} onChange={(event) => setTimeShiftInput(event.target.value)} />}
+          {(control) => <Input {...control} inputMode="numeric" value={timeShiftInput} onBlur={() => onCommit?.()} onChange={(event) => setTimeShiftInput(event.target.value)} />}
         </Field>
         {enablePriceChange && (
           <>
             <label className="flex items-center gap-2 text-sm">
-              <Checkbox checked={considerPriceChange} onCheckedChange={(checked) => setConsiderPriceChange(checked === true)} />
+              <Checkbox checked={considerPriceChange} onCheckedChange={(checked) => { setConsiderPriceChange(checked === true); onCommit?.(); }} />
               Учитывать смещение цены
             </label>
             <Field label="Смещение цены, %" className="w-36">
-              {(control) => <Input {...control} inputMode="decimal" disabled={!considerPriceChange} value={priceChangeInput} onChange={(event) => setPriceChangeInput(event.target.value)} />}
+              {(control) => <Input {...control} inputMode="decimal" disabled={!considerPriceChange} value={priceChangeInput} onBlur={() => onCommit?.()} onChange={(event) => setPriceChangeInput(event.target.value)} />}
             </Field>
           </>
         )}
@@ -201,9 +228,9 @@ function MatrixSection({
             className="h-2 w-36 cursor-pointer appearance-none rounded-lg bg-muted"
             value={gradientMinDraft}
             onChange={(event) => setGradientMinDraft(Number(event.target.value))}
-            onPointerUp={() => setGradientMin(gradientMinDraft)}
-            onKeyUp={() => setGradientMin(gradientMinDraft)}
-            onBlur={() => setGradientMin(gradientMinDraft)}
+            onPointerUp={commitGradientMin}
+            onKeyUp={commitGradientMin}
+            onBlur={commitGradientMin}
           />
           <span className="tabular-nums">{gradientMinDraft.toFixed(2)}</span>
         </label>
@@ -218,9 +245,9 @@ function MatrixSection({
             className="h-2 w-36 cursor-pointer appearance-none rounded-lg bg-muted"
             value={gradientMaxDraft}
             onChange={(event) => setGradientMaxDraft(Number(event.target.value))}
-            onPointerUp={() => setGradientMax(gradientMaxDraft)}
-            onKeyUp={() => setGradientMax(gradientMaxDraft)}
-            onBlur={() => setGradientMax(gradientMaxDraft)}
+            onPointerUp={commitGradientMax}
+            onKeyUp={commitGradientMax}
+            onBlur={commitGradientMax}
           />
           <span className="tabular-nums">{gradientMaxDraft.toFixed(2)}</span>
         </label>
@@ -275,18 +302,6 @@ function MatrixSection({
   </Card>;
 }
 
-function MonthOptions({ setId }: { setId: string }) {
-  const [months, setMonths] = useState<string[]>([]);
-  useEffect(() => {
-    let cancelled = false;
-    void fetchAnalyticsMonths(setId)
-      .then((items) => { if (!cancelled) setMonths(items); })
-      .catch(() => undefined);
-    return () => { cancelled = true; };
-  }, [setId]);
-  return <>{months.map((month) => <option key={month} value={month}>{month}</option>)}</>;
-}
-
 function utcDayOf(unix: number): string {
   return new Date(unix * 1000).toISOString().slice(0, 10);
 }
@@ -321,13 +336,46 @@ function timeRangeBounds(value: TimeRangeValue, setBounds: { from: string; to: s
   return setBounds;
 }
 
+/** Restores a saved time range from an untrusted JSON payload. */
+function normalizeTimeRange(raw: unknown): TimeRangeValue {
+  if (raw === null || typeof raw !== "object") return { mode: "all", month: "all", fromDay: null, toDay: null };
+  const value = raw as Partial<TimeRangeValue>;
+  if (value.mode === "month" && typeof value.month === "string" && /^\d{4}-\d{2}$/.test(value.month)) {
+    return { mode: "month", month: value.month, fromDay: null, toDay: null };
+  }
+  if (value.mode === "custom" && typeof value.fromDay === "string" && typeof value.toDay === "string") {
+    return { mode: "custom", month: "custom", fromDay: value.fromDay, toDay: value.toDay };
+  }
+  return { mode: "all", month: "all", fromDay: null, toDay: null };
+}
+
+function savedString(raw: unknown, fallback: string): string {
+  return typeof raw === "string" && raw !== "" ? raw : fallback;
+}
+
+function savedNumber(raw: unknown, fallback: number): number {
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : fallback;
+}
+
 /** Month selector + date pair: month choice auto-fills the dates, manual dates set the dash. */
-function TimeRangeControls({ setId, setBounds, value, onChange }: {
+function TimeRangeControls({ setId, setBounds, value, onChange, onCommit }: {
   setId: string;
   setBounds: { from: string; to: string } | null;
   value: TimeRangeValue;
   onChange: (next: TimeRangeValue) => void;
+  onCommit?: (() => void) | undefined;
 }) {
+  const [months, setMonths] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void fetchAnalyticsMonths(setId)
+      .then((items) => { if (!cancelled) setMonths(items); })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [setId]);
+  // The selected month must exist as an option even before the fetched list arrives,
+  // otherwise the browser cannot apply the controlled value and falls back to «Всё время».
+  const monthOptions = value.mode === "month" && !months.includes(value.month) ? [value.month, ...months] : months;
   const auto = value.mode === "month" ? monthDayBounds(value.month) : value.mode === "all" ? setBounds : null;
   const fromValue = value.mode === "custom" ? (value.fromDay ?? "") : (auto?.from ?? "");
   const toValue = value.mode === "custom" ? (value.toDay ?? "") : (auto?.to ?? "");
@@ -338,20 +386,25 @@ function TimeRangeControls({ setId, setBounds, value, onChange }: {
         value={value.mode === "custom" ? "custom" : value.month}
         onChange={(event) => {
           const next = event.target.value;
-          if (next === "all") onChange({ mode: "all", month: "all", fromDay: null, toDay: null });
-          else if (next !== "custom") onChange({ mode: "month", month: next, fromDay: null, toDay: null });
+          if (next === "all") {
+            onChange({ mode: "all", month: "all", fromDay: null, toDay: null });
+            onCommit?.();
+          } else if (next !== "custom") {
+            onChange({ mode: "month", month: next, fromDay: null, toDay: null });
+            onCommit?.();
+          }
         }}
       >
         <option value="all">Всё время</option>
-        <MonthOptions setId={setId} />
+        {monthOptions.map((month) => <option key={month} value={month}>{month}</option>)}
         <option value="custom" disabled>—</option>
       </Select>}
     </Field>
     <Field label="С даты" className="w-40">
-      {(control) => <Input {...control} type="date" value={fromValue} onChange={(event) => onChange({ mode: "custom", month: "custom", fromDay: event.target.value, toDay: toValue })} />}
+      {(control) => <Input {...control} type="date" value={fromValue} onBlur={() => onCommit?.()} onChange={(event) => onChange({ mode: "custom", month: "custom", fromDay: event.target.value, toDay: toValue })} />}
     </Field>
     <Field label="По дату" className="w-40">
-      {(control) => <Input {...control} type="date" value={toValue} onChange={(event) => onChange({ mode: "custom", month: "custom", fromDay: fromValue, toDay: event.target.value })} />}
+      {(control) => <Input {...control} type="date" value={toValue} onBlur={() => onCommit?.()} onChange={(event) => onChange({ mode: "custom", month: "custom", fromDay: fromValue, toDay: event.target.value })} />}
     </Field>
   </>;
 }
@@ -529,21 +582,28 @@ interface TradesSectionProps {
   maturity: number;
   clusterGapHours: number | null;
   setBounds: { from: string; to: string } | null;
+  initial?: Record<string, unknown> | undefined;
+  reportState?: ((snapshot: Record<string, unknown>) => void) | undefined;
+  onCommit?: (() => void) | undefined;
 }
 
-function TradesSection({ setId, description, direction, enablePriceChange, clusterize, maturity, clusterGapHours, setBounds }: TradesSectionProps) {
-  const [tpInput, setTpInput] = useState("4");
-  const [slInput, setSlInput] = useState("4");
-  const [timeShiftInput, setTimeShiftInput] = useState("0");
-  const [timeRange, setTimeRange] = useState<TimeRangeValue>({ mode: "all", month: "all", fromDay: null, toDay: null });
-  const [considerPriceChange, setConsiderPriceChange] = useState(false);
-  const [priceChangeInput, setPriceChangeInput] = useState("0");
+function TradesSection({ setId, description, direction, enablePriceChange, clusterize, maturity, clusterGapHours, setBounds, initial, reportState, onCommit }: TradesSectionProps) {
+  const [tpInput, setTpInput] = useState(() => savedString(initial?.tpInput, "4"));
+  const [slInput, setSlInput] = useState(() => savedString(initial?.slInput, "4"));
+  const [timeShiftInput, setTimeShiftInput] = useState(() => savedString(initial?.timeShiftInput, "0"));
+  const [timeRange, setTimeRange] = useState<TimeRangeValue>(() => normalizeTimeRange(initial?.timeRange));
+  const [considerPriceChange, setConsiderPriceChange] = useState(() => initial?.considerPriceChange === true);
+  const [priceChangeInput, setPriceChangeInput] = useState(() => savedString(initial?.priceChangeInput, "0"));
   const [rows, setRows] = useState<TradeRowWithSource[]>([]);
   const [filteredCount, setFilteredCount] = useState(0);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [error, setError] = useState<string | null>(null);
   const runIdRef = useRef(0);
+
+  useEffect(() => {
+    reportState?.({ timeRange, tpInput, slInput, timeShiftInput, considerPriceChange, priceChangeInput });
+  }, [reportState, timeRange, tpInput, slInput, timeShiftInput, considerPriceChange, priceChangeInput]);
 
   const params = useMemo(() => ({
     set: setId,
@@ -636,23 +696,23 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
       </div>
       <div className="flex flex-wrap items-end gap-3">
         <Field label="TP, %" className="w-28">
-          {(control) => <Input {...control} inputMode="decimal" value={tpInput} onChange={(event) => setTpInput(event.target.value)} />}
+          {(control) => <Input {...control} inputMode="decimal" value={tpInput} onBlur={() => onCommit?.()} onChange={(event) => setTpInput(event.target.value)} />}
         </Field>
         <Field label="SL, %" className="w-28">
-          {(control) => <Input {...control} inputMode="decimal" value={slInput} onChange={(event) => setSlInput(event.target.value)} />}
+          {(control) => <Input {...control} inputMode="decimal" value={slInput} onBlur={() => onCommit?.()} onChange={(event) => setSlInput(event.target.value)} />}
         </Field>
         <Field label="Time-shift, мин" className="w-32">
-          {(control) => <Input {...control} inputMode="numeric" value={timeShiftInput} onChange={(event) => setTimeShiftInput(event.target.value)} />}
+          {(control) => <Input {...control} inputMode="numeric" value={timeShiftInput} onBlur={() => onCommit?.()} onChange={(event) => setTimeShiftInput(event.target.value)} />}
         </Field>
-        <TimeRangeControls setId={setId} setBounds={setBounds} value={timeRange} onChange={setTimeRange} />
+        <TimeRangeControls setId={setId} setBounds={setBounds} value={timeRange} onChange={setTimeRange} onCommit={onCommit} />
         {enablePriceChange && (
           <>
             <label className="flex items-center gap-2 text-sm">
-              <Checkbox checked={considerPriceChange} onCheckedChange={(checked) => setConsiderPriceChange(checked === true)} />
+              <Checkbox checked={considerPriceChange} onCheckedChange={(checked) => { setConsiderPriceChange(checked === true); onCommit?.(); }} />
               Учитывать смещение цены
             </label>
             <Field label="Смещение цены, %" className="w-36">
-              {(control) => <Input {...control} inputMode="decimal" disabled={!considerPriceChange} value={priceChangeInput} onChange={(event) => setPriceChangeInput(event.target.value)} />}
+              {(control) => <Input {...control} inputMode="decimal" disabled={!considerPriceChange} value={priceChangeInput} onBlur={() => onCommit?.()} onChange={(event) => setPriceChangeInput(event.target.value)} />}
             </Field>
           </>
         )}
@@ -789,27 +849,88 @@ type AnalyticsSection = "short" | "long" | "cache";
 export function AnalyticsPage() {
   const [sets, setSets] = useState<AnalyticsSet[]>([]);
   const [setsState, setSetsState] = useState<"loading" | "ready" | "error">("loading");
+  const [settingsState, setSettingsState] = useState<"loading" | "ready">("loading");
+  const [savedSettings, setSavedSettings] = useState<AnalyticsUserSettings | null>(null);
+  const [saveStatus, setSaveStatus] = useState<"idle" | "saved" | "error">("idle");
   const [setId, setSetId] = useState("");
   const [section, setSection] = useState<AnalyticsSection>("short");
   const [clusterize, setClusterize] = useState(true);
   const [clusterGapInput, setClusterGapInput] = useState("8");
   const [maturityDraft, setMaturityDraft] = useState(0.5);
   const [maturity, setMaturity] = useState(0.5);
+  const [autoCalc, setAutoCalc] = useState(false);
+  const [runToken, setRunToken] = useState(0);
+  const sectionsRef = useRef<Partial<Record<AnalyticsSectionKey, Record<string, unknown>>>>({});
 
   useEffect(() => {
     let cancelled = false;
-    void fetchAnalyticsSets()
-      .then((items) => {
-        if (cancelled) return;
+    void Promise.all([
+      fetchAnalyticsSets().catch(() => null),
+      fetchAnalyticsSettings().catch(() => null),
+    ]).then(([items, settings]) => {
+      if (cancelled) return;
+      if (items !== null) {
         setSets(items);
         setSetsState("ready");
-        setSetId((current) => (current === "" && items.length > 0 ? (items[0]!.setId) : current));
-      })
-      .catch(() => {
-        if (!cancelled) setSetsState("error");
-      });
+        setSetId((current) => {
+          if (current !== "") return current;
+          const savedId = settings?.setId ?? null;
+          if (savedId !== null && items.some((set) => set.setId === savedId)) return savedId;
+          return items.length > 0 ? (items[0]!.setId) : current;
+        });
+      } else {
+        setSetsState("error");
+      }
+      if (settings !== null) {
+        setClusterize(settings.clusterize);
+        setMaturityDraft(settings.maturity);
+        setMaturity(settings.maturity);
+        setClusterGapInput(settings.clusterGapInput);
+        setAutoCalc(settings.autoCalc);
+      }
+      setSavedSettings(settings);
+      setSettingsState("ready");
+      if (settings?.autoCalc === true) setRunToken(1);
+    });
     return () => { cancelled = true; };
   }, []);
+
+  const reportShortMatrix = useCallback((snapshot: Record<string, unknown>) => { sectionsRef.current["short-matrix"] = snapshot; }, []);
+  const reportShortTrades = useCallback((snapshot: Record<string, unknown>) => { sectionsRef.current["short-trades"] = snapshot; }, []);
+  const reportLongMatrix = useCallback((snapshot: Record<string, unknown>) => { sectionsRef.current["long-matrix"] = snapshot; }, []);
+  const reportLongTrades = useCallback((snapshot: Record<string, unknown>) => { sectionsRef.current["long-trades"] = snapshot; }, []);
+
+  const collectSettings = useCallback((): AnalyticsUserSettings => ({
+    setId: setId === "" ? null : setId,
+    clusterize,
+    maturity,
+    clusterGapInput,
+    autoCalc,
+    sections: { ...sectionsRef.current },
+  }), [setId, clusterize, maturity, clusterGapInput, autoCalc]);
+  const collectRef = useRef(collectSettings);
+  useEffect(() => { collectRef.current = collectSettings; }, [collectSettings]);
+
+  /** Debounced autosave: coalesces slider commits and rapid consecutive changes. */
+  const commitTimerRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
+  }, []);
+  const onSettingsCommit = useCallback(() => {
+    if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
+    commitTimerRef.current = window.setTimeout(() => {
+      commitTimerRef.current = null;
+      void saveAnalyticsSettings(collectRef.current())
+        .then(() => setSaveStatus("saved"))
+        .catch(() => setSaveStatus("error"));
+      if (collectRef.current().autoCalc) setRunToken((token) => token + 1);
+    }, 800);
+  }, []);
+
+  const commitMaturity = () => {
+    setMaturity(maturityDraft);
+    onSettingsCommit();
+  };
 
   const appliedClusterGapHours = parseNumberInput(clusterGapInput);
   const activeSet = sets.find((set) => set.setId === setId);
@@ -824,7 +945,7 @@ export function AnalyticsPage() {
         <div className="flex flex-wrap items-end gap-3">
           <Field label="Набор сетапов" className="w-full max-w-md">
             {(control) => (
-              <Select {...control} value={setId} disabled={setsState !== "ready"} onChange={(event) => setSetId(event.target.value)}>
+              <Select {...control} value={setId} disabled={setsState !== "ready"} onChange={(event) => { setSetId(event.target.value); onSettingsCommit(); }}>
                 {sets.length === 0 && <option value="">Нет завершённых запусков</option>}
                 {sets.map((set) => <option key={set.setId} value={set.setId}>{set.label}</option>)}
               </Select>
@@ -852,7 +973,7 @@ export function AnalyticsPage() {
         </div>
         <div className="flex flex-wrap items-end gap-3">
           <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={clusterize} onCheckedChange={(checked) => setClusterize(checked === true)} />
+            <Checkbox checked={clusterize} onCheckedChange={(checked) => { setClusterize(checked === true); onSettingsCommit(); }} />
             Кластеризовать сетапы
           </label>
           <Field label={`Зрелость сетапа в кластере: ${maturityDraft.toFixed(1)}`} className="w-64">
@@ -865,14 +986,19 @@ export function AnalyticsPage() {
               disabled={!clusterize}
               value={maturityDraft}
               onChange={(event) => setMaturityDraft(Number(event.target.value))}
-              onPointerUp={() => setMaturity(maturityDraft)}
-              onKeyUp={() => setMaturity(maturityDraft)}
-              onBlur={() => setMaturity(maturityDraft)}
+              onPointerUp={commitMaturity}
+              onKeyUp={commitMaturity}
+              onBlur={commitMaturity}
             />}
           </Field>
           <Field label="Разрыв кластера, ч" className="w-32">
-            {(control) => <Input {...control} inputMode="decimal" disabled={!clusterize} value={clusterGapInput} onChange={(event) => setClusterGapInput(event.target.value)} />}
+            {(control) => <Input {...control} inputMode="decimal" disabled={!clusterize} value={clusterGapInput} onBlur={() => onSettingsCommit()} onChange={(event) => setClusterGapInput(event.target.value)} />}
           </Field>
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox checked={autoCalc} onCheckedChange={(checked) => { setAutoCalc(checked === true); onSettingsCommit(); }} />
+            Авторасчёт матриц
+          </label>
+          {saveStatus === "error" && <span className="self-center text-xs text-danger">Не удалось сохранить настройки</span>}
         </div>
         <p className="text-xs text-muted-foreground">Настройки кластеризации действуют одновременно на все разделы SHORT и LONG. 0 — первый сетап кластера, 1 — последний, 0.5 — середина; соседние сигналы одной монеты с разрывом до {(appliedClusterGapHours ?? 8).toString()} часов образуют кластер. При выключенной галочке кластеризация не выполняется — в расчёт входят все сетапы.</p>
       </CardContent>
@@ -882,11 +1008,12 @@ export function AnalyticsPage() {
       <SegmentedTrigger role="tab" aria-selected={section === "long"} onClick={() => setSection("long")}>LONG</SegmentedTrigger>
       <SegmentedTrigger role="tab" aria-selected={section === "cache"} onClick={() => setSection("cache")}>Кеш</SegmentedTrigger>
     </SegmentedList>
-    {setsState === "loading" && <Spinner label="Загрузка наборов…" />}
+    {(setsState === "loading" || settingsState === "loading") && <Spinner label="Загрузка наборов…" />}
     {setsState === "error" && <Alert variant="destructive" role="alert">Наборы недоступны: не удалось получить список исторических запусков</Alert>}
     {setsState === "ready" && sets.length === 0 && (
       <EmptyState title="Нет наборов для аналитики" description="Аналитика работает по завершённым историческим запускам. Создайте запуск на странице «Запуски» и дождитесь его завершения." />
     )}
+    {settingsState === "ready" && (<>
     <div hidden={section !== "short"} className="grid gap-4">
       <MatrixSection
         setId={setId}
@@ -901,6 +1028,10 @@ export function AnalyticsPage() {
         maturity={maturity}
         clusterGapHours={appliedClusterGapHours}
         setBounds={setBounds}
+        initial={savedSettings?.sections["short-matrix"]}
+        reportState={reportShortMatrix}
+        onCommit={onSettingsCommit}
+        runToken={runToken}
       />
       <TradesSection
         setId={setId}
@@ -911,6 +1042,9 @@ export function AnalyticsPage() {
         maturity={maturity}
         clusterGapHours={appliedClusterGapHours}
         setBounds={setBounds}
+        initial={savedSettings?.sections["short-trades"]}
+        reportState={reportShortTrades}
+        onCommit={onSettingsCommit}
       />
     </div>
     <div hidden={section !== "long"} className="grid gap-4">
@@ -927,6 +1061,10 @@ export function AnalyticsPage() {
         maturity={maturity}
         clusterGapHours={appliedClusterGapHours}
         setBounds={setBounds}
+        initial={savedSettings?.sections["long-matrix"]}
+        reportState={reportLongMatrix}
+        onCommit={onSettingsCommit}
+        runToken={runToken}
       />
       <TradesSection
         setId={setId}
@@ -937,10 +1075,14 @@ export function AnalyticsPage() {
         maturity={maturity}
         clusterGapHours={appliedClusterGapHours}
         setBounds={setBounds}
+        initial={savedSettings?.sections["long-trades"]}
+        reportState={reportLongTrades}
+        onCommit={onSettingsCommit}
       />
     </div>
     <div hidden={section !== "cache"} className="grid gap-4">
       <AnalyticsCacheCard />
     </div>
+    </>)}
   </section>;
 }

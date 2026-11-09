@@ -29,16 +29,21 @@ interface StubOptions {
   shortBulk?: { tpPct: number; slPct: number; avgMovePct: number | null; riskExpectancy: number | null }[];
   longBulk?: { tpPct: number; slPct: number; avgMovePct: number | null; riskExpectancy: number | null }[];
   interceptMatrixCell?: (tpPct: number, slPct: number) => Promise<Response> | undefined;
+  savedSettings?: Record<string, unknown>;
 }
 
 function stubFetch(options: StubOptions = {}) {
-  const calls: { method: string; path: string; search: string }[] = [];
+  const calls: { method: string; path: string; search: string; body?: string }[] = [];
   vi.stubGlobal("fetch", vi.fn((url: string, init?: RequestInit) => {
     const path = url.replace(/^https?:\/\/[^/]+/, "");
     const query = new URLSearchParams(path.split("?")[1] ?? "");
     const method = init?.method ?? "GET";
-    calls.push({ method, path: path.split("?")[0]!, search: path.split("?")[1] ?? "" });
+    calls.push({ method, path: path.split("?")[0]!, search: path.split("?")[1] ?? "", ...(typeof init?.body === "string" ? { body: init.body } : {}) });
     const json = (body: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(body), { status }));
+    if (path.startsWith("/v1/settings/web-analytics")) {
+      if (method === "PUT") return json({ settings: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : {} });
+      return json({ settings: options.savedSettings ?? {} });
+    }
     if (path.startsWith("/v1/analytics/sets")) return json({ sets: options.sets ?? [setFixture] });
     if (path.startsWith("/v1/analytics/months")) return json({ months: ["2024-01", "2024-02"] });
     if (path.startsWith("/v1/analytics/setups")) {
@@ -103,6 +108,8 @@ it("computes matrices only after the button press and honours subsections", asyn
   expect(screen.getAllByRole("checkbox", { name: "Кластеризовать сетапы" }).length).toBeGreaterThan(0);
   expect(screen.getAllByLabelText("Зрелость сетапа в кластере: 0.5").length).toBeGreaterThan(0);
   expect(screen.getAllByLabelText("Разрыв кластера, ч")[0]).toHaveValue("8");
+  expect(screen.getByRole("checkbox", { name: "Авторасчёт матриц" })).not.toBeChecked();
+  expect(screen.queryByRole("button", { name: "Сохранить настройки" })).not.toBeInTheDocument();
   expect(screen.getAllByLabelText("Период")[0]).toHaveValue("all");
   expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2023-11-14");
   expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2023-11-15");
@@ -189,6 +196,7 @@ it("syncs the month selector with the date pair", async () => {
   const calls = stubFetch({ shortBulk: fullShortGrid });
   render(<AnalyticsPage />);
   await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  await waitFor(() => expect(screen.getAllByText("2024-02")).toHaveLength(4));
   fireEvent.change(screen.getAllByLabelText("Период")[0]!, { target: { value: "2024-01" } });
   expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2024-01-01");
   expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2024-01-31");
@@ -204,6 +212,61 @@ it("syncs the month selector with the date pair", async () => {
   expect(customCalls.length).toBeGreaterThan(0);
   expect(customCalls.every((call) => call.search.includes("toDay=2024-01-31") && !call.search.includes("month="))).toBe(true);
 }, 10_000);
+
+it("restores saved analytics settings and autosaves on commit", async () => {
+  const calls = stubFetch({
+    shortBulk: fullShortGrid,
+    savedSettings: {
+      setId: "run-12",
+      clusterize: false,
+      maturity: 0.7,
+      clusterGapInput: "12",
+      sections: {
+        "short-matrix": { timeRange: { mode: "month", month: "2024-01", fromDay: null, toDay: null }, timeShiftInput: "5", considerPriceChange: true, priceChangeInput: "1.5", gradientMin: -0.1, gradientMax: 0.3 },
+      },
+    },
+  });
+  render(<AnalyticsPage />);
+  expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
+  expect(screen.getByLabelText("Зрелость сетапа в кластере: 0.7")).toBeDisabled();
+  expect(screen.getByLabelText("Разрыв кластера, ч")).toHaveValue("12");
+  expect(screen.getByRole("checkbox", { name: "Кластеризовать сетапы" })).not.toBeChecked();
+  expect(screen.getAllByLabelText("Период")[0]).toHaveValue("2024-01");
+  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2024-01-01");
+  expect(screen.getAllByLabelText("Time-shift, мин")[0]).toHaveValue("5");
+  expect(screen.getAllByLabelText("Смещение цены, %")[0]).toHaveValue("1.5");
+  expect(screen.getAllByLabelText("Красный при")[0]).toHaveValue("-0.1");
+  expect(screen.getAllByLabelText("Период")[1]).toHaveValue("all");
+  fireEvent.change(screen.getByLabelText("Разрыв кластера, ч"), { target: { value: "20" } });
+  expect(calls.filter((call) => call.method === "PUT" && call.path === "/v1/settings/web-analytics")).toHaveLength(0);
+  fireEvent.blur(screen.getByLabelText("Разрыв кластера, ч"));
+  await waitFor(() => expect(calls.filter((call) => call.method === "PUT" && call.path === "/v1/settings/web-analytics")).toHaveLength(1), { timeout: 3000 });
+  const putCall = calls.find((call) => call.method === "PUT" && call.path === "/v1/settings/web-analytics")!;
+  const sent = JSON.parse(putCall.body!) as Record<string, unknown>;
+  expect(sent.setId).toBe("run-12");
+  expect(sent.clusterize).toBe(false);
+  expect(sent.maturity).toBe(0.7);
+  expect(sent.clusterGapInput).toBe("20");
+  expect(sent.autoCalc).toBe(false);
+  const sections = sent.sections as Record<string, Record<string, unknown>>;
+  expect(sections["short-matrix"]).toMatchObject({ timeShiftInput: "5", considerPriceChange: true, priceChangeInput: "1.5", gradientMin: -0.1, gradientMax: 0.3 });
+  expect(sections["short-trades"]).toMatchObject({ tpInput: "4", slInput: "4" });
+}, 10_000);
+
+it("auto-calculates matrices on entry when enabled", async () => {
+  const calls = stubFetch({
+    shortBulk: fullShortGrid,
+    longBulk: fullLongGrid,
+    savedSettings: { autoCalc: true },
+  });
+  render(<AnalyticsPage />);
+  expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
+  expect(screen.getByRole("checkbox", { name: "Авторасчёт матриц" })).toBeChecked();
+  await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument(), { timeout: 15_000 });
+  await waitFor(() => expect(screen.getByText("Ячеек: 550 / 550")).toBeInTheDocument(), { timeout: 15_000 });
+  expect(calls.some((call) => call.path === "/v1/analytics/matrix-cells")).toBe(true);
+  expect(calls.every((call) => !call.path.startsWith("/v1/analytics/setups") && !call.path.startsWith("/v1/analytics/trades"))).toBe(true);
+}, 30_000);
 
 it("runs the SHORT trade list cache-first and builds the daily expectancy chart", async () => {
   stubFetch();
