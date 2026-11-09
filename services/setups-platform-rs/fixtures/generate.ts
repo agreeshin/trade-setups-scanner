@@ -10,6 +10,7 @@ import {
 import { ReplayQualityTracker } from "../../setups-platform/src/replay/quality.js";
 import { replayRun } from "../../setups-platform/src/replay/replay-runner.js";
 import { ArrayCandleSource } from "../../setups-platform/src/replay/source.js";
+import { canonicalCacheKey } from "../../setups-platform/src/replay/cache.js";
 import {
   selectByMaturity,
   setupMonths,
@@ -567,12 +568,68 @@ async function buildReplaySection() {
 const scenarios = SPECS.map(runScenario);
 const analytics = buildAnalyticsSection();
 const replay = await buildReplaySection();
+const cacheKeyQueries = [
+  {
+    exchangeCode: "bybit",
+    category: "linear",
+    symbol: "BTCUSDT",
+    algorithmId: "price_volume_spike",
+    algorithmVersion: "1.1.1",
+    params: DEFAULT_SPIKE_PARAMS,
+    fromUnix: 1699920000,
+    toUnix: 1700006400,
+  },
+  {
+    exchangeCode: "bybit",
+    category: "linear",
+    symbol: "ETHUSDT",
+    algorithmId: "price_volume_spike",
+    algorithmVersion: "1.1.1",
+    params: oneDay,
+    fromUnix: 1699920000,
+    toUnix: 1702512000,
+  },
+  {
+    exchangeCode: "bybit",
+    category: "spot",
+    symbol: "SOLUSDT",
+    algorithmId: "price_volume_spike",
+    algorithmVersion: "1.1.1",
+    params: { ...smallWindows, maxGapPercent: "0.5", volumeMultiplier: "2.5" },
+    fromUnix: 1600000000,
+    toUnix: 1600086400,
+  },
+  {
+    exchangeCode: "bybit",
+    category: "linear",
+    symbol: "BTCUSDT",
+    algorithmId: "price_volume_spike",
+    algorithmVersion: "1.1.1",
+    params: {
+      windowMinutes: smallWindows.windowMinutes,
+      baselineLongDays: smallWindows.baselineLongDays,
+      baselineShortDays: smallWindows.baselineShortDays,
+      volumeMultiplier: smallWindows.volumeMultiplier,
+      cooldownMinutes: smallWindows.cooldownMinutes,
+      maxGapPercent: smallWindows.maxGapPercent,
+      maxConsecutiveGapMinutes: smallWindows.maxConsecutiveGapMinutes,
+      requiredRecentMinutes: smallWindows.requiredRecentMinutes,
+      priceGrowthPct: smallWindows.priceGrowthPct,
+    },
+    fromUnix: 1699920000,
+    toUnix: 1700006400,
+  },
+];
+const cacheKeys = {
+  cases: cacheKeyQueries.map((query) => ({ query, key: canonicalCacheKey(query) })),
+};
 const fixture = {
   algorithmId: "price_volume_spike",
   algorithmVersion: "1.1.1",
   scenarios,
   analytics,
   replay,
+  cacheKeys,
 };
 const outPath = join(dirname(fileURLToPath(import.meta.url)), "parity.json");
 writeFileSync(outPath, `${JSON.stringify(fixture, null, 1)}\n`);

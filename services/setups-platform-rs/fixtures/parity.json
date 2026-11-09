@@ -95537,5 +95537,101 @@
    "cancelled": false,
    "lastStatus": "evaluated"
   }
+ },
+ "cacheKeys": {
+  "cases": [
+   {
+    "query": {
+     "exchangeCode": "bybit",
+     "category": "linear",
+     "symbol": "BTCUSDT",
+     "algorithmId": "price_volume_spike",
+     "algorithmVersion": "1.1.1",
+     "params": {
+      "priceGrowthPct": "12",
+      "windowMinutes": 5,
+      "baselineLongDays": 30,
+      "baselineShortDays": 7,
+      "volumeMultiplier": "3",
+      "cooldownMinutes": 5,
+      "maxGapPercent": "1",
+      "maxConsecutiveGapMinutes": 5,
+      "requiredRecentMinutes": 10
+     },
+     "fromUnix": 1699920000,
+     "toUnix": 1700006400
+    },
+    "key": "price_volume_spike@1.1.1|bybit/linear/BTCUSDT|1699920000-1700006400|baselineLongDays:30,baselineShortDays:7,cooldownMinutes:5,maxConsecutiveGapMinutes:5,maxGapPercent:1,priceGrowthPct:12,requiredRecentMinutes:10,volumeMultiplier:3,windowMinutes:5"
+   },
+   {
+    "query": {
+     "exchangeCode": "bybit",
+     "category": "linear",
+     "symbol": "ETHUSDT",
+     "algorithmId": "price_volume_spike",
+     "algorithmVersion": "1.1.1",
+     "params": {
+      "priceGrowthPct": "12",
+      "windowMinutes": 5,
+      "baselineLongDays": 1,
+      "baselineShortDays": 1,
+      "volumeMultiplier": "3",
+      "cooldownMinutes": 5,
+      "maxGapPercent": "1",
+      "maxConsecutiveGapMinutes": 5,
+      "requiredRecentMinutes": 10
+     },
+     "fromUnix": 1699920000,
+     "toUnix": 1702512000
+    },
+    "key": "price_volume_spike@1.1.1|bybit/linear/ETHUSDT|1699920000-1702512000|baselineLongDays:1,baselineShortDays:1,cooldownMinutes:5,maxConsecutiveGapMinutes:5,maxGapPercent:1,priceGrowthPct:12,requiredRecentMinutes:10,volumeMultiplier:3,windowMinutes:5"
+   },
+   {
+    "query": {
+     "exchangeCode": "bybit",
+     "category": "spot",
+     "symbol": "SOLUSDT",
+     "algorithmId": "price_volume_spike",
+     "algorithmVersion": "1.1.1",
+     "params": {
+      "priceGrowthPct": "12",
+      "windowMinutes": 5,
+      "baselineLongDays": 2,
+      "baselineShortDays": 1,
+      "volumeMultiplier": "2.5",
+      "cooldownMinutes": 5,
+      "maxGapPercent": "0.5",
+      "maxConsecutiveGapMinutes": 5,
+      "requiredRecentMinutes": 10
+     },
+     "fromUnix": 1600000000,
+     "toUnix": 1600086400
+    },
+    "key": "price_volume_spike@1.1.1|bybit/spot/SOLUSDT|1600000000-1600086400|baselineLongDays:2,baselineShortDays:1,cooldownMinutes:5,maxConsecutiveGapMinutes:5,maxGapPercent:0.5,priceGrowthPct:12,requiredRecentMinutes:10,volumeMultiplier:2.5,windowMinutes:5"
+   },
+   {
+    "query": {
+     "exchangeCode": "bybit",
+     "category": "linear",
+     "symbol": "BTCUSDT",
+     "algorithmId": "price_volume_spike",
+     "algorithmVersion": "1.1.1",
+     "params": {
+      "windowMinutes": 5,
+      "baselineLongDays": 2,
+      "baselineShortDays": 1,
+      "volumeMultiplier": "3",
+      "cooldownMinutes": 5,
+      "maxGapPercent": "1",
+      "maxConsecutiveGapMinutes": 5,
+      "requiredRecentMinutes": 10,
+      "priceGrowthPct": "12"
+     },
+     "fromUnix": 1699920000,
+     "toUnix": 1700006400
+    },
+    "key": "price_volume_spike@1.1.1|bybit/linear/BTCUSDT|1699920000-1700006400|baselineLongDays:2,baselineShortDays:1,cooldownMinutes:5,maxConsecutiveGapMinutes:5,maxGapPercent:1,priceGrowthPct:12,requiredRecentMinutes:10,volumeMultiplier:3,windowMinutes:5"
+   }
+  ]
  }
 }
