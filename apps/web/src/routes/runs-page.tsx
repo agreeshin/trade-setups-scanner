@@ -4,6 +4,7 @@ import { Alert } from "../components/ui/alert";
 import { Badge, runStatusVariant } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card } from "../components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { PageHeader, SectionHeader } from "../components/ui/page-header";
@@ -116,6 +117,10 @@ function RunResults({ id, isBatch, revision }: { id: number; isBatch: boolean; r
   </section>;
 }
 
+function TrashIcon() {
+  return <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true"><path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" /></svg>;
+}
+
 export function RunsPage() {
   const [form, setForm] = useState<ReplayForm>({ symbols: "", from: "", to: "", algorithmId: "" });
   const normalizedSymbols = new Set(form.symbols.split(/[\s,;]+/).map((item) => item.trim().toUpperCase()).filter(Boolean));
@@ -129,6 +134,9 @@ export function RunsPage() {
   const [reload, setReload] = useState(0);
   const runs = usePlatformPoll<{ runs: RunRow[] }>("/v1/replay-runs", reload);
   const [cancelling, setCancelling] = useState<number | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ id: number; symbol: string } | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [purgeArmed, setPurgeArmed] = useState(false);
   const [purging, setPurging] = useState(false);
   const [knownInstruments, setKnownInstruments] = useState<ReplayInstrument[]>([]);
@@ -235,6 +243,19 @@ export function RunsPage() {
     } catch (cause) { setError(errorText(cause)); }
     finally { setPurging(false); }
   }
+  async function confirmDeleteRun() {
+    if (deleteTarget === null) return;
+    setDeleting(true); setDeleteError(null);
+    try {
+      const response = await apiFetch(`/v1/replay-runs/${deleteTarget.id}`, { method: "DELETE" });
+      if (!response.ok) throw new Error(response.status === 409 ? "Запуск ещё активен: сначала отмените его." : `Не удалось удалить запуск: HTTP ${response.status}`);
+      setMessage(`Запуск #${deleteTarget.id} удалён.`);
+      if (selected?.id === deleteTarget.id && !selected.isBatch) setSelected(null);
+      setDeleteTarget(null);
+      setReload((value) => value + 1);
+    } catch (cause) { setDeleteError(cause instanceof Error ? cause.message : "Ошибка соединения"); }
+    finally { setDeleting(false); }
+  }
   return <section aria-labelledby="runs-heading">
     <PageHeader id="runs-heading" title="Исторические запуски" />
     <form onSubmit={(event) => { void submit(event); }} className="mt-6 max-w-2xl">
@@ -279,11 +300,31 @@ export function RunsPage() {
           <TableCell><Badge variant={runStatusVariant(run.status)}>{RUN_STATUS_LABELS[run.status] ?? run.status}{run.isBatch === true && run.status === "running" ? ` (${run.doneInstruments ?? 0}/${run.instrumentCount ?? 0})` : ""}</Badge><p className="mt-1 text-xs text-muted-foreground">{qualityLabel(run.quality)}</p></TableCell>
           <TableCell>{run.cacheHit ? "да" : "нет"}</TableCell>
           <TableCell numeric>{run.setupCount}</TableCell>
-          <TableCell>{["queued", "running", "cancel_requested"].includes(run.status) && <Button variant="outline" size="sm" disabled={cancelling !== null || run.status === "cancel_requested"} onClick={() => { void cancelRun(run.id, run.isBatch === true); }} aria-label={`Отменить запуск ${run.id}`}>Отменить</Button>}</TableCell>
+              <TableCell>
+                <div className="flex items-center justify-end gap-1">
+                  {["queued", "running", "cancel_requested"].includes(run.status) && <Button variant="outline" size="sm" disabled={cancelling !== null || run.status === "cancel_requested"} onClick={() => { void cancelRun(run.id, run.isBatch === true); }} aria-label={`Отменить запуск ${run.id}`}>Отменить</Button>}
+                  {run.isBatch !== true && !["queued", "running", "cancel_requested"].includes(run.status) && <Button variant="outline" size="sm" disabled={deleting} aria-label={`Удалить запуск ${run.id}`} onClick={() => { setDeleteError(null); setDeleteTarget({ id: run.id, symbol: run.symbol }); }}><TrashIcon /></Button>}
+                </div>
+              </TableCell>
         </TableRow>)}</TableBody>
       </Table>
       {runs.data.runs.length === 0 && <p className="mt-2 text-sm text-muted-foreground">Запусков пока нет.</p>}
     </div>}
-    {selected !== null && <RunResults key={`${selected.isBatch ? "b" : "r"}-${selected.id}`} id={selected.id} isBatch={selected.isBatch} revision={reload} />}
+      {selected !== null && <RunResults key={`${selected.isBatch ? "b" : "r"}-${selected.id}`} id={selected.id} isBatch={selected.isBatch} revision={reload} />}
+      {deleteTarget !== null && (
+        <Dialog open onOpenChange={(open) => { if (!open && !deleting) setDeleteTarget(null); }}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Удалить запуск #{deleteTarget.id}?</DialogTitle>
+              <DialogDescription>Запуск {deleteTarget.symbol} и связанные интервалы качества будут полностью удалены из базы. Кеш вычислений не затрагивается. Действие необратимо.</DialogDescription>
+            </DialogHeader>
+            {deleteError && <Alert variant="destructive" role="alert">{deleteError}</Alert>}
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" disabled={deleting} onClick={() => setDeleteTarget(null)}>Отмена</Button>
+              <Button disabled={deleting} onClick={() => { void confirmDeleteRun(); }}>{deleting ? "Удаление…" : "Удалить"}</Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
   </section>;
 }

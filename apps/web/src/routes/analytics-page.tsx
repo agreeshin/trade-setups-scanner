@@ -528,7 +528,7 @@ function DailyExpectancyChart({ items }: { items: DailyExpectancyPoint[] }) {
   }
 
   return (
-    <svg className="w-full max-w-3xl" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание в рисках">
+    <svg className="w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание в рисках">
       <line className="stroke-muted-foreground/40" x1={left} y1={top} x2={left} y2={height - bottom} />
       <line className="stroke-muted-foreground/40" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
       {zeroY !== null ? <line className="stroke-muted-foreground/50" x1={left} y1={zeroY} x2={width - right} y2={zeroY} /> : null}
@@ -595,6 +595,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(() => normalizeTimeRange(initial?.timeRange));
   const [considerPriceChange, setConsiderPriceChange] = useState(() => initial?.considerPriceChange === true);
   const [priceChangeInput, setPriceChangeInput] = useState(() => savedString(initial?.priceChangeInput, "0"));
+  const [riskPctInput, setRiskPctInput] = useState(() => savedString(initial?.riskPctInput, "1"));
   const [rows, setRows] = useState<TradeRowWithSource[]>([]);
   const [filteredCount, setFilteredCount] = useState(0);
   const [running, setRunning] = useState(false);
@@ -603,8 +604,8 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
   const runIdRef = useRef(0);
 
   useEffect(() => {
-    reportState?.({ timeRange, tpInput, slInput, timeShiftInput, considerPriceChange, priceChangeInput });
-  }, [reportState, timeRange, tpInput, slInput, timeShiftInput, considerPriceChange, priceChangeInput]);
+    reportState?.({ timeRange, tpInput, slInput, timeShiftInput, considerPriceChange, priceChangeInput, riskPctInput });
+  }, [reportState, timeRange, tpInput, slInput, timeShiftInput, considerPriceChange, priceChangeInput, riskPctInput]);
 
   const params = useMemo(() => ({
     set: setId,
@@ -679,6 +680,24 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
     return rows.filter((row) => row.setup.closeTimeUnix >= from && row.setup.closeTimeUnix <= to);
   }, [rows, effectiveDays]);
 
+  const deposit = useMemo(() => {
+    const riskPct = parseNumberInput(riskPctInput);
+    if (riskPct === null || !Number.isFinite(riskPct) || riskPct <= 0 || riskPct > 100) {
+      return { values: new Map<string, number>(), error: "Риск на сделку должен быть числом больше 0 и не больше 100" };
+    }
+    const values = new Map<string, number>();
+    let multiplier = 1;
+    for (const row of visibleRows) {
+      if (row.riskReturn === null) continue;
+      multiplier *= 1 + (riskPct / 100) * row.riskReturn;
+      if (!Number.isFinite(multiplier) || multiplier < 0) {
+        return { values, error: "Расчёт депозита остановлен: результат стал некорректным числом" };
+      }
+      values.set(`${row.setup.symbol}:${row.setup.closeTimeUnix}`, multiplier);
+    }
+    return { values, error: null as string | null };
+  }, [visibleRows, riskPctInput]);
+
   const summary = useMemo(() => {
     const closed = visibleRows.filter((row) => row.status === "tp" || row.status === "sl");
     const tp = closed.filter((row) => row.status === "tp");
@@ -717,12 +736,16 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
             </Field>
           </>
         )}
+        <Field label="Риск на сделку, %" className="w-32">
+          {(control) => <Input {...control} inputMode="decimal" value={riskPctInput} onBlur={() => onCommit?.()} onChange={(event) => setRiskPctInput(event.target.value)} />}
+        </Field>
         {running
           ? <Button variant="outline" onClick={() => { runIdRef.current += 1; setRunning(false); }}>Остановить</Button>
           : <Button disabled={setId === ""} onClick={() => { void run(); }}>Рассчитать</Button>}
         {progress.total > 0 && <Badge variant={progress.done >= progress.total ? "success" : "info"}>Сделок: {progress.done} / {progress.total}</Badge>}
       </div>
       {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
+      {deposit.error && visibleRows.length > 0 && <p role="status" className="text-sm text-danger">{deposit.error}</p>}
       <div className="flex flex-wrap gap-2 text-xs">
         {summary.winRate !== null && <Badge variant={summary.avgRisk !== null && summary.avgRisk >= 0 ? "success" : "danger"}>Win rate: {summary.winRate.toFixed(1)}%</Badge>}
         {summary.avgRisk !== null && <Badge>Матожидание: {formatRisk(summary.avgRisk)} по {summary.closed} закрытым</Badge>}
@@ -742,6 +765,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
                 <TableHead numeric className="text-danger">SL</TableHead>
                 <TableHead>Закрытие</TableHead>
                 <TableHead numeric>Результат</TableHead>
+                <TableHead numeric>Депозит, х</TableHead>
                 <TableHead>Статус</TableHead>
               </TableRow>
             </TableHeader>
@@ -755,6 +779,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
                   <TableCell numeric className="text-danger">{formatPrice(row.slPrice)}</TableCell>
                   <TableCell>{formatTime(row.closeTimeUnix)}</TableCell>
                   <TableCell numeric className={(row.riskReturn ?? 0) >= 0 ? "text-success" : "text-danger"}>{formatRisk(row.riskReturn)}</TableCell>
+                  <TableCell numeric>{deposit.values.get(`${row.setup.symbol}:${row.setup.closeTimeUnix}`)?.toFixed(2) ?? "—"}</TableCell>
                   <TableCell>
                     <Badge variant={row.status === "tp" ? "success" : row.status === "sl" ? "danger" : "neutral"}>
                       {row.status === "tp" ? "TP" : row.status === "sl" ? "SL" : row.status === "unclosed" ? "не закрылась" : "нет данных"}

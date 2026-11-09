@@ -169,6 +169,23 @@ describe.skipIf(!TEST_DATABASE_URL)("platform api", () => {
     await db.deleteFrom("replay_runs").execute();
   });
 
+  it("deletes a single finished run fully and rejects active or missing runs", async () => {
+    const headers = { "x-api-key": PLATFORM_KEY };
+    const seed = { exchange_code: "bybit", category: "linear", symbol: "DELETEUSDT", from_ts: new Date(0), to_ts: new Date(60_000), algorithm_id: "price_volume_spike", algorithm_version: "1", params: DEFAULT_SPIKE_PARAMS, cache_hit: false, setups: JSON.stringify([]) as unknown as SpikeSetup[] };
+    const done = await db.insertInto("replay_runs").values({ ...seed, status: "done" }).returning("id").executeTakeFirstOrThrow();
+    const active = await db.insertInto("replay_runs").values({ ...seed, status: "running" }).returning("id").executeTakeFirstOrThrow();
+    const conflict = await app.inject({ method: "DELETE", url: `/v1/replay-runs/${active.id}`, headers });
+    expect(conflict.statusCode).toBe(409);
+    const deleted = await app.inject({ method: "DELETE", url: `/v1/replay-runs/${done.id}`, headers });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toEqual({ deleted: true, qualityIntervalsDeleted: 0 });
+    const list = await app.inject({ method: "GET", url: "/v1/replay-runs", headers });
+    expect(list.json<{ runs: { id: number }[] }>().runs.some((run) => run.id === done.id)).toBe(false);
+    expect(list.json<{ runs: { id: number }[] }>().runs.some((run) => run.id === active.id)).toBe(true);
+    expect((await app.inject({ method: "DELETE", url: `/v1/replay-runs/${done.id}`, headers })).statusCode).toBe(404);
+    await db.deleteFrom("replay_runs").execute();
+  });
+
   it("serves batch grouping, unified detail, cancel and CSV via the API", async () => {
     const headers = { "x-api-key": PLATFORM_KEY };
     await db.deleteFrom("replay_batches").execute();

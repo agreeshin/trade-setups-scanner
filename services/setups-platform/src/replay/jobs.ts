@@ -203,6 +203,23 @@ export async function purgeReplayRuns(db: Kysely<SignalsDB>): Promise<ReplayPurg
   });
 }
 
+export type ReplayRunDeleteOutcome =
+  | { status: "deleted"; qualityIntervalsDeleted: number }
+  | { status: "active" };
+
+/** Fully removes one finished run and its quality intervals; shared computation cache is untouched. */
+export async function deleteReplayRun(db: Kysely<SignalsDB>, id: number): Promise<ReplayRunDeleteOutcome | null> {
+  return db.transaction().execute(async (tx) => {
+    await sql`select pg_advisory_xact_lock(72423412)`.execute(tx);
+    const run = await tx.selectFrom("replay_runs").select("status").where("id", "=", id).executeTakeFirst();
+    if (run === undefined) return null;
+    if (run.status === "queued" || run.status === "running" || run.status === "cancel_requested") return { status: "active" };
+    const quality = await tx.deleteFrom("replay_quality_intervals").where("run_id", "=", id).returning("run_id").execute();
+    await tx.deleteFrom("replay_runs").where("id", "=", id).execute();
+    return { status: "deleted", qualityIntervalsDeleted: quality.length };
+  });
+}
+
 /** One runtime per application process; stop before destroying the DB pool. */
 export async function startReplayJobs(db: Kysely<SignalsDB>, marketData: { url: string; apiKey: string }, options: {
   pollIntervalMs?: number;

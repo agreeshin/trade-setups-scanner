@@ -331,3 +331,20 @@ it("filters trades by the display date range", async () => {
   expect(await screen.findByText(/Сделок: 2 \/ 2/)).toBeInTheDocument();
   expect(screen.queryByText("BTCUSDT")).not.toBeInTheDocument();
 }, 10_000);
+
+it("shows deposit growth per trade and a full-width daily chart", async () => {
+  stubFetch();
+  render(<AnalyticsPage />);
+  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  expect(screen.getAllByLabelText("Риск на сделку, %")[0]).toHaveValue("1");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await waitFor(() => expect(screen.getByText("Сделок: 2 / 2")).toBeInTheDocument());
+  expect(screen.getByText("Депозит, х")).toBeInTheDocument();
+  expect(screen.getByText("1.01")).toBeInTheDocument();
+  expect(screen.getByText("1.00")).toBeInTheDocument();
+  const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
+  expect(chart).toHaveClass("w-full");
+  expect(chart).not.toHaveClass("max-w-3xl");
+  fireEvent.change(screen.getAllByLabelText("Риск на сделку, %")[0]!, { target: { value: "0" } });
+  await screen.findByText("Риск на сделку должен быть числом больше 0 и не больше 100");
+}, 15_000);
