@@ -61,18 +61,15 @@ function formatDuration(minutes: number | null): string {
   return `${(minutes / (60 * 24)).toFixed(1)} дн`;
 }
 
-function matrixCellClass(risk: number | null): string {
-  if (risk === null) return "bg-muted/40 text-muted-foreground";
-  if (risk <= -0.5) return "bg-danger/20 text-danger";
-  if (risk <= -0.05) return "bg-danger/10 text-danger";
-  if (risk >= 0.2) return "bg-success/20 text-success";
-  if (risk >= 0.05) return "bg-success/10 text-success";
-  return "text-foreground";
+/** Quantizes the cell fill to one of 21 gradient steps between the slider thresholds. */
+function matrixCellFillStep(value: number, min: number, max: number): number {
+  const span = max - min;
+  const t = span > 0 ? Math.min(1, Math.max(0, (value - min) / span)) : value >= max ? 1 : 0;
+  return Math.round(t * 20);
 }
 
 interface MatrixSectionProps {
   setId: string;
-  title: string;
   description: string;
   direction: "short" | "long";
   tpLevels: number[];
@@ -80,19 +77,24 @@ interface MatrixSectionProps {
   enableMaturity: boolean;
   enableMonth: boolean;
   enablePriceChange: boolean;
+  gradientMinDefault: number;
+  gradientMaxDefault: number;
 }
 
 function MatrixSection({
-  setId, title, description, direction, tpLevels, slLevels, enableMaturity, enableMonth, enablePriceChange,
+  setId, description, direction, tpLevels, slLevels, enableMaturity, enableMonth, enablePriceChange,
+  gradientMinDefault, gradientMaxDefault,
 }: MatrixSectionProps) {
   const [maturityDraft, setMaturityDraft] = useState(0.5);
   const [maturity, setMaturity] = useState(0.5);
   const [month, setMonth] = useState("all");
   const [timeShiftInput, setTimeShiftInput] = useState("0");
-  const [timeShift, setTimeShift] = useState(0);
   const [considerPriceChange, setConsiderPriceChange] = useState(false);
   const [priceChangeInput, setPriceChangeInput] = useState("0");
-  const [priceChange, setPriceChange] = useState<number | null>(null);
+  const [gradientMinDraft, setGradientMinDraft] = useState(gradientMinDefault);
+  const [gradientMaxDraft, setGradientMaxDraft] = useState(gradientMaxDefault);
+  const [gradientMin, setGradientMin] = useState(gradientMinDefault);
+  const [gradientMax, setGradientMax] = useState(gradientMaxDefault);
   const [cells, setCells] = useState<Map<string, MatrixCellRef>>(new Map());
   const [metrics, setMetrics] = useState<SelectionMetrics | null>(null);
   const [running, setRunning] = useState(false);
@@ -141,18 +143,13 @@ function MatrixSection({
     }
   }, [setId, direction, month, maturity, enableMonth, enableMaturity, tpLevels, slLevels, totalCells]);
 
-  useEffect(() => {
-    if (setId === "") return;
-    const timer = setTimeout(() => { void run(timeShift, priceChange); }, 400);
-    return () => { clearTimeout(timer); runIdRef.current += 1; setRunning(false); };
-  }, [setId, month, maturity, timeShift, priceChange, run]);
-
-  const commitSlider = () => { setMaturity(maturityDraft); };
+  const appliedShift = Math.max(0, Math.round(parseNumberInput(timeShiftInput) ?? 0));
+  const appliedPriceChange = enablePriceChange && considerPriceChange ? (parseNumberInput(priceChangeInput) ?? 0) : null;
 
   return <Card>
     <CardContent className="grid gap-4">
       <div className="grid gap-1">
-        <h2 className="text-lg font-semibold">{title}</h2>
+        <h2 className="text-lg font-semibold">Среднее матожидание сетапов</h2>
         <p className="text-xs text-muted-foreground">{description}</p>
       </div>
       <div className="flex flex-wrap items-end gap-3">
@@ -166,9 +163,9 @@ function MatrixSection({
               step={0.1}
               value={maturityDraft}
               onChange={(event) => setMaturityDraft(Number(event.target.value))}
-              onPointerUp={commitSlider}
-              onKeyUp={commitSlider}
-              onBlur={commitSlider}
+              onPointerUp={() => setMaturity(maturityDraft)}
+              onKeyUp={() => setMaturity(maturityDraft)}
+              onBlur={() => setMaturity(maturityDraft)}
             />}
           </Field>
         )}
@@ -194,15 +191,44 @@ function MatrixSection({
             </Field>
           </>
         )}
-        <Button variant="outline" disabled={running} onClick={() => {
-          const shift = Math.max(0, Math.round(parseNumberInput(timeShiftInput) ?? 0));
-          setTimeShiftInput(String(shift));
-          setTimeShift(shift);
-          const pct = considerPriceChange ? (parseNumberInput(priceChangeInput) ?? 0) : null;
-          setPriceChange(pct);
-          void run(shift, pct);
-        }}>Рассчитать</Button>
+        <Button disabled={running || setId === ""} onClick={() => { void run(appliedShift, appliedPriceChange); }}>{running ? "Расчёт…" : "Рассчитать"}</Button>
         {progress.total > 0 && <Badge variant={progress.done >= progress.total ? "success" : "info"}>Ячеек: {progress.done} / {progress.total}</Badge>}
+      </div>
+      <div className="flex flex-wrap items-center gap-6 text-sm">
+        <label className="flex items-center gap-2">
+          <span className="text-muted-foreground">Красный при ≤</span>
+          <input
+            type="range"
+            min={-1}
+            max={1}
+            step={0.05}
+            aria-label="Красный при"
+            className="h-2 w-36 cursor-pointer appearance-none rounded-lg bg-muted"
+            value={gradientMinDraft}
+            onChange={(event) => setGradientMinDraft(Number(event.target.value))}
+            onPointerUp={() => setGradientMin(gradientMinDraft)}
+            onKeyUp={() => setGradientMin(gradientMinDraft)}
+            onBlur={() => setGradientMin(gradientMinDraft)}
+          />
+          <span className="tabular-nums">{gradientMinDraft.toFixed(2)}</span>
+        </label>
+        <label className="flex items-center gap-2">
+          <span className="text-muted-foreground">Зелёный при ≥</span>
+          <input
+            type="range"
+            min={-1}
+            max={1}
+            step={0.05}
+            aria-label="Зелёный при"
+            className="h-2 w-36 cursor-pointer appearance-none rounded-lg bg-muted"
+            value={gradientMaxDraft}
+            onChange={(event) => setGradientMaxDraft(Number(event.target.value))}
+            onPointerUp={() => setGradientMax(gradientMaxDraft)}
+            onKeyUp={() => setGradientMax(gradientMaxDraft)}
+            onBlur={() => setGradientMax(gradientMaxDraft)}
+          />
+          <span className="tabular-nums">{gradientMaxDraft.toFixed(2)}</span>
+        </label>
       </div>
       {enableMaturity && <p className="text-xs text-muted-foreground">0 — первый сетап кластера, 1 — последний, 0.5 — середина. Соседние сигналы одной монеты с разрывом до 8 часов образуют кластер.</p>}
       {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
@@ -227,8 +253,19 @@ function MatrixSection({
                 <TableHead numeric>{tp}%</TableHead>
                 {slLevels.map((sl) => {
                   const cell = cells.get(`${tp}:${sl}`);
-                  return <TableCell key={sl} numeric className={cell ? matrixCellClass(cell.riskExpectancy) : "bg-muted/40 text-muted-foreground"} title={cell ? `avg ${cell.avgMovePct?.toFixed(2) ?? "—"}% · R ${cell.riskExpectancy?.toFixed(3) ?? "—"}` : undefined}>
-                    {cell ? (cell.riskExpectancy === null ? "—" : cell.riskExpectancy.toFixed(2)) : running ? "…" : "·"}
+                  if (cell === undefined) {
+                    return <TableCell key={sl} numeric className="bg-muted/20 text-muted-foreground">{running ? "…" : "·"}</TableCell>;
+                  }
+                  if (cell.riskExpectancy === null) {
+                    return <TableCell key={sl} numeric className="bg-muted/40 text-muted-foreground" title={`avg —% · R —`}>—</TableCell>;
+                  }
+                  return <TableCell
+                    key={sl}
+                    numeric
+                    className={`tabular-nums analytics-cell-fill-${matrixCellFillStep(cell.riskExpectancy, gradientMin, gradientMax)}`}
+                    title={`avg ${cell.avgMovePct?.toFixed(2) ?? "—"}% · R ${cell.riskExpectancy.toFixed(3)}`}
+                  >
+                    {cell.riskExpectancy.toFixed(2)}
                   </TableCell>;
                 })}
               </TableRow>
@@ -236,7 +273,7 @@ function MatrixSection({
           </TableBody>
         </Table>
       </div>
-      <p className="text-xs text-muted-foreground">Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок. Спорная свеча считается Stop Loss.</p>
+      <p className="text-xs text-muted-foreground">Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок. Спорная свеча считается Stop Loss. Заливка интерполируется от красного к зелёному между порогами ползунков.</p>
     </CardContent>
   </Card>;
 }
@@ -244,25 +281,188 @@ function MatrixSection({
 function MonthOptions({ setId }: { setId: string }) {
   const [months, setMonths] = useState<string[]>([]);
   useEffect(() => {
-    if (setId === "") return;
     let cancelled = false;
-    void fetchAnalyticsMonths(setId).then((items) => { if (!cancelled) setMonths(items); }).catch(() => undefined);
+    void fetchAnalyticsMonths(setId)
+      .then((items) => { if (!cancelled) setMonths(items); })
+      .catch(() => undefined);
     return () => { cancelled = true; };
   }, [setId]);
   return <>{months.map((month) => <option key={month} value={month}>{month}</option>)}</>;
 }
 
+interface TradeRowWithSource extends TradeRow {
+  fromCache: boolean;
+}
+
+interface DailyExpectancyPoint {
+  day: string;
+  riskExpectancy: number | null;
+  closedCount: number;
+  tpCount: number;
+  slCount: number;
+  computedCount: number;
+  cachedCount: number;
+}
+
+/** Groups closed trades into local-day points, like the reference project. */
+function buildDailyExpectancy(rows: TradeRowWithSource[]): DailyExpectancyPoint[] {
+  const buckets = new Map<string, { values: number[]; closedCount: number; tpCount: number; slCount: number; computedCount: number; cachedCount: number }>();
+  for (const row of rows) {
+    const day = new Date(row.setup.closeTimeUnix * 1000).toLocaleDateString("en-CA");
+    const bucket = buckets.get(day) ?? { values: [], closedCount: 0, tpCount: 0, slCount: 0, computedCount: 0, cachedCount: 0 };
+    bucket.computedCount += 1;
+    if (row.fromCache) bucket.cachedCount += 1;
+    if (row.riskReturn !== null) {
+      bucket.values.push(row.riskReturn);
+      bucket.closedCount += 1;
+      if (row.status === "tp") bucket.tpCount += 1;
+      else if (row.status === "sl") bucket.slCount += 1;
+    }
+    buckets.set(day, bucket);
+  }
+  return Array.from(buckets.entries())
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([day, bucket]) => ({
+      day,
+      riskExpectancy: bucket.values.length > 0 ? bucket.values.reduce((a, b) => a + b, 0) / bucket.values.length : null,
+      closedCount: bucket.closedCount,
+      tpCount: bucket.tpCount,
+      slCount: bucket.slCount,
+      computedCount: bucket.computedCount,
+      cachedCount: bucket.cachedCount,
+    }));
+}
+
+function dayLabel(day: string): string {
+  const [, month, dayNumber] = day.split("-");
+  return `${dayNumber}.${month}`;
+}
+
+/** Daily risk-expectancy line chart with a regression trend, ported from the reference project. */
+function DailyExpectancyChart({ items }: { items: DailyExpectancyPoint[] }) {
+  if (items.length === 0) {
+    return <p className="text-xs text-muted-foreground">График появится после расчёта первых строк.</p>;
+  }
+  const values = items.map((item) => item.riskExpectancy).filter((value): value is number => value !== null && Number.isFinite(value));
+  if (values.length === 0) {
+    return <p className="text-xs text-muted-foreground">Пока нет дней с закрытыми TP/SL сделками.</p>;
+  }
+  const width = 760;
+  const height = 280;
+  const left = 64;
+  const right = 24;
+  const top = 24;
+  const bottom = 56;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const minValue = Math.min(0, ...values);
+  const maxValue = Math.max(0, ...values);
+  const padding = Math.max(0.1, (maxValue - minValue) * 0.08);
+  const yMin = minValue === maxValue ? minValue - 0.5 : minValue - padding;
+  const yMax = minValue === maxValue ? maxValue + 0.5 : maxValue + padding;
+  const yRange = yMax - yMin;
+  const xForIndex = (index: number) => left + (items.length === 1 ? plotWidth / 2 : (index / (items.length - 1)) * plotWidth);
+  const yForValue = (value: number) => top + ((yMax - value) / yRange) * plotHeight;
+  const zeroY = yMin <= 0 && yMax >= 0 ? yForValue(0) : null;
+  const labelStep = Math.max(1, Math.ceil(items.length / 8));
+  const segments: string[][] = [];
+  let current: string[] = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index]!;
+    if (item.riskExpectancy === null || !Number.isFinite(item.riskExpectancy)) {
+      if (current.length > 0) { segments.push(current); current = []; }
+      continue;
+    }
+    current.push(`${xForIndex(index)},${yForValue(item.riskExpectancy)}`);
+  }
+  if (current.length > 0) segments.push(current);
+
+  const trendPoints = items
+    .map((item, index) => ({ index, value: item.riskExpectancy }))
+    .filter((point): point is { index: number; value: number } => point.value !== null && Number.isFinite(point.value));
+  let trendLine: { x1: number; y1: number; x2: number; y2: number; slope: number; totalChange: number } | null = null;
+  if (trendPoints.length > 1) {
+    const count = trendPoints.length;
+    const meanX = trendPoints.reduce((sum, point) => sum + point.index, 0) / count;
+    const meanY = trendPoints.reduce((sum, point) => sum + point.value, 0) / count;
+    let covariance = 0;
+    let variance = 0;
+    for (const point of trendPoints) {
+      covariance += (point.index - meanX) * (point.value - meanY);
+      variance += (point.index - meanX) ** 2;
+    }
+    if (variance > 0) {
+      const slope = covariance / variance;
+      const trendYAt = (index: number) => meanY + slope * (index - meanX);
+      const first = trendPoints[0]!;
+      const last = trendPoints[count - 1]!;
+      trendLine = {
+        x1: xForIndex(first.index),
+        y1: yForValue(trendYAt(first.index)),
+        x2: xForIndex(last.index),
+        y2: yForValue(trendYAt(last.index)),
+        slope,
+        totalChange: trendYAt(last.index) - trendYAt(first.index),
+      };
+    }
+  }
+
+  return (
+    <svg className="w-full max-w-3xl" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание в рисках">
+      <line className="stroke-muted-foreground/40" x1={left} y1={top} x2={left} y2={height - bottom} />
+      <line className="stroke-muted-foreground/40" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
+      {zeroY !== null ? <line className="stroke-muted-foreground/50" x1={left} y1={zeroY} x2={width - right} y2={zeroY} /> : null}
+      {[yMin, (yMin + yMax) / 2, yMax].map((value) => (
+        <g key={value.toFixed(4)}>
+          <line className="stroke-muted-foreground/20" x1={left} y1={yForValue(value)} x2={width - right} y2={yForValue(value)} />
+          <text className="fill-muted-foreground text-[10px]" x={left - 10} y={yForValue(value) + 4} textAnchor="end">{formatRisk(value)}</text>
+        </g>
+      ))}
+      {segments.map((segment, index) =>
+        segment.length > 1 ? <polyline key={index} className="fill-none stroke-primary stroke-2" points={segment.join(" ")} /> : null,
+      )}
+      {trendLine !== null ? (
+        <line
+          className="stroke-warning"
+          strokeWidth={2}
+          strokeDasharray="4 4"
+          x1={trendLine.x1} y1={trendLine.y1} x2={trendLine.x2} y2={trendLine.y2}
+        >
+          <title>{`Тренд дневного матожидания: ${formatRisk(trendLine.slope)}/день, за период ${formatRisk(trendLine.totalChange)}`}</title>
+        </line>
+      ) : null}
+      {items.map((item, index) => {
+        const x = xForIndex(index);
+        const showLabel = index % labelStep === 0 || index === items.length - 1;
+        return (
+          <g key={item.day}>
+            {item.riskExpectancy !== null && Number.isFinite(item.riskExpectancy) ? (
+              <circle
+                className={item.riskExpectancy >= 0 ? "fill-success" : "fill-danger"}
+                cx={x} cy={yForValue(item.riskExpectancy)} r={4}
+              >
+                <title>
+                  {`${dayLabel(item.day)}: ${formatRisk(item.riskExpectancy)}, закрыто ${item.closedCount}, TP ${item.tpCount}, SL ${item.slCount}, из кеша ${item.cachedCount}/${item.computedCount}`}
+                </title>
+              </circle>
+            ) : null}
+            {showLabel ? <text className="fill-muted-foreground text-[10px]" x={x} y={height - 26} textAnchor="middle">{dayLabel(item.day)}</text> : null}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
 interface TradesSectionProps {
   setId: string;
-  title: string;
   description: string;
-  fixedDirection: "short" | "long" | null;
+  direction: "short" | "long";
   enableMaturity: boolean;
   enablePriceChange: boolean;
 }
 
-function TradesSection({ setId, title, description, fixedDirection, enableMaturity, enablePriceChange }: TradesSectionProps) {
-  const [direction, setDirection] = useState<"short" | "long">(fixedDirection ?? "long");
+function TradesSection({ setId, description, direction, enableMaturity, enablePriceChange }: TradesSectionProps) {
   const [tpInput, setTpInput] = useState("4");
   const [slInput, setSlInput] = useState("4");
   const [timeShiftInput, setTimeShiftInput] = useState("0");
@@ -272,7 +472,7 @@ function TradesSection({ setId, title, description, fixedDirection, enableMaturi
   const [priceChangeInput, setPriceChangeInput] = useState("0");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
-  const [rows, setRows] = useState<TradeRow[]>([]);
+  const [rows, setRows] = useState<TradeRowWithSource[]>([]);
   const [filteredCount, setFilteredCount] = useState(0);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
@@ -305,7 +505,7 @@ function TradesSection({ setId, title, description, fixedDirection, enableMaturi
       const bulk = await fetchTradeRows(params);
       if (stale()) return;
       const cachedByKey = new Map(bulk.items.map((row) => [`${row.setup.symbol}:${row.setup.closeTimeUnix}`, row]));
-      const collected: TradeRow[] = [];
+      const collected: TradeRowWithSource[] = [];
       let filtered = 0;
       let done = 0;
       const flush = () => {
@@ -315,16 +515,21 @@ function TradesSection({ setId, title, description, fixedDirection, enableMaturi
       };
       for (const setup of setups) {
         const key = `${setup.symbol}:${setup.closeTimeUnix}`;
-        let row = cachedByKey.get(key);
-        if (row === undefined) {
+        const cachedRow = cachedByKey.get(key);
+        let row: TradeRow;
+        let fromCache = true;
+        if (cachedRow === undefined) {
           row = await fetchTradeRow(setup, params);
           if (stale()) return;
+          fromCache = false;
+        } else {
+          row = cachedRow;
         }
         done += 1;
         if (row.status === "price_change_filtered") {
           filtered += 1;
         } else {
-          collected.push(row);
+          collected.push({ ...row, fromCache });
         }
         flush();
       }
@@ -351,26 +556,18 @@ function TradesSection({ setId, title, description, fixedDirection, enableMaturi
     const tp = closed.filter((row) => row.status === "tp");
     const risks = closed.map((row) => row.riskReturn).filter((value): value is number => value !== null);
     const avgRisk = risks.length > 0 ? risks.reduce((a, b) => a + b, 0) / risks.length : null;
-    return {
-      closed: closed.length,
-      winRate: closed.length > 0 ? (tp.length / closed.length) * 100 : null,
-      avgRisk,
-    };
+    return { closed: closed.length, winRate: closed.length > 0 ? (tp.length / closed.length) * 100 : null, avgRisk };
   }, [visibleRows]);
+
+  const dailyPoints = useMemo(() => buildDailyExpectancy(visibleRows), [visibleRows]);
 
   return <Card>
     <CardContent className="grid gap-4">
       <div className="grid gap-1">
-        <h2 className="text-lg font-semibold">{title}</h2>
+        <h2 className="text-lg font-semibold">Матожидание по сетапам</h2>
         <p className="text-xs text-muted-foreground">{description}</p>
       </div>
       <div className="flex flex-wrap items-end gap-3">
-        {fixedDirection === null && (
-          <SegmentedList role="tablist" aria-label="Направление сделки">
-            <SegmentedTrigger role="tab" aria-selected={direction === "short"} onClick={() => setDirection("short")}>SHORT</SegmentedTrigger>
-            <SegmentedTrigger role="tab" aria-selected={direction === "long"} onClick={() => setDirection("long")}>LONG</SegmentedTrigger>
-          </SegmentedList>
-        )}
         <Field label="TP, %" className="w-28">
           {(control) => <Input {...control} inputMode="decimal" value={tpInput} onChange={(event) => setTpInput(event.target.value)} />}
         </Field>
@@ -422,6 +619,7 @@ function TradesSection({ setId, title, description, fixedDirection, enableMaturi
         {summary.avgRisk !== null && <Badge>Матожидание: {formatRisk(summary.avgRisk)} по {summary.closed} закрытым</Badge>}
         {filteredCount > 0 && <Badge variant="warning">Отфильтровано смещением цены: {filteredCount}</Badge>}
       </div>
+      {rows.length > 0 && <DailyExpectancyChart items={dailyPoints} />}
       {rows.length === 0 && !running && !error && <EmptyState title="Нет рассчитанных сделок" description="Выберите параметры и нажмите «Рассчитать». Сначала загружаются кешированные строки, затем досчитываются остальные." />}
       {rows.length > 0 && (
         <div className="overflow-x-auto">
@@ -468,7 +666,6 @@ function AnalyticsCacheCard() {
   const [state, setState] = useState<"loading" | "ready" | "error">("loading");
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-
   const [reloadToken, setReloadToken] = useState(0);
 
   useEffect(() => {
@@ -539,19 +736,26 @@ function AnalyticsCacheCard() {
   </Card>;
 }
 
+type AnalyticsSection = "short" | "long" | "cache";
+
 export function AnalyticsPage() {
   const [sets, setSets] = useState<AnalyticsSet[]>([]);
   const [setsState, setSetsState] = useState<"loading" | "ready" | "error">("loading");
   const [setId, setSetId] = useState("");
+  const [section, setSection] = useState<AnalyticsSection>("short");
 
   useEffect(() => {
     let cancelled = false;
-    void fetchAnalyticsSets().then((items) => {
-      if (cancelled) return;
-      setSets(items);
-      setSetsState("ready");
-      setSetId((current) => (current === "" && items.length > 0 ? (items[0]!.setId) : current));
-    }).catch(() => { if (!cancelled) setSetsState("error"); });
+    void fetchAnalyticsSets()
+      .then((items) => {
+        if (cancelled) return;
+        setSets(items);
+        setSetsState("ready");
+        setSetId((current) => (current === "" && items.length > 0 ? (items[0]!.setId) : current));
+      })
+      .catch(() => {
+        if (!cancelled) setSetsState("error");
+      });
     return () => { cancelled = true; };
   }, []);
 
@@ -577,51 +781,60 @@ export function AnalyticsPage() {
         })()}
       </CardContent>
     </Card>
+    <SegmentedList role="tablist" aria-label="Подразделы аналитики">
+      <SegmentedTrigger role="tab" aria-selected={section === "short"} onClick={() => setSection("short")}>SHORT</SegmentedTrigger>
+      <SegmentedTrigger role="tab" aria-selected={section === "long"} onClick={() => setSection("long")}>LONG</SegmentedTrigger>
+      <SegmentedTrigger role="tab" aria-selected={section === "cache"} onClick={() => setSection("cache")}>Кеш</SegmentedTrigger>
+    </SegmentedList>
     {setsState === "loading" && <Spinner label="Загрузка наборов…" />}
     {setsState === "error" && <Alert variant="destructive" role="alert">Наборы недоступны: не удалось получить список исторических запусков</Alert>}
     {setsState === "ready" && sets.length === 0 && (
       <EmptyState title="Нет наборов для аналитики" description="Аналитика работает по завершённым историческим запускам. Создайте запуск на странице «Запуски» и дождитесь его завершения." />
     )}
-    {setsState === "ready" && sets.length > 0 && setId !== "" && <>
+    <div hidden={section !== "short"} className="grid gap-4">
       <MatrixSection
         setId={setId}
-        title="Матожидание по зрелости сетапа и месяцам"
-        description="SHORT-матрица TP×SL по сетапам, выбранным из кластеров по зрелости. Месяц ограничивает исходные сигналы до кластеризации; горизонт сделки концом месяца не обрезается."
+        description="SHORT: TP×SL по сетапам, выбранным из кластеров по зрелости. Месяц ограничивает исходные сигналы до кластеризации; горизонт сделки концом месяца не обрезается."
         direction="short"
         tpLevels={SHORT_MATRIX_LEVELS}
         slLevels={SHORT_MATRIX_LEVELS}
         enableMaturity
         enableMonth
         enablePriceChange
+        gradientMinDefault={0.05}
+        gradientMaxDefault={0.2}
       />
       <TradesSection
         setId={setId}
-        title="SHORT: сделки по сетапам"
-        description="Построчный список SHORT-сделок по сетапам набора: вход по close свечи через time-shift, закрытие по TP или SL за 7 дней. Сначала показываются кешированные строки, недостающие досчитываются."
-        fixedDirection="short"
+        description="SHORT: построчные сделки — вход по close свечи через time-shift, закрытие по TP или SL за 7 дней. Сначала показываются кешированные строки, недостающие досчитываются."
+        direction="short"
         enableMaturity
         enablePriceChange
       />
+    </div>
+    <div hidden={section !== "long"} className="grid gap-4">
       <MatrixSection
         setId={setId}
-        title="Матожидание за всё время — LONG"
-        description="LONG-матрица TP×SL на всех сетапах набора или выбранного месяца. Гейт смещения цены зеркален: LONG заходит только при падении цены на заданный процент."
+        description="LONG: TP×SL на всех сетапах набора или выбранного месяца. Гейт смещения цены зеркален: LONG заходит только при падении цены на заданный процент."
         direction="long"
         tpLevels={LONG_TP_LEVELS}
         slLevels={LONG_SL_LEVELS}
         enableMaturity={false}
         enableMonth
         enablePriceChange
+        gradientMinDefault={0.05}
+        gradientMaxDefault={0.5}
       />
       <TradesSection
         setId={setId}
-        title="Сетапы: уровни закрытия"
-        description="Построчные закрытия с переключателем направления. Для каждой строки показывается цена входа, уровень TP/SL, время касания и результат в рисках."
-        fixedDirection={null}
+        description="LONG: построчные закрытия по уровням TP/SL с ценой входа, временем касания и результатом в рисках."
+        direction="long"
         enableMaturity={false}
         enablePriceChange={false}
       />
+    </div>
+    <div hidden={section !== "cache"} className="grid gap-4">
       <AnalyticsCacheCard />
-    </>}
+    </div>
   </section>;
 }

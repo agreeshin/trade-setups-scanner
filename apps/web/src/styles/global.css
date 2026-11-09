@@ -38,3 +38,26 @@ body {
   background-color: var(--color-background);
   color: var(--color-foreground);
 }
+
+/* Аналитика: заливка ячеек матрицы, 21 шаг интерполяции красный→зелёный (референс blago_bot_analysis) */
+.analytics-cell-fill-0 { background-color: rgb(248 113 113); }
+.analytics-cell-fill-1 { background-color: rgb(239 118 114); }
+.analytics-cell-fill-2 { background-color: rgb(231 124 115); }
+.analytics-cell-fill-3 { background-color: rgb(222 129 115); }
+.analytics-cell-fill-4 { background-color: rgb(213 135 116); }
+.analytics-cell-fill-5 { background-color: rgb(205 140 117); }
+.analytics-cell-fill-6 { background-color: rgb(196 146 118); }
+.analytics-cell-fill-7 { background-color: rgb(187 151 118); }
+.analytics-cell-fill-8 { background-color: rgb(178 157 119); }
+.analytics-cell-fill-9 { background-color: rgb(170 162 120); }
+.analytics-cell-fill-10 { background-color: rgb(161 168 121); }
+.analytics-cell-fill-11 { background-color: rgb(152 173 121); }
+.analytics-cell-fill-12 { background-color: rgb(144 178 122); }
+.analytics-cell-fill-13 { background-color: rgb(135 184 123); }
+.analytics-cell-fill-14 { background-color: rgb(126 189 124); }
+.analytics-cell-fill-15 { background-color: rgb(118 195 124); }
+.analytics-cell-fill-16 { background-color: rgb(109 200 125); }
+.analytics-cell-fill-17 { background-color: rgb(100 206 126); }
+.analytics-cell-fill-18 { background-color: rgb(91 211 127); }
+.analytics-cell-fill-19 { background-color: rgb(83 217 127); }
+.analytics-cell-fill-20 { background-color: rgb(74 222 128); }

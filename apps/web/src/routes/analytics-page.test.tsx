@@ -87,26 +87,38 @@ function stubFetch(options: StubOptions = {}) {
 const fullShortGrid = shortLevels.flatMap((tp) => shortLevels.map((sl) => matrixCell(tp, sl, tp === 6 && sl === 6 ? 0.17 : 0.05)));
 const fullLongGrid = longTpLevels.flatMap((tp) => longSlLevels.map((sl) => matrixCell(tp, sl, -0.3)));
 
-it("renders the set selector, fully cached matrices and the cache summary", async () => {
-  stubFetch({ shortBulk: fullShortGrid, longBulk: fullLongGrid });
+it("computes matrices only after the button press and honours subsections", async () => {
+  const calls = stubFetch({ shortBulk: fullShortGrid, longBulk: fullLongGrid });
   render(<AnalyticsPage />);
   expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
-  expect(await screen.findByText("Сетапов: 42")).toBeInTheDocument();
-  await waitFor(() => expect(screen.getAllByText("Ячеек: 196 / 196").length).toBeGreaterThan(0));
-  await waitFor(() => expect(screen.getAllByText("Ячеек: 550 / 550").length).toBeGreaterThan(0));
+  expect(screen.getByRole("heading", { name: "Среднее матожидание сетапов" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Матожидание по сетапам" })).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Кеш аналитики" })).not.toBeInTheDocument();
+  expect(calls.some((call) => call.path.startsWith("/v1/analytics/matrix"))).toBe(false);
+
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument());
   expect(screen.getAllByText("0.17").length).toBeGreaterThan(0);
-  expect(screen.getByText("Всего: 8")).toBeInTheDocument();
-  expect(screen.getByText("analytics_matrix_cache")).toBeInTheDocument();
-}, 10_000);
+
+  expect(screen.getAllByLabelText("Красный при")[0]).toHaveValue("0.05");
+  expect(screen.getAllByLabelText("Зелёный при")[0]).toHaveValue("0.2");
+
+  await userEvent.click(screen.getByRole("tab", { name: "LONG" }));
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await waitFor(() => expect(screen.getByText("Ячеек: 550 / 550")).toBeInTheDocument());
+  expect(screen.getAllByText("-0.30").length).toBeGreaterThan(0);
+  expect(screen.getAllByLabelText("Зелёный при")[1]).toHaveValue("0.5");
+}, 15_000);
 
 it("computes missing matrix cells sequentially after the bulk cache read", async () => {
   stubFetch({ shortBulk: fullShortGrid.slice(0, 1), longBulk: fullLongGrid });
   render(<AnalyticsPage />);
   expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
-  await waitFor(() => expect(screen.getAllByText("Ячеек: 196 / 196").length).toBeGreaterThan(0), { timeout: 15_000 });
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument(), { timeout: 15_000 });
 }, 30_000);
 
-it("runs the SHORT trades calculation cache-first and shows aggregates", async () => {
+it("runs the SHORT trade list cache-first and builds the daily expectancy chart", async () => {
   stubFetch();
   render(<AnalyticsPage />);
   await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
@@ -115,14 +127,18 @@ it("runs the SHORT trades calculation cache-first and shows aggregates", async (
   expect(await screen.findByText("ETHUSDT")).toBeInTheDocument();
   await waitFor(() => expect(screen.getByText("Win rate: 50.0%")).toBeInTheDocument());
   expect(screen.getByText("Матожидание: +0.00R по 2 закрытым")).toBeInTheDocument();
-  expect(screen.getAllByText("TP").length).toBeGreaterThan(0);
-  expect(screen.getAllByText("SL").length).toBeGreaterThan(0);
+  const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
+  expect(chart).toBeInTheDocument();
+  expect(chart.querySelectorAll("title").length).toBeGreaterThan(0);
 }, 10_000);
 
-it("clears the analytics cache and reports the deleted row count", async () => {
+it("keeps the cache summary in the third subsection and clears it", async () => {
   const calls = stubFetch();
   render(<AnalyticsPage />);
-  await screen.findByText("Всего: 8");
+  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  await userEvent.click(screen.getByRole("tab", { name: "Кеш" }));
+  expect(await screen.findByText("Всего: 8")).toBeInTheDocument();
+  expect(screen.getByText("analytics_matrix_cache")).toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "Очистить кеш" }));
   expect(await screen.findByText("Удалено записей: 8")).toBeInTheDocument();
   expect(calls.some((call) => call.method === "DELETE" && call.path === "/v1/analytics/cache")).toBe(true);
