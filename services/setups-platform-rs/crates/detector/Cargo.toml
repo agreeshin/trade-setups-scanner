@@ -1,0 +1,11 @@
+[package]
+name = "setups-detector"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+setups-domain = { path = "../domain" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
