@@ -7,7 +7,9 @@ import {
   aggregateLimitOutcomes,
   DEFAULT_CLUSTER_GAP_HOURS,
   DEFAULT_HORIZON_MINUTES,
+  dayRangeToUnixBounds,
   evaluateLimit,
+  filterByDayRange,
   filterByMonth,
   passesPriceChange,
   resolveEntry,
@@ -56,6 +58,7 @@ const ErrorEnvelope = Type.Object({ error: Type.String() });
 const SetIdParam = Type.String({ pattern: "^(batch|run)-[1-9][0-9]*$" });
 const DirectionParam = Type.Union([Type.Literal("short"), Type.Literal("long")]);
 const MonthParam = Type.String({ pattern: "^\\d{4}-(0[1-9]|1[0-2])$" });
+const DayParam = Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" });
 
 const NullableNumber = Type.Union([Type.Number(), Type.Null()]);
 
@@ -114,6 +117,8 @@ const AnalyticsQuery = {
   set: SetIdParam,
   direction: Type.Optional(DirectionParam),
   month: Type.Optional(MonthParam),
+  fromDay: Type.Optional(DayParam),
+  toDay: Type.Optional(DayParam),
   setupMaturity: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
   clusterGapHours: Type.Optional(Type.Number({ minimum: 0.01, maximum: 168 })),
   tpPct: Type.Optional(Type.Number({ minimum: 0.000001, maximum: 100 })),
@@ -127,6 +132,8 @@ interface AnalyticsQueryInput {
   set: string;
   direction?: TradeDirection;
   month?: string;
+  fromDay?: string;
+  toDay?: string;
   setupMaturity?: number;
   clusterGapHours?: number;
   tpPct?: number;
@@ -136,10 +143,23 @@ interface AnalyticsQueryInput {
   priceChangePct?: number;
 }
 
+export type TimeFilter =
+  | { kind: "all" }
+  | { kind: "month"; monthKey: string }
+  | { kind: "range"; fromDay: string; toDay: string };
+
+function filterSetupsByTime(setups: AnalyticsSetup[], filter: TimeFilter): AnalyticsSetup[] {
+  if (filter.kind === "month") return filterByMonth(setups, filter.monthKey);
+  if (filter.kind === "range") return filterByDayRange(setups, filter.fromDay, filter.toDay);
+  return setups;
+}
+
 interface ParsedAnalyticsParams {
   setRef: SetRef;
   direction: TradeDirection;
-  monthKey: string;
+  timeFilter: TimeFilter;
+  /** Cache dimension of the time filter: "all", "YYYY-MM" or "d:FROM:TO". */
+  cacheTimeKey: string;
   maturity: number | null;
   maturityTenths: number;
   clusterGapMinutes: number;
@@ -168,6 +188,22 @@ function parseAnalyticsQuery(query: AnalyticsQueryInput, requireTpSl: boolean): 
   if (clusterGapMinutes < 1 || clusterGapMinutes > 168 * 60) {
     return { error: "clusterGapHours must be 0.01..168" };
   }
+  if ((query.fromDay === undefined) !== (query.toDay === undefined)) {
+    return { error: "fromDay and toDay must be set together" };
+  }
+  let timeFilter: TimeFilter = { kind: "all" };
+  let cacheTimeKey = "all";
+  if (query.fromDay !== undefined && query.toDay !== undefined) {
+    const bounds = dayRangeToUnixBounds(query.fromDay, query.toDay);
+    if (bounds === null || bounds.fromUnix > bounds.toUnix) {
+      return { error: "invalid fromDay/toDay range" };
+    }
+    timeFilter = { kind: "range", fromDay: query.fromDay, toDay: query.toDay };
+    cacheTimeKey = `d:${query.fromDay}:${query.toDay}`;
+  } else if (query.month !== undefined) {
+    timeFilter = { kind: "month", monthKey: query.month };
+    cacheTimeKey = query.month;
+  }
   const maturity = query.setupMaturity ?? null;
   const effectiveGapMinutes = maturity !== null ? clusterGapMinutes : -1;
   const priceChangePct = query.priceChangePct ?? null;
@@ -179,7 +215,8 @@ function parseAnalyticsQuery(query: AnalyticsQueryInput, requireTpSl: boolean): 
   return {
     setRef,
     direction,
-    monthKey: query.month ?? "all",
+    timeFilter,
+    cacheTimeKey,
     maturity,
     maturityTenths: maturityTenthsOf(maturity),
     clusterGapMinutes: effectiveGapMinutes,
@@ -220,10 +257,10 @@ async function selectSetupRows(
   setups: AnalyticsSetup[],
   params: ParsedAnalyticsParams,
 ): Promise<SelectionResult> {
-  const inMonth = params.monthKey === "all" ? setups : filterByMonth(setups, params.monthKey);
+  const inScope = filterSetupsByTime(setups, params.timeFilter);
   if (params.maturity === null) {
     return {
-      rows: inMonth,
+      rows: inScope,
       avgSelectionOrdinal: null,
       avgSelectionDelayMinutes: null,
       totalClustersCount: null,
@@ -238,10 +275,10 @@ async function selectSetupRows(
     firstSetupUnix: fingerprint.first,
     lastSetupUnix: fingerprint.last,
   });
-  const cached = await getSelection(db, scopeKey, params.maturityTenths, params.clusterGapMinutes, params.monthKey).catch(() => undefined);
+  const cached = await getSelection(db, scopeKey, params.maturityTenths, params.clusterGapMinutes, params.cacheTimeKey).catch(() => undefined);
   if (cached !== undefined && Array.isArray(cached.identities)) {
     const identities = new Set(cached.identities as string[]);
-    const rows = inMonth.filter((setup) => identities.has(identityOf(setup)));
+    const rows = inScope.filter((setup) => identities.has(identityOf(setup)));
     return {
       rows,
       avgSelectionOrdinal: (cached.avgSelectionOrdinal as number | null) ?? null,
@@ -250,8 +287,8 @@ async function selectSetupRows(
       cachedSelection: true,
     };
   }
-  const selection = selectByMaturity(inMonth, params.maturity, params.clusterGapMinutes * 60);
-  await saveSelection(db, scopeKey, params.maturityTenths, params.clusterGapMinutes, params.monthKey, {
+  const selection = selectByMaturity(inScope, params.maturity, params.clusterGapMinutes * 60);
+  await saveSelection(db, scopeKey, params.maturityTenths, params.clusterGapMinutes, params.cacheTimeKey, {
     identities: selection.rows.map(identityOf),
     avgSelectionOrdinal: selection.avgSelectionOrdinal,
     avgSelectionDelayMinutes: selection.avgSelectionDelayMinutes,
@@ -383,7 +420,7 @@ function aggregatePayload(
     tpPct: params.tpPct,
     slPct: params.slPct,
     direction: params.direction,
-    month: params.monthKey === "all" ? null : params.monthKey,
+    month: params.timeFilter.kind === "month" ? params.timeFilter.monthKey : null,
     setupMaturity: params.maturity,
     timeShiftMinutes: params.timeShiftMinutes,
     horizonMinutes: params.horizonMinutes,
@@ -443,6 +480,8 @@ export function registerAnalyticsRoutes(app: FastifyInstance, options: Analytics
         set: SetIdParam,
         setupMaturity: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
         month: Type.Optional(MonthParam),
+        fromDay: Type.Optional(DayParam),
+        toDay: Type.Optional(DayParam),
       }),
       response: {
         200: Type.Object({
@@ -458,23 +497,25 @@ export function registerAnalyticsRoutes(app: FastifyInstance, options: Analytics
       },
     },
   }, async (request, reply) => {
-    const query = request.query as { set: string; setupMaturity?: number; month?: string };
+    const query = request.query as { set: string; setupMaturity?: number; month?: string; fromDay?: string; toDay?: string };
     const parsed = parseAnalyticsQuery({
       set: query.set,
       ...(query.setupMaturity !== undefined ? { setupMaturity: query.setupMaturity } : {}),
       ...(query.month !== undefined ? { month: query.month } : {}),
+      ...(query.fromDay !== undefined ? { fromDay: query.fromDay } : {}),
+      ...(query.toDay !== undefined ? { toDay: query.toDay } : {}),
     }, false);
     const loaded = await loadSetOrError(parsed);
     if ("error" in loaded) return reply.code(400).send({ error: loaded.error });
     const { params, setups } = loaded;
-    const inMonth = params.monthKey === "all" ? setups : filterByMonth(setups, params.monthKey);
+    const inScope = filterSetupsByTime(setups, params.timeFilter);
     const selection = await selectSetupRows(db, setups, params);
     return {
       setups: selection.rows.map((setup) => ({
         exchange: setup.exchangeCode, category: setup.category, symbol: setup.symbol,
         openTimeUnix: setup.openTimeUnix, closeTimeUnix: setup.closeTimeUnix, closePrice: setup.closePrice,
       })),
-      totalMatchingSetups: inMonth.length,
+      totalMatchingSetups: inScope.length,
       avgSelectionOrdinal: selection.avgSelectionOrdinal,
       avgSelectionDelayMinutes: selection.avgSelectionDelayMinutes,
       totalClustersCount: selection.totalClustersCount,
@@ -503,7 +544,7 @@ export function registerAnalyticsRoutes(app: FastifyInstance, options: Analytics
     const loaded = await loadSetOrError(parsed);
     if ("error" in loaded) return reply.code(400).send({ error: loaded.error });
     const { params, setups } = loaded;
-    const inMonth = params.monthKey === "all" ? setups : filterByMonth(setups, params.monthKey);
+    const inScope = filterSetupsByTime(setups, params.timeFilter);
     const selection = await selectSetupRows(db, setups, params);
     const scope = await computeScope(reader, setups, params);
     const rows = await listMatrixCells(db, matrixScopeKey(scope), {
@@ -513,7 +554,7 @@ export function registerAnalyticsRoutes(app: FastifyInstance, options: Analytics
       priceChangePpm: params.priceChangePpm,
       maturityTenths: params.maturityTenths,
       clusterGapMinutes: params.clusterGapMinutes,
-    }, params.monthKey).catch(() => []);
+    }, params.cacheTimeKey).catch(() => []);
     return {
       items: rows.map((row) => ({
         tpPct: row.tpPct,
@@ -521,7 +562,7 @@ export function registerAnalyticsRoutes(app: FastifyInstance, options: Analytics
         avgMovePct: (row.payload.avgMovePct as number | null) ?? null,
         riskExpectancy: (row.payload.riskExpectancy as number | null) ?? null,
       })),
-      totalMatchingSetups: inMonth.length,
+      totalMatchingSetups: inScope.length,
       filteredSetupsCount: selection.rows.length,
       avgSelectionOrdinal: selection.avgSelectionOrdinal,
       avgSelectionDelayMinutes: selection.avgSelectionDelayMinutes,
@@ -546,20 +587,20 @@ export function registerAnalyticsRoutes(app: FastifyInstance, options: Analytics
     if (setups.length > MAX_SETUPS_PER_COMPUTE) {
       return reply.code(400).send({ error: `set is too large for one computation (${setups.length} setups)` });
     }
-    const inMonth = params.monthKey === "all" ? setups : filterByMonth(setups, params.monthKey);
+    const inScope = filterSetupsByTime(setups, params.timeFilter);
     const selection = await selectSetupRows(db, setups, params);
     const scope = await computeScope(reader, setups, params);
     const scopeKey = matrixScopeKey(scope);
     const cached = setups.length > 0
-      ? await getMatrixCell(db, scopeKey, params.compute, params.monthKey).catch(() => undefined)
+      ? await getMatrixCell(db, scopeKey, params.compute, params.cacheTimeKey).catch(() => undefined)
       : undefined;
     if (cached !== undefined) {
       return { ...cached, cached: true, cachedSelection: selection.cachedSelection };
     }
     const { evaluations, eligibleCount, filteredCount } = await evaluateRows(reader, selection.rows, params);
-    const payload = aggregatePayload(params, selection, inMonth.length, eligibleCount, filteredCount, evaluations);
+    const payload = aggregatePayload(params, selection, inScope.length, eligibleCount, filteredCount, evaluations);
     if (setups.length > 0) {
-      await saveMatrixCell(db, scopeKey, params.compute, params.monthKey, payload).catch(() => undefined);
+      await saveMatrixCell(db, scopeKey, params.compute, params.cacheTimeKey, payload).catch(() => undefined);
     }
     return { ...payload, cached: false, cachedSelection: selection.cachedSelection };
   });

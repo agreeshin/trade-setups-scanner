@@ -59,8 +59,9 @@ function stubFetch(options: StubOptions = {}) {
       return json({ ...matrixCell(tpPct, slPct, tpPct / slPct), cached: false, cachedSelection: true, closedCount: 4, tpCount: 3, slCount: 1 });
     }
     if (path.startsWith("/v1/analytics/trades/")) {
-      const symbol = decodeURIComponent(path.split("/")[4] ?? "");
-      const closeTimeUnix = Number(path.split("/")[5]);
+      const pathname = path.split("?")[0]!;
+      const symbol = decodeURIComponent(pathname.split("/")[4] ?? "");
+      const closeTimeUnix = Number(pathname.split("/")[5]);
       const status = symbol === "BTCUSDT" ? "tp" : "sl";
       return json({
         setup: { ...setupA, symbol, closeTimeUnix },
@@ -102,6 +103,9 @@ it("computes matrices only after the button press and honours subsections", asyn
   expect(screen.getAllByRole("checkbox", { name: "Кластеризовать сетапы" }).length).toBeGreaterThan(0);
   expect(screen.getAllByLabelText("Зрелость сетапа в кластере: 0.5").length).toBeGreaterThan(0);
   expect(screen.getAllByLabelText("Разрыв кластера, ч")[0]).toHaveValue("8");
+  expect(screen.getAllByLabelText("Период")[0]).toHaveValue("all");
+  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2023-11-14");
+  expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2023-11-15");
   expect(screen.getByRole("heading", { name: "Среднее матожидание сетапов" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "Матожидание по сетапам" })).toBeInTheDocument();
   expect(screen.queryByRole("heading", { name: "Кеш аналитики" })).not.toBeInTheDocument();
@@ -181,6 +185,26 @@ it("disables maturity and sends no clustering params when the checkbox is off", 
   expect(screen.getAllByText("Сетапов: 42").length).toBe(2);
 }, 10_000);
 
+it("syncs the month selector with the date pair", async () => {
+  const calls = stubFetch({ shortBulk: fullShortGrid });
+  render(<AnalyticsPage />);
+  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  fireEvent.change(screen.getAllByLabelText("Период")[0]!, { target: { value: "2024-01" } });
+  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2024-01-01");
+  expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2024-01-31");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument());
+  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-cells").every((call) => call.search.includes("month=2024-01") && !call.search.includes("fromDay")));
+
+  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2024-01-10" } });
+  expect(screen.getAllByLabelText("Период")[0]).toHaveValue("custom");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument());
+  const customCalls = calls.filter((call) => call.path === "/v1/analytics/matrix-cells" && call.search.includes("fromDay=2024-01-10"));
+  expect(customCalls.length).toBeGreaterThan(0);
+  expect(customCalls.every((call) => call.search.includes("toDay=2024-01-31") && !call.search.includes("month="))).toBe(true);
+}, 10_000);
+
 it("runs the SHORT trade list cache-first and builds the daily expectancy chart", async () => {
   stubFetch();
   render(<AnalyticsPage />);
@@ -217,7 +241,8 @@ it("filters trades by the display date range", async () => {
   stubFetch();
   render(<AnalyticsPage />);
   await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
-  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2124-01-01" } });
+  fireEvent.change(screen.getAllByLabelText("С даты")[1]!, { target: { value: "2124-01-01" } });
+  expect(screen.getAllByLabelText("Период")[1]).toHaveValue("custom");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
   expect(await screen.findByText(/Сделок: 2 \/ 2/)).toBeInTheDocument();
   expect(screen.queryByText("BTCUSDT")).not.toBeInTheDocument();

@@ -75,22 +75,20 @@ interface MatrixSectionProps {
   direction: "short" | "long";
   tpLevels: number[];
   slLevels: number[];
-  enableMaturity: boolean;
-  enableMonth: boolean;
   enablePriceChange: boolean;
   gradientMinDefault: number;
   gradientMaxDefault: number;
+  clusterize: boolean;
+  maturity: number;
+  clusterGapHours: number | null;
+  setBounds: { from: string; to: string } | null;
 }
 
 function MatrixSection({
-  setId, description, direction, tpLevels, slLevels, enableMaturity, enableMonth, enablePriceChange,
-  gradientMinDefault, gradientMaxDefault,
+  setId, description, direction, tpLevels, slLevels, enablePriceChange,
+  gradientMinDefault, gradientMaxDefault, clusterize, maturity, clusterGapHours, setBounds,
 }: MatrixSectionProps) {
-  const [clusterize, setClusterize] = useState(true);
-  const [clusterGapInput, setClusterGapInput] = useState("8");
-  const [maturityDraft, setMaturityDraft] = useState(0.5);
-  const [maturity, setMaturity] = useState(0.5);
-  const [month, setMonth] = useState("all");
+  const [timeRange, setTimeRange] = useState<TimeRangeValue>({ mode: "all", month: "all", fromDay: null, toDay: null });
   const [timeShiftInput, setTimeShiftInput] = useState("0");
   const [considerPriceChange, setConsiderPriceChange] = useState(false);
   const [priceChangeInput, setPriceChangeInput] = useState("0");
@@ -107,7 +105,6 @@ function MatrixSection({
   const runIdRef = useRef(0);
 
   const totalCells = tpLevels.length * slLevels.length;
-  const appliedClusterGapHours = parseNumberInput(clusterGapInput);
 
   const stop = useCallback(() => {
     runIdRef.current += 1;
@@ -125,10 +122,10 @@ function MatrixSection({
     const baseParams = {
       set: setId,
       direction,
-      ...(enableMonth && month !== "all" ? { month } : {}),
-      ...(enableMaturity && clusterize ? {
+      ...timeRangeParams(timeRange),
+      ...(clusterize ? {
         setupMaturity: maturity,
-        ...(appliedClusterGapHours !== null && appliedClusterGapHours > 0 ? { clusterGapHours: appliedClusterGapHours } : {}),
+        ...(clusterGapHours !== null && clusterGapHours > 0 ? { clusterGapHours } : {}),
       } : {}),
       ...(shiftMinutes > 0 ? { timeShiftMinutes: shiftMinutes } : {}),
       ...(priceChangePct !== null ? { priceChangePct } : {}),
@@ -160,7 +157,7 @@ function MatrixSection({
         setPendingCell(null);
       }
     }
-  }, [setId, direction, month, maturity, clusterize, appliedClusterGapHours, enableMonth, enableMaturity, tpLevels, slLevels, totalCells]);
+  }, [setId, direction, timeRange, clusterize, maturity, clusterGapHours, tpLevels, slLevels, totalCells]);
 
   const appliedShift = Math.max(0, Math.round(parseNumberInput(timeShiftInput) ?? 0));
   const appliedPriceChange = enablePriceChange && considerPriceChange ? (parseNumberInput(priceChangeInput) ?? 0) : null;
@@ -172,40 +169,7 @@ function MatrixSection({
         <p className="text-xs text-muted-foreground">{description}</p>
       </div>
       <div className="flex flex-wrap items-end gap-3">
-        {enableMaturity && (
-          <>
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox checked={clusterize} onCheckedChange={(checked) => setClusterize(checked === true)} />
-              Кластеризовать сетапы
-            </label>
-            <Field label={`Зрелость сетапа в кластере: ${maturityDraft.toFixed(1)}`} className="w-64">
-              {(control) => <Input
-                {...control}
-                type="range"
-                min={0}
-                max={1}
-                step={0.1}
-                disabled={!clusterize}
-                value={maturityDraft}
-                onChange={(event) => setMaturityDraft(Number(event.target.value))}
-                onPointerUp={() => setMaturity(maturityDraft)}
-                onKeyUp={() => setMaturity(maturityDraft)}
-                onBlur={() => setMaturity(maturityDraft)}
-              />}
-            </Field>
-            <Field label="Разрыв кластера, ч" className="w-32">
-              {(control) => <Input {...control} inputMode="decimal" disabled={!clusterize} value={clusterGapInput} onChange={(event) => setClusterGapInput(event.target.value)} />}
-            </Field>
-          </>
-        )}
-        {enableMonth && (
-          <Field label="Месяц" className="w-44">
-            {(control) => <Select {...control} value={month} onChange={(event) => setMonth(event.target.value)}>
-              <option value="all">Всё время</option>
-              <MonthOptions setId={setId} />
-            </Select>}
-          </Field>
-        )}
+        <TimeRangeControls setId={setId} setBounds={setBounds} value={timeRange} onChange={setTimeRange} />
         <Field label="Time-shift, мин" className="w-32">
           {(control) => <Input {...control} inputMode="numeric" value={timeShiftInput} onChange={(event) => setTimeShiftInput(event.target.value)} />}
         </Field>
@@ -261,11 +225,10 @@ function MatrixSection({
           <span className="tabular-nums">{gradientMaxDraft.toFixed(2)}</span>
         </label>
       </div>
-      {enableMaturity && <p className="text-xs text-muted-foreground">0 — первый сетап кластера, 1 — последний, 0.5 — середина. Соседние сигналы одной монеты с разрывом до {(appliedClusterGapHours ?? 8).toString()} часов образуют кластер; при выключенной галочке кластеризации в расчёт входят все сетапы.</p>}
       {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
       {metrics !== null && (
         <div className="flex flex-wrap gap-2 text-xs">
-          <Badge>{enableMaturity && !clusterize ? "Сетапов" : "После кластеризации"}: {metrics.totalMatchingSetups}</Badge>
+          <Badge>{clusterize ? "После кластеризации" : "Сетапов"}: {metrics.totalMatchingSetups}</Badge>
           {metrics.avgSelectionOrdinal !== null && <Badge>Средний номер: {metrics.avgSelectionOrdinal.toFixed(2)}</Badge>}
           {metrics.avgSelectionDelayMinutes !== null && <Badge>Средняя задержка: {formatDuration(metrics.avgSelectionDelayMinutes)}</Badge>}
         </div>
@@ -322,6 +285,75 @@ function MonthOptions({ setId }: { setId: string }) {
     return () => { cancelled = true; };
   }, [setId]);
   return <>{months.map((month) => <option key={month} value={month}>{month}</option>)}</>;
+}
+
+function utcDayOf(unix: number): string {
+  return new Date(unix * 1000).toISOString().slice(0, 10);
+}
+
+function monthDayBounds(month: string): { from: string; to: string } {
+  const [year, monthNumber] = month.split("-").map(Number);
+  const lastDay = new Date(Date.UTC(year ?? 0, monthNumber ?? 0, 0)).toISOString().slice(0, 10);
+  return { from: `${month}-01`, to: lastDay };
+}
+
+/** Time filter state shared by every section: month selector synced with a date pair. */
+interface TimeRangeValue {
+  mode: "all" | "month" | "custom";
+  month: string;
+  fromDay: string | null;
+  toDay: string | null;
+}
+
+function timeRangeParams(value: TimeRangeValue): { month?: string; fromDay?: string; toDay?: string } {
+  if (value.mode === "month") return { month: value.month };
+  if (value.mode === "custom" && value.fromDay !== null && value.toDay !== null && value.fromDay !== "" && value.toDay !== "") {
+    return { fromDay: value.fromDay, toDay: value.toDay };
+  }
+  return {};
+}
+
+function timeRangeBounds(value: TimeRangeValue, setBounds: { from: string; to: string } | null): { from: string; to: string } | null {
+  if (value.mode === "custom") {
+    return value.fromDay !== null && value.toDay !== null && value.fromDay !== "" && value.toDay !== "" ? { from: value.fromDay, to: value.toDay } : null;
+  }
+  if (value.mode === "month") return monthDayBounds(value.month);
+  return setBounds;
+}
+
+/** Month selector + date pair: month choice auto-fills the dates, manual dates set the dash. */
+function TimeRangeControls({ setId, setBounds, value, onChange }: {
+  setId: string;
+  setBounds: { from: string; to: string } | null;
+  value: TimeRangeValue;
+  onChange: (next: TimeRangeValue) => void;
+}) {
+  const auto = value.mode === "month" ? monthDayBounds(value.month) : value.mode === "all" ? setBounds : null;
+  const fromValue = value.mode === "custom" ? (value.fromDay ?? "") : (auto?.from ?? "");
+  const toValue = value.mode === "custom" ? (value.toDay ?? "") : (auto?.to ?? "");
+  return <>
+    <Field label="Период" className="w-44">
+      {(control) => <Select
+        {...control}
+        value={value.mode === "custom" ? "custom" : value.month}
+        onChange={(event) => {
+          const next = event.target.value;
+          if (next === "all") onChange({ mode: "all", month: "all", fromDay: null, toDay: null });
+          else if (next !== "custom") onChange({ mode: "month", month: next, fromDay: null, toDay: null });
+        }}
+      >
+        <option value="all">Всё время</option>
+        <MonthOptions setId={setId} />
+        <option value="custom" disabled>—</option>
+      </Select>}
+    </Field>
+    <Field label="С даты" className="w-40">
+      {(control) => <Input {...control} type="date" value={fromValue} onChange={(event) => onChange({ mode: "custom", month: "custom", fromDay: event.target.value, toDay: toValue })} />}
+    </Field>
+    <Field label="По дату" className="w-40">
+      {(control) => <Input {...control} type="date" value={toValue} onChange={(event) => onChange({ mode: "custom", month: "custom", fromDay: fromValue, toDay: event.target.value })} />}
+    </Field>
+  </>;
 }
 
 interface TradeRowWithSource extends TradeRow {
@@ -492,22 +524,20 @@ interface TradesSectionProps {
   setId: string;
   description: string;
   direction: "short" | "long";
-  enableMaturity: boolean;
   enablePriceChange: boolean;
+  clusterize: boolean;
+  maturity: number;
+  clusterGapHours: number | null;
+  setBounds: { from: string; to: string } | null;
 }
 
-function TradesSection({ setId, description, direction, enableMaturity, enablePriceChange }: TradesSectionProps) {
+function TradesSection({ setId, description, direction, enablePriceChange, clusterize, maturity, clusterGapHours, setBounds }: TradesSectionProps) {
   const [tpInput, setTpInput] = useState("4");
   const [slInput, setSlInput] = useState("4");
   const [timeShiftInput, setTimeShiftInput] = useState("0");
-  const [clusterize, setClusterize] = useState(true);
-  const [clusterGapInput, setClusterGapInput] = useState("8");
-  const [maturityDraft, setMaturityDraft] = useState(0.5);
-  const [maturity, setMaturity] = useState(0.5);
+  const [timeRange, setTimeRange] = useState<TimeRangeValue>({ mode: "all", month: "all", fromDay: null, toDay: null });
   const [considerPriceChange, setConsiderPriceChange] = useState(false);
   const [priceChangeInput, setPriceChangeInput] = useState("0");
-  const [fromDate, setFromDate] = useState("");
-  const [toDate, setToDate] = useState("");
   const [rows, setRows] = useState<TradeRowWithSource[]>([]);
   const [filteredCount, setFilteredCount] = useState(0);
   const [running, setRunning] = useState(false);
@@ -515,19 +545,19 @@ function TradesSection({ setId, description, direction, enableMaturity, enablePr
   const [error, setError] = useState<string | null>(null);
   const runIdRef = useRef(0);
 
-  const appliedClusterGapHours = parseNumberInput(clusterGapInput);
   const params = useMemo(() => ({
     set: setId,
     direction,
     tpPct: parseNumberInput(tpInput) ?? 4,
     slPct: parseNumberInput(slInput) ?? 4,
     ...(Math.max(0, Math.round(parseNumberInput(timeShiftInput) ?? 0)) > 0 ? { timeShiftMinutes: Math.max(0, Math.round(parseNumberInput(timeShiftInput) ?? 0)) } : {}),
-    ...(enableMaturity && clusterize ? {
+    ...timeRangeParams(timeRange),
+    ...(clusterize ? {
       setupMaturity: maturity,
-      ...(appliedClusterGapHours !== null && appliedClusterGapHours > 0 ? { clusterGapHours: appliedClusterGapHours } : {}),
+      ...(clusterGapHours !== null && clusterGapHours > 0 ? { clusterGapHours } : {}),
     } : {}),
     ...(enablePriceChange && considerPriceChange ? { priceChangePct: parseNumberInput(priceChangeInput) ?? 0 } : {}),
-  }), [setId, direction, tpInput, slInput, timeShiftInput, maturity, clusterize, appliedClusterGapHours, enableMaturity, enablePriceChange, considerPriceChange, priceChangeInput]);
+  }), [setId, direction, tpInput, slInput, timeShiftInput, timeRange, clusterize, maturity, clusterGapHours, enablePriceChange, considerPriceChange, priceChangeInput]);
 
   const run = useCallback(async () => {
     const runId = runIdRef.current + 1;
@@ -580,16 +610,13 @@ function TradesSection({ setId, description, direction, enableMaturity, enablePr
     }
   }, [params]);
 
-  const dateBounds = useMemo(() => {
-    const from = fromDate === "" ? null : Math.floor(new Date(`${fromDate}T00:00:00`).getTime() / 1000);
-    const to = toDate === "" ? null : Math.floor(new Date(`${toDate}T23:59:59`).getTime() / 1000);
-    return { from, to };
-  }, [fromDate, toDate]);
-
-  const visibleRows = useMemo(() => rows.filter((row) => {
-    const time = row.setup.closeTimeUnix;
-    return (dateBounds.from === null || time >= dateBounds.from) && (dateBounds.to === null || time <= dateBounds.to);
-  }), [rows, dateBounds]);
+  const effectiveDays = timeRangeBounds(timeRange, setBounds);
+  const visibleRows = useMemo(() => {
+    if (effectiveDays === null) return rows;
+    const from = Math.floor(new Date(`${effectiveDays.from}T00:00:00Z`).getTime() / 1000);
+    const to = Math.floor(new Date(`${effectiveDays.to}T23:59:59Z`).getTime() / 1000);
+    return rows.filter((row) => row.setup.closeTimeUnix >= from && row.setup.closeTimeUnix <= to);
+  }, [rows, effectiveDays]);
 
   const summary = useMemo(() => {
     const closed = visibleRows.filter((row) => row.status === "tp" || row.status === "sl");
@@ -617,32 +644,7 @@ function TradesSection({ setId, description, direction, enableMaturity, enablePr
         <Field label="Time-shift, мин" className="w-32">
           {(control) => <Input {...control} inputMode="numeric" value={timeShiftInput} onChange={(event) => setTimeShiftInput(event.target.value)} />}
         </Field>
-        {enableMaturity && (
-          <>
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox checked={clusterize} onCheckedChange={(checked) => setClusterize(checked === true)} />
-              Кластеризовать сетапы
-            </label>
-            <Field label={`Зрелость сетапа в кластере: ${maturityDraft.toFixed(1)}`} className="w-64">
-              {(control) => <Input
-                {...control}
-                type="range"
-                min={0}
-                max={1}
-                step={0.1}
-                disabled={!clusterize}
-                value={maturityDraft}
-                onChange={(event) => setMaturityDraft(Number(event.target.value))}
-                onPointerUp={() => setMaturity(maturityDraft)}
-                onKeyUp={() => setMaturity(maturityDraft)}
-                onBlur={() => setMaturity(maturityDraft)}
-              />}
-            </Field>
-            <Field label="Разрыв кластера, ч" className="w-32">
-              {(control) => <Input {...control} inputMode="decimal" disabled={!clusterize} value={clusterGapInput} onChange={(event) => setClusterGapInput(event.target.value)} />}
-            </Field>
-          </>
-        )}
+        <TimeRangeControls setId={setId} setBounds={setBounds} value={timeRange} onChange={setTimeRange} />
         {enablePriceChange && (
           <>
             <label className="flex items-center gap-2 text-sm">
@@ -654,12 +656,6 @@ function TradesSection({ setId, description, direction, enableMaturity, enablePr
             </Field>
           </>
         )}
-        <Field label="С даты" className="w-40">
-          {(control) => <Input {...control} type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} />}
-        </Field>
-        <Field label="По дату" className="w-40">
-          {(control) => <Input {...control} type="date" value={toDate} onChange={(event) => setToDate(event.target.value)} />}
-        </Field>
         {running
           ? <Button variant="outline" onClick={() => { runIdRef.current += 1; setRunning(false); }}>Остановить</Button>
           : <Button disabled={setId === ""} onClick={() => { void run(); }}>Рассчитать</Button>}
@@ -795,6 +791,10 @@ export function AnalyticsPage() {
   const [setsState, setSetsState] = useState<"loading" | "ready" | "error">("loading");
   const [setId, setSetId] = useState("");
   const [section, setSection] = useState<AnalyticsSection>("short");
+  const [clusterize, setClusterize] = useState(true);
+  const [clusterGapInput, setClusterGapInput] = useState("8");
+  const [maturityDraft, setMaturityDraft] = useState(0.5);
+  const [maturity, setMaturity] = useState(0.5);
 
   useEffect(() => {
     let cancelled = false;
@@ -811,39 +811,70 @@ export function AnalyticsPage() {
     return () => { cancelled = true; };
   }, []);
 
+  const appliedClusterGapHours = parseNumberInput(clusterGapInput);
+  const activeSet = sets.find((set) => set.setId === setId);
+  const setBounds = activeSet?.fromUnix != null && activeSet?.toUnix != null
+    ? { from: utcDayOf(activeSet.fromUnix), to: utcDayOf(activeSet.toUnix) }
+    : null;
+
   return <section aria-labelledby="analytics-heading" className="grid gap-4">
     <PageHeader id="analytics-heading" title="Аналитика" description="Backtest наборов сетапов из завершённых исторических запусков: матожидание TP/SL, зрелость кластеров, построчные закрытия. Расчёты читают минутные свечи через сервис данных; результаты кешируются." />
     <Card>
-      <CardContent className="flex flex-wrap items-end gap-3">
-        <Field label="Набор сетапов" className="w-full max-w-md">
-          {(control) => (
-            <Select {...control} value={setId} disabled={setsState !== "ready"} onChange={(event) => setSetId(event.target.value)}>
-              {sets.length === 0 && <option value="">Нет завершённых запусков</option>}
-              {sets.map((set) => <option key={set.setId} value={set.setId}>{set.label}</option>)}
-            </Select>
-          )}
-        </Field>
-        {setsState === "ready" && setId !== "" && (() => {
-          const active = sets.find((set) => set.setId === setId);
-          if (active === undefined) return null;
-          return <div className="grid gap-2">
-            <div className="flex flex-wrap gap-2 text-xs">
-              <Badge>Сетапов: {active.setupCount}</Badge>
-              <Badge>{active.exchange} · {active.category}{active.symbol === null ? "" : ` · ${active.symbol}`}</Badge>
+      <CardContent className="grid gap-3">
+        <div className="flex flex-wrap items-end gap-3">
+          <Field label="Набор сетапов" className="w-full max-w-md">
+            {(control) => (
+              <Select {...control} value={setId} disabled={setsState !== "ready"} onChange={(event) => setSetId(event.target.value)}>
+                {sets.length === 0 && <option value="">Нет завершённых запусков</option>}
+                {sets.map((set) => <option key={set.setId} value={set.setId}>{set.label}</option>)}
+              </Select>
+            )}
+          </Field>
+          {setsState === "ready" && activeSet !== undefined && (
+            <div className="grid gap-2">
+              <div className="flex flex-wrap gap-2 text-xs">
+                <Badge>Сетапов: {activeSet.setupCount}</Badge>
+                <Badge>{activeSet.exchange} · {activeSet.category}{activeSet.symbol === null ? "" : ` · ${activeSet.symbol}`}</Badge>
+              </div>
+              <details>
+                <summary className="cursor-pointer font-medium">Снимок параметров запуска</summary>
+                <dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">
+                  {Object.entries(activeSet.params).map(([key, value]) => (
+                    <div key={key} className="break-words">
+                      <dt className="text-muted-foreground">{parameterLabels[key] ?? key}</dt>
+                      <dd>{value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </details>
             </div>
-            <details>
-              <summary className="cursor-pointer font-medium">Снимок параметров запуска</summary>
-              <dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">
-                {Object.entries(active.params).map(([key, value]) => (
-                  <div key={key} className="break-words">
-                    <dt className="text-muted-foreground">{parameterLabels[key] ?? key}</dt>
-                    <dd>{value}</dd>
-                  </div>
-                ))}
-              </dl>
-            </details>
-          </div>;
-        })()}
+          )}
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox checked={clusterize} onCheckedChange={(checked) => setClusterize(checked === true)} />
+            Кластеризовать сетапы
+          </label>
+          <Field label={`Зрелость сетапа в кластере: ${maturityDraft.toFixed(1)}`} className="w-64">
+            {(control) => <Input
+              {...control}
+              type="range"
+              min={0}
+              max={1}
+              step={0.1}
+              disabled={!clusterize}
+              value={maturityDraft}
+              onChange={(event) => setMaturityDraft(Number(event.target.value))}
+              onPointerUp={() => setMaturity(maturityDraft)}
+              onKeyUp={() => setMaturity(maturityDraft)}
+              onBlur={() => setMaturity(maturityDraft)}
+            />}
+          </Field>
+          <Field label="Разрыв кластера, ч" className="w-32">
+            {(control) => <Input {...control} inputMode="decimal" disabled={!clusterize} value={clusterGapInput} onChange={(event) => setClusterGapInput(event.target.value)} />}
+          </Field>
+        </div>
+        <p className="text-xs text-muted-foreground">Настройки кластеризации действуют одновременно на все разделы SHORT и LONG. 0 — первый сетап кластера, 1 — последний, 0.5 — середина; соседние сигналы одной монеты с разрывом до {(appliedClusterGapHours ?? 8).toString()} часов образуют кластер. При выключенной галочке кластеризация не выполняется — в расчёт входят все сетапы.</p>
       </CardContent>
     </Card>
     <SegmentedList role="tablist" aria-label="Подразделы аналитики">
@@ -859,43 +890,53 @@ export function AnalyticsPage() {
     <div hidden={section !== "short"} className="grid gap-4">
       <MatrixSection
         setId={setId}
-        description="SHORT: TP×SL по сетапам, выбранным из кластеров по зрелости. Месяц ограничивает исходные сигналы до кластеризации; горизонт сделки концом месяца не обрезается."
+        description="SHORT: TP×SL по сетапам, выбранным из кластеров по зрелости. Период ограничивает исходные сигналы до кластеризации; горизонт сделки концом периода не обрезается."
         direction="short"
         tpLevels={SHORT_MATRIX_LEVELS}
         slLevels={SHORT_MATRIX_LEVELS}
-        enableMaturity
-        enableMonth
         enablePriceChange
         gradientMinDefault={0.05}
         gradientMaxDefault={0.2}
+        clusterize={clusterize}
+        maturity={maturity}
+        clusterGapHours={appliedClusterGapHours}
+        setBounds={setBounds}
       />
       <TradesSection
         setId={setId}
         description="SHORT: построчные сделки — вход по close свечи через time-shift, закрытие по TP или SL за 7 дней. Сначала показываются кешированные строки, недостающие досчитываются."
         direction="short"
-        enableMaturity
         enablePriceChange
+        clusterize={clusterize}
+        maturity={maturity}
+        clusterGapHours={appliedClusterGapHours}
+        setBounds={setBounds}
       />
     </div>
     <div hidden={section !== "long"} className="grid gap-4">
       <MatrixSection
         setId={setId}
-        description="LONG: TP×SL на всех сетапах набора или выбранного месяца. Гейт смещения цены зеркален: LONG заходит только при падении цены на заданный процент."
+        description="LONG: TP×SL по сетапам набора с общими настройками кластеризации и периода. Гейт смещения цены зеркален: LONG заходит только при падении цены на заданный процент."
         direction="long"
         tpLevels={LONG_TP_LEVELS}
         slLevels={LONG_SL_LEVELS}
-        enableMaturity={false}
-        enableMonth
         enablePriceChange
         gradientMinDefault={0.05}
         gradientMaxDefault={0.5}
+        clusterize={clusterize}
+        maturity={maturity}
+        clusterGapHours={appliedClusterGapHours}
+        setBounds={setBounds}
       />
       <TradesSection
         setId={setId}
         description="LONG: построчные закрытия по уровням TP/SL с ценой входа, временем касания и результатом в рисках."
         direction="long"
-        enableMaturity={false}
         enablePriceChange={false}
+        clusterize={clusterize}
+        maturity={maturity}
+        clusterGapHours={appliedClusterGapHours}
+        setBounds={setBounds}
       />
     </div>
     <div hidden={section !== "cache"} className="grid gap-4">

@@ -349,6 +349,42 @@ describe.skipIf(!TEST_DATABASE_URL)("analytics api", () => {
     expect(tooLarge.statusCode).toBe(400);
   });
 
+  it("filters by an arbitrary day range and caches it separately from months", async () => {
+    const rangeUrl = url("/matrix-cell", {
+      set: `run-${runId}`, direction: "short", tpPct: 9, slPct: 11, horizonMinutes: 60, setupMaturity: 0.5,
+      fromDay: "2024-06-01", toDay: "2024-06-30",
+    });
+    const first = await app.inject({ method: "GET", url: rangeUrl, headers: auth });
+    expect(first.statusCode).toBe(200);
+    const body = first.json<MatrixCellBody>();
+    expect(body.cached).toBe(false);
+    expect(body.totalMatchingSetups).toBe(3); // the June trio, same subset as month=2024-06
+    const repeat = await app.inject({ method: "GET", url: rangeUrl, headers: auth });
+    expect(repeat.json<MatrixCellBody>().cached).toBe(true);
+    // The same June via the month key must not hit the range-keyed cache entry.
+    const byMonth = await app.inject({
+      method: "GET",
+      url: url("/matrix-cell", {
+        set: `run-${runId}`, direction: "short", tpPct: 9, slPct: 11, horizonMinutes: 60, setupMaturity: 0.5, month: "2024-06",
+      }),
+      headers: auth,
+    });
+    expect(byMonth.statusCode).toBe(200);
+    expect(byMonth.json<MatrixCellBody>().cached).toBe(false);
+  });
+
+  it("rejects mismatched or invalid day ranges", async () => {
+    const onlyFrom = await app.inject({
+      method: "GET", url: url("/matrix-cell", { set: `run-${runId}`, tpPct: 4, slPct: 4, fromDay: "2024-06-01" }), headers: auth,
+    });
+    expect(onlyFrom.statusCode).toBe(400);
+
+    const impossibleDay = await app.inject({
+      method: "GET", url: url("/matrix-cell", { set: `run-${runId}`, tpPct: 4, slPct: 4, fromDay: "2024-06-01", toDay: "2024-06-31" }), headers: auth,
+    });
+    expect(impossibleDay.statusCode).toBe(400);
+  });
+
   it("applies the price-change gate and reports filtered setups separately", async () => {
     const gated = await app.inject({
       method: "GET",

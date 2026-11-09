@@ -121,6 +121,24 @@ export function filterByMonth(setups: AnalyticsSetup[], monthKey: string): Analy
   return setups.filter((setup) => setup.closeTimeUnix >= start && setup.closeTimeUnix < nextMonth);
 }
 
+/** UTC unix bounds of a day range: start of fromDay .. end of toDay; null for invalid days. */
+export function dayRangeToUnixBounds(fromDay: string, toDay: string): { fromUnix: number; toUnix: number } | null {
+  const pattern = /^\d{4}-\d{2}-\d{2}$/;
+  if (!pattern.test(fromDay) || !pattern.test(toDay)) return null;
+  const fromDate = new Date(`${fromDay}T00:00:00Z`);
+  const toDate = new Date(`${toDay}T23:59:59Z`);
+  if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime())) return null;
+  if (fromDate.toISOString().slice(0, 10) !== fromDay || toDate.toISOString().slice(0, 10) !== toDay) return null;
+  return { fromUnix: Math.floor(fromDate.getTime() / 1000), toUnix: Math.floor(toDate.getTime() / 1000) };
+}
+
+/** Keep setups whose signal time falls into the inclusive UTC day range. */
+export function filterByDayRange(setups: AnalyticsSetup[], fromDay: string, toDay: string): AnalyticsSetup[] {
+  const bounds = dayRangeToUnixBounds(fromDay, toDay);
+  if (bounds === null) throw new Error(`invalid day range: ${fromDay}..${toDay}`);
+  return setups.filter((setup) => setup.closeTimeUnix >= bounds.fromUnix && setup.closeTimeUnix <= bounds.toUnix);
+}
+
 /** Group sorted-by-time setups of one instrument into clusters with gaps <= maxGapSeconds. */
 export function iterInstrumentClusters(sortedSetups: AnalyticsSetup[], maxGapSeconds: number = SETUP_CLUSTER_MAX_GAP_SECONDS): AnalyticsSetup[][] {
   const clusters: AnalyticsSetup[][] = [];
