@@ -44,14 +44,14 @@ describe("browser sessions", () => {
       const login = await app.inject({ method: "POST", url: "/v1/session", headers, payload: { apiKey: "admin-secret" } });
       expect(login.statusCode).toBe(200);
       const cookie = String(login.headers["set-cookie"]);
-      expect(cookie).toContain("HttpOnly; SameSite=Strict; Max-Age=28800");
+      expect(cookie).toContain("HttpOnly; SameSite=Strict; Max-Age=86400");
       expect(cookie).not.toContain("admin-secret");
       expect(cookie).not.toContain("Secure");
       const session = await app.inject({ url: "/v1/session", headers: { cookie } });
       expect(session.statusCode).toBe(200);
       expect(session.headers["cache-control"]).toBe("no-store");
       expect((await app.inject({ url: "/v1/session", headers: { cookie: cookie.replace("platform_session=", "platform_session=0") } })).statusCode).toBe(401);
-      vi.spyOn(Date, "now").mockReturnValue(now + 8 * 60 * 60 * 1000);
+      vi.spyOn(Date, "now").mockReturnValue(now + 24 * 60 * 60 * 1000);
       expect((await app.inject({ url: "/v1/session", headers: { cookie } })).statusCode).toBe(401);
       vi.spyOn(Date, "now").mockReturnValue(now);
       const logout = await app.inject({ method: "DELETE", url: "/v1/session", headers: { ...headers, cookie } });

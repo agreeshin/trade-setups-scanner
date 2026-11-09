@@ -3,7 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 export const API_KEY_HEADER = "x-api-key";
 const COOKIE = "platform_session";
-const SESSION_SECONDS = 8 * 60 * 60;
+const SESSION_SECONDS = 24 * 60 * 60;
 
 export function createSessionAuth(validKeys: string[]) {
   const keys = validKeys.filter(Boolean);

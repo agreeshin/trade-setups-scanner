@@ -12,7 +12,7 @@ import { Select } from "../components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { apiFetch, fetchPlatform, type PlatformState } from "../lib/platform-api";
 import { parameterLabels } from "../lib/parameter-labels";
-import { errorText, localDateInput, localTime, localTimezone, replayRange, savePreference, utcMidnightOnDateChange, writePlatform, type Algorithm, type SetupRow } from "./platform-controls";
+import { errorText, localDateInput, localTime, localTimezoneLabel, replayRange, savePreference, utcMidnightOnDateChange, writePlatform, type Algorithm, type SetupRow } from "./platform-controls";
 import { SetupTable } from "./setup-table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
 import { usePlatformPoll } from "./use-platform-poll";
@@ -52,7 +52,7 @@ function RunResultPage({ id, isBatch, offset, revision, onPage, qualityPanel, on
     {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Не удалось загрузить результаты ({state.detail})</Alert>}
     {state.kind === "ready" && <>
       <p className="mt-2 text-sm">{state.data.run.symbol} · {state.data.run.algorithmId} · {state.data.run.algorithmVersion} · {state.data.run.status}</p>
-      <p className="text-sm text-muted-foreground">{localTime(state.data.run.fromUnix)} – {localTime(state.data.run.toUnix)} ({localTimezone})</p>
+      <p className="text-sm text-muted-foreground">{localTime(state.data.run.fromUnix)} – {localTime(state.data.run.toUnix)} ({localTimezoneLabel()})</p>
       <details className="mt-3"><summary className="cursor-pointer font-medium">Снимок параметров запуска</summary><dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">{Object.entries(state.data.run.params).map(([key, value]) => <div key={key} className="break-words"><dt className="text-muted-foreground">{parameterLabels[key] ?? key}</dt><dd>{value}</dd></div>)}</dl></details>
       {state.data.run.error && <Alert variant="destructive" role="alert">{state.data.run.error}</Alert>}
       {!isBatch && <ReplayQualitySummary run={state.data.run} panel={qualityPanel} onPanel={onQualityPanel} revision={revision} />}
@@ -254,7 +254,7 @@ export function RunsPage() {
           <Field label="Начало">{(control) => <Input type="datetime-local" required disabled={!ready || busy} value={form.from} onChange={(event) => changeForm({ ...form, from: utcMidnightOnDateChange(form.from, event.target.value) })} {...control} />}</Field>
           <Field label="Конец">{(control) => <Input type="datetime-local" required disabled={!ready || busy} value={form.to} onChange={(event) => changeForm({ ...form, to: utcMidnightOnDateChange(form.to, event.target.value) })} {...control} />}</Field>
         </div>
-        <p className="text-xs text-muted-foreground">Локальное время: {localTimezone}. В API передаются Unix-секунды.</p>
+        <p className="text-xs text-muted-foreground">Локальное время: {localTimezoneLabel()}. В API передаются Unix-секунды.</p>
         {error && <Alert variant="destructive" role="alert">{error}</Alert>}
         {message && <Alert variant="success" role="status">{message}</Alert>}
         <p className="text-xs text-muted-foreground">Расчёт выполняется в фоне. Список обновляется каждые 3 секунды в видимой вкладке. Закрытие страницы не отменяет расчёт; используйте кнопку отмены.</p>
@@ -270,7 +270,7 @@ export function RunsPage() {
     {runs.kind === "unreachable" && <Alert className="mt-4" variant="destructive" role="alert">Запуски недоступны ({runs.detail})</Alert>}
     {runs.kind === "ready" && <div className="mt-4 overflow-x-auto">
       <Table>
-        <caption className="text-left text-muted-foreground">До 200 последних запусков. Время: {localTimezone}</caption>
+        <caption className="text-left text-muted-foreground">До 200 последних запусков. Время: {localTimezoneLabel()}</caption>
         <TableHeader><TableRow><TableHead>ID</TableHead><TableHead>Инструмент</TableHead><TableHead>Алгоритм</TableHead><TableHead>Статус</TableHead><TableHead>Кеш</TableHead><TableHead>Сетапов</TableHead><TableHead>Действие</TableHead></TableRow></TableHeader>
         <TableBody>{runs.data.runs.slice(0, 200).map((run) => <TableRow key={run.id}>
           <TableCell><Button variant="outline" size="sm" onClick={() => setSelected({ id: run.id, isBatch: run.isBatch === true })} aria-label={`Результаты запуска ${run.id}`}>#{run.id}</Button></TableCell>

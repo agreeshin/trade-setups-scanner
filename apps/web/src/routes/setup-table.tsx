@@ -1,4 +1,4 @@
-import { localTime, localTimezone, type SetupRow } from "./platform-controls";
+import { localTime, localTimezoneLabel, type SetupRow } from "./platform-controls";
 import { Badge } from "../components/ui/badge";
 import { EmptyState } from "../components/ui/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
@@ -26,7 +26,7 @@ export function SetupTable({ setups }: { setups: SetupRow[] }) {
   if (!setups.length) return <EmptyState className="mt-3" title="Сетапы не найдены." />;
   return <div className="mt-1 overflow-x-auto rounded-md border border-input/60">
     <Table>
-      <caption className="px-3 py-2 text-left text-xs text-muted-foreground">Время: {localTimezone}</caption>
+      <caption className="px-3 py-2 text-left text-xs text-muted-foreground">Время: {localTimezoneLabel()}</caption>
       <TableHeader>
         <TableRow className="hover:bg-transparent">
           <TableHead>Инструмент</TableHead>

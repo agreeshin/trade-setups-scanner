@@ -2,6 +2,7 @@ import { NavLink, Outlet } from "react-router";
 import { useEffect, useState } from "react";
 import { Button } from "../components/ui/button";
 import { AppFrame } from "../components/ui/app-frame";
+import { applyInterfaceSettings } from "../lib/datetime-format";
 import { fetchPlatform, type PlatformState } from "../lib/platform-api";
 
 export interface ServiceStatus { platform: "ready"; marketData: "ready" | "not_ready" | "unreachable" }
@@ -16,6 +17,14 @@ export function AppLayout() {
     void fetchPlatform<ServiceStatus>("/v1/status").then((result) => { if (!cancelled) setStatus(result); });
     return () => { cancelled = true; };
   }, [revision]);
+  // Sync persisted interface date/time settings from the platform once per layout mount.
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPlatform<{ value: { interface?: unknown } }>("/v1/settings/ui").then((result) => {
+      if (!cancelled && result.kind === "ready" && result.data.value.interface !== undefined) applyInterfaceSettings(result.data.value.interface);
+    });
+    return () => { cancelled = true; };
+  }, []);
   const refresh = () => { setStatus({ kind: "loading" }); setRevision((value) => value + 1); };
   return (
     <AppFrame navigation={<>

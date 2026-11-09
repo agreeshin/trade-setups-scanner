@@ -3,7 +3,8 @@ import { Button } from "../components/ui/button";
 import { Card } from "../components/ui/card";
 import { Pagination } from "../components/ui/pagination";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
-import { localTime, localTimezone } from "./platform-controls";
+import { formatIsoDateTime } from "../lib/datetime-format";
+import { localTime, localTimezoneLabel } from "./platform-controls";
 import { usePlatformPoll } from "./use-platform-poll";
 
 export const qualityReasonLabels = {
@@ -46,7 +47,7 @@ function QualityIntervals({ id, offset, revision, onPage }: { id: number; offset
   if (state.kind === "unreachable") return <Alert variant="destructive" role="alert">Интервалы качества недоступны ({state.detail}). Это не означает отсутствие пропусков.</Alert>;
   if (!state.data.available) return <p>Интервалы качества не сохранены или исходный расчёт удалён. Если сводка качества сохранена, она продолжает описывать исходный расчёт.</p>;
   return <div className="mt-3 grid gap-3">
-    <p className="text-xs text-muted-foreground">Интервалы [начало, конец): правая граница не включена. Время: {localTimezone}. Пригодные интервалы могут содержать допускаемые настройками пропуски входного окна.</p>
+    <p className="text-xs text-muted-foreground">Интервалы [начало, конец): правая граница не включена. Время: {localTimezoneLabel()}. Пригодные интервалы могут содержать допускаемые настройками пропуски входного окна.</p>
     <div className="overflow-x-auto"><Table>
       <caption className="text-left">Интервалы оценки и пропусков</caption>
       <TableHeader><TableRow><TableHead>Начало</TableHead><TableHead>Конец (не включая)</TableHead><TableHead>Результат оценки</TableHead></TableRow></TableHeader>
@@ -80,13 +81,13 @@ export function ReplayQualitySummary({ run, panel, onPanel, revision }: {
   const quality = run.quality;
   return <Card asChild><section className="mt-4 grid gap-3" aria-label="Качество расчёта">
     <h3 className="font-semibold">Качество расчёта: {qualityLabel(quality)}</h3>
-    <p className="text-sm">{run.cacheHit ? "Из кеша" : "Результат этого запуска"}. Исходное вычисление завершено: {run.qualityComputedAt ? new Date(run.qualityComputedAt).toLocaleString("ru-RU") : "время не сохранено или расчёт не завершён"}.{run.qualitySourceRunId != null && ` Исходный запуск: #${run.qualitySourceRunId}.`}</p>
+    <p className="text-sm">{run.cacheHit ? "Из кеша" : "Результат этого запуска"}. Исходное вычисление завершено: {run.qualityComputedAt ? formatIsoDateTime(run.qualityComputedAt) : "время не сохранено или расчёт не завершён"}.{run.qualitySourceRunId != null && ` Исходный запуск: #${run.qualitySourceRunId}.`}</p>
     {run.cacheHit && <p className="text-xs text-muted-foreground">Качество относится к исходным данным кешированного расчёта. Последующая дозагрузка истории не обновляет эту сводку.</p>}
     {quality ? <>
       <p className="text-xs text-muted-foreground">Качество данных и статус выполнения различаются. Полная оценка означает пригодность всех минут по настроенным допускам, а не отсутствие любых пропусков входных данных.</p>
       <dl className="grid gap-2 text-sm sm:grid-cols-2">
         {[["Запрошено минут", quality.requestedMinutes], ["Рассмотрено минут", quality.evaluatedMinutes + quality.skippedMinutes], ["Оценено пригодных минут", quality.evaluatedMinutes], ["Из них с допустимыми пропусками окна", quality.evaluatedWithGapsMinutes], ["Пропущено непригодных минут", quality.skippedMinutes], ["Ещё не рассмотрено минут", quality.unassessedMinutes], ["Требуемая история (минут)", quality.requiredHistoryMinutes]].map(([label, value]) => <div key={label}><dt className="text-muted-foreground">{label}</dt><dd>{value}</dd></div>)}
-        <div><dt className="text-muted-foreground">Граница рассмотренной части ({localTimezone})</dt><dd>{localTime(quality.assessedThroughUnix)}</dd></div>
+        <div><dt className="text-muted-foreground">Граница рассмотренной части ({localTimezoneLabel()})</dt><dd>{localTime(quality.assessedThroughUnix)}</dd></div>
       </dl>
       {quality.unassessedMinutes > 0 && <p className="text-sm">Нерассмотренный остаток не является пропуском данных. Для отменённого или ошибочного запуска показан только сохранённый результат обработанной части.</p>}
       <details><summary className="cursor-pointer font-medium">Причины пропуска минут ({quality.skippedMinutes})</summary><dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">{(Object.keys(qualityReasonLabels) as (keyof typeof qualityReasonLabels)[]).map((reason) => <div key={reason}><dt className="text-muted-foreground">{qualityReasonLabels[reason]}</dt><dd>{quality.reasonCounts[reason]}</dd></div>)}</dl></details>

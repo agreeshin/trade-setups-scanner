@@ -214,6 +214,12 @@ describe.skipIf(!TEST_DATABASE_URL)("platform api", () => {
     const analytics = { setId: "run-1", clusterize: true, maturity: 0.7, clusterGapInput: "12", sections: { "short-matrix": { timeShiftInput: "5" } } };
     expect((await app.inject({ method: "PUT", url: "/v1/settings/web-analytics", headers, payload: analytics })).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: "/v1/settings/web-analytics", headers })).json()).toEqual({ settings: analytics });
+    const session = await app.inject({ method: "POST", url: "/v1/session", headers: { "x-platform-request": "1" }, payload: { apiKey: PLATFORM_KEY } });
+    expect(session.statusCode).toBe(200);
+    const sessionBody = session.json<{ authenticated: boolean; expiresAt: number }>();
+    expect(sessionBody.authenticated).toBe(true);
+    expect(sessionBody.expiresAt - Date.now()).toBeGreaterThan(23 * 60 * 60 * 1000);
+    expect(sessionBody.expiresAt - Date.now()).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
     const response = await app.inject({ method: "POST", url: "/v1/replay-runs", headers, payload: {
       instruments: [{ exchange: "bybit", category: "linear", symbol: SYMBOL }], fromUnix, toUnix, algorithmId: "price_volume_spike",
     } });

@@ -34,6 +34,7 @@ import {
   type AnalyticsSectionKey,
   type AnalyticsUserSettings,
 } from "../lib/analytics-settings";
+import { dayKeyOf, formatUnix } from "../lib/datetime-format";
 
 const SHORT_MATRIX_LEVELS = Array.from({ length: 14 }, (_, index) => 4 + index * 2);
 const LONG_TP_LEVELS = [1, 2, 3, ...SHORT_MATRIX_LEVELS, 35, 40, 45, 50, 60];
@@ -58,7 +59,7 @@ function formatRisk(value: number | null): string {
 
 function formatTime(unix: number | null): string {
   if (unix === null) return "—";
-  return new Date(unix * 1000).toLocaleString(undefined, { dateStyle: "short", timeStyle: "medium" });
+  return formatUnix(unix);
 }
 
 function formatDuration(minutes: number | null): string {
@@ -427,7 +428,7 @@ interface DailyExpectancyPoint {
 function buildDailyExpectancy(rows: TradeRowWithSource[]): DailyExpectancyPoint[] {
   const buckets = new Map<string, { values: number[]; closedCount: number; tpCount: number; slCount: number; computedCount: number; cachedCount: number }>();
   for (const row of rows) {
-    const day = new Date(row.setup.closeTimeUnix * 1000).toLocaleDateString("en-CA");
+    const day = dayKeyOf(row.setup.closeTimeUnix);
     const bucket = buckets.get(day) ?? { values: [], closedCount: 0, tpCount: 0, slCount: 0, computedCount: 0, cachedCount: 0 };
     bucket.computedCount += 1;
     if (row.fromCache) bucket.cachedCount += 1;

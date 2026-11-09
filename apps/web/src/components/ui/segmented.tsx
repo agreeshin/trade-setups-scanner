@@ -8,5 +8,5 @@ export function SegmentedList({ className, ...props }: DivAttributes) {
 }
 
 export function SegmentedTrigger({ className, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) {
-  return <button type="button" data-slot="segmented-trigger" className={cn("inline-flex h-8 shrink-0 items-center justify-center whitespace-nowrap rounded-md px-3 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 aria-selected:bg-card aria-selected:text-foreground aria-selected:shadow-sm", className)} {...props} />;
+  return <button type="button" data-slot="segmented-trigger" className={cn("inline-flex h-8 shrink-0 items-center justify-center whitespace-nowrap rounded-md px-3 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 aria-selected:bg-primary aria-selected:text-primary-foreground aria-selected:shadow-sm", className)} {...props} />;
 }

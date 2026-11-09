@@ -132,12 +132,25 @@ describe("platform screens", () => {
     await userEvent.click(screen.getByRole("button", { name: "Сохранить алгоритм" }));
     await screen.findByText("Настройки алгоритма сохранены.");
     expect(requests.find((request) => request.path === "/v1/algorithms/price_volume_spike")?.body).toEqual({ params: { priceGrowthPct: "15", windowMinutes: 5, volumeMultiplier: "3" }, enabled: true });
+    await userEvent.click(screen.getByRole("tab", { name: "Обслуживание" }));
     expect(screen.getByRole("button", { name: "Очистить кеш" })).toBeDisabled();
     await userEvent.click(screen.getByLabelText("Подтверждаю очистку всего кеша"));
     await userEvent.click(screen.getByRole("button", { name: "Очистить кеш" }));
     await screen.findByText("Удалено записей кеша: 3.");
     expect(screen.getByRole("button", { name: "Очистить кеш" })).toBeDisabled();
     expect(requests.some((request) => request.path === "/v1/settings/live" && request.method === "PUT")).toBe(false);
+  });
+
+  it("saves interface date and time settings through the ui settings document", async () => {
+    render(<SettingsPage />);
+    await userEvent.click(screen.getByRole("tab", { name: "Интерфейс" }));
+    fireEvent.change(await screen.findByLabelText("Порядок даты"), { target: { value: "ymd" } });
+    fireEvent.change(screen.getByLabelText("Разделитель даты"), { target: { value: "-" } });
+    fireEvent.change(screen.getByLabelText("Формат времени"), { target: { value: "12" } });
+    await userEvent.click(screen.getByRole("button", { name: "Сохранить и применить" }));
+    await waitFor(() => expect(screen.getByText(/Настройки интерфейса сохранены/)).toBeInTheDocument());
+    const put = requests.find((request) => request.path === "/v1/settings/ui" && request.method === "PUT");
+    expect(put?.body).toEqual({ value: { existing: "keep", interface: { dateOrder: "ymd", dateSeparator: "-", yearDigits: 4, time24: false, timezone: "auto" } } });
   });
   it("requests server pages and finds records beyond the former latest-500 cap", async () => {
     render(<SetupsPage />);
@@ -321,6 +334,7 @@ describe("platform screens", () => {
       ...Array.from({ length: 996 }, (_, index) => ({ symbol: `ITEM${index}`, state: "ready" })),
     ] }))) : original(path, init)));
     render(<SettingsPage />);
+    await userEvent.click(screen.getByRole("tab", { name: "Сканирование" }));
     await userEvent.click(await screen.findByText("Состояния live-инструментов (1001)"));
     expect(screen.getByText("Ожидание данных")).toBeVisible();
     expect(screen.getByText("Недостаточно истории")).toBeVisible();

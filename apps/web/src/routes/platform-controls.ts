@@ -1,3 +1,4 @@
+import { effectiveTimezone, formatUnix } from "../lib/datetime-format";
 import { apiFetch } from "../lib/platform-api";
 
 export interface Algorithm {
@@ -30,8 +31,8 @@ export interface SetupRow {
   closePrice: string;
 }
 
-export const localTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-export const localTime = (unix: number): string => new Date(unix * 1000).toLocaleString("ru-RU");
+export const localTimezoneLabel = (): string => effectiveTimezone();
+export const localTime = (unix: number): string => formatUnix(unix);
 
 export function localDateInput(unix: number): string {
   const date = new Date(unix * 1000);

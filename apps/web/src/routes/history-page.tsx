@@ -12,7 +12,7 @@ import { SegmentedList, SegmentedTrigger } from "../components/ui/segmented";
 import { Select } from "../components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
-import { errorText, localTime, localTimezone, replayRange, utcMidnightOnDateChange, writePlatform } from "./platform-controls";
+import { errorText, localTime, localTimezoneLabel, replayRange, utcMidnightOnDateChange, writePlatform } from "./platform-controls";
 import { usePlatformPoll } from "./use-platform-poll";
 
 interface Coverage { instrumentId: number; firstMinuteUnix: number | null; lastMinuteUnix: number | null; totalCandles: number; intervals: { startUnix: number; endUnix: number }[]; gaps: { startUnix: number; endUnix: number }[] }
@@ -211,7 +211,7 @@ export function HistoryPage() {
   }
 
   return <section aria-labelledby="history-heading" className="grid gap-5">
-    <PageHeader id="history-heading" title="История и сбор" description={<>Загрузка истории и текущий сбор независимы от replay и live-сканера. Действия выполняются только по вашей команде. Время: {localTimezone}.</>} />
+    <PageHeader id="history-heading" title="История и сбор" description={<>Загрузка истории и текущий сбор независимы от replay и live-сканера. Действия выполняются только по вашей команде. Время: {localTimezoneLabel()}.</>} />
     {jobs.kind === "unreachable" && <Alert variant="destructive" role="alert">Статус массовых загрузок неизвестен ({jobs.detail}). Это не означает, что загрузок нет.</Alert>}
     {plans.kind === "unreachable" && <Alert variant="destructive" role="alert">Планы загрузки неизвестны ({plans.detail}). Это не означает, что планов нет.</Alert>}
     {activePlans.length > 0 && <p role="status" className="text-sm text-muted-foreground">Активных планов загрузки: {activePlans.length}. Инструментов ожидают освобождения лимитов очереди: {pendingPlanItems}.</p>}

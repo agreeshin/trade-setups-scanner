@@ -12,6 +12,7 @@ describe("Segmented", () => {
     );
     expect(screen.getByRole("tablist", { name: "Разделы" })).toHaveAttribute("data-slot", "segmented-list");
     expect(screen.getByRole("tab", { name: "Первый" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Первый" })).toHaveClass("aria-selected:bg-primary", "aria-selected:text-primary-foreground");
     const second = screen.getByRole("tab", { name: "Второй" });
     expect(second).toHaveAttribute("data-slot", "segmented-trigger");
     expect(second).toBeDisabled();
