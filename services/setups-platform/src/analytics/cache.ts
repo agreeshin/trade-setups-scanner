@@ -33,6 +33,8 @@ export interface ComputeParams {
   priceChangePpm: number;
   /** Maturity in tenths; -1 = no maturity clustering. */
   maturityTenths: number;
+  /** Cluster gap in minutes; -1 = clustering disabled. */
+  clusterGapMinutes: number;
 }
 
 export function priceChangePpmOf(pct: number | null | undefined): number {
@@ -71,6 +73,7 @@ export async function getMatrixCell(
     .where("scope_key", "=", scopeKey)
     .where("direction", "=", params.direction)
     .where("maturity_tenths", "=", params.maturityTenths)
+    .where("cluster_gap_minutes", "=", params.clusterGapMinutes)
     .where("month_key", "=", monthKey)
     .where("tp_pct", "=", params.tpPct.toString())
     .where("sl_pct", "=", params.slPct.toString())
@@ -95,6 +98,7 @@ export async function saveMatrixCell(
       scope_key: scopeKey,
       direction: params.direction,
       maturity_tenths: params.maturityTenths,
+      cluster_gap_minutes: params.clusterGapMinutes,
       month_key: monthKey,
       tp_pct: params.tpPct.toString(),
       sl_pct: params.slPct.toString(),
@@ -104,7 +108,7 @@ export async function saveMatrixCell(
       algorithm_version: ANALYTICS_CACHE_ALGORITHM_VERSION,
       result_json: result,
     })
-    .onConflict((b) => b.columns(["scope_key", "direction", "maturity_tenths", "month_key", "tp_pct", "sl_pct", "horizon_minutes", "time_shift_minutes", "price_change_ppm", "algorithm_version"])
+    .onConflict((b) => b.columns(["scope_key", "direction", "maturity_tenths", "cluster_gap_minutes", "month_key", "tp_pct", "sl_pct", "horizon_minutes", "time_shift_minutes", "price_change_ppm", "algorithm_version"])
       .doUpdateSet({ result_json: result, created_at: sql`now()` }))
     .execute();
 }
@@ -122,6 +126,7 @@ export async function listMatrixCells(
     .where("scope_key", "=", scopeKey)
     .where("direction", "=", params.direction)
     .where("maturity_tenths", "=", params.maturityTenths)
+    .where("cluster_gap_minutes", "=", params.clusterGapMinutes)
     .where("month_key", "=", monthKey)
     .where("horizon_minutes", "=", params.horizonMinutes)
     .where("time_shift_minutes", "=", params.timeShiftMinutes)
@@ -150,6 +155,7 @@ export async function getTradeRow(
     .where("scope_key", "=", scopeKey)
     .where("direction", "=", params.direction)
     .where("maturity_tenths", "=", params.maturityTenths)
+    .where("cluster_gap_minutes", "=", params.clusterGapMinutes)
     .where("exchange_code", "=", identity.exchangeCode)
     .where("category", "=", identity.category)
     .where("symbol", "=", identity.symbol)
@@ -177,6 +183,7 @@ export async function saveTradeRow(
       scope_key: scopeKey,
       direction: params.direction,
       maturity_tenths: params.maturityTenths,
+      cluster_gap_minutes: params.clusterGapMinutes,
       exchange_code: identity.exchangeCode,
       category: identity.category,
       symbol: identity.symbol,
@@ -189,7 +196,7 @@ export async function saveTradeRow(
       algorithm_version: ANALYTICS_CACHE_ALGORITHM_VERSION,
       result_json: result,
     })
-    .onConflict((b) => b.columns(["scope_key", "direction", "maturity_tenths", "exchange_code", "category", "symbol", "close_time_unix", "tp_pct", "sl_pct", "horizon_minutes", "time_shift_minutes", "price_change_ppm", "algorithm_version"])
+    .onConflict((b) => b.columns(["scope_key", "direction", "maturity_tenths", "cluster_gap_minutes", "exchange_code", "category", "symbol", "close_time_unix", "tp_pct", "sl_pct", "horizon_minutes", "time_shift_minutes", "price_change_ppm", "algorithm_version"])
       .doUpdateSet({ result_json: result, created_at: sql`now()` }))
     .execute();
 }
@@ -206,6 +213,7 @@ export async function listTradeRows(
     .where("scope_key", "=", scopeKey)
     .where("direction", "=", params.direction)
     .where("maturity_tenths", "=", params.maturityTenths)
+    .where("cluster_gap_minutes", "=", params.clusterGapMinutes)
     .where("tp_pct", "=", params.tpPct.toString())
     .where("sl_pct", "=", params.slPct.toString())
     .where("horizon_minutes", "=", params.horizonMinutes)
@@ -229,6 +237,7 @@ export async function getSelection(
   db: Kysely<SignalsDB>,
   scopeKey: string,
   maturityTenths: number,
+  clusterGapMinutes: number,
   monthKey: string,
 ): Promise<CachedPayload | undefined> {
   const row = await db
@@ -236,6 +245,7 @@ export async function getSelection(
     .select("result_json")
     .where("scope_key", "=", scopeKey)
     .where("maturity_tenths", "=", maturityTenths)
+    .where("cluster_gap_minutes", "=", clusterGapMinutes)
     .where("month_key", "=", monthKey)
     .where("algorithm_version", "=", ANALYTICS_CACHE_ALGORITHM_VERSION)
     .executeTakeFirst();
@@ -246,6 +256,7 @@ export async function saveSelection(
   db: Kysely<SignalsDB>,
   scopeKey: string,
   maturityTenths: number,
+  clusterGapMinutes: number,
   monthKey: string,
   result: CachedPayload,
 ): Promise<void> {
@@ -254,11 +265,12 @@ export async function saveSelection(
     .values({
       scope_key: scopeKey,
       maturity_tenths: maturityTenths,
+      cluster_gap_minutes: clusterGapMinutes,
       month_key: monthKey,
       algorithm_version: ANALYTICS_CACHE_ALGORITHM_VERSION,
       result_json: result,
     })
-    .onConflict((b) => b.columns(["scope_key", "maturity_tenths", "month_key", "algorithm_version"])
+    .onConflict((b) => b.columns(["scope_key", "maturity_tenths", "cluster_gap_minutes", "month_key", "algorithm_version"])
       .doUpdateSet({ result_json: result, created_at: sql`now()` }))
     .execute();
 }

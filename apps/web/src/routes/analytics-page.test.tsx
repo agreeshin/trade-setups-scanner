@@ -32,12 +32,12 @@ interface StubOptions {
 }
 
 function stubFetch(options: StubOptions = {}) {
-  const calls: { method: string; path: string }[] = [];
+  const calls: { method: string; path: string; search: string }[] = [];
   vi.stubGlobal("fetch", vi.fn((url: string, init?: RequestInit) => {
     const path = url.replace(/^https?:\/\/[^/]+/, "");
     const query = new URLSearchParams(path.split("?")[1] ?? "");
     const method = init?.method ?? "GET";
-    calls.push({ method, path: path.split("?")[0]! });
+    calls.push({ method, path: path.split("?")[0]!, search: path.split("?")[1] ?? "" });
     const json = (body: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(body), { status }));
     if (path.startsWith("/v1/analytics/sets")) return json({ sets: options.sets ?? [setFixture] });
     if (path.startsWith("/v1/analytics/months")) return json({ months: ["2024-01", "2024-02"] });
@@ -99,6 +99,9 @@ it("computes matrices only after the button press and honours subsections", asyn
   expect(screen.getByText("Снимок параметров запуска")).toBeInTheDocument();
   expect(screen.getByText("Рост цены (%)")).toBeInTheDocument();
   expect(screen.getByText("2.5")).toBeInTheDocument();
+  expect(screen.getAllByRole("checkbox", { name: "Кластеризовать сетапы" }).length).toBeGreaterThan(0);
+  expect(screen.getAllByLabelText("Зрелость сетапа в кластере: 0.5").length).toBeGreaterThan(0);
+  expect(screen.getAllByLabelText("Разрыв кластера, ч")[0]).toHaveValue("8");
   expect(screen.getByRole("heading", { name: "Среднее матожидание сетапов" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "Матожидание по сетапам" })).toBeInTheDocument();
   expect(screen.queryByRole("heading", { name: "Кеш аналитики" })).not.toBeInTheDocument();
@@ -159,6 +162,23 @@ it("shows a per-cell loader and stops the matrix run on demand", async () => {
   expect(cellCalls).toBe(1);
   expect(screen.queryByText("0.90")).not.toBeInTheDocument();
   expect(screen.getAllByRole("button", { name: "Рассчитать" })).toHaveLength(2);
+}, 10_000);
+
+it("disables maturity and sends no clustering params when the checkbox is off", async () => {
+  const calls = stubFetch({ shortBulk: fullShortGrid });
+  render(<AnalyticsPage />);
+  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  expect(screen.getAllByLabelText("Зрелость сетапа в кластере: 0.5")[0]).toBeEnabled();
+  await userEvent.click(screen.getAllByRole("checkbox", { name: "Кластеризовать сетапы" })[0]!);
+  expect(screen.getAllByLabelText("Зрелость сетапа в кластере: 0.5")[0]).toBeDisabled();
+  expect(screen.getAllByLabelText("Разрыв кластера, ч")[0]).toBeDisabled();
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument());
+  const bulkCalls = calls.filter((call) => call.path === "/v1/analytics/matrix-cells");
+  expect(bulkCalls.length).toBeGreaterThan(0);
+  expect(bulkCalls.every((call) => !call.search.includes("setupMaturity") && !call.search.includes("clusterGapHours"))).toBe(true);
+  expect(screen.queryByText("После кластеризации: 42")).not.toBeInTheDocument();
+  expect(screen.getAllByText("Сетапов: 42").length).toBe(2);
 }, 10_000);
 
 it("runs the SHORT trade list cache-first and builds the daily expectancy chart", async () => {

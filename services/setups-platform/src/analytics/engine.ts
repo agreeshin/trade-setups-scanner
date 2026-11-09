@@ -18,6 +18,7 @@ export type TradeDirection = "short" | "long";
 export type LimitStatus = "tp" | "sl" | "unclosed" | "no_data" | "price_change_filtered";
 
 export const SETUP_CLUSTER_MAX_GAP_SECONDS = 8 * 60 * 60;
+export const DEFAULT_CLUSTER_GAP_HOURS = 8;
 export const DEFAULT_HORIZON_MINUTES = 10_080;
 export const MINUTE_SECONDS = 60;
 
@@ -120,13 +121,13 @@ export function filterByMonth(setups: AnalyticsSetup[], monthKey: string): Analy
   return setups.filter((setup) => setup.closeTimeUnix >= start && setup.closeTimeUnix < nextMonth);
 }
 
-/** Group sorted-by-time setups of one instrument into clusters with gaps <= 8h. */
-export function iterInstrumentClusters(sortedSetups: AnalyticsSetup[]): AnalyticsSetup[][] {
+/** Group sorted-by-time setups of one instrument into clusters with gaps <= maxGapSeconds. */
+export function iterInstrumentClusters(sortedSetups: AnalyticsSetup[], maxGapSeconds: number = SETUP_CLUSTER_MAX_GAP_SECONDS): AnalyticsSetup[][] {
   const clusters: AnalyticsSetup[][] = [];
   let current: AnalyticsSetup[] = [];
   let previousTime: number | null = null;
   for (const setup of sortedSetups) {
-    if (previousTime !== null && setup.closeTimeUnix - previousTime > SETUP_CLUSTER_MAX_GAP_SECONDS) {
+    if (previousTime !== null && setup.closeTimeUnix - previousTime > maxGapSeconds) {
       if (current.length > 0) clusters.push(current);
       current = [];
     }
@@ -137,7 +138,7 @@ export function iterInstrumentClusters(sortedSetups: AnalyticsSetup[]): Analytic
   return clusters;
 }
 
-export function iterSetupClusters(setups: AnalyticsSetup[]): AnalyticsSetup[][] {
+export function iterSetupClusters(setups: AnalyticsSetup[], maxGapSeconds: number = SETUP_CLUSTER_MAX_GAP_SECONDS): AnalyticsSetup[][] {
   const byInstrument = new Map<string, AnalyticsSetup[]>();
   for (const setup of setups) {
     const key = setupInstrumentKey(setup);
@@ -148,7 +149,7 @@ export function iterSetupClusters(setups: AnalyticsSetup[]): AnalyticsSetup[][] 
   const clusters: AnalyticsSetup[][] = [];
   for (const list of byInstrument.values()) {
     const sorted = [...list].sort((a, b) => a.closeTimeUnix - b.closeTimeUnix);
-    clusters.push(...iterInstrumentClusters(sorted));
+    clusters.push(...iterInstrumentClusters(sorted, maxGapSeconds));
   }
   return clusters;
 }
@@ -183,12 +184,12 @@ function pickByMaturity(cluster: AnalyticsSetup[], maturity: number): { setup: A
  * filtered by month (if a month filter applies) — clustering sees the
  * filtered list only.
  */
-export function selectByMaturity(setups: AnalyticsSetup[], maturity: number): MaturitySelection {
+export function selectByMaturity(setups: AnalyticsSetup[], maturity: number, maxGapSeconds: number = SETUP_CLUSTER_MAX_GAP_SECONDS): MaturitySelection {
   const selected: AnalyticsSetup[] = [];
   const ordinals: number[] = [];
   const delaysSeconds: number[] = [];
   let totalClustersCount = 0;
-  for (const cluster of iterSetupClusters(setups)) {
+  for (const cluster of iterSetupClusters(setups, maxGapSeconds)) {
     totalClustersCount += 1;
     const picked = pickByMaturity(cluster, maturity);
     selected.push(picked.setup);
@@ -205,8 +206,8 @@ export function selectByMaturity(setups: AnalyticsSetup[], maturity: number): Ma
   };
 }
 
-export function setupClustersCount(setups: AnalyticsSetup[]): number {
-  return iterSetupClusters(setups).length;
+export function setupClustersCount(setups: AnalyticsSetup[], maxGapSeconds: number = SETUP_CLUSTER_MAX_GAP_SECONDS): number {
+  return iterSetupClusters(setups, maxGapSeconds).length;
 }
 
 /** Binary search: candle with exactly this open time, or undefined. */

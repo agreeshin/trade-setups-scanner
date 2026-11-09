@@ -97,6 +97,7 @@ export interface AnalyticsMatrixCacheRow {
   scope_key: string;
   direction: string;
   maturity_tenths: number;
+  cluster_gap_minutes: number;
   month_key: string;
   tp_pct: string;
   sl_pct: string;
@@ -112,6 +113,7 @@ export interface AnalyticsTradesCacheRow {
   scope_key: string;
   direction: string;
   maturity_tenths: number;
+  cluster_gap_minutes: number;
   exchange_code: string;
   category: string;
   symbol: string;
@@ -129,6 +131,7 @@ export interface AnalyticsTradesCacheRow {
 export interface AnalyticsSelectionCacheRow {
   scope_key: string;
   maturity_tenths: number;
+  cluster_gap_minutes: number;
   month_key: string;
   algorithm_version: number;
   result_json: Record<string, unknown>;

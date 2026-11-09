@@ -73,6 +73,19 @@ describe("analytics engine", () => {
     expect(aaaClusters.map((cluster) => cluster.length)).toEqual([2, 1]);
   });
 
+  it("honours the custom cluster gap parameter", () => {
+    const setups = [
+      makeSetup("AAA", T0),
+      makeSetup("AAA", T0 + 2 * 3600), // 2h after the first
+      makeSetup("AAA", T0 + 2 * 3600 + 5 * 3600), // 5h after the previous
+    ];
+    expect(iterSetupClusters(setups)).toHaveLength(1); // default 8h: single cluster
+    expect(iterSetupClusters(setups, 3 * 3600)).toHaveLength(2); // 3h gap splits the chain
+    const selection = selectByMaturity(setups, 0.5, 3 * 3600);
+    expect(selection.totalClustersCount).toBe(2);
+    expect(selection.rows).toHaveLength(2);
+  });
+
   it("selects the setup nearest to the maturity point, ties to the earlier one", () => {
     const cluster = [
       makeSetup("AAA", T0),

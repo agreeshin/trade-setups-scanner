@@ -5,6 +5,7 @@ import type { SignalsDB } from "../db/schema.js";
 import { MarketDataCandleReader } from "./candles.js";
 import {
   aggregateLimitOutcomes,
+  DEFAULT_CLUSTER_GAP_HOURS,
   DEFAULT_HORIZON_MINUTES,
   evaluateLimit,
   filterByMonth,
@@ -47,6 +48,8 @@ import {
 
 /** Hard cap protecting one request from unbounded setup sets. */
 const MAX_SETUPS_PER_COMPUTE = 100_000;
+
+const DEFAULT_CLUSTER_GAP_MINUTES = DEFAULT_CLUSTER_GAP_HOURS * 60;
 
 const ErrorEnvelope = Type.Object({ error: Type.String() });
 
@@ -112,6 +115,7 @@ const AnalyticsQuery = {
   direction: Type.Optional(DirectionParam),
   month: Type.Optional(MonthParam),
   setupMaturity: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  clusterGapHours: Type.Optional(Type.Number({ minimum: 0.01, maximum: 168 })),
   tpPct: Type.Optional(Type.Number({ minimum: 0.000001, maximum: 100 })),
   slPct: Type.Optional(Type.Number({ minimum: 0.000001, maximum: 100 })),
   timeShiftMinutes: Type.Optional(Type.Integer({ minimum: 0, maximum: 43_200, default: 0 })),
@@ -124,6 +128,7 @@ interface AnalyticsQueryInput {
   direction?: TradeDirection;
   month?: string;
   setupMaturity?: number;
+  clusterGapHours?: number;
   tpPct?: number;
   slPct?: number;
   timeShiftMinutes?: number;
@@ -137,6 +142,7 @@ interface ParsedAnalyticsParams {
   monthKey: string;
   maturity: number | null;
   maturityTenths: number;
+  clusterGapMinutes: number;
   tpPct: number;
   slPct: number;
   timeShiftMinutes: number;
@@ -158,7 +164,12 @@ function parseAnalyticsQuery(query: AnalyticsQueryInput, requireTpSl: boolean): 
   if (requireTpSl && (query.tpPct === undefined || query.slPct === undefined)) {
     return { error: "tpPct and slPct are required" };
   }
+  const clusterGapMinutes = query.clusterGapHours !== undefined ? Math.round(query.clusterGapHours * 60) : DEFAULT_CLUSTER_GAP_MINUTES;
+  if (clusterGapMinutes < 1 || clusterGapMinutes > 168 * 60) {
+    return { error: "clusterGapHours must be 0.01..168" };
+  }
   const maturity = query.setupMaturity ?? null;
+  const effectiveGapMinutes = maturity !== null ? clusterGapMinutes : -1;
   const priceChangePct = query.priceChangePct ?? null;
   const tpPct = query.tpPct ?? 0;
   const slPct = query.slPct ?? 0;
@@ -171,6 +182,7 @@ function parseAnalyticsQuery(query: AnalyticsQueryInput, requireTpSl: boolean): 
     monthKey: query.month ?? "all",
     maturity,
     maturityTenths: maturityTenthsOf(maturity),
+    clusterGapMinutes: effectiveGapMinutes,
     tpPct,
     slPct,
     timeShiftMinutes,
@@ -185,6 +197,7 @@ function parseAnalyticsQuery(query: AnalyticsQueryInput, requireTpSl: boolean): 
       timeShiftMinutes,
       priceChangePpm: priceChangePpmOf(priceChangePct),
       maturityTenths: maturityTenthsOf(maturity),
+      clusterGapMinutes: effectiveGapMinutes,
     },
   };
 }
@@ -225,7 +238,7 @@ async function selectSetupRows(
     firstSetupUnix: fingerprint.first,
     lastSetupUnix: fingerprint.last,
   });
-  const cached = await getSelection(db, scopeKey, params.maturityTenths, params.monthKey).catch(() => undefined);
+  const cached = await getSelection(db, scopeKey, params.maturityTenths, params.clusterGapMinutes, params.monthKey).catch(() => undefined);
   if (cached !== undefined && Array.isArray(cached.identities)) {
     const identities = new Set(cached.identities as string[]);
     const rows = inMonth.filter((setup) => identities.has(identityOf(setup)));
@@ -237,8 +250,8 @@ async function selectSetupRows(
       cachedSelection: true,
     };
   }
-  const selection = selectByMaturity(inMonth, params.maturity);
-  await saveSelection(db, scopeKey, params.maturityTenths, params.monthKey, {
+  const selection = selectByMaturity(inMonth, params.maturity, params.clusterGapMinutes * 60);
+  await saveSelection(db, scopeKey, params.maturityTenths, params.clusterGapMinutes, params.monthKey, {
     identities: selection.rows.map(identityOf),
     avgSelectionOrdinal: selection.avgSelectionOrdinal,
     avgSelectionDelayMinutes: selection.avgSelectionDelayMinutes,
@@ -499,6 +512,7 @@ export function registerAnalyticsRoutes(app: FastifyInstance, options: Analytics
       timeShiftMinutes: params.timeShiftMinutes,
       priceChangePpm: params.priceChangePpm,
       maturityTenths: params.maturityTenths,
+      clusterGapMinutes: params.clusterGapMinutes,
     }, params.monthKey).catch(() => []);
     return {
       items: rows.map((row) => ({

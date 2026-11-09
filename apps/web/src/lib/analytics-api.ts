@@ -88,6 +88,7 @@ export interface AnalyticsQueryParams {
   direction?: "short" | "long";
   month?: string;
   setupMaturity?: number;
+  clusterGapHours?: number;
   tpPct?: number;
   slPct?: number;
   timeShiftMinutes?: number;
@@ -100,6 +101,7 @@ function toQuery(params: AnalyticsQueryParams): URLSearchParams {
   if (params.direction !== undefined) search.set("direction", params.direction);
   if (params.month !== undefined) search.set("month", params.month);
   if (params.setupMaturity !== undefined) search.set("setupMaturity", String(params.setupMaturity));
+  if (params.clusterGapHours !== undefined) search.set("clusterGapHours", String(params.clusterGapHours));
   if (params.tpPct !== undefined) search.set("tpPct", String(params.tpPct));
   if (params.slPct !== undefined) search.set("slPct", String(params.slPct));
   if (params.timeShiftMinutes !== undefined) search.set("timeShiftMinutes", String(params.timeShiftMinutes));

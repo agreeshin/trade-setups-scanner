@@ -313,6 +313,42 @@ describe.skipIf(!TEST_DATABASE_URL)("analytics api", () => {
     expect(unknownSet.statusCode).toBe(400);
   });
 
+  it("separates matrix cache entries by the cluster gap", async () => {
+    const common = { set: `run-${runId}`, direction: "short" as const, tpPct: 7, slPct: 9, horizonMinutes: 60, setupMaturity: 0.5 };
+    const first = await app.inject({ method: "GET", url: url("/matrix-cell", { ...common, clusterGapHours: 2 }), headers: auth });
+    expect(first.statusCode).toBe(200);
+    expect(first.json<MatrixCellBody>().cached).toBe(false);
+    const repeat = await app.inject({ method: "GET", url: url("/matrix-cell", { ...common, clusterGapHours: 2 }), headers: auth });
+    expect(repeat.json<MatrixCellBody>().cached).toBe(true);
+    const otherGap = await app.inject({ method: "GET", url: url("/matrix-cell", { ...common, clusterGapHours: 5 }), headers: auth });
+    expect(otherGap.statusCode).toBe(200);
+    expect(otherGap.json<MatrixCellBody>().cached).toBe(false);
+  });
+
+  it("caches no-clustering cells the same way as clustered ones", async () => {
+    const cellUrl = url("/matrix-cell", { set: `run-${runId}`, direction: "short", tpPct: 8, slPct: 10, horizonMinutes: 60 });
+    const first = await app.inject({ method: "GET", url: cellUrl, headers: auth });
+    expect(first.statusCode).toBe(200);
+    const firstBody = first.json<MatrixCellBody & { totalClustersCount: number | null; avgSelectionOrdinal: number | null }>();
+    expect(firstBody.cached).toBe(false);
+    expect(firstBody.totalClustersCount).toBeNull();
+    expect(firstBody.avgSelectionOrdinal).toBeNull();
+    const repeat = await app.inject({ method: "GET", url: cellUrl, headers: auth });
+    expect(repeat.json<MatrixCellBody>().cached).toBe(true);
+  });
+
+  it("rejects an out-of-range cluster gap", async () => {
+    const tooSmall = await app.inject({
+      method: "GET", url: url("/matrix-cell", { set: `run-${runId}`, tpPct: 4, slPct: 4, clusterGapHours: 0.001 }), headers: auth,
+    });
+    expect(tooSmall.statusCode).toBe(400);
+
+    const tooLarge = await app.inject({
+      method: "GET", url: url("/matrix-cell", { set: `run-${runId}`, tpPct: 4, slPct: 4, clusterGapHours: 200 }), headers: auth,
+    });
+    expect(tooLarge.statusCode).toBe(400);
+  });
+
   it("applies the price-change gate and reports filtered setups separately", async () => {
     const gated = await app.inject({
       method: "GET",
