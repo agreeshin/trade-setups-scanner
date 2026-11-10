@@ -1,7 +1,7 @@
 use crate::{DbError, unix_to_ts};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use setups_domain::SpikeParams;
+use setups_domain::{AlgorithmParams, SPIKE_DROP_ALGORITHM_ID, SpikeDropParams, SpikeParams};
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgRow};
 
@@ -426,15 +426,37 @@ pub async fn mark_run_instrument_not_found(
     run_full_from_row(&row)
 }
 
-pub async fn get_replay_params(pool: &PgPool) -> Result<SpikeParams, DbError> {
-    let stored = crate::settings_get(pool, "algorithm:price_volume_spike").await?;
-    let mut params = SpikeParams::default();
-    if let Some(Value::Object(fields)) = stored
-        && let Ok(merged) = serde_json::from_value::<SpikeParams>(Value::Object(fields))
-    {
-        params = merged;
+/// Effective params of an algorithm for live scanning: algorithm defaults
+/// overlaid with the `params` object stored under the `algorithm:{id}` setting.
+/// Corrupt stored params fall back to defaults, matching the historical
+/// lenient behaviour of the live loop.
+pub async fn get_algorithm_params(
+    pool: &PgPool,
+    algorithm_id: &str,
+) -> Result<AlgorithmParams, DbError> {
+    let mut value = match algorithm_id {
+        SPIKE_DROP_ALGORITHM_ID => serde_json::to_value(SpikeDropParams::default()),
+        _ => serde_json::to_value(SpikeParams::default()),
     }
-    Ok(params)
+    .unwrap_or(Value::Null);
+    let stored = crate::settings_get(pool, &format!("algorithm:{algorithm_id}")).await?;
+    if let Some(stored_params) = stored.as_ref().and_then(|stored| stored.get("params"))
+        && let (Some(target), Some(source)) = (value.as_object_mut(), stored_params.as_object())
+    {
+        for (key, entry) in source {
+            target.insert(key.clone(), entry.clone());
+        }
+    }
+    let params = match algorithm_id {
+        SPIKE_DROP_ALGORITHM_ID => {
+            serde_json::from_value::<SpikeDropParams>(value).map(AlgorithmParams::SpikeDrop)
+        }
+        _ => serde_json::from_value::<SpikeParams>(value).map(AlgorithmParams::Spike),
+    };
+    Ok(params.unwrap_or_else(|_| match algorithm_id {
+        SPIKE_DROP_ALGORITHM_ID => AlgorithmParams::SpikeDrop(SpikeDropParams::default()),
+        _ => AlgorithmParams::Spike(SpikeParams::default()),
+    }))
 }
 
 pub async fn get_replay_batch(

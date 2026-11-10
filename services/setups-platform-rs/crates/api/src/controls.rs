@@ -1,5 +1,5 @@
 use crate::auth::SessionAuth;
-use crate::replay::{guard_auth, merge_objects, validate_spike_params};
+use crate::replay::{guard_auth, merge_objects, validate_algorithm_params};
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -14,11 +14,16 @@ use setups_db::push::{
     save_push_subscription, valid_push_endpoint, valid_push_subscription,
 };
 use setups_db::{DbError, settings_get, settings_set};
-use setups_domain::{SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION, SpikeParams};
+use setups_domain::{
+    AlgorithmParams, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION, SPIKE_DROP_ALGORITHM_ID,
+    SPIKE_DROP_ALGORITHM_VERSION, SpikeDropParams, SpikeParams,
+};
 use setups_mdclient::MarketDataClient;
 use sqlx::postgres::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+pub const ALGORITHM_IDS: [&str; 2] = [SPIKE_ALGORITHM_ID, SPIKE_DROP_ALGORITHM_ID];
 
 pub struct ControlsState {
     pub pool: PgPool,
@@ -45,22 +50,57 @@ fn guard(state: &ControlsState, headers: &HeaderMap, mutation: bool) -> Result<(
     guard_auth(&state.auth, headers, mutation)
 }
 
-fn algorithm_fields() -> Value {
-    json!([
-    { "key": "priceGrowthPct", "label": "Рост цены", "type": "decimal", "min": 0, "max": 1000, "unit": "%" },
-    { "key": "windowMinutes", "label": "Окно роста цены и оборота", "type": "integer", "min": 1, "max": 1440, "unit": "мин" },
-    { "key": "volumeMultiplier", "label": "Множитель оборота", "type": "decimal", "min": 0.000001, "max": 1000, "unit": "×" },
-    { "key": "baselineLongDays", "label": "Длинная база", "type": "integer", "min": 1, "max": 90, "unit": "дней" },
-    { "key": "baselineShortDays", "label": "Короткая база", "type": "integer", "min": 1, "max": 90, "unit": "дней" },
-    { "key": "cooldownMinutes", "label": "Интервал между сетапами", "type": "integer", "min": 0, "max": 10080, "unit": "мин" },
-    { "key": "maxGapPercent", "label": "Допустимая доля пропусков", "type": "decimal", "min": 0, "max": 100, "unit": "%" },
-    { "key": "maxConsecutiveGapMinutes", "label": "Максимальный непрерывный пропуск", "type": "integer", "min": 0, "max": 1440, "unit": "мин" },
-    { "key": "requiredRecentMinutes", "label": "Последние минуты без пропусков", "type": "integer", "min": 0, "max": 1440, "unit": "мин" }
-    ])
+fn algorithm_fields(id: &str) -> Value {
+    if id == SPIKE_DROP_ALGORITHM_ID {
+        json!([
+        { "key": "priceDropPct", "label": "Падение цены", "type": "decimal", "min": 0, "max": 100, "unit": "%" },
+        { "key": "windowMinutes", "label": "Окно падения цены и оборота", "type": "integer", "min": 1, "max": 1440, "unit": "мин" },
+        { "key": "volumeMultiplier", "label": "Множитель оборота", "type": "decimal", "min": 0.000001, "max": 1000, "unit": "×" },
+        { "key": "baselineLongDays", "label": "Длинная база", "type": "integer", "min": 1, "max": 90, "unit": "дней" },
+        { "key": "baselineShortDays", "label": "Короткая база", "type": "integer", "min": 1, "max": 90, "unit": "дней" },
+        { "key": "cooldownMinutes", "label": "Интервал между сетапами", "type": "integer", "min": 0, "max": 10080, "unit": "мин" },
+        { "key": "maxGapPercent", "label": "Допустимая доля пропусков", "type": "decimal", "min": 0, "max": 100, "unit": "%" },
+        { "key": "maxConsecutiveGapMinutes", "label": "Максимальный непрерывный пропуск", "type": "integer", "min": 0, "max": 1440, "unit": "мин" },
+        { "key": "requiredRecentMinutes", "label": "Последние минуты без пропусков", "type": "integer", "min": 0, "max": 1440, "unit": "мин" }
+        ])
+    } else {
+        json!([
+        { "key": "priceGrowthPct", "label": "Рост цены", "type": "decimal", "min": 0, "max": 1000, "unit": "%" },
+        { "key": "windowMinutes", "label": "Окно роста цены и оборота", "type": "integer", "min": 1, "max": 1440, "unit": "мин" },
+        { "key": "volumeMultiplier", "label": "Множитель оборота", "type": "decimal", "min": 0.000001, "max": 1000, "unit": "×" },
+        { "key": "baselineLongDays", "label": "Длинная база", "type": "integer", "min": 1, "max": 90, "unit": "дней" },
+        { "key": "baselineShortDays", "label": "Короткая база", "type": "integer", "min": 1, "max": 90, "unit": "дней" },
+        { "key": "cooldownMinutes", "label": "Интервал между сетапами", "type": "integer", "min": 0, "max": 10080, "unit": "мин" },
+        { "key": "maxGapPercent", "label": "Допустимая доля пропусков", "type": "decimal", "min": 0, "max": 100, "unit": "%" },
+        { "key": "maxConsecutiveGapMinutes", "label": "Максимальный непрерывный пропуск", "type": "integer", "min": 0, "max": 1440, "unit": "мин" },
+        { "key": "requiredRecentMinutes", "label": "Последние минуты без пропусков", "type": "integer", "min": 0, "max": 1440, "unit": "мин" }
+        ])
+    }
+}
+
+fn algorithm_identity(id: &str) -> (&'static str, &'static str, &'static str) {
+    if id == SPIKE_DROP_ALGORITHM_ID {
+        (
+            "Падение цены и всплеск оборота",
+            SPIKE_DROP_ALGORITHM_VERSION,
+            "Нейтральный WATCH: падение цены и оборот выше короткой или длинной базы. Общая конфигурация для истории и live.",
+        )
+    } else {
+        (
+            "Всплеск цены и оборота",
+            SPIKE_ALGORITHM_VERSION,
+            "Нейтральный WATCH: рост цены и оборот выше короткой или длинной базы. Общая конфигурация для истории и live.",
+        )
+    }
 }
 
 fn algorithm_dto(id: &str, stored: Option<Value>) -> Value {
-    let mut params = serde_json::to_value(SpikeParams::default()).unwrap_or(Value::Null);
+    let (name, version, description) = algorithm_identity(id);
+    let mut params = if id == SPIKE_DROP_ALGORITHM_ID {
+        serde_json::to_value(SpikeDropParams::default()).unwrap_or(Value::Null)
+    } else {
+        serde_json::to_value(SpikeParams::default()).unwrap_or(Value::Null)
+    };
     if let Some(stored_params) = stored.as_ref().and_then(|value| value.get("params")) {
         merge_objects(&mut params, stored_params);
     }
@@ -70,17 +110,17 @@ fn algorithm_dto(id: &str, stored: Option<Value>) -> Value {
         .is_none_or(|value| *value != Value::Bool(false));
     json!({
         "id": id,
-        "name": "Всплеск цены и оборота",
-        "version": SPIKE_ALGORITHM_VERSION,
-        "description": "Нейтральный WATCH: рост цены и оборот выше короткой или длинной базы. Общая конфигурация для истории и live.",
+        "name": name,
+        "version": version,
+        "description": description,
         "params": params,
         "enabled": enabled,
-        "fields": algorithm_fields(),
+        "fields": algorithm_fields(id),
     })
 }
 
 async fn get_algorithm(pool: &PgPool, id: &str) -> Result<Option<Value>, DbError> {
-    if id != SPIKE_ALGORITHM_ID {
+    if !ALGORITHM_IDS.contains(&id) {
         return Ok(None);
     }
     let stored = settings_get(pool, &format!("algorithm:{id}")).await?;
@@ -91,21 +131,34 @@ async fn list_algorithms(State(state): State<Arc<ControlsState>>, headers: Heade
     if let Err(response) = guard(&state, &headers, false) {
         return response;
     }
-    match get_algorithm(&state.pool, SPIKE_ALGORITHM_ID).await {
-        Ok(Some(algorithm)) => Json(json!({ "algorithms": [algorithm] })).into_response(),
-        Ok(None) => Json(json!({ "algorithms": [] })).into_response(),
-        Err(_) => internal_error(),
+    let mut algorithms: Vec<Value> = Vec::new();
+    for id in ALGORITHM_IDS {
+        match get_algorithm(&state.pool, id).await {
+            Ok(Some(algorithm)) => algorithms.push(algorithm),
+            Ok(None) => {}
+            Err(_) => return internal_error(),
+        }
     }
+    Json(json!({ "algorithms": algorithms })).into_response()
 }
 
 async fn export_config(State(state): State<Arc<ControlsState>>, headers: HeaderMap) -> Response {
     if let Err(response) = guard(&state, &headers, false) {
         return response;
     }
-    let algorithm = match get_algorithm(&state.pool, SPIKE_ALGORITHM_ID).await {
-        Ok(value) => value,
-        Err(_) => return internal_error(),
-    };
+    let mut algorithms_entries: Vec<Value> = Vec::new();
+    for id in ALGORITHM_IDS {
+        match get_algorithm(&state.pool, id).await {
+            Ok(Some(value)) => algorithms_entries.push(json!({
+                "id": value["id"],
+                "version": value["version"],
+                "params": value["params"],
+                "enabled": value["enabled"],
+            })),
+            Ok(None) => {}
+            Err(_) => return internal_error(),
+        }
+    }
     let notifications = settings_get(&state.pool, "notifications")
         .await
         .unwrap_or(None)
@@ -122,17 +175,9 @@ async fn export_config(State(state): State<Arc<ControlsState>>, headers: HeaderM
         Ok(value) => value,
         Err(_) => return internal_error(),
     };
-    let algorithms_entry = algorithm.map(|value| {
-        json!({
-            "id": value["id"],
-            "version": value["version"],
-            "params": value["params"],
-            "enabled": value["enabled"],
-        })
-    });
     let body = json!({
         "formatVersion": 1,
-        "algorithms": algorithms_entry.map(|entry| vec![entry]).unwrap_or_default(),
+        "algorithms": algorithms_entries,
         "notifications": { "maxAgeSeconds": notifications.get("maxAgeSeconds").cloned().unwrap_or(json!(60)) },
         "live": { "enabled": live.get("enabled") == Some(&Value::Bool(true)) },
         "replay": { "paused": replay.get("paused") == Some(&Value::Bool(true)) },
@@ -174,10 +219,24 @@ async fn update_algorithm(
         Ok(value) => value,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_body"),
     };
-    if let Some(error) = validate_spike_params(&parsed.params) {
+    let params: AlgorithmParams = if id == SPIKE_DROP_ALGORITHM_ID {
+        match serde_json::from_value::<SpikeDropParams>(parsed.params.clone()) {
+            Ok(value) => AlgorithmParams::SpikeDrop(value),
+            Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_body"),
+        }
+    } else {
+        match serde_json::from_value::<SpikeParams>(parsed.params) {
+            Ok(value) => AlgorithmParams::Spike(value),
+            Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_body"),
+        }
+    };
+    if let Some(error) = validate_algorithm_params(&params) {
         return error_response(StatusCode::BAD_REQUEST, error);
     }
-    let value = json!({ "params": parsed.params, "enabled": parsed.enabled });
+    let value = json!({
+        "params": serde_json::to_value(&params).unwrap_or(Value::Null),
+        "enabled": parsed.enabled,
+    });
     if settings_set(&state.pool, &format!("algorithm:{id}"), &value)
         .await
         .is_err()
@@ -192,7 +251,7 @@ async fn update_algorithm(
 
 #[derive(serde::Deserialize)]
 struct AlgorithmUpdateBody {
-    params: SpikeParams,
+    params: Value,
     enabled: bool,
 }
 
@@ -963,6 +1022,30 @@ mod tests {
         assert_eq!(dto["enabled"], json!(true));
         let dto = algorithm_dto(SPIKE_ALGORITHM_ID, None);
         assert_eq!(dto["enabled"], json!(true));
+    }
+
+    #[test]
+    fn algorithm_dto_drop_merges_stored_params_and_field_labels() {
+        let stored = json!({ "params": { "priceDropPct": "20" }, "enabled": false });
+        let dto = algorithm_dto(SPIKE_DROP_ALGORITHM_ID, Some(stored));
+        assert_eq!(dto["params"]["priceDropPct"], json!("20"));
+        let defaults = serde_json::to_value(SpikeDropParams::default()).unwrap();
+        assert_eq!(dto["params"]["windowMinutes"], defaults["windowMinutes"]);
+        assert_eq!(dto["name"], json!("Падение цены и всплеск оборота"));
+        assert_eq!(dto["version"], json!(SPIKE_DROP_ALGORITHM_VERSION));
+        assert_eq!(dto["enabled"], json!(false));
+        let fields = dto["fields"].as_array().expect("fields array");
+        let price_field = fields
+            .iter()
+            .find(|field| field["key"] == "priceDropPct")
+            .expect("price drop field");
+        assert_eq!(price_field["label"], json!("Падение цены"));
+        assert_eq!(price_field["max"], json!(100));
+        let window_field = fields
+            .iter()
+            .find(|field| field["key"] == "windowMinutes")
+            .expect("window field");
+        assert_eq!(window_field["label"], json!("Окно падения цены и оборота"));
     }
 
     #[test]

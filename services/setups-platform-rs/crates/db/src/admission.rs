@@ -1,6 +1,6 @@
 use crate::{CacheQuery, DbError, ReplayRun, canonical_cache_key, replay_run_from_row, unix_to_ts};
 use chrono::{DateTime, Utc};
-use setups_domain::{SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION, SpikeParams};
+use setups_domain::AlgorithmParams;
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{PgConnection, Row};
 use std::collections::HashSet;
@@ -115,7 +115,7 @@ pub struct ReplayAdmissionInput {
     pub instruments: Vec<AdmissionInstrument>,
     pub from_unix: i64,
     pub to_unix: i64,
-    pub params: SpikeParams,
+    pub params: AlgorithmParams,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,8 +133,8 @@ impl ReserveStatus {
     }
 }
 
-pub fn replay_work_minutes(from_unix: i64, to_unix: i64, params: &SpikeParams) -> i64 {
-    (to_unix - from_unix + 59) / 60 + i64::from(params.baseline_long_days) * 24 * 60
+pub fn replay_work_minutes(from_unix: i64, to_unix: i64, params: &AlgorithmParams) -> i64 {
+    (to_unix - from_unix + 59) / 60 + i64::from(params.baseline_long_days()) * 24 * 60
 }
 
 fn admission(resource: AdmissionResource, limit: i64, requested: i64) -> QueueError {
@@ -149,7 +149,7 @@ fn work_minutes_of(row: &PgRow) -> Result<i64, QueueError> {
     let from = row.try_get::<DateTime<Utc>, _>("from_ts")?.timestamp();
     let to = row.try_get::<DateTime<Utc>, _>("to_ts")?.timestamp();
     let params: serde_json::Value = row.try_get("params")?;
-    let params: SpikeParams =
+    let params: AlgorithmParams =
         serde_json::from_value(params).map_err(|error| QueueError::Json(error.to_string()))?;
     Ok(replay_work_minutes(from, to, &params))
 }
@@ -207,6 +207,8 @@ pub async fn reserve_replay_runs(
             requested_runs,
         ));
     }
+    let algorithm_id = input.params.algorithm_id().to_string();
+    let algorithm_version = input.params.algorithm_version().to_string();
     let cache_keys: Vec<String> = input
         .instruments
         .iter()
@@ -215,8 +217,8 @@ pub async fn reserve_replay_runs(
                 exchange_code: instrument.exchange.clone(),
                 category: instrument.category.clone(),
                 symbol: instrument.symbol.clone(),
-                algorithm_id: SPIKE_ALGORITHM_ID.to_string(),
-                algorithm_version: SPIKE_ALGORITHM_VERSION.to_string(),
+                algorithm_id: algorithm_id.clone(),
+                algorithm_version: algorithm_version.clone(),
                 params: input.params.clone(),
                 from_unix: input.from_unix,
                 to_unix: input.to_unix,
@@ -267,8 +269,8 @@ pub async fn reserve_replay_runs(
         )
         .bind(&first.exchange)
         .bind(&first.category)
-        .bind(SPIKE_ALGORITHM_ID)
-        .bind(SPIKE_ALGORITHM_VERSION)
+        .bind(&algorithm_id)
+        .bind(&algorithm_version)
         .bind(serde_json::to_value(&input.params)?)
         .bind(unix_to_ts(input.from_unix))
         .bind(unix_to_ts(input.to_unix))
@@ -292,8 +294,8 @@ pub async fn reserve_replay_runs(
         .bind(&instrument.symbol)
         .bind(unix_to_ts(input.from_unix))
         .bind(unix_to_ts(input.to_unix))
-        .bind(SPIKE_ALGORITHM_ID)
-        .bind(SPIKE_ALGORITHM_VERSION)
+        .bind(&algorithm_id)
+        .bind(&algorithm_version)
         .bind(serde_json::to_value(&input.params)?)
         .bind(initial_status.as_str())
         .bind(cached.contains(key))
@@ -534,13 +536,18 @@ mod tests {
 
     #[test]
     fn work_minutes_ceil_and_baseline_match_ts() {
-        let params = SpikeParams::default();
+        let params = AlgorithmParams::Spike(setups_domain::SpikeParams::default());
         assert_eq!(replay_work_minutes(0, 60, &params), 1 + 30 * 1440);
         assert_eq!(replay_work_minutes(0, 61, &params), 2 + 30 * 1440);
         assert_eq!(replay_work_minutes(0, 59, &params), 1 + 30 * 1440);
-        let mut small = params;
+        let AlgorithmParams::Spike(mut small) = params else {
+            unreachable!();
+        };
         small.baseline_long_days = 1;
-        assert_eq!(replay_work_minutes(0, 3600, &small), 60 + 1440);
+        assert_eq!(
+            replay_work_minutes(0, 3600, &AlgorithmParams::Spike(small)),
+            60 + 1440
+        );
     }
 
     #[test]

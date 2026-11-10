@@ -5,10 +5,11 @@ use setups_db::push::{
     delete_push_subscription, get_or_create_vapid_keys, list_push_subscriptions,
     valid_push_endpoint,
 };
-use setups_db::runs::{get_replay_params, insert_live_setup, last_live_setup_open_time};
+use setups_db::runs::{get_algorithm_params, insert_live_setup, last_live_setup_open_time};
 use setups_db::{settings_get, settings_set};
 use setups_domain::{
-    PushStatus, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION, SpikeParams, SpikeSetup,
+    AlgorithmParams, PushStatus, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION,
+    SPIKE_DROP_ALGORITHM_ID, SPIKE_DROP_ALGORITHM_VERSION, SpikeSetup,
 };
 use setups_mdclient::{ApiCandleSource, CatalogInstrument, MarketDataClient};
 use setups_replay::{CandleSource, CandleSourceQuery, ReplayRunOptions, replay_run};
@@ -23,6 +24,50 @@ use web_push::{
     ContentEncoding, HyperWebPushClient, SubscriptionInfo, VapidSignatureBuilder, WebPushClient,
     WebPushError, WebPushMessageBuilder,
 };
+
+/// One algorithm participating in a live tick. The spike checkpoint suffix
+/// stays empty so existing `live-checkpoint:{instrument}` entries keep
+/// working; the drop algorithm uses its own namespaced key.
+struct LiveAlgorithm {
+    params: AlgorithmParams,
+    config_hash: String,
+    checkpoint_suffix: &'static str,
+}
+
+fn live_config_hash(version: &str, params_value: &Value) -> String {
+    let payload = json!([version, params_value]);
+    let mut hasher = Sha256::new();
+    hasher.update(payload.to_string());
+    format!("{:x}", hasher.finalize())
+}
+
+async fn active_live_algorithms(pool: &PgPool) -> Result<Vec<LiveAlgorithm>, WorkerError> {
+    let mut algorithms = Vec::new();
+    for (algorithm_id, version, checkpoint_suffix) in [
+        (SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION, ""),
+        (
+            SPIKE_DROP_ALGORITHM_ID,
+            SPIKE_DROP_ALGORITHM_VERSION,
+            ":price_drop_volume_spike",
+        ),
+    ] {
+        let stored = settings_get(pool, &format!("algorithm:{algorithm_id}"))
+            .await?
+            .unwrap_or(json!({}));
+        if stored.get("enabled") == Some(&Value::Bool(false)) {
+            continue;
+        }
+        let params = get_algorithm_params(pool, algorithm_id).await?;
+        let params_value = serde_json::to_value(&params).unwrap_or(Value::Null);
+        let config_hash = live_config_hash(version, &params_value);
+        algorithms.push(LiveAlgorithm {
+            params,
+            config_hash,
+            checkpoint_suffix,
+        });
+    }
+    Ok(algorithms)
+}
 
 pub fn evaluate_delivery_age(
     close_time_unix: i64,
@@ -51,11 +96,11 @@ pub async fn live_scan_once<S: CandleSource>(
     now_unix: i64,
     from_unix: Option<i64>,
     delivery_now_unix: Option<i64>,
-    params: &SpikeParams,
+    params: &AlgorithmParams,
     max_age_seconds: i64,
     stopped: Option<&AtomicBool>,
 ) -> Result<LiveScanResult, WorkerError> {
-    let required_minutes = i64::from(params.baseline_long_days) * 1440;
+    let required_minutes = i64::from(params.baseline_long_days()) * 1440;
     let from_unix = from_unix.unwrap_or(now_unix - 600);
     // Align the warmup start down to a whole minute like the TS scanner.
     let warmup_unix = (from_unix - required_minutes * 60).div_euclid(60) * 60;
@@ -75,8 +120,8 @@ pub async fn live_scan_once<S: CandleSource>(
             exchange,
             category,
             symbol,
-            SPIKE_ALGORITHM_ID,
-            SPIKE_ALGORITHM_VERSION,
+            params.algorithm_id(),
+            params.algorithm_version(),
             &params_value,
         )
         .await?;
@@ -222,27 +267,15 @@ async fn live_tick_inner(
     if live.get("enabled") != Some(&Value::Bool(true)) {
         return Ok(());
     }
-    let algorithm_stored = settings_get(pool, "algorithm:price_volume_spike")
-        .await?
-        .unwrap_or(json!({}));
-    if algorithm_stored.get("enabled") == Some(&Value::Bool(false)) {
+    let algorithms = active_live_algorithms(pool).await?;
+    if algorithms.is_empty() {
         return Ok(());
     }
-    let params = get_replay_params(pool).await?;
     let now_unix = chrono::Utc::now().timestamp().div_euclid(60) * 60;
     if now_unix == *last_minute {
         return Ok(());
     }
     let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let config_hash = {
-        let payload = json!([
-            SPIKE_ALGORITHM_VERSION,
-            serde_json::to_value(&params).unwrap_or(Value::Null),
-        ]);
-        let mut hasher = Sha256::new();
-        hasher.update(payload.to_string());
-        format!("{:x}", hasher.finalize())
-    };
     settings_set(
         pool,
         "live-status",
@@ -307,80 +340,102 @@ async fn live_tick_inner(
         if !still_enabled {
             break;
         }
-        match scan_instrument(
-            pool,
-            market_url,
-            market_key,
-            item,
-            &params,
-            &config_hash,
-            now_unix,
-            max_age_seconds,
-        )
-        .await
-        {
-            ScanOutcome::WaitingData => {
-                stale += 1;
-                instrument_states.push(json!({
-                    "symbol": item.symbol,
-                    "state": "waiting_data",
-                }));
-            }
-            ScanOutcome::Skipped {
-                is_stale,
-                last_closed,
-            } => {
-                if is_stale {
-                    stale += 1;
+        let mut any_waiting = false;
+        let mut any_scanned = false;
+        let mut all_ready = true;
+        let mut instrument_failed = false;
+        let mut instrument_stale = false;
+        let mut instrument_setups: u64 = 0;
+        let mut last_closed: Option<i64> = None;
+        for algorithm in &algorithms {
+            match scan_instrument(
+                pool,
+                market_url,
+                market_key,
+                item,
+                algorithm,
+                now_unix,
+                max_age_seconds,
+            )
+            .await
+            {
+                ScanOutcome::WaitingData => {
+                    any_waiting = true;
                 }
-                let state = if is_stale { "stale" } else { "waiting_data" };
-                instrument_states.push(json!({
-                    "symbol": item.symbol,
-                    "state": state,
-                    "lastClosedUnix": last_closed,
-                }));
-            }
-            ScanOutcome::Scanned {
-                ready,
-                is_stale,
-                last_closed,
-                new_setups,
-                checkpoint_next,
-            } => {
-                scanned += 1;
-                setup_count += new_setups;
-                if is_stale {
-                    stale += 1;
+                ScanOutcome::Skipped {
+                    is_stale,
+                    last_closed: closed,
+                } => {
+                    if is_stale {
+                        instrument_stale = true;
+                    }
+                    if closed.is_some() {
+                        last_closed = closed;
+                    }
                 }
-                let state = if !ready {
-                    "insufficient_history"
-                } else if is_stale {
-                    "stale"
-                } else {
-                    "ready"
-                };
-                instrument_states.push(json!({
-                    "symbol": item.symbol,
-                    "state": state,
-                    "lastClosedUnix": last_closed,
-                }));
-                if let Some(next) = checkpoint_next {
-                    let _ = settings_set(
-                        pool,
-                        &format!("live-checkpoint:{}", item.id),
-                        &json!({ "configHash": config_hash, "nextUnix": next }),
-                    )
-                    .await;
+                ScanOutcome::Scanned {
+                    ready,
+                    is_stale,
+                    last_closed: closed,
+                    new_setups,
+                } => {
+                    any_scanned = true;
+                    if !ready {
+                        all_ready = false;
+                    }
+                    if is_stale {
+                        instrument_stale = true;
+                    }
+                    if closed.is_some() {
+                        last_closed = closed;
+                    }
+                    instrument_setups += new_setups;
+                }
+                ScanOutcome::Failed => {
+                    instrument_failed = true;
                 }
             }
-            ScanOutcome::Failed => {
-                failed += 1;
-                instrument_states.push(json!({
-                    "symbol": item.symbol,
-                    "state": "error",
-                    "error": "Ошибка чтения или расчёта",
-                }));
-            }
+        }
+        if instrument_failed {
+            failed += 1;
+            instrument_states.push(json!({
+                "symbol": item.symbol,
+                "state": "error",
+                "error": "Ошибка чтения или расчёта",
+            }));
+            continue;
+        }
+        // Preserve the historical counter semantics: an instrument without
+        // fresh data also counts towards the stale bucket.
+        if instrument_stale || any_waiting {
+            stale += 1;
+        }
+        if any_scanned {
+            scanned += 1;
+            setup_count += instrument_setups;
+            let state = if !all_ready {
+                "insufficient_history"
+            } else if instrument_stale {
+                "stale"
+            } else {
+                "ready"
+            };
+            instrument_states.push(json!({
+                "symbol": item.symbol,
+                "state": state,
+                "lastClosedUnix": last_closed,
+            }));
+        } else {
+            let state = if instrument_stale {
+                "stale"
+            } else {
+                "waiting_data"
+            };
+            instrument_states.push(json!({
+                "symbol": item.symbol,
+                "state": state,
+                "lastClosedUnix": last_closed,
+            }));
         }
     }
     *last_minute = now_unix;
@@ -417,19 +472,16 @@ enum ScanOutcome {
         is_stale: bool,
         last_closed: Option<i64>,
         new_setups: u64,
-        checkpoint_next: Option<i64>,
     },
     Failed,
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn scan_instrument(
     pool: &PgPool,
     market_url: &str,
     market_key: &str,
     item: &CatalogInstrument,
-    params: &SpikeParams,
-    config_hash: &str,
+    algorithm: &LiveAlgorithm,
     now_unix: i64,
     max_age_seconds: i64,
 ) -> ScanOutcome {
@@ -451,7 +503,7 @@ async fn scan_instrument(
     };
     let latest_close = last_bar.open_time_unix + 60;
     let is_stale = now_unix - latest_close > 60;
-    let checkpoint_key = format!("live-checkpoint:{}", item.id);
+    let checkpoint_key = format!("live-checkpoint:{}{}", item.id, algorithm.checkpoint_suffix);
     let checkpoint = settings_get(pool, &checkpoint_key)
         .await
         .ok()
@@ -460,7 +512,7 @@ async fn scan_instrument(
     let matching_next = checkpoint
         .get("configHash")
         .and_then(Value::as_str)
-        .filter(|stored| *stored == config_hash)
+        .filter(|stored| *stored == algorithm.config_hash)
         .and_then(|_| checkpoint.get("nextUnix").and_then(Value::as_i64));
     let from_unix = matching_next.unwrap_or(latest_close - 600);
     if from_unix >= latest_close {
@@ -481,19 +533,28 @@ async fn scan_instrument(
         to_unix,
         Some(from_unix),
         Some(now_unix),
-        params,
+        &algorithm.params,
         max_age_seconds,
         None,
     )
     .await
     {
-        Ok(result) => ScanOutcome::Scanned {
-            ready: result.ready,
-            is_stale,
-            last_closed: Some(latest_close),
-            new_setups: result.new_setups.len() as u64,
-            checkpoint_next: result.last_processed_unix.map(|value| value + 60),
-        },
+        Ok(result) => {
+            if let Some(next) = result.last_processed_unix.map(|value| value + 60) {
+                let _ = settings_set(
+                    pool,
+                    &checkpoint_key,
+                    &json!({ "configHash": algorithm.config_hash, "nextUnix": next }),
+                )
+                .await;
+            }
+            ScanOutcome::Scanned {
+                ready: result.ready,
+                is_stale,
+                last_closed: Some(latest_close),
+                new_setups: result.new_setups.len() as u64,
+            }
+        }
         Err(_) => ScanOutcome::Failed,
     }
 }

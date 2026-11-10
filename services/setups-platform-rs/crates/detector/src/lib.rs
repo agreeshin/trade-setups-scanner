@@ -6,11 +6,13 @@ use setups_domain::decimal::{
     Decimal, DecimalError, ZERO, add, compare_scaled, mul_by_i128, ratio, sub,
 };
 use setups_domain::{
-    DetectorBar, PushResult, PushStatus, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION, SetupDetails,
-    SkipReason, SpikeParams, SpikeSetup,
+    AlgorithmParams, DetectorBar, PushResult, PushStatus, SPIKE_ALGORITHM_ID,
+    SPIKE_ALGORITHM_VERSION, SPIKE_DROP_ALGORITHM_ID, SPIKE_DROP_ALGORITHM_VERSION, SetupDetails,
+    SkipReason, SpikeDropParams, SpikeParams, SpikeSetup,
 };
 
 const MINUTE_SECONDS: i64 = 60;
+const HUNDRED: Decimal = Decimal { int: 100, scale: 0 };
 
 struct CloseEntry {
     time: i64,
@@ -18,13 +20,16 @@ struct CloseEntry {
 }
 
 pub struct PriceVolumeSpikeDetector {
-    params: SpikeParams,
+    params: AlgorithmParams,
+    algorithm_id: &'static str,
+    algorithm_version: &'static str,
+    price_drop: bool,
     required_minutes: usize,
     short_minutes: usize,
     window_minutes: usize,
     cooldown_seconds: i64,
-    growth_denominator: i128,
-    growth_numerator: i128,
+    price_numerator: i128,
+    price_denominator: i128,
     multiplier: i128,
     multiplier_denominator: i128,
     max_consecutive_gap_minutes: i64,
@@ -42,11 +47,25 @@ pub struct PriceVolumeSpikeDetector {
 
 impl PriceVolumeSpikeDetector {
     pub fn new(params: SpikeParams, last_setup_time: Option<i64>) -> Result<Self, DecimalError> {
-        let required_minutes = params.baseline_long_days as usize * 1440;
-        let short_minutes = params.baseline_short_days as usize * 1440;
-        let window_minutes = params.window_minutes as usize;
+        Self::with_params(AlgorithmParams::Spike(params), last_setup_time)
+    }
 
-        let gap_percent = Decimal::parse(&params.max_gap_percent)?;
+    pub fn new_drop(
+        params: SpikeDropParams,
+        last_setup_time: Option<i64>,
+    ) -> Result<Self, DecimalError> {
+        Self::with_params(AlgorithmParams::SpikeDrop(params), last_setup_time)
+    }
+
+    pub fn with_params(
+        params: AlgorithmParams,
+        last_setup_time: Option<i64>,
+    ) -> Result<Self, DecimalError> {
+        let required_minutes = params.baseline_long_days() as usize * 1440;
+        let short_minutes = params.baseline_short_days() as usize * 1440;
+        let window_minutes = params.window_minutes() as usize;
+
+        let gap_percent = Decimal::parse(params.max_gap_percent())?;
         let gap_divisor = 100i128
             .checked_mul(10i128.pow(gap_percent.scale))
             .ok_or(DecimalError::Overflow("gap percent divisor"))?;
@@ -55,14 +74,27 @@ impl PriceVolumeSpikeDetector {
             .ok_or(DecimalError::Overflow("gap percent"))?
             / gap_divisor) as usize;
 
-        let pct = Decimal::parse(&params.price_growth_pct)?;
-        let growth = add(Decimal { int: 100, scale: 0 }, pct)?;
-        let growth_numerator = growth.int;
-        let growth_denominator = 100i128
-            .checked_mul(10i128.pow(growth.scale))
-            .ok_or(DecimalError::Overflow("growth denominator"))?;
+        let pct = Decimal::parse(params.price_pct())?;
+        let (algorithm_id, algorithm_version, price_drop, price_bound) = match &params {
+            AlgorithmParams::Spike(_) => (
+                SPIKE_ALGORITHM_ID,
+                SPIKE_ALGORITHM_VERSION,
+                false,
+                add(HUNDRED, pct)?,
+            ),
+            AlgorithmParams::SpikeDrop(_) => (
+                SPIKE_DROP_ALGORITHM_ID,
+                SPIKE_DROP_ALGORITHM_VERSION,
+                true,
+                sub(HUNDRED, pct)?,
+            ),
+        };
+        let price_numerator = price_bound.int;
+        let price_denominator = 100i128
+            .checked_mul(10i128.pow(price_bound.scale))
+            .ok_or(DecimalError::Overflow("price denominator"))?;
 
-        let multiplier = Decimal::parse(&params.volume_multiplier)?;
+        let multiplier = Decimal::parse(params.volume_multiplier())?;
         let multiplier_denominator = 10i128
             .checked_pow(multiplier.scale)
             .ok_or(DecimalError::Overflow("multiplier denominator"))?;
@@ -71,15 +103,18 @@ impl PriceVolumeSpikeDetector {
             required_minutes,
             short_minutes,
             window_minutes,
-            cooldown_seconds: params.cooldown_minutes as i64 * MINUTE_SECONDS,
-            growth_denominator,
-            growth_numerator,
+            cooldown_seconds: i64::from(params.cooldown_minutes()) * MINUTE_SECONDS,
+            price_denominator,
+            price_numerator,
             multiplier: multiplier.int,
             multiplier_denominator,
-            max_consecutive_gap_minutes: params.max_consecutive_gap_minutes as i64,
-            required_recent_minutes: params.required_recent_minutes as usize,
+            max_consecutive_gap_minutes: params.max_consecutive_gap_minutes() as i64,
+            required_recent_minutes: params.required_recent_minutes() as usize,
             max_missing_count,
             params,
+            algorithm_id,
+            algorithm_version,
+            price_drop,
             volumes: VecDeque::new(),
             missing_in_window: 0,
             sum_window: ZERO,
@@ -226,13 +261,18 @@ impl PriceVolumeSpikeDetector {
             _ => return Ok((None, Some(SkipReason::PriceReferenceMissing))),
         };
 
-        if compare_scaled(
+        let price_ordering = compare_scaled(
             current_close,
-            self.growth_denominator,
+            self.price_denominator,
             previous_close,
-            self.growth_numerator,
-        )? == std::cmp::Ordering::Less
-        {
+            self.price_numerator,
+        )?;
+        let price_condition_met = if self.price_drop {
+            price_ordering != std::cmp::Ordering::Greater
+        } else {
+            price_ordering != std::cmp::Ordering::Less
+        };
+        if !price_condition_met {
             return Ok((None, None));
         }
 
@@ -292,8 +332,8 @@ impl PriceVolumeSpikeDetector {
 
         Ok((
             Some(SpikeSetup {
-                algorithm_id: SPIKE_ALGORITHM_ID.to_string(),
-                algorithm_version: SPIKE_ALGORITHM_VERSION.to_string(),
+                algorithm_id: self.algorithm_id.to_string(),
+                algorithm_version: self.algorithm_version.to_string(),
                 open_time_unix: bar.open_time_unix,
                 close_time_unix: bar.open_time_unix + MINUTE_SECONDS,
                 close_price: bar.close.clone(),
@@ -318,5 +358,155 @@ impl PriceVolumeSpikeDetector {
         self.sum_short = ZERO;
         self.sum_long = ZERO;
         self.closes.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T0: i64 = 1_699_999_980;
+
+    fn minute(index: usize) -> i64 {
+        T0 + index as i64 * 60
+    }
+
+    fn bar(index: usize, close: &str, turnover: &str) -> DetectorBar {
+        DetectorBar {
+            open_time_unix: minute(index),
+            close: close.to_string(),
+            quote_turnover: turnover.to_string(),
+        }
+    }
+
+    fn drop_params() -> SpikeDropParams {
+        SpikeDropParams {
+            price_drop_pct: "12".to_string(),
+            window_minutes: 5,
+            baseline_long_days: 1,
+            baseline_short_days: 1,
+            volume_multiplier: "3".to_string(),
+            cooldown_minutes: 5,
+            max_gap_percent: "1".to_string(),
+            max_consecutive_gap_minutes: 5,
+            required_recent_minutes: 10,
+        }
+    }
+
+    fn spike_params() -> SpikeParams {
+        SpikeParams {
+            price_growth_pct: "12".to_string(),
+            window_minutes: 5,
+            baseline_long_days: 1,
+            baseline_short_days: 1,
+            volume_multiplier: "3".to_string(),
+            cooldown_minutes: 5,
+            max_gap_percent: "1".to_string(),
+            max_consecutive_gap_minutes: 5,
+            required_recent_minutes: 10,
+        }
+    }
+
+    /// 1439 warmup bars plus the signal bar; the four bars before the signal
+    /// join the signal window. `history_turnover` fills warmup, `window_turnover`
+    /// the five window bars (1435..=1439).
+    fn series(
+        signal_close: &str,
+        history_turnover: &str,
+        window_turnover: &str,
+    ) -> Vec<DetectorBar> {
+        let mut bars: Vec<DetectorBar> = (0..1439)
+            .map(|index| bar(index, "100", history_turnover))
+            .collect();
+        for entry in bars.iter_mut().skip(1435) {
+            entry.quote_turnover = window_turnover.to_string();
+        }
+        bars.push(bar(1439, signal_close, window_turnover));
+        bars
+    }
+
+    fn last_push(detector: &mut PriceVolumeSpikeDetector, bars: &[DetectorBar]) -> PushResult {
+        let mut last = None;
+        for entry in bars {
+            last = Some(detector.push(entry).expect("push succeeds"));
+        }
+        last.expect("at least one bar")
+    }
+
+    #[test]
+    fn drop_triggers_on_twelve_percent_fall_with_volume_spike() {
+        let mut detector = PriceVolumeSpikeDetector::new_drop(drop_params(), None).unwrap();
+        let result = last_push(&mut detector, &series("88", "10", "3000"));
+        let setup = result.setup.expect("setup emitted");
+        assert_eq!(setup.algorithm_id, "price_drop_volume_spike");
+        assert_eq!(setup.algorithm_version, "1.1.1");
+        assert_eq!(setup.open_time_unix, minute(1439));
+        assert_eq!(setup.close_price, "88");
+        let details = setup.details.expect("details present");
+        assert_eq!(details.growth_pct.as_deref(), Some("-12.0000"));
+        assert!(details.over_long || details.over_short);
+    }
+
+    #[test]
+    fn drop_does_not_trigger_on_rise_and_spike_does_not_trigger_on_fall() {
+        let mut drop_detector = PriceVolumeSpikeDetector::new_drop(drop_params(), None).unwrap();
+        let result = last_push(&mut drop_detector, &series("112", "10", "3000"));
+        assert!(result.setup.is_none(), "drop must not fire on a rise");
+
+        let mut spike_detector = PriceVolumeSpikeDetector::new(spike_params(), None).unwrap();
+        let result = last_push(&mut spike_detector, &series("88", "10", "3000"));
+        assert!(result.setup.is_none(), "spike must not fire on a fall");
+    }
+
+    #[test]
+    fn spike_still_triggers_on_twelve_percent_rise_with_volume_spike() {
+        let mut detector = PriceVolumeSpikeDetector::new(spike_params(), None).unwrap();
+        let result = last_push(&mut detector, &series("112", "10", "3000"));
+        let setup = result.setup.expect("setup emitted");
+        assert_eq!(setup.algorithm_id, "price_volume_spike");
+        assert_eq!(setup.algorithm_version, "1.1.1");
+        let details = setup.details.expect("details present");
+        assert_eq!(details.growth_pct.as_deref(), Some("12.0000"));
+    }
+
+    #[test]
+    fn drop_volume_exactly_3x_is_not_a_setup() {
+        let mut detector = PriceVolumeSpikeDetector::new_drop(drop_params(), None).unwrap();
+        let result = last_push(&mut detector, &series("88", "95", "287"));
+        assert!(
+            result.setup.is_none(),
+            "exactly x3 turnover must not create a setup"
+        );
+
+        let mut detector = PriceVolumeSpikeDetector::new_drop(drop_params(), None).unwrap();
+        let result = last_push(&mut detector, &series("88", "95", "288"));
+        assert!(
+            result.setup.is_some(),
+            "turnover above x3 must create a setup"
+        );
+    }
+
+    #[test]
+    fn drop_price_above_threshold_is_not_a_setup() {
+        let mut detector = PriceVolumeSpikeDetector::new_drop(drop_params(), None).unwrap();
+        let result = last_push(&mut detector, &series("88.5", "10", "3000"));
+        assert!(result.setup.is_none(), "11.5% fall is below the threshold");
+    }
+
+    #[test]
+    fn drop_cooldown_suppresses_recent_repetition() {
+        let signal_time = minute(1439);
+        let mut detector =
+            PriceVolumeSpikeDetector::new_drop(drop_params(), Some(signal_time - 240)).unwrap();
+        let result = last_push(&mut detector, &series("88", "10", "3000"));
+        assert!(result.setup.is_none(), "setup 4 minutes ago must suppress");
+
+        let mut detector =
+            PriceVolumeSpikeDetector::new_drop(drop_params(), Some(signal_time - 300)).unwrap();
+        let result = last_push(&mut detector, &series("88", "10", "3000"));
+        assert!(
+            result.setup.is_some(),
+            "boundary cooldown of 300s allows a setup"
+        );
     }
 }

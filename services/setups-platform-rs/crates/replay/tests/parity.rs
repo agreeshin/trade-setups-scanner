@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
-use setups_domain::SpikeParams;
+use setups_domain::{AlgorithmParams, SpikeParams};
 use setups_replay::{ArrayCandleSource, CandleBarDto, ReplayRunOptions, replay_run};
 
 #[derive(Deserialize)]
@@ -48,7 +48,7 @@ async fn replay_runner_parity() {
         source: &source,
         from_unix: section.from_unix,
         to_unix: section.to_unix,
-        params: Some(section.params.clone()),
+        params: Some(AlgorithmParams::Spike(section.params.clone())),
         last_setup_unix: None,
         warmup_unix: None,
         cancel: None,
@@ -78,7 +78,7 @@ async fn replay_runner_cancel_stops_midway() {
         source: &source,
         from_unix: section.from_unix,
         to_unix: section.to_unix,
-        params: Some(section.params.clone()),
+        params: Some(AlgorithmParams::Spike(section.params.clone())),
         last_setup_unix: None,
         warmup_unix: None,
         cancel: Some(&token),

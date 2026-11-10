@@ -658,6 +658,8 @@ pub async fn list_analytics_sets(pool: &PgPool) -> Result<Vec<AnalyticsSetInfo>,
 fn algorithm_name(algorithm_id: &str) -> String {
     if algorithm_id == setups_domain::SPIKE_ALGORITHM_ID {
         "Всплеск цены и оборота".to_string()
+    } else if algorithm_id == setups_domain::SPIKE_DROP_ALGORITHM_ID {
+        "Падение цены и всплеск оборота".to_string()
     } else {
         algorithm_id.to_string()
     }

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use setups_detector::quality::ReplayQuality;
-use setups_domain::{SpikeParams, SpikeSetup};
+use setups_domain::{AlgorithmParams, SpikeSetup};
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -48,7 +48,7 @@ pub struct CacheQuery {
     pub symbol: String,
     pub algorithm_id: String,
     pub algorithm_version: String,
-    pub params: SpikeParams,
+    pub params: AlgorithmParams,
     pub from_unix: i64,
     pub to_unix: i64,
 }
@@ -129,7 +129,7 @@ pub struct ReplayRun {
     pub to_ts: DateTime<Utc>,
     pub algorithm_id: String,
     pub algorithm_version: String,
-    pub params: SpikeParams,
+    pub params: AlgorithmParams,
     pub status: String,
     pub cache_hit: bool,
 }
@@ -327,13 +327,31 @@ mod tests {
             symbol: "BTCUSDT".into(),
             algorithm_id: "price_volume_spike".into(),
             algorithm_version: "1.1.1".into(),
-            params: SpikeParams::default(),
+            params: AlgorithmParams::Spike(setups_domain::SpikeParams::default()),
             from_unix: 1_699_920_000,
             to_unix: 1_700_006_400,
         };
         assert_eq!(
             canonical_cache_key(&query),
             "price_volume_spike@1.1.1|bybit/linear/BTCUSDT|1699920000-1700006400|baselineLongDays:30,baselineShortDays:7,cooldownMinutes:5,maxConsecutiveGapMinutes:5,maxGapPercent:1,priceGrowthPct:12,requiredRecentMinutes:10,volumeMultiplier:3,windowMinutes:5"
+        );
+    }
+
+    #[test]
+    fn canonical_cache_key_drop_uses_price_drop_pct() {
+        let query = CacheQuery {
+            exchange_code: "bybit".into(),
+            category: "linear".into(),
+            symbol: "BTCUSDT".into(),
+            algorithm_id: "price_drop_volume_spike".into(),
+            algorithm_version: "1.1.1".into(),
+            params: AlgorithmParams::SpikeDrop(setups_domain::SpikeDropParams::default()),
+            from_unix: 1_699_920_000,
+            to_unix: 1_700_006_400,
+        };
+        assert_eq!(
+            canonical_cache_key(&query),
+            "price_drop_volume_spike@1.1.1|bybit/linear/BTCUSDT|1699920000-1700006400|baselineLongDays:30,baselineShortDays:7,cooldownMinutes:5,maxConsecutiveGapMinutes:5,maxGapPercent:1,priceDropPct:12,requiredRecentMinutes:10,volumeMultiplier:3,windowMinutes:5"
         );
     }
 }

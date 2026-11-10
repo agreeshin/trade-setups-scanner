@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use setups_detector::PriceVolumeSpikeDetector;
 use setups_detector::quality::{ReplayQuality, ReplayQualityTracker};
 use setups_domain::decimal::DecimalError;
-use setups_domain::{MINUTE_SECONDS, PushStatus, SpikeParams, SpikeSetup};
+use setups_domain::{AlgorithmParams, MINUTE_SECONDS, PushStatus, SpikeSetup};
 
 pub const PAGE_LIMIT: usize = 5000;
 
@@ -162,7 +162,7 @@ pub struct ReplayRunOptions<'a, S> {
     pub source: &'a S,
     pub from_unix: i64,
     pub to_unix: i64,
-    pub params: Option<SpikeParams>,
+    pub params: Option<AlgorithmParams>,
     pub last_setup_unix: Option<i64>,
     pub warmup_unix: Option<i64>,
     pub cancel: Option<&'a CancelToken>,
@@ -172,8 +172,8 @@ pub async fn replay_run<S: CandleSource>(
     options: ReplayRunOptions<'_, S>,
 ) -> Result<ReplayRunResult, ReplayRunError> {
     let params = options.params.unwrap_or_default();
-    let required_minutes = params.baseline_long_days as u64 * 1440;
-    let mut detector = PriceVolumeSpikeDetector::new(params, options.last_setup_unix)
+    let required_minutes = params.baseline_long_days() as u64 * 1440;
+    let mut detector = PriceVolumeSpikeDetector::with_params(params, options.last_setup_unix)
         .map_err(ReplayRunError::Detector)?;
     let mut tracker =
         ReplayQualityTracker::new(options.from_unix, options.to_unix, required_minutes);

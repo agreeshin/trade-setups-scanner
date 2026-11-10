@@ -19,7 +19,10 @@ use setups_db::runs::{
     list_recent_runs, list_replay_batches, mark_run_instrument_not_found,
 };
 use setups_db::{CacheQuery, DbError, cache_lookup, settings_get, settings_set};
-use setups_domain::{SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION, SpikeParams};
+use setups_domain::{
+    AlgorithmParams, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION, SPIKE_DROP_ALGORITHM_ID,
+    SPIKE_DROP_ALGORITHM_VERSION, SpikeDropParams, SpikeParams,
+};
 use setups_mdclient::{ApiCandleSource, MarketDataClient};
 use setups_worker::run_one;
 use sqlx::postgres::PgPool;
@@ -168,18 +171,34 @@ fn number(value: &str) -> f64 {
 }
 
 pub fn validate_spike_params(params: &SpikeParams) -> Option<&'static str> {
-    if number(&params.price_growth_pct) > 1000.0
-        || number(&params.volume_multiplier) <= 0.0
-        || number(&params.volume_multiplier) > 1000.0
-        || number(&params.max_gap_percent) > 100.0
+    validate_algorithm_params(&AlgorithmParams::Spike(params.clone()))
+}
+
+pub fn validate_spike_drop_params(params: &SpikeDropParams) -> Option<&'static str> {
+    validate_algorithm_params(&AlgorithmParams::SpikeDrop(params.clone()))
+}
+
+pub fn validate_algorithm_params(params: &AlgorithmParams) -> Option<&'static str> {
+    let window_message = match params {
+        AlgorithmParams::Spike(_) => "Окно роста должно быть короче базового окна",
+        AlgorithmParams::SpikeDrop(_) => "Окно падения должно быть короче базового окна",
+    };
+    let price_threshold_invalid = match params {
+        AlgorithmParams::Spike(spike) => number(&spike.price_growth_pct) > 1000.0,
+        AlgorithmParams::SpikeDrop(drop) => number(&drop.price_drop_pct) > 100.0,
+    };
+    if price_threshold_invalid
+        || number(params.volume_multiplier()) <= 0.0
+        || number(params.volume_multiplier()) > 1000.0
+        || number(params.max_gap_percent()) > 100.0
     {
         return Some("Порог вне допустимого диапазона");
     }
-    if params.baseline_short_days > params.baseline_long_days {
+    if params.baseline_short_days() > params.baseline_long_days() {
         return Some("Короткая база не должна превышать длинную");
     }
-    if i64::from(params.window_minutes) >= i64::from(params.baseline_short_days) * 1440 {
-        return Some("Окно роста должно быть короче базового окна");
+    if i64::from(params.window_minutes()) >= i64::from(params.baseline_short_days()) * 1440 {
+        return Some(window_message);
     }
     None
 }
@@ -216,7 +235,7 @@ struct PreparedReplay {
     instruments: Vec<AdmissionInstrument>,
     from_unix: i64,
     to_unix: i64,
-    params: SpikeParams,
+    params: AlgorithmParams,
     async_run: bool,
 }
 
@@ -232,16 +251,22 @@ async fn prepare_replay_request(
         .algorithm_id
         .clone()
         .unwrap_or_else(|| SPIKE_ALGORITHM_ID.to_string());
-    if algorithm_id != SPIKE_ALGORITHM_ID {
-        return invalid("unknown_algorithm");
-    }
+    let current_version = match algorithm_id.as_str() {
+        SPIKE_ALGORITHM_ID => SPIKE_ALGORITHM_VERSION,
+        SPIKE_DROP_ALGORITHM_ID => SPIKE_DROP_ALGORITHM_VERSION,
+        _ => return invalid("unknown_algorithm"),
+    };
     if let Some(version) = &body.algorithm_version
-        && version != SPIKE_ALGORITHM_VERSION
+        && version != current_version
     {
         return invalid("algorithm_version_changed_repeat_preflight");
     }
-    let mut params_value = serde_json::to_value(SpikeParams::default()).unwrap_or(Value::Null);
-    if let Some(stored) = settings_get(pool, "algorithm:price_volume_spike").await?
+    let mut params_value = match algorithm_id.as_str() {
+        SPIKE_DROP_ALGORITHM_ID => serde_json::to_value(SpikeDropParams::default()),
+        _ => serde_json::to_value(SpikeParams::default()),
+    }
+    .unwrap_or(Value::Null);
+    if let Some(stored) = settings_get(pool, &format!("algorithm:{algorithm_id}")).await?
         && let Some(stored_params) = stored.get("params")
     {
         merge_objects(&mut params_value, stored_params);
@@ -249,11 +274,17 @@ async fn prepare_replay_request(
     if let Some(body_params) = &body.params {
         merge_objects(&mut params_value, body_params);
     }
-    let params: SpikeParams = match serde_json::from_value(params_value) {
+    let parsed_params = match algorithm_id.as_str() {
+        SPIKE_DROP_ALGORITHM_ID => {
+            serde_json::from_value::<SpikeDropParams>(params_value).map(AlgorithmParams::SpikeDrop)
+        }
+        _ => serde_json::from_value::<SpikeParams>(params_value).map(AlgorithmParams::Spike),
+    };
+    let params: AlgorithmParams = match parsed_params {
         Ok(value) => value,
         Err(_) => return invalid("invalid_params"),
     };
-    let semantic = validate_spike_params(&params);
+    let semantic = validate_algorithm_params(&params);
     let range_invalid = body.from_unix < 0
         || body.to_unix > 253_402_300_740
         || body.from_unix >= body.to_unix
@@ -371,8 +402,8 @@ async fn create_replay_runs(
             exchange_code: instrument.exchange.clone(),
             category: instrument.category.clone(),
             symbol: instrument.symbol.clone(),
-            algorithm_id: SPIKE_ALGORITHM_ID.to_string(),
-            algorithm_version: SPIKE_ALGORITHM_VERSION.to_string(),
+            algorithm_id: prepared.params.algorithm_id().to_string(),
+            algorithm_version: prepared.params.algorithm_version().to_string(),
             params: prepared.params.clone(),
             from_unix: prepared.from_unix,
             to_unix: prepared.to_unix,
@@ -843,7 +874,9 @@ async fn preflight_replay(
 }
 
 async fn run_preflight(state: &ReplayState, prepared: &PreparedReplay) -> Result<Value, DbError> {
-    let required_history_minutes = i64::from(prepared.params.baseline_long_days) * 1440;
+    let required_history_minutes = i64::from(prepared.params.baseline_long_days()) * 1440;
+    let algorithm_id = prepared.params.algorithm_id().to_string();
+    let algorithm_version = prepared.params.algorithm_version().to_string();
     let keys: Vec<String> = prepared
         .instruments
         .iter()
@@ -852,8 +885,8 @@ async fn run_preflight(state: &ReplayState, prepared: &PreparedReplay) -> Result
                 exchange_code: instrument.exchange.clone(),
                 category: instrument.category.clone(),
                 symbol: instrument.symbol.clone(),
-                algorithm_id: SPIKE_ALGORITHM_ID.to_string(),
-                algorithm_version: SPIKE_ALGORITHM_VERSION.to_string(),
+                algorithm_id: algorithm_id.clone(),
+                algorithm_version: algorithm_version.clone(),
                 params: prepared.params.clone(),
                 from_unix: prepared.from_unix,
                 to_unix: prepared.to_unix,
@@ -1059,7 +1092,7 @@ async fn run_preflight(state: &ReplayState, prepared: &PreparedReplay) -> Result
         .collect();
     Ok(json!({
         "checkedAt": iso8601(&Utc::now()),
-        "algorithmVersion": SPIKE_ALGORITHM_VERSION,
+        "algorithmVersion": algorithm_version,
         "requiredHistoryMinutes": required_history_minutes,
         "canRun": can_run,
         "request": {
@@ -1070,8 +1103,8 @@ async fn run_preflight(state: &ReplayState, prepared: &PreparedReplay) -> Result
             })).collect::<Vec<_>>(),
             "fromUnix": prepared.from_unix,
             "toUnix": prepared.to_unix,
-            "algorithmId": SPIKE_ALGORITHM_ID,
-            "algorithmVersion": SPIKE_ALGORITHM_VERSION,
+            "algorithmId": algorithm_id,
+            "algorithmVersion": algorithm_version,
             "params": serde_json::to_value(&prepared.params).unwrap_or(Value::Null),
             "async": true,
         },
@@ -1185,6 +1218,43 @@ mod tests {
                 "baselineShortDays": 1
             }))),
             Some("Окно роста должно быть короче базового окна")
+        );
+    }
+
+    fn drop_params_with(overlay: Value) -> SpikeDropParams {
+        let mut value =
+            serde_json::to_value(SpikeDropParams::default()).expect("default drop params");
+        merge_objects(&mut value, &overlay);
+        serde_json::from_value(value).expect("merged drop params")
+    }
+
+    #[test]
+    fn drop_validation_rules_mirror_spike_with_100_cap() {
+        assert_eq!(
+            validate_spike_drop_params(&SpikeDropParams::default()),
+            None
+        );
+        assert_eq!(
+            validate_spike_drop_params(&drop_params_with(json!({ "priceDropPct": "100.5" }))),
+            Some("Порог вне допустимого диапазона")
+        );
+        assert_eq!(
+            validate_spike_drop_params(&drop_params_with(json!({ "volumeMultiplier": "0" }))),
+            Some("Порог вне допустимого диапазона")
+        );
+        assert_eq!(
+            validate_spike_drop_params(&drop_params_with(json!({
+                "baselineShortDays": 90,
+                "baselineLongDays": 30
+            }))),
+            Some("Короткая база не должна превышать длинную")
+        );
+        assert_eq!(
+            validate_spike_drop_params(&drop_params_with(json!({
+                "windowMinutes": 1440,
+                "baselineShortDays": 1
+            }))),
+            Some("Окно падения должно быть короче базового окна")
         );
     }
 

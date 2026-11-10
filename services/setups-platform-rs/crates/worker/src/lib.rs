@@ -6,7 +6,10 @@ use setups_db::{canonical_cache_key, claim_next_queued_run, fail_interrupted_run
 use setups_detector::PriceVolumeSpikeDetector;
 use setups_detector::quality::{QualityInterval, ReplayQuality, ReplayQualityTracker};
 use setups_domain::decimal::DecimalError;
-use setups_domain::{DetectorBar, PushStatus, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION};
+use setups_domain::{
+    DetectorBar, PushStatus, SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION, SPIKE_DROP_ALGORITHM_ID,
+    SPIKE_DROP_ALGORITHM_VERSION,
+};
 use setups_mdclient::{ApiCandleSource, MarketDataClient};
 use setups_replay::{CandleSource, CandleSourceQuery, PAGE_LIMIT};
 use sqlx::Row;
@@ -110,8 +113,8 @@ async fn run_one_inner<S: CandleSource>(
     let generation = current_generation(pool).await?;
     let from_unix = run.from_ts.timestamp();
     let to_unix = run.to_ts.timestamp();
-    let required_minutes = run.params.baseline_long_days as u64 * 1440;
-    let mut detector = PriceVolumeSpikeDetector::new(run.params.clone(), None)?;
+    let required_minutes = run.params.baseline_long_days() as u64 * 1440;
+    let mut detector = PriceVolumeSpikeDetector::with_params(run.params.clone(), None)?;
     let mut tracker = ReplayQualityTracker::new(from_unix, to_unix, required_minutes);
     let warmup_from = from_unix - required_minutes as i64 * 60;
     let mut warmup_minutes: i64 = 0;
@@ -586,7 +589,12 @@ async fn execute_inner(
             .await
             .map_err(|error| error.to_string())?;
     }
-    if run.algorithm_id != SPIKE_ALGORITHM_ID || run.algorithm_version != SPIKE_ALGORITHM_VERSION {
+    let algorithm_supported = matches!(
+        (run.algorithm_id.as_str(), run.algorithm_version.as_str()),
+        (SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION)
+            | (SPIKE_DROP_ALGORITHM_ID, SPIKE_DROP_ALGORITHM_VERSION)
+    );
+    if !algorithm_supported {
         return Err(UNSUPPORTED_ALGORITHM.to_string());
     }
     let catalog = MarketDataClient::new(market_url, market_key)
