@@ -322,8 +322,10 @@ PRD 0.5 открыт в MarkText из read-only preview `~/Documents/setups-prd-
 
 ## Отдельная вкладка «Алгоритмы» (10 ноября 2026, вечер)
 
-Запрос владельца: вынести настройки алгоритмов из общей страницы «Настройки» в отдельную верхнюю вкладку «Алгоритмы», затем commit/push/deploy. Статус: `in_progress` до production smoke.
+Запрос владельца: вынести настройки алгоритмов из общей страницы «Настройки» в отдельную верхнюю вкладку «Алгоритмы», затем commit/push/deploy. Статус: `completed`.
 
 - PRD-first: `docs/prd/ux.md` фиксирует маршрут `/algorithms`, участие в общей keep-alive оболочке и четыре оставшихся подраздела «Настроек»; стартовый подраздел — «Сканирование».
 - Frontend: новая `AlgorithmsPage` — тонкая оболочка над прежней `AlgorithmSettings`, без дублирования логики; NavLink и stable keep-alive registry entry добавлены между «Запуски» и «Настройки»; из `SettingsPage` удалены импорт, сегмент и панель алгоритмов.
-- Проверки до commit: web 152/152 Vitest, корневые lint + check-styles и typecheck — PASS. Деплой web-only, signals-rust и replay-очередь не перезапускаются.
+- Проверки: web 152/152 Vitest, корневые lint + check-styles и typecheck — PASS.
+- Commit/push: `3dd6f78` (web), `9158cfa` (PRD/PLAN), `origin/main` синхронизирован.
+- Web-only deploy на tv: image `d2a288d2f1b2…`, asset `index-BvL0uUbJ.js`; `/` и `/algorithms` → 200, bundle содержит маршрут/подпись, no-cache и nginx `/v1` подтверждены. `signals-rust`, replay-очередь, market-data и PostgreSQL не перезапускались.
