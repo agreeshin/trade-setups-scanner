@@ -145,6 +145,17 @@ export async function fetchMatrixCell(params: AnalyticsQueryParams): Promise<Mat
   return getJson(`/v1/analytics/matrix-cell?${toQuery(params)}`);
 }
 
+export interface MatrixGridItem extends MatrixCellRef {
+  cached: boolean;
+}
+
+export async function fetchMatrixGrid(params: AnalyticsQueryParams, tpPcts: number[], slPcts: number[]): Promise<{ items: MatrixGridItem[] } & SelectionMetrics> {
+  const search = toQuery(params);
+  search.set("tpPct", tpPcts.join(","));
+  search.set("slPct", slPcts.join(","));
+  return getJson(`/v1/analytics/matrix-grid?${search.toString()}`);
+}
+
 export async function fetchTradeRows(params: AnalyticsQueryParams): Promise<{ items: TradeRow[]; cachedCount: number }> {
   return getJson(`/v1/analytics/trades?${toQuery(params)}`);
 }

@@ -5,6 +5,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
+use futures::future::join_all;
 use serde_json::{Map, Value, json};
 use setups_analytics::{
     AnalyticsSetup, DEFAULT_CLUSTER_GAP_HOURS, DEFAULT_HORIZON_MINUTES, EvaluateLimitOptions,
@@ -587,108 +588,188 @@ fn no_data_evaluation() -> LimitEvaluation {
     }
 }
 
-async fn evaluate_rows(
-    state: &AnalyticsState,
-    rows: &[AnalyticsSetup],
+enum PreparedEntry {
+    NoData,
+    Filtered {
+        entry_price: f64,
+        entry_open_unix: i64,
+    },
+    Eligible,
+}
+
+struct PreparedInput<'a> {
+    setup: &'a AnalyticsSetup,
+    group: usize,
+    entry: PreparedEntry,
+}
+
+/// Один раз подготовленные данные для сетки ячеек: окна свечей по инструментам
+/// (загружаются параллельно) и разрешённые входы с классификацией price-change.
+/// Поля entry не зависят от tp/sl, поэтому переиспользуются всеми ячейками.
+struct PreparedEvaluation<'a> {
+    windows: Vec<Arc<Vec<OhlcCandle>>>,
+    inputs: Vec<PreparedInput<'a>>,
+    eligible_count: usize,
+    filtered_count: usize,
+}
+
+async fn prepare_evaluation<'a>(
+    state: &'a AnalyticsState,
+    rows: &'a [AnalyticsSetup],
     params: &ParsedAnalyticsParams,
-) -> (Vec<LimitEvaluation>, usize, usize) {
-    let mut by_instrument: HashMap<String, Vec<&AnalyticsSetup>> = HashMap::new();
-    for row in rows {
+) -> PreparedEvaluation<'a> {
+    let mut by_instrument: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
         by_instrument
             .entry(format!(
                 "{}\0{}\0{}",
                 row.exchange_code, row.category, row.symbol
             ))
             .or_default()
-            .push(row);
+            .push(index);
     }
-    let mut evaluations: HashMap<String, LimitEvaluation> = HashMap::new();
-    let mut eligible_count = 0usize;
-    let mut filtered_count = 0usize;
-    for group in by_instrument.values() {
-        let Some(first) = group.first() else {
-            continue;
-        };
-        let Some(instrument_id) = state
-            .reader
-            .instrument_id(&first.exchange_code, &first.category, &first.symbol)
-            .await
-        else {
-            for setup in group {
-                evaluations.insert(identity_of(setup), no_data_evaluation());
-            }
-            continue;
-        };
-        let min_open = group
-            .iter()
-            .map(|setup| setup.open_time_unix)
-            .min()
-            .unwrap_or(i64::MAX);
-        let max_open = group
-            .iter()
-            .map(|setup| setup.open_time_unix)
-            .max()
-            .unwrap_or(0);
-        let window = state
-            .reader
-            .read_window_lossy(
-                instrument_id,
-                min_open,
-                max_open + params.time_shift_minutes * 60 + 60 + params.horizon_minutes * 60,
-            )
-            .await;
-        for setup in group {
-            let Some((entry_price, entry_candle)) =
-                resolve_entry(&window, setup, params.time_shift_minutes)
-            else {
-                evaluations.insert(identity_of(setup), no_data_evaluation());
-                continue;
-            };
-            let close_price: f64 = setup.close_price.parse().unwrap_or(f64::NAN);
-            if let Some(price_change_pct) = params.price_change_pct
-                && !passes_price_change(
-                    close_price,
-                    entry_price,
-                    params.direction,
-                    price_change_pct,
-                )
-            {
-                filtered_count += 1;
-                evaluations.insert(
-                    identity_of(setup),
-                    LimitEvaluation {
-                        status: LimitStatus::PriceChangeFiltered,
-                        entry_price: Some(entry_price),
-                        entry_time_unix: Some(entry_candle.open_time_unix + 60),
-                        tp_price: None,
-                        sl_price: None,
-                        close_time_unix: None,
-                        move_pct: None,
-                        close_minutes: None,
-                    },
-                );
-                continue;
-            }
-            eligible_count += 1;
-            evaluations.insert(
-                identity_of(setup),
-                evaluate_limit(EvaluateLimitOptions {
-                    candles: &window,
-                    setup,
-                    direction: params.direction,
-                    tp_pct: params.tp_pct,
-                    sl_pct: params.sl_pct,
-                    time_shift_minutes: params.time_shift_minutes,
-                    horizon_minutes: params.horizon_minutes,
-                }),
-            );
+    let mut group_of_row: Vec<usize> = vec![0; rows.len()];
+    let mut groups: Vec<(String, Vec<usize>)> = by_instrument.into_iter().collect();
+    groups.sort_by(|a, b| a.1[0].cmp(&b.1[0]));
+    for (group_index, (_, row_indexes)) in groups.iter().enumerate() {
+        for &row_index in row_indexes {
+            group_of_row[row_index] = group_index;
         }
     }
-    let ordered = rows
+    let mut fetches: Vec<(Option<i64>, i64, i64)> = Vec::with_capacity(groups.len());
+    for (_, row_indexes) in &groups {
+        let first = &rows[row_indexes[0]];
+        let instrument_id = state
+            .reader
+            .instrument_id(&first.exchange_code, &first.category, &first.symbol)
+            .await;
+        let min_open = row_indexes
+            .iter()
+            .map(|&index| rows[index].open_time_unix)
+            .min()
+            .unwrap_or(i64::MAX);
+        let max_open = row_indexes
+            .iter()
+            .map(|&index| rows[index].open_time_unix)
+            .max()
+            .unwrap_or(0);
+        fetches.push((
+            instrument_id,
+            min_open,
+            max_open + params.time_shift_minutes * 60 + 60 + params.horizon_minutes * 60,
+        ));
+    }
+    let windows: Vec<Option<Arc<Vec<OhlcCandle>>>> = join_all(fetches.iter().map(
+        |(instrument_id, min_open, max_bound)| async {
+            match instrument_id {
+                None => None,
+                Some(id) => Some(
+                    state
+                        .reader
+                        .read_window_lossy(*id, *min_open, *max_bound)
+                        .await,
+                ),
+            }
+        },
+    ))
+    .await;
+    let mut eligible_count = 0usize;
+    let mut filtered_count = 0usize;
+    let mut inputs: Vec<PreparedInput<'_>> = Vec::with_capacity(rows.len());
+    for (row_index, setup) in rows.iter().enumerate() {
+        let group = group_of_row[row_index];
+        let entry = match &windows[group] {
+            None => PreparedEntry::NoData,
+            Some(window) => match resolve_entry(window, setup, params.time_shift_minutes) {
+                None => PreparedEntry::NoData,
+                Some((entry_price, entry_candle)) => {
+                    if let Some(price_change_pct) = params.price_change_pct {
+                        let close_price: f64 = setup.close_price.parse().unwrap_or(f64::NAN);
+                        if !passes_price_change(
+                            close_price,
+                            entry_price,
+                            params.direction,
+                            price_change_pct,
+                        ) {
+                            filtered_count += 1;
+                            PreparedEntry::Filtered {
+                                entry_price,
+                                entry_open_unix: entry_candle.open_time_unix,
+                            }
+                        } else {
+                            eligible_count += 1;
+                            PreparedEntry::Eligible
+                        }
+                    } else {
+                        eligible_count += 1;
+                        PreparedEntry::Eligible
+                    }
+                }
+            },
+        };
+        inputs.push(PreparedInput {
+            setup,
+            group,
+            entry,
+        });
+    }
+    PreparedEvaluation {
+        windows: windows
+            .into_iter()
+            .map(|window| window.unwrap_or_default())
+            .collect(),
+        inputs,
+        eligible_count,
+        filtered_count,
+    }
+}
+
+fn evaluate_prepared(
+    prepared: &PreparedEvaluation<'_>,
+    params: &ParsedAnalyticsParams,
+) -> Vec<LimitEvaluation> {
+    prepared
+        .inputs
         .iter()
-        .filter_map(|setup| evaluations.get(&identity_of(setup)).copied())
-        .collect();
-    (ordered, eligible_count, filtered_count)
+        .map(|input| match &input.entry {
+            PreparedEntry::NoData => no_data_evaluation(),
+            PreparedEntry::Filtered {
+                entry_price,
+                entry_open_unix,
+            } => LimitEvaluation {
+                status: LimitStatus::PriceChangeFiltered,
+                entry_price: Some(*entry_price),
+                entry_time_unix: Some(entry_open_unix + 60),
+                tp_price: None,
+                sl_price: None,
+                close_time_unix: None,
+                move_pct: None,
+                close_minutes: None,
+            },
+            PreparedEntry::Eligible => evaluate_limit(EvaluateLimitOptions {
+                candles: &prepared.windows[input.group],
+                setup: input.setup,
+                direction: params.direction,
+                tp_pct: params.tp_pct,
+                sl_pct: params.sl_pct,
+                time_shift_minutes: params.time_shift_minutes,
+                horizon_minutes: params.horizon_minutes,
+            }),
+        })
+        .collect()
+}
+
+async fn evaluate_rows(
+    state: &AnalyticsState,
+    rows: &[AnalyticsSetup],
+    params: &ParsedAnalyticsParams,
+) -> (Vec<LimitEvaluation>, usize, usize) {
+    let prepared = prepare_evaluation(state, rows, params).await;
+    (
+        evaluate_prepared(&prepared, params),
+        prepared.eligible_count,
+        prepared.filtered_count,
+    )
 }
 
 fn aggregate_payload(
@@ -874,6 +955,150 @@ async fn analytics_setups(
     Json(json!({
         "setups": selection.rows.iter().map(setup_dto).collect::<Vec<_>>(),
         "totalMatchingSetups": in_scope.len(),
+        "avgSelectionOrdinal": selection.avg_selection_ordinal,
+        "avgSelectionDelayMinutes": selection.avg_selection_delay_minutes,
+        "totalClustersCount": selection.total_clusters_count,
+        "cachedSelection": selection.cached_selection,
+    }))
+    .into_response()
+}
+
+/// Максимум значений на ось сетки TP/SL (64x64 = 4096 ячеек上限).
+const MAX_GRID_AXIS_VALUES: usize = 64;
+
+fn parse_pct_list(raw: Option<&str>) -> Result<Vec<f64>, String> {
+    let raw = raw.ok_or_else(|| "tpPct and slPct lists are required".to_string())?;
+    let mut values = Vec::new();
+    for part in raw.split(',') {
+        let value = part
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| "invalid_query".to_string())?;
+        if !value.is_finite() || !(0.000_001..=100.0).contains(&value) {
+            return Err("invalid_query".to_string());
+        }
+        values.push(value);
+    }
+    if values.is_empty() || values.len() > MAX_GRID_AXIS_VALUES {
+        return Err("invalid_query".to_string());
+    }
+    Ok(values)
+}
+
+fn params_for_cell(
+    params: &ParsedAnalyticsParams,
+    tp_pct: f64,
+    sl_pct: f64,
+) -> ParsedAnalyticsParams {
+    let mut cell = params.clone();
+    cell.tp_pct = tp_pct;
+    cell.sl_pct = sl_pct;
+    cell.compute.tp_pct = tp_pct;
+    cell.compute.sl_pct = sl_pct;
+    cell
+}
+
+fn grid_item(tp_pct: f64, sl_pct: f64, payload: &Value, cached: bool) -> Value {
+    json!({
+        "tpPct": tp_pct,
+        "slPct": sl_pct,
+        "avgMovePct": payload.get("avgMovePct").filter(|value| !value.is_null()).and_then(Value::as_f64),
+        "riskExpectancy": payload.get("riskExpectancy").filter(|value| !value.is_null()).and_then(Value::as_f64),
+        "cached": cached,
+    })
+}
+
+/// Пакетный расчёт сетки TP×SL одним запросом: set/selection/окна свечей и
+/// входы готовятся один раз, ячейки различаются только проходом TP/SL.
+/// Закешированные ячейки возвращаются без пересчёта и совместимы с
+/// per-cell кешем (matrix-cell / matrix-cells).
+async fn analytics_matrix_grid(
+    State(state): State<Arc<AnalyticsState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(response) = guard_auth(&state.auth, &headers, false) {
+        return response;
+    }
+    let tp_list = match parse_pct_list(params.get("tpPct").map(String::as_str)) {
+        Ok(value) => value,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let sl_list = match parse_pct_list(params.get("slPct").map(String::as_str)) {
+        Ok(value) => value,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let mut raw = raw_query(&params);
+    raw.tp_pct = None;
+    raw.sl_pct = None;
+    let (base, setups) = match load_set(&state, parse_analytics_query(&raw, false)).await {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    if setups.len() > MAX_SETUPS_PER_COMPUTE {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "set is too large for one computation ({} setups)",
+                setups.len()
+            ),
+        );
+    }
+    let in_scope = filter_setups_by_time(&setups, &base.time_filter);
+    let selection = select_setup_rows(&state.pool, &setups, &base).await;
+    let scope = compute_scope(&state, &setups, &base).await;
+    let scope_key = matrix_scope_key(&scope);
+    let mut items: Vec<Value> = Vec::new();
+    let mut missing: Vec<(f64, f64)> = Vec::new();
+    for &tp_pct in &tp_list {
+        for &sl_pct in &sl_list {
+            if !setups.is_empty() {
+                let cell_params = params_for_cell(&base, tp_pct, sl_pct);
+                if let Ok(Some(cached)) = get_matrix_cell(
+                    &state.pool,
+                    &scope_key,
+                    &cell_params.compute,
+                    &base.cache_time_key,
+                )
+                .await
+                {
+                    items.push(grid_item(tp_pct, sl_pct, &cached, true));
+                    continue;
+                }
+            }
+            missing.push((tp_pct, sl_pct));
+        }
+    }
+    if !missing.is_empty() {
+        let prepared = prepare_evaluation(&state, &selection.rows, &base).await;
+        for (tp_pct, sl_pct) in missing {
+            let cell_params = params_for_cell(&base, tp_pct, sl_pct);
+            let evaluations = evaluate_prepared(&prepared, &cell_params);
+            let payload = aggregate_payload(
+                &cell_params,
+                &selection,
+                in_scope.len(),
+                prepared.eligible_count,
+                prepared.filtered_count,
+                &evaluations,
+            );
+            if !setups.is_empty() {
+                let _ = save_matrix_cell(
+                    &state.pool,
+                    &scope_key,
+                    &cell_params.compute,
+                    &base.cache_time_key,
+                    &payload,
+                )
+                .await;
+            }
+            items.push(grid_item(tp_pct, sl_pct, &payload, false));
+        }
+    }
+    Json(json!({
+        "items": items,
+        "totalMatchingSetups": in_scope.len(),
+        "filteredSetupsCount": selection.rows.len(),
         "avgSelectionOrdinal": selection.avg_selection_ordinal,
         "avgSelectionDelayMinutes": selection.avg_selection_delay_minutes,
         "totalClustersCount": selection.total_clusters_count,
@@ -1255,6 +1480,7 @@ pub fn analytics_router(state: Arc<AnalyticsState>) -> Router {
         .route("/v1/analytics/months", get(analytics_months))
         .route("/v1/analytics/setups", get(analytics_setups))
         .route("/v1/analytics/matrix-cells", get(analytics_matrix_cells))
+        .route("/v1/analytics/matrix-grid", get(analytics_matrix_grid))
         .route("/v1/analytics/matrix-cell", get(analytics_matrix_cell))
         .route("/v1/analytics/trades", get(analytics_trades))
         .route(

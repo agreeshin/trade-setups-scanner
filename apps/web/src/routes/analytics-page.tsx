@@ -19,8 +19,7 @@ import {
   fetchAnalyticsCacheSummary,
   fetchAnalyticsMonths,
   fetchAnalyticsSets,
-  fetchMatrixCell,
-  fetchMatrixCells,
+  fetchMatrixGrid,
   fetchAnalyticsSetups,
   fetchTradeRow,
   fetchTradeRows,
@@ -147,25 +146,14 @@ function MatrixSection({
       ...(shiftMinutes > 0 ? { timeShiftMinutes: shiftMinutes } : {}),
       ...(priceChangePct !== null ? { priceChangePct } : {}),
     };
+    setProgress({ done: 0, total: totalCells });
     try {
-      const bulk = await fetchMatrixCells(baseParams);
+      const grid = await fetchMatrixGrid(baseParams, tpLevels, slLevels);
       if (stale()) return;
-      const nextCells = new Map(bulk.items.map((item) => [`${item.tpPct}:${item.slPct}`, item]));
+      const nextCells = new Map(grid.items.map((item) => [`${item.tpPct}:${item.slPct}`, item]));
       setCells(nextCells);
-      setMetrics(bulk);
+      setMetrics(grid);
       setProgress({ done: nextCells.size, total: totalCells });
-      for (const tpPct of tpLevels) {
-        for (const slPct of slLevels) {
-          const key = `${tpPct}:${slPct}`;
-          if (nextCells.has(key)) continue;
-          setPendingCell(key);
-          const cell = await fetchMatrixCell({ ...baseParams, tpPct, slPct });
-          if (stale()) return;
-          nextCells.set(key, { tpPct, slPct, avgMovePct: cell.avgMovePct, riskExpectancy: cell.riskExpectancy });
-          setCells(new Map(nextCells));
-          setProgress({ done: nextCells.size, total: totalCells });
-        }
-      }
     } catch (cause) {
       if (!stale()) setError(cause instanceof Error ? cause.message : "ошибка расчёта");
     } finally {

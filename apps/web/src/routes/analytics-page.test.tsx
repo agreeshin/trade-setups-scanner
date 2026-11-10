@@ -28,7 +28,7 @@ interface StubOptions {
   sets?: typeof setFixture[];
   shortBulk?: { tpPct: number; slPct: number; avgMovePct: number | null; riskExpectancy: number | null }[];
   longBulk?: { tpPct: number; slPct: number; avgMovePct: number | null; riskExpectancy: number | null }[];
-  interceptMatrixCell?: (tpPct: number, slPct: number) => Promise<Response> | undefined;
+  interceptMatrixGrid?: (direction: string) => Promise<Response> | undefined;
   savedSettings?: Record<string, unknown>;
 }
 
@@ -49,6 +49,15 @@ function stubFetch(options: StubOptions = {}) {
     if (path.startsWith("/v1/analytics/setups")) {
       return json({ setups: [setupA, setupB], ...selectionMetrics });
     }
+    if (path.startsWith("/v1/analytics/matrix-grid")) {
+      const direction = query.get("direction") ?? "short";
+      if (options.interceptMatrixGrid !== undefined) {
+        const intercepted = options.interceptMatrixGrid(direction);
+        if (intercepted !== undefined) return intercepted;
+      }
+      const items = direction === "long" ? options.longBulk ?? [] : options.shortBulk ?? [];
+      return json({ items, ...selectionMetrics });
+    }
     if (path.startsWith("/v1/analytics/matrix-cells")) {
       const direction = query.get("direction") ?? "short";
       const items = direction === "long" ? options.longBulk ?? [] : options.shortBulk ?? [];
@@ -57,10 +66,6 @@ function stubFetch(options: StubOptions = {}) {
     if (path.startsWith("/v1/analytics/matrix-cell")) {
       const tpPct = Number(query.get("tpPct"));
       const slPct = Number(query.get("slPct"));
-      if (options.interceptMatrixCell !== undefined) {
-        const intercepted = options.interceptMatrixCell(tpPct, slPct);
-        if (intercepted !== undefined) return intercepted;
-      }
       return json({ ...matrixCell(tpPct, slPct, tpPct / slPct), cached: false, cachedSelection: true, closedCount: 4, tpCount: 3, slCount: 1 });
     }
     if (path.startsWith("/v1/analytics/trades/")) {
@@ -132,23 +137,25 @@ it("computes matrices only after the button press and honours subsections", asyn
   expect(screen.getAllByLabelText("Зелёный при")[1]).toHaveValue("0.5");
 }, 15_000);
 
-it("computes missing matrix cells sequentially after the bulk cache read", async () => {
-  stubFetch({ shortBulk: fullShortGrid.slice(0, 1), longBulk: fullLongGrid });
+it("fills the whole grid from a single batch request", async () => {
+  const calls = stubFetch({ shortBulk: fullShortGrid });
   render(<AnalyticsPage />);
   expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
   await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument(), { timeout: 15_000 });
+  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid")).toHaveLength(1);
+  expect(calls.some((call) => call.path === "/v1/analytics/matrix-cell")).toBe(false);
 }, 30_000);
 
-it("shows a per-cell loader and stops the matrix run on demand", async () => {
-  let cellCalls = 0;
-  const firstCellResolve: { fn: ((response: Response) => void) | null } = { fn: null };
+it("stops the matrix batch run on demand and ignores the stale result", async () => {
+  let gridCalls = 0;
+  const firstRunResolve: { fn: ((response: Response) => void) | null } = { fn: null };
   stubFetch({
-    shortBulk: fullShortGrid.slice(0, 1),
-    interceptMatrixCell: () => {
-      cellCalls += 1;
-      if (cellCalls === 1) {
-        return new Promise<Response>((resolve) => { firstCellResolve.fn = resolve; });
+    shortBulk: fullShortGrid,
+    interceptMatrixGrid: () => {
+      gridCalls += 1;
+      if (gridCalls === 1) {
+        return new Promise<Response>((resolve) => { firstRunResolve.fn = resolve; });
       }
       return undefined;
     },
@@ -157,22 +164,18 @@ it("shows a per-cell loader and stops the matrix run on demand", async () => {
   await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
   expect(await screen.findByRole("button", { name: "Остановить" })).toBeInTheDocument();
-  expect(await screen.findByRole("status", { name: "Расчёт ячейки" })).toBeInTheDocument();
-  expect(screen.getAllByText("0.05").length).toBeGreaterThan(0);
+  expect(screen.getByText("Ячеек: 0 / 196")).toBeInTheDocument();
 
   await userEvent.click(screen.getByRole("button", { name: "Остановить" }));
   await waitFor(() => expect(screen.getAllByRole("button", { name: "Рассчитать" })).toHaveLength(2));
-  expect(screen.queryByRole("status", { name: "Расчёт ячейки" })).not.toBeInTheDocument();
-  expect(screen.getAllByText("0.05").length).toBeGreaterThan(0);
 
-  firstCellResolve.fn?.(new Response(
-    JSON.stringify({ ...matrixCell(4, 6, 0.9), cached: false, cachedSelection: true, closedCount: 4, tpCount: 3, slCount: 1 }),
+  firstRunResolve.fn?.(new Response(
+    JSON.stringify({ items: fullShortGrid, ...selectionMetrics }),
     { status: 200 },
   ));
   await new Promise((resolve) => { setTimeout(resolve, 50); });
-  expect(cellCalls).toBe(1);
-  expect(screen.queryByText("0.90")).not.toBeInTheDocument();
-  expect(screen.getAllByRole("button", { name: "Рассчитать" })).toHaveLength(2);
+  expect(gridCalls).toBe(1);
+  expect(screen.queryByText("0.17")).not.toBeInTheDocument();
 }, 10_000);
 
 it("disables maturity and sends no clustering params when the checkbox is off", async () => {
@@ -185,7 +188,7 @@ it("disables maturity and sends no clustering params when the checkbox is off", 
   expect(screen.getAllByLabelText("Разрыв кластера, ч")[0]).toBeDisabled();
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
   await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument());
-  const bulkCalls = calls.filter((call) => call.path === "/v1/analytics/matrix-cells");
+  const bulkCalls = calls.filter((call) => call.path === "/v1/analytics/matrix-grid");
   expect(bulkCalls.length).toBeGreaterThan(0);
   expect(bulkCalls.every((call) => !call.search.includes("setupMaturity") && !call.search.includes("clusterGapHours"))).toBe(true);
   expect(screen.queryByText("После кластеризации: 42")).not.toBeInTheDocument();
@@ -202,13 +205,13 @@ it("syncs the month selector with the date pair", async () => {
   expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2024-01-31");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
   await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument());
-  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-cells").every((call) => call.search.includes("month=2024-01") && !call.search.includes("fromDay")));
+  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid").every((call) => call.search.includes("month=2024-01") && !call.search.includes("fromDay")));
 
   fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2024-01-10" } });
   expect(screen.getAllByLabelText("Период")[0]).toHaveValue("custom");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
   await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument());
-  const customCalls = calls.filter((call) => call.path === "/v1/analytics/matrix-cells" && call.search.includes("fromDay=2024-01-10"));
+  const customCalls = calls.filter((call) => call.path === "/v1/analytics/matrix-grid" && call.search.includes("fromDay=2024-01-10"));
   expect(customCalls.length).toBeGreaterThan(0);
   expect(customCalls.every((call) => call.search.includes("toDay=2024-01-31") && !call.search.includes("month="))).toBe(true);
 }, 10_000);
@@ -285,7 +288,7 @@ it("auto-calculates matrices on entry when enabled", async () => {
   expect(screen.getByRole("checkbox", { name: "Авторасчёт матриц" })).toBeChecked();
   await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument(), { timeout: 15_000 });
   await waitFor(() => expect(screen.getByText("Ячеек: 550 / 550")).toBeInTheDocument(), { timeout: 15_000 });
-  expect(calls.some((call) => call.path === "/v1/analytics/matrix-cells")).toBe(true);
+  expect(calls.some((call) => call.path === "/v1/analytics/matrix-grid")).toBe(true);
   expect(calls.every((call) => !call.path.startsWith("/v1/analytics/setups") && !call.path.startsWith("/v1/analytics/trades"))).toBe(true);
 }, 30_000);
 

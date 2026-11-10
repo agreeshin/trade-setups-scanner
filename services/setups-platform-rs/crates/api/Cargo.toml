@@ -16,6 +16,7 @@ chrono.workspace = true
 axum.workspace = true
 reqwest.workspace = true
 tokio-util.workspace = true
+futures.workspace = true
 futures-core.workspace = true
 hmac.workspace = true
 sha2.workspace = true
