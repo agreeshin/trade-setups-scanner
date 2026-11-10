@@ -96,7 +96,7 @@ services:
       PORT: 8082
       HOST: 0.0.0.0
       LOG_LEVEL: info
-      REPLAY_WORKERS: "0"
+      REPLAY_WORKERS: "2"
       BACKUP_DIR: /var/lib/trade-setups/backups
       BACKUP_MAX_UPLOAD_BYTES: ${PLATFORM_BACKUP_MAX_UPLOAD_BYTES:-64424509440}
     volumes:

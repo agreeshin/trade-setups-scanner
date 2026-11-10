@@ -45,7 +45,9 @@ fn run_full_from_row(row: &PgRow) -> Result<ReplayRunFull, DbError> {
         symbol: row.try_get("symbol")?,
         status: row.try_get("status")?,
         cache_hit: row.try_get("cache_hit")?,
-        setups: row.try_get("setups")?,
+        setups: row
+            .try_get::<Option<Value>, _>("setups")?
+            .unwrap_or(Value::Null),
         setup_count: i64::from(row.try_get::<i32, _>("setup_count")?),
         warmup_minutes: row
             .try_get::<Option<i32>, _>("warmup_minutes")?
