@@ -127,8 +127,8 @@ fn matrix_cell_where<'a>(
         .bind(params.maturity_tenths)
         .bind(params.cluster_gap_minutes)
         .bind(month_key)
-        .bind(format_pct(params.tp_pct))
-        .bind(format_pct(params.sl_pct))
+        .bind(params.tp_pct)
+        .bind(params.sl_pct)
         .bind(params.horizon_minutes)
         .bind(params.time_shift_minutes)
         .bind(params.price_change_ppm)
@@ -167,7 +167,8 @@ pub async fn save_matrix_cell(
     sqlx::query(
         "insert into analytics_matrix_cache (scope_key, direction, maturity_tenths, cluster_gap_minutes, \
          month_key, tp_pct, sl_pct, horizon_minutes, time_shift_minutes, price_change_ppm, \
-         algorithm_version, result_json) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+         algorithm_version, result_json) values ($1, $2, $3, $4, $5, $6, $7, \
+         $8, $9, $10, $11, $12) \
          on conflict (scope_key, direction, maturity_tenths, cluster_gap_minutes, month_key, tp_pct, \
          sl_pct, horizon_minutes, time_shift_minutes, price_change_ppm, algorithm_version) \
          do update set result_json = excluded.result_json, created_at = now()",
@@ -177,8 +178,8 @@ pub async fn save_matrix_cell(
     .bind(params.maturity_tenths)
     .bind(params.cluster_gap_minutes)
     .bind(month_key)
-    .bind(format_pct(params.tp_pct))
-    .bind(format_pct(params.sl_pct))
+    .bind(params.tp_pct)
+    .bind(params.sl_pct)
     .bind(params.horizon_minutes)
     .bind(params.time_shift_minutes)
     .bind(params.price_change_ppm)
@@ -253,8 +254,8 @@ pub async fn get_trade_row(
         "select result_json from analytics_trades_cache where scope_key = $1 \
          and direction = $2 and maturity_tenths = $3 and cluster_gap_minutes = $4 \
          and exchange_code = $5 and category = $6 and symbol = $7 and close_time_unix = $8 \
-         and tp_pct = $9 and sl_pct = $10 and horizon_minutes = $11 and time_shift_minutes = $12 \
-         and price_change_ppm = $13 and algorithm_version = $14",
+         and tp_pct = $9 and sl_pct = $10 and horizon_minutes = $11 \
+         and time_shift_minutes = $12 and price_change_ppm = $13 and algorithm_version = $14",
     )
     .bind(scope_key)
     .bind(&params.direction)
@@ -263,9 +264,9 @@ pub async fn get_trade_row(
     .bind(&identity.exchange_code)
     .bind(&identity.category)
     .bind(&identity.symbol)
-    .bind(identity.close_time_unix.to_string())
-    .bind(format_pct(params.tp_pct))
-    .bind(format_pct(params.sl_pct))
+    .bind(identity.close_time_unix)
+    .bind(params.tp_pct)
+    .bind(params.sl_pct)
     .bind(params.horizon_minutes)
     .bind(params.time_shift_minutes)
     .bind(params.price_change_ppm)
@@ -298,9 +299,9 @@ pub async fn save_trade_row(
     .bind(&identity.exchange_code)
     .bind(&identity.category)
     .bind(&identity.symbol)
-    .bind(identity.close_time_unix.to_string())
-    .bind(format_pct(params.tp_pct))
-    .bind(format_pct(params.sl_pct))
+    .bind(identity.close_time_unix)
+    .bind(params.tp_pct)
+    .bind(params.sl_pct)
     .bind(params.horizon_minutes)
     .bind(params.time_shift_minutes)
     .bind(params.price_change_ppm)
@@ -332,8 +333,8 @@ pub async fn list_trade_rows(
     .bind(&params.direction)
     .bind(params.maturity_tenths)
     .bind(params.cluster_gap_minutes)
-    .bind(format_pct(params.tp_pct))
-    .bind(format_pct(params.sl_pct))
+    .bind(params.tp_pct)
+    .bind(params.sl_pct)
     .bind(params.horizon_minutes)
     .bind(params.time_shift_minutes)
     .bind(params.price_change_ppm)

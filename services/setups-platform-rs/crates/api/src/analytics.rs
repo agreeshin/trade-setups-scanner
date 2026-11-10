@@ -520,7 +520,7 @@ async fn select_setup_rows(
         "avgSelectionDelayMinutes": selection.avg_selection_delay_minutes,
         "totalClustersCount": selection.total_clusters_count,
     });
-    let _ = save_selection(
+    if let Err(cache_error) = save_selection(
         pool,
         &scope_key,
         params.maturity_tenths,
@@ -528,7 +528,10 @@ async fn select_setup_rows(
         &params.cache_time_key,
         &payload,
     )
-    .await;
+    .await
+    {
+        eprintln!("analytics cache save failed (save_selection): {cache_error}");
+    }
     SelectionResult {
         rows: selection.rows,
         avg_selection_ordinal: selection.avg_selection_ordinal,
@@ -1082,15 +1085,17 @@ async fn analytics_matrix_grid(
                 prepared.filtered_count,
                 &evaluations,
             );
-            if !setups.is_empty() {
-                let _ = save_matrix_cell(
+            if !setups.is_empty()
+                && let Err(cache_error) = save_matrix_cell(
                     &state.pool,
                     &scope_key,
                     &cell_params.compute,
                     &base.cache_time_key,
                     &payload,
                 )
-                .await;
+                .await
+            {
+                eprintln!("analytics cache save failed (save_matrix_cell): {cache_error}");
             }
             items.push(grid_item(tp_pct, sl_pct, &payload, false));
         }
@@ -1198,15 +1203,17 @@ async fn analytics_matrix_cell(
         filtered_count,
         &evaluations,
     );
-    if !setups.is_empty() {
-        let _ = save_matrix_cell(
+    if !setups.is_empty()
+        && let Err(cache_error) = save_matrix_cell(
             &state.pool,
             &scope_key,
             &params.compute,
             &params.cache_time_key,
             &payload,
         )
-        .await;
+        .await
+    {
+        eprintln!("analytics cache save failed (save_matrix_cell): {cache_error}");
     }
     let mut response = payload;
     response["cached"] = json!(false);
@@ -1416,14 +1423,17 @@ async fn analytics_trade_detail(
             symbol: setup.symbol.clone(),
             close_time_unix: setup.close_time_unix,
         };
-        let _ = save_trade_row(
+        if let Err(cache_error) = save_trade_row(
             &state.pool,
             &scope_key,
             &params.compute,
             &identity,
             &payload,
         )
-        .await;
+        .await
+        {
+            eprintln!("analytics cache save failed (save_trade_row): {cache_error}");
+        }
     }
     let mut response = payload;
     response["setup"] = setup_dto_value;
