@@ -1,4 +1,4 @@
-use crate::replay::{ReplayState, batch_dto, guard_auth, parse_id, parse_paging};
+use crate::replay::{ReplayState, batch_dto, guard_auth, parse_id, parse_paging, parse_run_name};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -7,7 +7,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use setups_db::runs::{
     BatchDeleteOutcome, BatchSetupRow, cancel_replay_batch, delete_replay_batch, get_replay_batch,
-    get_run_page, live_setups_page, live_setups_search, live_setups_snapshot,
+    get_run_page, live_setups_page, live_setups_search, live_setups_snapshot, rename_replay_batch,
     replay_batch_result_page,
 };
 use setups_db::{settings_get, settings_set};
@@ -181,6 +181,29 @@ async fn cancel_batch(
             Json(json!({ "cancelled": cancelled, "cancelRequested": cancel_requested }))
                 .into_response()
         }
+        Err(_) => internal_error(),
+    }
+}
+
+async fn rename_batch(
+    State(state): State<Arc<ReplayState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: String,
+) -> Response {
+    if let Err(response) = guard(&state, &headers, true) {
+        return response;
+    }
+    let Some(batch_id) = parse_id(&id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_id");
+    };
+    let name = match parse_run_name(&body) {
+        Ok(name) => name,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+    match rename_replay_batch(&state.pool, batch_id, &name).await {
+        Ok(true) => Json(json!({ "ok": true, "name": name })).into_response(),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "batch not found"),
         Err(_) => internal_error(),
     }
 }
@@ -541,7 +564,7 @@ pub fn batches_router(state: Arc<ReplayState>) -> Router {
     Router::new()
         .route(
             "/v1/replay-batches/{id}",
-            get(get_batch).delete(delete_batch),
+            get(get_batch).patch(rename_batch).delete(delete_batch),
         )
         .route(
             "/v1/replay-batches/{id}/cancel",

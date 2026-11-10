@@ -586,7 +586,7 @@ pub struct AnalyticsSetInfo {
 pub async fn list_analytics_sets(pool: &PgPool) -> Result<Vec<AnalyticsSetInfo>, DbError> {
     let batches = crate::runs::list_replay_batches(pool, 200).await?;
     let standalone = sqlx::query(
-        "select id, exchange_code, category, symbol, algorithm_id, algorithm_version, params, \
+        "select id, name, exchange_code, category, symbol, algorithm_id, algorithm_version, params, \
          from_ts, to_ts, created_at, setups from replay_runs where batch_id is null \
          and status = 'done' order by id desc limit 200",
     )
@@ -594,15 +594,11 @@ pub async fn list_analytics_sets(pool: &PgPool) -> Result<Vec<AnalyticsSetInfo>,
     .await?;
     let mut sets: Vec<AnalyticsSetInfo> = Vec::new();
     for batch in batches.iter().filter(|batch| batch.status == "done") {
-        let suffix = match &batch.algorithm_version {
-            Some(version) => format!("{} · {version}", algorithm_name(&batch.algorithm_id)),
-            None => algorithm_name(&batch.algorithm_id),
-        };
         sets.push(AnalyticsSetInfo {
             set_id: format!("batch-{}", batch.id),
             kind: SetKind::Batch,
             numeric_id: batch.id,
-            label: format!("#{} - {suffix}", batch.id),
+            label: format!("#{} · {}", batch.id, batch.name),
             algorithm_id: batch.algorithm_id.clone(),
             algorithm_version: batch.algorithm_version.clone(),
             params: batch.params.clone(),
@@ -626,15 +622,13 @@ pub async fn list_analytics_sets(pool: &PgPool) -> Result<Vec<AnalyticsSetInfo>,
         let to_ts: Option<DateTime<Utc>> = row.try_get("to_ts")?;
         let created_at: DateTime<Utc> = row.try_get("created_at")?;
         let algorithm_id: String = row.try_get("algorithm_id")?;
-        let suffix = match &algorithm_version {
-            Some(version) => format!("{} · {version}", algorithm_name(&algorithm_id)),
-            None => algorithm_name(&algorithm_id),
-        };
+        let name: Option<String> = row.try_get("name")?;
+        let run_name = crate::replay_name(name.as_deref(), &algorithm_id);
         sets.push(AnalyticsSetInfo {
             set_id: format!("run-{id}"),
             kind: SetKind::Run,
             numeric_id: i64::from(id),
-            label: format!("#{id} - {suffix}"),
+            label: format!("#{id} · {run_name}"),
             algorithm_id,
             algorithm_version,
             params: row.try_get("params")?,
@@ -653,16 +647,6 @@ pub async fn list_analytics_sets(pool: &PgPool) -> Result<Vec<AnalyticsSetInfo>,
             .then_with(|| a.set_id.cmp(&b.set_id))
     });
     Ok(sets)
-}
-
-fn algorithm_name(algorithm_id: &str) -> String {
-    if algorithm_id == setups_domain::SPIKE_ALGORITHM_ID {
-        "Всплеск цены и оборота".to_string()
-    } else if algorithm_id == setups_domain::SPIKE_DROP_ALGORITHM_ID {
-        "Падение цены и всплеск оборота".to_string()
-    } else {
-        algorithm_id.to_string()
-    }
 }
 
 #[cfg(test)]

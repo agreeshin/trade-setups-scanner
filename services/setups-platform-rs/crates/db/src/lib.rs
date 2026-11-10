@@ -36,6 +36,22 @@ impl From<sqlx::Error> for DbError {
     }
 }
 
+pub(crate) fn algorithm_name(algorithm_id: &str) -> String {
+    if algorithm_id == setups_domain::SPIKE_ALGORITHM_ID {
+        "Всплеск цены и оборота".to_string()
+    } else if algorithm_id == setups_domain::SPIKE_DROP_ALGORITHM_ID {
+        "Падение цены и всплеск оборота".to_string()
+    } else {
+        algorithm_id.to_string()
+    }
+}
+
+pub(crate) fn replay_name(name: Option<&str>, algorithm_id: &str) -> String {
+    name.filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| algorithm_name(algorithm_id))
+}
+
 fn json_error(error: serde_json::Error) -> DbError {
     DbError::Json(error.to_string())
 }
@@ -307,6 +323,25 @@ pub fn run_query(run: &ReplayRun) -> CacheQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_names_default_to_algorithm_display_names() {
+        for name in [None, Some("")] {
+            assert_eq!(
+                replay_name(name, setups_domain::SPIKE_ALGORITHM_ID),
+                "Всплеск цены и оборота"
+            );
+            assert_eq!(
+                replay_name(name, setups_domain::SPIKE_DROP_ALGORITHM_ID),
+                "Падение цены и всплеск оборота"
+            );
+            assert_eq!(replay_name(name, "retired_algorithm"), "retired_algorithm");
+        }
+        assert_eq!(
+            replay_name(Some("Мой запуск"), setups_domain::SPIKE_ALGORITHM_ID),
+            "Мой запуск"
+        );
+    }
 
     #[test]
     fn canonical_params_sorts_keys_and_matches_ts_format() {

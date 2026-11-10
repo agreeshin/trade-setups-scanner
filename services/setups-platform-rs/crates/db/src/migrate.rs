@@ -2,11 +2,13 @@ use sqlx::PgPool;
 use std::collections::HashSet;
 
 const BASELINE: &str = "0010_baseline.sql";
-const MIGRATIONS: &[&str] = &[BASELINE];
+const RUN_NAMES: &str = "0011_run_names.sql";
+const MIGRATIONS: &[&str] = &[BASELINE, RUN_NAMES];
 
 fn migration_source(name: &str) -> &'static str {
     match name {
         BASELINE => include_str!("../migrations/0010_baseline.sql"),
+        RUN_NAMES => include_str!("../migrations/0011_run_names.sql"),
         other => unreachable!("unknown migration {other}"),
     }
 }
@@ -63,6 +65,18 @@ pub async fn ensure_migrations(pool: &PgPool) -> Result<String, sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_names_migration_is_registered_after_baseline() {
+        assert_eq!(MIGRATIONS, &[BASELINE, RUN_NAMES]);
+        let source = migration_source(RUN_NAMES);
+        assert!(
+            source.contains("ALTER TABLE public.replay_runs ADD COLUMN IF NOT EXISTS name text")
+        );
+        assert!(
+            source.contains("ALTER TABLE public.replay_batches ADD COLUMN IF NOT EXISTS name text")
+        );
+    }
 
     #[test]
     fn baseline_is_registered_without_execution_when_history_present() {

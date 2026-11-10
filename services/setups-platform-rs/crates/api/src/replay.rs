@@ -16,7 +16,7 @@ use setups_db::admission::{
 use setups_db::runs::{
     BatchSummary, CacheCompletion, ReplayRunFull, cache_clear_all, cache_clear_by_instrument,
     cache_stats, complete_run_from_cache, get_run_full, get_run_intervals, get_run_page,
-    list_recent_runs, list_replay_batches, mark_run_instrument_not_found,
+    list_recent_runs, list_replay_batches, mark_run_instrument_not_found, rename_replay_run,
 };
 use setups_db::{CacheQuery, DbError, cache_lookup, settings_get, settings_set};
 use setups_domain::{
@@ -87,6 +87,7 @@ fn run_dto(run: &ReplayRunFull) -> Value {
         "qualitySourceRunId": run.quality_source_run_id,
         "qualityComputedAt": run.quality_computed_at.as_ref().map(iso8601),
         "id": run.id,
+        "name": run.name,
         "exchange": run.exchange_code,
         "category": run.category,
         "symbol": run.symbol,
@@ -108,6 +109,7 @@ fn run_dto(run: &ReplayRunFull) -> Value {
 pub(crate) fn batch_dto(batch: &BatchSummary) -> Value {
     json!({
         "id": batch.id,
+        "name": batch.name,
         "exchange": batch.exchange_code,
         "category": batch.category,
         "symbol": format!("{} инструментов", batch.instrument_count),
@@ -139,6 +141,7 @@ pub(crate) fn batch_dto(batch: &BatchSummary) -> Value {
 fn failed_stub_dto(run: &ReplayRunFull) -> Value {
     json!({
         "id": run.id,
+        "name": run.name,
         "exchange": run.exchange_code,
         "category": run.category,
         "symbol": run.symbol,
@@ -644,6 +647,46 @@ async fn purge_runs(State(state): State<Arc<ReplayState>>, headers: HeaderMap) -
     }
 }
 
+#[derive(Deserialize)]
+struct RenameBody {
+    name: String,
+}
+
+pub(crate) fn parse_run_name(body: &str) -> Result<String, &'static str> {
+    let parsed: RenameBody = serde_json::from_str(body).map_err(|_| "invalid_body")?;
+    let name = parsed.name.trim();
+    if name.is_empty() {
+        return Err("Имя запуска не должно быть пустым");
+    }
+    if name.chars().count() > 120 {
+        return Err("Имя запуска не должно превышать 120 символов");
+    }
+    Ok(name.to_string())
+}
+
+async fn rename_run(
+    State(state): State<Arc<ReplayState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: String,
+) -> Response {
+    if let Err(response) = guard(&state, &headers, true) {
+        return response;
+    }
+    let Some(run_id) = parse_id(&id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_id");
+    };
+    let name = match parse_run_name(&body) {
+        Ok(name) => name,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+    match rename_replay_run(&state.pool, run_id, &name).await {
+        Ok(true) => Json(json!({ "ok": true, "name": name })).into_response(),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "run not found"),
+        Err(_) => internal_error(),
+    }
+}
+
 async fn delete_run(
     State(state): State<Arc<ReplayState>>,
     headers: HeaderMap,
@@ -760,7 +803,7 @@ pub fn replay_router(state: Arc<ReplayState>) -> Router {
         .route("/v1/replay-preflight", post(preflight_replay))
         .route(
             "/v1/replay-runs/{id}",
-            get(get_replay_run).delete(delete_run),
+            get(get_replay_run).patch(rename_run).delete(delete_run),
         )
         .route("/v1/replay-runs/{id}/cancel", post(cancel_run))
         .route(
@@ -1115,6 +1158,29 @@ async fn run_preflight(state: &ReplayState, prepared: &PreparedReplay) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_name_validation_trims_and_counts_unicode_characters() {
+        assert_eq!(
+            parse_run_name(r#"{"name":"  Мой запуск \t"}"#),
+            Ok("Мой запуск".into())
+        );
+        let name = "Я".repeat(120);
+        assert_eq!(
+            parse_run_name(&json!({ "name": name }).to_string()),
+            Ok(name)
+        );
+        assert!(parse_run_name(&json!({ "name": "Я".repeat(121) }).to_string()).is_err());
+        for body in [
+            r#"{"name":" \t\n"}"#,
+            r#"{}"#,
+            r#"{"name":null}"#,
+            r#"{"name":42}"#,
+            "not-json",
+        ] {
+            assert!(parse_run_name(body).is_err());
+        }
+    }
 
     fn sample_coverage() -> setups_mdclient::CoverageRangeDto {
         setups_mdclient::CoverageRangeDto {

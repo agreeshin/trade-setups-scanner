@@ -1,4 +1,4 @@
-use crate::{DbError, unix_to_ts};
+use crate::{DbError, replay_name, unix_to_ts};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use setups_domain::{AlgorithmParams, SPIKE_DROP_ALGORITHM_ID, SpikeDropParams, SpikeParams};
@@ -10,6 +10,7 @@ const CACHE_LOCK_KEY: i64 = 72_423_411;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplayRunFull {
     pub id: i64,
+    pub name: String,
     pub batch_id: Option<i64>,
     pub exchange_code: String,
     pub category: String,
@@ -32,13 +33,16 @@ pub struct ReplayRunFull {
     pub quality_computed_at: Option<DateTime<Utc>>,
 }
 
-const RUN_COLUMNS: &str = "id, batch_id, exchange_code, category, symbol, status, cache_hit, setups, warmup_minutes, \
+const RUN_COLUMNS: &str = "id, name, batch_id, exchange_code, category, symbol, status, cache_hit, setups, warmup_minutes, \
      processed_minutes, error, algorithm_id, algorithm_version, from_ts, to_ts, created_at, params, \
      quality, quality_source_run_id, quality_computed_at";
 
 fn run_full_from_row(row: &PgRow) -> Result<ReplayRunFull, DbError> {
+    let algorithm_id: String = row.try_get("algorithm_id")?;
+    let name: Option<String> = row.try_get("name")?;
     Ok(ReplayRunFull {
         id: i64::from(row.try_get::<i32, _>("id")?),
+        name: replay_name(name.as_deref(), &algorithm_id),
         batch_id: row.try_get::<Option<i32>, _>("batch_id")?.map(i64::from),
         exchange_code: row.try_get("exchange_code")?,
         category: row.try_get("category")?,
@@ -56,7 +60,7 @@ fn run_full_from_row(row: &PgRow) -> Result<ReplayRunFull, DbError> {
             .try_get::<Option<i32>, _>("processed_minutes")?
             .map(i64::from),
         error: row.try_get("error")?,
-        algorithm_id: row.try_get("algorithm_id")?,
+        algorithm_id,
         algorithm_version: row.try_get("algorithm_version")?,
         params: row.try_get("params")?,
         from_ts: row.try_get("from_ts")?,
@@ -92,6 +96,34 @@ pub async fn get_run_full(pool: &PgPool, run_id: i64) -> Result<Option<ReplayRun
     .fetch_optional(pool)
     .await?;
     row.as_ref().map(run_full_from_row).transpose()
+}
+
+pub async fn rename_replay_run(pool: &PgPool, run_id: i64, name: &str) -> Result<bool, DbError> {
+    let Ok(run_id) = i32::try_from(run_id) else {
+        return Ok(false);
+    };
+    let result = sqlx::query("update replay_runs set name = $2, updated_at = now() where id = $1")
+        .bind(run_id)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn rename_replay_batch(
+    pool: &PgPool,
+    batch_id: i64,
+    name: &str,
+) -> Result<bool, DbError> {
+    let Ok(batch_id) = i32::try_from(batch_id) else {
+        return Ok(false);
+    };
+    let result = sqlx::query("update replay_batches set name = $2 where id = $1")
+        .bind(batch_id)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,6 +168,7 @@ pub async fn get_run_page(
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchSummary {
     pub id: i64,
+    pub name: String,
     pub exchange_code: String,
     pub category: String,
     pub algorithm_id: String,
@@ -154,7 +187,7 @@ pub struct BatchSummary {
     pub cancelled_instruments: i64,
 }
 
-const BATCH_SELECT: &str = "select b.id, b.exchange_code, b.category, b.algorithm_id, b.algorithm_version, b.params, b.from_ts, b.to_ts, b.instrument_count, b.created_at, \
+const BATCH_SELECT: &str = "select b.id, b.name, b.exchange_code, b.category, b.algorithm_id, b.algorithm_version, b.params, b.from_ts, b.to_ts, b.instrument_count, b.created_at, \
      count(*) filter (where r.status in ('queued','running','cancel_requested')) as active_instruments, \
      count(*) filter (where r.status = 'done') as done_instruments, \
      count(*) filter (where r.status = 'failed') as failed_instruments, \
@@ -162,15 +195,18 @@ const BATCH_SELECT: &str = "select b.id, b.exchange_code, b.category, b.algorith
      coalesce(sum(case when jsonb_typeof(r.setups) = 'array' then jsonb_array_length(r.setups) else 0 end), 0) as setup_count, \
      bool_and(r.cache_hit) as cache_hit";
 
-fn batch_from_row(row: &PgRow) -> BatchSummary {
+fn batch_from_row(row: &PgRow) -> Result<BatchSummary, DbError> {
+    let algorithm_id: String = row.try_get("algorithm_id")?;
+    let name: Option<String> = row.try_get("name")?;
     let active: i64 = row.try_get("active_instruments").unwrap_or(0);
     let done: i64 = row.try_get("done_instruments").unwrap_or(0);
     let failed: i64 = row.try_get("failed_instruments").unwrap_or(0);
-    BatchSummary {
+    Ok(BatchSummary {
         id: i64::from(row.try_get::<i32, _>("id").unwrap_or(0)),
+        name: replay_name(name.as_deref(), &algorithm_id),
         exchange_code: row.try_get("exchange_code").unwrap_or_default(),
         category: row.try_get("category").unwrap_or_default(),
-        algorithm_id: row.try_get("algorithm_id").unwrap_or_default(),
+        algorithm_id,
         algorithm_version: row.try_get("algorithm_version").unwrap(),
         params: row.try_get("params").unwrap_or(Value::Null),
         from_ts: row.try_get("from_ts").unwrap_or_else(|_| unix_to_ts(0)),
@@ -193,7 +229,7 @@ fn batch_from_row(row: &PgRow) -> BatchSummary {
         done_instruments: done,
         failed_instruments: failed,
         cancelled_instruments: row.try_get("cancelled_instruments").unwrap_or(0),
-    }
+    })
 }
 
 pub async fn list_replay_batches(pool: &PgPool, limit: i64) -> Result<Vec<BatchSummary>, DbError> {
@@ -204,7 +240,7 @@ pub async fn list_replay_batches(pool: &PgPool, limit: i64) -> Result<Vec<BatchS
     .bind(limit as i32)
     .fetch_all(pool)
     .await?;
-    Ok(rows.iter().map(batch_from_row).collect())
+    rows.iter().map(batch_from_row).collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -470,7 +506,7 @@ pub async fn get_replay_batch(
     .bind(batch_id as i32)
     .fetch_optional(pool)
     .await?;
-    Ok(rows.as_ref().map(batch_from_row))
+    rows.as_ref().map(batch_from_row).transpose()
 }
 
 const QUEUE_LOCK_KEY: i64 = 72_423_412;
