@@ -831,9 +831,6 @@ async fn preflight_replay(
         Ok(value) => value,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_body"),
     };
-    if parsed.instruments.len() > 100 {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_body");
-    }
     let prepared = match prepare_replay_request(&state.pool, &parsed).await {
         Ok(Ok(prepared)) => prepared,
         Ok(Err(message)) => return error_response(StatusCode::BAD_REQUEST, &message),
