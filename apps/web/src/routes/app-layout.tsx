@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from "react-router";
-import { useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useState } from "react";
 import { Button } from "../components/ui/button";
 import { AppFrame } from "../components/ui/app-frame";
 import { applyInterfaceSettings } from "../lib/datetime-format";
@@ -8,6 +8,15 @@ import { fetchPlatform, type PlatformState } from "../lib/platform-api";
 export interface ServiceStatus { platform: "ready"; marketData: "ready" | "not_ready" | "unreachable" }
 export interface StatusContext { status: PlatformState<ServiceStatus>; refresh: () => void }
 export const marketDataLabel = (value: ServiceStatus["marketData"]): string => ({ ready: "готов", not_ready: "не готов", unreachable: "недоступен" })[value];
+
+const StatusContextValue = createContext<StatusContext | null>(null);
+
+/** Service status shared by the layout with mounted pages. */
+export function useStatus(): StatusContext {
+  const value = useContext(StatusContextValue);
+  if (value === null) throw new Error("useStatus requires the AppLayout provider");
+  return value;
+}
 
 export function AppLayout() {
   const [status, setStatus] = useState<PlatformState<ServiceStatus>>({ kind: "loading" });
@@ -35,7 +44,9 @@ export function AppLayout() {
       <Button asChild variant="navigation" size="sm"><NavLink to="/settings">Настройки</NavLink></Button>
       <Button asChild variant="navigation" size="sm"><NavLink to="/history">История и сбор</NavLink></Button>
     </>} status={<>Сервис данных: {status.kind === "ready" ? marketDataLabel(status.data.marketData) : status.kind === "loading" ? "проверка…" : "статус недоступен"}</>}>
-      <Outlet context={{ status, refresh } satisfies StatusContext} />
+      <StatusContextValue.Provider value={{ status, refresh }}>
+        <Outlet />
+      </StatusContextValue.Provider>
     </AppFrame>
   );
 }

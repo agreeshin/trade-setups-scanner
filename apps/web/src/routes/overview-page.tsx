@@ -1,14 +1,14 @@
-import { Link, useOutletContext } from "react-router";
+import { Link } from "react-router";
 import { Alert } from "../components/ui/alert";
 import { Badge, serviceStatusVariant } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../components/ui/card";
 import { PageHeader } from "../components/ui/page-header";
 import { Spinner } from "../components/ui/spinner";
-import { marketDataLabel, type StatusContext } from "./app-layout";
+import { marketDataLabel, useStatus } from "./app-layout";
 
 export function OverviewPage() {
-  const { status, refresh } = useOutletContext<StatusContext>();
+  const { status, refresh } = useStatus();
   return <section aria-labelledby="overview-heading" className="grid gap-6">
     <PageHeader id="overview-heading" title="Обзор" />
     <Card className="max-w-2xl">

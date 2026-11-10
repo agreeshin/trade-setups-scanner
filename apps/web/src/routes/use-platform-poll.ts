@@ -1,11 +1,15 @@
-import { useEffect, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { apiFetch, type PlatformState } from "../lib/platform-api";
 import { errorText } from "./platform-controls";
+import { RouteActiveContext } from "./route-active";
 
-// Each request belongs to this mounted view; hidden tabs neither poll nor retain in-flight requests.
+// Each request belongs to this mounted view; hidden navigation tabs and hidden browser tabs
+// neither poll nor retain in-flight requests, and the last loaded state is kept.
 export function usePlatformPoll<T>(path: string, revision = 0, intervalMs = 3000): PlatformState<T> {
   const [state, setState] = useState<PlatformState<T>>({ kind: "loading" });
+  const active = useContext(RouteActiveContext);
   useEffect(() => {
+    if (!active) return;
     let disposed = false;
     let controller: AbortController | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -32,6 +36,6 @@ export function usePlatformPoll<T>(path: string, revision = 0, intervalMs = 3000
     void load();
     document.addEventListener("visibilitychange", visibility);
     return () => { disposed = true; controller?.abort(); clearTimeout(timer); document.removeEventListener("visibilitychange", visibility); };
-  }, [path, revision, intervalMs]);
+  }, [path, revision, intervalMs, active]);
   return state;
 }
