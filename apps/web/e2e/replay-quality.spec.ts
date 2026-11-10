@@ -5,7 +5,7 @@ for (const width of [1440, 375]) {
     await page.setViewportSize({ width, height: 900 });
     const requests: string[] = [];
     const quality = { version: 1, state: "in_progress", requiredHistoryMinutes: 43200, requestedMinutes: 100, evaluatedMinutes: 20, evaluatedWithGapsMinutes: 2, skippedMinutes: 10, unassessedMinutes: 70, assessedThroughUnix: 1800, reasonCounts: { missing_candle: 0, insufficient_warmup: 0, recent_gap: 10, price_reference_missing: 0, gap_tolerance_exceeded: 0 } };
-    const run = { id: 7, symbol: "BTCUSDT", status: "cancelled", cacheHit: false, setupCount: 0, algorithmId: "price_volume_spike", algorithmVersion: "1", fromUnix: 0, toUnix: 6000, params: {}, quality, qualityComputedAt: null, qualitySourceRunId: 7 };
+    const run = { id: 7, name: "Рост цены и объёма", symbol: "BTCUSDT", status: "cancelled", cacheHit: false, setupCount: 0, algorithmId: "price_volume_spike", algorithmVersion: "1", fromUnix: 0, toUnix: 6000, params: {}, quality, qualityComputedAt: null, qualitySourceRunId: 7 };
     await page.route("**/v1/**", async (route) => {
       const url = new URL(route.request().url());
       requests.push(url.pathname + url.search);

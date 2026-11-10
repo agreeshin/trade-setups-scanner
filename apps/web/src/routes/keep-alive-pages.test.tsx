@@ -46,6 +46,7 @@ describe("keep-alive navigation tabs", () => {
     await user.click(screen.getByRole("link", { name: "Обзор" }));
     expect(view.container.querySelector('[data-page-path="/setups"]')).toHaveAttribute("hidden");
     expect(view.container.querySelector('[data-page-path="/"]')).not.toHaveAttribute("hidden");
+    expect(view.container.querySelector('[data-page-path="/"] [data-slot="card"]')).not.toHaveClass("max-w-2xl");
 
     await user.click(screen.getByRole("link", { name: "Сетапы" }));
     expect(view.container.querySelector('[data-page-path="/setups"]')).not.toHaveAttribute("hidden");

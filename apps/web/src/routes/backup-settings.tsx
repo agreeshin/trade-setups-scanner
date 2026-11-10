@@ -36,7 +36,7 @@ export function BackupSettings() {
     finally { setBusy(false); }
   }
 
-  return <section className="mt-10 grid max-w-xl gap-3" aria-labelledby="backup-heading">
+  return <section className="mt-10 grid gap-3" aria-labelledby="backup-heading">
     <SectionHeader id="backup-heading" title="Резервные копии и восстановление" />
     <Card className="grid gap-3">
       <p className="text-sm text-muted-foreground">Копии двух БД независимы. Platform backup содержит чувствительные Web Push endpoints и хранится защищённо.</p>

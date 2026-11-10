@@ -37,7 +37,7 @@ export function OperationSettings() {
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section aria-labelledby="operations-heading" className="mt-10 grid max-w-3xl gap-3">
+  return <section aria-labelledby="operations-heading" className="mt-10 grid gap-3">
     <SectionHeader id="operations-heading" title="Выполнение и конфигурация" />
     <Card className="grid gap-3">
       {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка состояния очереди…</p>}

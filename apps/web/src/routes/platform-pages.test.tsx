@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { RunsPage } from "./runs-page";
@@ -32,11 +32,14 @@ const dropAlgorithm = {
     { key: "volumeMultiplier", label: "Множитель объёма", type: "decimal", min: 1, max: 100, unit: "×" },
   ],
 };
+const runFixture = { id: 7, name: "Рост цены и объёма", symbol: "BTCUSDT", status: "done", cacheHit: false, setupCount: 3, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z", params: {} };
 let purgeResponses: { status: number; body: unknown }[] = [];
-let replayRunsResponse: unknown = { runs: [] };
+let replayRunsResponse: { runs: Record<string, unknown>[] } = { runs: [] };
 const requests: { path: string; method: string; body: unknown }[] = [];
 beforeEach(() => {
   requests.length = 0;
+  replayRunsResponse = { runs: [] };
+  purgeResponses = [];
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     requests.push({ path, method, body: typeof init?.body === "string" ? JSON.parse(init.body) as unknown : null });
@@ -54,10 +57,15 @@ beforeEach(() => {
     if (path === "/v1/history/instruments/coverage-summary") data = { instruments: instruments.map((instrument) => ({ instrumentId: instrument.id, exchange: instrument.exchange, category: instrument.category, symbol: instrument.symbol, status: instrument.status, firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, missingMinutes: 0, verifiedMinutes: 0 })) };
     if (path === "/v1/settings/ui") data = { value: { existing: "keep" } };
     if (path === "/v1/replay-runs") data = replayRunsResponse;
+    if (method === "PATCH" && /^\/v1\/replay-(runs|batches)\/\d+$/.test(path)) {
+      const { name } = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as { name: string };
+      replayRunsResponse = { runs: replayRunsResponse.runs.map((run) => path === `/v1/replay-${run.isBatch === true ? "batches" : "runs"}/${String(run.id)}` ? { ...run, name } : run) };
+      return Promise.resolve(new Response(JSON.stringify({ ok: true, name })));
+    }
     if (path.startsWith("/v1/replay-batches/")) {
       if (path.endsWith("/cancel")) data = { cancelled: 1, cancelRequested: 0 };
       else if (path.endsWith("/export.csv")) return Promise.resolve(new Response("signal,exchange,category,symbol\r\n", { status: 200, headers: { "content-type": "text/csv; charset=utf-8" } }));
-      else data = { run: { id: 7, isBatch: true, exchange: "bybit", category: "linear", symbol: "2 инструментов", status: "running", cacheHit: false, setupCount: 1, warmupMinutes: null, processedMinutes: null, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z", params: {}, instrumentCount: 2, activeInstruments: 1, doneInstruments: 1, failedInstruments: 0, cancelledInstruments: 0 }, setups: [{ exchange: "bybit", category: "linear", symbol: "AAAUSDT", algorithmId: "price_volume_spike", openTimeUnix: 1, closeTimeUnix: 2, closePrice: "3" }], offset: 0, limit: 100, total: 1 };
+      else data = { run: { id: 7, name: "Пакетный прогон", isBatch: true, exchange: "bybit", category: "linear", symbol: "2 инструментов", status: "running", cacheHit: false, setupCount: 1, warmupMinutes: null, processedMinutes: null, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z", params: {}, instrumentCount: 2, activeInstruments: 1, doneInstruments: 1, failedInstruments: 0, cancelledInstruments: 0 }, setups: [{ exchange: "bybit", category: "linear", symbol: "AAAUSDT", algorithmId: "price_volume_spike", openTimeUnix: 1, closeTimeUnix: 2, closePrice: "3" }], offset: 0, limit: 100, total: 1 };
     }
     if (path === "/v1/replay-preflight") data = { checkedAt: "2026-10-10T10:00:00Z", algorithmVersion: "snapshot-v2", requiredHistoryMinutes: 43200, canRun: true, request: { ...(JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>), async: true, algorithmVersion: "snapshot-v2", params: { priceGrowthPct: "17", windowMinutes: 9 } }, results: [] };
     if (path === "/v1/settings/notifications") data = { maxAgeSeconds: 60 };
@@ -79,9 +87,159 @@ beforeEach(() => {
     return Promise.resolve(new Response(JSON.stringify(data), { status: 200 }));
   }));
 });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("platform screens", () => {
+  it.each([
+    { isBatch: false, path: "/v1/replay-runs/7", trigger: "enter" },
+    { isBatch: true, path: "/v1/replay-batches/7", trigger: "blur" },
+  ])("renames a run through $path on $trigger and reloads the list", async ({ isBatch, path, trigger }) => {
+    replayRunsResponse = { runs: [{ ...runFixture, isBatch }] };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole("button", { name: "Переименовать запуск 7" }));
+    const input = screen.getByRole("textbox", { name: "Имя запуска 7" });
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue(runFixture.name);
+    fireEvent.change(input, { target: { value: "  Утренний прогон  " } });
+    if (trigger === "enter") await userEvent.keyboard("{Enter}");
+    else await userEvent.tab();
+    expect(await screen.findByText("Утренний прогон")).toHaveAttribute("title", "Утренний прогон");
+    expect(requests.filter((request) => request.method === "PATCH")).toEqual([{ path, method: "PATCH", body: { name: "Утренний прогон" } }]);
+    expect(requests.filter((request) => request.path === "/v1/replay-runs")).toHaveLength(2);
+    expect(screen.queryByRole("textbox", { name: "Имя запуска 7" })).not.toBeInTheDocument();
+  });
+
+  it("cancels run name editing with Escape and skips unchanged names", async () => {
+    replayRunsResponse = { runs: [runFixture] };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole("button", { name: "Переименовать запуск 7" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Имя запуска 7" }), { target: { value: "Не сохранять" } });
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("textbox", { name: "Имя запуска 7" })).not.toBeInTheDocument();
+    expect(screen.getByTitle(runFixture.name)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Переименовать запуск 7" }));
+    expect(screen.getByRole("textbox", { name: "Имя запуска 7" })).toHaveValue(runFixture.name);
+    await userEvent.keyboard("{Enter}");
+    expect(screen.queryByRole("textbox", { name: "Имя запуска 7" })).not.toBeInTheDocument();
+    expect(requests.some((request) => request.method === "PATCH")).toBe(false);
+  });
+
+  it.each([
+    { value: "", message: "Введите имя запуска." },
+    { value: "   ", message: "Введите имя запуска." },
+    { value: "Я".repeat(121), message: "Имя запуска должно содержать не более 120 символов." },
+  ])("rejects an invalid run name before PATCH: $value", async ({ value, message }) => {
+    replayRunsResponse = { runs: [runFixture] };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole("button", { name: "Переименовать запуск 7" }));
+    const input = screen.getByRole("textbox", { name: "Имя запуска 7" });
+    fireEvent.change(input, { target: { value } });
+    await userEvent.keyboard("{Enter}");
+    expect(screen.getByRole("alert")).toHaveTextContent(message);
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(input).toHaveAccessibleDescription(message);
+    fireEvent.blur(input);
+    expect(requests.some((request) => request.method === "PATCH")).toBe(false);
+  });
+
+  it("accepts a trimmed name of exactly 120 characters", async () => {
+    replayRunsResponse = { runs: [runFixture] };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole("button", { name: "Переименовать запуск 7" }));
+    const name = "Я".repeat(120);
+    fireEvent.change(screen.getByRole("textbox", { name: "Имя запуска 7" }), { target: { value: `  ${name}  ` } });
+    await userEvent.keyboard("{Enter}");
+    expect(await screen.findByTitle(name)).toHaveClass("truncate");
+    expect(requests.find((request) => request.method === "PATCH")?.body).toEqual({ name });
+  });
+
+  it.each([400, 404, 503, 0])("preserves the draft after a rename failure (%i) and allows retry", async (status) => {
+    replayRunsResponse = { runs: [runFixture] };
+    const original = globalThis.fetch;
+    let failing = true;
+    vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+      if (init?.method === "PATCH" && failing) return status === 0 ? Promise.reject(new Error("network offline")) : Promise.resolve(new Response("{}", { status }));
+      return original(path, init);
+    }));
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole("button", { name: "Переименовать запуск 7" }));
+    const input = screen.getByRole("textbox", { name: "Имя запуска 7" });
+    fireEvent.change(input, { target: { value: "Мой прогон" } });
+    await userEvent.keyboard("{Enter}");
+    expect(await screen.findByRole("alert")).toHaveTextContent(status === 0 ? "network offline" : `Не удалось сохранить имя запуска: HTTP ${status}`);
+    expect(input).toHaveValue("Мой прогон");
+    expect(input).toBeEnabled();
+    failing = false;
+    await userEvent.keyboard("{Enter}");
+    expect(await screen.findByTitle("Мой прогон")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("disables an in-flight rename, deduplicates Enter and blur, and aborts on unmount", async () => {
+    replayRunsResponse = { runs: [runFixture] };
+    const original = globalThis.fetch;
+    const pending: { resolve?: (response: Response) => void; signal?: AbortSignal | null } = {};
+    const patch = vi.fn((init?: RequestInit) => {
+      pending.signal = init?.signal ?? null;
+      return new Promise<Response>((resolve) => { pending.resolve = resolve; });
+    });
+    vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => init?.method === "PATCH" ? patch(init) : original(path, init)));
+    const view = render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole("button", { name: "Переименовать запуск 7" }));
+    const input = screen.getByRole("textbox", { name: "Имя запуска 7" });
+    fireEvent.change(input, { target: { value: "Мой прогон" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.blur(input);
+    expect(input).toBeDisabled();
+    expect(screen.getByText("Сохранение…")).toHaveAttribute("role", "status");
+    expect(patch).toHaveBeenCalledOnce();
+    view.unmount();
+    expect(pending.signal?.aborted).toBe(true);
+    await act(async () => { pending.resolve?.(new Response(JSON.stringify({ ok: true, name: "Мой прогон" }))); await Promise.resolve(); });
+    expect(requests.filter((request) => request.path === "/v1/replay-runs")).toHaveLength(1);
+  });
+
+  it("preserves the run name draft across the three-second polling refresh", async () => {
+    vi.useFakeTimers();
+    replayRunsResponse = { runs: [runFixture] };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    fireEvent.click(screen.getByRole("button", { name: "Переименовать запуск 7" }));
+    const input = screen.getByRole("textbox", { name: "Имя запуска 7" });
+    fireEvent.change(input, { target: { value: "Мой черновик" } });
+    replayRunsResponse = { runs: [{ ...runFixture, name: "Обновлённое имя с сервера", setupCount: 17 }] };
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(requests.filter((request) => request.path === "/v1/replay-runs")).toHaveLength(2);
+    expect(screen.getByText("17")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Имя запуска 7" })).toBe(input);
+    expect(input).toHaveValue("Мой черновик");
+    expect(input).toHaveFocus();
+  });
+
+  it("centers setup counts and run actions and leaves the launch card full width", async () => {
+    replayRunsResponse = { runs: [runFixture, { ...runFixture, id: 8, status: "running" }] };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    const table = await screen.findByRole("table");
+    expect(within(table).getAllByRole("columnheader").map((head) => head.textContent)).toEqual(["ID", "Имя", "Инструмент", "Алгоритм", "Статус", "Кеш", "Сетапов", "Действие"]);
+    expect(within(table).getByRole("columnheader", { name: "Сетапов" })).toHaveClass("text-center");
+    expect(within(table).getByRole("columnheader", { name: "Действие" })).toHaveClass("text-center");
+    for (const row of within(table).getAllByRole("row").slice(1)) {
+      const cells = within(row).getAllByRole("cell");
+      expect(cells[6]).toHaveClass("text-center", "tabular-nums");
+      expect(cells[6]).not.toHaveClass("text-right");
+      expect(cells[7]?.firstElementChild).toHaveClass("flex", "items-center", "justify-center");
+    }
+    expect(screen.getByLabelText("Начало").closest("form")?.className).not.toMatch(/max-w-/);
+  });
+
+  it("leaves all settings card and section wrappers full width", async () => {
+    const { container } = render(<SettingsPage />);
+    await screen.findByLabelText("Рост цены (%)");
+    const wrappers = container.querySelectorAll("section[aria-labelledby], form[aria-labelledby], [data-slot='card']");
+    expect(wrappers.length).toBeGreaterThan(10);
+    for (const wrapper of wrappers) expect(wrapper.className).not.toMatch(/max-w-/);
+  });
+
   it("purges all replay runs after two-step confirmation", async () => {
     purgeResponses = [{ status: 200, body: { runsDeleted: 2, cacheDeleted: 1, qualityIntervalsDeleted: 0 } }];
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
@@ -178,8 +336,8 @@ describe("platform screens", () => {
 
   it("deletes single and batch finished runs from the recent runs table", async () => {
     replayRunsResponse = { runs: [
-      { id: 7, symbol: "BTCUSDT", status: "done", cacheHit: false, setupCount: 3, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z" },
-      { id: 8, isBatch: true, symbol: "2 инструментов", status: "done", cacheHit: false, setupCount: 5, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-02T00:00:00.000Z", instrumentCount: 2, activeInstruments: 0, doneInstruments: 2, failedInstruments: 0, cancelledInstruments: 0 },
+      { id: 7, name: "Рост цены и объёма", symbol: "BTCUSDT", status: "done", cacheHit: false, setupCount: 3, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z" },
+      { id: 8, name: "Пакетный прогон", isBatch: true, symbol: "2 инструментов", status: "done", cacheHit: false, setupCount: 5, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-02T00:00:00.000Z", instrumentCount: 2, activeInstruments: 0, doneInstruments: 2, failedInstruments: 0, cancelledInstruments: 0 },
     ] };
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
     await userEvent.click(await screen.findByRole("button", { name: "Удалить запуск 7" }));
@@ -261,7 +419,7 @@ describe("platform screens", () => {
   });
   it("shows saved run params, WATCH and external chart links", async () => {
     const original = globalThis.fetch;
-    const run = { id: 7, symbol: "BTCUSDT", status: "completed", cacheHit: false, setupCount: 1, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1", fromUnix: 100, toUnix: 300, params: { priceGrowthPct: "17", windowMinutes: 5 } };
+    const run = { id: 7, name: "Прогон с сохранёнными параметрами", symbol: "BTCUSDT", status: "completed", cacheHit: false, setupCount: 1, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1", fromUnix: 100, toUnix: 300, params: { priceGrowthPct: "17", windowMinutes: 5 } };
     vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
       if (path === "/v1/replay-runs") return Promise.resolve(new Response(JSON.stringify({ runs: [run] })));
       if (path === "/v1/replay-runs/7?offset=0&limit=100") return Promise.resolve(new Response(JSON.stringify({ run, offset: 0, limit: 100, total: 1, setups: [{ exchange: "bybit", category: "linear", symbol: "BTCUSDT", algorithmId: "price_volume_spike", openTimeUnix: 100, closeTimeUnix: 200, closePrice: "100" }] })));
@@ -270,6 +428,7 @@ describe("platform screens", () => {
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
     await userEvent.click(await screen.findByRole("button", { name: "Результаты запуска 7" }));
     await userEvent.click(await screen.findByText("Снимок параметров запуска"));
+    expect(screen.getByText("Прогон с сохранёнными параметрами · BTCUSDT · price_volume_spike · 1 · completed")).toBeVisible();
     expect(screen.getByText("17")).toBeVisible();
     expect(screen.getByText("WATCH")).toBeVisible();
     expect(screen.getByRole("link", { name: "TradingView" })).toHaveAttribute("href", "https://www.tradingview.com/chart/?symbol=BYBIT%3ABTCUSDT.P");
@@ -287,6 +446,7 @@ describe("platform screens", () => {
     await userEvent.click(await screen.findByRole("checkbox", { name: "BTCUSDT (Trading)" }));
     fireEvent.change(screen.getByLabelText("Начало загрузки"), { target: { value: "2026-10-10T12:00" } });
     fireEvent.change(screen.getByLabelText("Конец загрузки"), { target: { value: "2026-10-11T13:00" } });
+    expect(screen.getByLabelText("Начало загрузки").closest("form")?.className).not.toMatch(/max-w-/);
     await userEvent.click(screen.getByRole("button", { name: "Создать план загрузки (1)" }));
     await screen.findByText(/Создан план загрузки #3: 1 инструментов/);
     expect(requests.find((request) => request.path === "/v1/history/backfill-plans" && request.method === "POST")?.body).toMatchObject({ instrumentIds: [1], fromUnix: Date.UTC(2026, 9, 10) / 1000 });
@@ -295,6 +455,7 @@ describe("platform screens", () => {
     await screen.findByText("Отмена задания #9 запрошена.");
     expect(requests.some((request) => request.path === "/v1/history/backfill-jobs/9/cancel" && request.method === "POST")).toBe(true);
     await userEvent.click(screen.getByRole("tab", { name: "Текущий сбор свечей" }));
+    expect(screen.getByRole("button", { name: "Импортировать листинг для сбора" }).closest("[data-slot='card']")?.className).not.toMatch(/max-w-/);
     await userEvent.click(screen.getByRole("button", { name: "Включить сбор" }));
     await screen.findByText("Настройка сбора сохранена.");
     expect(requests.find((request) => request.path === "/v1/history/collection-targets/1")?.body).toEqual({ enabled: true });
@@ -324,7 +485,7 @@ describe("platform screens", () => {
   });
   it("requests replay cancellation without reporting premature completion", async () => {
     const original = globalThis.fetch;
-    vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => path === "/v1/replay-runs" ? Promise.resolve(new Response(JSON.stringify({ runs: [{ id: 12, symbol: "BTCUSDT", status: "queued", cacheHit: false, setupCount: 0, algorithmId: "price_volume_spike", algorithmVersion: "1" }] }))) : original(path, init)));
+    vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => path === "/v1/replay-runs" ? Promise.resolve(new Response(JSON.stringify({ runs: [{ id: 12, name: "Рост цены и объёма", symbol: "BTCUSDT", status: "queued", cacheHit: false, setupCount: 0, algorithmId: "price_volume_spike", algorithmVersion: "1" }] }))) : original(path, init)));
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
     await userEvent.click(await screen.findByRole("button", { name: "Отменить запуск 12" }));
     await screen.findByText("Отмена запуска #12 запрошена. Дождитесь конечного статуса.");
@@ -333,7 +494,7 @@ describe("platform screens", () => {
   it("pages run results server-side, preserves the page during refresh and downloads the complete CSV", async () => {
     const original = globalThis.fetch;
     const detailRequests: string[] = [];
-    const run = { id: 7, symbol: "BTCUSDT", status: "completed", cacheHit: false, setupCount: 101, algorithmId: "price_volume_spike", algorithmVersion: "1", fromUnix: 100, toUnix: 300, params: {} };
+    const run = { id: 7, name: "Рост цены и объёма", symbol: "BTCUSDT", status: "completed", cacheHit: false, setupCount: 101, algorithmId: "price_volume_spike", algorithmVersion: "1", fromUnix: 100, toUnix: 300, params: {} };
     const createObjectURL = vi.fn(() => "blob:test-run");
     const revokeObjectURL = vi.fn();
     vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
@@ -387,12 +548,13 @@ describe("platform screens", () => {
   });
 
   it("shows a multi-instrument launch as one row with unified detail and batch cancel", async () => {
-    replayRunsResponse = { runs: [{ id: 7, isBatch: true, symbol: "2 инструментов", status: "running", cacheHit: false, setupCount: 3, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z", instrumentCount: 2, doneInstruments: 1, activeInstruments: 1, failedInstruments: 0 }] };
+    replayRunsResponse = { runs: [{ id: 7, name: "Пакетный прогон", isBatch: true, symbol: "2 инструментов", status: "running", cacheHit: false, setupCount: 3, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z", instrumentCount: 2, doneInstruments: 1, activeInstruments: 1, failedInstruments: 0 }] };
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
     expect(await screen.findByText("2 инструментов")).toBeInTheDocument();
     expect(screen.getByText(/Выполняется \(1\/2\)/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Результаты запуска 7" }));
     await waitFor(() => expect(screen.getByText(/Всего сетапов: 1/)).toBeInTheDocument());
+    expect(screen.getByText("Пакетный прогон · 2 инструментов · price_volume_spike · 1.1.1 · running")).toBeVisible();
     expect(requests.some((request) => request.path === "/v1/replay-batches/7?offset=0&limit=100")).toBe(true);
     await userEvent.click(screen.getByRole("button", { name: "Отменить запуск 7" }));
     await waitFor(() => expect(requests.some((request) => request.path === "/v1/replay-batches/7/cancel" && request.method === "POST")).toBe(true));

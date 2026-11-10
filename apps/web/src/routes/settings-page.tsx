@@ -37,7 +37,7 @@ function LiveSettings() {
     catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section className="mt-10 grid max-w-xl gap-3" aria-labelledby="live-heading">
+  return <section className="mt-10 grid gap-3" aria-labelledby="live-heading">
     <SectionHeader id="live-heading" title="Live-сканирование" />
     <Card className="grid gap-3">
       {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка…</p>}
@@ -92,7 +92,7 @@ function CacheSettings() {
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section className="mt-10 grid max-w-xl gap-3" aria-labelledby="cache-heading">
+  return <section className="mt-10 grid gap-3" aria-labelledby="cache-heading">
     <SectionHeader id="cache-heading" title="Кеш исторических запусков" />
     <Card className="grid gap-3">
       {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка…</p>}
@@ -138,7 +138,7 @@ function InterfaceSettingsSection() {
     }
   }
 
-  return <section className="mt-10 grid max-w-xl gap-3" aria-labelledby="interface-heading">
+  return <section className="mt-10 grid gap-3" aria-labelledby="interface-heading">
     <SectionHeader id="interface-heading" title="Интерфейс" />
     <Card className="grid gap-3">
       <p className="text-sm text-muted-foreground">Формат применяется ко всем датам и времени в приложении и сохраняется для всех ваших устройств. Нативные селекторы дат следуют локали браузера.</p>
@@ -221,7 +221,7 @@ export function SettingsPage() {
     <div hidden={section !== "algorithms"}><AlgorithmSettings /></div>
     <div hidden={section !== "scanning"}><LiveSettings /><LiveInstruments /></div>
     <div hidden={section !== "notifications"}>
-      <form className="mt-10 grid max-w-xl gap-3" onSubmit={(event) => { void save(event); }} aria-labelledby="notifications-heading">
+      <form className="mt-10 grid gap-3" onSubmit={(event) => { void save(event); }} aria-labelledby="notifications-heading">
         <SectionHeader id="notifications-heading" title="Уведомления" />
         <Card className="grid gap-3">
           <p className="text-sm text-muted-foreground">Telegram не подключён. Настройка возраста задаёт порог свежести; подписка Web Push включается отдельно ниже и только по вашему действию.</p>

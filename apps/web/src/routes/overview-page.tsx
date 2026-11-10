@@ -11,7 +11,7 @@ export function OverviewPage() {
   const { status, refresh } = useStatus();
   return <section aria-labelledby="overview-heading" className="grid gap-6">
     <PageHeader id="overview-heading" title="Обзор" />
-    <Card className="max-w-2xl">
+    <Card>
       <CardHeader>
         <CardTitle>Состояние сервисов</CardTitle>
         <CardDescription>Последний ответ API доступности. Это не проверка полноты истории или работы live-сканера.</CardDescription>

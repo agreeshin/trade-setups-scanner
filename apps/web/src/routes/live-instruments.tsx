@@ -42,7 +42,7 @@ export function LiveInstruments() {
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section className="mt-10 grid max-w-3xl gap-3" aria-labelledby="live-instruments-heading">
+  return <section className="mt-10 grid gap-3" aria-labelledby="live-instruments-heading">
     <SectionHeader id="live-instruments-heading" title="Отдельный список live-инструментов" />
     <Card className="grid gap-3">
       {!ready && !error && <p className="text-sm text-muted-foreground">Загрузка live-списка…</p>}

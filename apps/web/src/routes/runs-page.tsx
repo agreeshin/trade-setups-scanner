@@ -22,6 +22,7 @@ import { ReplayPreflight, type PreflightResponse, type ReplayInstrument } from "
 
 interface RunRow {
   id: number;
+  name: string;
   symbol: string;
   status: string;
   cacheHit: boolean;
@@ -52,7 +53,7 @@ function RunResultPage({ id, isBatch, offset, revision, onPage, qualityPanel, on
     {state.kind === "loading" && <p role="status">Загрузка результатов…</p>}
     {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Не удалось загрузить результаты ({state.detail})</Alert>}
     {state.kind === "ready" && <>
-      <p className="mt-2 text-sm">{state.data.run.symbol} · {state.data.run.algorithmId} · {state.data.run.algorithmVersion} · {state.data.run.status}</p>
+      <p className="mt-2 break-words text-sm">{state.data.run.name} · {state.data.run.symbol} · {state.data.run.algorithmId} · {state.data.run.algorithmVersion} · {state.data.run.status}</p>
       <p className="text-sm text-muted-foreground">{localTime(state.data.run.fromUnix)} – {localTime(state.data.run.toUnix)} ({localTimezoneLabel()})</p>
       <details className="mt-3"><summary className="cursor-pointer font-medium">Снимок параметров запуска</summary><dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">{Object.entries(state.data.run.params).map(([key, value]) => <div key={key} className="break-words"><dt className="text-muted-foreground">{parameterLabels[key] ?? key}</dt><dd>{value}</dd></div>)}</dl></details>
       {state.data.run.error && <Alert variant="destructive" role="alert">{state.data.run.error}</Alert>}
@@ -119,6 +120,63 @@ function RunResults({ id, isBatch, revision }: { id: number; isBatch: boolean; r
 
 function TrashIcon() {
   return <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true"><path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" /></svg>;
+}
+
+function PencilIcon() {
+  return <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true"><path d="m16 3 5 5-12 12-6 1 1-6Z" /><path d="m14 5 5 5" /></svg>;
+}
+
+function RunNameEditor({ run, onSaved }: { run: RunRow; onSaved: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(run.name);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const request = useRef<AbortController | null>(null);
+  const errorId = `run-name-error-${run.isBatch === true ? "batch" : "run"}-${run.id}`;
+  useEffect(() => () => { request.current?.abort(); }, []);
+  async function saveName() {
+    if (request.current) return;
+    const name = draft.trim();
+    if (!name || [...name].length > 120) {
+      setError(!name ? "Введите имя запуска." : "Имя запуска должно содержать не более 120 символов.");
+      return;
+    }
+    if (name === run.name) { setEditing(false); setError(null); return; }
+    const controller = new AbortController();
+    request.current = controller;
+    setSaving(true); setError(null);
+    try {
+      const response = await apiFetch(run.isBatch === true ? `/v1/replay-batches/${run.id}` : `/v1/replay-runs/${run.id}`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }), signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`Не удалось сохранить имя запуска: HTTP ${response.status}`);
+      if (!controller.signal.aborted) { setEditing(false); onSaved(); }
+    } catch (cause) { if (!controller.signal.aborted) setError(errorText(cause)); }
+    finally { if (!controller.signal.aborted) { request.current = null; setSaving(false); } }
+  }
+  return <div className="w-56">
+    {editing ? <Input
+      autoFocus
+      aria-label={`Имя запуска ${run.id}`}
+      aria-invalid={error !== null}
+      aria-describedby={error ? errorId : undefined}
+      title="Enter — сохранить, Escape — отменить"
+      value={draft}
+      disabled={saving}
+      onChange={(event) => { setDraft(event.target.value); setError(null); }}
+      onBlur={() => { void saveName(); }}
+      onKeyDown={(event) => {
+        if (event.nativeEvent.isComposing) return;
+        if (event.key === "Enter") { event.preventDefault(); void saveName(); }
+        if (event.key === "Escape") { event.preventDefault(); setEditing(false); setError(null); }
+      }}
+    /> : <div className="flex items-center gap-1">
+      <span className="min-w-0 flex-1 truncate" title={run.name}>{run.name}</span>
+      <Button type="button" variant="ghost" size="sm" aria-label={`Переименовать запуск ${run.id}`} onClick={() => { setDraft(run.name); setError(null); setEditing(true); }}><PencilIcon /></Button>
+    </div>}
+    {saving && <p className="mt-1 text-xs text-muted-foreground" role="status">Сохранение…</p>}
+    {error && <Alert id={errorId} className="mt-1" variant="destructive" role="alert">{error}</Alert>}
+  </div>;
 }
 
 export function RunsPage() {
@@ -258,7 +316,7 @@ export function RunsPage() {
   }
   return <section aria-labelledby="runs-heading">
     <PageHeader id="runs-heading" title="Исторические запуски" />
-    <form onSubmit={(event) => { void submit(event); }} className="mt-6 max-w-2xl">
+    <form onSubmit={(event) => { void submit(event); }} className="mt-6">
       <Card className="grid gap-4">
         <Field label="Алгоритм">
           {(control) => <Select required disabled={busy || !ready || algorithms.kind !== "ready"} value={form.algorithmId} onChange={(event) => changeForm({ ...form, algorithmId: event.target.value })} {...control}>
@@ -292,16 +350,17 @@ export function RunsPage() {
     {runs.kind === "ready" && <div className="mt-4 overflow-x-auto">
       <Table>
         <caption className="text-left text-muted-foreground">До 200 последних запусков. Время: {localTimezoneLabel()}</caption>
-        <TableHeader><TableRow><TableHead>ID</TableHead><TableHead>Инструмент</TableHead><TableHead>Алгоритм</TableHead><TableHead>Статус</TableHead><TableHead>Кеш</TableHead><TableHead>Сетапов</TableHead><TableHead>Действие</TableHead></TableRow></TableHeader>
-        <TableBody>{runs.data.runs.slice(0, 200).map((run) => <TableRow key={run.id}>
+        <TableHeader><TableRow><TableHead>ID</TableHead><TableHead>Имя</TableHead><TableHead>Инструмент</TableHead><TableHead>Алгоритм</TableHead><TableHead>Статус</TableHead><TableHead>Кеш</TableHead><TableHead className="text-center">Сетапов</TableHead><TableHead className="text-center">Действие</TableHead></TableRow></TableHeader>
+        <TableBody>{runs.data.runs.slice(0, 200).map((run) => <TableRow key={`${run.isBatch === true ? "batch" : "run"}-${run.id}`}>
           <TableCell><Button variant="outline" size="sm" onClick={() => setSelected({ id: run.id, isBatch: run.isBatch === true })} aria-label={`Результаты запуска ${run.id}`}>#{run.id}</Button></TableCell>
+          <TableCell><RunNameEditor run={run} onSaved={() => setReload((value) => value + 1)} /></TableCell>
           <TableCell className="font-medium">{run.symbol}</TableCell>
           <TableCell className="text-muted-foreground">{run.algorithmId} · {run.algorithmVersion}</TableCell>
           <TableCell><Badge variant={runStatusVariant(run.status)}>{RUN_STATUS_LABELS[run.status] ?? run.status}{run.isBatch === true && run.status === "running" ? ` (${run.doneInstruments ?? 0}/${run.instrumentCount ?? 0})` : ""}</Badge><p className="mt-1 text-xs text-muted-foreground">{qualityLabel(run.quality)}</p></TableCell>
           <TableCell>{run.cacheHit ? "да" : "нет"}</TableCell>
-          <TableCell numeric>{run.setupCount}</TableCell>
+          <TableCell numeric className="text-center">{run.setupCount}</TableCell>
               <TableCell>
-                <div className="flex items-center justify-end gap-1">
+                <div className="flex items-center justify-center gap-1">
                   {["queued", "running", "cancel_requested"].includes(run.status) && <Button variant="outline" size="sm" disabled={cancelling !== null || run.status === "cancel_requested"} onClick={() => { void cancelRun(run.id, run.isBatch === true); }} aria-label={`Отменить запуск ${run.id}`}>Отменить</Button>}
                   {!["queued", "running", "cancel_requested"].includes(run.status) && <Button variant="outline" size="sm" disabled={deleting} aria-label={`Удалить запуск ${run.id}`} onClick={() => { setDeleteError(null); setDeleteTarget({ id: run.id, symbol: run.symbol, isBatch: run.isBatch === true }); }}><TrashIcon /></Button>}
                 </div>

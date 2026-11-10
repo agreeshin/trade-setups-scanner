@@ -6,7 +6,7 @@ import { AnalyticsPage } from "./analytics-page";
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 const setFixture = {
-  setId: "run-12", kind: "run", numericId: 12, label: "#12 - Всплеск цены и оборота · 1.1.1",
+  setId: "run-12", kind: "run", numericId: 12, label: "#12 · Утренний прогон",
   algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", params: { priceGrowthPct: "2.5", windowMinutes: 30, volumeMultiplier: "3" },
   exchange: "bybit", category: "linear", symbol: "BTCUSDT", setupCount: 42, fromUnix: 1_700_000_000, toUnix: 1_700_086_400, createdAt: "2024-01-15T00:00:00Z",
 };
@@ -106,7 +106,7 @@ const fullLongGrid = longTpLevels.flatMap((tp) => longSlLevels.map((sl) => matri
 it("computes matrices only after the button press and honours subsections", async () => {
   const calls = stubFetch({ shortBulk: fullShortGrid, longBulk: fullLongGrid });
   render(<AnalyticsPage />);
-  expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
+  expect(await screen.findByText("#12 · Утренний прогон")).toBeInTheDocument();
   expect(screen.getByText("Снимок параметров запуска")).toBeInTheDocument();
   expect(screen.getByText("Рост цены (%)")).toBeInTheDocument();
   expect(screen.getByText("2.5")).toBeInTheDocument();
@@ -140,7 +140,7 @@ it("computes matrices only after the button press and honours subsections", asyn
 it("fills the whole grid from a single batch request", async () => {
   const calls = stubFetch({ shortBulk: fullShortGrid });
   render(<AnalyticsPage />);
-  expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
+  expect(await screen.findByText("#12 · Утренний прогон")).toBeInTheDocument();
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
   await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument(), { timeout: 15_000 });
   expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid")).toHaveLength(1);
@@ -161,7 +161,7 @@ it("stops the matrix batch run on demand and ignores the stale result", async ()
     },
   });
   render(<AnalyticsPage />);
-  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  await screen.findByText("#12 · Утренний прогон");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
   expect(await screen.findByRole("button", { name: "Остановить" })).toBeInTheDocument();
   expect(screen.getByText("Ячеек: 0 / 196")).toBeInTheDocument();
@@ -181,7 +181,7 @@ it("stops the matrix batch run on demand and ignores the stale result", async ()
 it("disables maturity and sends no clustering params when the checkbox is off", async () => {
   const calls = stubFetch({ shortBulk: fullShortGrid });
   render(<AnalyticsPage />);
-  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  await screen.findByText("#12 · Утренний прогон");
   expect(screen.getAllByLabelText("Зрелость сетапа в кластере: 0.5")[0]).toBeEnabled();
   await userEvent.click(screen.getAllByRole("checkbox", { name: "Кластеризовать сетапы" })[0]!);
   expect(screen.getAllByLabelText("Зрелость сетапа в кластере: 0.5")[0]).toBeDisabled();
@@ -198,7 +198,7 @@ it("disables maturity and sends no clustering params when the checkbox is off", 
 it("syncs the month selector with the date pair", async () => {
   const calls = stubFetch({ shortBulk: fullShortGrid });
   render(<AnalyticsPage />);
-  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  await screen.findByText("#12 · Утренний прогон");
   await waitFor(() => expect(screen.getAllByText("2024-02")).toHaveLength(4));
   fireEvent.change(screen.getAllByLabelText("Период")[0]!, { target: { value: "2024-01" } });
   expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2024-01-01");
@@ -230,7 +230,7 @@ it("restores saved analytics settings and autosaves on commit", async () => {
     },
   });
   render(<AnalyticsPage />);
-  expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
+  expect(await screen.findByText("#12 · Утренний прогон")).toBeInTheDocument();
   expect(screen.getByLabelText("Зрелость сетапа в кластере: 0.7")).toBeDisabled();
   expect(screen.getByLabelText("Разрыв кластера, ч")).toHaveValue("12");
   expect(screen.getByRole("checkbox", { name: "Кластеризовать сетапы" })).not.toBeChecked();
@@ -263,7 +263,7 @@ it("autoruns matrices only for matrix-relevant changes", async () => {
     savedSettings: { autoCalc: true },
   });
   render(<AnalyticsPage />);
-  expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
+  expect(await screen.findByText("#12 · Утренний прогон")).toBeInTheDocument();
   await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument(), { timeout: 15_000 });
   await waitFor(() => expect(screen.getByText("Ячеек: 550 / 550")).toBeInTheDocument(), { timeout: 15_000 });
   const matrixCallsAfterEntry = calls.filter((call) => call.path.startsWith("/v1/analytics/matrix")).length;
@@ -284,7 +284,7 @@ it("auto-calculates matrices on entry when enabled", async () => {
     savedSettings: { autoCalc: true },
   });
   render(<AnalyticsPage />);
-  expect(await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1")).toBeInTheDocument();
+  expect(await screen.findByText("#12 · Утренний прогон")).toBeInTheDocument();
   expect(screen.getByRole("checkbox", { name: "Авторасчёт матриц" })).toBeChecked();
   await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument(), { timeout: 15_000 });
   await waitFor(() => expect(screen.getByText("Ячеек: 550 / 550")).toBeInTheDocument(), { timeout: 15_000 });
@@ -295,7 +295,7 @@ it("auto-calculates matrices on entry when enabled", async () => {
 it("runs the SHORT trade list cache-first and builds the daily expectancy chart", async () => {
   stubFetch();
   render(<AnalyticsPage />);
-  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  await screen.findByText("#12 · Утренний прогон");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
   expect(await screen.findByText("BTCUSDT")).toBeInTheDocument();
   expect(await screen.findByText("ETHUSDT")).toBeInTheDocument();
@@ -309,7 +309,7 @@ it("runs the SHORT trade list cache-first and builds the daily expectancy chart"
 it("keeps the cache summary in the third subsection and clears it", async () => {
   const calls = stubFetch();
   render(<AnalyticsPage />);
-  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  await screen.findByText("#12 · Утренний прогон");
   await userEvent.click(screen.getByRole("tab", { name: "Кеш" }));
   expect(await screen.findByText("Всего: 8")).toBeInTheDocument();
   expect(screen.getByText("analytics_matrix_cache")).toBeInTheDocument();
@@ -327,7 +327,7 @@ it("shows the empty state when no finished runs exist", async () => {
 it("filters trades by the display date range", async () => {
   stubFetch();
   render(<AnalyticsPage />);
-  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  await screen.findByText("#12 · Утренний прогон");
   fireEvent.change(screen.getAllByLabelText("С даты")[1]!, { target: { value: "2124-01-01" } });
   expect(screen.getAllByLabelText("Период")[1]).toHaveValue("custom");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
@@ -338,7 +338,7 @@ it("filters trades by the display date range", async () => {
 it("shows deposit growth per trade and a full-width daily chart", async () => {
   stubFetch();
   render(<AnalyticsPage />);
-  await screen.findByText("#12 - Всплеск цены и оборота · 1.1.1");
+  await screen.findByText("#12 · Утренний прогон");
   expect(screen.getAllByLabelText("Риск на сделку, %")[0]).toHaveValue("1");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
   await waitFor(() => expect(screen.getByText("Сделок: 2 / 2")).toBeInTheDocument());

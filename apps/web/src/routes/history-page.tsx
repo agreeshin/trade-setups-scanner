@@ -232,7 +232,7 @@ export function HistoryPage() {
         <Button type="button" variant="outline" disabled={busy || symbols.trim().length === 0} onClick={() => { setSymbols(""); setMessage(null); }}>Очистить выбор</Button>
       </div>
       <InstrumentPicker catalog={instruments} symbols={symbols} onChange={(value) => { setSymbols(value); setMessage(null); }} disabled={busy || catalog.kind !== "ready"} />
-      <Card asChild><form className="grid max-w-2xl gap-3" onSubmit={(event) => { void enqueue(event); }}>
+      <Card asChild><form className="grid gap-3" onSubmit={(event) => { void enqueue(event); }}>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="Начало загрузки">{(control) => <Input type="datetime-local" required value={from} onChange={(event) => setFrom(utcMidnightOnDateChange(from, event.target.value))} {...control} />}</Field>
           <Field label="Конец загрузки">{(control) => <Input type="datetime-local" required value={to} onChange={(event) => setTo(utcMidnightOnDateChange(to, event.target.value))} {...control} />}</Field>
@@ -257,7 +257,7 @@ export function HistoryPage() {
     {tab === "collection" && <section className="grid gap-3" aria-labelledby="collection-heading">
       <SectionHeader id="collection-heading" title="Текущий сбор свечей" />
       <CoverageOverview revision={revision} />
-      <Card className="grid max-w-2xl gap-3">
+      <Card className="grid gap-3">
         <p className="text-sm text-muted-foreground">Массовое управление сбором: выберите инструменты чек-боксами, «Все из БД» выбирает весь каталог, импорт листинга Bybit обновляет каталог биржи и добавляет её символы в выбор. Лимита на количество нет.</p>
         <div><Button type="button" variant="outline" disabled={busy} onClick={() => { void importListingToCollection(); }}>Импортировать листинг для сбора</Button></div>
         <InstrumentPicker catalog={instruments} symbols={collectionSymbols} onChange={(value) => { setCollectionSymbols(value); setMessage(null); }} disabled={busy || catalog.kind !== "ready"} limit={null} />

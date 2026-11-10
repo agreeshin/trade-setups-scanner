@@ -66,7 +66,7 @@ export function AlgorithmSettings() {
     void fetchPlatform<{ algorithms: Algorithm[] }>("/v1/algorithms").then((result) => { if (!cancelled) setState(result); });
     return () => { cancelled = true; };
   }, []);
-  return <section aria-labelledby="algorithms-heading" className="mt-10 grid max-w-3xl gap-3">
+  return <section aria-labelledby="algorithms-heading" className="mt-10 grid gap-3">
     <SectionHeader id="algorithms-heading" title="Алгоритмы: live и история" />
     {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка алгоритмов…</p>}
     {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Алгоритмы недоступны ({state.detail})</Alert>}
