@@ -9,6 +9,7 @@ pub mod batches;
 pub mod config;
 pub mod controls;
 pub mod replay;
+pub mod restore;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};

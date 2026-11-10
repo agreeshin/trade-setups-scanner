@@ -20,6 +20,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if let Err(message) = setups_api::restore::apply_pending_restore(&config) {
+        eprintln!("pending restore failed: {message}");
+        std::process::exit(1);
+    }
     let pool = match PgPoolOptions::new()
         .max_connections(10)
         .connect(&config.database_url)
@@ -31,6 +35,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    match setups_db::migrate::ensure_migrations(&pool).await {
+        Ok(summary) => println!("migrations: {summary}"),
+        Err(error) => {
+            eprintln!("migrations failed: {error}");
+            std::process::exit(1);
+        }
+    }
     let live_status = json!({
         "running": false,
         "lastScanAt": serde_json::Value::Null,

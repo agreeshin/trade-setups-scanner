@@ -1,0 +1,89 @@
+{
+  "comment": "Golden-сценарии поверх живого контура signals-rust: sync POST /v1/replay-runs, md5 по компактной JSON-сериализации массива setups из ответа API. expected.sqlSetupsMd5 — сквозной эталон Этапа C (md5 по setups jsonb::text из БД, валидирован против TS). Обновление baselines: scripts/golden_runs.py --update.",
+  "scenarios": [
+    {
+      "name": "jctusdt-8d-batch9",
+      "exchange": "bybit",
+      "category": "linear",
+      "symbol": "JCTUSDT",
+      "fromUnix": 1793404800,
+      "toUnix": 1794182400,
+      "algorithm": {
+        "id": "price_volume_spike",
+        "version": "1.1.1",
+        "params": {
+          "maxGapPercent": "5",
+          "windowMinutes": 5,
+          "priceGrowthPct": "12",
+          "cooldownMinutes": 5,
+          "baselineLongDays": 30,
+          "volumeMultiplier": "3",
+          "baselineShortDays": 7,
+          "requiredRecentMinutes": 10,
+          "maxConsecutiveGapMinutes": 5
+        }
+      },
+      "expected": {
+        "setupsMd5": "233b72851f68c118f51b29cd0c6c9fa6",
+        "setupCount": 14,
+        "sqlSetupsMd5": "273ca6d42bd27094f952de9ef97b7dec"
+      }
+    },
+    {
+      "name": "btcusdt-8d-batch9",
+      "exchange": "bybit",
+      "category": "linear",
+      "symbol": "BTCUSDT",
+      "fromUnix": 1793404800,
+      "toUnix": 1794182400,
+      "algorithm": {
+        "id": "price_volume_spike",
+        "version": "1.1.1",
+        "params": {
+          "maxGapPercent": "5",
+          "windowMinutes": 5,
+          "priceGrowthPct": "12",
+          "cooldownMinutes": 5,
+          "baselineLongDays": 30,
+          "volumeMultiplier": "3",
+          "baselineShortDays": 7,
+          "requiredRecentMinutes": 10,
+          "maxConsecutiveGapMinutes": 5
+        }
+      },
+      "expected": {
+        "setupsMd5": "d751713988987e9331980363e24189ce",
+        "setupCount": 0,
+        "sqlSetupsMd5": "d751713988987e9331980363e24189ce"
+      }
+    },
+    {
+      "name": "ethusdt-8d-batch9",
+      "exchange": "bybit",
+      "category": "linear",
+      "symbol": "ETHUSDT",
+      "fromUnix": 1793404800,
+      "toUnix": 1794182400,
+      "algorithm": {
+        "id": "price_volume_spike",
+        "version": "1.1.1",
+        "params": {
+          "maxGapPercent": "5",
+          "windowMinutes": 5,
+          "priceGrowthPct": "12",
+          "cooldownMinutes": 5,
+          "baselineLongDays": 30,
+          "volumeMultiplier": "3",
+          "baselineShortDays": 7,
+          "requiredRecentMinutes": 10,
+          "maxConsecutiveGapMinutes": 5
+        }
+      },
+      "expected": {
+        "setupsMd5": "d751713988987e9331980363e24189ce",
+        "setupCount": 0,
+        "sqlSetupsMd5": "d751713988987e9331980363e24189ce"
+      }
+    }
+  ]
+}
