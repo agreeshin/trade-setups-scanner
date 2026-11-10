@@ -50,39 +50,6 @@ services:
     ports:
       - "127.0.0.1:8081:8080"
 
-  signals:
-    build:
-      context: ../..
-      dockerfile: Dockerfile.service
-      args:
-        SERVICE: setups-platform
-    restart: unless-stopped
-    environment:
-      DATABASE_URL: postgres://trade_setups:${POSTGRES_PASSWORD}@postgres:5432/signals
-      API_KEYS: ${PLATFORM_API_KEY:?set PLATFORM_API_KEY in .env}
-      MARKET_DATA_URL: http://market-data:8080
-      MARKET_DATA_API_KEY: ${MARKET_DATA_API_KEY}
-      PORT: 8080
-      HOST: 0.0.0.0
-      LOG_LEVEL: info
-      REPLAY_MAX_PENDING_RUNS: ${REPLAY_MAX_PENDING_RUNS:-10000}
-      REPLAY_MAX_WORK_MINUTES: ${REPLAY_MAX_WORK_MINUTES:-5270400000}
-      REPLAY_MAX_DATABASE_BYTES: ${REPLAY_MAX_DATABASE_BYTES:-53687091200}
-      REPLAY_ESTIMATED_BYTES_PER_MINUTE: ${REPLAY_ESTIMATED_BYTES_PER_MINUTE:-128}
-      BACKUP_SCOPE: platform
-      BACKUP_DIR: /var/lib/trade-setups/backups
-      BACKUP_MAX_UPLOAD_BYTES: ${PLATFORM_BACKUP_MAX_UPLOAD_BYTES:-64424509440}
-      BACKUP_ROLLBACK_RETENTION: ${BACKUP_ROLLBACK_RETENTION:-3}
-    volumes:
-      - ./backups/platform:/var/lib/trade-setups/backups
-    depends_on:
-      postgres:
-        condition: service_healthy
-      market-data:
-        condition: service_started
-    ports:
-      - "127.0.0.1:8082:8080"
-
   signals-rust:
     build:
       context: ../..
@@ -115,6 +82,6 @@ services:
       dockerfile: apps/web/Dockerfile
     restart: unless-stopped
     depends_on:
-      - signals
+      - signals-rust
     ports:
       - "80:80"
