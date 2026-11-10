@@ -11,7 +11,7 @@ function SetupDetails({ setup }: { setup: SetupRow }) {
     <dl className="mt-2 grid gap-2 text-xs">
       {setup.algorithmVersion !== undefined && <div><dt className="text-muted-foreground">Версия алгоритма</dt><dd className="tabular-nums">{setup.algorithmVersion}</dd></div>}
       {metrics ? <>
-        <div><dt className="text-muted-foreground">Рост цены (%)</dt><dd className="tabular-nums">{metrics.growthPct === null ? "не определено" : `${metrics.growthPct}%`}</dd></div>
+        <div><dt className="text-muted-foreground">Изменение цены (%)</dt><dd className="tabular-nums">{metrics.growthPct === null ? "не определено" : `${metrics.growthPct}%`}</dd></div>
         <div><dt className="text-muted-foreground">Оборот к длинной базе</dt><dd className="tabular-nums">{ratio(metrics.volumeLongRatio)}</dd></div>
         <div><dt className="text-muted-foreground">Оборот к короткой базе</dt><dd className="tabular-nums">{ratio(metrics.volumeShortRatio)}</dd></div>
         <div><dt className="text-muted-foreground">Сработавшая ветвь объёма (OR)</dt><dd>{metrics.overLong && metrics.overShort ? "Обе базы" : metrics.overLong ? "Длинная база" : metrics.overShort ? "Короткая база" : "Ни одна"}</dd></div>

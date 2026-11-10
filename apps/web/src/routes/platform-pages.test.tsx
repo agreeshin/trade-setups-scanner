@@ -23,6 +23,15 @@ const algorithm = {
     { key: "volumeMultiplier", label: "Множитель объёма", type: "decimal", min: 1, max: 100, unit: "×" },
   ],
 };
+const dropAlgorithm = {
+  id: "price_drop_volume_spike", name: "Падение цены и всплеск оборота", version: "1.1.1", description: "Нейтральный WATCH: падение цены и оборот выше короткой или длинной базы. Общая конфигурация для истории и live.", enabled: true,
+  params: { priceDropPct: "12", windowMinutes: 5, volumeMultiplier: "3" },
+  fields: [
+    { key: "priceDropPct", label: "Падение цены", type: "decimal", min: 0, max: 100, unit: "%" },
+    { key: "windowMinutes", label: "Окно падения цены и оборота", type: "integer", min: 1, max: 60, unit: "мин" },
+    { key: "volumeMultiplier", label: "Множитель объёма", type: "decimal", min: 1, max: 100, unit: "×" },
+  ],
+};
 let purgeResponses: { status: number; body: unknown }[] = [];
 let replayRunsResponse: unknown = { runs: [] };
 const requests: { path: string; method: string; body: unknown }[] = [];
@@ -32,7 +41,7 @@ beforeEach(() => {
     const method = init?.method ?? "GET";
     requests.push({ path, method, body: typeof init?.body === "string" ? JSON.parse(init.body) as unknown : null });
     let data: unknown = {};
-    if (path === "/v1/algorithms") data = { algorithms: [algorithm] };
+    if (path === "/v1/algorithms") data = { algorithms: [algorithm, dropAlgorithm] };
     if (path === "/v1/instruments") data = { instruments };
     if (path === "/v1/instrument-lists/live") data = { configured: false, instruments: [] };
     if (path === "/v1/history/backfill-jobs") data = { jobs: [{ id: 9, instrumentId: 1, fromUnix: 100, toUnix: 200, checkpointUnix: 150, status: "running", error: null }], counts: { queued: 0, running: 1, done: 0, cancel_requested: 0, cancelled: 0, failed: 0 } };
@@ -129,7 +138,7 @@ describe("platform screens", () => {
     expect(growth).toHaveValue(12);
     expect(screen.getByLabelText("Окно (мин)")).toHaveValue(5);
     fireEvent.change(growth, { target: { value: "15" } });
-    await userEvent.click(screen.getByRole("button", { name: "Сохранить алгоритм" }));
+    await userEvent.click(screen.getAllByRole("button", { name: "Сохранить алгоритм" })[0]!);
     await screen.findByText("Настройки алгоритма сохранены.");
     expect(requests.find((request) => request.path === "/v1/algorithms/price_volume_spike")?.body).toEqual({ params: { priceGrowthPct: "15", windowMinutes: 5, volumeMultiplier: "3" }, enabled: true });
     await userEvent.click(screen.getByRole("tab", { name: "Обслуживание" }));
@@ -139,6 +148,20 @@ describe("platform screens", () => {
     await screen.findByText("Удалено записей кеша: 3.");
     expect(screen.getByRole("button", { name: "Очистить кеш" })).toBeDisabled();
     expect(requests.some((request) => request.path === "/v1/settings/live" && request.method === "PUT")).toBe(false);
+  });
+
+  it("renders both algorithm forms with their own price threshold field", async () => {
+    render(<SettingsPage />);
+    expect(await screen.findByLabelText("Рост цены (%)")).toHaveValue(12);
+    expect(screen.getByText("Рост цены и объёма · 1")).toBeInTheDocument();
+    expect(screen.getByText("Падение цены и всплеск оборота · 1.1.1")).toBeInTheDocument();
+    const drop = screen.getByLabelText("Падение цены (%)");
+    expect(drop).toHaveValue(12);
+    expect(screen.getByLabelText("Окно падения цены и оборота (мин)")).toHaveValue(5);
+    fireEvent.change(drop, { target: { value: "9" } });
+    await userEvent.click(screen.getAllByRole("button", { name: "Сохранить алгоритм" })[1]!);
+    await screen.findByText("Настройки алгоритма сохранены.");
+    expect(requests.find((request) => request.path === "/v1/algorithms/price_drop_volume_spike")?.body).toEqual({ params: { priceDropPct: "9", windowMinutes: 5, volumeMultiplier: "3" }, enabled: true });
   });
 
   it("saves interface date and time settings through the ui settings document", async () => {

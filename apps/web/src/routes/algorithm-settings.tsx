@@ -10,7 +10,7 @@ import { fetchPlatform, type PlatformState } from "../lib/platform-api";
 import { errorText, writePlatform, type Algorithm } from "./platform-controls";
 
 const groups = [
-  { title: "Цена и объём", keys: ["priceGrowthPct", "windowMinutes", "volumeMultiplier"] },
+  { title: "Цена и объём", keys: ["priceGrowthPct", "priceDropPct", "windowMinutes", "volumeMultiplier"] },
   { title: "Базовый объём", keys: ["baselineLongDays", "baselineShortDays"] },
   { title: "Качество данных и повторные сигналы", keys: ["cooldownMinutes", "maxGapPercent", "maxConsecutiveGapMinutes", "requiredRecentMinutes"] },
 ];
@@ -52,7 +52,7 @@ function AlgorithmForm({ algorithm }: { algorithm: Algorithm }) {
         {(control) => <Input type="number" required min={field.min} max={field.max} step={field.type === "integer" ? "1" : "any"} value={params[field.key] ?? ""} onChange={(event) => { setParams({ ...params, [field.key]: event.target.value }); setSaved(false); }} {...control} />}
       </Field>)}
     </fieldset>)}
-    <p className="text-xs text-muted-foreground">Рост цены задаётся в процентах, окно в минутах. Множитель объёма 3 означает 3× (300% базового объёма). Изменения общие для live и новых исторических запусков; завершённые запуски сохраняют свой снимок параметров.</p>
+    <p className="text-xs text-muted-foreground">Порог цены задаётся в процентах — рост или падение, зависит от алгоритма; окно в минутах. Множитель объёма 3 означает 3× (300% базового объёма). Изменения общие для live и новых исторических запусков; завершённые запуски сохраняют свой снимок параметров.</p>
     {error && <Alert variant="destructive" role="alert">{error}</Alert>}
     {saved && <Alert variant="success" role="status">Настройки алгоритма сохранены.</Alert>}
     <div><Button disabled={busy} type="submit">{busy ? "Сохранение…" : "Сохранить алгоритм"}</Button></div>
