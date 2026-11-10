@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useLocation } from "react-router";
+import { AlgorithmsPage } from "./algorithms-page";
 import { AnalyticsPage } from "./analytics-page";
 import { HistoryPage } from "./history-page";
 import { OverviewPage } from "./overview-page";
@@ -14,6 +15,7 @@ const PAGES: readonly { path: string; element: ReactNode }[] = [
   { path: "/setups", element: <SetupsPage /> },
   { path: "/analytics", element: <AnalyticsPage /> },
   { path: "/runs", element: <RunsPage /> },
+  { path: "/algorithms", element: <AlgorithmsPage /> },
   { path: "/settings", element: <SettingsPage /> },
   { path: "/history", element: <HistoryPage /> },
 ];

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
+import { AlgorithmsPage } from "./algorithms-page";
 import { RunsPage } from "./runs-page";
 import { SettingsPage } from "./settings-page";
 import { SetupsPage } from "./setups-page";
@@ -234,7 +235,7 @@ describe("platform screens", () => {
 
   it("leaves all settings card and section wrappers full width", async () => {
     const { container } = render(<SettingsPage />);
-    await screen.findByLabelText("Рост цены (%)");
+    await screen.findByRole("button", { name: "Включить live" });
     const wrappers = container.querySelectorAll("section[aria-labelledby], form[aria-labelledby], [data-slot='card']");
     expect(wrappers.length).toBeGreaterThan(10);
     for (const wrapper of wrappers) expect(wrapper.className).not.toMatch(/max-w-/);
@@ -288,17 +289,29 @@ describe("platform screens", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("конец диапазона должен быть позже начала");
     expect(requests.some((request) => request.method === "POST")).toBe(false);
   });
-  it("keeps percent and minute units distinct and requires cache confirmation", async () => {
-    render(<SettingsPage />);
-    expect(screen.getByText(/Telegram не подключён/)).toBeInTheDocument();
-    expect(screen.getByText(/Web Push недоступен по обычному HTTP/)).toHaveTextContent("localhost");
+  it("keeps percent and minute units distinct when saving an algorithm", async () => {
+    render(<AlgorithmsPage />);
+    expect(screen.getByRole("heading", { level: 1, name: "Алгоритмы" })).toBeVisible();
     const growth = await screen.findByLabelText("Рост цены (%)");
     expect(growth).toHaveValue(12);
     expect(screen.getByLabelText("Окно (мин)")).toHaveValue(5);
     fireEvent.change(growth, { target: { value: "15" } });
     await userEvent.click(screen.getAllByRole("button", { name: "Сохранить алгоритм" })[0]!);
     await screen.findByText("Настройки алгоритма сохранены.");
-    expect(requests.find((request) => request.path === "/v1/algorithms/price_volume_spike")?.body).toEqual({ params: { priceGrowthPct: "15", windowMinutes: 5, volumeMultiplier: "3" }, enabled: true });
+    expect(requests.find((request) => request.path === "/v1/algorithms/price_volume_spike")).toEqual({ path: "/v1/algorithms/price_volume_spike", method: "PUT", body: { params: { priceGrowthPct: "15", windowMinutes: 5, volumeMultiplier: "3" }, enabled: true } });
+  });
+
+  it("defaults settings to scanning without algorithm controls and requires cache confirmation", async () => {
+    render(<SettingsPage />);
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["Сканирование", "Уведомления", "Обслуживание", "Интерфейс"]);
+    expect(screen.getByRole("tab", { name: "Сканирование" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("heading", { name: "Live-сканирование" })).toBeVisible();
+    expect(screen.queryByRole("tab", { name: "Алгоритмы" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Рост цены (%)")).not.toBeInTheDocument();
+    expect(requests.some((request) => request.path === "/v1/algorithms")).toBe(false);
+    await userEvent.click(screen.getByRole("tab", { name: "Уведомления" }));
+    expect(screen.getByText(/Telegram не подключён/)).toBeVisible();
+    expect(screen.getByText(/Web Push недоступен по обычному HTTP/)).toHaveTextContent("localhost");
     await userEvent.click(screen.getByRole("tab", { name: "Обслуживание" }));
     expect(screen.getByRole("button", { name: "Очистить кеш" })).toBeDisabled();
     await userEvent.click(screen.getByLabelText("Подтверждаю очистку всего кеша"));
@@ -309,7 +322,7 @@ describe("platform screens", () => {
   });
 
   it("renders both algorithm forms with their own price threshold field", async () => {
-    render(<SettingsPage />);
+    const { container } = render(<AlgorithmsPage />);
     expect(await screen.findByLabelText("Рост цены (%)")).toHaveValue(12);
     expect(screen.getByText("Рост цены и объёма · 1")).toBeInTheDocument();
     expect(screen.getByText("Падение цены и всплеск оборота · 1.1.1")).toBeInTheDocument();
@@ -319,7 +332,8 @@ describe("platform screens", () => {
     fireEvent.change(drop, { target: { value: "9" } });
     await userEvent.click(screen.getAllByRole("button", { name: "Сохранить алгоритм" })[1]!);
     await screen.findByText("Настройки алгоритма сохранены.");
-    expect(requests.find((request) => request.path === "/v1/algorithms/price_drop_volume_spike")?.body).toEqual({ params: { priceDropPct: "9", windowMinutes: 5, volumeMultiplier: "3" }, enabled: true });
+    expect(requests.find((request) => request.path === "/v1/algorithms/price_drop_volume_spike")).toEqual({ path: "/v1/algorithms/price_drop_volume_spike", method: "PUT", body: { params: { priceDropPct: "9", windowMinutes: 5, volumeMultiplier: "3" }, enabled: true } });
+    for (const wrapper of container.querySelectorAll("section[aria-labelledby], [data-slot='card']")) expect(wrapper.className).not.toMatch(/max-w-/);
   });
 
   it("saves interface date and time settings through the ui settings document", async () => {

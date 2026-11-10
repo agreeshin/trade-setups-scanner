@@ -41,6 +41,7 @@ export function AppLayout() {
       <Button asChild variant="navigation" size="sm"><NavLink to="/setups" end>Сетапы</NavLink></Button>
       <Button asChild variant="navigation" size="sm"><NavLink to="/analytics" end>Аналитика</NavLink></Button>
       <Button asChild variant="navigation" size="sm"><NavLink to="/runs">Запуски</NavLink></Button>
+      <Button asChild variant="navigation" size="sm"><NavLink to="/algorithms">Алгоритмы</NavLink></Button>
       <Button asChild variant="navigation" size="sm"><NavLink to="/settings">Настройки</NavLink></Button>
       <Button asChild variant="navigation" size="sm"><NavLink to="/history">История и сбор</NavLink></Button>
     </>} status={<>Сервис данных: {status.kind === "ready" ? marketDataLabel(status.data.marketData) : status.kind === "loading" ? "проверка…" : "статус недоступен"}</>}>

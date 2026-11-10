@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { useState } from "react";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { Provider } from "react-redux";
@@ -18,6 +18,11 @@ beforeEach(() => {
     let data: unknown = {};
     if (path === "/v1/status") data = { platform: "ready", marketData: "ready" };
     if (path === "/v1/settings/ui") data = { value: {} };
+    if (path === "/v1/algorithms") data = { algorithms: [{
+      id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "Общие настройки", enabled: true,
+      params: { priceGrowthPct: "12" },
+      fields: [{ key: "priceGrowthPct", label: "Рост цены", type: "decimal", min: 0, max: 100, unit: "%" }],
+    }] };
     if (path.startsWith("/v1/setups?")) data = { setups: [], offset: 0, limit: 25, total: 0, snapshotId: 0 };
     return Promise.resolve(new Response(JSON.stringify(data), { status: 200 }));
   }));
@@ -35,6 +40,34 @@ function renderAppAt(initialPath: string) {
 }
 
 describe("keep-alive navigation tabs", () => {
+  it("mounts algorithms on first visit and preserves drafts without reloading on return", async () => {
+    const user = userEvent.setup();
+    const view = renderAppAt("/");
+    const navigation = within(screen.getByRole("navigation", { name: "Основная навигация" }));
+    expect(navigation.getAllByRole("link").map((link) => link.textContent)).toEqual(["Обзор", "Сетапы", "Аналитика", "Запуски", "Алгоритмы", "Настройки", "История и сбор"]);
+    const algorithmsLink = navigation.getByRole("link", { name: "Алгоритмы" });
+    expect(algorithmsLink).toHaveAttribute("href", "/algorithms");
+    expect(requests.filter((path) => path === "/v1/algorithms")).toHaveLength(0);
+
+    await user.click(algorithmsLink);
+    expect(screen.getByRole("heading", { level: 1, name: "Алгоритмы" })).toBeVisible();
+    expect(algorithmsLink).toHaveAttribute("aria-current", "page");
+    const growth = await screen.findByRole("spinbutton", { name: "Рост цены (%)" });
+    fireEvent.change(growth, { target: { value: "15" } });
+    await user.click(screen.getByRole("checkbox", { name: "Включён для live-сканирования" }));
+
+    await user.click(navigation.getByRole("link", { name: "Обзор" }));
+    expect(view.container.querySelector('[data-page-path="/algorithms"]')).toHaveAttribute("hidden");
+    expect(growth).not.toBeVisible();
+
+    await user.click(algorithmsLink);
+    expect(view.container.querySelector('[data-page-path="/algorithms"]')).not.toHaveAttribute("hidden");
+    expect(screen.getByRole("spinbutton", { name: "Рост цены (%)" })).toBe(growth);
+    expect(growth).toHaveValue(15);
+    expect(screen.getByRole("checkbox", { name: "Включён для live-сканирования" })).not.toBeChecked();
+    expect(requests.filter((path) => path === "/v1/algorithms")).toHaveLength(1);
+  });
+
   it("keeps page state and skips refetch when switching tabs and back", async () => {
     const user = userEvent.setup();
     const view = renderAppAt("/setups");

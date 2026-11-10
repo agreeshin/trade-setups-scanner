@@ -11,7 +11,6 @@ import { Select } from "../components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { applyInterfaceSettings, effectiveTimezone, formatIsoDateTime, formatUnix, interfaceSettings, type DateOrder, type DateSeparator, type InterfaceSettings } from "../lib/datetime-format";
 import { apiFetch, fetchPlatform, type PlatformState } from "../lib/platform-api";
-import { AlgorithmSettings } from "./algorithm-settings";
 import { errorText, localTime, savePreference, writePlatform } from "./platform-controls";
 import { LiveInstruments } from "./live-instruments";
 import { OperationSettings } from "./operation-settings";
@@ -182,10 +181,10 @@ function InterfaceSettingsSection() {
   </section>;
 }
 
-type SettingsSection = "algorithms" | "scanning" | "notifications" | "maintenance" | "interface";
+type SettingsSection = "scanning" | "notifications" | "maintenance" | "interface";
 
 export function SettingsPage() {
-  const [section, setSection] = useState<SettingsSection>("algorithms");
+  const [section, setSection] = useState<SettingsSection>("scanning");
   const [maxAge, setMaxAge] = useState("");
   const [ready, setReady] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -212,13 +211,11 @@ export function SettingsPage() {
   return <section aria-labelledby="settings-heading">
     <PageHeader id="settings-heading" title="Настройки" />
     <SegmentedList role="tablist" aria-label="Подразделы настроек">
-      <SegmentedTrigger role="tab" aria-selected={section === "algorithms"} onClick={() => setSection("algorithms")}>Алгоритмы</SegmentedTrigger>
       <SegmentedTrigger role="tab" aria-selected={section === "scanning"} onClick={() => setSection("scanning")}>Сканирование</SegmentedTrigger>
       <SegmentedTrigger role="tab" aria-selected={section === "notifications"} onClick={() => setSection("notifications")}>Уведомления</SegmentedTrigger>
       <SegmentedTrigger role="tab" aria-selected={section === "maintenance"} onClick={() => setSection("maintenance")}>Обслуживание</SegmentedTrigger>
       <SegmentedTrigger role="tab" aria-selected={section === "interface"} onClick={() => setSection("interface")}>Интерфейс</SegmentedTrigger>
     </SegmentedList>
-    <div hidden={section !== "algorithms"}><AlgorithmSettings /></div>
     <div hidden={section !== "scanning"}><LiveSettings /><LiveInstruments /></div>
     <div hidden={section !== "notifications"}>
       <form className="mt-10 grid gap-3" onSubmit={(event) => { void save(event); }} aria-labelledby="notifications-heading">

@@ -5,7 +5,6 @@ import { Card } from "../components/ui/card";
 import { Checkbox } from "../components/ui/checkbox";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
-import { SectionHeader } from "../components/ui/page-header";
 import { fetchPlatform, type PlatformState } from "../lib/platform-api";
 import { errorText, writePlatform, type Algorithm } from "./platform-controls";
 
@@ -42,7 +41,7 @@ function AlgorithmForm({ algorithm }: { algorithm: Algorithm }) {
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <Card asChild><form onSubmit={(event) => { void save(event); }} className="mt-4 grid gap-4">
+  return <Card asChild><form onSubmit={(event) => { void save(event); }} className="grid gap-4">
     <h3 className="text-lg font-semibold">{algorithm.name} · {algorithm.version}</h3>
     <p className="text-sm text-muted-foreground">{algorithm.description}</p>
     <label className="flex items-center gap-2 text-sm"><Checkbox checked={enabled} onCheckedChange={(checked) => { setEnabled(checked === true); setSaved(false); }} />Включён для live-сканирования</label>
@@ -66,10 +65,9 @@ export function AlgorithmSettings() {
     void fetchPlatform<{ algorithms: Algorithm[] }>("/v1/algorithms").then((result) => { if (!cancelled) setState(result); });
     return () => { cancelled = true; };
   }, []);
-  return <section aria-labelledby="algorithms-heading" className="mt-10 grid gap-3">
-    <SectionHeader id="algorithms-heading" title="Алгоритмы: live и история" />
+  return <div className="grid gap-4">
     {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка алгоритмов…</p>}
     {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Алгоритмы недоступны ({state.detail})</Alert>}
     {state.kind === "ready" && state.data.algorithms.map((algorithm) => <AlgorithmForm key={algorithm.id} algorithm={algorithm} />)}
-  </section>;
+  </div>;
 }
