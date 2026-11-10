@@ -319,3 +319,11 @@ PRD 0.5 открыт в MarkText из read-only preview `~/Documents/setups-prd-
 - Проверки: Rust — fmt/clippy `-D warnings`/74 теста (включая 3 PostgreSQL-интеграционных на времpg PG16); web — typecheck/lint/styles, vitest 150/150; корневые lint+typecheck после интеграции — PASS.
 - Деплой на tv (10 ноября, ~13:00 UTC): pre-deploy dump `platform-before-run-names-20261110.dump` (859 КБ); миграция `0011` применена при старте; images signals-rust `da88e865cd43…`, web `713de918e88a…` (asset `index-BVFJ-6Dq.js`); smoke зелёный (name в API, PATCH 404/400, analytics label, очередь работает). Рестарт при активном батче владельца: startup-семантика воркеров отменила 178 queued → восстановлены адресным SQL из снапшота, батч продолжился без потерь (failed вернулся к 4). Детали — docs/invent/tv.md.
 - TODO (латентный edge-дефект, не блокирует): жёсткий kill воркера в момент записи интервала качества оставляет осиротевшую строку `replay_quality_intervals`, которая при повторном выполнении прогона даёт `duplicate key replay_quality_intervals_pk` (наблюдался на SOFIUSDT #10556, вылечен удалением одной строки + re-queue). Условие возврата: сделать `insert_intervals_merged` устойчивым к перекрытию с осиротевшими интервалами (upsert/merge по PK) или чистить интервалы прогона при его re-queue/fail_interrupted.
+
+## Отдельная вкладка «Алгоритмы» (10 ноября 2026, вечер)
+
+Запрос владельца: вынести настройки алгоритмов из общей страницы «Настройки» в отдельную верхнюю вкладку «Алгоритмы», затем commit/push/deploy. Статус: `in_progress` до production smoke.
+
+- PRD-first: `docs/prd/ux.md` фиксирует маршрут `/algorithms`, участие в общей keep-alive оболочке и четыре оставшихся подраздела «Настроек»; стартовый подраздел — «Сканирование».
+- Frontend: новая `AlgorithmsPage` — тонкая оболочка над прежней `AlgorithmSettings`, без дублирования логики; NavLink и stable keep-alive registry entry добавлены между «Запуски» и «Настройки»; из `SettingsPage` удалены импорт, сегмент и панель алгоритмов.
+- Проверки до commit: web 152/152 Vitest, корневые lint + check-styles и typecheck — PASS. Деплой web-only, signals-rust и replay-очередь не перезапускаются.
