@@ -38,7 +38,7 @@ function DomainControls({ fields, value, onChange }: { fields: SearchField[]; va
 function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algorithm; controller: OptimizationController; onStarted: () => void }) {
   const [algorithmDomains, setAlgorithmDomains] = useState(() => initialDomains(algorithm.fields, algorithm.params));
   const [analyticsDomains, setAnalyticsDomains] = useState(() => initialDomains(ANALYTICS_SEARCH_FIELDS, { ...ANALYTICS_BASELINE }));
-  const [scope, setScope] = useState<ScopeDraft>({ from: "", to: "", symbols: "", direction: "short", setupMaturity: "0", horizonMinutes: "10080", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, minClosedPerCell: "1", seed: "42", maxTrials: "256", maxSeconds: "3600" });
+  const [scope, setScope] = useState<ScopeDraft>({ from: "", to: "", symbols: "", direction: "short", setupMaturity: "0", horizonMinutes: "10080", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, minClosedPerCell: "1", minSetupsPerDay: "4", seed: "42", maxTrials: "256", maxSeconds: "3600" });
   const [catalog, setCatalog] = useState<CatalogInstrument[]>([]);
   const [ready, setReady] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -78,10 +78,11 @@ function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algori
       if (await controller.start(spec)) onStarted();
     } catch (cause) { setError(errorText(cause)); }
   }
-  const numericFields: { key: "setupMaturity" | "horizonMinutes" | "minClosedPerCell" | "seed" | "maxTrials" | "maxSeconds"; label: string; min: number; max?: number; step?: number }[] = [
+  const numericFields: { key: "setupMaturity" | "horizonMinutes" | "minClosedPerCell" | "minSetupsPerDay" | "seed" | "maxTrials" | "maxSeconds"; label: string; min: number; max?: number; step?: number; hint?: string }[] = [
     { key: "setupMaturity", label: "Зрелость (фиксирована)", min: 0, max: 1, step: 0.1 },
     { key: "horizonMinutes", label: "Горизонт сделки, мин (фиксирован)", min: 1, max: 43200 },
     { key: "minClosedPerCell", label: "Минимум закрытых на ячейку", min: 1 },
+    { key: "minSetupsPerDay", label: "Минимум сетапов в день", min: 0, step: 0.1, hint: "Среднее по всем выбранным инструментам за весь точный выбранный период сигналов, включая дробные дни и интервалы без сигналов. 0 отключает только частотный гейт." },
     { key: "seed", label: "Seed", min: 0 }, { key: "maxTrials", label: "Бюджет trials", min: 1, max: 4096 },
     { key: "maxSeconds", label: "Бюджет времени, секунд", min: 1, max: 86400 },
   ];
@@ -101,7 +102,7 @@ function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algori
       <div className="grid gap-3 sm:grid-cols-2">
         <Field label="Уровни TP, %" hint="1..64 уникальных значений через запятую; 0 < TP ≤ 100.">{(control) => <Input {...control} maxLength={8192} value={scope.tpLevels} onChange={(event) => change({ tpLevels: event.target.value })} />}</Field>
         <Field label="Уровни SL, %" hint="Независимая ось: 0 < SL ≤ 100, не более 64 уровней.">{(control) => <Input {...control} maxLength={8192} value={scope.slLevels} onChange={(event) => change({ slLevels: event.target.value })} />}</Field>
-        {numericFields.map((field) => <Field key={field.key} label={field.label}>{(control) => <Input {...control} type="number" min={field.min} max={field.max} step={field.step ?? 1} value={scope[field.key]} onChange={(event) => change({ [field.key]: event.target.value })} />}</Field>)}
+        {numericFields.map((field) => <Field key={field.key} label={field.label} hint={field.hint}>{(control) => <Input {...control} type="number" min={field.min} max={field.max} step={field.step ?? 1} value={scope[field.key]} onChange={(event) => change({ [field.key]: event.target.value })} />}</Field>)}
       </div>
       <p className="text-xs text-muted-foreground">Выбрано ячеек TP×SL: {scope.tpLevels.split(",").filter((item) => item.trim()).length} × {scope.slLevels.split(",").filter((item) => item.trim()).length}. Зрелость не подбирается; без кластеризации не применяется. Гейт null отличается от порога 0.</p>
       <h3 className="font-semibold">Параметры алгоритма · {algorithm.version}</h3>

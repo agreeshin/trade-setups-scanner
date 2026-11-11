@@ -16,6 +16,9 @@ fn default_horizon() -> i64 {
 fn default_min_closed() -> usize {
     1
 }
+fn default_min_setups_per_day() -> f64 {
+    4.0
+}
 fn default_trials() -> usize {
     256
 }
@@ -48,6 +51,8 @@ pub struct StudyRequest {
     pub horizon_minutes: i64,
     #[serde(default = "default_min_closed")]
     pub min_closed_per_cell: usize,
+    #[serde(default = "default_min_setups_per_day")]
+    pub min_setups_per_day: f64,
     #[serde(default = "default_trials")]
     pub max_trials: usize,
     #[serde(default = "default_seconds")]
@@ -214,6 +219,12 @@ pub struct TrialSummary {
     pub score: Option<f64>,
     pub setup_count: usize,
     pub selected_setup_count: usize,
+    /// None only for legacy saved summaries which did not record frequency.
+    #[serde(default)]
+    pub avg_setups_per_day: Option<f64>,
+    /// None for legacy summaries or a requirement beyond usize::MAX.
+    #[serde(default)]
+    pub required_setup_count: Option<usize>,
     pub evaluated_minutes: u64,
     pub warmup_minutes: u64,
 }

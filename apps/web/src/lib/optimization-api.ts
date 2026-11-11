@@ -23,6 +23,8 @@ export interface OptimizationSpec {
   tpLevels: number[];
   slLevels: number[];
   minClosedPerCell: number;
+  // Absent in legacy persisted studies; new forms explicitly send their threshold.
+  minSetupsPerDay?: number;
   seed: number;
   maxTrials: number;
   maxSeconds: number;
@@ -46,6 +48,11 @@ export interface OptimizationBest {
   params: Record<string, string | number>;
   analytics: Omit<OptimizationAnalytics, "clusterGapMinutes"> & { clusterGapMinutes: number | null };
   matrix: OptimizationMatrixCell[];
+  support?: {
+    selectedSetupCount?: number;
+    avgSetupsPerDay?: number | null;
+    requiredSetupCount?: number | null;
+  } | null;
   provenance: { optimizerVersion: string; seed: number; snapshotHash: string; capturedAt: string };
   conclusions: string[];
 }

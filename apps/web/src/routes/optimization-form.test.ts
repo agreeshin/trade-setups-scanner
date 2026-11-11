@@ -10,7 +10,7 @@ const algorithm: Algorithm = {
     { key: "addedInteger", label: "Целое", type: "integer", min: 1, max: 10, unit: "мин" },
   ],
 };
-const scope: ScopeDraft = { from: "2026-10-01T00:00", to: "2026-10-02T00:00", symbols: "OLDUSDT", direction: "short", setupMaturity: "0", horizonMinutes: "10080", minClosedPerCell: "1", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, maxTrials: "256", maxSeconds: "3600", seed: "42" };
+const scope: ScopeDraft = { from: "2026-10-01T00:00", to: "2026-10-02T00:00", symbols: "OLDUSDT", direction: "short", setupMaturity: "0", horizonMinutes: "10080", minClosedPerCell: "1", minSetupsPerDay: "4", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, maxTrials: "256", maxSeconds: "3600", seed: "42" };
 const catalog = [{ id: 1, exchange: "bybit", category: "linear", symbol: "OLDUSDT", status: "Delisted" }];
 function build(overrides: Partial<ScopeDraft> = {}, mutate?: (domains: ReturnType<typeof initialDomains>) => void) {
   const params = initialDomains(algorithm.fields, algorithm.params);
@@ -24,7 +24,20 @@ it("keeps full baseline, typed dynamic defaults and independent axes", () => {
     analyticsParams: ANALYTICS_BASELINE,
     analyticsSearch: { clusterEnabled: [false, true], clusterGapMinutes: [240, 480], timeShiftMinutes: [0, 5], priceChangePct: [null, 0, 1] },
     tpLevels: [25, 100], slLevels: [0.1, 0.5],
-    setupMaturity: 0, horizonMinutes: 10080, maxTrials: 256, maxSeconds: 3600,
+    setupMaturity: 0, horizonMinutes: 10080, minSetupsPerDay: 4, maxTrials: 256, maxSeconds: 3600,
+  });
+});
+describe("fixed setup frequency gate", () => {
+  it.each(["4", "0.6", "2.25", "0"])("sends %s as a number only in fixed scope", (raw) => {
+    const result = build({ minSetupsPerDay: raw });
+    expect(result.minSetupsPerDay).toBe(Number(raw));
+    expect(result.algorithmSearch).not.toHaveProperty("minSetupsPerDay");
+    expect(result.analyticsSearch).not.toHaveProperty("minSetupsPerDay");
+    expect(result.algorithmParams).not.toHaveProperty("minSetupsPerDay");
+    expect(result.analyticsParams).not.toHaveProperty("minSetupsPerDay");
+  });
+  it.each(["", " ", "NaN", "Infinity", "-Infinity", "-0.1", "0,6", "0x10", "1e2", "9".repeat(310)])("rejects invalid point-decimal threshold %s", (minSetupsPerDay) => {
+    expect(() => build({ minSetupsPerDay })).toThrow("Минимум сетапов в день");
   });
 });
 it("preserves distinct exact decimal thresholds instead of deduplicating through floating point", () => {

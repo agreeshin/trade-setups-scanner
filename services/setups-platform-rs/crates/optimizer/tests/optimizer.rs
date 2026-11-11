@@ -45,6 +45,7 @@ fn spec() -> StudyRequest {
         sl_levels: default_levels(),
         horizon_minutes: 30,
         min_closed_per_cell: 1,
+        min_setups_per_day: 4.0,
         max_trials: 32,
         max_seconds: 30,
         seed: 42,
@@ -99,6 +100,224 @@ fn candidate(spec: &StudyRequest) -> StudyCandidate {
         params: spec.algorithm_params.clone(),
         analytics: spec.analytics_params.clone(),
     }
+}
+
+fn six_setups_over_ten_days() -> (StudyRequest, StudyInput) {
+    let mut spec = spec();
+    spec.to_unix = spec.from_unix + 10 * 86400;
+    spec.direction = TradeDirection::Long;
+    spec.tp_levels = vec![20.0];
+    spec.sl_levels = vec![1.0];
+    let mut data = input();
+    let flat_close = data.instruments[0].detector_bars[1464].close.clone();
+    for bar in &mut data.instruments[0].detector_bars {
+        if bar.open_time_unix >= minute(1465) {
+            bar.close = flat_close.clone();
+            bar.quote_turnover = "10".into();
+        }
+    }
+    let instrument = &mut data.instruments[0];
+    for (bar, candle) in instrument.detector_bars.iter().zip(&mut instrument.candles) {
+        let close: f64 = bar.close.parse().unwrap();
+        candle.open = close;
+        candle.close = close;
+        candle.low = close;
+        candle.high = close * 1.25;
+    }
+    (spec, data)
+}
+
+#[test]
+fn default_frequency_gate_rejects_six_selected_setups_over_ten_days_even_with_high_r() {
+    let (spec, data) = six_setups_over_ten_days();
+    let evaluated = evaluate_candidate(
+        &spec,
+        &data,
+        &candidate(&spec),
+        &StudyLimits::default(),
+        &CancelToken::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(evaluated.summary.setup_count, 6);
+    assert_eq!(evaluated.summary.selected_setup_count, 6);
+    assert_eq!(evaluated.matrix[0].risk_expectancy, Some(20.0));
+    assert_eq!(evaluated.summary.score, None);
+    assert_eq!(evaluated.summary.avg_setups_per_day, Some(0.6));
+    assert_eq!(evaluated.summary.required_setup_count, Some(40));
+    let outcome = run_study(
+        &spec,
+        &data,
+        &StudyLimits::default(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(outcome.best.is_none());
+    assert_eq!(outcome.progress.scorable_candidates, 0);
+    assert_eq!(outcome.baseline.unwrap(), evaluated.summary);
+}
+
+#[test]
+fn frequency_exact_boundary_disabled_zero_and_closed_cell_gate_are_independent() {
+    let (mut spec, data) = six_setups_over_ten_days();
+    for (threshold, score, required) in [
+        (0.6, Some(20.0), 6),
+        (0.6000000000000001, None, 7),
+        (0.0, Some(20.0), 0),
+    ] {
+        spec.min_setups_per_day = threshold;
+        let evaluated = evaluate_candidate(
+            &spec,
+            &data,
+            &candidate(&spec),
+            &StudyLimits::default(),
+            &CancelToken::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(evaluated.summary.score, score, "threshold={threshold}");
+        assert_eq!(evaluated.summary.required_setup_count, Some(required));
+        assert_eq!(evaluated.summary.avg_setups_per_day, Some(0.6));
+    }
+    spec.min_setups_per_day = 0.0;
+    spec.min_closed_per_cell = 7;
+    let evaluated = evaluate_candidate(
+        &spec,
+        &data,
+        &candidate(&spec),
+        &StudyLimits::default(),
+        &CancelToken::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(evaluated.matrix[0].closed_count, 6);
+    assert_eq!(
+        evaluated.summary.score, None,
+        "disabled frequency gate must not disable minClosedPerCell"
+    );
+}
+
+#[test]
+fn frequency_uses_exact_signal_range_including_fractional_days_and_reports_required_count() {
+    let (mut spec, data) = six_setups_over_ten_days();
+    spec.to_unix += 60;
+    let evaluated = evaluate_candidate(
+        &spec,
+        &data,
+        &candidate(&spec),
+        &StudyLimits::default(),
+        &CancelToken::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(spec.to_unix - spec.from_unix, 864060);
+    assert_eq!(evaluated.summary.required_setup_count, Some(41));
+    assert_eq!(
+        evaluated.summary.avg_setups_per_day,
+        Some(6.0 * 86400.0 / 864060.0)
+    );
+    assert_eq!(evaluated.summary.score, None);
+
+    spec.to_unix = spec.from_unix + 129600; // 1.5 days, not two calendar days.
+    let result = run_study(
+        &spec,
+        &data,
+        &StudyLimits::default(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap();
+    let best = result.best.unwrap();
+    assert_eq!(best.support.avg_setups_per_day, Some(4.0));
+    assert_eq!(best.support.required_setup_count, Some(6));
+    assert_eq!(best.score, 20.0);
+    assert!(
+        best.conclusions
+            .iter()
+            .any(|line| line.contains("4.000000 сетапов/сутки") && line.contains("6 сетапов"))
+    );
+}
+
+#[test]
+fn frequency_counts_clustering_selection_before_price_gate_and_no_data_outcomes() {
+    let (mut spec, data) = six_setups_over_ten_days();
+    spec.min_setups_per_day = 0.2;
+    spec.analytics_params.cluster_enabled = true;
+    let evaluated = evaluate_candidate(
+        &spec,
+        &data,
+        &candidate(&spec),
+        &StudyLimits::default(),
+        &CancelToken::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(evaluated.summary.setup_count, 6);
+    assert_eq!(evaluated.summary.selected_setup_count, 1);
+    assert_eq!(evaluated.summary.avg_setups_per_day, Some(0.1));
+    assert_eq!(evaluated.summary.required_setup_count, Some(2));
+    assert_eq!(evaluated.matrix[0].risk_expectancy, Some(20.0));
+    assert_eq!(
+        evaluated.summary.score, None,
+        "raw pre-clustering count must not pass frequency gate"
+    );
+
+    spec.analytics_params.cluster_enabled = false;
+    spec.min_setups_per_day = 0.6;
+    for (shift, price_gate) in [(0, Some(1.0)), (43200, None)] {
+        let mut candidate = candidate(&spec);
+        candidate.analytics.time_shift_minutes = shift;
+        candidate.analytics.price_change_pct = price_gate;
+        let evaluated = evaluate_candidate(
+            &spec,
+            &data,
+            &candidate,
+            &StudyLimits::default(),
+            &CancelToken::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(evaluated.summary.selected_setup_count, 6);
+        assert_eq!(evaluated.summary.avg_setups_per_day, Some(0.6));
+        assert_eq!(evaluated.summary.required_setup_count, Some(6));
+        assert_eq!(
+            evaluated.matrix[0].price_change_filtered_count + evaluated.matrix[0].no_data_count,
+            6
+        );
+        assert_eq!(
+            evaluated.summary.score, None,
+            "per-cell support still required after frequency passes"
+        );
+    }
+}
+
+#[test]
+fn frequency_request_validation_defaults_and_legacy_support_are_explicit() {
+    let mut spec = spec();
+    let fields = default_parameter_descriptors(&spec.algorithm_id).unwrap();
+    for threshold in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        spec.min_setups_per_day = threshold;
+        assert!(validate_request(&spec, &fields).is_err());
+    }
+    for threshold in [0.0, 0.6, 4.0, f64::MAX] {
+        spec.min_setups_per_day = threshold;
+        validate_request(&spec, &fields).unwrap();
+    }
+    spec.min_setups_per_day = 4.0;
+    spec.analytics_search
+        .insert("minSetupsPerDay".into(), vec![json!(1)]);
+    assert!(validate_request(&spec, &fields).is_err());
+    spec.analytics_search.clear();
+    spec.algorithm_search
+        .insert("minSetupsPerDay".into(), vec![json!(1)]);
+    assert!(validate_request(&spec, &fields).is_err());
+    let legacy: TrialSummary = serde_json::from_value(json!({
+        "score":0.47681,"setupCount":6,"selectedSetupCount":6,"evaluatedMinutes":10,"warmupMinutes":0
+    })).unwrap();
+    assert_eq!(legacy.score, Some(0.47681));
+    assert_eq!(legacy.avg_setups_per_day, None);
+    assert_eq!(legacy.required_setup_count, None);
 }
 
 fn scalar_oracle(
@@ -341,6 +560,7 @@ fn schema_defaults_metadata_decimal_precision_and_fixed_fields() {
         "slLevels",
         "horizonMinutes",
         "minClosedPerCell",
+        "minSetupsPerDay",
         "maxTrials",
         "maxSeconds",
     ] {
@@ -350,6 +570,7 @@ fn schema_defaults_metadata_decimal_precision_and_fixed_fields() {
     assert_eq!(defaults.tp_levels, default_levels());
     assert_eq!(defaults.max_trials, 256);
     assert_eq!(defaults.horizon_minutes, 10080);
+    assert_eq!(defaults.min_setups_per_day, 4.0);
     assert!(
         json!(StudyProgress {
             phase: StudyPhase::Initial,

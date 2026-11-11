@@ -55,6 +55,10 @@ fn app_with_health(
 }
 
 async fn request(app: &Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
+    request_raw(app, method, path, body.to_string()).await
+}
+
+async fn request_raw(app: &Router, method: &str, path: &str, body: String) -> (StatusCode, Value) {
     let response = app
         .clone()
         .oneshot(
@@ -63,7 +67,7 @@ async fn request(app: &Router, method: &str, path: &str, body: Value) -> (Status
                 .uri(path)
                 .header("x-api-key", "test-key")
                 .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await
@@ -125,6 +129,62 @@ async fn routes_validate_without_database_access() {
             .0,
         StatusCode::BAD_REQUEST
     );
+}
+
+#[tokio::test]
+async fn frequency_gate_validation_precedes_runtime_admission() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test")
+        .unwrap();
+    let app = app_with_health(
+        pool,
+        OptimizationConfig::default(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    for value in [
+        None,
+        Some(json!(0)),
+        Some(json!(0.6)),
+        Some(json!(4)),
+        Some(json!(f64::MAX)),
+    ] {
+        let mut body = spec();
+        if let Some(value) = value {
+            body["minSetupsPerDay"] = value;
+        }
+        let (status, error) = request(&app, "POST", "/v1/optimization-studies", body).await;
+        // Valid requests reach the health boundary without touching the lazy DB.
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error["error"], "optimization_runtime_unavailable");
+    }
+    for value in [
+        json!(-1),
+        json!(-0.1),
+        Value::Null,
+        json!("NaN"),
+        json!("Infinity"),
+    ] {
+        let mut body = spec();
+        body["minSetupsPerDay"] = value.clone();
+        let (status, error) = request(&app, "POST", "/v1/optimization-studies", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(
+            error["error"],
+            if value.is_number() {
+                "invalid_request"
+            } else {
+                "invalid_body"
+            }
+        );
+    }
+    for literal in ["NaN", "Infinity", "-Infinity", "1e999"] {
+        let mut body = spec().to_string();
+        assert_eq!(body.pop(), Some('}'));
+        body.push_str(&format!(",\"minSetupsPerDay\":{literal}}}"));
+        let (status, error) = request_raw(&app, "POST", "/v1/optimization-studies", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{literal}");
+        assert_eq!(error["error"], "invalid_body");
+    }
 }
 
 #[tokio::test]
@@ -251,6 +311,153 @@ async fn wait_for(
     })
     .await
     .expect("study transition timeout")
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn frequency_gate_admission_persists_default_and_explicit_values() {
+    let db = TestDb::new().await;
+    // Exercise real admission without starting a worker that could claim the row.
+    let mut owner = db.pool.begin().await.unwrap();
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(db::RUNTIME_LOCK)
+        .execute(&mut *owner)
+        .await
+        .unwrap();
+    let router = app(db.pool.clone(), OptimizationConfig::default());
+    for (value, expected) in [(None, 4.0), (Some(0.0), 0.0), (Some(0.6), 0.6)] {
+        let mut body = spec();
+        assert!(body.get("minSetupsPerDay").is_none());
+        if let Some(value) = value {
+            body["minSetupsPerDay"] = json!(value);
+        }
+        let (status, created) = request(&router, "POST", "/v1/optimization-studies", body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+        assert_eq!(created["spec"]["minSetupsPerDay"].as_f64(), Some(expected));
+        let id = created["id"].as_i64().unwrap();
+        let persisted = db::get(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(persisted.spec, created["spec"]);
+        for path in [
+            format!("/v1/optimization-studies/{id}"),
+            "/v1/optimization-studies?algorithmId=price_volume_spike".into(),
+        ] {
+            let (status, response) = request(&router, "GET", &path, Value::Null).await;
+            assert_eq!(status, StatusCode::OK);
+            let record = if path.contains('?') {
+                &response["studies"][0]
+            } else {
+                &response
+            };
+            assert_eq!(record["id"], id);
+            assert_eq!(record["spec"], created["spec"]);
+        }
+        let (status, cancelled) = request(
+            &router,
+            "POST",
+            &format!("/v1/optimization-studies/{id}/cancel"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(cancelled["status"], "cancelled");
+    }
+    let mut body = spec();
+    body["minSetupsPerDay"] = json!(-1);
+    assert_eq!(
+        request(&router, "POST", "/v1/optimization-studies", body)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let count: i64 = sqlx::query_scalar("select count(*) from optimization_studies")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 3, "invalid frequency must not create a study");
+    owner.rollback().await.unwrap();
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn frequency_gate_legacy_running_and_completed_records_remain_raw() {
+    let db = TestDb::new().await;
+    let router = app(db.pool.clone(), OptimizationConfig::default());
+    let mut legacy_spec = spec();
+    legacy_spec["toUnix"] = json!(172800 + 10 * 86400);
+    assert!(legacy_spec.get("minSetupsPerDay").is_none());
+    let progress = json!({"phase":"initial","evaluatedCandidates":1,"scorableCandidates":1,"maxTrials":1,"elapsedSeconds":1,"bestScore":1});
+    let created = match db::create(&db.pool, "price_volume_spike", &legacy_spec, &progress)
+        .await
+        .unwrap()
+    {
+        Admission::Created(row) => row,
+        Admission::Busy(_) => panic!("fresh legacy fixture must be admitted"),
+    };
+    let id = created.id;
+    db::claim(&db.pool).await.unwrap().unwrap();
+    // Six selected setups over ten days would fail the new default gate. A
+    // historical score/result must nevertheless remain exactly as recorded.
+    let support = json!({"score":1,"setupCount":6,"selectedSetupCount":6,"evaluatedMinutes":14400,"warmupMinutes":1440});
+    let legacy_result = json!({
+        "progress":progress,"reason":"trial_budget","invalidProposals":0,"detectorPasses":1,
+        "baseline":support,
+        "best":{
+            "score":1,"partial":false,"params":legacy_spec["algorithmParams"],
+            "analytics":{"clusterEnabled":false,"clusterGapMinutes":null,"timeShiftMinutes":0,"priceChangePct":null,"setupMaturity":null,"horizonMinutes":60},
+            "matrix":[{"tpPct":4,"slPct":4,"riskExpectancy":1,"avgMovePct":4,"closedCount":6,"tpCount":6,"slCount":0,"unclosedCount":0,"noDataCount":0,"priceChangeFilteredCount":0}],
+            "provenance":{"optimizerVersion":"legacy","seed":42,"snapshotHash":"legacy","capturedAt":"2026-11-11T00:00:00Z"},
+            "conclusions":[],"support":support,"trialIndex":0
+        }
+    });
+    for completed in [false, true] {
+        if completed {
+            db::finish(
+                &db.pool,
+                id,
+                "completed",
+                &progress,
+                Some(&legacy_result),
+                None,
+                &json!([]),
+            )
+            .await
+            .unwrap();
+        }
+        let before = db::get(&db.pool, id).await.unwrap().unwrap();
+        for path in [
+            format!("/v1/optimization-studies/{id}"),
+            "/v1/optimization-studies?algorithmId=price_volume_spike".into(),
+        ] {
+            let (status, response) = request(&router, "GET", &path, Value::Null).await;
+            assert_eq!(status, StatusCode::OK);
+            let record = if path.contains('?') {
+                &response["studies"][0]
+            } else {
+                &response
+            };
+            assert_eq!(record, &json!(before));
+            assert_eq!(record["spec"], legacy_spec);
+            assert!(record["spec"].get("minSetupsPerDay").is_none());
+            if completed {
+                assert_eq!(record["result"], legacy_result);
+                for support in [
+                    &record["result"]["baseline"],
+                    &record["result"]["best"]["support"],
+                ] {
+                    assert!(support.get("avgSetupsPerDay").is_none());
+                    assert!(support.get("requiredSetupCount").is_none());
+                }
+            }
+        }
+        let after = db::get(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(
+            json!(after),
+            json!(before),
+            "GET must not rewrite a legacy row"
+        );
+    }
+    db.cleanup().await;
 }
 
 #[derive(Clone)]
@@ -698,6 +905,8 @@ async fn snapshot_byte_cap_is_explicit_and_failure_releases_owned_input() {
 
 fn compute_spec() -> Value {
     let mut body = spec();
+    // These lifecycle fixtures need a winner despite their deliberately rare setups.
+    body["minSetupsPerDay"] = json!(0);
     body["toUnix"] = json!(172800 + 7 * 86400);
     body["maxTrials"] = json!(4096);
     body["algorithmSearch"] = json!({"priceGrowthPct":(1..=128).map(|n|n.to_string()).collect::<Vec<_>>(),"windowMinutes":(1..=16).collect::<Vec<_>>()});

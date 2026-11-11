@@ -90,10 +90,18 @@ export function integerInput(raw: string, name: string, min: number, max = Numbe
   if (!raw.trim() || !Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${name}: требуется целое число от ${min} до ${max}.`);
   return value;
 }
+function nonnegativeDecimalInput(raw: string, name: string): number {
+  const text = raw.trim();
+  const value = Number(text);
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(text) || !Number.isFinite(value) || value < 0) {
+    throw new Error(`${name}: требуется конечное неотрицательное десятичное число с точкой; 0 отключает частотный гейт.`);
+  }
+  return value;
+}
 export interface ScopeDraft {
   from: string; to: string; symbols: string; direction: "short" | "long";
   setupMaturity: string; horizonMinutes: string; tpLevels: string; slLevels: string;
-  minClosedPerCell: string; seed: string; maxTrials: string; maxSeconds: string;
+  minClosedPerCell: string; minSetupsPerDay: string; seed: string; maxTrials: string; maxSeconds: string;
 }
 export function buildOptimizationSpec(algorithm: Algorithm, scope: ScopeDraft, catalog: CatalogInstrument[], params: DomainDrafts, analytics: DomainDrafts): OptimizationSpec {
   const range = replayRange(scope.from, scope.to);
@@ -128,6 +136,7 @@ export function buildOptimizationSpec(algorithm: Algorithm, scope: ScopeDraft, c
     horizonMinutes: integerInput(scope.horizonMinutes, "Горизонт", 1, 43200),
     tpLevels: parseAxis(scope.tpLevels, "TP"), slLevels: parseAxis(scope.slLevels, "SL"),
     minClosedPerCell: integerInput(scope.minClosedPerCell, "Минимум закрытых на ячейку", 1),
+    minSetupsPerDay: nonnegativeDecimalInput(scope.minSetupsPerDay, "Минимум сетапов в день"),
     seed: integerInput(scope.seed, "Seed", 0),
     maxTrials: integerInput(scope.maxTrials, "Бюджет trials", 1, 4096), maxSeconds: integerInput(scope.maxSeconds, "Бюджет времени", 1, 86400),
   };

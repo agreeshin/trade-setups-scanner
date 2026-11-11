@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { OptimizationSpec } from "../lib/optimization-api";
 import { AlgorithmsPage } from "./algorithms-page";
 
 const algorithm = {
@@ -15,7 +16,7 @@ const instruments = [
   { id: 1, exchange: "bybit", category: "linear", symbol: "BTCUSDT", status: "Trading" },
   { id: 2, exchange: "bybit", category: "linear", symbol: "OLDUSDT", status: "Delisted" },
 ];
-const spec = {
+const spec: OptimizationSpec = {
   algorithmId: algorithm.id, algorithmVersion: algorithm.version, algorithmParams: algorithm.params,
   algorithmSearch: { futureThreshold: ["1.5", "2.5", "4"] },
   analyticsParams: { clusterEnabled: true, clusterGapMinutes: 480, timeShiftMinutes: 0, priceChangePct: null }, analyticsSearch: {},
@@ -75,6 +76,12 @@ it("builds unknown fields from metadata and submits the complete typed scope onl
   expect(controls.getByLabelText("Подбирать: Новый порог")).toBeChecked();
   expect(controls.getByLabelText("Подбирать: Новое окно")).not.toBeChecked();
   expect(controls.getByLabelText("OLDUSDT (Delisted)")).toBeChecked();
+  const frequency = controls.getByLabelText("Минимум сетапов в день");
+  expect(frequency).toHaveValue(4);
+  expect(frequency).toHaveAttribute("type", "number");
+  expect(frequency).toHaveAttribute("min", "0");
+  expect(frequency).toHaveAttribute("step", "0.1");
+  expect(frequency).toHaveAccessibleDescription(/точн.*период.*0 отключает/);
   expect(requests.every((request) => request.method === "GET")).toBe(true);
   fireEvent.change(controls.getByLabelText("Начало периода сигналов"), { target: { value: "2026-10-01T00:00" } });
   fireEvent.change(controls.getByLabelText("Конец периода сигналов"), { target: { value: "2026-10-03T00:00" } });
@@ -94,7 +101,7 @@ it("builds unknown fields from metadata and submits the complete typed scope onl
   expect(creates).toHaveLength(1);
   expect(creates[0]?.body).toEqual({
     ...spec, fromUnix: new Date(2026, 9, 1).getTime() / 1000, toUnix: new Date(2026, 9, 3).getTime() / 1000,
-    direction: "long", tpLevels: [4, 25], slLevels: [0.5, 6],
+    direction: "long", tpLevels: [4, 25], slLevels: [0.5, 6], minSetupsPerDay: 4,
     algorithmSearch: { futureThreshold: ["1.5", "2.5", "4"], futureWindow: [2, 3, 5] },
     analyticsSearch: { clusterEnabled: [false, true], clusterGapMinutes: [240, 480], timeShiftMinutes: [0, 5], priceChangePct: [null, 0, 1] },
   });
@@ -161,6 +168,7 @@ it.each([false, true])("restores full terminal inputs with exact UI labels and c
     score: 0.125, partial: false, params: { futureThreshold: "4", futureWindow: 5 },
     analytics: { clusterEnabled, clusterGapMinutes: clusterEnabled ? 480 : null, timeShiftMinutes: 5, priceChangePct: null },
     matrix: [{ tpPct: 4, slPct: 4, riskExpectancy: 0.125, avgMovePct: 0.5, closedCount: 8, tpCount: 5, slCount: 3, unclosedCount: 2, noDataCount: 1, priceChangeFilteredCount: 4 }],
+    ...(clusterEnabled ? { support: { selectedSetupCount: 9, avgSetupsPerDay: null } } : {}),
     provenance: { optimizerVersion: "plan-a-1", seed: 42, snapshotHash: "snapshot-test-hash", capturedAt: "2026-11-10T00:00:00Z" }, conclusions: ["Проверенный вывод"],
   };
   studies = [{ ...record("completed"), result: { progress: { ...progress, bestScore: best.score }, best, reason: "trial_budget" } }];
@@ -170,6 +178,11 @@ it.each([false, true])("restores full terminal inputs with exact UI labels and c
   expect(screen.getByText("snapshot-test-hash")).toBeInTheDocument();
   expect(screen.getByRole("table", { name: "Матрица и поддержка результата" })).toHaveTextContent("Закрытых");
   expect(screen.getByText(/не доказанный глобальный оптимум/)).toBeInTheDocument();
+  const requirements = within(screen.getByRole("region", { name: "Фиксированные требования исследования" }));
+  expect(requirements.getByText("Гейт не применялся")).toBeInTheDocument();
+  expect(screen.queryByText("Среднее сетапов в день")).not.toBeInTheDocument();
+  const support = within(screen.getByRole("region", { name: "Поддержка результата" }));
+  expect(support.getByText("Выбрано сетапов").nextElementSibling).toHaveTextContent(clusterEnabled ? "9" : "Не сохранено");
   const parameters = within(screen.getByRole("region", { name: "Полные параметры результата" }));
   expect(parameters.getAllByRole("term").map((term) => term.textContent)).toEqual([
     "Новый порог (%)", "Новое окно (мин)", "Кластеризовать сетапы", "Разрыв кластера, ч",
@@ -180,7 +193,39 @@ it.each([false, true])("restores full terminal inputs with exact UI labels and c
   ]);
   await userEvent.click(screen.getByText("Все входы исследования"));
   expect(screen.getByLabelText("Сохранённый spec")).toHaveTextContent("algorithmSearch");
+  expect(screen.getByLabelText("Сохранённый spec")).not.toHaveTextContent("minSetupsPerDay");
   expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it.each([0.6, 0])("renders fixed frequency threshold %s and actual winner support without recalculating it", async (minSetupsPerDay) => {
+  const best = {
+    score: 0.125, partial: false, params: algorithm.params,
+    analytics: { clusterEnabled: true, clusterGapMinutes: 480, timeShiftMinutes: 0, priceChangePct: null },
+    matrix: [], support: { selectedSetupCount: 6, avgSetupsPerDay: 0.6, requiredSetupCount: minSetupsPerDay === 0 ? 0 : 6 },
+    provenance: { optimizerVersion: "plan-a-2", seed: 42, snapshotHash: "frequency-snapshot", capturedAt: "2026-11-10T00:00:00Z" }, conclusions: [],
+  };
+  studies = [{ ...record("completed"), spec: { ...spec, minSetupsPerDay }, result: { progress, best, reason: "trial_budget" } }];
+  render(<AlgorithmsPage />);
+  await openOptimizer();
+  const requirements = within(await screen.findByRole("region", { name: "Фиксированные требования исследования" }));
+  expect(requirements.getByText("Минимум сетапов в день").nextElementSibling).toHaveTextContent(String(minSetupsPerDay));
+  expect(requirements.queryByText("Гейт не применялся")).not.toBeInTheDocument();
+  if (minSetupsPerDay === 0) expect(requirements.getByText(/гейт отключён/)).toBeInTheDocument();
+  const support = within(screen.getByRole("region", { name: "Поддержка результата" }));
+  expect(support.getByText("Выбрано сетапов").nextElementSibling).toHaveTextContent("6");
+  expect(support.getByText("Среднее сетапов в день").nextElementSibling).toHaveTextContent("0.6");
+  expect(screen.getByLabelText("Сохранённый spec")).toHaveTextContent(`"minSetupsPerDay": ${minSetupsPerDay}`);
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it.each([undefined, 0, 4])("explains only applied gates when no candidate is scorable with threshold %s", async (minSetupsPerDay) => {
+  studies = [{ ...record("completed"), spec: { ...spec, ...(minSetupsPerDay === undefined ? {} : { minSetupsPerDay }) }, result: { progress, best: null, reason: "space_exhausted" } }];
+  render(<AlgorithmsPage />);
+  await openOptimizer();
+  const warning = await screen.findByText(/Нет оценимого кандидата/);
+  expect(warning).toHaveTextContent("Минимум закрытых на ячейку");
+  if (minSetupsPerDay !== undefined && minSetupsPerDay > 0) expect(warning).toHaveTextContent("Минимум сетапов в день");
+  else expect(warning).not.toHaveTextContent("Минимум сетапов в день");
 });
 
 it("pauses observer polling and releases requests/timers on unmount without cancelling server work", async () => {

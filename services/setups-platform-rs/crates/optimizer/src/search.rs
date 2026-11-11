@@ -721,6 +721,19 @@ pub fn run_study(
     if let Some(best) = &mut best {
         best.partial = reason == TerminationReason::Cancelled;
         best.conclusions = search.conclusions(snapshot.evaluated_candidates);
+        let threshold =
+            if spec.min_setups_per_day != 0.0 && !(1e-6..1e9).contains(&spec.min_setups_per_day) {
+                format!("{:.6e}", spec.min_setups_per_day)
+            } else {
+                spec.min_setups_per_day.to_string()
+            };
+        best.conclusions.insert(1, format!(
+            "Отобрано {} сетапов за {:.6} суток: {:.6} сетапов/сутки; порог {}, требуется не менее {} сетапов.",
+            best.support.selected_setup_count, (spec.to_unix - spec.from_unix) as f64 / 86400.0,
+            best.support.avg_setups_per_day.expect("new completed summary has frequency"), threshold,
+            best.support.required_setup_count.expect("a qualified winner has a representable required count")
+        ));
+        best.conclusions.truncate(6);
     }
     let event = (search.invalid > 0).then(|| StudyEvent {
         at: chrono::Utc::now().to_rfc3339(),

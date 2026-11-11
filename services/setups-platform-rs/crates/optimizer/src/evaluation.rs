@@ -1,3 +1,4 @@
+use crate::frequency::FrequencyGate;
 use crate::validation::{decimal, invalid, normalized_decimal, parse_params, validate_analytics};
 use crate::*;
 use serde_json::Value;
@@ -499,6 +500,7 @@ pub(crate) fn evaluate_group(
         validate_analytics(&candidate.analytics)?;
     }
     numerical_budget(&params, stats)?;
+    let frequency_gate = FrequencyGate::new(spec)?;
     let required = params.baseline_long_days() as usize * 1440;
     let detector_bytes = (required + 1)
         .saturating_mul(size_of::<Option<Decimal>>() * 2)
@@ -521,6 +523,8 @@ pub(crate) fn evaluate_group(
         score: None,
         setup_count: 0,
         selected_setup_count: 0,
+        avg_setups_per_day: None,
+        required_setup_count: frequency_gate.required_setup_count,
         evaluated_minutes: 0,
         warmup_minutes: 0,
     };
@@ -651,7 +655,12 @@ pub(crate) fn evaluate_group(
         }
         let mut summary = summary.clone();
         summary.selected_setup_count = selected_counts[candidate_index];
-        summary.score = score_matrix(&matrix, spec.min_closed_per_cell);
+        summary.avg_setups_per_day = Some(frequency_gate.average(summary.selected_setup_count));
+        summary.score = if frequency_gate.accepts(summary.selected_setup_count) {
+            score_matrix(&matrix, spec.min_closed_per_cell)
+        } else {
+            None
+        };
         evaluations.push(Some(CandidateEvaluation { summary, matrix }));
     }
     Ok(evaluations)

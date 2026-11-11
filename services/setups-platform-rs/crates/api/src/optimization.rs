@@ -169,6 +169,8 @@ async fn create_study(
             json!({"error":"invalid_request","message":error.to_string()}),
         );
     }
+    // Only new admissions receive serde defaults (including minSetupsPerDay).
+    // Detail/list return persisted raw spec/result JSON, preserving legacy meaning.
     let normalized = match serde_json::to_value(&spec) {
         Ok(value) => value,
         Err(error) => return internal_error("serialize_spec", error),
