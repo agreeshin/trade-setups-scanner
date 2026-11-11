@@ -1,4 +1,6 @@
 pub mod decimal;
+pub mod parameter_metadata;
+pub use parameter_metadata::algorithm_fields;
 
 use serde::{Deserialize, Serialize};
 

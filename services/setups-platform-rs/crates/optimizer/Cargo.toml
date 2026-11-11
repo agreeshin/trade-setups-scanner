@@ -1,0 +1,18 @@
+[package]
+name = "setups-optimizer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+setups-domain.workspace = true
+setups-detector.workspace = true
+setups-analytics.workspace = true
+setups-replay.workspace = true
+rayon.workspace = true
+rand.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -19,6 +19,7 @@ test-results/
 npm-debug.log*
 .DS_Store
 .cache/
+.codegraph/
 .eslintcache
 tsconfig.tsbuildinfo
 __pycache__/

@@ -4,6 +4,7 @@ members = [
     "crates/domain",
     "crates/detector",
     "crates/analytics",
+    "crates/optimizer",
     "crates/replay",
     "crates/mdclient",
     "crates/db",
@@ -30,6 +31,7 @@ axum = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.9"
+rayon = "1.11"
 tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 futures-core = "0.3"
@@ -41,6 +43,7 @@ setups-replay = { path = "crates/replay" }
 setups-mdclient = { path = "crates/mdclient" }
 setups-db = { path = "crates/db" }
 setups-worker = { path = "crates/worker" }
+setups-optimizer = { path = "crates/optimizer" }
 
 [profile.release]
 lto = "thin"

@@ -51,31 +51,39 @@ fn guard(state: &ControlsState, headers: &HeaderMap, mutation: bool) -> Result<(
 }
 
 fn algorithm_fields(id: &str) -> Value {
-    if id == SPIKE_DROP_ALGORITHM_ID {
-        json!([
-        { "key": "priceDropPct", "label": "Падение цены", "type": "decimal", "min": 0, "max": 100, "unit": "%" },
-        { "key": "windowMinutes", "label": "Окно падения цены и оборота", "type": "integer", "min": 1, "max": 1440, "unit": "мин" },
-        { "key": "volumeMultiplier", "label": "Множитель оборота", "type": "decimal", "min": 0.000001, "max": 1000, "unit": "×" },
-        { "key": "baselineLongDays", "label": "Длинная база", "type": "integer", "min": 1, "max": 90, "unit": "дней" },
-        { "key": "baselineShortDays", "label": "Короткая база", "type": "integer", "min": 1, "max": 90, "unit": "дней" },
-        { "key": "cooldownMinutes", "label": "Интервал между сетапами", "type": "integer", "min": 0, "max": 10080, "unit": "мин" },
-        { "key": "maxGapPercent", "label": "Допустимая доля пропусков", "type": "decimal", "min": 0, "max": 100, "unit": "%" },
-        { "key": "maxConsecutiveGapMinutes", "label": "Максимальный непрерывный пропуск", "type": "integer", "min": 0, "max": 1440, "unit": "мин" },
-        { "key": "requiredRecentMinutes", "label": "Последние минуты без пропусков", "type": "integer", "min": 0, "max": 1440, "unit": "мин" }
-        ])
-    } else {
-        json!([
-        { "key": "priceGrowthPct", "label": "Рост цены", "type": "decimal", "min": 0, "max": 1000, "unit": "%" },
-        { "key": "windowMinutes", "label": "Окно роста цены и оборота", "type": "integer", "min": 1, "max": 1440, "unit": "мин" },
-        { "key": "volumeMultiplier", "label": "Множитель оборота", "type": "decimal", "min": 0.000001, "max": 1000, "unit": "×" },
-        { "key": "baselineLongDays", "label": "Длинная база", "type": "integer", "min": 1, "max": 90, "unit": "дней" },
-        { "key": "baselineShortDays", "label": "Короткая база", "type": "integer", "min": 1, "max": 90, "unit": "дней" },
-        { "key": "cooldownMinutes", "label": "Интервал между сетапами", "type": "integer", "min": 0, "max": 10080, "unit": "мин" },
-        { "key": "maxGapPercent", "label": "Допустимая доля пропусков", "type": "decimal", "min": 0, "max": 100, "unit": "%" },
-        { "key": "maxConsecutiveGapMinutes", "label": "Максимальный непрерывный пропуск", "type": "integer", "min": 0, "max": 1440, "unit": "мин" },
-        { "key": "requiredRecentMinutes", "label": "Последние минуты без пропусков", "type": "integer", "min": 0, "max": 1440, "unit": "мин" }
-        ])
+    setups_domain::algorithm_fields(id).expect("registered algorithm fields")
+}
+
+/// Validation uses the exact module fields exposed to the UI, not a separate
+/// optimizer parameter registry. Hints never widen these allowed boundaries.
+pub fn optimization_descriptors(
+    id: &str,
+) -> Option<std::collections::BTreeMap<String, setups_optimizer::ParameterDescriptor>> {
+    use setups_optimizer::{ParameterDescriptor, ParameterKind};
+    if !ALGORITHM_IDS.contains(&id) {
+        return None;
     }
+    Some(
+        algorithm_fields(id)
+            .as_array()
+            .expect("algorithm fields")
+            .iter()
+            .map(|field| {
+                (
+                    field["key"].as_str().expect("field key").to_string(),
+                    ParameterDescriptor {
+                        kind: if field["type"] == "integer" {
+                            ParameterKind::Integer
+                        } else {
+                            ParameterKind::Decimal
+                        },
+                        min: field["min"].clone(),
+                        max: field["max"].clone(),
+                    },
+                )
+            })
+            .collect(),
+    )
 }
 
 fn algorithm_identity(id: &str) -> (&'static str, &'static str, &'static str) {

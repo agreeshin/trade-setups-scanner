@@ -8,6 +8,7 @@ use auth::PostSessionResult;
 pub mod batches;
 pub mod config;
 pub mod controls;
+pub mod optimization;
 pub mod replay;
 pub mod restore;
 

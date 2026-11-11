@@ -3,12 +3,14 @@ use std::collections::HashSet;
 
 const BASELINE: &str = "0010_baseline.sql";
 const RUN_NAMES: &str = "0011_run_names.sql";
-const MIGRATIONS: &[&str] = &[BASELINE, RUN_NAMES];
+const OPTIMIZATION_STUDIES: &str = "0012_optimization_studies.sql";
+const MIGRATIONS: &[&str] = &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES];
 
 fn migration_source(name: &str) -> &'static str {
     match name {
         BASELINE => include_str!("../migrations/0010_baseline.sql"),
         RUN_NAMES => include_str!("../migrations/0011_run_names.sql"),
+        OPTIMIZATION_STUDIES => include_str!("../migrations/0012_optimization_studies.sql"),
         other => unreachable!("unknown migration {other}"),
     }
 }
@@ -68,7 +70,7 @@ mod tests {
 
     #[test]
     fn run_names_migration_is_registered_after_baseline() {
-        assert_eq!(MIGRATIONS, &[BASELINE, RUN_NAMES]);
+        assert_eq!(MIGRATIONS, &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES]);
         let source = migration_source(RUN_NAMES);
         assert!(
             source.contains("ALTER TABLE public.replay_runs ADD COLUMN IF NOT EXISTS name text")

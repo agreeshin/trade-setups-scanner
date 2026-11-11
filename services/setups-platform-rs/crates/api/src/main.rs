@@ -85,6 +85,27 @@ async fn main() {
         config.market_data_url.clone(),
         config.market_data_api_key.clone(),
     );
+    let optimization_runtime = match setups_api::optimization::start_optimization_runtime(
+        pool.clone(),
+        config.market_data_url.clone(),
+        config.market_data_api_key.clone(),
+        config.optimization.clone(),
+    )
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("optimization runtime failed to start: {error}");
+            std::process::exit(1);
+        }
+    };
+    let optimization_state = Arc::new(setups_api::optimization::OptimizationState {
+        pool: pool.clone(),
+        auth: auth.clone(),
+        config: config.optimization.clone(),
+        notify: optimization_runtime.notify.clone(),
+        available: optimization_runtime.available.clone(),
+    });
     let analytics_state = std::sync::Arc::new(setups_api::analytics::AnalyticsState {
         pool: pool.clone(),
         auth: auth.clone(),
@@ -115,6 +136,9 @@ async fn main() {
         .merge(controls_router(controls_state))
         .merge(batches_router(replay_state))
         .merge(setups_api::analytics::analytics_router(analytics_state))
+        .merge(setups_api::optimization::optimization_router(
+            optimization_state,
+        ))
         .merge(setups_api::backup::backup_router(backup_state));
     let listener = match tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await {
         Ok(value) => value,
@@ -128,7 +152,7 @@ async fn main() {
         config.host, config.port
     );
     if let Err(error) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(jobs, live_runtime))
+        .with_graceful_shutdown(shutdown_signal(jobs, live_runtime, optimization_runtime))
         .await
     {
         eprintln!("server error: {error}");
@@ -136,7 +160,11 @@ async fn main() {
     }
 }
 
-async fn shutdown_signal(jobs: setups_worker::JobsHandle, live: setups_worker::live::LiveHandle) {
+async fn shutdown_signal(
+    jobs: setups_worker::JobsHandle,
+    live: setups_worker::live::LiveHandle,
+    optimization: setups_api::optimization::OptimizationHandle,
+) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -155,6 +183,5 @@ async fn shutdown_signal(jobs: setups_worker::JobsHandle, live: setups_worker::l
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-    let _ = live.stop().await;
-    let _ = jobs.stop().await;
+    tokio::join!(live.stop(), jobs.stop(), optimization.stop());
 }

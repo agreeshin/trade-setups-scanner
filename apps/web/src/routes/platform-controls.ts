@@ -8,7 +8,7 @@ export interface Algorithm {
   description: string;
   enabled: boolean;
   params: Record<string, string | number>;
-  fields: { key: string; label: string; type: "decimal" | "integer"; min: number; max: number; unit: string }[];
+  fields: { key: string; label: string; type: "decimal" | "integer"; min: number; max: number; unit: string; optimization?: { enabledByDefault: boolean; values: (string | number)[] } }[];
 }
 
 export interface SetupRow {

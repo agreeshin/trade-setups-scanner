@@ -185,11 +185,11 @@ async fn run_names_migration_preserves_legacy_data_and_is_idempotent() {
         .bind(SPIKE_ALGORITHM_ID).execute(&db.pool).await.unwrap();
     assert_eq!(
         ensure_migrations(&db.pool).await.unwrap(),
-        "2 applied, 0 up to date"
+        "3 applied, 0 up to date"
     );
     assert_eq!(
         ensure_migrations(&db.pool).await.unwrap(),
-        "0 applied, 2 up to date"
+        "0 applied, 3 up to date"
     );
     let names: Vec<Option<String>> = sqlx::query_scalar("select name from replay_runs")
         .fetch_all(&db.pool)
