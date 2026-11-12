@@ -50,7 +50,7 @@ describe("keep-alive navigation tabs", () => {
     expect(requests.filter((path) => path === "/v1/algorithms")).toHaveLength(0);
 
     await user.click(algorithmsLink);
-    expect(screen.getByRole("heading", { level: 1, name: "Алгоритмы" })).toBeVisible();
+    expect(screen.getByRole("heading", { level: 1, name: "Алгоритмы" })).toHaveClass("sr-only");
     expect(algorithmsLink).toHaveAttribute("aria-current", "page");
     const growth = await screen.findByRole("spinbutton", { name: "Рост цены (%)" });
     fireEvent.change(growth, { target: { value: "15" } });

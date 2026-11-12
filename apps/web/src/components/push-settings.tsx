@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { apiFetch } from "../lib/platform-api";
 import { Alert } from "./ui/alert";
 import { Button } from "./ui/button";
-import { Card } from "./ui/card";
 import { SectionHeader } from "./ui/page-header";
 
 function applicationKey(value: string): Uint8Array<ArrayBuffer> {
@@ -70,7 +69,7 @@ export function PushSettings() {
     finally { setBusy(false); }
   }
 
-  return <Card asChild><section className="mt-10 grid gap-3" aria-label="Web Push">
+  return <section className="grid gap-3" aria-label="Web Push">
     <SectionHeader title="Web Push" />
     <p className="text-sm text-muted-foreground">Возраст уведомления ограничивает доставку, но сам по себе не включает её. Подключите этот браузер отдельно.</p>
     {!supported ? <p role="status" className="text-sm">Web Push недоступен: нужны HTTPS, Service Worker и поддержка Push API. На HTTP-адресе сервера подключение заблокировано.</p> : <>
@@ -84,5 +83,5 @@ export function PushSettings() {
     </>}
     {message && <Alert variant="success" role="status">{message}</Alert>}
     {error && <Alert variant="destructive" role="alert">{error}</Alert>}
-  </section></Card>;
+  </section>;
 }

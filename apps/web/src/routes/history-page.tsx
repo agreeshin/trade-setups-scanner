@@ -8,7 +8,7 @@ import { Checkbox } from "../components/ui/checkbox";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { PageHeader, SectionHeader } from "../components/ui/page-header";
-import { SegmentedList, SegmentedTrigger } from "../components/ui/segmented";
+import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
 import { Select } from "../components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
@@ -212,19 +212,17 @@ export function HistoryPage() {
 
   return <section aria-labelledby="history-heading" className="grid gap-5">
     <PageHeader id="history-heading" title="История и сбор" description={<>Загрузка истории и текущий сбор независимы от replay и live-сканера. Действия выполняются только по вашей команде. Время: {localTimezoneLabel()}.</>} />
+    <PageSidebar label="Разделы «История и сбор»" items={HISTORY_TABS} value={tab} onValueChange={setTab}>
     {jobs.kind === "unreachable" && <Alert variant="destructive" role="alert">Статус массовых загрузок неизвестен ({jobs.detail}). Это не означает, что загрузок нет.</Alert>}
     {plans.kind === "unreachable" && <Alert variant="destructive" role="alert">Планы загрузки неизвестны ({plans.detail}). Это не означает, что планов нет.</Alert>}
     {activePlans.length > 0 && <p role="status" className="text-sm text-muted-foreground">Активных планов загрузки: {activePlans.length}. Инструментов ожидают освобождения лимитов очереди: {pendingPlanItems}.</p>}
     {counts !== null && (activeJobs > 0
       ? <Alert variant="info" role="status">Идёт массовая загрузка истории: активных заданий {activeJobs} (в очереди {counts.queued}, выполняется {counts.running}, запрошена отмена {counts.cancel_requested}). Статус хранится на сервере и виден после перезагрузки страницы.</Alert>
       : <p role="status" className="text-sm text-muted-foreground">Массовых загрузок, запущенных пользователем, сейчас нет. Постоянный ежеминутный сбор закрытых минут работает отдельно и здесь не учитывается.</p>)}
-    <SegmentedList role="tablist" aria-label="Разделы «История и сбор»">
-      {HISTORY_TABS.map((item) => <SegmentedTrigger key={item.id} role="tab" aria-selected={tab === item.id} onClick={() => setTab(item.id)}>{item.label}</SegmentedTrigger>)}
-    </SegmentedList>
     {error && <Alert variant="destructive" role="alert">{error}</Alert>}
     {message && <Alert variant="success" role="status">{message}</Alert>}
 
-    {tab === "upload" && <section className="grid gap-3" aria-labelledby="upload-heading">
+    <PageSidebarPanel value="upload" lazy><section className="grid gap-3" aria-labelledby="upload-heading">
       <SectionHeader id="upload-heading" title="Загрузить историю" />
       <p className="text-xs text-muted-foreground">Выберите инструменты вручную, импортом CSV без заголовка или текущим листингом Bybit, при необходимости отредактируйте список и подтвердите загрузку для выбранных дат. Создаётся отдельное задание на каждый инструмент.</p>
       <div className="flex flex-wrap gap-2">
@@ -232,14 +230,14 @@ export function HistoryPage() {
         <Button type="button" variant="outline" disabled={busy || symbols.trim().length === 0} onClick={() => { setSymbols(""); setMessage(null); }}>Очистить выбор</Button>
       </div>
       <InstrumentPicker catalog={instruments} symbols={symbols} onChange={(value) => { setSymbols(value); setMessage(null); }} disabled={busy || catalog.kind !== "ready"} />
-      <Card asChild><form className="grid gap-3" onSubmit={(event) => { void enqueue(event); }}>
+      <form className="grid gap-3" onSubmit={(event) => { void enqueue(event); }}>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="Начало загрузки">{(control) => <Input type="datetime-local" required value={from} onChange={(event) => setFrom(utcMidnightOnDateChange(from, event.target.value))} {...control} />}</Field>
           <Field label="Конец загрузки">{(control) => <Input type="datetime-local" required value={to} onChange={(event) => setTo(utcMidnightOnDateChange(to, event.target.value))} {...control} />}</Field>
         </div>
         <p className="text-sm text-muted-foreground">Выбрано инструментов: {pickedInstruments.length}.</p>
         <div><Button type="submit" disabled={busy || pickedInstruments.length === 0}>Создать план загрузки ({pickedInstruments.length})</Button></div>
-      </form></Card>
+      </form>
       {plans.kind === "ready" && plans.data.plans.length > 0 && <div className="overflow-x-auto"><Table>
         <caption className="text-left text-muted-foreground">Планы загрузки</caption>
         <TableHeader><TableRow><TableHead>План</TableHead><TableHead>Диапазон</TableHead><TableHead>Статус</TableHead><TableHead>Поставлено / ждёт / ошибки</TableHead><TableHead numeric>Активных заданий</TableHead><TableHead>Действие</TableHead></TableRow></TableHeader>
@@ -252,12 +250,12 @@ export function HistoryPage() {
           <TableCell>{plan.status === "active" && <Button variant="outline" size="sm" disabled={busy} onClick={() => { void mutation(`/v1/history/backfill-plans/${plan.id}/cancel`, {}, "POST", `Отмена плана #${plan.id} запрошена: новые задания больше не ставятся, активные получают запрос отмены.`); }}>Отменить план {plan.id}</Button>}</TableCell>
         </TableRow>)}</TableBody>
       </Table></div>}
-    </section>}
+    </section></PageSidebarPanel>
 
-    {tab === "collection" && <section className="grid gap-3" aria-labelledby="collection-heading">
+    <PageSidebarPanel value="collection" lazy><section className="grid gap-3" aria-labelledby="collection-heading">
       <SectionHeader id="collection-heading" title="Текущий сбор свечей" />
       <CoverageOverview revision={revision} />
-      <Card className="grid gap-3">
+      <div className="grid gap-3">
         <p className="text-sm text-muted-foreground">Массовое управление сбором: выберите инструменты чек-боксами, «Все из БД» выбирает весь каталог, импорт листинга Bybit обновляет каталог биржи и добавляет её символы в выбор. Лимита на количество нет.</p>
         <div><Button type="button" variant="outline" disabled={busy} onClick={() => { void importListingToCollection(); }}>Импортировать листинг для сбора</Button></div>
         <InstrumentPicker catalog={instruments} symbols={collectionSymbols} onChange={(value) => { setCollectionSymbols(value); setMessage(null); }} disabled={busy || catalog.kind !== "ready"} limit={null} />
@@ -266,7 +264,7 @@ export function HistoryPage() {
           <Button type="button" variant="outline" disabled={busy || collectionSelectionIds.length === 0} onClick={() => { void bulkSetCollection(false); }}>Выключить сбор для выбранных</Button>
           <Button type="button" variant="outline" disabled={busy || collectionSelectionIds.length === 0} onClick={() => { void startGapRepairs(); }}>Проверить и заполнить пропуски ({collectionSelectionIds.length})</Button>
         </div>
-      </Card>
+      </div>
       <div className="flex flex-wrap items-end gap-3">
         <Field label="Инструмент БД" className="min-w-56 flex-1 sm:max-w-md">{(control) => <Select value={instrumentId} disabled={catalog.kind !== "ready" || busy} onChange={(event) => setInstrumentId(event.target.value)} {...control}><option value="">Выберите инструмент</option>{instruments.map((instrument) => <option key={instrument.id} value={instrument.id}>{instrument.exchange} / {instrument.category} / {instrument.symbol} ({instrument.status})</option>)}</Select>}</Field>
         <Button variant="outline" disabled={busy} onClick={() => setRevision((value) => value + 1)}>Обновить историю</Button>
@@ -296,9 +294,9 @@ export function HistoryPage() {
             <TableCell>{job.error && <span role="alert" className="block max-w-sm break-words text-danger">{job.error}</span>}</TableCell>
           </TableRow>)}</TableBody>
         </Table></div>}</>}
-    </section>}
+    </section></PageSidebarPanel>
 
-    {tab === "jobs" && <section className="grid gap-3" aria-labelledby="backfill-heading">
+    <PageSidebarPanel value="jobs" lazy><section className="grid gap-3" aria-labelledby="backfill-heading">
       <SectionHeader id="backfill-heading" title="Задания загрузки" /><p className="text-xs text-muted-foreground">Обновление каждые 3 секунды в видимой вкладке. Прогресс отражает checkpoint диапазона, не полноту свечей.</p>
       {counts !== null && <p className="text-sm text-muted-foreground">Активных: {activeJobs}. Завершено успешно: {counts.done}. С ошибкой: {counts.failed}. Отменено: {counts.cancelled}.</p>}
       {jobs.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка заданий…</p>}{jobs.kind === "unreachable" && <Alert variant="destructive" role="alert">Задания недоступны ({jobs.detail})</Alert>}
@@ -313,6 +311,7 @@ export function HistoryPage() {
           <TableCell>{["queued", "running", "cancel_requested"].includes(job.status) && <Button variant="outline" size="sm" disabled={busy || job.status === "cancel_requested"} onClick={() => { void mutation(`/v1/history/backfill-jobs/${encodeURIComponent(String(job.id))}/cancel`, {}, "POST", `Отмена задания #${job.id} запрошена.`); }}>Отменить загрузку {job.id}</Button>}</TableCell>
         </TableRow>)}</TableBody>
       </Table>{jobs.data.jobs.length === 0 && <p>Заданий загрузки пока нет.</p>}</div>}
-    </section>}
+    </section></PageSidebarPanel>
+    </PageSidebar>
   </section>;
 }

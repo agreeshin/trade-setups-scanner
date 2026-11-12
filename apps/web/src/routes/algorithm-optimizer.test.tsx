@@ -111,7 +111,6 @@ function enterDates() {
 it("shows three separated card sections and only the existing constant-live checkbox persists", async () => {
   render(<AlgorithmsPage />);
   const first = within((await screen.findByText("Новый алгоритм · 2.0")).closest("form")!);
-  const second = within(screen.getByText("Второй алгоритм · 2.0").closest("form")!);
   expect(first.getAllByRole("heading", { level: 4 }).map((heading) => heading.textContent)).toEqual([
     "Live-сканирование с постоянными параметрами", "Live-сканирование с гибкими параметрами", "Оптимизации",
   ]);
@@ -128,13 +127,55 @@ it("shows three separated card sections and only the existing constant-live chec
   expect(toggle).toBeChecked();
   await userEvent.click(toggle);
   expect(toggle).not.toBeChecked();
-  expect(second.getByRole("checkbox", { name: "Включён для live-сканирования" })).toBeChecked();
   expect(requests.every((request) => request.method === "GET")).toBe(true);
   await userEvent.click(constant.getByRole("button", { name: "Сохранить алгоритм" }));
   await constant.findByText("Настройки алгоритма сохранены.");
   expect(requests.filter((request) => request.method !== "GET")).toEqual([
     expect.objectContaining({ path: `/v1/algorithms/${algorithm.id}`, method: "PUT", body: { params: algorithm.params, enabled: false } }),
   ]);
+  await userEvent.click(screen.getByRole("tab", { name: "Второй алгоритм" }));
+  expect(screen.getByRole("checkbox", { name: "Включён для live-сканирования" })).toBeChecked();
+  await userEvent.click(screen.getByRole("tab", { name: "Новый алгоритм" }));
+  expect(toggle).not.toBeChecked();
+});
+
+it("shows one retained algorithm panel and derives live dots from saved enabled flags only", async () => {
+  listedAlgorithms[1] = { ...listedAlgorithms[1]!, enabled: false };
+  const { container } = render(<AlgorithmsPage />);
+  const firstTab = await screen.findByRole("tab", { name: "Новый алгоритм" });
+  const secondTab = screen.getByRole("tab", { name: "Второй алгоритм" });
+  expect(screen.getByRole("heading", { name: "Алгоритмы" })).toHaveClass("sr-only");
+  expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  expect(firstTab).toHaveAccessibleDescription("Live-сканирование включено");
+  expect(secondTab.querySelector('[data-slot="sidebar-status-dot"]')).toBeNull();
+  const firstInput = screen.getByRole("spinbutton", { name: "Новый порог (%)" });
+  fireEvent.change(firstInput, { target: { value: "8.5" } });
+  await userEvent.click(screen.getByRole("checkbox", { name: "Включён для live-сканирования" }));
+  expect(firstTab.querySelector('[data-slot="sidebar-status-dot"]')).toBeInTheDocument();
+  await userEvent.click(secondTab);
+  expect(firstInput).toBeInTheDocument(); expect(firstInput).not.toBeVisible();
+  const secondInput = screen.getByRole("spinbutton", { name: "Новый порог (%)" });
+  expect(secondInput).not.toBe(firstInput); expect(secondInput).toHaveValue(2.5);
+  fireEvent.change(secondInput, { target: { value: "9.5" } });
+  await userEvent.click(firstTab);
+  expect(screen.getByRole("spinbutton", { name: "Новый порог (%)" })).toBe(firstInput);
+  expect(firstInput).toHaveValue(8.5);
+  expect(screen.getByRole("checkbox", { name: "Включён для live-сканирования" })).not.toBeChecked();
+  expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  expect(container.querySelectorAll('[data-slot="page-sidebar-content"] form')).toHaveLength(2);
+  await userEvent.click(screen.getByRole("button", { name: "Сохранить алгоритм" }));
+  await screen.findByText("Настройки алгоритма сохранены.");
+  expect(firstTab).not.toHaveAttribute("aria-describedby");
+  expect(firstTab.querySelector('[data-slot="sidebar-status-dot"]')).toBeNull();
+  await userEvent.click(secondTab);
+  expect(secondInput).toHaveValue(9.5);
+  await userEvent.click(screen.getByRole("checkbox", { name: "Включён для live-сканирования" }));
+  expect(secondTab.querySelector('[data-slot="sidebar-status-dot"]')).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Сохранить алгоритм" }));
+  await waitFor(() => expect(secondTab).toHaveAccessibleDescription("Live-сканирование включено"));
+  expect(secondTab.querySelector('[data-slot="sidebar-status-dot"]')).toHaveClass("bg-success");
+  expect(requests.filter((request) => request.path === "/v1/algorithms")).toHaveLength(1);
+  expect(requests.filter((request) => request.method !== "GET").map((request) => request.method)).toEqual(["PUT", "PUT"]);
 });
 
 it("builds unknown fields from metadata and submits the complete typed scope only explicitly", async () => {
@@ -188,10 +229,12 @@ it.each([0, 1])("switches algorithm cards without stale metadata and submits onl
   const ownLabel = targetIndex === 0 ? "Рост цены" : "Падение цены";
   const otherLabel = targetIndex === 0 ? "Падение цены" : "Рост цены";
   render(<AlgorithmsPage />);
+  await userEvent.click(await screen.findByRole("tab", { name: other.name }));
   fireEvent.click(await screen.findByRole("button", { name: `Оптимизировать ${other.name}` }));
   const previous = within(await screen.findByRole("dialog", { name: `Оптимизация · ${other.name}` }));
   fireEvent.change(await previous.findByLabelText(`Baseline: ${otherLabel}`), { target: { value: "91" } });
   await userEvent.click(previous.getByRole("button", { name: "Закрыть" }));
+  await userEvent.click(screen.getByRole("tab", { name: target.name }));
   fireEvent.click(screen.getByRole("button", { name: `Оптимизировать ${target.name}` }));
   const controls = within(await screen.findByRole("dialog", { name: `Оптимизация · ${target.name}` }));
   expect(await controls.findByLabelText(`Baseline: ${ownLabel}`)).toHaveValue("12");
@@ -410,18 +453,22 @@ it("discovers compact summaries without loading matrices until a dialog opens an
 
 it("shows five inline summaries without pagination and all history in an open paginated dialog", async () => {
   studies = Array.from({ length: 12 }, (_, index) => ({ ...record("completed"), id: 30 - index,
-    progress: { ...progress, bestScore: index === 0 ? 0 : index === 1 ? null : 0.25 },
+    progress: { ...progress, elapsedSeconds: index === 1 ? 90061 : 12, bestScore: index === 0 ? 0 : index === 1 ? null : index === 3 ? -0.126 : index === 4 ? 1e21 : 0.25 },
     spec: { ...spec, ...(index === 0 ? { minSetupsPerDay: 0 } : index > 1 ? { minSetupsPerDay: 4 } : {}) },
   }));
   render(<AlgorithmsPage />);
   const table = within(await screen.findByRole("table", { name: "Исследования · Новый алгоритм" }));
   await table.findByRole("button", { name: "Результат исследования 30" });
-  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Диапазон дат", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"]);
+  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"]);
   expect(table.getAllByRole("row")).toHaveLength(6);
   const first = within(table.getAllByRole("row")[1]!);
-  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#30", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "0", "0 R", ""]);
+  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#30", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "Менее 1 мин", "0", "0.00 R", ""]);
   expect(table.getAllByRole("row")[2]).toHaveTextContent("Гейт не применялся");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("—");
+  expect(table.getAllByRole("row")[2]).toHaveTextContent("1 дн 1 ч 1 мин");
+  expect(table.getAllByRole("row")[3]).toHaveTextContent("0.25 R");
+  expect(table.getAllByRole("row")[4]).toHaveTextContent("-0.13 R");
+  expect(table.getAllByRole("row")[5]).toHaveTextContent("1000000000000000000000.00 R");
   const section = within(screen.getByRole("region", { name: "История оптимизации · Новый алгоритм" }));
   expect(section.queryByRole("button", { name: /страница исследований/ })).not.toBeInTheDocument();
   expect(requests.some((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "10")).toBe(false);
@@ -435,6 +482,11 @@ it("shows five inline summaries without pagination and all history in an open pa
   const ids = [...document.querySelectorAll("[id]")].map((element) => element.id);
   expect(new Set(ids).size).toBe(ids.length);
   expect(fullTable.getAllByRole("row")).toHaveLength(11);
+  expect(fullTable.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(table.getAllByRole("columnheader", { hidden: true }).map((header) => header.textContent));
+  expect(fullTable.getAllByRole("row")[1]).toHaveTextContent("0.00 R");
+  expect(fullTable.getAllByRole("row")[2]).toHaveTextContent("1 дн 1 ч 1 мин");
+  expect(fullTable.getAllByRole("row")[4]).toHaveTextContent("-0.13 R");
+  expect(fullTable.getAllByRole("row")[5]).toHaveTextContent("1000000000000000000000.00 R");
   fireEvent.click(full.getByRole("button", { name: /Следующая страница/ }));
   await fullTable.findByRole("button", { name: "Результат исследования 20" });
   expect(fullTable.getAllByRole("row")).toHaveLength(3);

@@ -1,7 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
-import { Card } from "../components/ui/card";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { SectionHeader } from "../components/ui/page-header";
@@ -36,9 +35,9 @@ export function BackupSettings() {
     finally { setBusy(false); }
   }
 
-  return <section className="mt-10 grid gap-3" aria-labelledby="backup-heading">
+  return <section className="grid gap-3" aria-labelledby="backup-heading">
     <SectionHeader id="backup-heading" title="Резервные копии и восстановление" />
-    <Card className="grid gap-3">
+    <div className="grid gap-3">
       <p className="text-sm text-muted-foreground">Копии двух БД независимы. Platform backup содержит чувствительные Web Push endpoints и хранится защищённо.</p>
       <div className="flex flex-wrap gap-2"><Button asChild variant="outline"><a href="/v1/admin/backup" download>Скачать platform DB</a></Button><Button asChild variant="outline"><a href="/v1/admin/market-backup" download>Скачать market-data DB</a></Button></div>
       <form className="grid gap-4 border-t border-input pt-4" onSubmit={(event) => { void stage(event); }}>
@@ -49,6 +48,6 @@ export function BackupSettings() {
         {message && <Alert variant="info" role="status">{message}</Alert>}
         <div><Button type="submit" disabled={busy || !file || confirmation !== expected}>{busy ? "Проверка…" : "Проверить и подготовить restore"}</Button></div>
       </form>
-    </Card>
+    </div>
   </section>;
 }

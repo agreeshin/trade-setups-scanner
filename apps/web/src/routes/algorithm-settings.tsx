@@ -1,11 +1,11 @@
 import { useEffect, useId, useState, type FormEvent } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
-import { Card } from "../components/ui/card";
 import { Checkbox } from "../components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
+import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
 import { Separator } from "../components/ui/separator";
 import { fetchPlatform, type PlatformState } from "../lib/platform-api";
 import type { OptimizationStudyAction } from "../lib/optimization-api";
@@ -20,7 +20,7 @@ const groups = [
   { title: "Качество данных и повторные сигналы", keys: ["cooldownMinutes", "maxGapPercent", "maxConsecutiveGapMinutes", "requiredRecentMinutes"] },
 ];
 
-function AlgorithmForm({ algorithm, optimization }: { algorithm: Algorithm; optimization: OptimizationController }) {
+function AlgorithmForm({ algorithm, optimization, onEnabledSaved }: { algorithm: Algorithm; optimization: OptimizationController; onEnabledSaved: (enabled: boolean) => void }) {
   const [params, setParams] = useState(algorithm.params);
   const [baseline, setBaseline] = useState(algorithm.params);
   const [optimizationOpen, setOptimizationOpen] = useState(false);
@@ -60,11 +60,12 @@ function AlgorithmForm({ algorithm, optimization }: { algorithm: Algorithm; opti
     try {
       await writePlatform(`/v1/algorithms/${encodeURIComponent(algorithm.id)}`, { params: values, enabled });
       setBaseline(values);
+      onEnabledSaved(enabled);
       setSaved(true);
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <><Card asChild><form onSubmit={(event) => { void save(event); }} className="grid gap-4">
+  return <><form onSubmit={(event) => { void save(event); }} className="grid min-w-0 gap-4">
     <h3 className="text-lg font-semibold">{algorithm.name} · {algorithm.version}</h3>
     <p className="text-sm text-muted-foreground">{algorithm.description}</p>
     <section aria-labelledby={`${optimizerTriggerId}-constant`} className="grid min-w-0 gap-4">
@@ -96,7 +97,7 @@ function AlgorithmForm({ algorithm, optimization }: { algorithm: Algorithm; opti
     </div>
     <OptimizationHistory algorithmId={algorithm.id} algorithmName={algorithm.name} controller={optimization} pageSize={5} pagination={false} onSelect={selectHistory} onDelete={requestDelete} />
     </section>
-  </form></Card>
+  </form>
     <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
       <DialogContent id={historyDialogId} tabIndex={-1} className="max-w-5xl" onCloseAutoFocus={(event) => { event.preventDefault(); document.getElementById(historyTriggerId)?.focus(); }}>
         <DialogHeader><DialogTitle>Все оптимизации · {algorithm.name}</DialogTitle><DialogDescription>Полная история исследований алгоритма. ID открывает сохранённый результат, не закрывая список.</DialogDescription></DialogHeader>
@@ -116,9 +117,24 @@ function AlgorithmForm({ algorithm, optimization }: { algorithm: Algorithm; opti
   </>;
 }
 
+// Extend this predicate only when another live mode has a supported server contract.
+function hasEnabledLiveMode(algorithm: Pick<Algorithm, "enabled">): boolean {
+  return algorithm.enabled;
+}
+
 function AlgorithmForms({ algorithms }: { algorithms: Algorithm[] }) {
   const optimization = useOptimizationStudies(algorithms.map((algorithm) => algorithm.id));
-  return <>{algorithms.map((algorithm) => <AlgorithmForm key={algorithm.id} algorithm={algorithm} optimization={optimization} />)}</>;
+  const [selected, setSelected] = useState(algorithms[0]?.id ?? "");
+  const [savedEnabled, setSavedEnabled] = useState<Record<string, boolean>>({});
+  const items = algorithms.map((algorithm) => ({ id: algorithm.id, label: algorithm.name,
+    ...(hasEnabledLiveMode({ enabled: savedEnabled[algorithm.id] ?? algorithm.enabled }) ? { status: "Live-сканирование включено" } : {}),
+  }));
+  return <PageSidebar label="Алгоритмы" items={items} value={selected} onValueChange={setSelected}>
+    {algorithms.map((algorithm) => <PageSidebarPanel key={algorithm.id} value={algorithm.id}>
+      <AlgorithmForm algorithm={algorithm} optimization={optimization} onEnabledSaved={(enabled) => setSavedEnabled((previous) => ({ ...previous, [algorithm.id]: enabled }))} />
+    </PageSidebarPanel>)}
+    {algorithms.length === 0 && <p className="text-sm text-muted-foreground">Алгоритмов пока нет.</p>}
+  </PageSidebar>;
 }
 
 export function AlgorithmSettings() {

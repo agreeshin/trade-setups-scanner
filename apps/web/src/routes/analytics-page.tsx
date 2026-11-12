@@ -2,13 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
-import { Card, CardContent } from "../components/ui/card";
 import { Checkbox } from "../components/ui/checkbox";
 import { EmptyState } from "../components/ui/empty-state";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { PageHeader } from "../components/ui/page-header";
-import { SegmentedList, SegmentedTrigger } from "../components/ui/segmented";
+import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
 import { Select } from "../components/ui/select";
 import { Separator } from "../components/ui/separator";
 import { Spinner } from "../components/ui/spinner";
@@ -179,8 +178,7 @@ function MatrixSection({
   const commitGradientMin = () => { setGradientMin(gradientMinDraft); onCommit?.(); };
   const commitGradientMax = () => { setGradientMax(gradientMaxDraft); onCommit?.(); };
 
-  return <Card>
-    <CardContent className="grid gap-4">
+  return <section className="grid min-w-0 gap-4">
       <div className="grid gap-1">
         <h2 className="text-lg font-semibold">Среднее матожидание сетапов</h2>
         <p className="text-xs text-muted-foreground">{description}</p>
@@ -288,8 +286,7 @@ function MatrixSection({
         </Table>
       </div>
       <p className="text-xs text-muted-foreground">Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок. Спорная свеча считается Stop Loss. Цвет жирных значений интерполируется от красного к зелёному между порогами ползунков.</p>
-    </CardContent>
-  </Card>;
+  </section>;
 }
 
 function utcDayOf(unix: number): string {
@@ -697,8 +694,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
 
   const dailyPoints = useMemo(() => buildDailyExpectancy(visibleRows), [visibleRows]);
 
-  return <Card>
-    <CardContent className="grid gap-4">
+  return <section className="grid min-w-0 gap-4">
       <div className="grid gap-1">
         <h2 className="text-lg font-semibold">Матожидание по сетапам</h2>
         <p className="text-xs text-muted-foreground">{description}</p>
@@ -780,8 +776,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
           </Table>
         </div>
       )}
-    </CardContent>
-  </Card>;
+  </section>;
 }
 
 function AnalyticsCacheCard() {
@@ -819,8 +814,7 @@ function AnalyticsCacheCard() {
     }
   };
 
-  return <Card>
-    <CardContent className="grid gap-4">
+  return <section className="grid min-w-0 gap-4">
       <div className="grid gap-1">
         <h2 className="text-lg font-semibold">Кеш аналитики</h2>
         <p className="text-xs text-muted-foreground">Кеш результатов хранится в БД платформы рядом с сетапами. Догрузка истории не сбрасывает его автоматически; очистка удаляет только кеш аналитики, не трогая запуски, сетапы и рыночные данные.</p>
@@ -855,8 +849,7 @@ function AnalyticsCacheCard() {
           </div>
         </div>
       )}
-    </CardContent>
-  </Card>;
+  </section>;
 }
 
 type AnalyticsSection = "short" | "long" | "cache";
@@ -956,8 +949,10 @@ export function AnalyticsPage() {
 
   return <section aria-labelledby="analytics-heading" className="grid gap-4">
     <PageHeader id="analytics-heading" title="Аналитика" description="Backtest наборов сетапов из завершённых исторических запусков: матожидание TP/SL, зрелость кластеров, построчные закрытия. Расчёты читают минутные свечи через сервис данных; результаты кешируются." />
-    <Card>
-      <CardContent className="grid gap-4">
+    <PageSidebar label="Подразделы аналитики" value={section} onValueChange={setSection} items={[
+      { id: "short", label: "SHORT" }, { id: "long", label: "LONG" }, { id: "cache", label: "Кеш" },
+    ]}>
+    <section className="grid min-w-0 gap-4">
         <div className="grid gap-3">
           <h3 className="text-sm font-semibold text-muted-foreground">Набор и параметры запуска</h3>
           <div className="flex flex-wrap items-end gap-3">
@@ -1024,20 +1019,14 @@ export function AnalyticsPage() {
           <p className="text-xs text-muted-foreground">Настройки кластеризации действуют одновременно на все разделы SHORT и LONG. 0 — первый сетап кластера, 1 — последний, 0.5 — середина; соседние сигналы одной монеты с разрывом до {(appliedClusterGapHours ?? 8).toString()} часов образуют кластер. При выключенной галочке кластеризация не выполняется — в расчёт входят все сетапы.</p>
         </div>
         {saveStatus === "error" && <p role="status" className="text-xs text-danger">Не удалось сохранить настройки</p>}
-      </CardContent>
-    </Card>
-    <SegmentedList role="tablist" aria-label="Подразделы аналитики">
-      <SegmentedTrigger role="tab" aria-selected={section === "short"} onClick={() => setSection("short")}>SHORT</SegmentedTrigger>
-      <SegmentedTrigger role="tab" aria-selected={section === "long"} onClick={() => setSection("long")}>LONG</SegmentedTrigger>
-      <SegmentedTrigger role="tab" aria-selected={section === "cache"} onClick={() => setSection("cache")}>Кеш</SegmentedTrigger>
-    </SegmentedList>
+    </section>
     {(setsState === "loading" || settingsState === "loading") && <Spinner label="Загрузка наборов…" />}
     {setsState === "error" && <Alert variant="destructive" role="alert">Наборы недоступны: не удалось получить список исторических запусков</Alert>}
     {setsState === "ready" && sets.length === 0 && (
       <EmptyState title="Нет наборов для аналитики" description="Аналитика работает по завершённым историческим запускам. Создайте запуск на странице «Запуски» и дождитесь его завершения." />
     )}
     {settingsState === "ready" && (<>
-    <div hidden={section !== "short"} className="grid gap-4">
+    <PageSidebarPanel value="short">
       <MatrixSection
         setId={setId}
         description="SHORT: TP×SL по сетапам, выбранным из кластеров по зрелости. Период ограничивает исходные сигналы до кластеризации; горизонт сделки концом периода не обрезается."
@@ -1056,6 +1045,7 @@ export function AnalyticsPage() {
         onCommit={onSettingsCommit}
         runToken={runToken}
       />
+      <Separator />
       <TradesSection
         setId={setId}
         description="SHORT: построчные сделки — вход по close свечи через time-shift, закрытие по TP или SL за 7 дней. Сначала показываются кешированные строки, недостающие досчитываются."
@@ -1069,8 +1059,8 @@ export function AnalyticsPage() {
         reportState={reportShortTrades}
         onCommit={() => onSettingsCommit(false)}
       />
-    </div>
-    <div hidden={section !== "long"} className="grid gap-4">
+    </PageSidebarPanel>
+    <PageSidebarPanel value="long">
       <MatrixSection
         setId={setId}
         description="LONG: TP×SL по сетапам набора с общими настройками кластеризации и периода. Гейт смещения цены зеркален: LONG заходит только при падении цены на заданный процент."
@@ -1089,6 +1079,7 @@ export function AnalyticsPage() {
         onCommit={onSettingsCommit}
         runToken={runToken}
       />
+      <Separator />
       <TradesSection
         setId={setId}
         description="LONG: построчные закрытия по уровням TP/SL с ценой входа, временем касания и результатом в рисках."
@@ -1102,10 +1093,11 @@ export function AnalyticsPage() {
         reportState={reportLongTrades}
         onCommit={() => onSettingsCommit(false)}
       />
-    </div>
-    <div hidden={section !== "cache"} className="grid gap-4">
+    </PageSidebarPanel>
+    <PageSidebarPanel value="cache">
       <AnalyticsCacheCard />
-    </div>
+    </PageSidebarPanel>
     </>)}
+    </PageSidebar>
   </section>;
 }

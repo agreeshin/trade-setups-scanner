@@ -4,10 +4,15 @@ import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { formatUnix } from "../lib/datetime-format";
+import { formatElapsedDuration } from "../lib/format-duration";
 import { isActiveStudy, listOptimizationStudies, type OptimizationStudyAction, type OptimizationStudyPage } from "../lib/optimization-api";
 import { errorText } from "./platform-controls";
 import { RouteActiveContext } from "./route-active";
 import type { OptimizationController } from "./use-optimization-studies";
+
+const scoreFormatter = new Intl.NumberFormat("en-US", {
+  notation: "standard", useGrouping: false, minimumFractionDigits: 2, maximumFractionDigits: 2,
+});
 
 export function OptimizationTrashIcon() {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6" /></svg>;
@@ -68,12 +73,13 @@ export function OptimizationHistory({ algorithmId, algorithmName, controller, on
     {error && <Alert variant="destructive" role="alert">{error}<Button type="button" variant="outline" onClick={() => setRetry((value) => value + 1)}>Повторить загрузку истории</Button></Alert>}
     <div className="overflow-x-auto">
       <Table aria-label={`Исследования · ${algorithmName}`} aria-busy={loading}>
-        <TableHeader><TableRow>{["ID", "Диапазон дат", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
+        <TableHeader><TableRow>{["ID", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
         <TableBody>{page?.studies.map((study) => <TableRow key={study.id}>
           <TableCell><Button id={`${instanceId}-study-${study.id}`} type="button" variant="outline" size="sm" aria-label={`Результат исследования ${study.id}`} onClick={() => onSelect(study.id, `${instanceId}-study-${study.id}`)}>#{study.id}</Button></TableCell>
           <TableCell className="whitespace-nowrap">[{formatUnix(study.spec.fromUnix)}, {formatUnix(study.spec.toUnix)})</TableCell>
+          <TableCell className="whitespace-nowrap">{formatElapsedDuration(study.progress.elapsedSeconds)}</TableCell>
           <TableCell>{study.spec.minSetupsPerDay ?? "Гейт не применялся"}</TableCell>
-          <TableCell>{study.bestScore === null ? "—" : `${study.bestScore} R`}</TableCell>
+          <TableCell>{study.bestScore === null || !Number.isFinite(study.bestScore) ? "—" : `${scoreFormatter.format(study.bestScore)} R`}</TableCell>
           <TableCell>{isActiveStudy(study)
             ? <Button type="button" variant="outline" size="sm" disabled={busy || study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested")} aria-label={`Остановить исследование ${study.id}`} onClick={() => { void controller.stop(study); }}>{study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested") ? "Остановка запрошена" : controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить"}</Button>
             : <Button type="button" variant="outline" size="sm" disabled={busy} aria-label={`Удалить исследование ${study.id}`} onClick={() => onDelete(study)}><OptimizationTrashIcon /></Button>}</TableCell>

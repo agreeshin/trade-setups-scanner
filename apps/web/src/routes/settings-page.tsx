@@ -1,13 +1,13 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
-import { Card } from "../components/ui/card";
 import { Checkbox } from "../components/ui/checkbox";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { PageHeader, SectionHeader } from "../components/ui/page-header";
-import { SegmentedList, SegmentedTrigger } from "../components/ui/segmented";
+import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
 import { Select } from "../components/ui/select";
+import { Separator } from "../components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { applyInterfaceSettings, effectiveTimezone, formatIsoDateTime, formatUnix, interfaceSettings, type DateOrder, type DateSeparator, type InterfaceSettings } from "../lib/datetime-format";
 import { apiFetch, fetchPlatform, type PlatformState } from "../lib/platform-api";
@@ -36,9 +36,9 @@ function LiveSettings() {
     catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section className="mt-10 grid gap-3" aria-labelledby="live-heading">
+  return <section className="grid gap-3" aria-labelledby="live-heading">
     <SectionHeader id="live-heading" title="Live-сканирование" />
-    <Card className="grid gap-3">
+    <div className="grid gap-3">
       {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка…</p>}
       {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Статус недоступен ({state.detail})</Alert>}
       {state.kind === "ready" && <>
@@ -65,7 +65,7 @@ function LiveSettings() {
       </>}
       {error && <Alert variant="destructive" role="alert">{error}</Alert>}
       <div><Button variant="outline" disabled={busy} onClick={() => setReload((value) => value + 1)}>Обновить статус live</Button></div>
-    </Card>
+    </div>
   </section>;
 }
 
@@ -91,9 +91,9 @@ function CacheSettings() {
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section className="mt-10 grid gap-3" aria-labelledby="cache-heading">
+  return <section className="grid gap-3" aria-labelledby="cache-heading">
     <SectionHeader id="cache-heading" title="Кеш исторических запусков" />
-    <Card className="grid gap-3">
+    <div className="grid gap-3">
       {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка…</p>}
       {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Кеш недоступен ({state.detail})</Alert>}
       {state.kind === "ready" && <p>Записей: {state.data.entries} · Размер таблицы: {(state.data.bytes / 1024 / 1024).toFixed(2)} МиБ</p>}
@@ -102,7 +102,7 @@ function CacheSettings() {
       <div><Button variant="outline" disabled={busy || !confirm || state.kind !== "ready"} onClick={() => { void clear(); }}>Очистить кеш</Button></div>
       {message && <Alert variant="success" role="status">{message}</Alert>}
       {error && <Alert variant="destructive" role="alert">{error}</Alert>}
-    </Card>
+    </div>
   </section>;
 }
 
@@ -137,9 +137,9 @@ function InterfaceSettingsSection() {
     }
   }
 
-  return <section className="mt-10 grid gap-3" aria-labelledby="interface-heading">
+  return <section className="grid gap-3" aria-labelledby="interface-heading">
     <SectionHeader id="interface-heading" title="Интерфейс" />
-    <Card className="grid gap-3">
+    <div className="grid gap-3">
       <p className="text-sm text-muted-foreground">Формат применяется ко всем датам и времени в приложении и сохраняется для всех ваших устройств. Нативные селекторы дат следуют локали браузера.</p>
       <Field label="Порядок даты">
         {(control) => <Select {...control} value={settings.dateOrder} onChange={(event) => update({ dateOrder: event.target.value as DateOrder })}>
@@ -177,7 +177,7 @@ function InterfaceSettingsSection() {
       {error && <Alert variant="destructive" role="alert">{error}</Alert>}
       {message && <Alert variant="success" role="status">{message}</Alert>}
       <div><Button disabled={saving} onClick={() => { void save(); }}>{saving ? "Сохранение…" : "Сохранить и применить"}</Button></div>
-    </Card>
+    </div>
   </section>;
 }
 
@@ -210,17 +210,15 @@ export function SettingsPage() {
   }
   return <section aria-labelledby="settings-heading">
     <PageHeader id="settings-heading" title="Настройки" />
-    <SegmentedList role="tablist" aria-label="Подразделы настроек">
-      <SegmentedTrigger role="tab" aria-selected={section === "scanning"} onClick={() => setSection("scanning")}>Сканирование</SegmentedTrigger>
-      <SegmentedTrigger role="tab" aria-selected={section === "notifications"} onClick={() => setSection("notifications")}>Уведомления</SegmentedTrigger>
-      <SegmentedTrigger role="tab" aria-selected={section === "maintenance"} onClick={() => setSection("maintenance")}>Обслуживание</SegmentedTrigger>
-      <SegmentedTrigger role="tab" aria-selected={section === "interface"} onClick={() => setSection("interface")}>Интерфейс</SegmentedTrigger>
-    </SegmentedList>
-    <div hidden={section !== "scanning"}><LiveSettings /><LiveInstruments /></div>
-    <div hidden={section !== "notifications"}>
-      <form className="mt-10 grid gap-3" onSubmit={(event) => { void save(event); }} aria-labelledby="notifications-heading">
+    <PageSidebar label="Подразделы настроек" value={section} onValueChange={setSection} items={[
+      { id: "scanning", label: "Сканирование" }, { id: "notifications", label: "Уведомления" },
+      { id: "maintenance", label: "Обслуживание" }, { id: "interface", label: "Интерфейс" },
+    ]}>
+    <PageSidebarPanel value="scanning"><LiveSettings /><Separator /><LiveInstruments /></PageSidebarPanel>
+    <PageSidebarPanel value="notifications">
+      <form className="grid gap-3" onSubmit={(event) => { void save(event); }} aria-labelledby="notifications-heading">
         <SectionHeader id="notifications-heading" title="Уведомления" />
-        <Card className="grid gap-3">
+        <div className="grid gap-3">
           <p className="text-sm text-muted-foreground">Telegram не подключён. Настройка возраста задаёт порог свежести; подписка Web Push включается отдельно ниже и только по вашему действию.</p>
           <p className="text-sm text-muted-foreground">Web Push недоступен по обычному HTTP: требуется HTTPS (исключение — localhost). Сохранение порога не запрашивает разрешение на уведомления.</p>
           <Field label="Максимальный возраст уведомления (секунд)">
@@ -230,11 +228,12 @@ export function SettingsPage() {
           {error && <Alert variant="destructive" role="alert">{error}</Alert>}
           {message && <Alert variant="success" role="status">{message}</Alert>}
           <div><Button type="submit" disabled={saving || !ready}>{saving ? "Сохранение…" : "Сохранить уведомления"}</Button></div>
-        </Card>
+        </div>
       </form>
-      <PushSettings />
-    </div>
-    <div hidden={section !== "maintenance"}><CacheSettings /><OperationSettings /><BackupSettings /></div>
-    <div hidden={section !== "interface"}><InterfaceSettingsSection /></div>
+      <Separator /><PushSettings />
+    </PageSidebarPanel>
+    <PageSidebarPanel value="maintenance"><CacheSettings /><Separator /><OperationSettings /><Separator /><BackupSettings /></PageSidebarPanel>
+    <PageSidebarPanel value="interface"><InterfaceSettingsSection /></PageSidebarPanel>
+    </PageSidebar>
   </section>;
 }

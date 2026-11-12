@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
-import { Card } from "../components/ui/card";
 import { SectionHeader } from "../components/ui/page-header";
 import { fetchPlatform } from "../lib/platform-api";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
@@ -42,14 +41,14 @@ export function LiveInstruments() {
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section className="mt-10 grid gap-3" aria-labelledby="live-instruments-heading">
+  return <section className="grid gap-3" aria-labelledby="live-instruments-heading">
     <SectionHeader id="live-instruments-heading" title="Отдельный список live-инструментов" />
-    <Card className="grid gap-3">
+    <div className="grid gap-3">
       {!ready && !error && <p className="text-sm text-muted-foreground">Загрузка live-списка…</p>}
       {ready && <><p className="text-sm text-muted-foreground">{configured ? "Загружен сохранённый выбор." : "Список ещё не настроен: используются все активные инструменты каталога. Сохраните, чтобы зафиксировать выбор."}</p><InstrumentPicker live catalog={catalog} symbols={symbols} onChange={(value) => { setSymbols(value); setMessage(null); }} disabled={busy} /></>}
       {error && <Alert variant="destructive" role="alert">{error}</Alert>}
       {message && <Alert variant="success" role="status">{message}</Alert>}
       <div><Button disabled={!ready || busy} onClick={() => { void save(); }}>Сохранить live-список</Button></div>
-    </Card>
+    </div>
   </section>;
 }

@@ -233,11 +233,14 @@ describe("platform screens", () => {
     expect(screen.getByLabelText("Начало").closest("form")?.className).not.toMatch(/max-w-/);
   });
 
-  it("leaves all settings card and section wrappers full width", async () => {
+  it("keeps settings sections full width on one surface with a shared sidebar", async () => {
     const { container } = render(<SettingsPage />);
     await screen.findByRole("button", { name: "Включить live" });
     const wrappers = container.querySelectorAll("section[aria-labelledby], form[aria-labelledby], [data-slot='card']");
-    expect(wrappers.length).toBeGreaterThan(10);
+    expect(wrappers.length).toBeGreaterThan(5);
+    expect(container.querySelector('[data-slot="page-sidebar"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-slot="card"]')).toBeNull();
+    expect(container.querySelector('[data-slot="segmented-list"]')).toBeNull();
     for (const wrapper of wrappers) expect(wrapper.className).not.toMatch(/max-w-/);
   });
 
@@ -291,7 +294,7 @@ describe("platform screens", () => {
   });
   it("keeps percent and minute units distinct when saving an algorithm", async () => {
     render(<AlgorithmsPage />);
-    expect(screen.getByRole("heading", { level: 1, name: "Алгоритмы" })).toBeVisible();
+    expect(screen.getByRole("heading", { level: 1, name: "Алгоритмы" })).toHaveClass("sr-only");
     const growth = await screen.findByLabelText("Рост цены (%)");
     expect(growth).toHaveValue(12);
     expect(screen.getByLabelText("Окно (мин)")).toHaveValue(5);
@@ -310,6 +313,8 @@ describe("platform screens", () => {
     expect(screen.queryByLabelText("Рост цены (%)")).not.toBeInTheDocument();
     expect(requests.some((request) => request.path === "/v1/algorithms")).toBe(false);
     await userEvent.click(screen.getByRole("tab", { name: "Уведомления" }));
+    const age = await screen.findByRole("spinbutton", { name: "Максимальный возраст уведомления (секунд)" });
+    fireEvent.change(age, { target: { value: "99" } });
     expect(screen.getByText(/Telegram не подключён/)).toBeVisible();
     expect(screen.getByText(/Web Push недоступен по обычному HTTP/)).toHaveTextContent("localhost");
     await userEvent.click(screen.getByRole("tab", { name: "Обслуживание" }));
@@ -319,18 +324,25 @@ describe("platform screens", () => {
     await screen.findByText("Удалено записей кеша: 3.");
     expect(screen.getByRole("button", { name: "Очистить кеш" })).toBeDisabled();
     expect(requests.some((request) => request.path === "/v1/settings/live" && request.method === "PUT")).toBe(false);
+    await userEvent.click(screen.getByRole("tab", { name: "Уведомления" }));
+    expect(screen.getByRole("spinbutton", { name: "Максимальный возраст уведомления (секунд)" })).toBe(age);
+    expect(age).toHaveValue(99);
+    expect(requests.filter((request) => request.path === "/v1/settings/notifications")).toHaveLength(1);
   });
 
-  it("renders both algorithm forms with their own price threshold field", async () => {
+  it("retains both algorithm forms but shows and saves only the selected one", async () => {
     const { container } = render(<AlgorithmsPage />);
     expect(await screen.findByLabelText("Рост цены (%)")).toHaveValue(12);
     expect(screen.getByText("Рост цены и объёма · 1")).toBeInTheDocument();
     expect(screen.getByText("Падение цены и всплеск оборота · 1.1.1")).toBeInTheDocument();
+    expect(screen.getByText("Падение цены и всплеск оборота · 1.1.1")).not.toBeVisible();
+    await userEvent.click(screen.getByRole("tab", { name: "Падение цены и всплеск оборота" }));
+    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
     const drop = screen.getByLabelText("Падение цены (%)");
     expect(drop).toHaveValue(12);
     expect(screen.getByLabelText("Окно падения цены и оборота (мин)")).toHaveValue(5);
     fireEvent.change(drop, { target: { value: "9" } });
-    await userEvent.click(screen.getAllByRole("button", { name: "Сохранить алгоритм" })[1]!);
+    await userEvent.click(screen.getByRole("button", { name: "Сохранить алгоритм" }));
     await screen.findByText("Настройки алгоритма сохранены.");
     expect(requests.find((request) => request.path === "/v1/algorithms/price_drop_volume_spike")).toEqual({ path: "/v1/algorithms/price_drop_volume_spike", method: "PUT", body: { params: { priceDropPct: "9", windowMinutes: 5, volumeMultiplier: "3" }, enabled: true } });
     for (const wrapper of container.querySelectorAll("section[aria-labelledby], [data-slot='card']")) expect(wrapper.className).not.toMatch(/max-w-/);
@@ -469,10 +481,30 @@ describe("platform screens", () => {
     await screen.findByText("Отмена задания #9 запрошена.");
     expect(requests.some((request) => request.path === "/v1/history/backfill-jobs/9/cancel" && request.method === "POST")).toBe(true);
     await userEvent.click(screen.getByRole("tab", { name: "Текущий сбор свечей" }));
-    expect(screen.getByRole("button", { name: "Импортировать листинг для сбора" }).closest("[data-slot='card']")?.className).not.toMatch(/max-w-/);
+    expect(screen.getByRole("button", { name: "Импортировать листинг для сбора" }).closest("[data-slot='card']")).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: "Включить сбор" }));
     await screen.findByText("Настройка сбора сохранена.");
     expect(requests.find((request) => request.path === "/v1/history/collection-targets/1")?.body).toEqual({ enabled: true });
+  });
+  it("loads heavy history panels lazily and retains their filters after switching the sidebar", async () => {
+    const { container } = render(<HistoryPage />);
+    await screen.findByRole("checkbox", { name: "BTCUSDT (Trading)" });
+    expect(requests.some((request) => request.path.endsWith("/coverage-summary"))).toBe(false);
+    expect(container.querySelector('[data-slot="page-sidebar"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-slot="segmented-list"]')).toBeNull();
+    await userEvent.click(screen.getByRole("tab", { name: "Текущий сбор свечей" }));
+    const filter = await screen.findByRole("textbox", { name: "Фильтр по символу" });
+    fireEvent.change(filter, { target: { value: "ETH" } });
+    await userEvent.click(screen.getByRole("checkbox", { name: "Только инструменты со свечами" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Загрузка истории" }));
+    expect(filter).toBeInTheDocument(); expect(filter).not.toBeVisible();
+    await userEvent.click(screen.getByRole("tab", { name: "Текущий сбор свечей" }));
+    expect(screen.getByRole("textbox", { name: "Фильтр по символу" })).toBe(filter);
+    expect(filter).toHaveValue("ETH");
+    expect(screen.getByRole("checkbox", { name: "Только инструменты со свечами" })).not.toBeChecked();
+    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+    expect(requests.filter((request) => request.path.endsWith("/coverage-summary"))).toHaveLength(1);
+    expect(requests.every((request) => request.method === "GET")).toBe(true);
   });
   it("distinguishes unavailable coverage from empty history", async () => {
     const original = globalThis.fetch;

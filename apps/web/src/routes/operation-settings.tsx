@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { apiFetch, fetchPlatform, type PlatformState } from "../lib/platform-api";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
-import { Card } from "../components/ui/card";
 import { SectionHeader } from "../components/ui/page-header";
 import { errorText, writePlatform } from "./platform-controls";
 
@@ -37,9 +36,9 @@ export function OperationSettings() {
     } catch (cause) { setError(errorText(cause)); }
     finally { setBusy(false); }
   }
-  return <section aria-labelledby="operations-heading" className="mt-10 grid gap-3">
+  return <section aria-labelledby="operations-heading" className="grid gap-3">
     <SectionHeader id="operations-heading" title="Выполнение и конфигурация" />
-    <Card className="grid gap-3">
+    <div className="grid gap-3">
       {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка состояния очереди…</p>}
       {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Очередь недоступна ({state.detail})</Alert>}
       {state.kind === "ready" && <><p>{state.data.paused ? "Исторические расчёты приостановлены" : "Очередь исторических расчётов работает"}</p><div><Button variant="outline" disabled={busy} onClick={() => { void toggle(); }}>{state.data.paused ? "Продолжить расчёты" : "Приостановить расчёты"}</Button></div></>}
@@ -47,6 +46,6 @@ export function OperationSettings() {
       <div><Button variant="outline" disabled={busy} onClick={() => { void download(); }}>Экспорт конфигурации без секретов</Button></div>
       <p className="text-sm text-muted-foreground">Экспорт включает параметры алгоритма, списки инструментов и режимы работы. Это не резервная копия БД: история свечей и данные платформы резервируются отдельно администратором.</p>
       {error && <Alert variant="destructive" role="alert">{error}</Alert>}
-    </Card>
+    </div>
   </section>;
 }

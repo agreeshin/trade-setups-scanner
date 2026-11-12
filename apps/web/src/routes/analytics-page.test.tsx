@@ -105,7 +105,10 @@ const fullLongGrid = longTpLevels.flatMap((tp) => longSlLevels.map((sl) => matri
 
 it("computes matrices only after the button press and honours subsections", async () => {
   const calls = stubFetch({ shortBulk: fullShortGrid, longBulk: fullLongGrid });
-  render(<AnalyticsPage />);
+  const { container } = render(<AnalyticsPage />);
+  expect(container.querySelector('[data-slot="page-sidebar"]')).toBeInTheDocument();
+  expect(container.querySelector('[data-slot="card"]')).toBeNull();
+  expect(container.querySelector('[data-slot="segmented-list"]')).toBeNull();
   expect(await screen.findByText("#12 · Утренний прогон")).toBeInTheDocument();
   expect(screen.getByText("Снимок параметров запуска")).toBeInTheDocument();
   expect(screen.getByText("Рост цены (%)")).toBeInTheDocument();
@@ -129,12 +132,19 @@ it("computes matrices only after the button press and honours subsections", asyn
 
   expect(screen.getAllByLabelText("Красный при")[0]).toHaveValue("0.05");
   expect(screen.getAllByLabelText("Зелёный при")[0]).toHaveValue("0.2");
+  const shortShift = screen.getAllByLabelText("Time-shift, мин")[0]!;
+  fireEvent.change(shortShift, { target: { value: "7" } });
 
   await userEvent.click(screen.getByRole("tab", { name: "LONG" }));
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
   await waitFor(() => expect(screen.getByText("Ячеек: 550 / 550")).toBeInTheDocument());
   expect(screen.getAllByText("-0.30").length).toBeGreaterThan(0);
   expect(screen.getAllByLabelText("Зелёный при")[1]).toHaveValue("0.5");
+  await userEvent.click(screen.getByRole("tab", { name: "SHORT" }));
+  expect(shortShift).toBeVisible(); expect(shortShift).toHaveValue("7");
+  expect(screen.getByText("Ячеек: 196 / 196")).toBeVisible();
+  expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid")).toHaveLength(2);
 }, 15_000);
 
 it("fills the whole grid from a single batch request", async () => {
