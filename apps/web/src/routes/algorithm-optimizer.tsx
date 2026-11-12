@@ -8,11 +8,13 @@ import { Input } from "../components/ui/input";
 import { Select } from "../components/ui/select";
 import { Spinner } from "../components/ui/spinner";
 import { fetchPlatform } from "../lib/platform-api";
-import { isActiveStudy } from "../lib/optimization-api";
+import { isActiveStudy, type OptimizationStudyAction } from "../lib/optimization-api";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
 import { errorText, localDateInput, type Algorithm } from "./platform-controls";
 import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildOptimizationSpec, DEFAULT_AXIS, initialDomains, type DomainDrafts, type ScopeDraft, type SearchField } from "./optimization-form";
 import { OptimizationResults } from "./optimization-results";
+import { OptimizationTrashIcon } from "./optimization-history";
+import { useOptimizationDetail } from "./use-optimization-detail";
 import type { OptimizationController } from "./use-optimization-studies";
 
 function DomainControls({ fields, value, onChange }: { fields: SearchField[]; value: DomainDrafts; onChange: (next: DomainDrafts) => void }) {
@@ -117,10 +119,43 @@ function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algori
   </form>;
 }
 
-export function AlgorithmOptimizer({ algorithm, controller, open, onOpenChange, returnFocusId }: { algorithm: Algorithm; controller: OptimizationController; open: boolean; onOpenChange: (open: boolean) => void; returnFocusId: string }) {
+function StudyDetail({ detail, algorithm, controller, onDelete, onNew }: {
+  detail: ReturnType<typeof useOptimizationDetail>; algorithm: Algorithm; controller: OptimizationController;
+  onDelete: (study: OptimizationStudyAction) => void; onNew?: () => void;
+}) {
+  return <>
+    {detail?.error && <Alert variant="destructive" role="alert">{detail.error}<Button type="button" variant="outline" onClick={controller.refresh}>Повторить загрузку результата</Button></Alert>}
+    {!detail?.study && !detail?.error && <Spinner label="Загрузка исследования" />}
+    {detail?.study && <>
+      <OptimizationResults study={detail.study} algorithm={algorithm} controller={controller} {...(onNew ? { onNew } : {})} />
+      {!isActiveStudy(detail.study) && <div><Button type="button" variant="outline" disabled={controller.creating || controller.cancelling !== null || controller.deleting !== null} aria-label={`Удалить исследование ${detail.study.id}`} onClick={() => onDelete(detail.study!)}><OptimizationTrashIcon />Удалить исследование</Button></div>}
+    </>}
+  </>;
+}
+
+// A history selection has its own sibling dialog/state. It never follows "latest"
+// and closes/reopens the exact ID even when discovery finds a newer study.
+export function OptimizationStudyDialog({ id, algorithm, controller, open, onOpenChange, returnFocusId, onDelete }: {
+  id: number | undefined; algorithm: Algorithm; controller: OptimizationController; open: boolean;
+  onOpenChange: (open: boolean) => void; returnFocusId: string; onDelete: (study: OptimizationStudyAction) => void;
+}) {
+  const detail = useOptimizationDetail(id, open, controller.revision);
+  return <Dialog open={open} onOpenChange={onOpenChange}>
+    <DialogContent className="max-w-4xl" onCloseAutoFocus={(event) => { event.preventDefault(); (document.getElementById(`optimization-study-${id}`) ?? document.getElementById(returnFocusId))?.focus(); }}>
+      <DialogHeader><DialogTitle>Исследование #{id} · {algorithm.name}</DialogTitle><DialogDescription>Сохранённое исследование. Просмотр и закрытие окна не меняют серверную работу или настройки.</DialogDescription></DialogHeader>
+      <div className="grid min-h-0 min-w-0 flex-1 gap-4 overflow-y-auto pr-1">
+        {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
+        <StudyDetail detail={detail} algorithm={algorithm} controller={controller} onDelete={onDelete} />
+      </div>
+    </DialogContent>
+  </Dialog>;
+}
+
+export function AlgorithmOptimizer({ algorithm, controller, open, onOpenChange, returnFocusId, onDelete }: { algorithm: Algorithm; controller: OptimizationController; open: boolean; onOpenChange: (open: boolean) => void; returnFocusId: string; onDelete: (study: OptimizationStudyAction) => void }) {
   const study = controller.byAlgorithm[algorithm.id];
   const [drafting, setDrafting] = useState(false);
   const showStudy = study && (isActiveStudy(study) || !drafting);
+  const detail = useOptimizationDetail(study?.id, open && Boolean(showStudy), controller.revision, study && !isActiveStudy(study) ? study.updatedAt : undefined);
   return <Dialog open={open} onOpenChange={(next) => { if (!next) setDrafting(false); onOpenChange(next); }}>
     <DialogContent className="max-w-4xl" onCloseAutoFocus={(event) => { event.preventDefault(); document.getElementById(returnFocusId)?.focus(); }}>
       <DialogHeader>
@@ -131,7 +166,7 @@ export function AlgorithmOptimizer({ algorithm, controller, open, onOpenChange, 
         {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
         {!controller.ready && <div className="flex flex-wrap items-center gap-2 text-sm"><span>Проверяем сохранённые исследования. Новый запуск пока недоступен.</span><Button type="button" variant="outline" onClick={controller.refresh}>Обновить статус</Button></div>}
         {controller.active && controller.active.spec.algorithmId !== algorithm.id && <Alert variant="warning">Исследование #{controller.active.id} для {controller.active.spec.algorithmId} уже выполняется. В платформе допускается только одно активное исследование.</Alert>}
-        {showStudy ? <OptimizationResults study={study} algorithm={algorithm} controller={controller} onNew={() => setDrafting(true)} />
+        {showStudy ? <StudyDetail detail={detail} algorithm={algorithm} controller={controller} onDelete={onDelete} onNew={() => setDrafting(true)} />
           : <OptimizerForm algorithm={algorithm} controller={controller} onStarted={() => setDrafting(false)} />}
       </div>
     </DialogContent>

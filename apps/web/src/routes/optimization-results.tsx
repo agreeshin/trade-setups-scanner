@@ -21,7 +21,7 @@ const analyticsLabels: Record<string, string> = {
   setupMaturity: "Зрелость сетапа в кластере", horizonMinutes: "Горизонт сделки, мин (фиксирован)",
 };
 
-export function OptimizationResults({ study, algorithm, controller, onNew }: { study: OptimizationStudy; algorithm: Algorithm; controller: OptimizationController; onNew: () => void }) {
+export function OptimizationResults({ study, algorithm, controller, onNew }: { study: OptimizationStudy; algorithm: Algorithm; controller: OptimizationController; onNew?: () => void }) {
   const { progress, spec, result } = study;
   const best = result?.best;
   const frequencyThreshold = spec.minSetupsPerDay === undefined ? "Гейт не применялся"
@@ -47,8 +47,8 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
     </section>
     <div className="flex flex-wrap gap-2">
       <Button type="button" variant="outline" onClick={controller.refresh}>Обновить статус</Button>
-      {isActiveStudy(study) ? <Button type="button" variant="outline" disabled={study.status === "cancel_requested" || controller.cancelling !== null} onClick={() => { void controller.stop(study); }}>{controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить исследование"}</Button>
-        : <Button type="button" disabled={!controller.ready || controller.active !== null} onClick={onNew}>Новое исследование</Button>}
+      {isActiveStudy(study) ? <Button type="button" variant="outline" disabled={study.status === "cancel_requested" || controller.cancelling !== null || controller.deleting !== null || controller.creating} onClick={() => { void controller.stop(study); }}>{controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить исследование"}</Button>
+        : onNew && <Button type="button" disabled={!controller.ready || controller.active !== null} onClick={onNew}>Новое исследование</Button>}
     </div>
     {study.status === "cancel_requested" && <Alert role="status">Сервер завершает текущие задачи и очистку. Остановка ещё не завершена.</Alert>}
     {study.error && <Alert variant="destructive" role="alert">{study.error.code}: {study.error.message}</Alert>}

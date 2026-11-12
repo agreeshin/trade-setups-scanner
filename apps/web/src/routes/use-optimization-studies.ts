@@ -1,15 +1,15 @@
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import {
-  cancelOptimizationStudy, createOptimizationStudy, getOptimizationStudy, isActiveStudy,
-  listOptimizationStudies, OptimizationApiError, type OptimizationSpec, type OptimizationStudy,
+  cancelOptimizationStudy, createOptimizationStudy, deleteOptimizationStudy, getOptimizationStudy, isActiveStudy,
+  listOptimizationStudies, OptimizationApiError, summarizeOptimizationStudy, type OptimizationSpec, type OptimizationStudy, type OptimizationStudyAction, type OptimizationStudySummary,
 } from "../lib/optimization-api";
 import { errorText } from "./platform-controls";
 import { RouteActiveContext } from "./route-active";
 
-interface StudySnapshot { byAlgorithm: Record<string, OptimizationStudy>; active: OptimizationStudy | null }
+interface StudySnapshot { byAlgorithm: Record<string, OptimizationStudySummary>; active: OptimizationStudySummary | null }
 
-/** Only snapshots belong to this view. Timers/GETs are disposed, never the server study.
- * Retention is one record per registered algorithm plus the single global active study. */
+/** Retain one compact summary per registered algorithm plus the global active summary.
+ * Full detail belongs only to an open modal, never to discovery or the history table. */
 export function useOptimizationStudies(algorithmIds: string[]) {
   const idsKey = JSON.stringify(algorithmIds);
   const routeActive = useContext(RouteActiveContext);
@@ -19,19 +19,25 @@ export function useOptimizationStudies(algorithmIds: string[]) {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [cancelling, setCancelling] = useState<number | null>(null);
+  const [deleting, setDeleting] = useState<number | null>(null);
+  const [revision, setRevision] = useState(0);
   const mounted = useRef(false);
   const version = useRef(0);
   const mutation = useRef<AbortController | null>(null);
   const refreshRef = useRef<() => void>(() => undefined);
-  const activeRef = useRef<OptimizationStudy | null>(null);
+  const activeRef = useRef<OptimizationStudySummary | null>(null);
   const readyRef = useRef(false);
 
   const accept = useCallback((study: OptimizationStudy) => {
-    const active = isActiveStudy(study) ? study : null;
+    const summary = summarizeOptimizationStudy(study);
+    const previous = snapshotRef.current;
+    const active = isActiveStudy(summary) ? summary : previous.active?.id === summary.id ? null : previous.active;
     activeRef.current = active;
     readyRef.current = true;
     setReady(true);
-    const next = { byAlgorithm: { ...snapshotRef.current.byAlgorithm, [study.spec.algorithmId]: study }, active };
+    const existing = previous.byAlgorithm[study.spec.algorithmId];
+    const replace = !existing || existing.id === study.id || isActiveStudy(summary) || (!isActiveStudy(existing) && study.id > existing.id);
+    const next = { byAlgorithm: replace ? { ...previous.byAlgorithm, [study.spec.algorithmId]: summary } : previous.byAlgorithm, active };
     snapshotRef.current = next; setSnapshot(next);
   }, []);
 
@@ -56,23 +62,16 @@ export function useOptimizationStudies(algorithmIds: string[]) {
           listOptimizationStudies(undefined, current.signal),
           ...ids.map((id) => listOptimizationStudies(id, current.signal)),
         ]);
-        const activeSummary = global?.find(isActiveStudy);
+        const activeSummary = global.studies.find(isActiveStudy);
         const selected = lists.flatMap((list) => {
-          const ordered = [...list].sort((a, b) => Number(isActiveStudy(b)) - Number(isActiveStudy(a)) || b.id - a.id);
+          const ordered = [...list.studies].sort((a, b) => Number(isActiveStudy(b)) - Number(isActiveStudy(a)) || b.id - a.id);
           return ordered[0] ? [ordered[0]] : [];
         });
         if (activeSummary && !selected.some((study) => study.id === activeSummary.id)) selected.push(activeSummary);
-        const details = await Promise.all(selected.map((study) => {
-          const cached = snapshotRef.current.byAlgorithm[study.spec.algorithmId];
-          // Terminal matrices can contain 4096 cells. Keep one snapshot and only fetch again
-          // for a new/changed record; active studies always get authoritative detail updates.
-          if (!isActiveStudy(study) && cached?.id === study.id && cached.status === study.status && cached.updatedAt === study.updatedAt) return Promise.resolve(cached);
-          return getOptimizationStudy(study.id, current.signal);
-        }));
         if (disposed || current.signal.aborted || revision !== version.current) return;
-        const active = details.find(isActiveStudy) ?? null;
-        const byAlgorithm: Record<string, OptimizationStudy> = {};
-        for (const study of details) if (ids.includes(study.spec.algorithmId)) byAlgorithm[study.spec.algorithmId] = study;
+        const active = selected.find(isActiveStudy) ?? null;
+        const byAlgorithm: Record<string, OptimizationStudySummary> = {};
+        for (const study of selected) if (ids.includes(study.spec.algorithmId)) byAlgorithm[study.spec.algorithmId] = study;
         activeRef.current = active; readyRef.current = true;
         const next = { byAlgorithm, active }; snapshotRef.current = next;
         setSnapshot(next); setReady(true); setError(null);
@@ -105,7 +104,7 @@ export function useOptimizationStudies(algorithmIds: string[]) {
     version.current += 1; setCreating(true); setError(null);
     try {
       const study = await createOptimizationStudy(spec, controller.signal);
-      if (mounted.current && !controller.signal.aborted) { version.current += 1; accept(study); return true; }
+      if (mounted.current && !controller.signal.aborted) { version.current += 1; accept(study); setRevision((value) => value + 1); refreshRef.current(); return true; }
     } catch (cause) {
       if (mounted.current && !controller.signal.aborted) {
         if (cause instanceof OptimizationApiError && cause.activeStudyId !== undefined) {
@@ -131,13 +130,13 @@ export function useOptimizationStudies(algorithmIds: string[]) {
     }
     return false;
   }
-  async function stop(study: OptimizationStudy) {
+  async function stop(study: OptimizationStudyAction) {
     if (mutation.current || !isActiveStudy(study) || study.status === "cancel_requested") return;
     const controller = new AbortController(); mutation.current = controller;
     version.current += 1; setCancelling(study.id); setError(null);
     try {
       const next = await cancelOptimizationStudy(study.id, controller.signal);
-      if (mounted.current && !controller.signal.aborted) { version.current += 1; accept(next); }
+      if (mounted.current && !controller.signal.aborted) { version.current += 1; accept(next); setRevision((value) => value + 1); refreshRef.current(); }
     } catch (cause) {
       if (mounted.current && !controller.signal.aborted) setError(errorText(cause));
     } finally {
@@ -145,6 +144,29 @@ export function useOptimizationStudies(algorithmIds: string[]) {
       if (mounted.current && !controller.signal.aborted) setCancelling(null);
     }
   }
-  return { ...snapshot, ready, error, creating, cancelling, start, stop, refresh: () => refreshRef.current() };
+  async function remove(study: OptimizationStudyAction): Promise<boolean> {
+    if (mutation.current || isActiveStudy(study)) return false;
+    const controller = new AbortController(); mutation.current = controller;
+    version.current += 1; setDeleting(study.id); setError(null);
+    try {
+      await deleteOptimizationStudy(study.id, controller.signal);
+      if (!mounted.current || controller.signal.aborted) return false;
+      version.current += 1;
+      const previous = snapshotRef.current;
+      const next = { ...previous, byAlgorithm: Object.fromEntries(Object.entries(previous.byAlgorithm).filter(([, item]) => item.id !== study.id)) };
+      snapshotRef.current = next; setSnapshot(next);
+      readyRef.current = false; setReady(false);
+      setRevision((value) => value + 1); refreshRef.current();
+      return true;
+    } catch (cause) {
+      if (mounted.current && !controller.signal.aborted) setError(errorText(cause));
+    } finally {
+      if (mutation.current === controller) mutation.current = null;
+      if (mounted.current && !controller.signal.aborted) setDeleting(null);
+    }
+    return false;
+  }
+  return { ...snapshot, ready, error, creating, cancelling, deleting, revision, start, stop, remove,
+    clearError: () => setError(null), refresh: () => { setRevision((value) => value + 1); refreshRef.current(); } };
 }
 export type OptimizationController = ReturnType<typeof useOptimizationStudies>;

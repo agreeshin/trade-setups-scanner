@@ -89,22 +89,111 @@ pub async fn get(pool: &PgPool, id: i64) -> Result<Option<StudyRecord>, DbError>
         .transpose()
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudySummary {
+    pub id: i64,
+    pub status: String,
+    pub spec: Value,
+    pub progress: Value,
+    pub error: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub best_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StudyPage {
+    pub studies: Vec<StudySummary>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 pub async fn list(
     pool: &PgPool,
     algorithm: Option<&str>,
     limit: i64,
-) -> Result<Vec<StudyRecord>, DbError> {
-    sqlx::query(
-        "select * from optimization_studies where ($1::text is null or algorithm_id=$1) \
-         order by (status in ('queued','running','cancel_requested')) desc, id desc limit $2",
+    offset: i64,
+) -> Result<StudyPage, DbError> {
+    let limit = limit.clamp(1, 100);
+    let offset = offset.max(0);
+    let mut tx = pool.begin().await?;
+    // Count and page must describe the same history even during admission/deletion.
+    sqlx::query("set transaction isolation level repeatable read, read only")
+        .execute(&mut *tx)
+        .await?;
+    let total = sqlx::query_scalar(
+        "select count(*) from optimization_studies where ($1::text is null or algorithm_id=$1)",
     )
     .bind(algorithm)
-    .bind(limit.clamp(1, 100))
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(record)
-    .collect()
+    .fetch_one(&mut *tx)
+    .await?;
+    // Extract only the scalar winner score in PostgreSQL. Never transfer or
+    // retain full result matrices/events for a history page (at most 100 rows).
+    let rows = sqlx::query(
+        "select id,status,spec,progress,error,created_at,updated_at, \
+         (case when status in ('queued','running','cancel_requested') \
+          then progress->>'bestScore' else result#>>'{best,score}' end)::double precision as best_score \
+         from optimization_studies where ($1::text is null or algorithm_id=$1) \
+         order by (status in ('queued','running','cancel_requested')) desc, id desc limit $2 offset $3",
+    )
+    .bind(algorithm)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let studies = rows
+        .into_iter()
+        .map(|row| {
+            Ok(StudySummary {
+                id: row.try_get("id")?,
+                status: row.try_get("status")?,
+                spec: row.try_get("spec")?,
+                progress: row.try_get("progress")?,
+                error: row.try_get("error")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+                best_score: row.try_get("best_score")?,
+            })
+        })
+        .collect::<Result<_, DbError>>()?;
+    Ok(StudyPage {
+        studies,
+        total,
+        limit,
+        offset,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteStudyOutcome {
+    Deleted,
+    Active,
+}
+
+pub async fn delete(pool: &PgPool, id: i64) -> Result<Option<DeleteStudyOutcome>, DbError> {
+    let mut tx = pool.begin().await?;
+    let status: Option<String> =
+        sqlx::query_scalar("select status from optimization_studies where id=$1 for update")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(status) = status else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    if !matches!(status.as_str(), "completed" | "cancelled" | "failed") {
+        tx.commit().await?;
+        return Ok(Some(DeleteStudyOutcome::Active));
+    }
+    sqlx::query("delete from optimization_studies where id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(DeleteStudyOutcome::Deleted))
 }
 
 pub async fn claim(pool: &PgPool) -> Result<Option<StudyRecord>, DbError> {

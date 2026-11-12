@@ -68,7 +68,22 @@ export interface OptimizationStudy {
   events: { at: string; kind: string; message: string }[];
 }
 
-export const isActiveStudy = (study: OptimizationStudy): boolean =>
+export type OptimizationStudySummary = Omit<OptimizationStudy, "result" | "events"> & { bestScore: number | null };
+export interface OptimizationStudyPage {
+  studies: OptimizationStudySummary[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+export type OptimizationStudyAction = Pick<OptimizationStudy, "id" | "status">;
+
+// Project mutation responses explicitly: a compact summary must not retain matrix/events.
+export function summarizeOptimizationStudy(study: OptimizationStudy): OptimizationStudySummary {
+  return { id: study.id, status: study.status, spec: study.spec, progress: study.progress, error: study.error,
+    createdAt: study.createdAt, updatedAt: study.updatedAt, bestScore: study.result?.best?.score ?? study.progress.bestScore ?? null };
+}
+
+export const isActiveStudy = (study: Pick<OptimizationStudy, "status">): boolean =>
   study.status === "queued" || study.status === "running" || study.status === "cancel_requested";
 
 export class OptimizationApiError extends Error {
@@ -81,7 +96,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const detail = await response.json().catch(() => null) as { error?: unknown; message?: string; activeStudyId?: number; resource?: string; requested?: number; limit?: number } | null;
   const activeId = detail?.activeStudyId;
   let message = `Не удалось выполнить запрос оптимизации: HTTP ${response.status}`;
-  if (response.status === 409) message = activeId !== undefined ? `Исследование #${activeId} уже выполняется. Восстановлен его статус.` : "Версия алгоритма изменилась. Обновите страницу перед новым запуском.";
+  if (response.status === 409) message = init.method === "DELETE" ? "Нельзя удалить активное исследование. Сначала остановите его и дождитесь завершения."
+    : activeId !== undefined ? `Исследование #${activeId} уже выполняется. Восстановлен его статус.` : "Версия алгоритма изменилась. Обновите страницу перед новым запуском.";
+  else if (response.status === 404) message = "Исследование не найдено или уже удалено.";
   else if (response.status === 429) message = `Превышен ресурсный допуск${detail?.resource ? ` (${detail.resource}: ${String(detail.requested)} > ${String(detail.limit)})` : ""}. Уменьшите scope или бюджет исследования.`;
   else if (response.status === 400) {
     const reason = typeof detail?.message === "string" ? detail.message : typeof detail?.error === "string" ? detail.error : null;
@@ -90,11 +107,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   throw new OptimizationApiError(message, response.status, activeId);
 }
 
-export async function listOptimizationStudies(algorithmId: string | undefined, signal: AbortSignal): Promise<OptimizationStudy[]> {
-  const query = new URLSearchParams({ limit: "1" });
+export async function listOptimizationStudies(algorithmId: string | undefined, signal: AbortSignal, limit = 1, offset = 0): Promise<OptimizationStudyPage> {
+  const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
   if (algorithmId !== undefined) query.set("algorithmId", algorithmId);
-  const data = await request<{ studies: OptimizationStudy[] }>(`/v1/optimization-studies?${query}`, { signal });
-  return data.studies;
+  return request(`/v1/optimization-studies?${query}`, { signal });
 }
 export const getOptimizationStudy = (id: number, signal: AbortSignal): Promise<OptimizationStudy> =>
   request(`/v1/optimization-studies/${id}`, { signal });
@@ -102,3 +118,5 @@ export const createOptimizationStudy = (spec: OptimizationSpec, signal: AbortSig
   request("/v1/optimization-studies", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(spec), signal });
 export const cancelOptimizationStudy = (id: number, signal: AbortSignal): Promise<OptimizationStudy> =>
   request(`/v1/optimization-studies/${id}/cancel`, { method: "POST", signal });
+export const deleteOptimizationStudy = (id: number, signal: AbortSignal): Promise<{ deleted: true; id: number }> =>
+  request(`/v1/optimization-studies/${id}`, { method: "DELETE", signal });

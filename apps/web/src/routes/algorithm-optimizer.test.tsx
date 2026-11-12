@@ -1,7 +1,8 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { OptimizationSpec } from "../lib/optimization-api";
+import { summarizeOptimizationStudy, type OptimizationSpec, type OptimizationStudy } from "../lib/optimization-api";
+import { formatUnix } from "../lib/datetime-format";
 import { AlgorithmsPage } from "./algorithms-page";
 
 const algorithm = {
@@ -25,14 +26,15 @@ const spec: OptimizationSpec = {
   tpLevels: [4, 6], slLevels: [4, 6], minClosedPerCell: 1, seed: 42, maxTrials: 256, maxSeconds: 3600,
 };
 const progress = { phase: "acquiring", evaluatedCandidates: 0, scorableCandidates: 0, maxTrials: 256, elapsedSeconds: 12, bestScore: null as number | null };
-function record(status = "running") {
-  return { id: 17, status, spec, progress, result: null as unknown, error: null, createdAt: "2026-11-10T00:00:00Z", updatedAt: "2026-11-10T00:01:00Z", events: [{ at: "2026-11-10T00:00:00Z", kind: "started", message: "Подготовка снимка" }] };
+function record(status: OptimizationStudy["status"] = "running") {
+  return { id: 17, status, spec, progress, result: null as OptimizationStudy["result"], error: null, createdAt: "2026-11-10T00:00:00Z", updatedAt: "2026-11-10T00:01:00Z", events: [{ at: "2026-11-10T00:00:00Z", kind: "started", message: "Подготовка снимка" }] };
 }
 let studies: ReturnType<typeof record>[];
 let createStatus: number;
+let deleteStatus: number;
 const requests: { path: string; method: string; body: unknown; signal?: AbortSignal | null }[] = [];
 beforeEach(() => {
-  studies = []; createStatus = 202; requests.length = 0;
+  studies = []; createStatus = 202; deleteStatus = 200; requests.length = 0;
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : null;
@@ -47,11 +49,24 @@ beforeEach(() => {
       studies = [created]; return json(created, 202);
     }
     if (path.startsWith("/v1/optimization-studies?")) {
-      const id = new URL(path, "http://localhost").searchParams.get("algorithmId");
-      return json({ studies: id ? studies.filter((study) => study.spec.algorithmId === id) : studies });
+      const query = new URL(path, "http://localhost").searchParams;
+      const id = query.get("algorithmId");
+      const limit = Number(query.get("limit")); const offset = Number(query.get("offset"));
+      const ordered = studies.filter((study) => !id || study.spec.algorithmId === id).sort((a, b) => Number(["queued", "running", "cancel_requested"].includes(b.status)) - Number(["queued", "running", "cancel_requested"].includes(a.status)) || b.id - a.id);
+      return json({ studies: ordered.slice(offset, offset + limit).map(summarizeOptimizationStudy), total: ordered.length, limit, offset });
     }
-    if (path.endsWith("/17/cancel")) { studies = [{ ...studies[0]!, status: "cancel_requested" }]; return json(studies[0], 202); }
-    if (path === "/v1/optimization-studies/17") return json(studies[0]);
+    const cancel = /^\/v1\/optimization-studies\/(\d+)\/cancel$/.exec(path);
+    if (cancel) { studies = studies.map((study) => study.id === Number(cancel[1]) ? { ...study, status: "cancel_requested" } : study); return json(studies.find((study) => study.id === Number(cancel[1])), 202); }
+    const detail = /^\/v1\/optimization-studies\/(\d+)$/.exec(path);
+    if (detail) {
+      const id = Number(detail[1]);
+      if (method === "DELETE") {
+        if (deleteStatus !== 200) return json({ error: "delete_failed" }, deleteStatus);
+        studies = studies.filter((study) => study.id !== id); return json({ deleted: true, id });
+      }
+      const study = studies.find((study) => study.id === id);
+      return study ? json(study) : json({ error: "not_found" }, 404);
+    }
     return json({});
   }));
 });
@@ -243,19 +258,114 @@ it("pauses observer polling and releases requests/timers on unmount without canc
   expect(vi.getTimerCount()).toBe(0);
 });
 
-it("keeps an unchanged terminal matrix snapshot and fetches details only after updatedAt changes", async () => {
+it("discovers compact summaries without loading matrices until a dialog opens and releases detail on close", async () => {
   vi.useFakeTimers(); studies = [record("completed")];
   render(<AlgorithmsPage />);
   await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   const lists = requests.filter((request) => request.path.startsWith("/v1/optimization-studies?"));
-  expect(lists).toHaveLength(3);
-  expect(lists.every((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "1")).toBe(true);
+  expect(lists.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "1")).toHaveLength(3);
+  expect(lists.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "10")).toHaveLength(2);
+  expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(0);
+  fireEvent.click(screen.getByRole("button", { name: "Оптимизировать Новый алгоритм" }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(1);
   await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(1);
   studies = [{ ...studies[0]!, updatedAt: "2026-11-10T00:02:00Z" }];
   await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(2);
+  fireEvent.click(screen.getByRole("button", { name: "Закрыть" }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
+  expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(2);
+});
+
+it("shows exact history columns, legacy/zero thresholds, R scores and date ranges across bounded pages", async () => {
+  studies = Array.from({ length: 12 }, (_, index) => ({ ...record("completed"), id: 30 - index,
+    progress: { ...progress, bestScore: index === 0 ? 0 : index === 1 ? null : 0.25 },
+    spec: { ...spec, ...(index === 0 ? { minSetupsPerDay: 0 } : index > 1 ? { minSetupsPerDay: 4 } : {}) },
+  }));
+  render(<AlgorithmsPage />);
+  const table = within(await screen.findByRole("table", { name: "Исследования · Новый алгоритм" }));
+  await table.findByRole("button", { name: "Результат исследования 30" });
+  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Диапазон дат", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"]);
+  expect(table.getAllByRole("row")).toHaveLength(11);
+  const first = within(table.getAllByRole("row")[1]!);
+  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#30", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "0", "0 R", ""]);
+  expect(table.getAllByRole("row")[2]).toHaveTextContent("Гейт не применялся");
+  expect(table.getAllByRole("row")[2]).toHaveTextContent("—");
+  const section = within(screen.getByRole("region", { name: "История оптимизации · Новый алгоритм" }));
+  fireEvent.click(section.getByRole("button", { name: /Следующая страница/ }));
+  await table.findByRole("button", { name: "Результат исследования 20" });
+  expect(table.getAllByRole("row")).toHaveLength(3);
+  expect(section.getByRole("button", { name: /Следующая страница/ })).toBeDisabled();
+  expect(requests.some((request) => new URL(request.path, "http://localhost").searchParams.get("offset") === "10")).toBe(true);
+  expect(requests.some((request) => /^\/v1\/optimization-studies\/\d+$/.test(request.path))).toBe(false);
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it("opens the requested older ID independently from latest discovery without nested optimizer dialogs", async () => {
+  studies = [{ ...record("completed"), id: 20 }, { ...record("cancelled"), id: 17 }];
+  render(<AlgorithmsPage />);
+  fireEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }));
+  expect(await screen.findByText("Исследование #17")).toBeInTheDocument();
+  expect(screen.getAllByRole("dialog")).toHaveLength(1);
+  studies.unshift({ ...record("completed"), id: 21 });
+  fireEvent.click(screen.getByRole("button", { name: "Обновить статус" }));
+  await waitFor(() => expect(requests.some((request) => request.path.startsWith("/v1/optimization-studies?"))).toBe(true));
+  expect(screen.getByText("Исследование #17")).toBeInTheDocument();
+  expect(requests.some((request) => request.path === "/v1/optimization-studies/20" || request.path === "/v1/optimization-studies/21")).toBe(false);
+  await userEvent.click(screen.getByRole("button", { name: "Закрыть" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }));
+  expect(await screen.findByText("Исследование #17")).toBeInTheDocument();
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it.each(["queued", "running"] as const)("stops an active %s history row once without submitting settings", async (status) => {
+  studies = [record(status)];
+  render(<AlgorithmsPage />);
+  const stop = await screen.findByRole("button", { name: "Остановить исследование 17" });
+  fireEvent.click(stop); fireEvent.click(stop);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Остановить исследование 17" })).toBeDisabled());
+  expect(await screen.findByText("Остановка запрошена")).toBeInTheDocument();
+  expect(requests.filter((request) => request.path.endsWith("/cancel"))).toHaveLength(1);
+  expect(requests.some((request) => request.method === "PUT")).toBe(false);
+});
+
+it("does not offer repeated stop or deletion for cancel_requested", async () => {
+  studies = [record("cancel_requested")];
+  render(<AlgorithmsPage />);
+  const stop = await screen.findByRole("button", { name: "Остановить исследование 17" });
+  expect(stop).toBeDisabled(); fireEvent.click(stop);
+  expect(screen.queryByRole("button", { name: "Удалить исследование 17" })).not.toBeInTheDocument();
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it.each(["completed", "cancelled", "failed"] as const)("confirms terminal %s deletion, closes selected detail and refreshes history", async (status) => {
+  studies = [{ ...record("completed"), id: 20 }, record(status)];
+  render(<AlgorithmsPage />);
+  fireEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }));
+  await screen.findByText("Исследование #17");
+  fireEvent.click(screen.getByRole("button", { name: "Удалить исследование 17" }));
+  const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
+  expect(requests.some((request) => request.method === "DELETE")).toBe(false);
+  const confirm = confirmation.getByRole("button", { name: "Удалить" });
+  fireEvent.click(confirm); fireEvent.click(confirm);
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await screen.findByRole("button", { name: "Результат исследования 20" });
+  expect(screen.queryByRole("button", { name: "Результат исследования 17" })).not.toBeInTheDocument();
+  expect(requests.filter((request) => request.method === "DELETE").map((request) => request.path)).toEqual(["/v1/optimization-studies/17"]);
+  expect(requests.some((request) => request.method === "PUT")).toBe(false);
+});
+
+it("retains the history row and shows a deletion conflict without claiming success", async () => {
+  studies = [record("completed")]; deleteStatus = 409;
+  render(<AlgorithmsPage />);
+  fireEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }));
+  const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
+  fireEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
+  expect(await confirmation.findByRole("alert")).toHaveTextContent("Нельзя удалить активное исследование");
+  fireEvent.click(confirmation.getByRole("button", { name: "Отмена" }));
+  expect(await screen.findByRole("button", { name: "Результат исследования 17" })).toBeInTheDocument();
 });
 
 it("blocks a new study for another algorithm while the platform already has active work", async () => {

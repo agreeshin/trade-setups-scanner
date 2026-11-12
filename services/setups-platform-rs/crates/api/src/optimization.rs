@@ -7,7 +7,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State, rejection::QueryRejection},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -70,7 +70,10 @@ pub fn optimization_router(state: Arc<OptimizationState>) -> Router {
             "/v1/optimization-studies",
             post(create_study).get(list_studies),
         )
-        .route("/v1/optimization-studies/{id}", get(get_study))
+        .route(
+            "/v1/optimization-studies/{id}",
+            get(get_study).delete(delete_study),
+        )
         .route("/v1/optimization-studies/{id}/cancel", post(cancel_study))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
@@ -170,7 +173,8 @@ async fn create_study(
         );
     }
     // Only new admissions receive serde defaults (including minSetupsPerDay).
-    // Detail/list return persisted raw spec/result JSON, preserving legacy meaning.
+    // Detail returns persisted raw spec/result JSON, preserving legacy meaning;
+    // list projects the same raw spec without loading the full result/events.
     let normalized = match serde_json::to_value(&spec) {
         Ok(value) => value,
         Err(error) => return internal_error("serialize_spec", error),
@@ -222,18 +226,24 @@ async fn create_study(
 struct ListQuery {
     algorithm_id: Option<String>,
     limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 async fn list_studies(
     State(state): State<Arc<OptimizationState>>,
     headers: HeaderMap,
-    Query(query): Query<ListQuery>,
+    query: Result<Query<ListQuery>, QueryRejection>,
 ) -> Response {
     if let Err(error) = guard_auth(&state.auth, &headers, false) {
         return error;
     }
+    let Ok(Query(query)) = query else {
+        return response(StatusCode::BAD_REQUEST, json!({"error":"invalid_query"}));
+    };
     let limit = query.limit.unwrap_or(20);
+    let offset = query.offset.unwrap_or(0);
     if !(1..=100).contains(&limit)
+        || offset < 0
         || query
             .algorithm_id
             .as_deref()
@@ -241,12 +251,8 @@ async fn list_studies(
     {
         return response(StatusCode::BAD_REQUEST, json!({"error":"invalid_query"}));
     }
-    match db::list(&state.pool, query.algorithm_id.as_deref(), limit).await {
-        Ok(studies) => (
-            [("cache-control", "no-store")],
-            Json(json!({"studies":studies})),
-        )
-            .into_response(),
+    match db::list(&state.pool, query.algorithm_id.as_deref(), limit, offset).await {
+        Ok(page) => ([("cache-control", "no-store")], Json(page)).into_response(),
         Err(error) => internal_error("list", error),
     }
 }
@@ -266,6 +272,29 @@ async fn get_study(
         Ok(Some(record)) => record_response(StatusCode::OK, record),
         Ok(None) => response(StatusCode::NOT_FOUND, json!({"error":"not_found"})),
         Err(error) => internal_error("get", error),
+    }
+}
+
+async fn delete_study(
+    State(state): State<Arc<OptimizationState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(error) = guard_auth(&state.auth, &headers, true) {
+        return error;
+    }
+    if id < 1 {
+        return response(StatusCode::BAD_REQUEST, json!({"error":"invalid_id"}));
+    }
+    match db::delete(&state.pool, id).await {
+        Ok(Some(db::DeleteStudyOutcome::Deleted)) => {
+            response(StatusCode::OK, json!({"deleted":true,"id":id}))
+        }
+        Ok(Some(db::DeleteStudyOutcome::Active)) => {
+            response(StatusCode::CONFLICT, json!({"error":"study_active"}))
+        }
+        Ok(None) => response(StatusCode::NOT_FOUND, json!({"error":"not_found"})),
+        Err(error) => internal_error("delete", error),
     }
 }
 

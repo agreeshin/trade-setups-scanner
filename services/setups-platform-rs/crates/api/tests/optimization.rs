@@ -112,23 +112,39 @@ async fn routes_validate_without_database_access() {
             .0,
         StatusCode::CONFLICT
     );
-    assert_eq!(
-        request(
+    for query in [
+        "limit=0",
+        "limit=101",
+        "offset=-1",
+        "offset=1.5",
+        "offset=abc",
+        "offset=9223372036854775808",
+        "algorithmId=missing",
+        "unexpected=1",
+    ] {
+        let (status, error) = request(
             &app,
             "GET",
-            "/v1/optimization-studies?limit=101",
-            Value::Null
+            &format!("/v1/optimization-studies?{query}"),
+            Value::Null,
         )
-        .await
-        .0,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        request(&app, "GET", "/v1/optimization-studies/0", Value::Null)
-            .await
-            .0,
-        StatusCode::BAD_REQUEST
-    );
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        assert_eq!(error, json!({"error":"invalid_query"}));
+    }
+    for method in ["GET", "DELETE"] {
+        for id in [0, -1] {
+            let (status, error) = request(
+                &app,
+                method,
+                &format!("/v1/optimization-studies/{id}"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error, json!({"error":"invalid_id"}));
+        }
+    }
 }
 
 #[tokio::test]
@@ -208,6 +224,7 @@ async fn all_routes_require_auth_and_cookie_mutations_require_origin_guard() {
         ("POST", "/v1/optimization-studies"),
         ("GET", "/v1/optimization-studies"),
         ("GET", "/v1/optimization-studies/1"),
+        ("DELETE", "/v1/optimization-studies/1"),
         ("POST", "/v1/optimization-studies/1/cancel"),
     ] {
         let response = app
@@ -222,7 +239,7 @@ async fn all_routes_require_auth_and_cookie_mutations_require_origin_guard() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        if method == "POST" {
+        if matches!(method, "POST" | "DELETE") {
             let response = app
                 .clone()
                 .oneshot(
@@ -436,10 +453,21 @@ async fn frequency_gate_legacy_running_and_completed_records_remain_raw() {
             } else {
                 &response
             };
-            assert_eq!(record, &json!(before));
+            if path.contains('?') {
+                assert_eq!(
+                    record,
+                    &json!({
+                        "id":before.id,"status":before.status,"spec":before.spec,
+                        "progress":before.progress,"error":before.error,
+                        "createdAt":before.created_at,"updatedAt":before.updated_at,"bestScore":1.0
+                    })
+                );
+            } else {
+                assert_eq!(record, &json!(before));
+            }
             assert_eq!(record["spec"], legacy_spec);
             assert!(record["spec"].get("minSetupsPerDay").is_none());
-            if completed {
+            if completed && !path.contains('?') {
                 assert_eq!(record["result"], legacy_result);
                 for support in [
                     &record["result"]["baseline"],
@@ -457,6 +485,348 @@ async fn frequency_gate_legacy_running_and_completed_records_remain_raw() {
             "GET must not rewrite a legacy row"
         );
     }
+    db.cleanup().await;
+}
+
+async fn insert_history_study(
+    pool: &PgPool,
+    algorithm: &str,
+    status: &str,
+    score: Option<f64>,
+    progress_score: Option<f64>,
+) -> i64 {
+    let mut body = spec();
+    body["algorithmId"] = json!(algorithm);
+    let progress = json!({"phase":"initial","evaluatedCandidates":1,"scorableCandidates":1,"maxTrials":1,"elapsedSeconds":1,"bestScore":progress_score});
+    let result = matches!(status, "completed" | "cancelled").then(|| {
+        json!({"best":score.map(|score|json!({"score":score,"matrix":[{"payload":"matrix-marker".repeat(5000)}]}))})
+    });
+    let error = (status == "failed").then(|| json!({"code":"fixture","message":"history error"}));
+    sqlx::query_scalar("insert into optimization_studies (algorithm_id,status,spec,progress,result,error,events) values ($1,$2,$3,$4,$5,$6,$7) returning id")
+        .bind(algorithm).bind(status).bind(body).bind(progress).bind(result).bind(error)
+        .bind(json!([{"at":"fixture","kind":"fixture","message":"event-marker".repeat(100)}]))
+        .fetch_one(pool).await.unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn history_list_is_paginated_filtered_ordered_and_compact() {
+    let db = TestDb::new().await;
+    let router = app(db.pool.clone(), OptimizationConfig::default());
+    let (_, empty) = request(&router, "GET", "/v1/optimization-studies", Value::Null).await;
+    assert_eq!(empty, json!({"studies":[],"total":0,"limit":20,"offset":0}));
+    let spike = "price_volume_spike";
+    let active = insert_history_study(&db.pool, spike, "queued", None, Some(0.75)).await;
+    let completed = insert_history_study(&db.pool, spike, "completed", Some(5.0), Some(99.0)).await;
+    let cancelled = insert_history_study(&db.pool, spike, "cancelled", Some(0.0), Some(99.0)).await;
+    let failed = insert_history_study(&db.pool, spike, "failed", None, Some(99.0)).await;
+    let drop = insert_history_study(
+        &db.pool,
+        "price_drop_volume_spike",
+        "completed",
+        Some(-1.0),
+        None,
+    )
+    .await;
+    let (status, page) = request(&router, "GET", "/v1/optimization-studies", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page.as_object().unwrap().len(), 4);
+    assert_eq!(page["total"], 5);
+    assert_eq!(page["limit"], 20);
+    assert_eq!(page["offset"], 0);
+    let summaries = page["studies"].as_array().unwrap();
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|s| s["id"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        [active, drop, failed, cancelled, completed]
+    );
+    for summary in summaries {
+        assert_eq!(summary.as_object().unwrap().len(), 8);
+        for field in [
+            "id",
+            "status",
+            "spec",
+            "progress",
+            "error",
+            "createdAt",
+            "updatedAt",
+            "bestScore",
+        ] {
+            assert!(summary.get(field).is_some(), "{field}");
+        }
+        assert!(summary.get("result").is_none());
+        assert!(summary.get("events").is_none());
+    }
+    assert_eq!(summaries[0]["bestScore"].as_f64(), Some(0.75));
+    assert_eq!(summaries[1]["bestScore"].as_f64(), Some(-1.0));
+    assert!(
+        summaries[2]["bestScore"].is_null(),
+        "a failed study must not expose a stale progress winner"
+    );
+    assert_eq!(summaries[3]["bestScore"].as_f64(), Some(0.0));
+    assert_eq!(summaries[4]["bestScore"].as_f64(), Some(5.0));
+    assert!(serde_json::to_vec(&page).unwrap().len() < 10_000);
+    let (status, detail) = request(
+        &router,
+        "GET",
+        &format!("/v1/optimization-studies/{completed}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(detail["result"]["best"]["matrix"].is_array());
+    assert!(detail["events"].is_array());
+    assert!(serde_json::to_vec(&detail).unwrap().len() > 50_000);
+    for (query, total, offset, ids) in [
+        ("limit=2&offset=1", 5, 1, vec![drop, failed]),
+        (
+            "algorithmId=price_volume_spike&limit=2",
+            4,
+            0,
+            vec![active, failed],
+        ),
+        (
+            "algorithmId=price_volume_spike&limit=2&offset=2",
+            4,
+            2,
+            vec![cancelled, completed],
+        ),
+        (
+            "algorithmId=price_drop_volume_spike&limit=2",
+            1,
+            0,
+            vec![drop],
+        ),
+        (
+            "algorithmId=price_volume_spike&limit=2&offset=99",
+            4,
+            99,
+            vec![],
+        ),
+    ] {
+        let (status, page) = request(
+            &router,
+            "GET",
+            &format!("/v1/optimization-studies?{query}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["total"], total);
+        assert_eq!(page["offset"], offset);
+        assert_eq!(page["limit"], 2);
+        assert_eq!(
+            page["studies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+    for status in ["queued", "running", "cancel_requested"] {
+        sqlx::query("update optimization_studies set status=$2 where id=$1")
+            .bind(active)
+            .bind(status)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let page = db::list(&db.pool, Some(spike), 100, 0).await.unwrap();
+        assert_eq!(page.studies[0].id, active);
+        assert_eq!(page.studies[0].best_score, Some(0.75));
+    }
+    sqlx::query("update optimization_studies set progress=progress-'bestScore' where id=$1")
+        .bind(active)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let page = db::list(&db.pool, None, 100, 0).await.unwrap();
+    assert!(page.studies[0].best_score.is_none());
+    db.cleanup().await;
+}
+
+async fn adjacent_history_snapshot(pool: &PgPool) -> Value {
+    let mut snapshot = serde_json::Map::new();
+    for table in [
+        "settings",
+        "replay_batches",
+        "replay_runs",
+        "replay_quality_intervals",
+        "replay_cache",
+        "analytics_selection_cache",
+        "analytics_matrix_cache",
+        "analytics_trades_cache",
+        "live_setups",
+        "instrument_lists",
+    ] {
+        let rows: Value=sqlx::query_scalar(&format!("select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text),'[]'::jsonb) from {table} t")).fetch_one(pool).await.unwrap();
+        assert!(
+            !rows.as_array().unwrap().is_empty(),
+            "{table} must contain preserved sentinel data"
+        );
+        snapshot.insert(table.into(), rows);
+    }
+    Value::Object(snapshot)
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn history_delete_rejects_active_removes_terminal_and_preserves_adjacent_data() {
+    let db = TestDb::new().await;
+    sqlx::raw_sql("insert into settings (key,value) values ('history-sentinel','{\"keep\":true}');
+        insert into replay_batches (exchange_code,category,algorithm_id,algorithm_version,params,from_ts,to_ts,instrument_count) values ('bybit','linear','price_volume_spike','1.1.1','{}',to_timestamp(60),to_timestamp(120),1);
+        insert into replay_runs (batch_id,exchange_code,category,symbol,from_ts,to_ts,algorithm_id,algorithm_version,params,status,setups) select id,'bybit','linear','BTCUSDT',to_timestamp(60),to_timestamp(120),'price_volume_spike','1.1.1','{}','done','[]' from replay_batches;
+        insert into replay_quality_intervals (run_id,from_unix,to_unix,reason) select id,60,120,'missing' from replay_runs;
+        insert into replay_cache (cache_key,exchange_code,category,symbol,algorithm_id,algorithm_version,params,from_ts,to_ts,setups,warmup_minutes,processed_minutes) values ('sentinel','bybit','linear','BTCUSDT','price_volume_spike','1.1.1','{}',to_timestamp(60),to_timestamp(120),'[]',1,1);
+        insert into analytics_selection_cache (scope_key,maturity_tenths,month_key,algorithm_version,result_json) values ('sentinel',0,'all',1,'{}');
+        insert into analytics_matrix_cache (scope_key,direction,maturity_tenths,month_key,tp_pct,sl_pct,horizon_minutes,time_shift_minutes,price_change_ppm,algorithm_version,result_json) values ('sentinel','long',0,'all',4,4,60,0,0,1,'{}');
+        insert into analytics_trades_cache (scope_key,direction,maturity_tenths,exchange_code,category,symbol,close_time_unix,tp_pct,sl_pct,horizon_minutes,time_shift_minutes,price_change_ppm,algorithm_version,result_json) values ('sentinel','long',0,'bybit','linear','BTCUSDT',120,4,4,60,0,0,1,'{}');
+        insert into live_setups (exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price) values ('bybit','linear','BTCUSDT','price_volume_spike','1.1.1','{}',to_timestamp(60),to_timestamp(120),'100');
+        insert into instrument_lists (list_type,exchange_code,category,symbol) values ('live','bybit','linear','BTCUSDT');")
+        .execute(&db.pool).await.unwrap();
+    let before = adjacent_history_snapshot(&db.pool).await;
+    let auth = Arc::new(SessionAuth::new(&["test-key".into()]));
+    let token = match auth.post_session(Some("test-key"), setups_api::now_ms()) {
+        setups_api::auth::PostSessionResult::Issued { token, .. } => token,
+        _ => panic!("session"),
+    };
+    let router = optimization_router(Arc::new(OptimizationState {
+        pool: db.pool.clone(),
+        auth,
+        config: OptimizationConfig::default(),
+        notify: Arc::new(tokio::sync::Notify::new()),
+        available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    }));
+    let survivor =
+        insert_history_study(&db.pool, "price_volume_spike", "completed", Some(7.0), None).await;
+    let survivor_before = db::get(&db.pool, survivor).await.unwrap().unwrap();
+    for status in ["completed", "cancelled", "failed"] {
+        let id =
+            insert_history_study(&db.pool, "price_volume_spike", status, Some(1.0), None).await;
+        let path = format!("/v1/optimization-studies/{id}");
+        let (status, body) = request(&router, "DELETE", &path, Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"deleted":true,"id":id}));
+        assert!(db::get(&db.pool, id).await.unwrap().is_none());
+        assert_eq!(
+            request(&router, "DELETE", &path, Value::Null).await,
+            (StatusCode::NOT_FOUND, json!({"error":"not_found"}))
+        );
+        assert_eq!(
+            request(&router, "GET", &path, Value::Null).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let active =
+        insert_history_study(&db.pool, "price_volume_spike", "queued", None, Some(1.0)).await;
+    for status in ["queued", "running", "cancel_requested"] {
+        sqlx::query("update optimization_studies set status=$2 where id=$1")
+            .bind(active)
+            .bind(status)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let before = db::get(&db.pool, active).await.unwrap().unwrap();
+        assert_eq!(
+            request(
+                &router,
+                "DELETE",
+                &format!("/v1/optimization-studies/{active}"),
+                Value::Null
+            )
+            .await,
+            (StatusCode::CONFLICT, json!({"error":"study_active"}))
+        );
+        assert_eq!(
+            json!(db::get(&db.pool, active).await.unwrap().unwrap()),
+            json!(before)
+        );
+    }
+    assert_eq!(
+        request(
+            &router,
+            "DELETE",
+            "/v1/optimization-studies/9223372036854775807",
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        json!(db::get(&db.pool, survivor).await.unwrap().unwrap()),
+        json!(survivor_before)
+    );
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/optimization-studies/{survivor}"))
+                .header("cookie", format!("platform_session={token}"))
+                .header("x-platform-request", "1")
+                .header("origin", "http://localhost")
+                .header("host", "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let (_, page) = request(&router, "GET", "/v1/optimization-studies", Value::Null).await;
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["studies"][0]["id"], active);
+    assert_eq!(adjacent_history_snapshot(&db.pool).await, before);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn history_delete_checks_status_under_the_row_lock() {
+    let db = TestDb::new().await;
+    let id =
+        insert_history_study(&db.pool, "price_volume_spike", "completed", Some(1.0), None).await;
+    // Hold a concurrent status transition. DELETE must wait and inspect the
+    // committed status under its own lock, not act on a stale terminal read.
+    let mut transition = db.pool.begin().await.unwrap();
+    sqlx::query("update optimization_studies set status='running',result=null where id=$1")
+        .bind(id)
+        .execute(&mut *transition)
+        .await
+        .unwrap();
+    let pool = db.pool.clone();
+    let deletion = tokio::spawn(async move { db::delete(&pool, id).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!deletion.is_finished());
+    transition.commit().await.unwrap();
+    assert_eq!(
+        deletion.await.unwrap(),
+        Some(db::DeleteStudyOutcome::Active)
+    );
+    assert_eq!(
+        db::get(&db.pool, id).await.unwrap().unwrap().status,
+        "running"
+    );
+    let mut transition = db.pool.begin().await.unwrap();
+    sqlx::query("update optimization_studies set status='completed' where id=$1")
+        .bind(id)
+        .execute(&mut *transition)
+        .await
+        .unwrap();
+    let pool = db.pool.clone();
+    let deletion = tokio::spawn(async move { db::delete(&pool, id).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!deletion.is_finished());
+    transition.commit().await.unwrap();
+    assert_eq!(
+        deletion.await.unwrap(),
+        Some(db::DeleteStudyOutcome::Deleted)
+    );
+    assert_eq!(db::delete(&db.pool, id).await.unwrap(), None);
     db.cleanup().await;
 }
 
