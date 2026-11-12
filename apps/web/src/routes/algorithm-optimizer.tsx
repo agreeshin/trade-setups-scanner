@@ -135,13 +135,13 @@ function StudyDetail({ detail, algorithm, controller, onDelete, onNew }: {
 
 // A history selection has its own sibling dialog/state. It never follows "latest"
 // and closes/reopens the exact ID even when discovery finds a newer study.
-export function OptimizationStudyDialog({ id, algorithm, controller, open, onOpenChange, returnFocusId, onDelete }: {
+export function OptimizationStudyDialog({ id, algorithm, controller, open, onOpenChange, returnFocusId, fallbackFocusId = returnFocusId, onDelete }: {
   id: number | undefined; algorithm: Algorithm; controller: OptimizationController; open: boolean;
-  onOpenChange: (open: boolean) => void; returnFocusId: string; onDelete: (study: OptimizationStudyAction) => void;
+  onOpenChange: (open: boolean) => void; returnFocusId: string; fallbackFocusId?: string; onDelete: (study: OptimizationStudyAction) => void;
 }) {
   const detail = useOptimizationDetail(id, open, controller.revision);
   return <Dialog open={open} onOpenChange={onOpenChange}>
-    <DialogContent className="max-w-4xl" onCloseAutoFocus={(event) => { event.preventDefault(); (document.getElementById(`optimization-study-${id}`) ?? document.getElementById(returnFocusId))?.focus(); }}>
+    <DialogContent className="max-w-4xl" onCloseAutoFocus={(event) => { event.preventDefault(); (document.getElementById(returnFocusId) ?? document.getElementById(fallbackFocusId))?.focus(); }}>
       <DialogHeader><DialogTitle>Исследование #{id} · {algorithm.name}</DialogTitle><DialogDescription>Сохранённое исследование. Просмотр и закрытие окна не меняют серверную работу или настройки.</DialogDescription></DialogHeader>
       <div className="grid min-h-0 min-w-0 flex-1 gap-4 overflow-y-auto pr-1">
         {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
