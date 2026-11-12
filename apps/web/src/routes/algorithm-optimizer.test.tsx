@@ -4,8 +4,9 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { summarizeOptimizationStudy, type OptimizationSpec, type OptimizationStudy } from "../lib/optimization-api";
 import { formatUnix } from "../lib/datetime-format";
 import { AlgorithmsPage } from "./algorithms-page";
+import type { Algorithm } from "./platform-controls";
 
-const algorithm = {
+const algorithm: Algorithm = {
   id: "future_algorithm", name: "Новый алгоритм", version: "2.0", description: "Metadata driven", enabled: true,
   params: { futureThreshold: "2.5", futureWindow: 3 },
   fields: [
@@ -13,6 +14,26 @@ const algorithm = {
     { key: "futureWindow", label: "Новое окно", type: "integer", min: 1, max: 50, unit: "мин" },
   ],
 };
+const sharedParams = { windowMinutes: 5, volumeMultiplier: "3", baselineLongDays: 30, baselineShortDays: 7, cooldownMinutes: 5, maxGapPercent: "1", maxConsecutiveGapMinutes: 5, requiredRecentMinutes: 10 };
+const sharedFields: Algorithm["fields"] = [
+  { key: "windowMinutes", label: "Окно", type: "integer", min: 1, max: 10080, unit: "мин", optimization: { enabledByDefault: true, values: [3, 5] } },
+  { key: "volumeMultiplier", label: "Множитель объёма", type: "decimal", min: 0.1, max: 100, unit: "×", optimization: { enabledByDefault: true, values: ["2", "3"] } },
+  { key: "baselineLongDays", label: "Длинная база", type: "integer", min: 1, max: 365, unit: "дни" },
+  { key: "baselineShortDays", label: "Короткая база", type: "integer", min: 1, max: 365, unit: "дни" },
+  { key: "cooldownMinutes", label: "Отсечка повторов", type: "integer", min: 0, max: 10080, unit: "мин" },
+  { key: "maxGapPercent", label: "Допуск пропусков", type: "decimal", min: 0, max: 100, unit: "%" },
+  { key: "maxConsecutiveGapMinutes", label: "Пропусков подряд", type: "integer", min: 0, max: 10080, unit: "мин" },
+  { key: "requiredRecentMinutes", label: "Последних минут без пропусков", type: "integer", min: 0, max: 10080, unit: "мин" },
+];
+const metadataAlgorithms: Algorithm[] = [
+  { id: "price_volume_spike", name: "Рост цены и объёма", version: "1.1.1", description: "Рост", enabled: true,
+    params: { priceGrowthPct: "12", ...sharedParams }, fields: [{ key: "priceGrowthPct", label: "Рост цены", type: "decimal", min: 0, max: 100, unit: "%", optimization: { enabledByDefault: true, values: ["6", "12"] } }, ...sharedFields] },
+  { id: "price_drop_volume_spike", name: "Падение цены и всплеск оборота", version: "1.1.1", description: "Падение", enabled: true,
+    params: { priceDropPct: "12", ...sharedParams, metadataOnlyWindow: 7 }, fields: [...sharedFields].reverse().concat([
+      { key: "priceDropPct", label: "Падение цены", type: "decimal", min: 0, max: 100, unit: "%", optimization: { enabledByDefault: true, values: ["6", "12"] } },
+      { key: "metadataOnlyWindow", label: "Дополнительное окно", type: "integer", min: 5, max: 20, unit: "мин" },
+    ]) },
+];
 const instruments = [
   { id: 1, exchange: "bybit", category: "linear", symbol: "BTCUSDT", status: "Trading" },
   { id: 2, exchange: "bybit", category: "linear", symbol: "OLDUSDT", status: "Delisted" },
@@ -32,15 +53,17 @@ function record(status: OptimizationStudy["status"] = "running") {
 let studies: ReturnType<typeof record>[];
 let createStatus: number;
 let deleteStatus: number;
+let listedAlgorithms: Algorithm[];
 const requests: { path: string; method: string; body: unknown; signal?: AbortSignal | null }[] = [];
 beforeEach(() => {
   studies = []; createStatus = 202; deleteStatus = 200; requests.length = 0;
+  listedAlgorithms = [algorithm, { ...algorithm, id: "second_algorithm", name: "Второй алгоритм" }];
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : null;
     requests.push({ path, method, body, ...(init?.signal ? { signal: init.signal } : {}) });
     const json = (value: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(value), { status }));
-    if (path === "/v1/algorithms") return json({ algorithms: [algorithm, { ...algorithm, id: "second_algorithm", name: "Второй алгоритм" }] });
+    if (path === "/v1/algorithms") return json({ algorithms: listedAlgorithms });
     if (path === "/v1/instruments") return json({ instruments });
     if (path === "/v1/settings/ui") return json({ value: { replay: { symbols: "BTCUSDT\nOLDUSDT" } } });
     if (path === "/v1/optimization-studies" && method === "POST") {
@@ -121,6 +144,78 @@ it("builds unknown fields from metadata and submits the complete typed scope onl
     analyticsSearch: { clusterEnabled: [false, true], clusterGapMinutes: [240, 480], timeShiftMinutes: [0, 5], priceChangePct: [null, 0, 1] },
   });
   expect(requests.some((request) => request.method === "PUT")).toBe(false);
+});
+
+it.each([0, 1])("switches algorithm cards without stale metadata and submits only algorithm %s keys", async (targetIndex) => {
+  listedAlgorithms = metadataAlgorithms;
+  const target = metadataAlgorithms[targetIndex]!;
+  const other = metadataAlgorithms[1 - targetIndex]!;
+  const ownKey = targetIndex === 0 ? "priceGrowthPct" : "priceDropPct";
+  const otherKey = targetIndex === 0 ? "priceDropPct" : "priceGrowthPct";
+  const ownLabel = targetIndex === 0 ? "Рост цены" : "Падение цены";
+  const otherLabel = targetIndex === 0 ? "Падение цены" : "Рост цены";
+  render(<AlgorithmsPage />);
+  fireEvent.click(await screen.findByRole("button", { name: `Оптимизировать ${other.name}` }));
+  const previous = within(await screen.findByRole("dialog", { name: `Оптимизация · ${other.name}` }));
+  fireEvent.change(await previous.findByLabelText(`Baseline: ${otherLabel}`), { target: { value: "91" } });
+  await userEvent.click(previous.getByRole("button", { name: "Закрыть" }));
+  fireEvent.click(screen.getByRole("button", { name: `Оптимизировать ${target.name}` }));
+  const controls = within(await screen.findByRole("dialog", { name: `Оптимизация · ${target.name}` }));
+  expect(await controls.findByLabelText(`Baseline: ${ownLabel}`)).toHaveValue("12");
+  expect(controls.queryByLabelText(`Baseline: ${otherLabel}`)).not.toBeInTheDocument();
+  expect(controls.queryByLabelText(`Подбирать: ${otherLabel}`)).not.toBeInTheDocument();
+  expect(controls.getAllByLabelText(/^Baseline:/).slice(0, target.fields.length)).toEqual(target.fields.map((field) => controls.getByLabelText(`Baseline: ${field.label}`)));
+  for (const field of target.fields) {
+    expect(controls.getByLabelText(`Baseline: ${field.label}`)).toHaveValue(String(target.params[field.key]));
+    if (field.optimization?.enabledByDefault) expect(controls.getByLabelText(`Подбирать: ${field.label}`)).toBeChecked();
+    else expect(controls.getByLabelText(`Подбирать: ${field.label}`)).not.toBeChecked();
+  }
+  fireEvent.change(controls.getByLabelText(`Baseline: ${ownLabel}`), { target: { value: "13.25" } });
+  fireEvent.change(controls.getByLabelText(`Значения: ${ownLabel}`), { target: { value: "13.25, 20" } });
+  if (targetIndex === 1) {
+    fireEvent.change(controls.getByLabelText("Baseline: Дополнительное окно"), { target: { value: "9" } });
+    fireEvent.click(controls.getByLabelText("Подбирать: Дополнительное окно"));
+    fireEvent.change(controls.getByLabelText("Значения: Дополнительное окно"), { target: { value: "7, 9" } });
+  } else expect(controls.queryByLabelText("Baseline: Дополнительное окно")).not.toBeInTheDocument();
+  enterDates();
+  const start = controls.getByRole("button", { name: "Начать исследование" });
+  await waitFor(() => expect(start).toBeEnabled()); fireEvent.click(start);
+  await screen.findByText("Исследование #17");
+  const payload = requests.find((request) => request.path === "/v1/optimization-studies" && request.method === "POST")?.body as OptimizationSpec;
+  expect(payload.algorithmId).toBe(target.id);
+  expect(payload.algorithmVersion).toBe(target.version);
+  expect(payload.algorithmParams).toEqual({ ...target.params, [ownKey]: "13.25", ...(targetIndex === 1 ? { metadataOnlyWindow: 9 } : {}) });
+  expect(payload.algorithmSearch).toEqual({ windowMinutes: [3, 5], volumeMultiplier: ["2", "3"], [ownKey]: ["13.25", "20"], ...(targetIndex === 1 ? { metadataOnlyWindow: [7, 9] } : {}) });
+  expect(payload.algorithmParams).not.toHaveProperty(otherKey);
+  expect(payload.algorithmSearch).not.toHaveProperty(otherKey);
+  expect(requests.some((request) => request.method === "PUT")).toBe(false);
+});
+
+it("renders ungrouped metadata in normal settings and uses its saved values as the optimizer baseline", async () => {
+  render(<AlgorithmsPage />);
+  const heading = await screen.findByText("Новый алгоритм · 2.0");
+  const settings = within(heading.closest("form")!);
+  const threshold = settings.getByLabelText("Новый порог (%)");
+  const window = settings.getByLabelText("Новое окно (мин)");
+  expect(threshold).toHaveValue(2.5);
+  expect(window).toHaveAttribute("min", "1");
+  expect(window).toHaveAttribute("max", "50");
+  expect(window).toHaveAttribute("step", "1");
+  expect(within(settings.getByRole("group", { name: "Другие параметры" })).getByLabelText("Новое окно (мин)")).toBe(window);
+  fireEvent.change(threshold, { target: { value: "3.75" } });
+  fireEvent.change(window, { target: { value: "7" } });
+  fireEvent.click(settings.getByRole("button", { name: "Сохранить алгоритм" }));
+  await settings.findByText("Настройки алгоритма сохранены.");
+  expect(requests.find((request) => request.path === `/v1/algorithms/${algorithm.id}`)?.body).toEqual({ params: { futureThreshold: "3.75", futureWindow: 7 }, enabled: true });
+  const optimizer = within(await openOptimizer());
+  expect(await optimizer.findByLabelText("Baseline: Новый порог")).toHaveValue("3.75");
+  expect(optimizer.getByLabelText("Baseline: Новое окно")).toHaveValue("7");
+  expect(optimizer.getByLabelText("Подбирать: Новое окно")).not.toBeChecked();
+  enterDates();
+  const start = optimizer.getByRole("button", { name: "Начать исследование" });
+  await waitFor(() => expect(start).toBeEnabled()); fireEvent.click(start);
+  await screen.findByText("Исследование #17");
+  expect(requests.find((request) => request.path === "/v1/optimization-studies" && request.method === "POST")?.body).toMatchObject({ algorithmParams: { futureThreshold: "3.75", futureWindow: 7 }, algorithmSearch: { futureThreshold: ["1.5", "2.5", "4"] } });
 });
 
 it("restores the same server study after remount without starting or cancelling it", async () => {

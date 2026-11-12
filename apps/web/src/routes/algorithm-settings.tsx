@@ -29,6 +29,8 @@ function AlgorithmForm({ algorithm, optimization }: { algorithm: Algorithm; opti
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const ungrouped = algorithm.fields.filter((field) => !groups.some((group) => group.keys.includes(field.key)));
+  const fieldGroups = [...groups, ...(ungrouped.length ? [{ title: "Другие параметры", keys: ungrouped.map((field) => field.key) }] : [])];
   const requestDelete = (study: OptimizationStudyAction) => {
     optimization.clearError(); setDeleteTarget({ id: study.id, status: study.status });
   };
@@ -58,7 +60,7 @@ function AlgorithmForm({ algorithm, optimization }: { algorithm: Algorithm; opti
     <h3 className="text-lg font-semibold">{algorithm.name} · {algorithm.version}</h3>
     <p className="text-sm text-muted-foreground">{algorithm.description}</p>
     <label className="flex items-center gap-2 text-sm"><Checkbox checked={enabled} onCheckedChange={(checked) => { setEnabled(checked === true); setSaved(false); }} />Включён для live-сканирования</label>
-    {groups.map((group) => <fieldset key={group.title} className="grid gap-3 sm:grid-cols-2">
+    {fieldGroups.map((group) => <fieldset key={group.title} className="grid gap-3 sm:grid-cols-2">
       <legend className="mb-2 font-medium">{group.title}</legend>
       {algorithm.fields.filter((field) => group.keys.includes(field.key)).map((field) => <Field key={field.key} label={`${field.label} (${field.unit})`}>
         {(control) => <Input type="number" required min={field.min} max={field.max} step={field.type === "integer" ? "1" : "any"} value={params[field.key] ?? ""} onChange={(event) => { setParams({ ...params, [field.key]: event.target.value }); setSaved(false); }} {...control} />}
