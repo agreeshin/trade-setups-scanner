@@ -217,7 +217,11 @@ pub struct StudyOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct TrialSummary {
     pub score: Option<f64>,
+    /// Detector signals in the study interval, before analytics selection.
     pub setup_count: usize,
+    /// Since plan-a-3: after clustering/maturity, entry availability and the
+    /// candidate's price gate, independent of TP/SL/unclosed outcomes.
+    /// Persisted older summaries retain their original counts and meaning.
     pub selected_setup_count: usize,
     /// None only for legacy saved summaries which did not record frequency.
     #[serde(default)]

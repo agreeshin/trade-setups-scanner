@@ -361,6 +361,7 @@ fn accumulate_setup(
     data: &InstrumentInput,
     setup: &AnalyticsSetup,
     matrix: &mut [MatrixCell],
+    selected_count: &mut usize,
     control: &Control<'_>,
 ) -> bool {
     let Some(entry) = find_candle_by_open_time(
@@ -381,6 +382,10 @@ fn accumulate_setup(
             return true;
         }
     }
+    // The frequency population is the very same full-candidate population
+    // admitted to TP/SL evaluation. Missing/filtered entries cannot open a
+    // trade; every eligible entry counts regardless of its later outcome.
+    *selected_count += 1;
     let entry_time = entry.open_time_unix + 60;
     let end = entry_time + spec.horizon_minutes * 60;
     let tp_prices: Vec<f64> = spec
@@ -605,7 +610,6 @@ pub(crate) fn evaluate_group(
             else {
                 return Ok(interrupted());
             };
-            selected_counts[candidate_index] += indexes.len();
             for index in indexes {
                 if control.stopped()
                     || !accumulate_setup(
@@ -614,6 +618,7 @@ pub(crate) fn evaluate_group(
                         data,
                         &setups[index],
                         &mut matrices[candidate_index],
+                        &mut selected_counts[candidate_index],
                         control,
                     )
                 {
@@ -725,6 +730,7 @@ mod tests {
             candles,
         };
         let mut matrix = empty_matrix(&spec);
+        let mut selected_count = 0;
         let token = CancelToken::new();
         let passes = std::sync::atomic::AtomicUsize::new(0);
         let control = Control {
@@ -738,6 +744,7 @@ mod tests {
             &data,
             &setup,
             &mut matrix,
+            &mut selected_count,
             &control
         ));
         for cell in matrix {
@@ -756,6 +763,8 @@ mod tests {
                 LimitStatus::Sl
             } else if cell.no_data_count > 0 {
                 LimitStatus::NoData
+            } else if cell.price_change_filtered_count > 0 {
+                LimitStatus::PriceChangeFiltered
             } else {
                 LimitStatus::Unclosed
             };
@@ -765,7 +774,18 @@ mod tests {
                 cell.tp_pct, cell.sl_pct
             );
             assert_eq!(
-                cell.tp_count + cell.sl_count + cell.no_data_count + cell.unclosed_count,
+                selected_count,
+                usize::from(matches!(
+                    observed,
+                    LimitStatus::Tp | LimitStatus::Sl | LimitStatus::Unclosed
+                ))
+            );
+            assert_eq!(
+                cell.tp_count
+                    + cell.sl_count
+                    + cell.no_data_count
+                    + cell.price_change_filtered_count
+                    + cell.unclosed_count,
                 1
             );
         }
@@ -887,12 +907,14 @@ mod tests {
             deadline: Instant::now() + std::time::Duration::from_secs(30),
             detector_passes: &passes,
         };
+        let mut selected_count = 0;
         assert!(!accumulate_setup(
             &spec,
             &AnalyticsParams::default(),
             &data,
             &setup,
             &mut empty_matrix(&spec),
+            &mut selected_count,
             &control
         ));
     }

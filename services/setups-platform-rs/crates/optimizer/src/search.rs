@@ -728,7 +728,7 @@ pub fn run_study(
                 spec.min_setups_per_day.to_string()
             };
         best.conclusions.insert(1, format!(
-            "Отобрано {} сетапов за {:.6} суток: {:.6} сетапов/сутки; порог {}, требуется не менее {} сетапов.",
+            "Допущено после фильтров {} сетапов за {:.6} суток: {:.6} сетапов/сутки; порог {}, требуется не менее {} сетапов.",
             best.support.selected_setup_count, (spec.to_unix - spec.from_unix) as f64 / 86400.0,
             best.support.avg_setups_per_day.expect("new completed summary has frequency"), threshold,
             best.support.required_setup_count.expect("a qualified winner has a representable required count")

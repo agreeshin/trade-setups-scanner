@@ -240,7 +240,7 @@ fn frequency_uses_exact_signal_range_including_fractional_days_and_reports_requi
 }
 
 #[test]
-fn frequency_counts_clustering_selection_before_price_gate_and_no_data_outcomes() {
+fn frequency_counts_clustering_selection_and_excludes_filtered_or_missing_entries() {
     let (mut spec, data) = six_setups_over_ten_days();
     spec.min_setups_per_day = 0.2;
     spec.analytics_params.cluster_enabled = true;
@@ -278,8 +278,9 @@ fn frequency_counts_clustering_selection_before_price_gate_and_no_data_outcomes(
         )
         .unwrap()
         .unwrap();
-        assert_eq!(evaluated.summary.selected_setup_count, 6);
-        assert_eq!(evaluated.summary.avg_setups_per_day, Some(0.6));
+        assert_eq!(evaluated.summary.setup_count, 6);
+        assert_eq!(evaluated.summary.selected_setup_count, 0);
+        assert_eq!(evaluated.summary.avg_setups_per_day, Some(0.0));
         assert_eq!(evaluated.summary.required_setup_count, Some(6));
         assert_eq!(
             evaluated.matrix[0].price_change_filtered_count + evaluated.matrix[0].no_data_count,
@@ -287,9 +288,118 @@ fn frequency_counts_clustering_selection_before_price_gate_and_no_data_outcomes(
         );
         assert_eq!(
             evaluated.summary.score, None,
-            "per-cell support still required after frequency passes"
+            "neither missing entries nor rejected price changes can open a trade"
         );
     }
+}
+
+#[test]
+fn frequency_uses_full_candidate_price_eligibility_not_shared_detector_count() {
+    let (mut spec, mut data) = six_setups_over_ten_days();
+    spec.min_setups_per_day = 0.6;
+    spec.analytics_params.time_shift_minutes = 1;
+    // Only two shifted entries satisfy the LONG 1% price-decrease gate.
+    // Keep detector candles and analytics candles from the same frozen input.
+    for index in [1440, 1445] {
+        let instrument = &mut data.instruments[0];
+        let close = instrument.candles[index].close * 0.98;
+        instrument.detector_bars[index].close = close.to_string();
+        instrument.candles[index].open = close;
+        instrument.candles[index].close = close;
+        instrument.candles[index].low = close;
+        instrument.candles[index].high = close * 1.25;
+    }
+    let mut filtered = candidate(&spec);
+    filtered.analytics.price_change_pct = Some(1.0);
+    let evaluate = |spec: &StudyRequest, candidate: &StudyCandidate| {
+        evaluate_candidate(
+            spec,
+            &data,
+            candidate,
+            &StudyLimits::default(),
+            &CancelToken::new(),
+        )
+        .unwrap()
+        .unwrap()
+    };
+    let disabled = evaluate(&spec, &candidate(&spec));
+    assert_eq!(disabled.summary.setup_count, 6);
+    assert_eq!(disabled.summary.selected_setup_count, 6);
+    assert_eq!(disabled.summary.avg_setups_per_day, Some(0.6));
+    assert_eq!(disabled.summary.score, Some(20.0));
+    let rejected = evaluate(&spec, &filtered);
+    assert_eq!(rejected.summary.setup_count, 6);
+    assert_eq!(rejected.matrix[0].price_change_filtered_count, 4);
+    assert_eq!(rejected.matrix[0].closed_count, 2);
+    assert_eq!(rejected.matrix[0].risk_expectancy, Some(20.0));
+    assert_eq!(
+        rejected.summary.score, None,
+        "high R cannot bypass eligibility frequency"
+    );
+    assert_eq!(rejected.summary.selected_setup_count, 2);
+    assert_eq!(rejected.summary.avg_setups_per_day, Some(0.2));
+    assert_eq!(rejected.summary.required_setup_count, Some(6));
+
+    // Joint search must keep counts separate even when detector output is reused.
+    spec.analytics_params = filtered.analytics.clone();
+    spec.analytics_search
+        .insert("priceChangePct".into(), vec![Value::Null]);
+    let outcome = run_study(
+        &spec,
+        &data,
+        &StudyLimits::default(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(outcome.baseline.unwrap(), rejected.summary);
+    assert_eq!(outcome.progress.evaluated_candidates, 2);
+    assert_eq!(outcome.progress.scorable_candidates, 1);
+    let best = outcome.best.unwrap();
+    assert_eq!(best.analytics.price_change_pct, None);
+    assert_eq!(best.support, disabled.summary);
+    assert_eq!(best.provenance.optimizer_version, "plan-a-3");
+
+    spec.min_setups_per_day = 0.0;
+    let admitted = evaluate(&spec, &filtered);
+    assert_eq!(admitted.summary.selected_setup_count, 2);
+    assert_eq!(admitted.summary.avg_setups_per_day, Some(0.2));
+    assert_eq!(admitted.summary.required_setup_count, Some(0));
+    assert_eq!(admitted.summary.score, Some(20.0));
+    assert_eq!(
+        admitted.matrix, rejected.matrix,
+        "frequency must not change matrix scoring"
+    );
+    spec.min_closed_per_cell = 3;
+    assert_eq!(evaluate(&spec, &filtered).summary.score, None);
+}
+
+#[test]
+fn frequency_includes_opened_but_unclosed_trades_independently_of_tp_sl_cells() {
+    let (mut spec, data) = six_setups_over_ten_days();
+    spec.min_setups_per_day = 0.6;
+    spec.tp_levels = vec![20.0, 100.0];
+    let evaluated = evaluate_candidate(
+        &spec,
+        &data,
+        &candidate(&spec),
+        &StudyLimits::default(),
+        &CancelToken::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(evaluated.summary.selected_setup_count, 6);
+    assert_eq!(evaluated.summary.avg_setups_per_day, Some(0.6));
+    assert_eq!(evaluated.summary.required_setup_count, Some(6));
+    assert_eq!(evaluated.matrix[0].closed_count, 6);
+    let long_target = &evaluated.matrix[1];
+    assert!(long_target.closed_count > 0 && long_target.closed_count < 6);
+    assert!(long_target.unclosed_count > 0);
+    for cell in &evaluated.matrix {
+        assert_eq!(cell.closed_count + cell.unclosed_count, 6);
+        assert_eq!(cell.no_data_count + cell.price_change_filtered_count, 0);
+    }
+    assert_eq!(evaluated.summary.score, Some(60.0));
 }
 
 #[test]
@@ -370,7 +480,10 @@ fn scalar_oracle(
         selected.extend(setups);
     }
     let matrix = scalar_matrix_from_setups(spec, input, candidate, &selected);
-    (matrix, setup_count, selected.len())
+    // Scalar outcomes independently partition the selected rows: an existing,
+    // eligible entry opens a trade whether it subsequently closes or not.
+    let eligible = matrix[0].closed_count + matrix[0].unclosed_count;
+    (matrix, setup_count, eligible)
 }
 
 fn scalar_matrix_from_setups(
