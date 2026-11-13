@@ -129,3 +129,16 @@ export const cancelOptimizationStudy = (id: number, signal: AbortSignal): Promis
   request(`/v1/optimization-studies/${id}/cancel`, { method: "POST", signal });
 export const deleteOptimizationStudy = (id: number, signal: AbortSignal): Promise<{ deleted: true; id: number }> =>
   request(`/v1/optimization-studies/${id}`, { method: "DELETE", signal });
+
+export async function getOptimizationDraft(algorithmId: string, signal: AbortSignal): Promise<unknown> {
+  const result = await request<{ algorithmId: string; value?: unknown }>(`/v1/optimization-drafts/${encodeURIComponent(algorithmId)}`, { signal });
+  return result.value ?? null;
+}
+
+export async function putOptimizationDraft(algorithmId: string, value: object): Promise<void> {
+  await request(`/v1/optimization-drafts/${encodeURIComponent(algorithmId)}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ value }),
+  });
+}

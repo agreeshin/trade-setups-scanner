@@ -1,5 +1,17 @@
 # План разработки продукта
 
+## Общий черновик оптимизации и continuous budget (2026-11-13)
+
+Цель: сохранять один per-algorithm черновик ручной/непрерывной оптимизации в БД платформы с autosave по blur, поднять отдельный continuous snapshot budget на TV до 8 GiB и повторно развернуть backend+web.
+
+- completed: Предыдущая continuous/adaptive реализация зафиксирована коммитом `6d5828b` и отправлена в `origin/main` до начала нового изменения.
+- completed: PRD-first контракт добавлен в `PRD.md`, `ux.md`, `capacity.md`, `decisions.md`: общие и режимные поля, platform DB, blur autosave без запуска работы, отдельный continuous budget 8 GiB.
+- completed: Frontend реализует общий per-algorithm draft через отдельный `/v1/optimization-drafts/{algorithm}`, загрузку при открытии обеих форм и последовательный blur autosave. Общие поля проходят manual → continuous → manual; даты/частотные режимные поля не смешиваются; алгоритмы изолированы; ошибка autosave видна без закрытия формы.
+- completed: Backend исправляет отдельную env/Compose-квоту continuous snapshot, верхнюю границу 8 GiB и корректное имя лимита в ошибках; draft API использует существующую platform `settings`, отдельную атомарную запись на алгоритм и 256 KiB body cap без миграции.
+- completed: Полная интеграционная регрессия: web 308/308, typecheck/lint/styles/build; Rust API lib 41 passed, обычные optimization 5 и continuous 2, `cargo check`, strict Clippy и `git diff --check`. PostgreSQL round-trip draft API с 822 инструментами отдельно прошёл у backend-специалиста.
+- in_progress: Зафиксировать и отправить отдельный feature commit.
+- pending: Безопасный последовательный deployment signals-rust и web на TV с backup, пустыми ручными очередями, миграционной/HTTP/UI проверкой и обновлением локальной инвентаризации.
+
 ## Непрерывные исследования и адаптивные сетапы (2026-11-12)
 
 Цель: реализовать согласованный PRD 0.9 после документационного этапа. Владелец разрешил commit PRD и начало реализации 12 ноября; PRD закоммичен как `008c0a7`. Развёртывание на TV отдельно разрешено и выполнено 13 ноября; push не поручен.
@@ -10,7 +22,7 @@
 - completed: Реализованы персистентная очередь/API, frozen-расчёты, реальный service replay/set с независимой повторной аналитикой, адаптивный live, формы/история/превью и независимое внешнее имя алгоритма. Ручная вычислительная ёмкость и fixed live сохранены отдельно.
 - completed: Compute-ядро и компактный bootstrap: 50 целевых тестов; web: полный итоговый прогон 305 тестов, typecheck/lint/styles/build; worker: 13 unit + 2 PostgreSQL/HTTP integration и strict Clippy. Leading-gap восстановление и 120-символьные Unicode-имена исправлены с red/green проверками. Внешнее имя: 8 unit и PostgreSQL/API тест независимого сохранения имени и параметров.
 - completed: Сквозной controller: 11 PostgreSQL/HTTP integration-тестов; ручной оптимизатор: 20 integration-тестов; DB-контракт: 6 integration-тестов, включая red/green heartbeat при задержанной materialization и запрет удаления новых Stop-targets устаревшим владельцем. Проверены остановка idle B при работающем A, сохранность завершённой истории, независимый ручной admission и остановка по ресурсу до acquisition. Continuous использует не более 95% настроенного replay DB budget с учётом резервов; история автоматически не удаляется.
-- completed: Общие Rust unit-тесты, workspace/all-targets check, строгий API/DB Clippy и итоговый git diff --check пройдены. Временная PostgreSQL остановлена после завершения проверок. Реализация остаётся незакоммиченной; push не выполнялся.
+- completed: Общие Rust unit-тесты, workspace/all-targets check, строгий API/DB Clippy и итоговый git diff --check пройдены. Временная PostgreSQL остановлена после завершения проверок. Реализация зафиксирована коммитом `6d5828b` и отправлена в `origin/main` 13 ноября.
 - completed: Полный текущий рабочий набор развёрнут на TV: обновлены только `signals-rust` и web, применена additive-миграция `0013_continuous_studies.sql`; PostgreSQL и market-data не перезапускались. Pre-deploy dump проверен, rollback-теги сохранены. Authenticated API, continuous endpoints, live runtime, UI routes/assets, миграция и сохранность истории проверены; активных задач после smoke нет. Детали и ограничение backend rollback после замены unique constraint на partial index записаны в ignored `docs/invent/tv.md`.
 - pending: Вне текущей приёмки: реальная доставка Web Push, отдельный визуальный/browser roundtrip новой формы, длительная production-нагрузка и запуск тяжёлого continuous-исследования на реальных данных. Автоисполнение ордеров и развёртывание многопользовательских кластеров не входят в этот этап.
 - completed: Инкрементальное обслуживание codegraph завершено: 254 файла, 6691 узел, 3332/3332 embeddings; остаточный drift 1 файл. Обвязка build вернула `Missing field uses`, embed сообщил timeout, хотя последующий status подтвердил завершение embeddings. Timestamp успешного build не обновился, lookup по имени репозитория даёт `CONFIG_INVALID`; это ограничение инструмента, не провал функциональных тестов.

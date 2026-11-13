@@ -1,10 +1,10 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Spinner } from "../components/ui/spinner";
 import { fetchPlatform } from "../lib/platform-api";
-import { isActiveStudy, type OptimizationStudyAction } from "../lib/optimization-api";
+import { getOptimizationDraft, isActiveStudy, type OptimizationStudyAction } from "../lib/optimization-api";
 import type { CatalogInstrument } from "./instrument-picker";
 import { algorithmDisplayName, errorText, localDateInput, type Algorithm } from "./platform-controls";
 import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildOptimizationSpec, initialDomains, initialScope, type ScopeDraft } from "./optimization-form";
@@ -13,6 +13,7 @@ import { OptimizationResults } from "./optimization-results";
 import { OptimizationTrashIcon } from "./optimization-history";
 import { useOptimizationDetail } from "./use-optimization-detail";
 import type { OptimizationController } from "./use-optimization-studies";
+import { applyOptimizationDraftScope, createOptimizationDraft, restoreOptimizationDraft, useOptimizationDraftSave, type OptimizationFormDraft } from "./optimization-draft";
 
 function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algorithm; controller: OptimizationController; onStarted: () => void }) {
   const [algorithmDomains, setAlgorithmDomains] = useState(() => initialDomains(algorithm.fields, algorithm.params));
@@ -23,12 +24,15 @@ function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algori
   const [loadError, setLoadError] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const storedDraft = useRef<OptimizationFormDraft | null>(null);
+  const draftSave = useOptimizationDraftSave(algorithm.id);
   useEffect(() => {
     const controller = new AbortController();
     void Promise.all([
       fetchPlatform<{ instruments: CatalogInstrument[] }>("/v1/instruments", controller.signal),
       fetchPlatform<{ value: { replay?: { symbols?: string; instruments?: { symbol: string; exchange: string; category: string }[]; fromUnix?: number; toUnix?: number; from?: string; to?: string } } }>("/v1/settings/ui", controller.signal),
-    ]).then(([instruments, preferences]) => {
+      getOptimizationDraft(algorithm.id, controller.signal),
+    ]).then(([instruments, preferences, rawDraft]) => {
       if (controller.signal.aborted) return;
       if (instruments.kind !== "ready" || preferences.kind !== "ready") {
         setLoadError("Не удалось загрузить historical-каталог или сохранённый выбор. Запуск заблокирован; повторите загрузку.");
@@ -36,16 +40,25 @@ function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algori
       }
       const items = instruments.data.instruments.filter((item) => item.exchange === "bybit" && item.category === "linear");
       const saved = preferences.data.value.replay;
-      setCatalog(items);
-      setScope((previous) => ({ ...previous,
+      const fallbackScope = { ...initialScope(),
         symbols: typeof saved?.symbols === "string" ? saved.symbols : (saved?.instruments ?? items).filter((item) => item.exchange === "bybit" && item.category === "linear").map((item) => item.symbol).join("\n"),
         from: typeof saved?.fromUnix === "number" ? localDateInput(saved.fromUnix) : saved?.from ?? "",
         to: typeof saved?.toUnix === "number" ? localDateInput(saved.toUnix) : saved?.to ?? "",
-      }));
+      };
+      const fallbackAlgorithmDomains = initialDomains(algorithm.fields, algorithm.params);
+      const fallbackAnalyticsDomains = initialDomains(ANALYTICS_SEARCH_FIELDS, { ...ANALYTICS_BASELINE });
+      const restored = restoreOptimizationDraft(rawDraft, algorithm.fields, ANALYTICS_SEARCH_FIELDS, fallbackScope, fallbackAlgorithmDomains, fallbackAnalyticsDomains);
+      storedDraft.current = restored;
+      setCatalog(items);
+      setScope(restored ? applyOptimizationDraftScope(fallbackScope, restored, "manual") : fallbackScope);
+      setAlgorithmDomains(restored?.shared.algorithmDomains ?? fallbackAlgorithmDomains);
+      setAnalyticsDomains(restored?.shared.analyticsDomains ?? fallbackAnalyticsDomains);
       setLoadError(null); setReady(true);
+    }).catch(() => {
+      if (!controller.signal.aborted) setLoadError("Не удалось загрузить сохранённые настройки оптимизации. Запуск заблокирован; повторите загрузку.");
     });
     return () => controller.abort();
-  }, [revision]);
+  }, [algorithm, revision]);
   const change = (patch: Partial<ScopeDraft>) => { setScope({ ...scope, ...patch }); setError(null); };
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -56,12 +69,20 @@ function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algori
       if (await controller.start(spec)) onStarted();
     } catch (cause) { setError(errorText(cause)); }
   }
-  return <form noValidate onSubmit={(event) => { void submit(event); }} className="grid min-w-0 gap-5">
+  function saveDraft(): void {
+    if (!ready || controller.creating) return;
+    const next = createOptimizationDraft(scope, algorithmDomains, analyticsDomains, storedDraft.current, {
+      manual: { from: scope.from, to: scope.to, setupMaturity: scope.setupMaturity, minSetupsPerDay: scope.minSetupsPerDay },
+    });
+    storedDraft.current = next;
+    draftSave.save(next);
+  }
+  return <form noValidate onSubmit={(event) => { void submit(event); }} onBlur={saveDraft} className="grid min-w-0 gap-5">
     <Alert>Исследование изолировано от live, обычных прогонов и кешей. Все выбранные TP×SL-ячейки имеют равный вес; baseline оценивается как trial 0 и входит в бюджет. Открытие и изменение формы ничего не запускают.</Alert>
     {!ready && !loadError && <Spinner label="Загрузка historical-списка" />}
     {loadError && <Alert variant="destructive" role="alert">{loadError}<Button type="button" variant="outline" onClick={() => setRevision((value) => value + 1)}>Повторить загрузку</Button></Alert>}
     <OptimizationFields algorithm={algorithm} scope={scope} onScopeChange={change} catalog={catalog} ready={ready} disabled={controller.creating} algorithmDomains={algorithmDomains} onAlgorithmDomainsChange={setAlgorithmDomains} analyticsDomains={analyticsDomains} onAnalyticsDomainsChange={setAnalyticsDomains} />
-    {error && <Alert variant="destructive" role="alert">{error}</Alert>}
+    {(error ?? draftSave.saveError) && <Alert variant="destructive" role="alert">{error ?? draftSave.saveError}</Alert>}
     <div><Button type="submit" disabled={!ready || !controller.ready || controller.creating || controller.active !== null}>{controller.creating ? "Создание исследования…" : "Начать исследование"}</Button></div>
   </form>;
 }

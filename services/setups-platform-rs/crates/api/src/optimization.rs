@@ -7,7 +7,10 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State, rejection::QueryRejection},
+    extract::{
+        DefaultBodyLimit, Path, Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -37,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 const POLL: Duration = Duration::from_millis(100);
 const MAX_EVENTS: usize = 64;
+const MAX_DRAFT_BODY_BYTES: usize = 262_144;
 
 pub struct OptimizationState {
     pub pool: PgPool,
@@ -75,6 +79,12 @@ pub fn optimization_router(state: Arc<OptimizationState>) -> Router {
             get(get_study).delete(delete_study),
         )
         .route("/v1/optimization-studies/{id}/cancel", post(cancel_study))
+        .route(
+            "/v1/optimization-drafts/{algorithm}",
+            get(get_draft)
+                .put(put_draft)
+                .layer(DefaultBodyLimit::max(MAX_DRAFT_BODY_BYTES)),
+        )
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
@@ -100,6 +110,72 @@ fn version(id: &str) -> Option<&'static str> {
         SPIKE_ALGORITHM_ID => Some(SPIKE_ALGORITHM_VERSION),
         SPIKE_DROP_ALGORITHM_ID => Some(SPIKE_DROP_ALGORITHM_VERSION),
         _ => None,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftBody {
+    value: serde_json::Map<String, Value>,
+}
+
+async fn get_draft(
+    State(state): State<Arc<OptimizationState>>,
+    headers: HeaderMap,
+    Path(algorithm): Path<String>,
+) -> Response {
+    if let Err(error) = guard_auth(&state.auth, &headers, false) {
+        return error;
+    }
+    if version(&algorithm).is_none() {
+        return response(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"unknown_algorithm"}),
+        );
+    }
+    let key = format!("optimization-draft:{algorithm}");
+    match setups_db::settings_get(&state.pool, &key).await {
+        Ok(value) => response(
+            StatusCode::OK,
+            json!({"algorithmId":algorithm,"value":value}),
+        ),
+        Err(error) => internal_error("get_draft", error),
+    }
+}
+
+async fn put_draft(
+    State(state): State<Arc<OptimizationState>>,
+    headers: HeaderMap,
+    Path(algorithm): Path<String>,
+    body: Result<Json<DraftBody>, JsonRejection>,
+) -> Response {
+    if let Err(error) = guard_auth(&state.auth, &headers, true) {
+        return error;
+    }
+    if version(&algorithm).is_none() {
+        return response(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"unknown_algorithm"}),
+        );
+    }
+    let value = match body {
+        Ok(Json(body)) => Value::Object(body.value),
+        Err(error) if error.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error":"body_too_large"}),
+            );
+        }
+        Err(_) => return response(StatusCode::BAD_REQUEST, json!({"error":"invalid_body"})),
+    };
+    // Replace only this algorithm's draft atomically; never merge the shared UI settings.
+    let key = format!("optimization-draft:{algorithm}");
+    match setups_db::settings_set(&state.pool, &key, &value).await {
+        Ok(()) => response(
+            StatusCode::OK,
+            json!({"algorithmId":algorithm,"value":value}),
+        ),
+        Err(error) => internal_error("put_draft", error),
     }
 }
 
@@ -293,7 +369,10 @@ async fn delete_study(
         Ok(Some(db::DeleteStudyOutcome::Active)) => {
             response(StatusCode::CONFLICT, json!({"error":"study_active"}))
         }
-        Ok(Some(db::DeleteStudyOutcome::Referenced)) => response(StatusCode::CONFLICT,json!({"error":"continuous_history_referenced"})),
+        Ok(Some(db::DeleteStudyOutcome::Referenced)) => response(
+            StatusCode::CONFLICT,
+            json!({"error":"continuous_history_referenced"}),
+        ),
         Ok(None) => response(StatusCode::NOT_FOUND, json!({"error":"not_found"})),
         Err(error) => internal_error("delete", error),
     }
@@ -312,7 +391,12 @@ async fn cancel_study(
     }
     match db::cancel(&state.pool, id).await {
         Ok(Some((record, accepted))) => {
-            if record.origin=="continuous" { return response(StatusCode::CONFLICT,json!({"error":"continuous_owner_stop_required"})); }
+            if record.origin == "continuous" {
+                return response(
+                    StatusCode::CONFLICT,
+                    json!({"error":"continuous_owner_stop_required"}),
+                );
+            }
             state.notify.notify_one();
             record_response(
                 if accepted {

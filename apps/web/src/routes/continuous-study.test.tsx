@@ -15,9 +15,11 @@ function study(id: number, origin: "manual" | "continuous", status: Optimization
 let process: ContinuousProcess | null;
 let studies: OptimizationStudy[];
 let unavailable: boolean;
+let draftStatus: number;
+let drafts: Record<string, unknown>;
 const requests: { path: string; method: string; body: unknown }[] = [];
 beforeEach(() => {
-  process = null; studies = []; unavailable = false; requests.length = 0;
+  process = null; studies = []; unavailable = false; draftStatus = 200; drafts = {}; requests.length = 0;
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : null;
@@ -26,6 +28,15 @@ beforeEach(() => {
     if (path === "/v1/algorithms") return json({ algorithms: [algorithm] });
     if (path === "/v1/instruments") return json({ instruments: [{ id: 1, exchange: "bybit", category: "linear", symbol: "OLDUSDT", status: "Delisted" }] });
     if (path === "/v1/settings/ui") return json({ value: { replay: { symbols: "OLDUSDT" } } });
+    const draft = /^\/v1\/optimization-drafts\/(.+)$/.exec(path);
+    if (draft) {
+      const id = decodeURIComponent(draft[1]!);
+      if (method === "PUT") {
+        if (draftStatus !== 200) return json({ error: "draft_failed" }, draftStatus);
+        drafts[id] = (body as { value: unknown }).value;
+      }
+      return json({ algorithmId: id, value: drafts[id] ?? null });
+    }
     if (path.startsWith("/v1/continuous-studies?")) return unavailable ? json({}, 404) : json({ processes: process ? [process] : [] });
     if (path === "/v1/continuous-studies/future" && method === "PUT") {
       const config = body as ContinuousConfig;
@@ -81,9 +92,46 @@ it("saves actual metadata controls, date-free list/gate config and locked maturi
   expect(config).toMatchObject({ lookbackDays: 10, minSetupsPerDay: [0, 0.6, 4], minMeanExpectancy: 0.15, adaptiveEnabled: false,
     study: { algorithmParams: { futureThreshold: "3.75", opaqueFixed: "kept" }, algorithmSearch: { futureThreshold: ["1.5", "2.5"] }, instruments: [{ symbol: "OLDUSDT" }] } });
   for (const key of ["fromUnix", "toUnix", "minSetupsPerDay", "setupMaturity"]) expect(config.study).not.toHaveProperty(key);
-  expect(requests.filter((request) => request.method !== "GET")).toHaveLength(1);
+  expect(requests.filter((request) => request.method !== "GET" && !request.path.startsWith("/v1/optimization-drafts/"))).toHaveLength(1);
   expect(screen.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" })).not.toBeChecked();
   expect(screen.getByRole("checkbox", { name: "Включён для live-сканирования" })).not.toBeChecked();
+});
+
+it("shares common draft fields in both directions while preserving mode-specific values", async () => {
+  render(<AlgorithmsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Оптимизировать Мой алгоритм" }));
+  let manual = within(await screen.findByRole("dialog", { name: "Оптимизация · Мой алгоритм" }));
+  const manualBaseline = await manual.findByLabelText("Baseline: Новый порог");
+  fireEvent.change(manual.getByLabelText("Начало периода сигналов"), { target: { value: "2026-10-05T01:02" } });
+  fireEvent.change(manual.getByLabelText("Направление сделки"), { target: { value: "long" } });
+  fireEvent.change(manual.getByLabelText("Горизонт сделки, мин (фиксирован)"), { target: { value: "600" } });
+  fireEvent.change(manualBaseline, { target: { value: "7.5" } });
+  fireEvent.blur(manualBaseline);
+  await waitFor(() => expect(requests.filter((request) => request.path === "/v1/optimization-drafts/future" && request.method === "PUT")).toHaveLength(1));
+  await userEvent.click(manual.getByRole("button", { name: "Закрыть" }));
+
+  const continuous = await configure();
+  expect(continuous.getByLabelText("Направление сделки")).toHaveValue("long");
+  expect(continuous.getByLabelText("Горизонт сделки, мин (фиксирован)")).toHaveValue(600);
+  expect(continuous.getByLabelText("Baseline: Новый порог")).toHaveValue("7.5");
+  fireEvent.change(continuous.getByLabelText("Последние N дней"), { target: { value: "17" } });
+  const tp = continuous.getByLabelText("Уровни TP, %");
+  fireEvent.change(tp, { target: { value: "5, 9" } });
+  fireEvent.blur(tp);
+  await waitFor(() => expect(requests.filter((request) => request.path === "/v1/optimization-drafts/future" && request.method === "PUT")).toHaveLength(2));
+  expect(drafts.future).toMatchObject({
+    shared: { scope: { direction: "long", horizonMinutes: "600", tpLevels: "5, 9" } },
+    manual: { from: "2026-10-05T01:02" },
+    continuous: { lookbackDays: "17" },
+  });
+  await userEvent.click(continuous.getByRole("button", { name: "Закрыть" }));
+
+  await userEvent.click(screen.getByRole("button", { name: "Оптимизировать Мой алгоритм" }));
+  manual = within(await screen.findByRole("dialog", { name: "Оптимизация · Мой алгоритм" }));
+  expect(await manual.findByLabelText("Начало периода сигналов")).toHaveValue("2026-10-05T01:02");
+  expect(manual.getByLabelText("Направление сделки")).toHaveValue("long");
+  expect(manual.getByLabelText("Уровни TP, %")).toHaveValue("5, 9");
+  expect(manual.queryByLabelText("Последние N дней")).not.toBeInTheDocument();
 });
 
 it("keeps adaptive permission independent and drains only through the common algorithm stop", async () => {

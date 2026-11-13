@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Alert } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -11,11 +11,13 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from ".
 import { formatIsoDateTime } from "../lib/datetime-format";
 import { fetchPlatform } from "../lib/platform-api";
 import { MAX_CONTINUOUS_LOOKBACK_DAYS, MIN_CONTINUOUS_LOOKBACK_DAYS } from "../lib/continuous-api";
+import { getOptimizationDraft } from "../lib/optimization-api";
 import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildContinuousConfig, initialDomains, initialScope, restoreDomains, type ContinuousDraft, type ScopeDraft } from "./optimization-form";
 import { OptimizationFields } from "./optimization-fields";
 import type { CatalogInstrument } from "./instrument-picker";
 import { algorithmDisplayName, errorText, type Algorithm } from "./platform-controls";
 import type { ContinuousController } from "./use-continuous-study";
+import { applyOptimizationDraftScope, createOptimizationDraft, restoreOptimizationDraft, useOptimizationDraftSave, type OptimizationFormDraft } from "./optimization-draft";
 
 const statuses = { stopped: "Остановлено", running: "Непрерывное исследование включено", stopping: "Останавливается", error: "Ошибка непрерывного исследования" };
 const phases: Record<string, string> = { queued: "Ожидание очереди", idle: "Ожидание следующего исследования", research: "Исследование", acquiring: "Подготовка снимка", replay: "Служебный replay", analytics: "Аналитика сохранённого набора", cleanup: "Очистка незавершённых данных" };
@@ -53,17 +55,32 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
   const locked = controller.process !== null && controller.process.status !== "stopped";
+  const storedDraft = useRef<OptimizationFormDraft | null>(null);
+  const initialValues = useRef({ scope, algorithmDomains, analyticsDomains });
+  const draftSave = useOptimizationDraftSave(algorithm.id);
   useEffect(() => {
     const request = new AbortController();
-    void Promise.all([fetchPlatform<{ instruments: CatalogInstrument[] }>("/v1/instruments", request.signal), fetchPlatform<{ value: { replay?: { symbols?: string } } }>("/v1/settings/ui", request.signal)]).then(([instruments, preferences]) => {
+    void Promise.all([fetchPlatform<{ instruments: CatalogInstrument[] }>("/v1/instruments", request.signal), fetchPlatform<{ value: { replay?: { symbols?: string } } }>("/v1/settings/ui", request.signal), getOptimizationDraft(algorithm.id, request.signal)]).then(([instruments, preferences, rawDraft]) => {
       if (request.signal.aborted) return;
       if (instruments.kind !== "ready" || preferences.kind !== "ready") { setError("Historical-каталог или сохранённый выбор недоступны. Сохранение заблокировано; повторите загрузку."); return; }
       const items = instruments.data.instruments.filter((item) => item.exchange === "bybit" && item.category === "linear");
-      setCatalog(items); setScope((previous) => previous.symbols ? previous : { ...previous, symbols: preferences.data.value.replay?.symbols ?? items.map((item) => item.symbol).join("\n") });
+      const initial = initialValues.current;
+      const fallbackScope = initial.scope.symbols ? initial.scope : { ...initial.scope, symbols: preferences.data.value.replay?.symbols ?? items.map((item) => item.symbol).join("\n") };
+      const restored = restoreOptimizationDraft(rawDraft, algorithm.fields, ANALYTICS_SEARCH_FIELDS, fallbackScope, initial.algorithmDomains, initial.analyticsDomains);
+      storedDraft.current = restored;
+      setCatalog(items);
+      if (restored && !locked) {
+        setScope(applyOptimizationDraftScope(fallbackScope, restored, "continuous"));
+        setDraft((previous) => ({ ...previous, ...restored.continuous }));
+        setAlgorithmDomains(restored.shared.algorithmDomains);
+        setAnalyticsDomains(restored.shared.analyticsDomains);
+      } else setScope(fallbackScope);
       setReady(true); setError(null);
+    }).catch(() => {
+      if (!request.signal.aborted) setError("Не удалось загрузить сохранённые настройки оптимизации. Сохранение заблокировано; повторите загрузку.");
     });
     return () => request.abort();
-  }, [retry]);
+  }, [algorithm, locked, retry]);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     // Radix portals retain React ancestry: never bubble this submit into the fixed-settings form.
@@ -75,7 +92,15 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
       if (await controller.save(config)) onSaved();
     } catch (cause) { setError(errorText(cause)); }
   }
-  return <form noValidate onSubmit={(event) => { void submit(event); }} className="grid min-w-0 gap-5">
+  function saveDraft(): void {
+    if (!ready || locked || controller.busy !== null) return;
+    const next = createOptimizationDraft(scope, algorithmDomains, analyticsDomains, storedDraft.current, {
+      continuous: { lookbackDays: draft.lookbackDays, minSetupsPerDay: draft.minSetupsPerDay, minMeanExpectancy: draft.minMeanExpectancy },
+    });
+    storedDraft.current = next;
+    draftSave.save(next);
+  }
+  return <form noValidate onSubmit={(event) => { void submit(event); }} onBlur={saveDraft} className="grid min-w-0 gap-5">
     <Alert>Сохранение не запускает исследование и не включает live. Сервер фиксирует последние N суток при фактическом старте, без lag; вся цепочка использует один период и снимок. Включённая кластеризация выбирает только первый сетап.</Alert>
     {locked && <Alert>Параметры исследования доступны для чтения. Чтобы изменить период, пороги или домены, остановите процесс и дождитесь drain. Разрешение adaptive live сохраняется отдельно.</Alert>}
     <fieldset disabled={locked || controller.busy !== null} className="grid gap-3 sm:grid-cols-2">
@@ -85,7 +110,7 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
       <Field label="Минимальное среднее матожидание, R" hint="Гейт всей неокруглённой матрицы, а не лучшей ячейки. По умолчанию 0.15 R.">{(control) => <Input {...control} type="number" step="any" value={draft.minMeanExpectancy} onChange={(event) => setDraft({ ...draft, minMeanExpectancy: event.target.value })} />}</Field>
     </fieldset>
     {!ready && !error && <Spinner label="Загрузка historical-списка" />}
-    {error && <Alert variant="destructive" role="alert">{error}{!ready && <Button type="button" variant="outline" onClick={() => setRetry((value) => value + 1)}>Повторить загрузку</Button>}</Alert>}
+    {(error ?? draftSave.saveError) && <Alert variant="destructive" role="alert">{error ?? draftSave.saveError}{!ready && <Button type="button" variant="outline" onClick={() => setRetry((value) => value + 1)}>Повторить загрузку</Button>}</Alert>}
     <OptimizationFields algorithm={baseline} scope={scope} onScopeChange={(patch) => { setScope((previous) => ({ ...previous, ...patch })); setError(null); }} catalog={catalog} ready={ready} disabled={locked || controller.busy !== null} algorithmDomains={algorithmDomains} onAlgorithmDomainsChange={setAlgorithmDomains} analyticsDomains={analyticsDomains} onAnalyticsDomainsChange={setAnalyticsDomains} continuous />
     {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
     <div><Button type="submit" disabled={!ready || locked || !controller.available || controller.busy !== null}>{controller.busy === "save" ? "Сохранение…" : "Сохранить непрерывное исследование"}</Button></div>

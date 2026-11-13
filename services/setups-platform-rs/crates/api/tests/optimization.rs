@@ -262,6 +262,270 @@ struct TestDb {
     pool: PgPool,
     name: String,
 }
+
+#[tokio::test]
+async fn optimization_drafts_require_auth_and_cookie_mutation_origin_guard() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test")
+        .unwrap();
+    let auth = Arc::new(SessionAuth::new(&["test-key".into()]));
+    let token = match auth.post_session(Some("test-key"), setups_api::now_ms()) {
+        setups_api::auth::PostSessionResult::Issued { token, .. } => token,
+        _ => panic!("session"),
+    };
+    let router = optimization_router(Arc::new(OptimizationState {
+        pool,
+        auth,
+        config: OptimizationConfig::default(),
+        notify: Arc::new(tokio::sync::Notify::new()),
+        available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }));
+    for method in ["GET", "PUT"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/v1/optimization-drafts/price_volume_spike")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"value":{}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+    for valid_origin in [false, true] {
+        let mut request = Request::builder()
+            .method("PUT")
+            .uri("/v1/optimization-drafts/missing")
+            .header("content-type", "application/json")
+            .header("cookie", format!("platform_session={token}"));
+        if valid_origin {
+            request = request
+                .header("x-platform-request", "1")
+                .header("origin", "http://localhost")
+                .header("host", "localhost");
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::from(r#"{"value":{}}"#)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if valid_origin {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+    // A read-only cookie request does not need the mutation-origin headers.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/v1/optimization-drafts/missing")
+                .header("cookie", format!("platform_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn optimization_drafts_validate_algorithm_object_and_body_limit_before_database() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test")
+        .unwrap();
+    let router = app(pool, OptimizationConfig::default());
+    for algorithm in ["missing", "ui", "optimization-draft:price_volume_spike"] {
+        for method in ["GET", "PUT"] {
+            assert_eq!(
+                request(
+                    &router,
+                    method,
+                    &format!("/v1/optimization-drafts/{algorithm}"),
+                    json!({"value":{}})
+                )
+                .await,
+                (
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":"unknown_algorithm"})
+                )
+            );
+        }
+    }
+    for body in [
+        json!(null),
+        json!({}),
+        json!({"value":null}),
+        json!({"value":[]}),
+        json!({"value":"draft"}),
+        json!({"value":42}),
+        json!({"value":{},"unexpected":true}),
+    ] {
+        assert_eq!(
+            request(
+                &router,
+                "PUT",
+                "/v1/optimization-drafts/price_volume_spike",
+                body
+            )
+            .await,
+            (StatusCode::BAD_REQUEST, json!({"error":"invalid_body"}))
+        );
+    }
+    assert_eq!(
+        request_raw(
+            &router,
+            "PUT",
+            "/v1/optimization-drafts/price_volume_spike",
+            "{".into()
+        )
+        .await,
+        (StatusCode::BAD_REQUEST, json!({"error":"invalid_body"}))
+    );
+    assert_eq!(
+        request(
+            &router,
+            "PUT",
+            "/v1/optimization-drafts/price_volume_spike",
+            json!({"value":{"padding":"x".repeat(262_144)}})
+        )
+        .await,
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({"error":"body_too_large"})
+        )
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn optimization_drafts_round_trip_full_universe_and_isolate_algorithm_and_ui_settings() {
+    let database = TestDb::new().await;
+    let ui = json!({"replay":{"symbols":"BTCUSDT"},"sidebar":{"expanded":true},"unrelated":42});
+    setups_db::settings_set(&database.pool, "ui", &ui)
+        .await
+        .unwrap();
+    // Draft capacity and persistence are independent of optimizer admission and request limits.
+    let router = app_with_health(
+        database.pool.clone(),
+        OptimizationConfig {
+            max_request_bytes: 1024,
+            ..Default::default()
+        },
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    for algorithm in ["price_volume_spike", "price_drop_volume_spike"] {
+        assert_eq!(
+            request(
+                &router,
+                "GET",
+                &format!("/v1/optimization-drafts/{algorithm}"),
+                Value::Null
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({"algorithmId":algorithm,"value":null})
+            )
+        );
+    }
+    let draft = json!({"instruments":(0..822).map(|index|json!({"exchange":"bybit","category":"linear","symbol":format!("COIN{index}USDT")})).collect::<Vec<_>>(),
+        "algorithmSearch":{"baselineLongDays":[14,30,60]},"manual":{"from":"2026-10-01"},"continuous":{"lookbackDays":30},"notes":"юникод"});
+    let body = json!({"value":draft});
+    assert!(body.to_string().len() > 16 * 1024);
+    assert!(body.to_string().len() < 262_144);
+    let path = "/v1/optimization-drafts/price_volume_spike";
+    let expected = json!({"algorithmId":"price_volume_spike","value":draft});
+    assert_eq!(
+        request(&router, "PUT", path, body).await,
+        (StatusCode::OK, expected.clone())
+    );
+    assert_eq!(
+        request(&router, "GET", path, Value::Null).await,
+        (StatusCode::OK, expected)
+    );
+    let other = json!({"algorithmId":"price_drop_volume_spike","value":{"sentinel":"other"}});
+    assert_eq!(
+        request(
+            &router,
+            "PUT",
+            "/v1/optimization-drafts/price_drop_volume_spike",
+            json!({"value":{"sentinel":"other"}})
+        )
+        .await,
+        (StatusCode::OK, other.clone())
+    );
+    assert_eq!(
+        request(
+            &router,
+            "GET",
+            "/v1/optimization-drafts/price_drop_volume_spike",
+            Value::Null
+        )
+        .await,
+        (StatusCode::OK, other)
+    );
+    assert_eq!(
+        setups_db::settings_get(&database.pool, "optimization-draft:price_volume_spike")
+            .await
+            .unwrap(),
+        Some(draft)
+    );
+    assert_eq!(
+        setups_db::settings_get(&database.pool, "ui").await.unwrap(),
+        Some(ui)
+    );
+    let overhead = json!({"value":{"padding":""}}).to_string().len();
+    let boundary_value = json!({"padding":"x".repeat(262_144 - overhead)});
+    let boundary_body = json!({"value":boundary_value}).to_string();
+    assert_eq!(boundary_body.len(), 262_144);
+    assert_eq!(
+        request_raw(&router, "PUT", path, boundary_body.clone()).await,
+        (
+            StatusCode::OK,
+            json!({"algorithmId":"price_volume_spike","value":boundary_value})
+        )
+    );
+    assert_eq!(
+        request_raw(&router, "PUT", path, format!("{boundary_body} ")).await,
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({"error":"body_too_large"})
+        )
+    );
+    assert_eq!(
+        request(&router, "GET", path, Value::Null).await,
+        (
+            StatusCode::OK,
+            json!({"algorithmId":"price_volume_spike","value":boundary_value})
+        )
+    );
+    // A PUT is a replacement, not a stale read/merge of a shared document.
+    let replacement = json!({"algorithmId":"price_volume_spike","value":{}});
+    assert_eq!(
+        request(&router, "PUT", path, json!({"value":{}})).await,
+        (StatusCode::OK, replacement.clone())
+    );
+    assert_eq!(
+        request(&router, "GET", path, Value::Null).await,
+        (StatusCode::OK, replacement)
+    );
+    assert_eq!(
+        setups_db::settings_get(&database.pool, "optimization-draft:price_drop_volume_spike")
+            .await
+            .unwrap(),
+        Some(json!({"sentinel":"other"}))
+    );
+    database.cleanup().await;
+}
 impl TestDb {
     async fn new() -> Self {
         let options = PgConnectOptions::from_str(

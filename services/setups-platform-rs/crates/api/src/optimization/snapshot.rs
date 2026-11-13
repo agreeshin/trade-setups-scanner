@@ -39,19 +39,28 @@ struct SnapshotCandle {
     quote_turnover: String,
 }
 
-fn resource(limit: usize) -> JobError {
-    JobError::new(
-        "resource_limit",
-        format!(
-            "Снимок превышает OPTIMIZATION_MAX_SNAPSHOT_BYTES={limit}; уменьшите число инструментов/период/прогрев или увеличьте локальный лимит памяти."
-        ),
-    )
+#[derive(Clone, Copy)]
+struct SnapshotBudget {
+    limit: usize,
+    setting: &'static str,
+}
+
+impl SnapshotBudget {
+    fn error(self) -> JobError {
+        let Self { limit, setting } = self;
+        JobError::new(
+            "resource_limit",
+            format!(
+                "Снимок превышает {setting}={limit}; уменьшите число инструментов/период/прогрев или увеличьте локальный лимит памяти."
+            ),
+        )
+    }
 }
 
 async fn read<T: DeserializeOwned>(
     request: reqwest::RequestBuilder,
     cap: usize,
-    snapshot_cap: usize,
+    budget: SnapshotBudget,
 ) -> Result<T, JobError> {
     let response = request
         .timeout(Duration::from_secs(30))
@@ -76,7 +85,7 @@ async fn read<T: DeserializeOwned>(
         .content_length()
         .is_some_and(|len| len > cap as u64)
     {
-        return Err(resource(snapshot_cap));
+        return Err(budget.error());
     }
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
@@ -88,11 +97,11 @@ async fn read<T: DeserializeOwned>(
             )
         })?;
         if bytes.len().saturating_add(chunk.len()) > cap {
-            return Err(resource(snapshot_cap));
+            return Err(budget.error());
         }
         bytes
             .try_reserve_exact(chunk.len())
-            .map_err(|_| resource(snapshot_cap))?;
+            .map_err(|_| budget.error())?;
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| {
@@ -124,26 +133,58 @@ pub(super) async fn acquire(
 ) -> Result<StudyInput, JobError> {
     let bounds = setups_optimizer::required_input_bounds(spec)
         .map_err(|error| JobError::new("invalid_request", error.to_string()))?;
-    acquire_bounds(spec,url,key,config,bounds).await
+    acquire_bounds(
+        spec,
+        url,
+        key,
+        SnapshotBudget {
+            limit: config.max_snapshot_bytes,
+            setting: "OPTIMIZATION_MAX_SNAPSHOT_BYTES",
+        },
+        bounds,
+    )
+    .await
 }
 
-pub(crate) async fn acquire_continuous(spec: &StudyRequest, context: ContinuousContext, url: &str, key: &str, config: &OptimizationConfig) -> Result<StudyInput,JobError> {
-    let bounds=setups_optimizer::required_continuous_input_bounds(spec,context)
-        .map_err(|error|JobError::new("invalid_request",error.to_string()))?;
-    acquire_bounds(spec,url,key,config,bounds).await
+pub(crate) async fn acquire_continuous(
+    spec: &StudyRequest,
+    context: ContinuousContext,
+    url: &str,
+    key: &str,
+    config: &OptimizationConfig,
+) -> Result<StudyInput, JobError> {
+    let bounds = setups_optimizer::required_continuous_input_bounds(spec, context)
+        .map_err(|error| JobError::new("invalid_request", error.to_string()))?;
+    acquire_bounds(
+        spec,
+        url,
+        key,
+        SnapshotBudget {
+            limit: config.max_snapshot_bytes,
+            setting: "CONTINUOUS_MAX_SNAPSHOT_BYTES",
+        },
+        bounds,
+    )
+    .await
 }
 
-async fn acquire_bounds(spec: &StudyRequest, url: &str, key: &str, config: &OptimizationConfig, bounds: InputBounds) -> Result<StudyInput,JobError> {
+async fn acquire_bounds(
+    spec: &StudyRequest,
+    url: &str,
+    key: &str,
+    budget: SnapshotBudget,
+    bounds: InputBounds,
+) -> Result<StudyInput, JobError> {
     let client = reqwest::Client::new();
     let url = url.trim_end_matches('/');
-    let cap = config.max_snapshot_bytes;
+    let cap = budget.limit;
     // Account for the bounded wire buffer and decoded page simultaneously.
     let catalog: InstrumentsResponse = read(
         client
             .get(format!("{url}/v1/instruments"))
             .header("x-api-key", key),
         MAX_HTTP_BYTES.min(cap / 4),
-        cap,
+        budget,
     )
     .await?;
     let mut input = StudyInput {
@@ -196,7 +237,7 @@ async fn acquire_bounds(spec: &StudyRequest, url: &str, key: &str, config: &Opti
         loop {
             let remaining = cap.saturating_sub(retained);
             if remaining < 4096 {
-                return Err(resource(cap));
+                return Err(budget.error());
             }
             let page_size = PAGE_SIZE.min(remaining / 2048).max(1);
             let mut request = client
@@ -211,7 +252,8 @@ async fn acquire_bounds(spec: &StudyRequest, url: &str, key: &str, config: &Opti
             if let Some(after) = cursor {
                 request = request.query(&[("afterUnix", after)]);
             }
-            let page: SnapshotPage = read(request, MAX_HTTP_BYTES.min(remaining / 4), cap).await?;
+            let page: SnapshotPage =
+                read(request, MAX_HTTP_BYTES.min(remaining / 4), budget).await?;
             let page_bytes = page.candles.capacity() * size_of::<SnapshotCandle>()
                 + page
                     .candles
@@ -226,7 +268,7 @@ async fn acquire_bounds(spec: &StudyRequest, url: &str, key: &str, config: &Opti
                     })
                     .sum::<usize>();
             if retained.saturating_add(page_bytes) > cap {
-                return Err(resource(cap));
+                return Err(budget.error());
             }
             if page.candles.len() > page_size
                 || (page.candles.is_empty() && page.next_cursor_unix.is_some())
@@ -261,19 +303,19 @@ async fn acquire_bounds(spec: &StudyRequest, url: &str, key: &str, config: &Opti
                 .saturating_add(additional)
                 > cap
             {
-                return Err(resource(cap));
+                return Err(budget.error());
             }
             item.detector_bars
                 .try_reserve_exact(detector_count)
-                .map_err(|_| resource(cap))?;
+                .map_err(|_| budget.error())?;
             item.candles
                 .try_reserve_exact(candle_count)
-                .map_err(|_| resource(cap))?;
+                .map_err(|_| budget.error())?;
             let after = item.detector_bars.capacity() * size_of::<DetectorBar>()
                 + item.candles.capacity() * size_of::<OhlcCandle>();
             retained = retained.saturating_add(after - before);
             if retained.saturating_add(page_bytes) > cap {
-                return Err(resource(cap));
+                return Err(budget.error());
             }
             let mut last = cursor;
             for candle in page.candles {
@@ -321,7 +363,7 @@ async fn acquire_bounds(spec: &StudyRequest, url: &str, key: &str, config: &Opti
                     });
                 }
                 if retained > cap {
-                    return Err(resource(cap));
+                    return Err(budget.error());
                 }
                 last = Some(time);
             }
@@ -349,6 +391,85 @@ async fn acquire_bounds(spec: &StudyRequest, url: &str, key: &str, config: &Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request() -> StudyRequest {
+        serde_json::from_value(serde_json::json!({
+            "algorithmId": "price_volume_spike",
+            "algorithmVersion": "1.1.1",
+            "algorithmParams": setups_domain::SpikeParams::default(),
+            "algorithmSearch": {},
+            "analyticsParams": {"clusterEnabled": false, "clusterGapMinutes": 480, "timeShiftMinutes": 0, "priceChangePct": null},
+            "analyticsSearch": {},
+            "instruments": [{"exchange": "bybit", "category": "linear", "symbol": "BTCUSDT"}],
+            "fromUnix": 1_700_000_040, "toUnix": 1_700_003_640,
+            "direction": "short", "setupMaturity": 0,
+            "horizonMinutes": 60, "tpLevels": [4], "slLevels": [4],
+            "minClosedPerCell": 1, "minSetupsPerDay": 0,
+            "seed": 42, "maxTrials": 1, "maxSeconds": 10
+        })).unwrap()
+    }
+
+    async fn acquisition_errors(cap: usize) -> (JobError, JobError) {
+        let app = axum::Router::new().route("/v1/instruments", axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"instruments": [{"id": 42, "exchange": "bybit", "category": "linear", "symbol": "BTCUSDT", "status": "active"}]}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = OptimizationConfig {
+            max_snapshot_bytes: cap,
+            ..Default::default()
+        };
+        let spec = request();
+        let manual = acquire(&spec, &url, "fixture-key", &config).await;
+        let continuous = acquire_continuous(
+            &spec,
+            ContinuousContext {
+                observation_cutoff: spec.to_unix,
+            },
+            &url,
+            "fixture-key",
+            &config,
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        (manual.unwrap_err(), continuous.unwrap_err())
+    }
+
+    fn assert_lane_errors(manual: JobError, continuous: JobError, cap: usize) {
+        assert_eq!(manual.code, "resource_limit");
+        assert_eq!(continuous.code, "resource_limit");
+        assert!(
+            manual
+                .message
+                .contains(&format!("OPTIMIZATION_MAX_SNAPSHOT_BYTES={cap}"))
+        );
+        assert!(!manual.message.contains("CONTINUOUS_MAX_SNAPSHOT_BYTES"));
+        assert!(
+            continuous
+                .message
+                .contains(&format!("CONTINUOUS_MAX_SNAPSHOT_BYTES={cap}"))
+        );
+        assert!(
+            !continuous
+                .message
+                .contains("OPTIMIZATION_MAX_SNAPSHOT_BYTES")
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_http_body_limit_errors_name_the_owning_lane_setting() {
+        let (manual, continuous) = acquisition_errors(1).await;
+        assert_lane_errors(manual, continuous, 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_retained_budget_errors_name_the_owning_lane_setting() {
+        let (manual, continuous) = acquisition_errors(4096).await;
+        assert_lane_errors(manual, continuous, 4096);
+    }
+
     #[test]
     fn cursor_is_required_but_explicit_null_is_valid() {
         assert!(

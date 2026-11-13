@@ -55,9 +55,11 @@ let createStatus: number;
 let deleteStatus: number;
 let cancelStatus: number;
 let listedAlgorithms: Algorithm[];
+let draftStatus: number;
+let drafts: Record<string, unknown>;
 const requests: { path: string; method: string; body: unknown; signal?: AbortSignal | null }[] = [];
 beforeEach(() => {
-  studies = []; createStatus = 202; deleteStatus = 200; cancelStatus = 202; requests.length = 0;
+  studies = []; createStatus = 202; deleteStatus = 200; cancelStatus = 202; draftStatus = 200; drafts = {}; requests.length = 0;
   listedAlgorithms = [algorithm, { ...algorithm, id: "second_algorithm", name: "Второй алгоритм" }];
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
@@ -67,6 +69,15 @@ beforeEach(() => {
     if (path === "/v1/algorithms") return json({ algorithms: listedAlgorithms });
     if (path === "/v1/instruments") return json({ instruments });
     if (path === "/v1/settings/ui") return json({ value: { replay: { symbols: "BTCUSDT\nOLDUSDT" } } });
+    const draft = /^\/v1\/optimization-drafts\/(.+)$/.exec(path);
+    if (draft) {
+      const id = decodeURIComponent(draft[1]!);
+      if (method === "PUT") {
+        if (draftStatus !== 200) return json({ error: "draft_failed" }, draftStatus);
+        drafts[id] = (body as { value: unknown }).value;
+      }
+      return json({ algorithmId: id, value: drafts[id] ?? null });
+    }
     if (path === "/v1/optimization-studies" && method === "POST") {
       if (createStatus === 409) { studies = [record()]; return json({ error: "optimization_busy", activeStudyId: 17 }, 409); }
       const created = { ...record("queued"), spec: body as typeof spec };
@@ -216,7 +227,7 @@ it("builds unknown fields from metadata and submits the complete typed scope onl
     algorithmSearch: { futureThreshold: ["1.5", "2.5", "4"], futureWindow: [2, 3, 5] },
     analyticsSearch: { clusterEnabled: [false, true], clusterGapMinutes: [240, 480], timeShiftMinutes: [0, 5], priceChangePct: [null, 0, 1] },
   });
-  expect(requests.some((request) => request.method === "PUT")).toBe(false);
+  expect(requests.some((request) => request.method === "PUT" && !request.path.startsWith("/v1/optimization-drafts/"))).toBe(false);
 });
 
 it.each([0, 1])("switches algorithm cards without stale metadata and submits only algorithm %s keys", async (targetIndex) => {
@@ -263,7 +274,48 @@ it.each([0, 1])("switches algorithm cards without stale metadata and submits onl
   expect(payload.algorithmSearch).toEqual({ windowMinutes: [3, 5], volumeMultiplier: ["2", "3"], [ownKey]: ["13.25", "20"], ...(targetIndex === 1 ? { metadataOnlyWindow: [7, 9] } : {}) });
   expect(payload.algorithmParams).not.toHaveProperty(otherKey);
   expect(payload.algorithmSearch).not.toHaveProperty(otherKey);
-  expect(requests.some((request) => request.method === "PUT")).toBe(false);
+  expect(requests.some((request) => request.method === "PUT" && !request.path.startsWith("/v1/optimization-drafts/"))).toBe(false);
+});
+
+it("autosaves on blur, restores after reopening and isolates drafts by algorithm", async () => {
+  render(<AlgorithmsPage />);
+  let dialog = within(await openOptimizer());
+  const baseline = await dialog.findByLabelText("Baseline: Новый порог");
+  fireEvent.change(dialog.getByLabelText("Начало периода сигналов"), { target: { value: "2026-10-02T03:04" } });
+  fireEvent.change(dialog.getByLabelText("Горизонт сделки, мин (фиксирован)"), { target: { value: "720" } });
+  fireEvent.change(baseline, { target: { value: "8.75" } });
+  fireEvent.blur(baseline);
+  await waitFor(() => expect(requests.filter((request) => request.path === "/v1/optimization-drafts/future_algorithm" && request.method === "PUT")).toHaveLength(1));
+  expect(drafts.future_algorithm).toMatchObject({
+    version: 1,
+    shared: { scope: { horizonMinutes: "720" }, algorithmDomains: { futureThreshold: { baseline: "8.75" } } },
+    manual: { from: "2026-10-02T03:04" },
+    continuous: { lookbackDays: "30" },
+  });
+  await userEvent.click(dialog.getByRole("button", { name: "Закрыть" }));
+  dialog = within(await openOptimizer());
+  expect(await dialog.findByLabelText("Начало периода сигналов")).toHaveValue("2026-10-02T03:04");
+  expect(dialog.getByLabelText("Горизонт сделки, мин (фиксирован)")).toHaveValue(720);
+  expect(dialog.getByLabelText("Baseline: Новый порог")).toHaveValue("8.75");
+  await userEvent.click(dialog.getByRole("button", { name: "Закрыть" }));
+  await userEvent.click(screen.getByRole("tab", { name: "Второй алгоритм" }));
+  await userEvent.click(screen.getByRole("button", { name: "Оптимизировать Второй алгоритм" }));
+  const second = within(await screen.findByRole("dialog", { name: "Оптимизация · Второй алгоритм" }));
+  expect(await second.findByLabelText("Горизонт сделки, мин (фиксирован)")).toHaveValue(10080);
+  expect(second.getByLabelText("Baseline: Новый порог")).toHaveValue("2.5");
+  expect(drafts.second_algorithm).toBeUndefined();
+});
+
+it("shows a draft autosave failure without closing the optimizer", async () => {
+  draftStatus = 503;
+  render(<AlgorithmsPage />);
+  const dialog = within(await openOptimizer());
+  const input = await dialog.findByLabelText("Бюджет trials");
+  fireEvent.change(input, { target: { value: "128" } });
+  fireEvent.blur(input);
+  expect(await dialog.findByRole("alert")).toHaveTextContent("HTTP 503");
+  expect(screen.getByRole("dialog", { name: "Оптимизация · Новый алгоритм" })).toBeInTheDocument();
+  expect(requests.some((request) => request.method === "POST")).toBe(false);
 });
 
 it("renders ungrouped metadata in normal settings and uses its saved values as the optimizer baseline", async () => {
@@ -305,12 +357,12 @@ it("restores the same server study after remount without starting or cancelling 
   await openOptimizer();
   expect(screen.getByText("Исследование #17")).toBeInTheDocument();
   first.unmount();
-  expect(requests.every((request) => request.method === "GET")).toBe(true);
+  expect(requests.every((request) => request.method === "GET" || request.path.startsWith("/v1/optimization-drafts/"))).toBe(true);
   render(<AlgorithmsPage />);
   await openOptimizer();
   expect(await screen.findByText("Исследование #17")).toBeInTheDocument();
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17").length).toBeGreaterThanOrEqual(2);
-  expect(requests.every((request) => request.method === "GET")).toBe(true);
+  expect(requests.every((request) => request.method === "GET" || request.path.startsWith("/v1/optimization-drafts/"))).toBe(true);
 });
 
 it("explicitly requests Stop once and observes cancellation until the server is terminal", async () => {
@@ -335,7 +387,7 @@ it.each(["", "0, 4", "101", "4, 4", "NaN", Array.from({ length: 65 }, (_, i) => 
   fireEvent.change(screen.getByLabelText("Уровни TP, %"), { target: { value: levels } });
   await userEvent.click(screen.getByRole("button", { name: "Начать исследование" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(/TP/);
-  expect(requests.every((request) => request.method === "GET")).toBe(true);
+  expect(requests.every((request) => request.method === "GET" || request.path.startsWith("/v1/optimization-drafts/"))).toBe(true);
 });
 
 it("handles a cross-client 409 by discovering the active ID instead of retrying creation", async () => {
