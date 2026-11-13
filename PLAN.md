@@ -9,8 +9,8 @@
 - completed: Frontend реализует общий per-algorithm draft через отдельный `/v1/optimization-drafts/{algorithm}`, загрузку при открытии обеих форм и последовательный blur autosave. Общие поля проходят manual → continuous → manual; даты/частотные режимные поля не смешиваются; алгоритмы изолированы; ошибка autosave видна без закрытия формы.
 - completed: Backend исправляет отдельную env/Compose-квоту continuous snapshot, верхнюю границу 8 GiB и корректное имя лимита в ошибках; draft API использует существующую platform `settings`, отдельную атомарную запись на алгоритм и 256 KiB body cap без миграции.
 - completed: Полная интеграционная регрессия: web 308/308, typecheck/lint/styles/build; Rust API lib 41 passed, обычные optimization 5 и continuous 2, `cargo check`, strict Clippy и `git diff --check`. PostgreSQL round-trip draft API с 822 инструментами отдельно прошёл у backend-специалиста.
-- in_progress: Зафиксировать и отправить отдельный feature commit.
-- pending: Безопасный последовательный deployment signals-rust и web на TV с backup, пустыми ручными очередями, миграционной/HTTP/UI проверкой и обновлением локальной инвентаризации.
+- completed: Реализация зафиксирована отдельным commit `cb0071b` (`feat: сохранять настройки оптимизации по алгоритму`) и отправлена в `origin/main`.
+- completed: Последовательный deployment `signals-rust` и web на TV выполнен из точного commit snapshot. Перед cutover ручные replay/optimization очереди были пусты; создан проверенный platform dump и rollback-теги. PostgreSQL/market-data не перезапускались, миграций не было. Draft API прошёл authenticated PUT/GET round-trip с удалением smoke-записи, web routes/assets доступны. Сохранённый continuous-процесс явно перезапущен после исчерпанного старого retry budget: full-universe snapshot завершил `acquiring` и перешёл в `searching` с `retry_count=0`, без resource error; наблюдаемый RSS backend достиг 6.92 GiB при отдельном лимите snapshot 8 GiB. Само длительное исследование остаётся штатно работающим.
 
 ## Непрерывные исследования и адаптивные сетапы (2026-11-12)
 
