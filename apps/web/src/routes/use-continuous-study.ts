@@ -1,5 +1,5 @@
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
-import { listContinuousStudies, saveContinuousStudy, startContinuousStudy, stopContinuousStudy, type ContinuousConfig, type ContinuousProcess } from "../lib/continuous-api";
+import { isContinuousWorkActive, listContinuousStudies, saveContinuousStudy, startContinuousStudy, stopContinuousStudy, type ContinuousConfig, type ContinuousProcess } from "../lib/continuous-api";
 import { errorText } from "./platform-controls";
 import { RouteActiveContext } from "./route-active";
 
@@ -48,7 +48,7 @@ export function useContinuousStudy(algorithmId: string, refreshRevision = 0) {
         if (!disposed && !current.signal.aborted && observedVersion === version.current) {
           setLoading(false);
           // Unsupported endpoints wait for an explicit retry; do not generate an error-poll storm.
-          if (succeeded) timer = setTimeout(() => { void load(); }, 3000);
+          if (succeeded) timer = setTimeout(() => { void load(); }, isContinuousWorkActive(snapshot.current) ? 3000 : 15000);
         }
       }
     }

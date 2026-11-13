@@ -10,7 +10,7 @@ interface StudySnapshot { byAlgorithm: Record<string, OptimizationStudySummary>;
 
 /** Retain latest manual and latest any-origin compact summaries per registered algorithm, plus the active manual summary.
  * Full detail belongs only to an open modal, never to discovery or the history table. */
-export function useOptimizationStudies(algorithmIds: string[]) {
+export function useOptimizationStudies(algorithmIds: string[], continuousWorkActive = false) {
   const idsKey = JSON.stringify(algorithmIds);
   const routeActive = useContext(RouteActiveContext);
   const [snapshot, setSnapshot] = useState<StudySnapshot>({ byAlgorithm: {}, latestByAlgorithm: {}, active: null });
@@ -59,6 +59,8 @@ export function useOptimizationStudies(algorithmIds: string[]) {
       controller?.abort(); clearTimeout(timer);
       const current = new AbortController(); controller = current;
       const revision = version.current;
+      // Manual admission intentionally excludes continuous jobs; observer cadence must not.
+      let workActive = continuousWorkActive || Object.values(snapshotRef.current.latestByAlgorithm).some(isActiveStudy) || activeRef.current !== null;
       try {
         const [global, ...lists] = await Promise.all([
           listOptimizationStudies(undefined, current.signal),
@@ -74,6 +76,7 @@ export function useOptimizationStudies(algorithmIds: string[]) {
         });
         if (activeSummary && !selected.some((study) => study.id === activeSummary.id)) selected.push(activeSummary);
         if (disposed || current.signal.aborted || revision !== version.current) return;
+        workActive = continuousWorkActive || global.studies.some(isActiveStudy) || lists.some((list) => list.studies.some(isActiveStudy));
         const active = selected.find((study) => isActiveStudy(study) && !isContinuousStudy(study)) ?? null;
         const byAlgorithm: Record<string, OptimizationStudySummary> = {};
         const latestByAlgorithm: Record<string, OptimizationStudySummary> = {};
@@ -90,7 +93,7 @@ export function useOptimizationStudies(algorithmIds: string[]) {
           readyRef.current = false; setReady(false);
         }
       } finally {
-        if (!disposed && !current.signal.aborted) timer = setTimeout(() => { void load(); }, 3000);
+        if (!disposed && !current.signal.aborted) timer = setTimeout(() => { void load(); }, workActive ? 3000 : 15000);
       }
     }
     const refresh = () => { void load(); };
@@ -105,7 +108,7 @@ export function useOptimizationStudies(algorithmIds: string[]) {
       document.removeEventListener("visibilitychange", visibility);
       if (refreshRef.current === refresh) refreshRef.current = () => undefined;
     };
-  }, [idsKey, routeActive]);
+  }, [idsKey, routeActive, continuousWorkActive]);
 
   async function start(spec: OptimizationSpec): Promise<boolean> {
     if (mutation.current || activeRef.current || !readyRef.current) return false;

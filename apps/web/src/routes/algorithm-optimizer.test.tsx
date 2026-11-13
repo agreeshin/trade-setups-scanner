@@ -509,7 +509,7 @@ it("discovers compact summaries without loading matrices until a dialog opens an
   await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(1);
   studies = [{ ...studies[0]!, updatedAt: "2026-11-10T00:02:00Z" }];
-  await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(2);
   fireEvent.click(screen.getByRole("button", { name: "Закрыть" }));
   await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
@@ -604,6 +604,34 @@ it("does not fetch the full history while closed, but continues compact active o
   expect(fullRequests()).toBe(1);
   expect(requests.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "5").length).toBeGreaterThan(inlineBefore);
   expect(requests.some((request) => /^\/v1\/optimization-studies\/\d+$/.test(request.path))).toBe(false);
+});
+
+it("keeps shared discovery fast for a hidden algorithm's running process between children without losing fixed-form state", async () => {
+  vi.useFakeTimers();
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    if (path.startsWith("/v1/continuous-studies?")) {
+      requests.push({ path, method: "GET", body: null, ...(init?.signal ? { signal: init.signal } : {}) });
+      const id = new URL(path, "http://localhost").searchParams.get("algorithmId");
+      return Promise.resolve(new Response(JSON.stringify({ processes: [{ algorithmId: id, status: id === "second_algorithm" ? "running" : "stopped", configRevision: 1, config: null, activeStudyId: null, phase: id === "second_algorithm" ? "queued" : null, error: null, slots: [] }] })));
+    }
+    return original(path, init);
+  }));
+  render(<AlgorithmsPage />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  expect(screen.getByRole("tab", { name: "Новый алгоритм" })).toHaveAttribute("aria-selected", "true");
+  const fixed = screen.getByRole("spinbutton", { name: "Новый порог (%)" });
+  fireEvent.change(fixed, { target: { value: "8.5" } });
+  const globalReads = () => requests.filter((request) => request.path === "/v1/optimization-studies?limit=1&offset=0").length;
+  const before = globalReads();
+  await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+  expect(globalReads()).toBeGreaterThan(before);
+  expect(screen.getByRole("spinbutton", { name: "Новый порог (%)" })).toBe(fixed);
+  expect(fixed).toHaveValue(8.5);
+  fireEvent.click(screen.getByRole("tab", { name: "Второй алгоритм" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Новый алгоритм" }));
+  expect(screen.getByRole("spinbutton", { name: "Новый порог (%)" })).toHaveValue(8.5);
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
 
 it("corrects full-list pagination after deletion and restores the underlying list after detail closes", async () => {

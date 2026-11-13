@@ -46,6 +46,7 @@ export interface ContinuousSlot {
 export interface ContinuousProcess {
   // The unconfigured detail response has no persisted owner yet.
   ownerId?: string;
+  desiredRunning?: boolean;
   algorithmId: string;
   status: "stopped" | "running" | "stopping" | "error";
   configRevision: number;
@@ -54,6 +55,13 @@ export interface ContinuousProcess {
   phase: string | null;
   error: { code: string; message: string } | null;
   slots: ContinuousSlot[];
+}
+
+/** Research/replacement work, not the mere existence of a retained live profile. */
+export function isContinuousWorkActive(process: ContinuousProcess | null): boolean {
+  return process !== null && (process.desiredRunning === true || process.status !== "stopped" || process.activeStudyId !== null
+    || process.slots.some((slot) => slot.pendingGenerationId != null || slot.pendingStatus != null
+      || ["running", "researching", "warming"].includes(slot.status)));
 }
 
 export class ContinuousApiError extends Error {
@@ -74,6 +82,7 @@ function isProcess(value: unknown): value is ContinuousProcess {
     && config.study !== null && typeof config.study === "object" && config.study.algorithmId === process.algorithmId
     && Array.isArray(config.study.instruments) && (config.study.direction === "short" || config.study.direction === "long"));
   return typeof process.algorithmId === "string" && ["stopped", "running", "stopping", "error"].includes(process.status ?? "")
+    && (process.desiredRunning === undefined || typeof process.desiredRunning === "boolean")
     && Number.isSafeInteger(process.configRevision) && validConfig && nullableId(process.activeStudyId)
     && (process.phase === null || typeof process.phase === "string")
     && (process.error === null || (process.error !== undefined && typeof process.error === "object" && typeof process.error.code === "string" && typeof process.error.message === "string"))

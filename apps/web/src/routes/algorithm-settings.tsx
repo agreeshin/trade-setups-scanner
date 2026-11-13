@@ -9,6 +9,7 @@ import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
 import { Separator } from "../components/ui/separator";
 import { fetchPlatform, type PlatformState } from "../lib/platform-api";
 import type { OptimizationStudyAction } from "../lib/optimization-api";
+import { isContinuousWorkActive } from "../lib/continuous-api";
 import { algorithmDisplayName, errorText, writePlatform, type Algorithm } from "./platform-controls";
 import { AlgorithmOptimizer, OptimizationStudyDialog } from "./algorithm-optimizer";
 import { OptimizationDeleteDialog, OptimizationHistory } from "./optimization-history";
@@ -24,7 +25,7 @@ const groups = [
 ];
 
 type SavedAlgorithm = Partial<Pick<Algorithm, "enabled" | "externalName">> & { adaptiveEnabled?: boolean };
-function AlgorithmForm({ algorithm, optimization, onSaved, continuousRevision, cleanupRevision }: { algorithm: Algorithm; optimization: OptimizationController; onSaved: (id: string, patch: SavedAlgorithm) => void; continuousRevision: number; cleanupRevision: number }) {
+function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuousRevision, cleanupRevision }: { algorithm: Algorithm; optimization: OptimizationController; onSaved: (id: string, patch: SavedAlgorithm) => void; onActivity: (id: string, active: boolean) => void; continuousRevision: number; cleanupRevision: number }) {
   const continuous = useContinuousStudy(algorithm.id, continuousRevision);
   const displayName = algorithmDisplayName(algorithm);
   const [externalName, setExternalName] = useState(displayName);
@@ -33,6 +34,8 @@ function AlgorithmForm({ algorithm, optimization, onSaved, continuousRevision, c
   const [nameSaved, setNameSaved] = useState(false);
   const { refresh: refreshOptimization } = optimization;
   const adaptiveSaved = continuous.available ? continuous.process?.config?.adaptiveEnabled ?? false : undefined;
+  const continuousActive = isContinuousWorkActive(continuous.process);
+  useEffect(() => { onActivity(algorithm.id, continuousActive); }, [algorithm.id, continuousActive, onActivity]);
   useEffect(() => { if (adaptiveSaved !== undefined) onSaved(algorithm.id, { adaptiveEnabled: adaptiveSaved }); }, [adaptiveSaved, algorithm.id, onSaved]);
   useEffect(() => { if (continuous.revision > 0) refreshOptimization(); }, [continuous.revision, refreshOptimization]);
   const [params, setParams] = useState(algorithm.params);
@@ -156,7 +159,10 @@ function hasEnabledLiveMode(algorithm: Pick<Algorithm, "enabled"> & { adaptiveEn
 }
 
 function AlgorithmForms({ algorithms }: { algorithms: Algorithm[] }) {
-  const optimization = useOptimizationStudies(algorithms.map((algorithm) => algorithm.id));
+  // One boolean per registered algorithm; hidden panels remain mounted and report their own work.
+  const [continuousActivity, setContinuousActivity] = useState<Record<string, boolean>>({});
+  const onActivity = useCallback((id: string, active: boolean) => setContinuousActivity((previous) => (previous[id] ?? false) === active ? previous : { ...previous, [id]: active }), []);
+  const optimization = useOptimizationStudies(algorithms.map((algorithm) => algorithm.id), algorithms.some((algorithm) => continuousActivity[algorithm.id]));
   const [continuousRevision, setContinuousRevision] = useState(0);
   const [cleanupRevision, setCleanupRevision] = useState(0);
   const [selected, setSelected] = useState(algorithms[0]?.id ?? "");
@@ -172,7 +178,7 @@ function AlgorithmForms({ algorithms }: { algorithms: Algorithm[] }) {
     <ContinuousHistoryCleanup disabled={optimization.creating || optimization.cancelling !== null || optimization.deleting !== null} onRefreshStates={refreshStates} onDeleted={() => { refreshStates(); setCleanupRevision((value) => value + 1); }} />
     <PageSidebar label="Алгоритмы" items={items} value={selected} onValueChange={setSelected}>
     {displayAlgorithms.map((algorithm) => <PageSidebarPanel key={algorithm.id} value={algorithm.id}>
-      <AlgorithmForm algorithm={algorithm} optimization={optimization} onSaved={onSaved} continuousRevision={continuousRevision} cleanupRevision={cleanupRevision} />
+      <AlgorithmForm algorithm={algorithm} optimization={optimization} onSaved={onSaved} onActivity={onActivity} continuousRevision={continuousRevision} cleanupRevision={cleanupRevision} />
     </PageSidebarPanel>)}
     {algorithms.length === 0 && <p className="text-sm text-muted-foreground">Алгоритмов пока нет.</p>}
   </PageSidebar></>;

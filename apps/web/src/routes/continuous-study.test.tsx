@@ -88,9 +88,20 @@ function profileView(patch: Partial<ContinuousSlot> = {}) {
   };
   return <ContinuousResearch algorithm={algorithm} controller={controller} />;
 }
+it("labels configured profiles separately from research history and marks cleared results without deleting the slot", () => {
+  render(profileView({ status: "stopped", activeGenerationId: null, activeStatus: "inactive", studyId: null, meanExpectancy: null, selectedCell: null,
+    pendingGenerationId: null, pendingStatus: null, readinessFrontier: null, pendingError: null, liveWatermark: null }));
+  expect(screen.getByRole("heading", { name: "Настроенные адаптивные профили" })).toBeInTheDocument();
+  const table = within(screen.getByRole("table", { name: "Настроенные адаптивные профили · Мой алгоритм" }));
+  expect(table.getAllByRole("row")).toHaveLength(2);
+  expect(table.getByText("Результатов нет")).toBeInTheDocument();
+  expect(table.getByRole("columnheader", { name: "Изменение состояния профиля" })).toBeInTheDocument();
+  expect(screen.getByText(/не дата исследования/)).toBeInTheDocument();
+  expect(requests).toHaveLength(0);
+});
 it("separates successful research, incumbent live and the warming candidate without relabelling its study as the incumbent", () => {
   render(profileView({ activeStatus: "active", pendingGenerationId: 8, pendingStatus: "warming", readinessFrontier: null, pendingError: null, liveWatermark: closedBoundary }));
-  const table = within(screen.getByRole("table", { name: "Адаптивные профили · Мой алгоритм" }));
+  const table = within(screen.getByRole("table", { name: "Настроенные адаптивные профили · Мой алгоритм" }));
   const incumbent = table.getByRole("cell", { name: /Действующее поколение #7/ });
   const candidate = table.getByRole("cell", { name: /Кандидат #8/ });
   expect(table.getByText("Исследование успешно · допуск пройден")).toBeInTheDocument();
@@ -298,12 +309,12 @@ it("observes without creating work and releases every polling timer on unmount",
   const view = render(<AlgorithmsPage />);
   await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   const reads = requests.filter((request) => request.path.startsWith("/v1/continuous-studies?")).length;
-  await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
   expect(requests.filter((request) => request.path.startsWith("/v1/continuous-studies?")).length).toBeGreaterThan(reads);
   expect(requests.every((request) => request.method === "GET")).toBe(true);
   view.unmount();
   const after = requests.length;
-  await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(30000); });
   expect(requests).toHaveLength(after);
   expect(vi.getTimerCount()).toBe(0);
 });

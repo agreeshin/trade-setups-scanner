@@ -59,6 +59,12 @@ function SlotPending({ slot }: { slot: ContinuousSlot }) {
   </div>;
 }
 
+function hasNoProfileResults(slot: ContinuousSlot): boolean {
+  return slot.studyId === null && slot.activeGenerationId === null && slot.pendingGenerationId == null
+    && slot.meanExpectancy === null && slot.selectedCell === null && slot.pendingStatus == null
+    && slot.pendingError == null && slot.readinessFrontier == null && slot.liveWatermark == null;
+}
+
 
 export function AdaptiveLive({ controller }: { controller: ContinuousController }) {
   const savedPermission = controller.process?.config?.adaptiveEnabled ?? false;
@@ -158,7 +164,7 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
   const [open, setOpen] = useState(false);
   const process = controller.process;
   return <section aria-label="Непрерывные исследования" className="grid min-w-0 gap-3">
-    <h5 className="font-semibold">Непрерывные исследования</h5>
+    <h5 className="font-semibold">Настроенные адаптивные профили</h5>
     {controller.loading && <Spinner label="Проверка непрерывного процесса" />}
     {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
     {!controller.available && process && <p className="text-sm">Показан последний подтверждённый снимок; актуальность не подтверждена.</p>}
@@ -167,11 +173,12 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
       <p className="text-sm">Ревизия конфигурации: {process.configRevision}{process.activeStudyId !== null ? ` · Исследование #${process.activeStudyId}` : ""}{process.phase ? ` · ${phases[process.phase] ?? process.phase}` : ""}</p>
       {process.error && <Alert variant="destructive">{process.error.code}: {process.error.message}. Технический сбой не означает непрохождение допуска; прежний принятый профиль может сохраняться.</Alert>}
       <p className="text-xs text-muted-foreground">Успех исследования не означает готовый live. Сохранённое исследование может относиться к кандидату; при сохранённом принятом поколении среднее и рекомендация относятся к нему. Границы — время закрытия минуты: новое поколение действует после watermark.</p>
-      <div className="overflow-x-auto"><Table aria-label={`Адаптивные профили · ${algorithmDisplayName(algorithm)}`}>
-        <TableHeader><TableRow>{["Минимум сетапов в день", "Исследование / допуск", "Принятое поколение / live", "Кандидат / прогрев", "Среднее матрицы", "Рекомендация", "Обновлено"].map((title) => <TableHead key={title}>{title}</TableHead>)}</TableRow></TableHeader>
+      <p className="text-xs text-muted-foreground">Это настроенные пороги, а не история исследований. Очистка сохраняет их настройки. Дата ниже — изменение состояния профиля, включая сброс при очистке, а не дата исследования.</p>
+      <div className="overflow-x-auto"><Table aria-label={`Настроенные адаптивные профили · ${algorithmDisplayName(algorithm)}`}>
+        <TableHeader><TableRow>{["Минимум сетапов в день", "Исследование / допуск", "Принятое поколение / live", "Кандидат / прогрев", "Среднее матрицы", "Рекомендация", "Изменение состояния профиля"].map((title) => <TableHead key={title}>{title}</TableHead>)}</TableRow></TableHeader>
         <TableBody>{process.slots.map((slot) => <TableRow key={slot.id}>
           <TableCell>{slot.minSetupsPerDay === 0 ? "0 · без частотного допуска" : slot.minSetupsPerDay}</TableCell>
-          <TableCell><div className="grid gap-1"><Badge>{slotStatuses[slot.status] ?? slot.status}</Badge><span className="text-xs">{slot.studyId === null ? "Сохранённое исследование не указано" : `Сохранённое исследование #${slot.studyId}`}</span></div></TableCell>
+          <TableCell><div className="grid gap-1"><Badge>{slotStatuses[slot.status] ?? slot.status}</Badge><span className="text-xs">{hasNoProfileResults(slot) ? "Результатов нет" : slot.studyId === null ? "Сохранённое исследование не указано" : `Сохранённое исследование #${slot.studyId}`}</span></div></TableCell>
           <TableCell><SlotIncumbent slot={slot} /></TableCell>
           <TableCell><SlotPending slot={slot} /></TableCell>
           <TableCell>{slot.meanExpectancy === null ? "—" : `${slot.meanExpectancy.toFixed(2)} R`}</TableCell>
@@ -179,7 +186,7 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
           <TableCell>{slot.updatedAt ? formatIsoDateTime(slot.updatedAt) : "—"}</TableCell>
         </TableRow>)}</TableBody>
       </Table></div>
-      {process.slots.length === 0 && <p className="text-sm text-muted-foreground">Принятых профилей пока нет. Включённое исследование не означает готовый live.</p>}
+      {process.slots.length === 0 && <p className="text-sm text-muted-foreground">Настроенных профилей пока нет. Включённое исследование не означает готовый live.</p>}
     </>}
     <div className="flex flex-wrap gap-2">
       <Button type="button" variant="outline" onClick={controller.refresh} disabled={controller.busy !== null}>Обновить статус непрерывного процесса</Button>
