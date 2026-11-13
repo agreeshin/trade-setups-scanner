@@ -22,10 +22,17 @@ export async function ensureMonthPartitions(
     const name = partitionName(cursor);
     // Bind parameters are not allowed in DDL, so bounds are embedded as
     // escaped literals via sql.lit.
+    const exists = await sql<{ name: string | null }>`SELECT to_regclass(${name})::text AS name`.execute(db);
+    if (exists.rows[0]?.name) { cursor = next; continue; }
+    const create = async (tx: Kysely<MarketDataDB>) => {
+    await sql`SELECT pg_advisory_xact_lock(72423414)`.execute(tx);
     await sql`CREATE TABLE IF NOT EXISTS ${sql.table(name)} PARTITION OF candles
       FOR VALUES FROM (${sql.lit(cursor.toISOString())}) TO (${sql.lit(next.toISOString())})`.execute(
-      db,
+      tx,
     );
+    };
+    if (db.isTransaction) await create(db);
+    else await db.transaction().execute(create);
     created.push(name);
     cursor = next;
   }

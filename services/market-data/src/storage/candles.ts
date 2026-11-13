@@ -1,6 +1,8 @@
-import type { Kysely } from "kysely";
+import { sql, type Kysely } from "kysely";
 import type { MarketDataDB, CandleRecordJson } from "../db/schema.js";
 import { ensureMonthPartitions } from "./partitions.js";
+import { ensureWatermarks } from "./watermarks.js";
+import { recordCanonicalInsert } from "./read-guards.js";
 
 export interface CandleInsert {
   openTime: Date;
@@ -93,12 +95,31 @@ export async function insertCandles(
   const uniqueCandles = [...uniqueByTime.values()];
 
   const times = uniqueCandles.map((candle) => candle.openTime.getTime());
+  await ensureWatermarks(db, [instrumentId]);
   await ensureMonthPartitions(
     db,
     new Date(Math.min(...times)),
     new Date(Math.max(...times)),
   );
 
+  const write = async (db: Kysely<MarketDataDB>): Promise<InsertResult> => {
+  // Serialize BEFORE any canonical insertion. Revision allocation after an
+  // unlocked insert would permit commit-order gaps across concurrent writers.
+  await db.selectFrom("instrument_watermarks").where("instrument_id", "=", instrumentId)
+    .select("instrument_id").forUpdate().executeTakeFirstOrThrow();
+  const journal = await db.selectFrom("candle_insert_heads").where("instrument_id", "=", instrumentId)
+    .select("instrument_id").executeTakeFirst();
+  if (!journal) throw new Error(`canonical insert metadata missing for instrument ${instrumentId}`);
+  const inserted = await db
+    .insertInto("candles")
+    .values(uniqueCandles.map((candle) => candleValues(instrumentId, candle)))
+    .onConflict((oc) => oc.constraint("candles_pkey").doNothing())
+    .returning("open_time")
+    .execute();
+  await recordCanonicalInsert(db, instrumentId, inserted.map((row) => row.open_time));
+
+  // Read after ON CONFLICT has waited for concurrent writers. Comparing a
+  // pre-insert snapshot would miss WS/REST conflicts under READ COMMITTED.
   const existingRows = await db
     .selectFrom("candles")
     .where((eb) =>
@@ -125,12 +146,6 @@ export async function insertCandles(
   const existingByTime = new Map(
     existingRows.map((row) => [row.open_time.getTime(), row]),
   );
-
-  await db
-    .insertInto("candles")
-    .values(uniqueCandles.map((candle) => candleValues(instrumentId, candle)))
-    .onConflict((oc) => oc.constraint("candles_pkey").doNothing())
-    .execute();
 
   const conflicts = uniqueCandles.filter((candle) => {
     const existing = existingByTime.get(candle.openTime.getTime());
@@ -165,10 +180,22 @@ export async function insertCandles(
       .execute();
   }
 
+  const latest = new Date(Math.max(...times));
+  await sql`INSERT INTO instrument_watermarks (instrument_id, latest_open_time, latest_received_at)
+    VALUES (${instrumentId}, ${latest}, statement_timestamp())
+    ON CONFLICT (instrument_id) DO UPDATE SET
+      latest_open_time = greatest(instrument_watermarks.latest_open_time, excluded.latest_open_time),
+      latest_received_at = CASE WHEN instrument_watermarks.latest_open_time IS NULL
+        OR excluded.latest_open_time > instrument_watermarks.latest_open_time
+        THEN excluded.latest_received_at ELSE instrument_watermarks.latest_received_at END`.execute(db);
+  await sql`UPDATE collection_targets SET last_collected_ts = greatest(last_collected_ts, ${latest})
+    WHERE instrument_id = ${instrumentId}`.execute(db);
   return {
-    inserted: uniqueCandles.length - existingByTime.size,
+    inserted: inserted.length,
     conflicting: conflicts.length,
   };
+  };
+  return db.isTransaction ? write(db) : db.transaction().execute(write);
 }
 
 export interface ReadCandlesQuery {

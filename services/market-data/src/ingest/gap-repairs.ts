@@ -14,6 +14,7 @@ const SANITY_WINDOW_MINUTES = 720;
 export interface GapRepairDeps {
   db: Kysely<MarketDataDB>;
   client: BybitClient;
+  signal?: AbortSignal;
 }
 
 export async function createGapRepairJobs(db: Kysely<MarketDataDB>, instrumentIds: number[]): Promise<number[]> {
@@ -69,15 +70,16 @@ export async function listGapRepairJobs(db: Kysely<MarketDataDB>, limit: number)
 export async function drainGapRepairs(deps: GapRepairDeps, budgetMs = 25_000): Promise<number> {
   const deadline = Date.now() + budgetMs;
   let processed = 0;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !deps.signal?.aborted) {
     const worked = await processOneGapRepair(deps);
     if (!worked) break;
     processed += 1;
+    if (worked === "waiting") break;
   }
   return processed;
 }
 
-async function processOneGapRepair(deps: GapRepairDeps): Promise<boolean> {
+async function processOneGapRepair(deps: GapRepairDeps): Promise<boolean | "waiting"> {
   const { db, client } = deps;
   const job = await db.selectFrom("gap_repair_jobs")
     .where("status", "in", ["queued", "running"])
@@ -104,7 +106,7 @@ async function processOneGapRepair(deps: GapRepairDeps): Promise<boolean> {
     // Sanity: the exchange must serve a range we already store; an unavailable
     // or delisted symbol must never have ranges marked as no-trade.
     const sanityEndMs = Math.min(firstMs + (SANITY_WINDOW_MINUTES - 1) * MINUTE_MS, lastMs);
-    const sanityBars = await client.fetchClosedBars(instrument.symbol, firstMs, sanityEndMs);
+    const sanityBars = await client.fetchClosedBars(instrument.symbol, firstMs, sanityEndMs, { signal: deps.signal });
     if (sanityBars.length === 0) {
       throw new Error("exchange returned no candles for a range already stored; symbol unavailable");
     }
@@ -122,15 +124,17 @@ async function processOneGapRepair(deps: GapRepairDeps): Promise<boolean> {
     let verifiedMinutes = job.verified_minutes;
     let gapsProcessed = job.gaps_processed;
     let exhausted = false;
+    let waitingPublication = false;
 
     for (const gap of pending) {
+      deps.signal?.throwIfAborted();
       if (budget <= 0) {
         exhausted = true;
         break;
       }
       const gapMinutes = (gap.toMs - gap.fromMs) / MINUTE_MS + 1;
       const endMs = gapMinutes > budget ? gap.fromMs + (budget - 1) * MINUTE_MS : gap.toMs;
-      const bars = await client.fetchClosedBars(instrument.symbol, gap.fromMs, endMs);
+      const bars = await client.fetchClosedBars(instrument.symbol, gap.fromMs, endMs, { signal: deps.signal });
       await insertCandles(db, job.instrument_id, bars.map((bar) => ({
         openTime: bar.openTime,
         open: bar.open,
@@ -142,13 +146,17 @@ async function processOneGapRepair(deps: GapRepairDeps): Promise<boolean> {
       })));
       filled += bars.length;
       for (const range of uncoveredRanges(gap.fromMs, endMs, bars.map((bar) => bar.openTime))) {
+        const cutoff = client.closedMinuteStartMs - 2 * MINUTE_MS;
+        if (range.toMs > cutoff) waitingPublication = true;
+        if (range.fromMs > cutoff) continue;
+        const verifiedToMs = Math.min(range.toMs, cutoff);
         await insertNoTradeVerification(db, {
           instrumentId: job.instrument_id,
           fromTs: new Date(range.fromMs),
-          toTs: new Date(range.toMs),
+          toTs: new Date(verifiedToMs),
           source: "repair",
         });
-        verifiedMinutes += (range.toMs - range.fromMs) / MINUTE_MS + 1;
+        verifiedMinutes += (verifiedToMs - range.fromMs) / MINUTE_MS + 1;
       }
       gapsProcessed += 1;
       budget -= (endMs - gap.fromMs) / MINUTE_MS + 1;
@@ -159,15 +167,20 @@ async function processOneGapRepair(deps: GapRepairDeps): Promise<boolean> {
     }
 
     await db.updateTable("gap_repair_jobs").set({
-      status: exhausted ? "running" : "done",
+      status: waitingPublication ? "queued" : exhausted ? "running" : "done",
       gaps_processed: gapsProcessed,
       filled_minutes: filled,
       verified_minutes: verifiedMinutes,
       error: null,
       updated_at: new Date(),
     }).where("id", "=", job.id).execute();
-    return true;
+    // Publication lag retries on a later scheduling tick, not a tight drain loop.
+    return waitingPublication ? "waiting" : true;
   } catch (error) {
+    if (deps.signal?.aborted) {
+      await db.updateTable("gap_repair_jobs").set({ status: "queued", updated_at: new Date() }).where("id", "=", job.id).execute();
+      return false;
+    }
     await db.updateTable("gap_repair_jobs").set({
       status: "failed",
       error: error instanceof Error ? error.message : String(error),

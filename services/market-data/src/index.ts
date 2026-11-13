@@ -5,7 +5,8 @@ import { createMigrator } from "./db/migrator.js";
 import { loadConfig } from "./config.js";
 import { startIngestRuntime, type IngestRuntime } from "./ingest/runtime.js";
 import { BybitClient } from "./ingest/bybit.js";
-import { AdaptiveGate, DEFAULT_GATE_LIMITS } from "./ingest/gate.js";
+import { AdaptiveGate } from "./ingest/gate.js";
+import { createGatePersistence } from "./ingest/state-persistence.js";
 import { RealClock } from "./ingest/clock.js";
 import { FetchTransport } from "./ingest/transport.js";
 import { BackupManager } from "./backup/routes.js";
@@ -20,6 +21,9 @@ if (migration.error) {
   process.exit(1);
 }
 
+const clock = new RealClock();
+const bybit = new BybitClient(new FetchTransport(config.bybit.requestTimeoutMs),
+  new AdaptiveGate(config.bybit.gate, clock, createGatePersistence(db)), clock);
 const app = await buildApp({
   db,
   apiKeys: config.apiKeys,
@@ -30,20 +34,23 @@ const app = await buildApp({
     backupDir: config.backupDir,
     maxUploadBytes: config.backupMaxUploadBytes,
   }),
-  exchangeListing: () => new BybitClient(
-    new FetchTransport(),
-    new AdaptiveGate(DEFAULT_GATE_LIMITS, new RealClock()),
-    new RealClock(),
-  ).fetchLinearPerpetualUsdtSymbols(),
+  exchangeListing: () => bybit.fetchLinearPerpetualUsdtSymbols(),
 });
 let ingestRuntime: IngestRuntime | undefined;
 
 if (process.env.BYBIT_INGEST_ENABLED === "1") {
-  ingestRuntime = await startIngestRuntime({ db, databaseUrl: config.databaseUrl, backfillLimits: config.backfillLimits });
+  ingestRuntime = await startIngestRuntime({ db, databaseUrl: config.databaseUrl, client: bybit,
+    fresh: config.bybit.fresh, backfillLimits: config.backfillLimits,
+    onEvent: (event, detail) => {
+      if (event.endsWith("_failed")) app.log.error({ event, detail }, "market-data ingest");
+      else app.log.info({ event, detail }, "market-data ingest");
+    },
+  });
   app.log.info("bybit ingest runtime started");
 }
 
 async function shutdown(): Promise<void> {
+  bybit.close();
   if (ingestRuntime) {
     await ingestRuntime.stop();
   }

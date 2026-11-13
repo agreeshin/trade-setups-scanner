@@ -1,4 +1,8 @@
+import { DEFAULT_FRESH_OPTIONS, type FreshOptions } from "./ingest/fresh.js";
+import { DEFAULT_GATE_LIMITS, type GateLimits } from "./ingest/gate.js";
+
 export interface AppConfig {
+  bybit: { requestTimeoutMs: number; gate: GateLimits; fresh: FreshOptions };
   databaseUrl: string;
   testDatabaseUrl?: string | undefined;
   apiKeys: string[];
@@ -30,7 +34,29 @@ function positiveInteger(env: Record<string, string | undefined>, key: string, f
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): AppConfig {
+  const bounded = (key: string, fallback: number, max: number) => {
+    const value = positiveInteger(env, key, fallback);
+    if (value > max) throw new Error(`${key} must be <= ${max}`);
+    return value;
+  };
+  const rps = bounded("BYBIT_REST_MAX_RPS", 30, 60);
   return {
+    bybit: {
+      requestTimeoutMs: bounded("BYBIT_REQUEST_TIMEOUT_MS", 5000, 60_000),
+      gate: { ...DEFAULT_GATE_LIMITS, maxPerWindow: rps * 5, minIntervalMs: Math.ceil(1000 / rps), initialIntervalMs: Math.max(100, Math.ceil(1000 / rps)) },
+      fresh: {
+        ...DEFAULT_FRESH_OPTIONS,
+        tickMs: bounded("BYBIT_FRESH_TICK_MS", 2000, 10_000),
+        fallbackDelayMs: bounded("BYBIT_FRESH_FALLBACK_DELAY_MS", 3000, 60_000),
+        repairMinutes: bounded("BYBIT_FRESH_REPAIR_MINUTES", 5, 30),
+        maxSymbols: bounded("BYBIT_FRESH_MAX_SYMBOLS", 4096, 10_000),
+        concurrency: bounded("BYBIT_FRESH_CONCURRENCY", 8, 16),
+        ws: { ...DEFAULT_FRESH_OPTIONS.ws,
+          shardSymbols: bounded("BYBIT_WS_SHARD_SYMBOLS", 200, 200),
+          maxPayloadBytes: bounded("BYBIT_WS_MAX_PAYLOAD_BYTES", 256 * 1024, 1024 * 1024),
+        },
+      },
+    },
     databaseUrl: required(env, "DATABASE_URL"),
     testDatabaseUrl: env.TEST_DATABASE_URL,
     apiKeys: (env.API_KEYS ?? "")

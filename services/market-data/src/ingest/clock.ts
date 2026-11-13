@@ -1,6 +1,8 @@
+import { setTimeout as delay } from "node:timers/promises";
+
 export interface Clock {
   nowMs(): number;
-  sleep(ms: number): Promise<void>;
+  sleep(ms: number, signal?: AbortSignal): Promise<void>;
 }
 
 export class RealClock implements Clock {
@@ -8,10 +10,8 @@ export class RealClock implements Clock {
     return Date.now();
   }
 
-  sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-      setTimeout(resolve, ms);
-    });
+  sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return delay(ms, undefined, { signal });
   }
 }
 

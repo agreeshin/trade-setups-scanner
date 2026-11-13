@@ -91,6 +91,8 @@ export interface CollectionTargetsTable {
   instrument_id: number;
   enabled: boolean;
   last_collected_ts: Date | null;
+  tail_next_ts: Date | null;
+  tail_initialized: Generated<boolean>;
   updated_at: Generated<Date>;
 }
 
@@ -142,6 +144,24 @@ export interface GapRepairJobsTable {
 }
 
 export interface MarketDataDB {
+  candle_source_identity: { id: number; epoch: string };
+  candle_insert_heads: {
+    instrument_id: number;
+    revision: Generated<string>;
+    pruned_through_revision: Generated<string>;
+    ready: Generated<boolean>;
+  };
+  candle_insert_journal: {
+    instrument_id: number;
+    revision: string;
+    from_ts: Date;
+    to_ts: Date;
+  };
+  instrument_watermarks: {
+    instrument_id: number;
+    latest_open_time: Date | null;
+    latest_received_at: Date | null;
+  };
   exchanges: ExchangesTable;
   instruments: InstrumentsTable;
   candles: CandlesTable;

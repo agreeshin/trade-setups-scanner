@@ -167,4 +167,30 @@ describe("BybitClient", () => {
       "retCode 10006",
     );
   });
+
+  it("honours HTTP-date Retry-After and 10006 reset across fresh/history requests", async () => {
+    const clock = new FakeClock(BASE);
+    const { gate } = makeGate(clock);
+    const fetchMock = vi.fn<() => Promise<TransportResponse>>()
+      .mockResolvedValueOnce(errorResponse(429, {}, { "retry-after": new Date(BASE + 10_000).toUTCString() }))
+      .mockResolvedValueOnce(errorResponse(200, { retCode: 10006 }, { "x-bapi-limit-reset-timestamp": String(BASE + 20_000) }))
+      .mockResolvedValueOnce(okPage([MINUTE]));
+    const client = new BybitClient({ fetch: fetchMock }, gate, clock);
+    await expect(client.fetchClosedBars("TESTUSDT", MINUTE, MINUTE, { priority: "fresh", maxAttempts: 1 })).rejects.toThrow("429");
+    await expect(client.fetchLinearPerpetualUsdtSymbols()).resolves.toEqual([]);
+    expect(clock.nowMs()).toBeGreaterThanOrEqual(BASE + 20_000);
+    client.close();
+  });
+
+  it("rejects malformed decimals/result lists instead of manufacturing absence", async () => {
+    const clock = new FakeClock(BASE);
+    const { gate } = makeGate(clock);
+    const fetchMock = vi.fn<() => Promise<TransportResponse>>()
+      .mockResolvedValueOnce(errorResponse(200, { retCode: 0, result: {} }))
+      .mockResolvedValueOnce(errorResponse(200, { retCode: 0, result: { list: [[String(MINUTE), 1, "1", "1", "1", "1", "1"]] } }));
+    const client = new BybitClient({ fetch: fetchMock }, gate, clock);
+    await expect(client.fetchClosedBars("TESTUSDT", MINUTE, MINUTE)).rejects.toThrow("result list");
+    await expect(client.fetchClosedBars("TESTUSDT", MINUTE, MINUTE)).rejects.toThrow("decimal");
+    client.close();
+  });
 });

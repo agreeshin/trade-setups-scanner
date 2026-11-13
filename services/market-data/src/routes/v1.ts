@@ -6,6 +6,7 @@ import { readCandles } from "../storage/candles.js";
 import { COVERAGE_MAX_UNIX, COVERAGE_MIN_UNIX, getCoverage, getCoverageRange, getCoverageSummaries, type CoverageRangeInput } from "../storage/coverage.js";
 import { registerManagementRoutes } from "./management.js";
 import type { BackfillAdmissionLimits } from "../ingest/backfill.js";
+import { readTailBatch, TailBatchSizeError, type TailBatchInput } from "../storage/tail-batch.js";
 
 export type ApiKeyGuard = (
   request: FastifyRequest,
@@ -71,6 +72,14 @@ const CandlesResponse = Type.Object({
 });
 
 const ErrorEnvelope = Type.Object({ error: Type.String() });
+const ReadGuardTokenDto = Type.Object({
+  epoch: Type.String({ minLength: 1, maxLength: 128 }),
+  revision: Type.String({ pattern: "^[0-9]+$", minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false });
+const ReadGuardDto = Type.Object({
+  status: Type.Union([Type.Literal("valid"), Type.Literal("invalid"), Type.Literal("unknown")]),
+  token: Type.Union([ReadGuardTokenDto, Type.Null()]),
+});
 
 const unixSeconds = (iso: string | null): number | null =>
   iso === null ? null : Math.floor(new Date(iso).getTime() / 1000);
@@ -88,6 +97,54 @@ export function registerV1Routes(
 ): void {
   const { db, requireApiKey } = options;
   registerManagementRoutes(app, options);
+
+  app.post<{ Body: TailBatchInput }>("/v1/candles/tail-batch", {
+    onRequest: [requireApiKey],
+    schema: {
+      description: "Bounded saved-only tail snapshot. Minute-aligned half-open open times; contiguous means real candles starting at fromUnix, not latest availability. Optional readGuards validate a separate causal interval against committed canonical inserts; unknown is not unchanged. previous=null captures a token only, not historical proof. Never downloads data.",
+      body: Type.Object({
+        instrumentIds: Type.Array(Type.Integer({ minimum: 1, maximum: 2_147_483_647 }), { minItems: 1, maxItems: 200, uniqueItems: true }),
+        fromUnix: Type.Integer({ minimum: COVERAGE_MIN_UNIX, maximum: COVERAGE_MAX_UNIX }),
+        toUnix: Type.Integer({ minimum: COVERAGE_MIN_UNIX, maximum: COVERAGE_MAX_UNIX }),
+        readGuards: Type.Optional(Type.Array(Type.Object({
+          instrumentId: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }),
+          fromUnix: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+          toUnix: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+          previous: Type.Union([ReadGuardTokenDto, Type.Null()]),
+        }, { additionalProperties: false }), { maxItems: 200 })),
+      }, { additionalProperties: false }),
+      response: {
+        200: Type.Object({ checkedAt: Type.String(), instruments: Type.Array(Type.Object({
+          instrumentId: Type.Integer(), status: Type.Union([Type.Literal("known"), Type.Literal("not_found")]),
+          latestStoredOpenTimeUnix: Type.Union([Type.Integer(), Type.Null()]),
+          contiguousThroughOpenTimeUnix: Type.Union([Type.Integer(), Type.Null()]),
+          candles: Type.Array(CandleDto, { maxItems: 30 }),
+          missingRanges: Type.Array(Type.Object({ fromUnix: Type.Integer(), toUnix: Type.Integer() }), { maxItems: 30 }),
+          readGuard: Type.Optional(ReadGuardDto),
+        }), { maxItems: 200 }) }),
+        400: ErrorEnvelope, 401: ErrorEnvelope, 413: ErrorEnvelope,
+      },
+    },
+  }, async (request, reply) => {
+    const body = request.body;
+    if (body.fromUnix % 60 || body.toUnix % 60 || body.toUnix <= body.fromUnix || body.toUnix - body.fromUnix > 1800)
+      return reply.code(400).send({ error: "tail range must be minute-aligned, nonempty and at most 30 minutes" });
+    const requested = new Set(body.instrumentIds);
+    const guarded = new Set<number>();
+    for (const guard of body.readGuards ?? []) {
+      if (!requested.has(guard.instrumentId) || guarded.has(guard.instrumentId))
+        return reply.code(400).send({ error: "readGuards require at most one entry per requested instrument" });
+      if (![guard.fromUnix, guard.toUnix].every((value) => Number.isSafeInteger(value) && value >= 0 && value % 60 === 0)
+        || guard.fromUnix > guard.toUnix)
+        return reply.code(400).send({ error: "readGuard causal range must be safe, nonnegative, minute-aligned and ordered" });
+      guarded.add(guard.instrumentId);
+    }
+    try { return await readTailBatch(db, body); }
+    catch (error) {
+      if (error instanceof TailBatchSizeError) return reply.code(413).send({ error: error.message });
+      throw error;
+    }
+  });
 
   app.get(
     "/v1/instruments",

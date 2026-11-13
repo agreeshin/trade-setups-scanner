@@ -1,4 +1,4 @@
-import type { Kysely } from "kysely";
+import { sql, type Kysely } from "kysely";
 import type { MarketDataDB } from "../db/schema.js";
 
 const STATE_KEY = "bybit_gate";
@@ -21,7 +21,10 @@ export function createGatePersistence(db: Kysely<MarketDataDB>) {
         .insertInto("service_state")
         .values({ key: STATE_KEY, value })
         .onConflict((oc) =>
-          oc.column("key").doUpdateSet({ value, updated_at: new Date() }),
+          oc.column("key").doUpdateSet({
+            value: sql`jsonb_build_object('cooldownUntilIso', greatest(service_state.value->>'cooldownUntilIso', ${value.cooldownUntilIso}))`,
+            updated_at: new Date(),
+          }),
         )
         .execute();
     },

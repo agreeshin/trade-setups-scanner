@@ -105,7 +105,7 @@ describe.skipIf(!TEST_DATABASE_URL)("gap verification and repair", () => {
     return rows.map((row) => [row.from_ts.getTime(), row.to_ts.getTime(), row.source] as const);
   }
 
-  it("marks minutes the exchange did not return as no_trade during downloads", async () => {
+  it("marks mature absent minutes but leaves the fresh empty tail pending", async () => {
     await insertCandles(db, instrumentId, Array.from({ length: 5 }, (_, index) => candle(minute(index))));
     await setCollectionTarget(db, instrumentId, true);
     const clock = new FakeClock(T0 + 10 * MINUTE + 30_000);
@@ -116,8 +116,23 @@ describe.skipIf(!TEST_DATABASE_URL)("gap verification and repair", () => {
     expect(page.candles).toHaveLength(8);
     expect(await verificationRanges()).toEqual([
       [minute(5).getTime(), minute(5).getTime(), "download"],
-      [minute(9).getTime(), minute(9).getTime(), "download"],
     ]);
+    const target = await db.selectFrom("collection_targets").select("tail_next_ts").where("instrument_id", "=", instrumentId).executeTakeFirstOrThrow();
+    expect(target.tail_next_ts).toEqual(minute(9));
+  });
+
+  it("does not classify a fresh internal empty repair result as no-trade or retry it tightly", async () => {
+    await insertCandles(db, instrumentId, [
+      ...Array.from({ length: 7 }, (_, index) => candle(minute(index))), candle(minute(9)),
+    ]);
+    const clock = new FakeClock(T0 + 10 * MINUTE + 5000);
+    const { transport, requests } = recordingTransport((ms) => ms < minute(7).getTime() || ms === minute(9).getTime());
+    const [jobId] = await createGapRepairJobs(db, [instrumentId]);
+    expect(await drainGapRepairs({ db, client: makeClient(transport, clock) })).toBe(1);
+    expect(requests).toHaveLength(2);
+    expect(await verificationRanges()).toEqual([[minute(7).getTime(), minute(7).getTime(), "repair"]]);
+    const job = await db.selectFrom("gap_repair_jobs").where("id", "=", jobId!).select("status").executeTakeFirstOrThrow();
+    expect(job.status).toBe("queued");
   });
 
   it("does not re-request verified no-trade minutes on later jobs", async () => {

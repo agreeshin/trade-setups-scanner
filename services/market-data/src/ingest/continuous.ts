@@ -1,6 +1,6 @@
-import type { Kysely } from "kysely";
+import { sql, type Kysely } from "kysely";
 import type { MarketDataDB } from "../db/schema.js";
-import { getCoverage } from "../storage/coverage.js";
+import { initializeCollectionTails } from "../storage/watermarks.js";
 import { BackfillAdmissionError, requestBackfill, runBackfillJobOnce, type BackfillAdmissionLimits, type BackfillWorkerDeps } from "./backfill.js";
 import type { Clock } from "./clock.js";
 
@@ -58,18 +58,27 @@ export async function collectOnce(
   if (targets.length === 0) {
     return 0;
   }
-
+  await initializeCollectionTails(db, targets.filter((target) => !target.tail_initialized).map((target) => target.instrument_id));
   const lastClosedMinute = new Date(
     Math.floor(clock.nowMs() / MINUTE_MS) * MINUTE_MS - MINUTE_MS,
   );
+  // Healthy WS collection needs no per-minute backfill job or full-history
+  // coverage scan. Advance only a short, explicitly counted real-candle prefix.
+  await sql`UPDATE collection_targets t SET tail_next_ts = ${lastClosedMinute}::timestamptz + interval '1 minute'
+    WHERE t.enabled AND t.tail_next_ts <= ${lastClosedMinute}
+      AND t.tail_next_ts >= ${lastClosedMinute}::timestamptz - interval '30 minutes'
+      AND (SELECT count(*) FROM candles c WHERE c.instrument_id = t.instrument_id
+        AND c.open_time >= t.tail_next_ts AND c.open_time <= ${lastClosedMinute})
+        = extract(epoch FROM (${lastClosedMinute}::timestamptz - t.tail_next_ts)) / 60 + 1`.execute(db);
+  const initialized = await db.selectFrom("collection_targets").where("enabled", "=", true).selectAll().execute();
   let scheduled = 0;
 
-  for (const target of targets) {
-    const coverage = await getCoverage(db, target.instrument_id);
-    if (coverage.lastMinute === null) {
+  for (const target of initialized) {
+    if (target.tail_next_ts === null) {
       continue;
     }
-    const from = new Date(new Date(coverage.lastMinute).getTime() + MINUTE_MS);
+    // This durable repair cursor is deliberately NOT max(open_time).
+    const from = target.tail_next_ts;
     if (from.getTime() > lastClosedMinute.getTime()) {
       continue;
     }

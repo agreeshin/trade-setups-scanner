@@ -153,6 +153,7 @@ export interface BackfillWorkerDeps {
   db: Kysely<MarketDataDB>;
   client: BybitClient;
   chunkMinutes?: number;
+  signal?: AbortSignal;
 }
 
 export interface MissingInterval {
@@ -206,6 +207,7 @@ export function missingIntervals(
  * picked up (regardless of final status), false when the queue is empty.
  */
 export async function runBackfillJobOnce(deps: BackfillWorkerDeps): Promise<boolean> {
+  if (deps.signal?.aborted) return false;
   const { db, client } = deps;
   const chunkMinutes = deps.chunkMinutes ?? DEFAULT_CHUNK_MINUTES;
 
@@ -250,8 +252,13 @@ export async function runBackfillJobOnce(deps: BackfillWorkerDeps): Promise<bool
       : job.from_ts.getTime();
   const endMs = job.to_ts.getTime();
   let chunkFailures = 0;
+  let earliestPendingMs: number | null = null;
 
   while (cursorMs <= endMs) {
+    if (deps.signal?.aborted) {
+      await db.updateTable("backfill_jobs").set({ status: "queued", updated_at: new Date() }).where("id", "=", job.id).execute();
+      return false;
+    }
     const fresh = await db
       .selectFrom("backfill_jobs")
       .where("id", "=", job.id)
@@ -277,6 +284,7 @@ export async function runBackfillJobOnce(deps: BackfillWorkerDeps): Promise<bool
           instrument.symbol,
           gap.fromMs,
           gap.toMs,
+          { signal: deps.signal },
         );
         await insertCandles(
           db,
@@ -292,10 +300,14 @@ export async function runBackfillJobOnce(deps: BackfillWorkerDeps): Promise<bool
           })),
         );
         for (const range of uncoveredRanges(gap.fromMs, gap.toMs, bars.map((bar) => bar.openTime))) {
+          // A just-closed missing result can be publication lag, not no-trade.
+          const cutoff = client.closedMinuteStartMs - 2 * MINUTE_MS;
+          if (range.toMs > cutoff) earliestPendingMs = Math.min(earliestPendingMs ?? Infinity, Math.max(range.fromMs, cutoff + MINUTE_MS));
+          if (range.fromMs > cutoff) continue;
           await insertNoTradeVerification(db, {
             instrumentId: job.instrument_id,
             fromTs: new Date(range.fromMs),
-            toTs: new Date(range.toMs),
+            toTs: new Date(Math.min(range.toMs, cutoff)),
             source: "download",
           });
         }
@@ -308,6 +320,10 @@ export async function runBackfillJobOnce(deps: BackfillWorkerDeps): Promise<bool
         .where("id", "=", job.id)
         .execute();
     } catch (error) {
+      if (deps.signal?.aborted) {
+        await db.updateTable("backfill_jobs").set({ status: "queued", updated_at: new Date() }).where("id", "=", job.id).execute();
+        return false;
+      }
       chunkFailures += 1;
       if (chunkFailures > MAX_CHUNK_FAILURES) {
         await db
@@ -329,5 +345,18 @@ export async function runBackfillJobOnce(deps: BackfillWorkerDeps): Promise<bool
     .set({ status: "done", checkpoint_ts: job.to_ts, updated_at: new Date() })
     .where("id", "=", job.id)
     .execute();
+  if (job.requested_by.includes("continuous")) {
+    // Recheck the last two minutes even on checkpoint-only restart: a crash
+    // after checkpoint commit must not forget publication-lag absence.
+    const recheckFrom = Math.max(job.from_ts.getTime(), endMs - MINUTE_MS);
+    const recent = await db.selectFrom("candles").select("open_time").where("instrument_id", "=", job.instrument_id)
+      .where("open_time", ">=", new Date(recheckFrom)).where("open_time", "<=", job.to_ts).execute();
+    const noTrade = await getNoTradeRanges(db, job.instrument_id, new Date(recheckFrom), job.to_ts);
+    const unresolved = subtractRanges(uncoveredRanges(recheckFrom, endMs, recent.map((row) => row.open_time)), noTrade);
+    if (unresolved[0]) earliestPendingMs = Math.min(earliestPendingMs ?? Infinity, unresolved[0].fromMs);
+    await db.updateTable("collection_targets").set({ tail_next_ts: new Date(earliestPendingMs ?? endMs + MINUTE_MS) })
+      .where("instrument_id", "=", job.instrument_id)
+      .where("tail_next_ts", ">=", job.from_ts).where("tail_next_ts", "<=", job.to_ts).execute();
+  }
   return true;
 }

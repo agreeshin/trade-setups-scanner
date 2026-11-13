@@ -1,4 +1,4 @@
-import type { AdaptiveGate } from "./gate.js";
+import type { AdaptiveGate, RequestPriority } from "./gate.js";
 import type { Clock } from "./clock.js";
 import type { Transport } from "./transport.js";
 
@@ -36,13 +36,29 @@ const MAX_LIMIT = 1000;
 const MINUTE_MS = 60_000;
 const MAX_ATTEMPTS_PER_PAGE = 6;
 
-function parseRetryAfterMs(headers: Map<string, string>): number | undefined {
+function parseRetryAfterMs(headers: Map<string, string>, nowMs: number): number | undefined {
   const value = headers.get("retry-after");
   if (value === undefined) {
     return undefined;
   }
   const seconds = Number(value);
-  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : undefined;
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - nowMs) : undefined;
+}
+
+export interface BybitRequestOptions {
+  priority?: RequestPriority;
+  signal?: AbortSignal | undefined;
+  maxAttempts?: number;
+}
+
+export function validateBar(bar: KlineBar): void {
+  const time = bar.openTime.getTime();
+  if (!Number.isSafeInteger(time) || time % MINUTE_MS !== 0) throw new Error("invalid kline minute timestamp");
+  for (const value of [bar.open, bar.high, bar.low, bar.close, bar.volume, bar.quoteTurnover]) {
+    if (typeof value !== "string" || value.length > 128 || !/^\d+(?:\.\d+)?$/.test(value)) throw new Error("invalid kline decimal");
+  }
 }
 
 function isAccessTooFrequent(status: number, bodyText: string): boolean {
@@ -50,6 +66,7 @@ function isAccessTooFrequent(status: number, bodyText: string): boolean {
 }
 
 export class BybitClient {
+  private readonly lifetime = new AbortController();
   constructor(
     private readonly transport: Transport,
     private readonly gate: AdaptiveGate,
@@ -61,6 +78,7 @@ export class BybitClient {
     symbol: string,
     fromMs: number,
     toMs: number,
+    options: BybitRequestOptions = {},
   ): Promise<KlineBar[]> {
     const collected = new Map<number, RawPageBar>();
     const windowMinutes = MAX_LIMIT - 1;
@@ -69,7 +87,7 @@ export class BybitClient {
     while (cursor <= toMs) {
       const windowStart = cursor;
       const windowEnd = Math.min(toMs, windowStart + windowMinutes * MINUTE_MS);
-      const rows = await this.fetchWindowWithRetry(symbol, windowStart, windowEnd);
+      const rows = await this.fetchWindowWithRetry(symbol, windowStart, windowEnd, options);
       const lastClosedMinuteStart =
         Math.floor(this.clock.nowMs() / MINUTE_MS) * MINUTE_MS;
       for (const bar of rows) {
@@ -95,12 +113,16 @@ export class BybitClient {
     symbol: string,
     startMs: number,
     endMs: number,
+    options: BybitRequestOptions,
   ): Promise<RawPageBar[]> {
     const url =
       `${this.baseUrl}/v5/market/kline?category=linear&symbol=${encodeURIComponent(symbol)}` +
       `&interval=1&start=${startMs}&end=${endMs}&limit=${MAX_LIMIT}`;
-    const { list } = await this.fetchResult<[string, string, string, string, string, string, string]>(url);
-    return list.map((row) => ({
+    const { list } = await this.fetchResult<[string, string, string, string, string, string, string]>(url, options);
+    if (list.length > MAX_LIMIT) throw new Error("Bybit kline page exceeds item limit");
+    return list.map((row) => {
+      if (!Array.isArray(row) || row.length !== 7) throw new Error("invalid Bybit kline row");
+      const bar = {
       openTimeMs: Number(row[0]),
       open: row[1],
       high: row[2],
@@ -108,7 +130,10 @@ export class BybitClient {
       close: row[4],
       volume: row[5],
       quoteTurnover: row[6],
-    }));
+      };
+      validateBar({ ...bar, openTime: new Date(bar.openTimeMs) });
+      return bar;
+    });
   }
 
   async fetchLinearPerpetualUsdtSymbols(): Promise<string[]> {
@@ -135,25 +160,34 @@ export class BybitClient {
     return [...symbols].sort();
   }
 
-  private async fetchResult<TRow>(url: string): Promise<{ list: TRow[]; nextPageCursor: string | undefined }> {
+  close(): void {
+    this.lifetime.abort(new Error("Bybit client stopped"));
+    this.gate.stop();
+    this.transport.abortActive?.();
+  }
+
+  get closedMinuteStartMs(): number { return Math.floor(this.clock.nowMs() / MINUTE_MS) * MINUTE_MS - MINUTE_MS; }
+
+  private async fetchResult<TRow>(url: string, options: BybitRequestOptions = {}): Promise<{ list: TRow[]; nextPageCursor: string | undefined }> {
     let lastError: unknown = undefined;
-    for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_PAGE; attempt += 1) {
-      await this.gate.acquire();
+    const signal = options.signal ? AbortSignal.any([options.signal, this.lifetime.signal]) : this.lifetime.signal;
+    for (let attempt = 0; attempt < (options.maxAttempts ?? MAX_ATTEMPTS_PER_PAGE); attempt += 1) {
+      signal.throwIfAborted();
       try {
-        const response = await this.transport.fetch(url);
+        return await this.gate.run(async () => {
+        const response = await this.transport.fetch(url, signal);
+        const retryAfter = parseRetryAfterMs(response.headers, this.clock.nowMs());
 
         if (response.status === 429) {
-          this.gate.reportThrottle(parseRetryAfterMs(response.headers));
-          lastError = new BybitApiError("http-429", "HTTP 429 frequency protection");
-          continue;
+          await this.gate.reportThrottle(Math.max(1000, retryAfter ?? 0));
+          throw new BybitApiError("http-429", "HTTP 429 frequency protection");
         }
 
         if (response.status === 403) {
           if (isAccessTooFrequent(response.status, response.bodyText)) {
-            const serverWait = parseRetryAfterMs(response.headers);
-            await this.gate.reportIpBan(serverWait);
-            lastError = new BybitApiError("ip-ban", "403 access too frequent");
-            continue;
+            this.transport.abortActive?.();
+            await this.gate.reportIpBan(retryAfter);
+            throw new BybitApiError("ip-ban", "403 access too frequent");
           }
           throw new BybitApiError(
             "forbidden",
@@ -163,7 +197,7 @@ export class BybitClient {
 
         if (response.status !== 200) {
           throw new BybitApiError(
-            "api-error",
+            response.status >= 500 ? "network" : "api-error",
             `unexpected HTTP ${response.status}: ${response.bodyText.slice(0, 200)}`,
           );
         }
@@ -175,9 +209,9 @@ export class BybitClient {
         };
 
         if (payload.retCode === 10006) {
-          this.gate.reportThrottle();
-          lastError = new BybitApiError("rate-limit", "retCode 10006 API rate limit");
-          continue;
+          const reset = Number(response.headers.get("x-bapi-limit-reset-timestamp"));
+          await this.gate.reportThrottle(Math.max(1000, retryAfter ?? 0, Number.isFinite(reset) ? reset - this.clock.nowMs() : 0));
+          throw new BybitApiError("rate-limit", "retCode 10006 API rate limit");
         }
 
         if (payload.retCode !== 0) {
@@ -187,14 +221,17 @@ export class BybitClient {
           );
         }
 
+        if (!Array.isArray(payload.result?.list)) throw new BybitApiError("api-error", "invalid Bybit result list");
         this.gate.reportSuccess();
-        return { list: payload.result?.list ?? [], nextPageCursor: payload.result?.nextPageCursor };
+        return { list: payload.result.list, nextPageCursor: payload.result.nextPageCursor };
+        }, options.priority ?? "history", signal);
       } catch (error) {
-        if (error instanceof BybitApiError && error.kind !== "network") {
+        signal.throwIfAborted();
+        if (error instanceof BybitApiError && (error.kind === "forbidden" || error.kind === "api-error")) {
           throw error;
         }
         lastError = error;
-        continue;
+        if (!(error instanceof BybitApiError) || error.kind === "network") await this.clock.sleep(Math.min(2000, 100 * 2 ** attempt), signal);
       }
     }
     throw lastError instanceof Error

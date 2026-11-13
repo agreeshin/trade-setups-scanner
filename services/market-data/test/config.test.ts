@@ -13,4 +13,13 @@ describe("market-data resource config", () => {
     expect(() => loadConfig({ DATABASE_URL: "postgresql://example/market", BACKFILL_MAX_PENDING_JOBS: "-1" })).toThrow("BACKFILL_MAX_PENDING_JOBS");
     expect(() => loadConfig({ DATABASE_URL: "postgresql://example/market", BACKFILL_ESTIMATED_BYTES_PER_MINUTE: "1.5" })).toThrow("BACKFILL_ESTIMATED_BYTES_PER_MINUTE");
   });
+  it("loads the single shared Bybit budget and rejects unsafe/unbounded source settings", () => {
+    const config = loadConfig({ DATABASE_URL: "postgresql://example/market" });
+    expect(config.bybit).toMatchObject({ requestTimeoutMs: 5000,
+      gate: { maxPerWindow: 150, minIntervalMs: 34, freshBurst: 6 }, fresh: { maxSymbols: 4096, ws: { shardSymbols: 200 } } });
+    for (const [key, value] of [["BYBIT_REST_MAX_RPS", "121"], ["BYBIT_WS_SHARD_SYMBOLS", "201"],
+      ["BYBIT_FRESH_MAX_SYMBOLS", "0"], ["BYBIT_REQUEST_TIMEOUT_MS", "Infinity"]]) {
+      expect(() => loadConfig({ DATABASE_URL: "postgresql://example/market", [key!]: value })).toThrow(key);
+    }
+  });
 });
