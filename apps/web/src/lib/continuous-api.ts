@@ -29,6 +29,15 @@ export interface ContinuousSlot {
   minSetupsPerDay: number;
   status: string;
   activeGenerationId: number | null;
+  // Optional only for rollout compatibility; absence is unknown, never implicitly ready.
+  activeStatus?: "active" | "inactive";
+  pendingGenerationId?: number | null;
+  pendingStatus?: string | null;
+  /** Unix seconds at the CLOSED minute boundary, not candle-open time. */
+  readinessFrontier?: number | null;
+  /** Opaque serde_json::Value from response.json(); do not assume an error-object schema. */
+  pendingError?: unknown;
+  liveWatermark?: number | null;
   studyId: number | null;
   meanExpectancy: number | null;
   selectedCell: RecommendedCell | null;
@@ -55,6 +64,8 @@ function isProcess(value: unknown): value is ContinuousProcess {
   if (value === null || typeof value !== "object") return false;
   const process = value as Partial<ContinuousProcess>;
   const nullableId = (id: unknown) => id === null || (typeof id === "number" && Number.isSafeInteger(id) && id > 0);
+  const optionalClosedBoundary = (time: unknown) => time === undefined || time === null || (typeof time === "number"
+    && Number.isSafeInteger(time) && time >= 0 && time % 60 === 0 && Number.isFinite(new Date(time * 1000).getTime()));
   const config = process.config;
   const validConfig = config === null || (config !== undefined && typeof config === "object" && typeof config.adaptiveEnabled === "boolean"
     && isContinuousLookbackDays(config.lookbackDays) && Number.isFinite(config.minMeanExpectancy)
@@ -68,6 +79,10 @@ function isProcess(value: unknown): value is ContinuousProcess {
     && (process.error === null || (process.error !== undefined && typeof process.error === "object" && typeof process.error.code === "string" && typeof process.error.message === "string"))
     && Array.isArray(process.slots) && process.slots.every((slot) => slot !== null && typeof slot === "object"
       && Number.isSafeInteger(slot.id) && slot.id > 0 && typeof slot.status === "string" && Number.isFinite(slot.minSetupsPerDay) && nullableId(slot.activeGenerationId) && nullableId(slot.studyId)
+      && (slot.activeStatus === undefined || slot.activeStatus === "active" || slot.activeStatus === "inactive")
+      && (slot.pendingGenerationId === undefined || nullableId(slot.pendingGenerationId))
+      && (slot.pendingStatus === undefined || slot.pendingStatus === null || typeof slot.pendingStatus === "string")
+      && optionalClosedBoundary(slot.readinessFrontier) && optionalClosedBoundary(slot.liveWatermark)
       && (slot.meanExpectancy === null || Number.isFinite(slot.meanExpectancy))
       && typeof slot.updatedAt === "string" && Number.isFinite(Date.parse(slot.updatedAt))
       && (slot.selectedCell === null || (typeof slot.selectedCell === "object" && slot.selectedCell !== undefined && [slot.selectedCell.tpPct, slot.selectedCell.slPct, slot.selectedCell.rawR, slot.selectedCell.meanR, slot.selectedCell.robustScore].every(Number.isFinite))));

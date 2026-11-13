@@ -48,13 +48,26 @@ fn continuous_config_locks_owned_coordinates_and_normalizes_manual_defaults() {
 async fn continuous_routes_authenticate_and_validate_before_database() {
     let pool=PgPoolOptions::new().connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test").unwrap();
     let router=continuous_router(state(pool));
-    for (method,url) in [("GET",path("")),("PUT",path("")),("POST",path("/start")),("POST",path("/stop"))] {
+    for (method,url) in [("GET",path("")),("PUT",path("")),("POST",path("/start")),("POST",path("/stop")),("GET","/v1/continuous-studies/cleanup".into()),("POST","/v1/continuous-studies/cleanup".into())] {
         let response=router.clone().oneshot(Request::builder().method(method).uri(url).header("content-type","application/json").body(Body::from(config().to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
     }
     for url in ["/v1/continuous-studies?ownerId=other","/v1/continuous-studies?algorithmId=missing"] {assert_eq!(request(&router,"GET",url,Value::Null).await.0,StatusCode::BAD_REQUEST);}
     let mut invalid=config();invalid["study"]["setupMaturity"]=json!(0);
     assert_eq!(request(&router,"PUT",&path(""),invalid).await.0,StatusCode::BAD_REQUEST);
+    for body in [json!({}),json!({"confirm":false,"fingerprint":"0".repeat(32)}),json!({"confirm":true,"fingerprint":"bad"}),json!({"confirm":true,"fingerprint":"0".repeat(32),"ownerId":"other"})] {
+        assert_eq!(request(&router,"POST","/v1/continuous-studies/cleanup",body).await.0,StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn continuous_cleanup_rejects_cookie_mutation_without_browser_origin_before_database() {
+    let pool=PgPoolOptions::new().connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test").unwrap();
+    let s=state(pool);
+    let setups_api::auth::PostSessionResult::Issued{token,..}=s.auth.post_session(Some("test-key"),setups_api::now_ms()) else {panic!("fixture login failed")};
+    let router=continuous_router(s);
+    let response=router.oneshot(Request::builder().method("POST").uri("/v1/continuous-studies/cleanup").header("cookie",format!("{}={token}",setups_api::COOKIE_NAME)).header("content-type","application/json").body(Body::from(json!({"confirm":true,"fingerprint":"0".repeat(32)}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(),StatusCode::FORBIDDEN);
 }
 
 struct TestDb{admin:PgPool,pool:PgPool,name:String}
@@ -73,6 +86,59 @@ impl TestDb {
         Self{admin,pool,name}
     }
     async fn cleanup(self) {self.pool.close().await;sqlx::query(&format!("drop database {} with(force)",self.name)).execute(&self.admin).await.unwrap();self.admin.close().await;}
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn cleanup_http_preserves_source_dtos_and_allows_confirmed_terminal_row_deletions() {
+    let database=TestDb::new().await;
+    let s=state(database.pool.clone());
+    let replay=Arc::new(setups_api::replay::ReplayState {pool:database.pool.clone(),auth:s.auth.clone(),market_url:"http://127.0.0.1:1".into(),market_key:"unused".into(),limits:Default::default()});
+    let router=continuous_router(s.clone())
+        .merge(optimization_router(Arc::new(OptimizationState {pool:database.pool.clone(),auth:s.auth.clone(),config:Default::default(),notify:Arc::new(tokio::sync::Notify::new()),available:Arc::new(AtomicBool::new(false))})))
+        .merge(setups_api::replay::replay_router(replay.clone())).merge(setups_api::batches::batches_router(replay));
+    assert_eq!(request(&router,"PUT",&path(""),config()).await.0,StatusCode::OK);
+    let slot=db::get(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap().slots[0].id;
+    let generation:i64=sqlx::query_scalar("insert into continuous_generations(owner_id,algorithm_id,slot_id,config_revision,lease_token,status,spec,execution_started_at,observation_cutoff,result) values('admin',$1,$2,1,1,'completed','{}',now(),0,'{\"analytics\":{\"matrix\":\"keep\"}}') returning id").bind(ALGORITHM).bind(slot).fetch_one(&database.pool).await.unwrap();
+    let study:i64=sqlx::query_scalar("insert into optimization_studies(algorithm_id,status,spec,progress,origin,owner_id,continuous_generation_id,continuous_slot_id) values($1,'completed','{}','{}','continuous','admin',$2,$3) returning id").bind(ALGORITHM).bind(generation).bind(slot).fetch_one(&database.pool).await.unwrap();
+    let batch:i32=sqlx::query_scalar("insert into replay_batches(exchange_code,category,algorithm_id,algorithm_version,params,from_ts,to_ts,instrument_count,origin,owner_id,continuous_generation_id) values('bybit','linear',$1,'1.1.1','{}',to_timestamp(0),to_timestamp(60),1,'continuous','admin',$2) returning id").bind(ALGORITHM).bind(generation).fetch_one(&database.pool).await.unwrap();
+    let mut runs=Vec::new();
+    for parent in [Some(batch),None] {
+        let id:i32=sqlx::query_scalar("insert into replay_runs(exchange_code,category,symbol,algorithm_id,algorithm_version,params,from_ts,to_ts,status,setups,batch_id,origin,owner_id,continuous_generation_id) values('bybit','linear','BTCUSDT',$1,'1.1.1','{}',to_timestamp(0),to_timestamp(60),'done','[]',$2,'continuous','admin',$3) returning id").bind(ALGORITHM).bind(parent).bind(generation).fetch_one(&database.pool).await.unwrap();runs.push(id);
+    }
+    sqlx::query("update continuous_generations set study_id=$2,replay_batch_id=$3 where id=$1").bind(generation).bind(study).bind(batch).execute(&database.pool).await.unwrap();
+    for url in [format!("/v1/optimization-studies/{study}"),format!("/v1/replay-runs/{}",runs[1]),format!("/v1/replay-batches/{batch}")] {
+        let (status,body)=request(&router,"DELETE",&url,Value::Null).await;
+        assert_eq!(status,StatusCode::CONFLICT);assert_eq!(body["error"],"continuous_history_referenced");
+    }
+    let url="/v1/continuous-studies/cleanup";
+    let (status,preview)=request(&router,"GET",url,Value::Null).await;
+    assert_eq!(status,StatusCode::OK);assert_eq!(preview["eligible"],true);
+    assert_eq!(preview["counts"]["generations"],1);assert_eq!(preview["retained"]["analyticsResults"],1);
+    let (status,result)=request(&router,"POST",url,json!({"confirm":true,"fingerprint":preview["fingerprint"]})).await;
+    assert_eq!(status,StatusCode::OK,"{result}");assert_eq!(result["deleted"]["studies"],1);
+    let (status,details)=request(&router,"GET",&format!("/v1/replay-batches/{batch}"),Value::Null).await;
+    assert_eq!(status,StatusCode::OK);assert_eq!(details["run"]["continuousGenerationId"],generation);assert_eq!(details["run"]["continuousStudyId"],study);
+    assert_eq!(details["continuousArchive"]["analytics"],json!({"matrix":"keep"}));
+    assert_eq!(details["continuousArchive"]["analyticsPresent"],true);
+    assert_eq!(details["continuousArchive"]["context"],json!({"effectiveAnalytics":null,"direction":null}));
+    let (_,history)=request(&router,"GET","/v1/replay-runs",Value::Null).await;
+    assert!(!history.to_string().contains("continuousArchive"),"lists must not load archived analytical blobs");
+    for url in [format!("/v1/replay-runs/{}",runs[1]),format!("/v1/replay-batches/{batch}")] {
+        let (status,body)=request(&router,"DELETE",&url,Value::Null).await;
+        assert_eq!(status,StatusCode::OK,"{body}");assert_eq!(body["deleted"],true);
+    }
+    let manual:i64=sqlx::query_scalar("insert into optimization_studies(algorithm_id,status,spec,progress,origin,owner_id) values($1,'completed','{}','{}','manual','admin') returning id").bind(ALGORITHM).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(request(&router,"DELETE",&format!("/v1/optimization-studies/{manual}"),Value::Null).await.0,StatusCode::OK);
+    let active:i64=sqlx::query_scalar("insert into optimization_studies(algorithm_id,status,spec,progress,origin,owner_id) values($1,'running','{}','{}','manual','admin') returning id").bind(ALGORITHM).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(request(&router,"DELETE",&format!("/v1/optimization-studies/{active}"),Value::Null).await.0,StatusCode::CONFLICT);
+    let (_,again)=request(&router,"GET",url,Value::Null).await;
+    let (status,zero)=request(&router,"POST",url,json!({"confirm":true,"fingerprint":again["fingerprint"]})).await;
+    assert_eq!(status,StatusCode::OK);assert_eq!(zero["deleted"]["studies"],0);
+    assert_eq!(request(&router,"POST",&path("/start"),Value::Null).await.0,StatusCode::ACCEPTED);
+    let (status,blocked)=request(&router,"POST",url,json!({"confirm":true,"fingerprint":again["fingerprint"]})).await;
+    assert_eq!(status,StatusCode::CONFLICT);assert_eq!(blocked["error"],"continuous_cleanup_blocked");
+    database.cleanup().await;
 }
 
 #[derive(Default)]
@@ -113,6 +179,27 @@ async fn wait_sql(pool:&PgPool,sql:&str)->Value {
     }}).await.unwrap_or_else(|_|panic!("transition timeout: {sql}"))
 }
 
+// Explicit readiness transition for API-only fixtures: no worker/scanner is running here.
+async fn promote_fixture_pending(pool:&PgPool)->i64 {
+    use setups_db::continuous::live::*;
+    let pending=pending_adaptive_slots(pool,ADMIN_OWNER).await.unwrap().remove(0);
+    let profile=&pending.profile;
+    let bootstrap=&profile.result["bootstrap"];
+    let frontier=bootstrap["nextOpenUnix"].as_i64().unwrap();
+    let mut expected=Vec::new(); let mut initial=Vec::new();
+    for raw in bootstrap["instruments"].as_array().unwrap() {
+        let instrument=&raw["instrument"];
+        let key=format!("{}/{}/{}",instrument["exchange"].as_str().unwrap(),instrument["category"].as_str().unwrap(),instrument["symbol"].as_str().unwrap());
+        expected.push(CheckpointExpectation {instrument_key:key.clone(),checkpoint:db::get_adaptive_checkpoint(pool,profile.slot_id,&key).await.unwrap()});
+        initial.push(InitialAdaptiveCheckpoint {instrument_key:key,state:json!({"generationId":profile.generation_id,"nextOpenUnix":frontier,"lastRawOpenUnix":raw["lastRawOpenUnix"],"lastRawClusterTime":raw["lastRawClusterTime"]})});
+    }
+    setups_db::settings_set(pool,"live",&json!({"enabled":true})).await.unwrap();
+    let lease=claim_pending_warmup(pool,&pending,"api-fixture-readiness").await.unwrap().unwrap();
+    assert!(report_warmup(pool,&lease,"ready",Some(frontier),None).await.unwrap());
+    assert!(promote_pending(pool,&lease,pending.expected_active_generation_id,&expected,frontier,&initial).await.unwrap());
+    profile.generation_id
+}
+
 #[tokio::test]
 #[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn real_chain_persists_service_set_recomputes_analytics_activates_and_stop_preserves_completed_history() {
@@ -139,6 +226,12 @@ async fn real_chain_persists_service_set_recomputes_analytics_activates_and_stop
     assert_eq!(generation["result"]["setupSetId"],format!("batch-{batch_id}"));
     assert_eq!(generation["result"]["analytics"]["evaluation"]["matrix"],generation["result"]["best"]["matrix"]);
     assert!(generation["result"]["bootstrap"]["instruments"][0].get("setups").is_none());
+    assert_eq!(generation["result"]["bootstrap"]["frozenPrefix"]["version"],1);
+    assert_eq!(generation["result"]["bootstrap"]["frozenPrefix"]["instruments"][0]["sha256"].as_str().unwrap().len(),64);
+    let staged=db::get(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap();
+    assert!(staged.slots[0].active_generation_id.is_none());
+    assert_eq!(staged.slots[0].pending_generation_id,Some(generation_id));
+    assert_eq!(staged.slots[0].pending_status.as_deref(),Some("warming"));
     assert_eq!(market.state.catalog_calls.load(Ordering::SeqCst),1,"post-chain must not refetch market data");
     let (_,history)=request(&router,"GET","/v1/optimization-studies",Value::Null).await;
     assert_eq!(history["studies"][0]["origin"],"continuous");
@@ -153,9 +246,11 @@ async fn real_chain_persists_service_set_recomputes_analytics_activates_and_stop
     let revision=db::get(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap().config_revision;
     let mut updated=config();updated["adaptiveEnabled"]=json!(false);
     let (status,disabled)=request(&router,"PUT",&path(""),updated.clone()).await;assert_eq!(status,StatusCode::OK);
-    assert_eq!(disabled["configRevision"],revision);assert_eq!(disabled["slots"][0]["activeGenerationId"],generation_id);
+    assert_eq!(disabled["configRevision"],revision);assert!(disabled["slots"][0]["activeGenerationId"].is_null());
+    assert_eq!(disabled["slots"][0]["pendingGenerationId"],generation_id);
     assert!(db::active_adaptive_slots(&database.pool,ADMIN_OWNER).await.unwrap().is_empty());
     updated["adaptiveEnabled"]=json!(true);assert_eq!(request(&router,"PUT",&path(""),updated).await.0,StatusCode::OK);
+    assert_eq!(promote_fixture_pending(&database.pool).await,generation_id);
     assert_eq!(db::active_adaptive_slots(&database.pool,ADMIN_OWNER).await.unwrap()[0].study_id,study_id);
     assert_eq!(request(&router,"POST",&path("/stop"),Value::Null).await.0,StatusCode::ACCEPTED);
     wait_sql(&database.pool,"select to_jsonb(p) from continuous_processes p where status='stopped'").await;
@@ -221,6 +316,7 @@ async fn completed_nonpass_replaces_only_own_slot_and_keeps_previous_completed_c
     request(&router,"PUT",&path(""),config()).await;request(&router,"POST",&path("/start"),Value::Null).await;
     let first=wait_sql(&database.pool,"select to_jsonb(g) from continuous_generations g where accepted=true").await;
     market.state.blocked.store(true,Ordering::SeqCst);market.state.losing.store(true,Ordering::SeqCst);
+    promote_fixture_pending(&database.pool).await;
     wait_sql(&database.pool,"select to_jsonb(g) from continuous_generations g where status='running'").await;
     assert_eq!(db::get(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap().slots[0].active_generation_id,first["id"].as_i64());
     market.state.blocked.store(false,Ordering::SeqCst);
@@ -244,6 +340,7 @@ async fn transport_failure_keeps_accepted_slot_and_retries_are_bounded() {
     request(&router,"PUT",&path(""),config()).await;request(&router,"POST",&path("/start"),Value::Null).await;
     let first=wait_sql(&database.pool,"select to_jsonb(g) from continuous_generations g where accepted=true").await;
     market.state.failing.store(true,Ordering::SeqCst);
+    promote_fixture_pending(&database.pool).await;
     wait_sql(&database.pool,"select to_jsonb(p) from continuous_processes p where retry_count=3 and status='error'").await;
     let process=db::get(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap();
     assert_eq!(process.slots[0].active_generation_id,first["id"].as_i64());

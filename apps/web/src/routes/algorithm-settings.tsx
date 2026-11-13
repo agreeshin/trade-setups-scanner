@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useState, type FormEvent } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
 import { Checkbox } from "../components/ui/checkbox";
@@ -15,6 +15,7 @@ import { OptimizationDeleteDialog, OptimizationHistory } from "./optimization-hi
 import { useOptimizationStudies, type OptimizationController } from "./use-optimization-studies";
 import { useContinuousStudy } from "./use-continuous-study";
 import { AdaptiveLive, ContinuousResearch } from "./continuous-study";
+import { ContinuousHistoryCleanup } from "./continuous-history-cleanup";
 
 const groups = [
   { title: "Цена и объём", keys: ["priceGrowthPct", "priceDropPct", "windowMinutes", "volumeMultiplier"] },
@@ -23,8 +24,8 @@ const groups = [
 ];
 
 type SavedAlgorithm = Partial<Pick<Algorithm, "enabled" | "externalName">> & { adaptiveEnabled?: boolean };
-function AlgorithmForm({ algorithm, optimization, onSaved }: { algorithm: Algorithm; optimization: OptimizationController; onSaved: (id: string, patch: SavedAlgorithm) => void }) {
-  const continuous = useContinuousStudy(algorithm.id);
+function AlgorithmForm({ algorithm, optimization, onSaved, continuousRevision, cleanupRevision }: { algorithm: Algorithm; optimization: OptimizationController; onSaved: (id: string, patch: SavedAlgorithm) => void; continuousRevision: number; cleanupRevision: number }) {
+  const continuous = useContinuousStudy(algorithm.id, continuousRevision);
   const displayName = algorithmDisplayName(algorithm);
   const [externalName, setExternalName] = useState(displayName);
   const [nameBusy, setNameBusy] = useState(false);
@@ -36,10 +37,13 @@ function AlgorithmForm({ algorithm, optimization, onSaved }: { algorithm: Algori
   useEffect(() => { if (continuous.revision > 0) refreshOptimization(); }, [continuous.revision, refreshOptimization]);
   const [params, setParams] = useState(algorithm.params);
   const [baseline, setBaseline] = useState(algorithm.params);
+  const optimizerAlgorithm = useMemo(() => ({ ...algorithm, params: baseline }), [algorithm, baseline]);
   const [optimizationOpen, setOptimizationOpen] = useState(false);
-  const [historySelection, setHistorySelection] = useState<{ id: number; open: boolean; triggerId: string } | null>(null);
+  const [historySelection, setHistorySelection] = useState<{ id: number; open: boolean; triggerId: string; continuous: boolean; cleanupRevision: number } | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [deleteTarget, setDeleteTarget] = useState<OptimizationStudyAction | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<(OptimizationStudyAction & { cleanupRevision: number }) | null>(null);
+  const selectedHistory = historySelection?.continuous && historySelection.cleanupRevision !== cleanupRevision ? null : historySelection;
+  const selectedDeleteTarget = deleteTarget?.origin === "continuous" && deleteTarget.cleanupRevision !== cleanupRevision ? null : deleteTarget;
   const optimizerTriggerId = useId();
   const historyTriggerId = useId();
   const historyDialogId = useId();
@@ -50,10 +54,10 @@ function AlgorithmForm({ algorithm, optimization, onSaved }: { algorithm: Algori
   const ungrouped = algorithm.fields.filter((field) => !groups.some((group) => group.keys.includes(field.key)));
   const fieldGroups = [...groups, ...(ungrouped.length ? [{ title: "Другие параметры", keys: ungrouped.map((field) => field.key) }] : [])];
   const requestDelete = (study: OptimizationStudyAction) => {
-    optimization.clearError(); setDeleteTarget({ id: study.id, status: study.status });
+    optimization.clearError(); setDeleteTarget({ id: study.id, status: study.status, ...(study.origin ? { origin: study.origin } : {}), cleanupRevision });
   };
-  const selectHistory = (id: number, triggerId: string) => {
-    setOptimizationOpen(false); setHistorySelection({ id, open: true, triggerId });
+  const selectHistory = (id: number, triggerId: string, continuous: boolean) => {
+    setOptimizationOpen(false); setHistorySelection({ id, open: true, triggerId, continuous, cleanupRevision });
   };
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -124,7 +128,7 @@ function AlgorithmForm({ algorithm, optimization, onSaved }: { algorithm: Algori
       <Button id={optimizerTriggerId} type="button" variant="outline" aria-label={`Оптимизировать ${displayName}`} onClick={() => { setHistoryOpen(false); setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setOptimizationOpen(true); }}>Оптимизировать</Button>
       <Button id={historyTriggerId} type="button" variant="outline" onClick={() => { setOptimizationOpen(false); setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setHistoryOpen(true); }}>Посмотреть весь список</Button>
     </div>
-    <ContinuousResearch algorithm={{ ...algorithm, params: baseline }} controller={continuous} />
+    <ContinuousResearch algorithm={optimizerAlgorithm} controller={continuous} />
     <OptimizationHistory algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} pageSize={5} pagination={false} onSelect={selectHistory} onDelete={requestDelete} />
     </section>
   </form>
@@ -133,13 +137,13 @@ function AlgorithmForm({ algorithm, optimization, onSaved }: { algorithm: Algori
         <DialogHeader><DialogTitle>Все оптимизации · {displayName}</DialogTitle><DialogDescription>Полная история исследований алгоритма. ID открывает сохранённый результат, не закрывая список.</DialogDescription></DialogHeader>
         <div className="grid min-h-0 min-w-0 gap-4 overflow-y-auto pr-1">
           {optimization.error && <Alert variant="destructive" role="alert">{optimization.error}<Button type="button" variant="outline" onClick={optimization.refresh}>Обновить статус оптимизации</Button></Alert>}
-          {historyOpen && <OptimizationHistory algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} pageSize={10} active={historySelection?.open !== true && deleteTarget === null} onSelect={selectHistory} onDelete={requestDelete} />}
+          {historyOpen && <OptimizationHistory algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} pageSize={10} active={selectedHistory?.open !== true && selectedDeleteTarget === null} onSelect={selectHistory} onDelete={requestDelete} />}
         </div>
       </DialogContent>
     </Dialog>
-    <AlgorithmOptimizer algorithm={{ ...algorithm, params: baseline }} controller={optimization} open={optimizationOpen} onOpenChange={setOptimizationOpen} returnFocusId={optimizerTriggerId} onDelete={requestDelete} />
-    <OptimizationStudyDialog id={historySelection?.id} algorithm={algorithm} controller={optimization} open={historySelection?.open === true} onOpenChange={(open) => setHistorySelection((previous) => previous ? { ...previous, open } : null)} returnFocusId={historySelection?.triggerId ?? optimizerTriggerId} fallbackFocusId={historyOpen ? historyDialogId : optimizerTriggerId} onDelete={requestDelete} />
-    <OptimizationDeleteDialog target={deleteTarget} controller={optimization} onClose={() => setDeleteTarget(null)} onDeleted={(id) => {
+    <AlgorithmOptimizer algorithm={optimizerAlgorithm} controller={optimization} open={optimizationOpen} onOpenChange={setOptimizationOpen} returnFocusId={optimizerTriggerId} onDelete={requestDelete} />
+    <OptimizationStudyDialog id={selectedHistory?.id} algorithm={algorithm} controller={optimization} open={selectedHistory?.open === true} onOpenChange={(open) => setHistorySelection((previous) => previous ? { ...previous, open } : null)} returnFocusId={selectedHistory?.triggerId ?? optimizerTriggerId} fallbackFocusId={historyOpen ? historyDialogId : optimizerTriggerId} onDelete={requestDelete} />
+    <OptimizationDeleteDialog target={selectedDeleteTarget} controller={optimization} onClose={() => setDeleteTarget(null)} onDeleted={(id) => {
       if (historySelection?.id === id) setHistorySelection(null);
       if (optimization.byAlgorithm[algorithm.id]?.id === id) setOptimizationOpen(false);
       setDeleteTarget(null);
@@ -153,18 +157,25 @@ function hasEnabledLiveMode(algorithm: Pick<Algorithm, "enabled"> & { adaptiveEn
 
 function AlgorithmForms({ algorithms }: { algorithms: Algorithm[] }) {
   const optimization = useOptimizationStudies(algorithms.map((algorithm) => algorithm.id));
+  const [continuousRevision, setContinuousRevision] = useState(0);
+  const [cleanupRevision, setCleanupRevision] = useState(0);
   const [selected, setSelected] = useState(algorithms[0]?.id ?? "");
   const [saved, setSaved] = useState<Record<string, SavedAlgorithm>>({});
   const onSaved = useCallback((id: string, patch: SavedAlgorithm) => setSaved((previous) => ({ ...previous, [id]: { ...previous[id], ...patch } })), []);
+  // Keep metadata identity stable during refresh: open forms must not restore their draft over local edits.
+  const displayAlgorithms = useMemo(() => algorithms.map((algorithm) => ({ ...algorithm, externalName: saved[algorithm.id]?.externalName ?? algorithmDisplayName(algorithm) })), [algorithms, saved]);
+  const refreshStates = () => { optimization.refresh(); setContinuousRevision((value) => value + 1); };
   const items = algorithms.map((algorithm) => ({ id: algorithm.id, label: saved[algorithm.id]?.externalName ?? algorithmDisplayName(algorithm),
     ...(hasEnabledLiveMode({ enabled: saved[algorithm.id]?.enabled ?? algorithm.enabled, adaptiveEnabled: saved[algorithm.id]?.adaptiveEnabled ?? false }) ? { status: "Live-сканирование включено" } : {}),
   }));
-  return <PageSidebar label="Алгоритмы" items={items} value={selected} onValueChange={setSelected}>
-    {algorithms.map((algorithm) => <PageSidebarPanel key={algorithm.id} value={algorithm.id}>
-      <AlgorithmForm algorithm={{ ...algorithm, externalName: saved[algorithm.id]?.externalName ?? algorithmDisplayName(algorithm) }} optimization={optimization} onSaved={onSaved} />
+  return <>
+    <ContinuousHistoryCleanup disabled={optimization.creating || optimization.cancelling !== null || optimization.deleting !== null} onRefreshStates={refreshStates} onDeleted={() => { refreshStates(); setCleanupRevision((value) => value + 1); }} />
+    <PageSidebar label="Алгоритмы" items={items} value={selected} onValueChange={setSelected}>
+    {displayAlgorithms.map((algorithm) => <PageSidebarPanel key={algorithm.id} value={algorithm.id}>
+      <AlgorithmForm algorithm={algorithm} optimization={optimization} onSaved={onSaved} continuousRevision={continuousRevision} cleanupRevision={cleanupRevision} />
     </PageSidebarPanel>)}
     {algorithms.length === 0 && <p className="text-sm text-muted-foreground">Алгоритмов пока нет.</p>}
-  </PageSidebar>;
+  </PageSidebar></>;
 }
 
 export function AlgorithmSettings() {

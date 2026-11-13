@@ -20,12 +20,18 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let mut continuous_config=setups_api::continuous::ContinuousRuntimeConfig::from_env().unwrap_or_else(|error|{eprintln!("{error}");std::process::exit(1)});
+    config.resources.validate_continuous(&continuous_config).unwrap_or_else(|error|{eprintln!("runtime resource admission failed: {error}");std::process::exit(1)});
+    continuous_config.replay_admission=config.replay_limits;
+    // Continuous storage cannot consume the ordinary lane's final five-percent reserve.
+    continuous_config.max_database_bytes=continuous_config.max_database_bytes.min(config.replay_limits.max_database_bytes.saturating_sub(config.replay_limits.max_database_bytes/20));
     if let Err(message) = setups_api::restore::apply_pending_restore(&config) {
         eprintln!("pending restore failed: {message}");
         std::process::exit(1);
     }
     let pool = match PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(config.resources.api_db_connections)
+        .acquire_timeout(Duration::from_secs(5))
         .connect(&config.database_url)
         .await
     {
@@ -42,6 +48,11 @@ async fn main() {
             std::process::exit(1);
         }
     }
+    let live_pool=connect_lane(&config.database_url,config.resources.live_db_connections,"live").await;
+    let manual_pool=connect_lane(&config.database_url,config.resources.manual_db_connections,"manual").await;
+    let continuous_pool=connect_lane(&config.database_url,config.resources.continuous_db_connections,"continuous").await;
+    setups_db::continuous::outbox::configure_limits(&live_pool,config.resources.notification_max_jobs,config.resources.notification_max_bytes)
+        .await.unwrap_or_else(|error|{eprintln!("notification budget configuration failed: {error}");std::process::exit(1)});
     let live_status = json!({
         "running": false,
         "lastScanAt": serde_json::Value::Null,
@@ -66,7 +77,7 @@ async fn main() {
         market_key: config.market_data_api_key.clone(),
     });
     let jobs = match setups_worker::start_replay_jobs(
-        pool.clone(),
+        manual_pool.clone(),
         config.market_data_url.clone(),
         config.market_data_api_key.clone(),
         config.replay_workers,
@@ -81,12 +92,12 @@ async fn main() {
         }
     };
     let live_runtime = setups_worker::live::start_live_runtime(
-        pool.clone(),
+        live_pool,
         config.market_data_url.clone(),
         config.market_data_api_key.clone(),
     );
     let optimization_runtime = match setups_api::optimization::start_optimization_runtime(
-        pool.clone(),
+        manual_pool,
         config.market_data_url.clone(),
         config.market_data_api_key.clone(),
         config.optimization.clone(),
@@ -106,11 +117,7 @@ async fn main() {
         notify: optimization_runtime.notify.clone(),
         available: optimization_runtime.available.clone(),
     });
-    let mut continuous_config=setups_api::continuous::ContinuousRuntimeConfig::from_env().unwrap_or_else(|error|{eprintln!("{error}");std::process::exit(1)});
-    continuous_config.replay_admission=config.replay_limits;
-    // Continuous storage cannot consume the ordinary lane's final five-percent reserve.
-    continuous_config.max_database_bytes=continuous_config.max_database_bytes.min(config.replay_limits.max_database_bytes.saturating_sub(config.replay_limits.max_database_bytes/20));
-    let continuous_runtime=setups_api::continuous::runtime::start_continuous_runtime(pool.clone(),config.market_data_url.clone(),config.market_data_api_key.clone(),continuous_config.clone()).await.unwrap_or_else(|error|{eprintln!("continuous runtime failed to start: {error}");std::process::exit(1)});
+    let continuous_runtime=setups_api::continuous::runtime::start_continuous_runtime(continuous_pool,config.market_data_url.clone(),config.market_data_api_key.clone(),continuous_config.clone()).await.unwrap_or_else(|error|{eprintln!("continuous runtime failed to start: {error}");std::process::exit(1)});
     let continuous_state=Arc::new(setups_api::continuous::ContinuousState{pool:pool.clone(),auth:auth.clone(),config:continuous_config,notify:continuous_runtime.notify.clone(),available:continuous_runtime.available.clone()});
     let analytics_state = std::sync::Arc::new(setups_api::analytics::AnalyticsState {
         pool: pool.clone(),
@@ -165,6 +172,11 @@ async fn main() {
         eprintln!("server error: {error}");
         std::process::exit(1);
     }
+}
+
+async fn connect_lane(url: &str, connections: u32, lane: &str) -> sqlx::PgPool {
+    PgPoolOptions::new().max_connections(connections).acquire_timeout(Duration::from_secs(5)).connect(url).await
+        .unwrap_or_else(|error|{eprintln!("{lane} database lane connection failed: {error}");std::process::exit(1)})
 }
 
 async fn shutdown_signal(

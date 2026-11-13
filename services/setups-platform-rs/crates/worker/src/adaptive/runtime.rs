@@ -1,523 +1,610 @@
 use super::*;
 use serde_json::json;
-use setups_db::continuous::{self, ActiveAdaptiveSlot, AdaptiveSetupWrite};
-use setups_db::push::{
-    delete_push_subscription, get_or_create_vapid_keys, list_push_subscriptions,
-    valid_push_endpoint,
-};
+use setups_db::continuous::{self, ActiveAdaptiveSlot, live};
 use setups_db::settings_get;
-use setups_domain::{AdaptiveRecommendationSnapshot, RecommendationDirection};
-use setups_mdclient::{ApiCandleSource, CatalogInstrument, MarketDataClient};
+use setups_domain::RecommendationDirection;
+use setups_mdclient::{CandlesQuery, CatalogInstrument, MarketDataClient, TailBatchQuery};
 pub use setups_optimizer::ContinuousBootstrap as AdaptiveLiveBootstrap;
-use setups_optimizer::{ContinuousInstrumentBootstrap, StudyRequest};
 use sqlx::PgPool;
-use std::collections::{BTreeSet, HashSet};
-use web_push::{
-    ContentEncoding, HyperWebPushClient, SubscriptionInfo, VapidSignatureBuilder, WebPushClient,
-    WebPushError, WebPushMessageBuilder,
-};
+use std::{collections::{BTreeMap,BTreeSet},sync::Arc,time::{Duration,Instant}};
+use crate::adaptive::state::{ProfileSpec,PreparedProfile};
 
+mod delivery;
+mod profile;
+mod store;
+mod source;
+mod promotion;
 mod text;
+use profile::{LiveProfile,RecommendationEnvelope};
+pub use store::PgAdaptiveStore;
 pub use text::recommendation_message;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RecommendationEnvelope {
-    #[serde(flatten)]
-    snapshot: AdaptiveRecommendationSnapshot,
-    study_id: i64,
-    generation_id: i64,
-    slot_id: i64,
-    owner_id: String,
-    external_name: String,
-    params: AlgorithmParams,
-}
+const HISTORY_PAGE_LIMIT:u32=5000;
+const IO_CONCURRENCY:usize=4;
+const COMMIT_CONCURRENCY:usize=16;
+const WARMUP_TIME_SLICE:Duration=Duration::from_secs(1);
 
-struct LiveProfile {
-    fence: AdaptiveFence,
-    params: AlgorithmParams,
-    bootstrap: AdaptiveLiveBootstrap,
-    recommendation: Value,
-    cluster_gap_minutes: Option<u32>,
-    live_from_close_unix: i64,
-}
+fn instrument_key(instrument:&AdaptiveInstrument)->String {format!("{}/{}/{}",instrument.exchange,instrument.category,instrument.symbol)}
+fn instrument(item:&CatalogInstrument)->AdaptiveInstrument {AdaptiveInstrument {exchange:item.exchange.clone(),category:item.category.clone(),symbol:item.symbol.clone()}}
 
-impl LiveProfile {
-    fn parse(slot: &ActiveAdaptiveSlot) -> Result<Self, WorkerError> {
-        let params: AlgorithmParams = serde_json::from_value(slot.params.clone())?;
-        let snapshot: AdaptiveRecommendationSnapshot = serde_json::from_value(
-            slot.result
-                .get("recommendation")
-                .cloned()
-                .ok_or_else(|| invalid("missing result.recommendation"))?,
-        )?;
-        let bootstrap: AdaptiveLiveBootstrap = serde_json::from_value(
-            slot.result
-                .get("bootstrap")
-                .cloned()
-                .ok_or_else(|| invalid("missing result.bootstrap"))?,
-        )?;
-        let spec: StudyRequest = serde_json::from_value(slot.spec.clone())?;
-        let expected: BTreeSet<_> = spec.instruments.iter().cloned().collect();
-        let actual: BTreeSet<_> = bootstrap
-            .instruments
-            .iter()
-            .map(|raw| raw.instrument.clone())
-            .collect();
-        if params.algorithm_id() != slot.algorithm_id
-            || params.algorithm_version() != spec.algorithm_version
-            || snapshot.provenance.algorithm_id != slot.algorithm_id
-            || snapshot.provenance.algorithm_version != spec.algorithm_version
-            || snapshot.provenance.from_unix != spec.from_unix
-            || snapshot.provenance.to_unix != spec.to_unix
-            || snapshot.provenance.observation_cutoff != bootstrap.observation_cutoff
-            || snapshot.provenance.snapshot_hash != bootstrap.provenance.snapshot_hash
-            || snapshot.provenance.optimizer_version != bootstrap.provenance.optimizer_version
-            || snapshot.provenance.seed != bootstrap.provenance.seed
-            || snapshot.provenance.captured_at != bootstrap.provenance.captured_at
-            || snapshot.provenance.seed != spec.seed
-            || serde_json::to_value(snapshot.direction)?.as_str() != Some(slot.direction.as_str())
-            || slot.analytics["clusterEnabled"].as_bool() != Some(snapshot.cluster_enabled)
-            || slot.analytics["timeShiftMinutes"].as_i64() != Some(snapshot.time_shift_minutes)
-            || slot.analytics["priceChangePct"].as_f64() != snapshot.price_change_pct
-            || (snapshot.cluster_enabled
-                && slot.analytics["clusterGapMinutes"].as_i64() != snapshot.cluster_gap_minutes)
-            || slot.selected_cell["tpPct"].as_f64() != Some(snapshot.tp_pct)
-            || slot.selected_cell["slPct"].as_f64() != Some(snapshot.sl_pct)
-            || slot.selected_cell["rawR"].as_f64() != Some(snapshot.raw_r)
-            || bootstrap.export_from_unix != spec.from_unix
-            || bootstrap.export_to_unix != spec.to_unix
-            || snapshot.mean_r != slot.mean_expectancy
-            || ![
-                snapshot.tp_pct,
-                snapshot.sl_pct,
-                snapshot.raw_r,
-                snapshot.mean_r,
-                snapshot.robust_score,
-            ]
-            .iter()
-            .all(|number| number.is_finite())
-            || !(0.0 < snapshot.tp_pct && snapshot.tp_pct <= 100.0)
-            || !(0.0 < snapshot.sl_pct && snapshot.sl_pct <= 100.0)
-            || !(0..=43200).contains(&snapshot.time_shift_minutes)
-            || snapshot
-                .price_change_pct
-                .is_some_and(|pct| !pct.is_finite() || !(-100.0..=1000.0).contains(&pct))
-            || slot.external_name.trim().is_empty()
-            || slot.external_name.chars().count() > 120
-            || slot.external_name.len() > 480
-            || slot.external_name.chars().any(char::is_control)
-            || expected != actual
-            || actual.len() != bootstrap.instruments.len()
-            || actual.len() > 1000
-            || bootstrap.next_open_unix.rem_euclid(60) != 0
-            || bootstrap.next_open_unix < 0
-            || bootstrap.next_open_unix > bootstrap.observation_cutoff
-            || bootstrap.detector_warmup_from_unix.rem_euclid(60) != 0
-            || bootstrap.emit_from_close_unix != bootstrap.observation_cutoff + 60
-            || bootstrap.instruments.iter().any(|raw| {
-                raw.last_raw_cluster_time.is_some_and(|time| {
-                    time < 60 || time > bootstrap.next_open_unix || time % 60 != 0
-                }) || raw.last_raw_open_unix.map(|time| time + 60) != raw.last_raw_cluster_time
-            })
-        {
-            return Err(invalid(
-                "accepted profile/bootstrap identity or values mismatch",
-            ));
+#[derive(Clone)]
+struct SymbolPlan {
+    epoch:String,
+    instrument:AdaptiveInstrument,
+    catalog_id:i64,
+    specs:Vec<ProfileSpec>,
+    slots:BTreeMap<String,Arc<ActiveAdaptiveSlot>>,
+}
+struct Warmup {
+    pending:live::PendingAdaptiveSlot,
+    lease:live::WarmupLease,
+    plans:Vec<SymbolPlan>,
+    candidate_key:String,
+    cohort:BTreeSet<String>,
+    barrier_attempts:u32,
+}
+pub struct AdaptiveLiveRuntime {
+    state:AdaptiveRuntime,
+    warmup:Option<Warmup>,
+    worker:String,
+    next_pending:usize,
+    warm_cursor:usize,
+    peak_staging_epochs:usize,
+}
+impl AdaptiveLiveRuntime {
+    pub fn new(limits:AdaptiveRuntimeLimits)->Self {
+        Self {state:AdaptiveRuntime::new(limits),warmup:None,
+            worker:format!("adaptive-live-{}",std::process::id()),next_pending:0,warm_cursor:0,peak_staging_epochs:0}
+    }
+    pub fn peak_staging_epochs(&self)->usize {self.peak_staging_epochs}
+    pub fn retained_history_epochs(&self)->usize {self.state.retained_history_epochs()}
+    pub fn retained_history_bytes(&self)->usize {self.state.retained_history_bytes()}
+    pub fn retained_profile_bytes(&self)->usize {self.state.retained_profile_bytes()}
+    async fn active_plans(&mut self,pool:&PgPool,slots:&[Arc<ActiveAdaptiveSlot>],catalog:&[CatalogInstrument])->Result<Vec<SymbolPlan>,WorkerError> {
+        if slots.len()>self.state.limits.max_profiles {return Err(invalid("active live slot count exceeds admission budget"));}
+        let mut plans:BTreeMap<String,SymbolPlan>=BTreeMap::new();
+        for slot in slots {
+            let profile=LiveProfile::parse(slot)?;
+            for seed in &profile.bootstrap.instruments {
+                let matches:Vec<_>=catalog.iter().filter(|c|c.status=="active" && c.exchange==seed.instrument.exchange
+                    && c.category==seed.instrument.category && c.symbol==seed.instrument.symbol).collect();
+                if matches.len()>1 {return Err(invalid("ambiguous active listing"));}
+                let Some(item)=matches.first() else {continue;};
+                let instrument=instrument(item);
+                let key=profile.fence_key();
+                let epoch=self.state.profile_epoch(&instrument,&key).unwrap_or_else(||AdaptiveRuntime::epoch_key(&instrument,None));
+                let checkpoint=match self.state.cached_checkpoint(&epoch,&key) {
+                    Some(checkpoint)=>checkpoint,
+                    None=>store::load_checkpoint(pool,slot.slot_id,&instrument).await?,
+                };
+                let spec=profile.spec(seed,checkpoint,false)?;
+                let plan=plans.entry(epoch.clone()).or_insert_with(||SymbolPlan {epoch,instrument,catalog_id:item.id,specs:Vec::new(),slots:BTreeMap::new()});
+                plan.slots.insert(spec.key(),slot.clone());plan.specs.push(spec);
+            }
         }
-        let cluster_gap_minutes = if snapshot.cluster_enabled {
-            Some(
-                u32::try_from(
-                    snapshot
-                        .cluster_gap_minutes
-                        .filter(|gap| (1..=10080).contains(gap))
-                        .ok_or_else(|| invalid("missing causal cluster gap"))?,
-                )
-                .map_err(|_| invalid("invalid causal gap"))?,
-            )
-        } else {
-            None
-        };
-        let recommendation = serde_json::to_value(RecommendationEnvelope {
-            snapshot,
-            study_id: slot.study_id,
-            generation_id: slot.generation_id,
-            slot_id: slot.slot_id,
-            owner_id: slot.owner_id.clone(),
-            external_name: slot.external_name.clone(),
-            params: params.clone(),
-        })?;
-        let live_from_close_unix = bootstrap.emit_from_close_unix;
-        Ok(Self {
-            fence: AdaptiveFence {
-                owner_id: slot.owner_id.clone(),
-                algorithm_id: slot.algorithm_id.clone(),
-                slot_id: slot.slot_id,
-                generation_id: slot.generation_id,
-                config_revision: slot.config_revision,
-            },
-            params,
-            bootstrap,
-            recommendation,
-            cluster_gap_minutes,
-            live_from_close_unix,
-        })
+        Ok(plans.into_values().collect())
     }
-}
-
-pub struct PgAdaptiveStore<'a> {
-    pub pool: &'a PgPool,
-    pub slot: &'a ActiveAdaptiveSlot,
-}
-
-impl AdaptiveStore for PgAdaptiveStore<'_> {
-    async fn current(&self, _: &AdaptiveFence) -> Result<bool, WorkerError> {
-        Ok(continuous::adaptive_notification_permitted(self.pool, self.slot).await?)
-    }
-
-    async fn commit_page(
-        &self,
-        _: &AdaptiveFence,
-        instrument: &AdaptiveInstrument,
-        expected: Option<&AdaptiveCheckpoint>,
-        checkpoint: &AdaptiveCheckpoint,
-        setups: &mut [AdaptiveSetup],
-    ) -> Result<Option<Vec<AdaptiveInserted>>, WorkerError> {
-        // Capture the editable name at creation/persistence, not when a long
-        // multi-instrument tick started. The same materialized value is used
-        // for the DB row, immutable JSON and subsequent notification.
-        let mut captured = self.slot.clone();
-        let settings =
-            settings_get(self.pool, &format!("algorithm:{}", self.slot.algorithm_id)).await?;
-        captured.external_name = settings
-            .as_ref()
-            .and_then(|value| value["externalName"].as_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| match self.slot.algorithm_id.as_str() {
-                setups_domain::SPIKE_ALGORITHM_ID => "Всплеск цены и оборота".into(),
-                setups_domain::SPIKE_DROP_ALGORITHM_ID => "Падение цены и всплеск оборота".into(),
-                _ => self.slot.external_name.clone(),
-            });
-        if captured.external_name.trim().is_empty()
-            || captured.external_name.chars().count() > 120
-            || captured.external_name.len() > 480
-            || captured.external_name.chars().any(char::is_control)
-        {
-            return Err(invalid("invalid external algorithm name at setup creation"));
+    async fn build_warmup_plans(&self,pool:&PgPool,candidate:&live::PendingAdaptiveSlot,active:&[SymbolPlan],slots:&[Arc<ActiveAdaptiveSlot>],catalog:&[CatalogInstrument])->Result<(Vec<SymbolPlan>,String),WorkerError> {
+        let profile=LiveProfile::parse(&candidate.profile)?;
+        let candidate_key=profile.fence_key();
+        let incumbent=slots.iter().find(|slot|slot.slot_id==candidate.profile.slot_id).cloned();
+        let old=incumbent.as_ref().map(|slot|LiveProfile::parse(slot)).transpose()?;
+        let mut scope:BTreeSet<_>=profile.bootstrap.instruments.iter().map(|seed|seed.instrument.clone()).collect();
+        if let Some(old)=&old {scope.extend(old.bootstrap.instruments.iter().map(|seed|seed.instrument.clone()));}
+        let mut plans=Vec::new();
+        for scoped in scope {
+            let matches:Vec<_>=catalog.iter().filter(|item|item.exchange==scoped.exchange && item.category==scoped.category && item.symbol==scoped.symbol).collect();
+            if matches.len()!=1 {return Err(invalid("pending old/new scope missing or ambiguous in source catalog"));}
+            let item=matches[0];let instrument=instrument(item);
+            let candidate_seed=profile.bootstrap.instruments.iter().find(|seed|seed.instrument==scoped);
+            let epoch=AdaptiveRuntime::epoch_key(&instrument,if candidate_seed.is_none() && item.status=="active" {None}else{Some(candidate.profile.generation_id)});
+            let mut specs:BTreeMap<String,ProfileSpec>=BTreeMap::new();let mut stores=BTreeMap::new();
+            for plan in active.iter().filter(|plan|plan.catalog_id==item.id) {
+                for spec in &plan.specs {let mut shadow=spec.clone();shadow.pending=epoch!=AdaptiveRuntime::epoch_key(&instrument,None);specs.insert(shadow.key(),shadow);}
+                stores.extend(plan.slots.clone());
+            }
+            if let (Some(old),Some(slot))=(&old,&incumbent)
+                && let Some(seed)=old.bootstrap.instruments.iter().find(|seed|seed.instrument==scoped)
+                && !specs.contains_key(&old.fence_key()) {
+                let checkpoint=store::load_checkpoint(pool,slot.slot_id,&instrument).await?;
+                let mut shadow=old.spec(seed,checkpoint,true)?;shadow.publish_enabled=item.status=="active";
+                stores.insert(shadow.key(),slot.clone());specs.insert(shadow.key(),shadow);
+            }
+            if let Some(seed)=profile.bootstrap.instruments.iter().find(|seed|seed.instrument==scoped) {
+                let mut pending=profile.spec(seed,None,true)?;pending.publish_enabled=item.status=="active";
+                specs.insert(pending.key(),pending);
+            }
+            plans.push(SymbolPlan {epoch,instrument,catalog_id:item.id,specs:specs.into_values().collect(),slots:stores});
         }
-        for setup in setups.iter_mut() {
-            setup.recommendation["externalName"] = captured.external_name.clone().into();
+        if plans.is_empty() {return Err(invalid("pending universe is empty"));}
+        self.check_warmup_admission(active,&plans)?;
+        Ok((plans,candidate_key))
+    }
+    fn check_warmup_admission(&self,active:&[SymbolPlan],pending:&[SymbolPlan])->Result<(),WorkerError> {
+        let mut allocations:BTreeMap<String,usize>=BTreeMap::new();
+        for plan in active.iter().chain(pending) {
+            let capacity=plan.specs.iter().map(|spec|spec.params.baseline_long_days() as usize*1440
+                +spec.params.window_minutes() as usize+spec.params.max_consecutive_gap_minutes() as usize+2).max().unwrap_or(0);
+            let close=capacity.checked_mul(self.state.limits.max_close_bytes_per_minute).ok_or_else(||invalid("history admission overflow"))?;
+            let bytes=setups_detector::shared::SharedHistory::required_bytes(capacity,close).map_err(|error|invalid(&error.to_string()))?;
+            allocations.entry(AdaptiveRuntime::epoch_key(&plan.instrument,None)).and_modify(|current|*current=(*current).max(bytes)).or_insert(bytes);
         }
-        let writes: Vec<_> = setups
-            .iter()
-            .map(|setup| AdaptiveSetupWrite {
-                exchange_code: instrument.exchange.clone(),
-                category: instrument.category.clone(),
-                symbol: instrument.symbol.clone(),
-                setup: setup.raw.clone(),
-                recommendation: setup.recommendation.clone(),
-            })
-            .collect();
-        let expected = expected
-            .map(|state| {
-                Ok::<_, WorkerError>(continuous::AdaptiveCheckpoint {
-                    generation_id: state.generation_id,
-                    state: serde_json::to_value(state)?,
-                })
-            })
-            .transpose()?;
-        let commit = continuous::commit_adaptive_scan_cas(
-            self.pool,
-            &captured,
-            &instrument_key(instrument),
-            expected.as_ref(),
-            &serde_json::to_value(checkpoint)?,
-            &writes,
-        )
-        .await?;
-        Ok(commit.applied.then_some(commit.inserted))
+        let mut peaks:Vec<_>=allocations.values().copied().collect();peaks.sort_unstable_by(|a,b|b.cmp(a));
+        let total=allocations.values().chain(peaks.iter().take(IO_CONCURRENCY)).try_fold(0usize,|sum,bytes|sum.checked_add(*bytes))
+            .ok_or_else(||invalid("history admission overflow"))?;
+        if total>self.state.limits.max_history_bytes {return Err(invalid("complete pending universe plus staging exceeds history byte admission budget"));}
+        Ok(())
     }
-
-    async fn notify(
-        &self,
-        _: &AdaptiveFence,
-        setup_id: i64,
-        instrument: &AdaptiveInstrument,
-        setup: &AdaptiveSetup,
-        max_age_seconds: i64,
-    ) -> Result<(), WorkerError> {
-        send_push(
-            self.pool,
-            self.slot,
-            setup_id,
-            instrument,
-            setup,
-            max_age_seconds,
-        )
-        .await
+    async fn refresh_warmup(&mut self,pool:&PgPool,pending:Vec<live::PendingAdaptiveSlot>,catalog:&[CatalogInstrument],active:&[SymbolPlan],slots:&[Arc<ActiveAdaptiveSlot>])->Result<(),WorkerError> {
+        let cohort:BTreeSet<_>=slots.iter().map(|slot|json!([slot.owner_id,slot.algorithm_id,slot.slot_id,slot.generation_id,slot.config_revision]).to_string()).collect();
+        if let Some(warmup)=&self.warmup {
+            let current=warmup.cohort==cohort && pending.iter().any(|p|p.profile.slot_id==warmup.lease.slot_id && p.profile.generation_id==warmup.lease.generation_id
+                && p.profile.config_revision==warmup.lease.config_revision);
+            if current && live::report_warmup(pool,&warmup.lease,"warming",None,None).await? {return Ok(());}
+            self.discard_warmup();
+        }
+        if pending.is_empty() {return Ok(());}
+        for offset in 0..pending.len() {
+            let index=(self.next_pending+offset)%pending.len();
+            let candidate=&pending[index];
+            let Some(lease)=live::claim_pending_warmup(pool,candidate,&self.worker).await? else {continue;};
+            self.next_pending=(index+1)%pending.len();
+            let build=self.build_warmup_plans(pool,candidate,active,slots,catalog).await;
+            match build {
+                Ok((plans,candidate_key))=>self.warmup=Some(Warmup {pending:candidate.clone(),lease,plans,candidate_key,cohort:cohort.clone(),barrier_attempts:0}),
+                Err(error)=>{live::report_warmup(pool,&lease,"error",None,Some(&json!({"code":"invalid_live_candidate","message":error.to_string().chars().take(240).collect::<String>()}))).await?;}
+            }
+            break;
+        }
+        Ok(())
     }
-}
-
-fn instrument_key(instrument: &AdaptiveInstrument) -> String {
-    format!(
-        "{}/{}/{}",
-        instrument.exchange, instrument.category, instrument.symbol
-    )
-}
-
-pub(crate) async fn adaptive_live_loop(
-    pool: PgPool,
-    market_url: String,
-    market_key: String,
-    stopped: std::sync::Arc<AtomicBool>,
-    notify: std::sync::Arc<tokio::sync::Notify>,
-) {
-    let mut last_minute = 0;
-    loop {
-        tokio::select! {
-            _=notify.notified()=> { if stopped.load(Ordering::SeqCst) { break; } },
-            _=tokio::time::sleep(std::time::Duration::from_secs(15))=> {
-                if stopped.load(Ordering::SeqCst) { break; }
-                if let Err(error)=adaptive_live_tick(&pool,&market_url,&market_key,&stopped,&mut last_minute).await {
-                    eprintln!("[adaptive-live] tick failed: {}",error.to_string().chars().take(240).collect::<String>());
-                }
+    fn discard_warmup(&mut self) {
+        if let Some(warmup)=self.warmup.take() {
+            for plan in warmup.plans {
+                if plan.epoch==AdaptiveRuntime::epoch_key(&plan.instrument,None) {self.state.remove_profile(&plan.epoch,&warmup.candidate_key);}
+                else {self.state.invalidate(&plan.epoch,None);}
             }
         }
     }
+    fn cold_plans(&self,active:&[SymbolPlan],target:i64,completed:&BTreeSet<String>)->Vec<SymbolPlan> {
+        let mut cold:BTreeMap<String,SymbolPlan>=active.iter().filter(|p|!self.state.is_current(&p.epoch,target-1800) && !completed.contains(&p.epoch))
+            .map(|p|(p.epoch.clone(),p.clone())).collect();
+        if let Some(warmup)=&self.warmup {
+            let mut resident=warmup.plans.iter().filter(|p|p.epoch!=AdaptiveRuntime::epoch_key(&p.instrument,None) && self.state.has_epoch(&p.epoch)).count();
+            for plan in &warmup.plans {
+                let canonical=plan.epoch==AdaptiveRuntime::epoch_key(&plan.instrument,None);
+                let exists=self.state.has_epoch(&plan.epoch);
+                if !canonical && !exists {
+                    if resident>=IO_CONCURRENCY {continue;}
+                    resident+=1;
+                }
+                if !self.state.is_current(&plan.epoch,target-1800) && !completed.contains(&plan.epoch) {
+                    let mut merged=plan.clone();
+                    if let Some(active)=cold.remove(&plan.epoch) {
+                        let mut specs:BTreeMap<_,_>=merged.specs.into_iter().map(|spec|(spec.key(),spec)).collect();
+                        specs.extend(active.specs.into_iter().map(|spec|(spec.key(),spec)));
+                        merged.specs=specs.into_values().collect();merged.slots.extend(active.slots);
+                    }
+                    cold.insert(plan.epoch.clone(),merged);
+                }
+            }
+        }
+        cold.into_values().collect()
+    }
+    async fn adopt_ready_staging(&mut self,pool:&PgPool,frontier:i64)->Result<(),WorkerError> {
+        let Some(warmup)=&self.warmup else {return Ok(());};
+        let candidate=warmup.candidate_key.clone();
+        let ready:Vec<_>=warmup.plans.iter().filter(|p|p.epoch!=AdaptiveRuntime::epoch_key(&p.instrument,None)
+            && self.state.is_current(&p.epoch,frontier)).cloned().collect();
+        for plan in ready {
+            let mut expected=BTreeMap::new();let mut caught_up=true;
+            for spec in plan.specs.iter().filter(|spec|spec.key()!=candidate) {
+                let staged=self.state.checkpoint_for(&plan.epoch,&spec.key()).ok_or_else(||invalid("staged incumbent checkpoint missing"))?;
+                let durable=store::load_checkpoint(pool,spec.fence.slot_id,&plan.instrument).await?;
+                if durable.as_ref()!=Some(&staged) {
+                    if spec.publish_enabled {caught_up=false;break;}
+                    // A delisted incumbent has no live emissions. Its explicit
+                    // not-listed source accounting may drain a control cursor.
+                    let slot=plan.slots.get(&spec.key()).ok_or_else(||invalid("inactive incumbent store missing"))?;
+                    let mut page=self.state.adoption_page(&plan.epoch,&spec.key(),durable)?;
+                    if !store::persist(&PgAdaptiveStore {pool,slot},&plan.instrument,&mut page).await? {caught_up=false;break;}
+                }
+                expected.insert(spec.key(),staged);
+            }
+            if !caught_up {continue;}
+            let production=AdaptiveRuntime::epoch_key(&plan.instrument,None);
+            self.state.adopt_staging(&plan.epoch,&production,&candidate,&expected)?;
+            if let Some(warmup)=&mut self.warmup
+                && let Some(staged)=warmup.plans.iter_mut().find(|p|p.epoch==plan.epoch) {
+                    staged.epoch=production;
+                    for spec in &mut staged.specs {if spec.key()!=candidate {spec.pending=false;}}
+                }
+        }
+        Ok(())
+    }
+    pub async fn tick(&mut self,pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool)->Result<(),WorkerError> {
+        self.tick_at(pool,client,stopped,chrono::Utc::now().timestamp()).await
+    }
+    /// Explicit observation clock for deterministic guarded-tick integration.
+    /// The production loop always uses tick(), which supplies the actual UTC clock.
+    pub async fn tick_at(&mut self,pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool,observation_unix:i64)->Result<(),WorkerError> {
+        let result=self.tick_observed(pool,client,stopped,observation_unix).await;
+        if let Err(error)=&result && let Some(warmup)=&self.warmup {
+            let report=json!({"code":"adaptive_warmup_failed","message":error.to_string().chars().take(240).collect::<String>()});
+            if let Err(report_error)=live::report_warmup(pool,&warmup.lease,"error",None,Some(&report)).await {
+                eprintln!("[adaptive-live] warmup error report failed: {}",report_error.to_string().chars().take(200).collect::<String>());
+            }
+            self.discard_warmup();
+        }
+        result
+    }
+    async fn tick_observed(&mut self,pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool,observation_unix:i64)->Result<(),WorkerError> {
+        if stopped.load(Ordering::SeqCst) || settings_get(pool,"live").await?.unwrap_or(json!({}))["enabled"]!=true {
+            self.state.clear();self.warmup=None;return Ok(());
+        }
+        let slots:Vec<_>=continuous::active_adaptive_slots(pool,continuous::ADMIN_OWNER).await?.into_iter().map(Arc::new).collect();
+        let pending=live::pending_adaptive_slots(pool,continuous::ADMIN_OWNER).await?;
+        if slots.is_empty() && pending.is_empty() {self.state.clear();self.warmup=None;return Ok(());}
+        let catalog=client.instruments().await.map_err(|e|invalid(&e.to_string()))?;
+        let active=self.active_plans(pool,&slots,&catalog).await?;
+        self.refresh_warmup(pool,pending,&catalog,&active,&slots).await?;
+        let mut wanted:BTreeMap<String,BTreeSet<String>>=BTreeMap::new();
+        for plan in active.iter().chain(self.warmup.iter().flat_map(|w|w.plans.iter())) {
+            wanted.entry(plan.epoch.clone()).or_default().extend(plan.specs.iter().map(ProfileSpec::key));
+        }
+        self.state.reconcile(&wanted);
+        for plan in &active {
+            // Re-enabling an already accepted profile has no pending research
+            // lease. Never attach it to unchecked existing scalar history:
+            // cold-reconstruct the complete current cohort once. Pending
+            // generations use the non-disruptive staged path below instead.
+            if self.state.needs_reconstruction(&plan.epoch,&plan.specs) {self.state.invalidate(&plan.epoch,None);}
+            self.state.install(&plan.epoch,&plan.specs)?;
+        }
+        let target=observation_unix.div_euclid(60)*60;
+        let mut hot=active.clone();
+        if let Some(warmup)=&self.warmup {hot.extend(warmup.plans.iter().filter(|p|self.state.is_current(&p.epoch,target-1800)).cloned());}
+        self.hot_tail(pool,client,&hot,target,stopped).await?;
+        self.adopt_ready_staging(pool,target).await?;
+        // Active hot work wins; at most four duplicate staging rings exist.
+        // A completed empty observation is retried next tick, not in a loop.
+        let mut completed=BTreeSet::new();
+        let mut cold=self.cold_plans(&active,target,&completed);
+        let started=Instant::now();
+        let mut pages=0;
+        while !cold.is_empty() && pages<self.state.limits.warmup_pages_per_turn && started.elapsed()<WARMUP_TIME_SLICE && !stopped.load(Ordering::SeqCst) {
+            let count=IO_CONCURRENCY.min(self.state.limits.warmup_pages_per_turn-pages).min(cold.len());
+            let mut reads=tokio::task::JoinSet::new();
+            for offset in 0..count {
+                let index=(self.warm_cursor+offset)%cold.len();
+                let mut plan=cold[index].clone();
+                if !self.state.has_epoch(&plan.epoch) {
+                    for spec in plan.specs.iter_mut().filter(|spec|!spec.pending) {
+                        spec.checkpoint=store::load_checkpoint(pool,spec.fence.slot_id,&plan.instrument).await?;
+                    }
+                }
+                self.state.install(&plan.epoch,&plan.specs)?;
+                let resident=self.warmup.as_ref().map_or(0,|w|w.plans.iter().filter(|p|p.epoch!=AdaptiveRuntime::epoch_key(&p.instrument,None) && self.state.has_epoch(&p.epoch)).count());
+                self.peak_staging_epochs=self.peak_staging_epochs.max(resident);
+                let client=client.clone();
+                let (from,_)=self.state.fetch_bounds(&plan.epoch,target)?;
+                let guard=self.state.source_guard(&plan.epoch,plan.catalog_id)?;
+                let frozen_boundary=if plan.specs.iter().any(|spec|spec.publish_enabled) {self.state.frozen_boundary(&plan.epoch)?}else{target};
+                reads.spawn(async move {
+                    let result=source::read_history(&client,plan.catalog_id,from,target,guard,frozen_boundary).await;
+                    (plan,result)
+                });
+            }
+            self.warm_cursor=(self.warm_cursor+count)%cold.len();
+            while let Some(result)=reads.join_next().await {
+                let (plan,response)=result.map_err(|e|invalid(&e.to_string()))?;
+                let page=match response {
+                    Ok(page)=>page,
+                    Err(failure)=>{
+                        if failure.invalidate {self.state.invalidate(&plan.epoch,None);}
+                        return Err(failure.error);
+                    }
+                };
+                self.state.acknowledge_source(&plan.epoch,page.token)?;
+                process_page(&mut self.state,pool,&plan,&page.bars,target,page.complete).await?;
+                if page.complete {
+                    completed.insert(plan.epoch.clone());
+                    if !plan.specs.iter().any(|spec|spec.publish_enabled) {self.state.account_not_listed(&plan.epoch,target)?;}
+                }
+                pages+=1;
+            }
+            self.adopt_ready_staging(pool,target).await?;
+            cold=self.cold_plans(&active,target,&completed);
+            tokio::task::yield_now().await;
+        }
+        self.try_promote(pool,&slots,&catalog,target,stopped).await?;
+        Ok(())
+    }
+    async fn hot_tail(&mut self,pool:&PgPool,client:&MarketDataClient,plans:&[SymbolPlan],target:i64,stopped:&AtomicBool)->Result<(),WorkerError> {
+        let mut by_epoch:BTreeMap<String,SymbolPlan>=BTreeMap::new();
+        for plan in plans.iter().filter(|plan|self.state.is_current(&plan.epoch,target-1800)) {
+            if let Some(existing)=by_epoch.get_mut(&plan.epoch) {
+                existing.slots.extend(plan.slots.clone());
+                let specs:BTreeMap<_,_>=existing.specs.iter().chain(&plan.specs).map(|s|(s.key(),s.clone())).collect();
+                existing.specs=specs.into_values().collect();
+            } else {by_epoch.insert(plan.epoch.clone(),plan.clone());}
+        }
+        let mut canonical=BTreeMap::new();let mut staging=Vec::new();
+        for plan in by_epoch.into_values() {
+            if plan.epoch==AdaptiveRuntime::epoch_key(&plan.instrument,None) {
+                if canonical.insert(plan.catalog_id,plan).is_some() {return Err(invalid("multiple canonical epochs for one source instrument"));}
+            } else {staging.push(vec![plan]);}
+        }
+        if staging.len()>IO_CONCURRENCY {return Err(invalid("resident staging epochs exceed admission budget"));}
+        let canonical:Vec<_>=canonical.into_values().collect();
+        let batches=canonical.chunks(200).map(|batch|batch.to_vec()).collect();
+        // A proof belongs to ONE consumed interval in ONE epoch. Taking the
+        // oldest revision and union of intervals is not equivalent: an ordinary
+        // insert can already be consumed by one epoch and still be fresh input
+        // for another. Finish canonical snapshots/effects before observing the
+        // at-most-four staging epochs, each in its own coherent request.
+        self.hot_tail_snapshots(pool,client,batches,target,stopped).await?;
+        self.hot_tail_snapshots(pool,client,staging,target,stopped).await
+    }
+    async fn hot_tail_snapshots(&mut self,pool:&PgPool,client:&MarketDataClient,batches:Vec<Vec<SymbolPlan>>,target:i64,stopped:&AtomicBool)->Result<(),WorkerError> {
+        let mut batches=batches.into_iter();let mut first_error=None;
+        loop {
+            let mut reads=tokio::task::JoinSet::new();
+            for batch in batches.by_ref().take(IO_CONCURRENCY) {
+                let ids:Vec<_>=batch.iter().map(|plan|plan.catalog_id).collect();
+                if ids.iter().copied().collect::<BTreeSet<_>>().len()!=ids.len() {return Err(invalid("one coherent tail request cannot contain two epochs of one instrument"));}
+                let from=batch.iter().map(|plan|self.state.fetch_bounds(&plan.epoch,target).map(|(from,_)|from))
+                    .collect::<Result<Vec<_>,_>>()?.into_iter().min().unwrap_or(target).min(target-60).max(target-1800);
+                let guards=batch.iter().map(|plan|self.state.source_guard(&plan.epoch,plan.catalog_id)).collect::<Result<Vec<_>,_>>()?;
+                let client=client.clone();
+                reads.spawn(async move {
+                    let response=client.tail_batch_guarded(&TailBatchQuery {instrument_ids:ids,from_unix:from,to_unix:target},&guards).await;
+                    (batch,guards,response)
+                });
+            }
+            if reads.is_empty() {break;}
+            while let Some(response)=reads.join_next().await {
+                let (batch,guards,response)=response.map_err(|e|invalid(&e.to_string()))?;
+                let response=match response {
+                    Ok(response)=>response,
+                    Err(error)=>{
+                        if matches!(&error,setups_mdclient::MdClientError::Decode(_)) {
+                            for plan in &batch {self.state.invalidate(&plan.epoch,None);}
+                        }
+                        first_error.get_or_insert_with(||invalid(&error.to_string()));continue;
+                    }
+                };
+                for item in response.instruments {
+                    if stopped.load(Ordering::SeqCst) {return Ok(());}
+                    let plan=batch.iter().find(|plan|plan.catalog_id==item.instrument_id).ok_or_else(||invalid("requested source epoch missing"))?;
+                    let guard=guards.iter().find(|guard|guard.instrument_id==item.instrument_id).ok_or_else(||invalid("requested source guard missing"))?;
+                    let token=guard.validated_token(item.read_guard.as_ref());
+                    if item.status!="known" || token.is_none() {
+                        self.state.invalidate(&plan.epoch,None);
+                        first_error.get_or_insert_with(||invalid("source causal history changed or repair coverage is unknown"));continue;
+                    }
+                    let bars:Vec<_>=item.candles.into_iter().map(|row|DetectorBar {open_time_unix:row.candle.open_time_unix,close:row.candle.close,quote_turnover:row.candle.quote_turnover}).collect();
+                    self.state.acknowledge_source(&plan.epoch,token.unwrap())?;
+                    if let Err(error)=process_page(&mut self.state,pool,plan,&bars,target,true).await {first_error.get_or_insert(error);continue;}
+                    if !plan.specs.iter().any(|spec|spec.publish_enabled) {
+                        self.state.account_not_listed(&plan.epoch,target)?;
+                        if let Err(error)=process_chunk(&mut self.state,pool,plan,&[],target,false).await {first_error.get_or_insert(error);}
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(()),Err)
+    }
+    async fn try_promote(&mut self,pool:&PgPool,_active:&[Arc<ActiveAdaptiveSlot>],catalog:&[CatalogInstrument],frontier:i64,stopped:&AtomicBool)->Result<(),WorkerError> {
+        let Some(warmup)=self.warmup.as_ref() else {return Ok(());};
+        if stopped.load(Ordering::SeqCst) {return Ok(());}
+        for plan in &warmup.plans {
+            if plan.epoch!=AdaptiveRuntime::epoch_key(&plan.instrument,None) || !self.state.is_current(&plan.epoch,frontier) {return Ok(());}
+            if plan.specs.iter().any(|spec|spec.key()==warmup.candidate_key)
+                && catalog.iter().any(|item|item.id==plan.catalog_id && item.status=="active")
+                && !self.state.ready(&plan.epoch,&warmup.candidate_key,frontier) {return Ok(());}
+        }
+        // The owner has joined all active commits. This short CAS is the slot
+        // barrier; no historical fetch or detector-frame borrow enters it.
+        let mut expected=Vec::new();
+        for plan in &warmup.plans {
+            let key=instrument_key(&plan.instrument);
+            let checkpoint=continuous::get_adaptive_checkpoint(pool,warmup.lease.slot_id,&key).await?;
+            if checkpoint.as_ref().is_some_and(|row|row.state["nextOpenUnix"].as_i64()!=Some(frontier)) {return Ok(());}
+            expected.push(live::CheckpointExpectation {instrument_key:key,checkpoint});
+        }
+        let mut initial=Vec::new();
+        for plan in warmup.plans.iter().filter(|plan|plan.specs.iter().any(|spec|spec.key()==warmup.candidate_key)) {
+            let checkpoint=self.state.checkpoint_for(&plan.epoch,&warmup.candidate_key).ok_or_else(||invalid("ready candidate checkpoint missing"))?;
+            if checkpoint.next_open_unix!=frontier {return Ok(());}
+            initial.push(live::InitialAdaptiveCheckpoint {instrument_key:instrument_key(&plan.instrument),state:serde_json::to_value(checkpoint)?});
+        }
+        if !live::report_warmup(pool,&warmup.lease,"ready",Some(frontier),None).await? {self.discard_warmup();return Ok(());}
+        let result=promotion::persist(&promotion::PgPromotion {pool,lease:&warmup.lease,
+            predecessor:warmup.pending.expected_active_generation_id,expected:&expected,frontier,initial:&initial}).await;
+        match result {
+            Ok(promotion::Outcome::Adopt)=>{
+                let warmup=self.warmup.take().unwrap();
+                for plan in &warmup.plans {
+                    if plan.specs.iter().any(|spec|spec.key()==warmup.candidate_key) {self.state.activate(&plan.epoch,&warmup.candidate_key,frontier)?;}
+                    for spec in plan.specs.iter().filter(|spec|spec.fence.slot_id==warmup.lease.slot_id && spec.key()!=warmup.candidate_key) {
+                        self.state.remove_profile(&plan.epoch,&spec.key());
+                    }
+                }
+            },
+            Ok(promotion::Outcome::Rebuild)=>{
+                let warmup=self.warmup.take().unwrap();
+                for plan in &warmup.plans {self.state.invalidate(&plan.epoch,None);}
+            },
+            Ok(promotion::Outcome::Lost)=>self.discard_warmup(),
+            Ok(promotion::Outcome::Retry)=>{
+                let warmup=self.warmup.as_mut().unwrap();warmup.barrier_attempts+=1;
+                if warmup.barrier_attempts>=3 {self.discard_warmup();}
+            },
+            Err(error)=>{
+                // Do not leave a possibly committed candidate missing from a
+                // nonempty production ring. Reconstruct from durable fences.
+                if let Some(warmup)=&self.warmup {for plan in &warmup.plans {self.state.invalidate(&plan.epoch,None);}}
+                return Err(error);
+            },
+        }
+        Ok(())
+    }
 }
 
-fn listed_study_instruments<'a>(
-    bootstrap: &'a AdaptiveLiveBootstrap,
-    catalog: &'a [CatalogInstrument],
-) -> Result<Vec<(&'a ContinuousInstrumentBootstrap, &'a CatalogInstrument)>, WorkerError> {
-    let mut seen = HashSet::new();
-    let mut selected = Vec::new();
-    for raw in &bootstrap.instruments {
-        let key = (
-            &raw.instrument.exchange,
-            &raw.instrument.category,
-            &raw.instrument.symbol,
-        );
-        if !seen.insert(key) {
-            return Err(invalid("duplicate bootstrap instrument"));
-        }
-        let mut matches = catalog.iter().filter(|item| {
-            item.status == "active"
-                && item.exchange == raw.instrument.exchange
-                && item.category == raw.instrument.category
-                && item.symbol == raw.instrument.symbol
+fn validate_history_page(bars:&[DetectorBar],from:i64,to:i64,next:Option<i64>)->Result<(),WorkerError> {
+    if bars.len()>HISTORY_PAGE_LIMIT as usize {return Err(WorkerError::PageLimitExceeded(bars.len()));}
+    let mut previous=None;
+    for bar in bars {
+        if bar.open_time_unix<from || bar.open_time_unix>=to || bar.open_time_unix%60!=0
+            || previous.is_some_and(|time|bar.open_time_unix<=time) {return Err(invalid("malformed history pagination"));}
+        previous=Some(bar.open_time_unix);
+    }
+    if next.is_some() && (next!=previous || bars.is_empty()) {return Err(invalid("nonadvancing history pagination"));}
+    Ok(())
+}
+
+async fn process_page(state:&mut AdaptiveRuntime,pool:&PgPool,plan:&SymbolPlan,bars:&[DetectorBar],target:i64,complete:bool)->Result<(),WorkerError> {
+    if bars.is_empty() {process_chunk(state,pool,plan,&[],target,complete).await?;}
+    for (index,chunk) in bars.chunks(ADAPTIVE_PAGE_LIMIT).enumerate() {
+        process_chunk(state,pool,plan,chunk,target,complete && (index+1)*ADAPTIVE_PAGE_LIMIT>=bars.len()).await?;
+    }
+    Ok(())
+}
+async fn process_chunk(state:&mut AdaptiveRuntime,pool:&PgPool,plan:&SymbolPlan,bars:&[DetectorBar],target:i64,complete:bool)->Result<(),WorkerError> {
+    let prepared=match state.prepare(&plan.epoch,&plan.instrument,bars,target,complete) {
+        Ok(prepared)=>prepared,
+        Err(error)=>{state.invalidate(&plan.epoch,None);return Err(error);}
+    };
+    let mut tasks=tokio::task::JoinSet::new();
+    for prepared in prepared {
+        if !prepared.should_commit() {state.accept(&plan.epoch,prepared,false);continue;}
+        let slot=plan.slots.get(&prepared.key).cloned().ok_or_else(||invalid("active store missing"))?;
+        let pool=pool.clone();let instrument=plan.instrument.clone();
+        tasks.spawn(async move {
+            let mut prepared=prepared;
+            let store=PgAdaptiveStore {pool:&pool,slot:&slot};
+            let result=store::persist(&store,&instrument,&mut prepared).await;
+            (prepared,result)
         });
-        if let Some(item) = matches.next() {
-            if matches.next().is_some() {
-                return Err(invalid("ambiguous active listing"));
-            }
-            selected.push((raw, item));
-        }
+        if tasks.len()>=COMMIT_CONCURRENCY {accept_result(state,&plan.epoch,tasks.join_next().await.unwrap())?;}
     }
-    selected.sort_by(|(a, _), (b, _)| a.instrument.cmp(&b.instrument));
-    Ok(selected)
+    while let Some(result)=tasks.join_next().await {accept_result(state,&plan.epoch,result)?;}
+    Ok(())
 }
-
-/// Called by the existing live owner even when every fixed detector is disabled.
-/// Separate minute/checkpoint namespaces keep fixed and other slots independent.
-pub async fn adaptive_live_tick(
-    pool: &PgPool,
-    market_url: &str,
-    market_key: &str,
-    stopped: &AtomicBool,
-    last_minute: &mut i64,
-) -> Result<(), WorkerError> {
-    if stopped.load(Ordering::SeqCst)
-        || settings_get(pool, "live").await?.unwrap_or(json!({}))["enabled"] != json!(true)
-    {
-        return Ok(());
+fn accept_result(state:&mut AdaptiveRuntime,epoch:&str,result:Result<(PreparedProfile,Result<bool,WorkerError>),tokio::task::JoinError>)->Result<(),WorkerError> {
+    let (prepared,result)=result.map_err(|e|invalid(&e.to_string()))?;
+    match result {
+        Ok(true)=>state.accept(epoch,prepared,true),
+        Ok(false)=>state.invalidate(epoch,Some(&prepared.key)),
+        Err(error)=>{state.invalidate(epoch,Some(&prepared.key));return Err(error);}
     }
-    let now_unix = chrono::Utc::now().timestamp().div_euclid(60) * 60;
-    if now_unix == *last_minute {
-        return Ok(());
-    }
-    let slots = continuous::active_adaptive_slots(pool, continuous::ADMIN_OWNER).await?;
-    if slots.is_empty() {
-        *last_minute = now_unix;
-        return Ok(());
-    }
-    let catalog = MarketDataClient::new(market_url, market_key)
-        .instruments()
-        .await
-        .map_err(|error| WorkerError::Source(error.to_string()))?;
-    let max_age = settings_get(pool, "notifications")
-        .await?
-        .unwrap_or(json!({}))["maxAgeSeconds"]
-        .as_i64()
-        .unwrap_or(60);
-    for slot in slots {
-        if stopped.load(Ordering::SeqCst) {
-            break;
-        }
-        if let Err(error) = scan_slot(
-            pool, market_url, market_key, &slot, &catalog, now_unix, max_age, stopped,
-        )
-        .await
-        {
-            // One malformed/stale profile must not starve other adaptive slots.
-            eprintln!(
-                "[adaptive-live] slot={} generation={} failed: {}",
-                slot.slot_id,
-                slot.generation_id,
-                error.to_string().chars().take(240).collect::<String>()
-            );
-        }
-    }
-    *last_minute = now_unix;
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn scan_slot(
-    pool: &PgPool,
-    market_url: &str,
-    market_key: &str,
-    slot: &ActiveAdaptiveSlot,
-    catalog: &[CatalogInstrument],
-    now_unix: i64,
-    max_age_seconds: i64,
-    stopped: &AtomicBool,
-) -> Result<(), WorkerError> {
-    let profile = LiveProfile::parse(slot)?;
-    let store = PgAdaptiveStore { pool, slot };
-    for (seed, item) in listed_study_instruments(&profile.bootstrap, catalog)? {
-        if stopped.load(Ordering::SeqCst) || !store.current(&profile.fence).await? {
-            break;
-        }
-        let instrument = AdaptiveInstrument {
-            exchange: item.exchange.clone(),
-            category: item.category.clone(),
-            symbol: item.symbol.clone(),
-        };
-        let stored =
-            continuous::get_adaptive_checkpoint(pool, slot.slot_id, &instrument_key(&instrument))
-                .await?;
-        let checkpoint = stored
-            .map(|row| {
-                let value: AdaptiveCheckpoint = serde_json::from_value(row.state)?;
-                if value.generation_id != row.generation_id {
-                    return Err(invalid("checkpoint generation differs from stored fence"));
+/// Compatibility helper for isolated tests/callers; production keeps AdaptiveLiveRuntime
+/// across turns. `last_minute` is observational only, never a suppression gate.
+pub async fn adaptive_live_tick(pool:&PgPool,market_url:&str,market_key:&str,stopped:&AtomicBool,last_minute:&mut i64)->Result<(),WorkerError> {
+    let mut owner=AdaptiveLiveRuntime::new(AdaptiveRuntimeLimits::default());
+    owner.tick(pool,&MarketDataClient::new(market_url,market_key),stopped).await?;
+    *last_minute=chrono::Utc::now().timestamp().div_euclid(60)*60;
+    Ok(())
+}
+
+pub(crate) async fn adaptive_live_loop(pool:PgPool,market_url:String,market_key:String,stopped:Arc<AtomicBool>,notify:Arc<tokio::sync::Notify>) {
+    let scan_pool=pool.clone();let scan_stopped=stopped.clone();let scan_notify=notify.clone();
+    let scan=async move {
+        let client=MarketDataClient::new(market_url,market_key);
+        let mut owner=AdaptiveLiveRuntime::new(AdaptiveRuntimeLimits::default());
+        while !scan_stopped.load(Ordering::SeqCst) {
+            if let Err(error)=owner.tick(&scan_pool,&client,&scan_stopped).await {
+                if let Some(warmup)=&owner.warmup {
+                    let report=json!({"code":"adaptive_warmup_failed","message":error.to_string().chars().take(240).collect::<String>()});
+                    let _=live::report_warmup(&scan_pool,&warmup.lease,"error",None,Some(&report)).await;
+                    owner.discard_warmup();
                 }
-                Ok(value)
-            })
-            .transpose()?;
-        let initial = AdaptiveCheckpoint {
-            generation_id: slot.generation_id,
-            next_open_unix: profile.bootstrap.next_open_unix,
-            last_raw_open_unix: seed.last_raw_open_unix,
-            last_raw_cluster_time: seed.last_raw_cluster_time,
-        };
-        let from = checkpoint
-            .as_ref()
-            .filter(|c| c.generation_id == slot.generation_id)
-            .unwrap_or(&initial)
-            .next_open_unix;
-        if from >= now_unix {
-            continue;
+                eprintln!("[adaptive-live] tick failed: {}",error.to_string().chars().take(240).collect::<String>());
+            }
+            tokio::select! {_=scan_notify.notified()=>{},_=tokio::time::sleep(Duration::from_secs(2))=>{}}
         }
-        let source = ApiCandleSource::new(market_url, market_key, item.id);
-        let result = scan_adaptive_pages(
-            &source,
-            &store,
-            AdaptiveScanOptions {
-                fence: &profile.fence,
-                instrument: &instrument,
-                params: &profile.params,
-                recommendation: &profile.recommendation,
-                bootstrap_from_unix: profile.bootstrap.detector_warmup_from_unix,
-                emit_from_close_unix: profile.live_from_close_unix,
-                observation_close_unix: now_unix.min(from + 86400),
-                cluster_gap_minutes: profile.cluster_gap_minutes,
-                initial_state: Some(initial),
-                checkpoint,
-                max_age_seconds,
-                stopped,
-            },
-        )
-        .await?;
-        if result.fenced {
-            break;
-        }
-    }
-    Ok(())
+        owner.state.clear();
+    };
+    tokio::join!(scan,delivery::run(pool,stopped,notify));
 }
 
-async fn send_push(
-    pool: &PgPool,
-    slot: &ActiveAdaptiveSlot,
-    setup_id: i64,
-    instrument: &AdaptiveInstrument,
-    setup: &AdaptiveSetup,
-    max_age_seconds: i64,
-) -> Result<(), WorkerError> {
-    let close = setup.raw.close_time_unix;
-    if max_age_seconds <= 0
-        || !crate::live::evaluate_delivery_age(
-            close,
-            chrono::Utc::now().timestamp(),
-            max_age_seconds,
-        )
-        .1
-    {
-        return Ok(());
-    }
-    let message = recommendation_message(instrument, &setup.raw, &setup.recommendation)?;
-    let payload = serde_json::to_vec(&json!({
-        "symbol":instrument.symbol, "setupId":setup_id,"slotId":slot.slot_id,"tag":format!("setup-{setup_id}"),
-        "timestamp":close*1000,"expiresAt":(close+max_age_seconds)*1000,
-        "recommendation":{"direction":setup.recommendation["direction"]},"message":message,
-    }))?;
-    // RFC8291 single-record payload budget. Never truncate a recommendation into
-    // a different financial condition; the full saved snapshot remains in UI.
-    if payload.len() > 3800 {
-        return Err(invalid("adaptive notification exceeds push payload budget"));
-    }
-    let (_, private_key) = get_or_create_vapid_keys(pool).await?;
-    let subscriptions = list_push_subscriptions(pool, 100).await?;
-    let client = HyperWebPushClient::new();
-    for row in subscriptions {
-        if !valid_push_endpoint(&row.endpoint) {
-            continue;
-        }
-        let info = SubscriptionInfo::new(row.endpoint.clone(), row.p256dh, row.auth);
-        let mut signature = VapidSignatureBuilder::from_base64(&private_key, &info)
-            .map_err(|_| invalid("invalid push signing keys"))?;
-        signature.add_claim("sub", "mailto:admin@example.invalid");
-        let signature = signature
-            .build()
-            .map_err(|_| invalid("invalid push signature"))?;
-        // Fresh owner/generation/global permission and age for each subscriber,
-        // after signing and immediately before handing the message to transport.
-        if !continuous::adaptive_notification_permitted(pool, slot).await? {
-            break;
-        }
-        let (age, eligible) = crate::live::evaluate_delivery_age(
-            close,
-            chrono::Utc::now().timestamp(),
-            max_age_seconds,
-        );
-        if !eligible {
-            break;
-        }
-        let mut builder = WebPushMessageBuilder::new(&info);
-        builder.set_payload(ContentEncoding::Aes128Gcm, &payload);
-        builder.set_ttl((max_age_seconds - age.unwrap_or(0)).min(28 * 24 * 60 * 60) as u32);
-        builder.set_vapid_signature(signature);
-        let notification = builder
-            .build()
-            .map_err(|_| invalid("invalid push message"))?;
-        match client.send(notification).await {
-            Ok(()) => {}
-            Err(WebPushError::EndpointNotFound(_)) | Err(WebPushError::EndpointNotValid(_)) => {
-                delete_push_subscription(pool, &row.endpoint).await?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adaptive::state::tests::{fixture,feed};
+    #[tokio::test]
+    async fn independent_epoch_proofs_keep_long_revision_two_and_short_revision_one_valid() {
+        use axum::{Json,Router,routing::post};
+        use setups_mdclient::TailReadToken;
+        let mut f=fixture();f.spec.bootstrap_next=60;f.spec.emit_from_close=120;
+        let digest=setups_optimizer::detector_prefix_fingerprint(&f.bars[..1],0,60).unwrap();
+        f.spec.prefix.bar_count=digest.bar_count;f.spec.prefix.sha256=digest.sha256;
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars[..2],120).unwrap();
+        f.runtime.acknowledge_source(&f.epoch,TailReadToken {epoch:"proof-fixture".into(),revision:"2".into()}).unwrap();
+        let staging=AdaptiveRuntime::epoch_key(&f.instrument,Some(2));let mut candidate=f.spec.clone();
+        candidate.fence.generation_id=2;candidate.pending=true;
+        f.runtime.install(&staging,std::slice::from_ref(&candidate)).unwrap();
+        feed(&mut f.runtime,&staging,&f.instrument,&f.bars[..1],60).unwrap();
+        f.runtime.acknowledge_source(&staging,TailReadToken {epoch:"proof-fixture".into(),revision:"1".into()}).unwrap();
+        let active=f.runtime.source_guard(&f.epoch,1).unwrap();let pending=f.runtime.source_guard(&staging,1).unwrap();
+        assert_eq!((active.from_unix,active.to_unix,active.previous.unwrap().revision),(0,120,"2".into()));
+        assert_eq!((pending.from_unix,pending.to_unix,pending.previous.unwrap().revision),(0,60,"1".into()));
+        let requests=Arc::new(std::sync::Mutex::new(Vec::new()));let observed=requests.clone();
+        let app=Router::new().route("/v1/candles/tail-batch",post(move |Json(request):Json<Value>| {
+            let observed=observed.clone();async move {
+                let guard=&request["readGuards"][0];let revision=guard["previous"]["revision"].as_str().unwrap().parse::<i64>().unwrap();
+                let from=guard["fromUnix"].as_i64().unwrap();let to=guard["toUnix"].as_i64().unwrap();
+                let head={let mut requests=observed.lock().unwrap();requests.push((from,to,revision));if requests.len()==1 {2}else{3}};
+                // Revision 2 inserts OPEN 60. After canonical processing,
+                // revision 3 corrects that same bar before staging observes it.
+                let status=if revision<head && from<=60 && 60<to {"invalid"}else{"valid"};
+                Json(json!({"checkedAt":chrono::Utc::now().to_rfc3339(),"instruments":[{"instrumentId":1,"status":"known",
+                    "latestStoredOpenTimeUnix":60,"contiguousThroughOpenTimeUnix":60,"missingRanges":[],
+                    "candles":[{"instrumentId":1,"openTimeUnix":60,"open":"100","high":"100","low":"100","close":"100","volume":"1","quoteTurnover":if head==2 {"1"}else{"2"}}],
+                    "readGuard":{"status":status,"token":{"epoch":"proof-fixture","revision":head.to_string()}}}]}))
             }
-            Err(_) => eprintln!("[adaptive-live] setup={setup_id} push delivery failed: network"),
-        }
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let url=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap();});
+        let mut owner=AdaptiveLiveRuntime::new(AdaptiveRuntimeLimits::default());owner.state=f.runtime;
+        let plans=vec![SymbolPlan {epoch:f.epoch.clone(),instrument:f.instrument.clone(),catalog_id:1,specs:vec![f.spec],slots:BTreeMap::new()},
+            SymbolPlan {epoch:staging.clone(),instrument:f.instrument.clone(),catalog_id:1,specs:vec![candidate],slots:BTreeMap::new()}];
+        let pool=sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://test:test@127.0.0.1:1/unreachable_test").unwrap();
+        let result=tokio::time::timeout(Duration::from_millis(500),owner.hot_tail(&pool,&MarketDataClient::new(url,"fixture"),&plans,120,&AtomicBool::new(false))).await.unwrap();
+        assert!(result.is_ok(),"both original proofs are valid; their oldest-token/union-range merge is not: {result:?}");
+        assert_eq!(*requests.lock().unwrap(),vec![(0,120,2),(0,60,1)]);
+        assert_eq!(owner.state.source_guard(&f.epoch,1).unwrap().previous.unwrap().revision,"2",
+            "staging's later snapshot did NOT prove canonical's consumed OPEN 60 and must never acknowledge its revision");
+        assert_eq!(owner.state.source_guard(&staging,1).unwrap().previous.unwrap().revision,"3");
+        assert_eq!(owner.state.retained_history_epochs(),2);
+        server.abort();let _=server.await;pool.close().await;
     }
-    Ok(())
+
+    #[tokio::test]
+    async fn trailing_repair_rejection_invalidates_only_affected_symbol_before_database_io() {
+        let mut f=fixture();f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars,f.frontier).unwrap();
+        feed(&mut f.runtime,&f.epoch,&f.instrument,&[],f.frontier+120).unwrap();
+        crate::adaptive::state::tests::mark_legacy_consumed(&mut f.runtime,&f.epoch,f.frontier+120);
+        let mut other=f.instrument.clone();other.symbol="OTHERUSDT".into();
+        let other_epoch=AdaptiveRuntime::epoch_key(&other,None);
+        let mut other_spec=f.spec.clone();other_spec.prefix.instrument.symbol=other.symbol.clone();
+        f.runtime.install(&other_epoch,&[other_spec]).unwrap();
+        feed(&mut f.runtime,&other_epoch,&other,&f.bars,f.frontier).unwrap();
+        let other_bytes=f.runtime.retained_history_bytes();
+        let pool=sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://test:test@127.0.0.1:1/unreachable_test").unwrap();
+        let plan=SymbolPlan {epoch:f.epoch.clone(),instrument:f.instrument.clone(),catalog_id:1,specs:Vec::new(),slots:BTreeMap::new()};
+        let late=DetectorBar {open_time_unix:f.frontier+60,close:"99".into(),quote_turnover:"50".into()};
+        let result=tokio::time::timeout(Duration::from_millis(250),process_chunk(&mut f.runtime,&pool,&plan,&[late],f.frontier+120,true))
+            .await.expect("must reject before acquiring any database connection");
+        assert!(result.is_err());assert!(f.runtime.profile_epoch(&f.instrument,&f.spec.key()).is_none());
+        assert!(f.runtime.retained_history_bytes()>0 && f.runtime.retained_history_bytes()<other_bytes);
+        assert_eq!(f.runtime.profile_epoch(&other,&f.spec.key()),Some(other_epoch));
+        pool.close().await;
+    }
 }

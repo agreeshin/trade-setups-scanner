@@ -47,20 +47,27 @@ const spec: OptimizationSpec = {
   tpLevels: [4, 6], slLevels: [4, 6], minClosedPerCell: 1, seed: 42, maxTrials: 256, maxSeconds: 3600,
 };
 const progress = { phase: "acquiring", evaluatedCandidates: 0, scorableCandidates: 0, maxTrials: 256, elapsedSeconds: 12, bestScore: null as number | null };
-function record(status: OptimizationStudy["status"] = "running") {
+function record(status: OptimizationStudy["status"] = "running"): OptimizationStudy {
   return { id: 17, status, spec, progress, result: null as OptimizationStudy["result"], error: null, createdAt: "2026-11-10T00:00:00Z", updatedAt: "2026-11-10T00:01:00Z", events: [{ at: "2026-11-10T00:00:00Z", kind: "started", message: "Подготовка снимка" }] };
 }
 let studies: ReturnType<typeof record>[];
 let createStatus: number;
 let deleteStatus: number;
+let deleteErrorCode: string;
 let cancelStatus: number;
 let listedAlgorithms: Algorithm[];
 let draftStatus: number;
 let drafts: Record<string, unknown>;
+const cleanupFixture = { eligible: true, blockers: [] as string[], fingerprint: "a".repeat(32),
+  counts: { studies: 12, generations: 7, profiles: 3, checkpoints: 2, notificationJobs: 1, processesReset: 2 },
+  retained: { runs: 9, batches: 4, qualityIntervals: 20, analyticsResults: 4, liveSetups: 19, configuredProcesses: 2, configuredSlots: 6 } };
+let cleanupPreview = cleanupFixture;
+let cleanupStatus = 200;
 const requests: { path: string; method: string; body: unknown; signal?: AbortSignal | null }[] = [];
 beforeEach(() => {
-  studies = []; createStatus = 202; deleteStatus = 200; cancelStatus = 202; draftStatus = 200; drafts = {}; requests.length = 0;
+  studies = []; createStatus = 202; deleteStatus = 200; deleteErrorCode = "delete_failed"; cancelStatus = 202; draftStatus = 200; drafts = {}; requests.length = 0;
   listedAlgorithms = [algorithm, { ...algorithm, id: "second_algorithm", name: "Второй алгоритм" }];
+  cleanupPreview = cleanupFixture; cleanupStatus = 200;
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : null;
@@ -68,6 +75,12 @@ beforeEach(() => {
     const json = (value: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(value), { status }));
     if (path === "/v1/algorithms") return json({ algorithms: listedAlgorithms });
     if (path === "/v1/instruments") return json({ instruments });
+    if (path === "/v1/continuous-studies/cleanup") {
+      if (method === "GET") return json(cleanupPreview);
+      if (cleanupStatus !== 200) return json({ error: cleanupStatus === 409 ? "continuous_cleanup_preview_stale" : "cleanup_failed", preview: cleanupPreview }, cleanupStatus);
+      studies = studies.filter((study) => study.origin !== "continuous");
+      return json({ deleted: cleanupPreview.counts, retained: cleanupPreview.retained });
+    }
     if (path === "/v1/settings/ui") return json({ value: { replay: { symbols: "BTCUSDT\nOLDUSDT" } } });
     const draft = /^\/v1\/optimization-drafts\/(.+)$/.exec(path);
     if (draft) {
@@ -99,7 +112,7 @@ beforeEach(() => {
     if (detail) {
       const id = Number(detail[1]);
       if (method === "DELETE") {
-        if (deleteStatus !== 200) return json({ error: "delete_failed" }, deleteStatus);
+        if (deleteStatus !== 200) return json({ error: deleteErrorCode }, deleteStatus);
         studies = studies.filter((study) => study.id !== id); return json({ deleted: true, id });
       }
       const study = studies.find((study) => study.id === id);
@@ -704,6 +717,164 @@ it("retains the history row and shows a deletion conflict without claiming succe
   expect(await confirmation.findByRole("alert")).toHaveTextContent("Нельзя удалить активное исследование");
   fireEvent.click(confirmation.getByRole("button", { name: "Отмена" }));
   expect(await screen.findByRole("button", { name: "Результат исследования 17" })).toBeInTheDocument();
+});
+
+it.each(["completed", "cancelled", "failed"] as const)("allows explicit deletion of an archived continuous %s study without touching other rows or fixed drafts", async (status) => {
+  studies = [{ ...record("completed"), id: 20, origin: "manual" },
+    { ...record(status), origin: "continuous", continuousGenerationId: null, continuousSlotId: null }];
+  render(<AlgorithmsPage />);
+  const fixed = await screen.findByRole("spinbutton", { name: "Новый порог (%)" });
+  fireEvent.change(fixed, { target: { value: "8.5" } });
+  await userEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }));
+  const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+  await userEvent.click(confirmation.getByRole("button", { name: "Отмена" }));
+  expect(screen.getByRole("button", { name: "Результат исследования 17" })).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Удалить исследование 17" }));
+  await userEvent.click(within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" })).getByRole("button", { name: "Удалить" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Результат исследования 17" })).not.toBeInTheDocument());
+  expect(screen.getByRole("button", { name: "Результат исследования 20" })).toBeInTheDocument();
+  expect(fixed).toHaveValue(8.5);
+  expect(requests.filter((request) => request.method !== "GET").map(({ path, method }) => ({ path, method }))).toEqual([
+    { path: "/v1/optimization-studies/17", method: "DELETE" },
+  ]);
+});
+
+it("explains study deletion authentication failure and retains the confirmation and row", async () => {
+  studies = [record("failed")]; deleteStatus = 401;
+  render(<AlgorithmsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }));
+  const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
+  await userEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
+  expect(await confirmation.findByRole("alert")).toHaveTextContent(/Сессия истекла|Войдите/);
+  expect(confirmation.getByRole("button", { name: "Удалить" })).toBeEnabled();
+  expect(studies).toHaveLength(1);
+  expect(requests.filter((request) => request.method !== "GET")).toHaveLength(1);
+});
+
+it("distinguishes retained-chain deletion conflict and refreshes study discovery without auto-stopping", async () => {
+  studies = [{ ...record("failed"), origin: "continuous", continuousGenerationId: 7, continuousSlotId: 5 }];
+  deleteStatus = 409; deleteErrorCode = "continuous_history_referenced";
+  render(<AlgorithmsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }));
+  const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
+  const readsBefore = requests.filter((request) => request.path.startsWith("/v1/optimization-studies?")).length;
+  await userEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
+  expect(await confirmation.findByRole("alert")).toHaveTextContent(/связано с адаптивным профилем|непрерывной цепочкой/);
+  await waitFor(() => expect(requests.filter((request) => request.path.startsWith("/v1/optimization-studies?")).length).toBeGreaterThan(readsBefore));
+  expect(studies).toHaveLength(1);
+  expect(requests.filter((request) => request.method !== "GET").map((request) => request.path)).toEqual(["/v1/optimization-studies/17"]);
+});
+
+it("previews owner-wide continuous cleanup once, cancels safely, and preserves drafts/manual rows after one confirmed command", async () => {
+  studies = [{ ...record("completed"), id: 20, origin: "manual" }, { ...record("failed"), origin: "continuous" }];
+  render(<AlgorithmsPage />);
+  const fixed = await screen.findByRole("spinbutton", { name: "Новый порог (%)" });
+  fireEvent.change(fixed, { target: { value: "8.5" } });
+  expect(screen.getAllByRole("button", { name: "Удалить историю непрерывных исследований…" })).toHaveLength(1);
+  expect(requests.some((request) => request.path === "/v1/continuous-studies/cleanup")).toBe(false);
+  await userEvent.click(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…" }));
+  let confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
+  await confirmation.findByText("Непрерывные исследования: 12");
+  expect(confirmation.getByText(/всех алгоритмов.*всё время/)).toBeInTheDocument();
+  expect(confirmation.getByText(/Исторические прогоны: 9/)).toBeInTheDocument();
+  expect(confirmation.getByText(/Аналитические результаты: 4/)).toBeInTheDocument();
+  expect(confirmation.getByRole("button", { name: "Отмена" })).toHaveFocus();
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+  await userEvent.click(confirmation.getByRole("button", { name: "Отмена" }));
+  expect(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…" })).toHaveFocus();
+  await userEvent.click(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…" }));
+  confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
+  const confirm = await confirmation.findByRole("button", { name: "Удалить историю" });
+  await waitFor(() => expect(confirm).toBeEnabled());
+  fireEvent.click(confirm); fireEvent.click(confirm);
+  await screen.findByText(/История непрерывных исследований удалена/);
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Результат исследования 17" })).not.toBeInTheDocument());
+  expect(screen.getByRole("button", { name: "Результат исследования 20" })).toBeInTheDocument();
+  expect(fixed).toHaveValue(8.5);
+  expect(requests.filter((request) => request.method !== "GET").map(({ path, method, body }) => ({ path, method, body }))).toEqual([
+    { path: "/v1/continuous-studies/cleanup", method: "POST", body: { confirm: true, fingerprint: cleanupFixture.fingerprint } },
+  ]);
+  expect(requests.filter((request) => request.path.startsWith("/v1/continuous-studies?")).length).toBeGreaterThan(2);
+});
+
+it.each(["continuous_not_stopped", "ownership_conflict"])("disables bulk cleanup for the server blocker %s, not for unrelated manual work", async (blocker) => {
+  studies = [record("running")];
+  cleanupPreview = { ...cleanupFixture, eligible: false, blockers: [blocker] };
+  render(<AlgorithmsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Удалить историю непрерывных исследований…" }));
+  const confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
+  await confirmation.findByText("Непрерывные исследования: 12");
+  expect(confirmation.getByRole("button", { name: "Удалить историю" })).toBeDisabled();
+  expect(confirmation.getByRole("alert")).toHaveTextContent(blocker === "ownership_conflict" ? /владени/ : /остановите.*дождитесь/i);
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it("requires a new explicit confirmation with the replacement fingerprint after a stale cleanup preview", async () => {
+  cleanupStatus = 409;
+  render(<AlgorithmsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Удалить историю непрерывных исследований…" }));
+  const confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
+  await confirmation.findByText("Непрерывные исследования: 12");
+  cleanupPreview = { ...cleanupFixture, fingerprint: "b".repeat(32), counts: { ...cleanupFixture.counts, studies: 13 } };
+  await userEvent.click(confirmation.getByRole("button", { name: "Удалить историю" }));
+  expect(await confirmation.findByRole("alert")).toHaveTextContent(/состав.*изменился|подтвердите заново/i);
+  expect(confirmation.getByText("Непрерывные исследования: 13")).toBeInTheDocument();
+  expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
+  cleanupStatus = 200;
+  await userEvent.click(confirmation.getByRole("button", { name: "Удалить историю" }));
+  await screen.findByText(/История непрерывных исследований удалена/);
+  expect(requests.filter((request) => request.method === "POST").at(-1)?.body).toEqual({ confirm: true, fingerprint: "b".repeat(32) });
+});
+
+it("keeps the exact selected manual detail open across continuous cleanup", async () => {
+  studies = [{ ...record("completed"), id: 20, origin: "manual" }, { ...record("failed"), origin: "continuous" }];
+  render(<AlgorithmsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Результат исследования 20" }));
+  await screen.findByRole("dialog", { name: "Исследование #20 · Новый алгоритм" });
+  // Simulates an owner-wide cleanup completing while an existing selection is retained.
+  fireEvent.click(screen.getByText("Удалить историю непрерывных исследований…"));
+  const confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
+  await confirmation.findByText("Непрерывные исследования: 12");
+  await userEvent.click(confirmation.getByRole("button", { name: "Удалить историю" }));
+  await screen.findByText(/История непрерывных исследований удалена/);
+  expect(screen.getByRole("dialog", { name: "Исследование #20 · Новый алгоритм" })).toBeInTheDocument();
+  expect(studies.map((study) => study.id)).toEqual([20]);
+});
+
+it("preserves the mounted manual form and its shared saved draft when cleanup refreshes controllers", async () => {
+  studies = [{ ...record("failed"), origin: "continuous" }];
+  render(<AlgorithmsPage />);
+  const manual = within(await openOptimizer());
+  const horizon = await manual.findByLabelText("Горизонт сделки, мин (фиксирован)");
+  fireEvent.change(horizon, { target: { value: "720" } });
+  fireEvent.blur(horizon);
+  await waitFor(() => expect(drafts.future_algorithm).toMatchObject({ shared: { scope: { horizonMinutes: "720" } } }));
+  const savedDraft = structuredClone(drafts.future_algorithm);
+  fireEvent.click(screen.getByText("Удалить историю непрерывных исследований…"));
+  const confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
+  await confirmation.findByText("Непрерывные исследования: 12");
+  await userEvent.click(confirmation.getByRole("button", { name: "Удалить историю" }));
+  await screen.findByText(/История непрерывных исследований удалена/);
+  expect(manual.getByLabelText("Горизонт сделки, мин (фиксирован)")).toBe(horizon);
+  expect(horizon).toHaveValue(720);
+  expect(drafts.future_algorithm).toEqual(savedDraft);
+  expect(requests.filter((request) => request.method === "POST").map((request) => request.path)).toEqual(["/v1/continuous-studies/cleanup"]);
+});
+
+it("closes a deleted continuous selection without closing retained manual optimizer state", async () => {
+  studies = [{ ...record("completed"), id: 20, origin: "manual" }, { ...record("failed"), origin: "continuous" }];
+  render(<AlgorithmsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }));
+  await screen.findByRole("dialog", { name: "Исследование #17 · Новый алгоритм" });
+  fireEvent.click(screen.getByText("Удалить историю непрерывных исследований…"));
+  const confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
+  await confirmation.findByText("Непрерывные исследования: 12");
+  await userEvent.click(confirmation.getByRole("button", { name: "Удалить историю" }));
+  await screen.findByText(/История непрерывных исследований удалена/);
+  expect(screen.queryByRole("dialog", { name: "Исследование #17 · Новый алгоритм" })).not.toBeInTheDocument();
+  expect(await screen.findByRole("button", { name: "Результат исследования 20" })).toBeInTheDocument();
 });
 
 it("blocks a new study for another algorithm while the platform already has active work", async () => {

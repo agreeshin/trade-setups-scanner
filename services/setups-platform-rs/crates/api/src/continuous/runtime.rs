@@ -27,6 +27,8 @@ pub async fn start_continuous_runtime(pool:PgPool,market_url:String,market_key:S
     if pool.options().get_max_connections()<2 {return Err("continuous runtime requires at least two shared database connections".into());}
     sqlx::query("select owner_id from continuous_owner_lanes limit 0").execute(&pool).await.map_err(|e|e.to_string())?;
     if config.workers==0 || config.workers>4 {return Err("continuous workers must be in 1..=4".into());}
+    if config.max_concurrent_chains==0 || config.max_concurrent_chains>config.workers {return Err("continuous resident chain admission must be in 1..=workers".into());}
+    let resident = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_chains));
     let stop=CancellationToken::new();
     let notify=Arc::new(Notify::new());
     let available=Arc::new(AtomicBool::new(true));
@@ -34,9 +36,13 @@ pub async fn start_continuous_runtime(pool:PgPool,market_url:String,market_key:S
     for index in 0..config.workers {
         let pool=pool.clone();let url=market_url.clone();let key=market_key.clone();let config=config.clone();
         let stop=stop.clone();let notify=notify.clone();let available=available.clone();
+        let resident=resident.clone();
         let worker=format!("continuous-{}-{:016x}-{index}",std::process::id(),rand::random::<u64>());
         tasks.push(tokio::spawn(async move {
             while !stop.is_cancelled() {
+                // A permit owns the entire snapshot/CPU lifecycle, through the final join.
+                // Extra pollers cannot multiply resident snapshots or CPU kernels.
+                let permit=tokio::select!{_=stop.cancelled()=>break,result=resident.clone().acquire_owned()=>match result {Ok(permit)=>permit,Err(_)=>break}};
                 match db::claim_owner(&pool,&worker).await {
                     Ok(Some(lease))=>{
                         available.store(true,Ordering::SeqCst);
@@ -56,6 +62,7 @@ pub async fn start_continuous_runtime(pool:PgPool,market_url:String,market_key:S
                         tokio::select!{_=stop.cancelled()=>{},_=tokio::time::sleep(Duration::from_secs(1))=>{}}
                     }
                 }
+                drop(permit);
             }
         }));
     }
@@ -183,9 +190,12 @@ async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&Continuo
     }};
     change_phase(pool,job,"replay").await?;
     let cpu_spec=spec.clone();let cpu_input=input.clone();let cpu_candidate=candidate.clone();let limits=config.optimizer.study_limits();
-    let (replay,_)=blocking(cancel,None,move|token|core::materialize_continuous(&cpu_spec,&cpu_input,&cpu_candidate,context,&limits,&token)).await?;
-    let replay=replay.ok_or_else(interrupted)?;
-    let bootstrap=core::continuous_bootstrap(&spec,&replay).map_err(compute_error)?;
+    let (prepared,_)=blocking(cancel,None,move|token| {
+        let Some(replay)=core::materialize_continuous(&cpu_spec,&cpu_input,&cpu_candidate,context,&limits,&token)? else {return Ok(None);};
+        let bootstrap=core::continuous_bootstrap_with_frozen_prefix(&cpu_spec,&replay,&cpu_input)?;
+        Ok(Some((replay,bootstrap)))
+    }).await?;
+    let (replay,bootstrap)=prepared.ok_or_else(interrupted)?;
     let manifest=replay_manifest(&replay);
     let runs=replay.instruments.iter().map(|raw|Ok(ServiceReplayRun{
         exchange:raw.instrument.exchange.clone(),category:raw.instrument.category.clone(),symbol:raw.instrument.symbol.clone(),
@@ -210,7 +220,7 @@ async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&Continuo
     let mean=evaluation.evaluation.summary.score;
     let accepted=recommendation.is_some();
     let result=json!({"best":best,"selectedCell":selected,"meanExpectancy":mean,"analytics":evaluation,"recommendation":recommendation,"bootstrap":bootstrap,"setupSetId":format!("batch-{}",persisted_batch_id(pool,job).await?)});
-    drop(input); // Release the only frozen snapshot before terminal activation/persistence retries.
+    drop(input); // Compact prefix fingerprints are captured; the raw snapshot is no longer retained.
     db::finalize(pool,job,&result,accepted,mean,selected.as_ref()).await.map_err(database)?;
     Ok(())
 }

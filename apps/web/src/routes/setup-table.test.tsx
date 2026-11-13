@@ -89,6 +89,36 @@ it("marks an elapsed recommendation and keeps two profile events instead of coll
   expect(dialog).toHaveTextContent("не поднимется выше 99,00 USDT");
   expect(dialog).not.toHaveTextContent("через 3 мин");
 });
+it("retains an open recommendation when refreshed rows change, disappear or become empty", async () => {
+  vi.spyOn(Date, "now").mockReturnValue(signalAt * 1000);
+  const selected = { ...setup, id: 1, closeTimeUnix: signalAt, recommendation };
+  const view = render(<SetupTable setups={[selected]} />);
+  await userEvent.click(screen.getByRole("button", { name: /Условия сетапа BTCUSDT.*исследование 42/ }));
+  const dialog = screen.getByRole("dialog");
+  view.rerender(<SetupTable setups={[{ ...selected, closePrice: "999", recommendation: { ...recommendation, studyId: 99, generationId: 88, externalName: "Новое имя" } }]} />);
+  expect(screen.getByRole("dialog")).toBe(dialog);
+  expect(dialog).toHaveTextContent("исследование #42"); expect(dialog).toHaveTextContent("поколение #7");
+  expect(dialog).toHaveTextContent("Цена: 100,00 USDT"); expect(dialog).not.toHaveTextContent("Новое имя");
+  view.rerender(<SetupTable setups={[{ ...selected, id: 2, symbol: "ETHUSDT" }]} />);
+  expect(screen.getByRole("dialog")).toBe(dialog); expect(dialog).toHaveTextContent("Условия сетапа BTCUSDT");
+  view.rerender(<SetupTable setups={[]} />);
+  expect(screen.getByRole("dialog")).toBe(dialog);
+  await userEvent.click(screen.getByRole("button", { name: "Закрыть" }));
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "Список сетапов" })).toHaveFocus();
+});
+
+it("keeps a visible tooltip snapshot stable while its row props refresh", () => {
+  vi.spyOn(Date, "now").mockReturnValue(signalAt * 1000);
+  const selected = { ...setup, id: 1, closeTimeUnix: signalAt, recommendation };
+  const view = render(<SetupTable setups={[selected]} />);
+  fireEvent.focus(screen.getByRole("button", { name: /Условия сетапа BTCUSDT/ }));
+  expect(screen.getByRole("tooltip")).toHaveTextContent("Цена: 100,00 USDT");
+  view.rerender(<SetupTable setups={[{ ...selected, closePrice: "999", recommendation: { ...recommendation, externalName: "Новое имя" } }]} />);
+  expect(screen.getByRole("tooltip")).toHaveTextContent("Цена: 100,00 USDT");
+  expect(screen.getByRole("tooltip")).not.toHaveTextContent("Новое имя");
+});
+
 it("updates only the visible display clock and releases its interval on unmount", () => {
   vi.useFakeTimers(); vi.setSystemTime(signalAt * 1000);
   const view = render(<RouteActiveContext.Provider value><SetupTable setups={[{ ...setup, closeTimeUnix: signalAt, recommendation }]} /></RouteActiveContext.Provider>);

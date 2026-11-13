@@ -154,14 +154,19 @@ async fn get_batch(
         Err(_) => return internal_error(),
     };
     let setups: Vec<Value> = setups.iter().map(batch_setup_dto).collect();
-    Json(json!({
+    let archive=match setups_db::runs::replay_batch_archive(&state.pool,batch_id).await {
+        Ok(archive)=>archive,
+        Err(_)=>return internal_error(),
+    };
+    let mut body=json!({
         "offset": offset,
         "limit": limit,
         "total": total,
         "run": batch_dto(&batch),
         "setups": setups,
-    }))
-    .into_response()
+    });
+    if let Some(archive)=archive {body["continuousArchive"]=archive;}
+    ([("cache-control","no-store")],Json(body)).into_response()
 }
 
 async fn cancel_batch(
@@ -225,7 +230,7 @@ async fn delete_batch(
         Ok(Some(BatchDeleteOutcome::Active)) => {
             error_response(StatusCode::CONFLICT, "batch active")
         }
-        Ok(Some(BatchDeleteOutcome::Referenced))=>error_response(StatusCode::CONFLICT,"continuous_history_referenced"),
+        Ok(Some(BatchDeleteOutcome::Referenced))=>(StatusCode::CONFLICT,[("cache-control","no-store")],Json(json!({"error":"continuous_history_referenced","message":"Stop and drain continuous processes, then use confirmed continuous history cleanup before deleting linked history"}))).into_response(),
         Ok(Some(BatchDeleteOutcome::Deleted {
             runs_deleted,
             quality_intervals_deleted,

@@ -36,10 +36,12 @@ const dropAlgorithm = {
 const runFixture = { id: 7, name: "Рост цены и объёма", symbol: "BTCUSDT", status: "done", cacheHit: false, setupCount: 3, error: null, algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", fromUnix: 100, toUnix: 200, createdAt: "2026-01-01T00:00:00.000Z", params: {} };
 let purgeResponses: { status: number; body: unknown }[] = [];
 let replayRunsResponse: { runs: Record<string, unknown>[] } = { runs: [] };
+let deleteRunResponse: { status: number; body: unknown } | null = null;
 const requests: { path: string; method: string; body: unknown }[] = [];
 beforeEach(() => {
   requests.length = 0;
   replayRunsResponse = { runs: [] };
+  deleteRunResponse = null;
   purgeResponses = [];
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
@@ -62,6 +64,11 @@ beforeEach(() => {
       const { name } = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as { name: string };
       replayRunsResponse = { runs: replayRunsResponse.runs.map((run) => path === `/v1/replay-${run.isBatch === true ? "batches" : "runs"}/${String(run.id)}` ? { ...run, name } : run) };
       return Promise.resolve(new Response(JSON.stringify({ ok: true, name })));
+    }
+    if (method === "DELETE" && /^\/v1\/replay-(runs|batches)\/\d+$/.test(path)) {
+      const result = deleteRunResponse ?? { status: 200, body: { deleted: true, qualityIntervalsDeleted: 0 } };
+      if (result.status === 200) replayRunsResponse = { runs: replayRunsResponse.runs.filter((run) => path !== `/v1/replay-${run.isBatch === true ? "batches" : "runs"}/${String(run.id)}`) };
+      return Promise.resolve(new Response(JSON.stringify(result.body), { status: result.status }));
     }
     if (path.startsWith("/v1/replay-batches/")) {
       if (path.endsWith("/cancel")) data = { cancelled: 1, cancelRequested: 0 };
@@ -377,6 +384,77 @@ describe("platform screens", () => {
     await waitFor(() => expect(screen.getByText("Запуск #8 удалён.")).toBeInTheDocument());
     expect(requests.some((request) => request.path === "/v1/replay-batches/8" && request.method === "DELETE")).toBe(true);
   });
+  it.each([
+    { isBatch: false, status: "done" }, { isBatch: true, status: "done" },
+    { isBatch: false, status: "cancelled" }, { isBatch: true, status: "cancelled" },
+    { isBatch: false, status: "failed" }, { isBatch: true, status: "failed" },
+  ])("explicitly deletes an archived continuous $status output (batch=$isBatch), preserving other rows, caches and replay form", async ({ isBatch, status }) => {
+    replayRunsResponse = { runs: [
+      // Archived DTOs can still report source IDs; only the server's real live references block deletion.
+      { ...runFixture, status, isBatch, origin: "continuous", continuousGenerationId: 7, continuousSlotId: 5 },
+      { ...runFixture, id: 20, name: "Сохранить ручной запуск", origin: "manual" },
+    ] };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    const from = await screen.findByLabelText("Начало");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Проверить данные" })).toBeEnabled());
+    fireEvent.change(from, { target: { value: "2026-10-01T00:00" } });
+    const formDate = (from as HTMLInputElement).value;
+    await userEvent.click(await screen.findByRole("button", { name: "Удалить запуск 7" }));
+    let confirmation = within(await screen.findByRole("dialog", { name: "Удалить запуск #7?" }));
+    expect(confirmation.getByText(/Кеш вычислений не затрагивается/)).toBeInTheDocument();
+    expect(requests.every((request) => request.method === "GET")).toBe(true);
+    await userEvent.click(confirmation.getByRole("button", { name: "Отмена" }));
+    expect(screen.getByRole("button", { name: "Удалить запуск 7" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Удалить запуск 7" }));
+    confirmation = within(await screen.findByRole("dialog", { name: "Удалить запуск #7?" }));
+    await userEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
+    await screen.findByText("Запуск #7 удалён.");
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Удалить запуск 7" })).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Удалить запуск 20" })).toBeInTheDocument();
+    expect(from).toHaveValue(formDate);
+    expect(requests.filter((request) => request.method !== "GET")).toEqual([
+      { path: `/v1/replay-${isBatch ? "batches" : "runs"}/7`, method: "DELETE", body: null },
+    ]);
+  });
+
+  it.each([false, true])("explains row deletion authentication failure (batch=%s) without claiming success", async (isBatch) => {
+    replayRunsResponse = { runs: [{ ...runFixture, isBatch, origin: "continuous" }] };
+    deleteRunResponse = { status: 401, body: { error: "unauthorized" } };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole("button", { name: "Удалить запуск 7" }));
+    const confirmation = within(await screen.findByRole("dialog", { name: "Удалить запуск #7?" }));
+    await userEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
+    expect(await confirmation.findByRole("alert")).toHaveTextContent(/Сессия истекла|Войдите/);
+    expect(confirmation.getByRole("button", { name: "Удалить" })).toBeEnabled();
+    expect(screen.queryByText("Запуск #7 удалён.")).not.toBeInTheDocument();
+    expect(replayRunsResponse.runs).toHaveLength(1);
+    expect(requests.filter((request) => request.method !== "GET")).toHaveLength(1);
+  });
+
+  it.each([false, true])("explains a retained-chain conflict (batch=%s) and refreshes rows without cancelling anything", async (isBatch) => {
+    replayRunsResponse = { runs: [{ ...runFixture, isBatch, origin: "continuous" }] };
+    deleteRunResponse = { status: 409, body: { error: "continuous_history_referenced" } };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole("button", { name: "Удалить запуск 7" }));
+    const confirmation = within(await screen.findByRole("dialog", { name: "Удалить запуск #7?" }));
+    const readsBefore = requests.filter((request) => request.path === "/v1/replay-runs").length;
+    await userEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
+    expect(await confirmation.findByRole("alert")).toHaveTextContent(/адаптивн|непрерывн.*цепоч/);
+    await waitFor(() => expect(requests.filter((request) => request.path === "/v1/replay-runs").length).toBeGreaterThan(readsBefore));
+    expect(replayRunsResponse.runs).toHaveLength(1);
+    expect(requests.filter((request) => request.method !== "GET")).toEqual([
+      { path: `/v1/replay-${isBatch ? "batches" : "runs"}/7`, method: "DELETE", body: null },
+    ]);
+  });
+
+  it.each(["queued", "running", "cancel_requested"])("does not offer deletion for an active %s run", async (status) => {
+    replayRunsResponse = { runs: [{ ...runFixture, status, origin: "continuous" }] };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await screen.findByRole("button", { name: "Результаты запуска 7" });
+    expect(screen.queryByRole("button", { name: "Удалить запуск 7" })).not.toBeInTheDocument();
+    expect(requests.every((request) => request.method === "GET")).toBe(true);
+  });
+
   it("requests server pages and finds records beyond the former latest-500 cap", async () => {
     render(<SetupsPage />);
     await screen.findByText("Страница 1 из 25 · Найдено: 601");

@@ -30,7 +30,7 @@ pub struct ChainJob {
 
 pub async fn claim_owner(pool: &PgPool, worker: &str) -> Result<Option<OwnerLease>, DbError> {
     let mut tx=pool.begin().await?;
-    let owner: Option<String>=sqlx::query_scalar("select l.owner_id from continuous_owner_lanes l where (l.lease_owner is null or l.lease_until<=now()) and exists(select 1 from continuous_processes p where p.owner_id=l.owner_id and (p.status='stopping' or (p.desired_running and p.next_attempt_at<=now() and p.retry_count<3))) order by l.lease_until nulls first,l.owner_id for update skip locked limit 1")
+    let owner: Option<String>=sqlx::query_scalar("select l.owner_id from continuous_owner_lanes l where (l.lease_owner is null or l.lease_until<=now()) and exists(select 1 from continuous_processes p where p.owner_id=l.owner_id and (p.status='stopping' or (p.desired_running and p.next_attempt_at<=now() and p.retry_count<3 and exists(select 1 from continuous_slots s where s.owner_id=p.owner_id and s.algorithm_id=p.algorithm_id and s.enabled and s.pending_generation_id is null)))) order by l.lease_until nulls first,l.owner_id for update skip locked limit 1")
         .fetch_optional(&mut *tx).await?;
     let Some(owner_id)=owner else { return Ok(None); };
     // try-lock avoids inversion with owner_lock's advisory -> lease-row ordering.
@@ -53,8 +53,10 @@ pub(super) async fn owns(tx: &mut Transaction<'_,Postgres>, lease: &OwnerLease) 
 async fn fenced(tx: &mut Transaction<'_,Postgres>, job: &ChainJob) -> Result<bool,DbError> {
     owner_lock(tx,&job.lease.owner_id).await?;
     if !owns(tx,&job.lease).await? { return Ok(false); }
-    Ok(sqlx::query_scalar("select exists(select 1 from continuous_processes where owner_id=$1 and algorithm_id=$2 and desired_running and config_revision=$3 and active_generation_id=$4)")
-        .bind(&job.lease.owner_id).bind(&job.algorithm_id).bind(job.config_revision).bind(job.generation_id).fetch_one(&mut **tx).await?)
+    // Protect revision/Stop without excluding live scanners during bulk replay
+    // persistence. Transitions updating slots upgrade the process lock FIRST.
+    Ok(sqlx::query_scalar::<_,i64>("select config_revision from continuous_processes where owner_id=$1 and algorithm_id=$2 and desired_running and config_revision=$3 and active_generation_id=$4 for share")
+        .bind(&job.lease.owner_id).bind(&job.algorithm_id).bind(job.config_revision).bind(job.generation_id).fetch_optional(&mut **tx).await?.is_some())
 }
 
 pub async fn heartbeat(pool: &PgPool, lease: &OwnerLease) -> Result<bool,DbError> {
@@ -117,7 +119,7 @@ pub async fn prepare_next(pool: &PgPool, lease: &OwnerLease) -> Result<Option<Ch
     let mut tx=pool.begin().await?;
     owner_lock(&mut tx,&lease.owner_id).await?;
     if !owns(&mut tx,lease).await? { return Ok(None); }
-    let row=sqlx::query("select p.* from continuous_processes p join continuous_owner_lanes l using(owner_id) where p.owner_id=$1 and p.desired_running and p.retry_count<3 and p.next_attempt_at<=now() order by (p.algorithm_id>l.last_algorithm_id) desc,p.algorithm_id for update of p limit 1")
+    let row=sqlx::query("select p.* from continuous_processes p join continuous_owner_lanes l using(owner_id) where p.owner_id=$1 and p.desired_running and p.retry_count<3 and p.next_attempt_at<=now() and exists(select 1 from continuous_slots s where s.owner_id=p.owner_id and s.algorithm_id=p.algorithm_id and s.enabled and s.pending_generation_id is null) order by (p.algorithm_id>l.last_algorithm_id) desc,p.algorithm_id for update of p limit 1")
         .bind(&lease.owner_id).fetch_optional(&mut *tx).await?;
     let Some(row)=row else { return Ok(None); };
     let algorithm: String=row.try_get("algorithm_id")?;
@@ -125,10 +127,18 @@ pub async fn prepare_next(pool: &PgPool, lease: &OwnerLease) -> Result<Option<Ch
     let revision: i64=row.try_get("config_revision")?;
     let cursor: i32=row.try_get("next_slot")?;
     let thresholds=config["minSetupsPerDay"].as_array().ok_or_else(||DbError::Json("invalid persisted continuous thresholds".into()))?;
-    let frequency=thresholds.get(cursor as usize%thresholds.len()).and_then(Value::as_f64)
-        .ok_or_else(||DbError::Json("invalid persisted continuous frequency".into()))?;
-    let slot_id: i64=sqlx::query_scalar("select id from continuous_slots where owner_id=$1 and algorithm_id=$2 and enabled and min_setups_per_day=$3::text::numeric for update")
-        .bind(&lease.owner_id).bind(&algorithm).bind(frequency.to_string()).fetch_one(&mut *tx).await?;
+    if thresholds.is_empty() {return Err(DbError::Json("empty persisted continuous thresholds".into()));}
+    let mut selected_slot = None;
+    for offset in 0..thresholds.len() {
+        let index = (cursor as usize+offset)%thresholds.len();
+        let frequency=thresholds[index].as_f64().ok_or_else(||DbError::Json("invalid persisted continuous frequency".into()))?;
+        let slot: Option<i64>=sqlx::query_scalar("select id from continuous_slots where owner_id=$1 and algorithm_id=$2 and enabled and pending_generation_id is null and min_setups_per_day=$3::text::numeric for update")
+            .bind(&lease.owner_id).bind(&algorithm).bind(frequency.to_string()).fetch_optional(&mut *tx).await?;
+        if let Some(slot_id)=slot {selected_slot=Some((slot_id,frequency,index));break;}
+    }
+    let Some((slot_id,frequency,slot_index))=selected_slot else {return Ok(None);};
+    sqlx::query("update continuous_processes set next_slot=$3 where owner_id=$1 and algorithm_id=$2")
+        .bind(&lease.owner_id).bind(&algorithm).bind(slot_index as i32).execute(&mut *tx).await?;
     // Actual execution start, never enqueue time. This timestamp and cutoff cannot move.
     let start=Utc::now();
     let to=start.timestamp();
@@ -261,6 +271,9 @@ pub async fn load_replay(pool: &PgPool, job: &ChainJob, max_bytes: usize) -> Res
 pub async fn finalize(pool: &PgPool, job: &ChainJob, result: &Value, accepted: bool, mean: Option<f64>, selected: Option<&Value>) -> Result<bool,DbError> {
     let mut tx=pool.begin().await?;
     if !fenced(&mut tx,job).await? { return Ok(false); }
+    // Process -> slot, like scan commit and promotion. No market/CPU work here.
+    sqlx::query("select owner_id from continuous_processes where owner_id=$1 and algorithm_id=$2 for update")
+        .bind(&job.lease.owner_id).bind(&job.algorithm_id).execute(&mut *tx).await?;
     let ready: bool=sqlx::query_scalar("select exists(select 1 from continuous_generations g join optimization_studies s on s.id=g.study_id where g.id=$1 and s.status='completed' and (not $2 or (g.replay_batch_id is not null and g.replay_manifest is not null and exists(select 1 from replay_runs r where r.batch_id=g.replay_batch_id) and not exists(select 1 from replay_runs r where r.batch_id=g.replay_batch_id and r.status<>'done'))))")
         .bind(job.generation_id).bind(accepted).fetch_one(&mut *tx).await?;
     if !ready || (accepted && (!result["recommendation"].is_object() || !result["analytics"].is_object() || mean.is_none() || selected.is_none())) {
@@ -268,8 +281,20 @@ pub async fn finalize(pool: &PgPool, job: &ChainJob, result: &Value, accepted: b
     }
     sqlx::query("update continuous_generations set status='completed',phase='completed',result=$2,accepted=$3,updated_at=now() where id=$1")
         .bind(job.generation_id).bind(result).bind(accepted).execute(&mut *tx).await?;
-    sqlx::query("update continuous_slots set active_generation_id=$2,status=$3,study_id=$4,mean_expectancy=$5,selected_cell=$6,updated_at=now() where id=$1")
-        .bind(job.slot_id).bind(if accepted{Some(job.generation_id)}else{None}).bind(if accepted{"active"}else{"rejected"}).bind(job.study_id).bind(mean).bind(selected).execute(&mut *tx).await?;
+    if accepted {
+        if !result["bootstrap"]["frozenPrefix"].is_object() {
+            return Err(DbError::Json("accepted pending generation requires a frozen prefix manifest".into()));
+        }
+        let installed=sqlx::query("update continuous_slots set pending_generation_id=$2,pending_status='warming',pending_error=null,readiness_frontier=null,status='warming',study_id=$3,updated_at=now() where id=$1 and pending_generation_id is null")
+            .bind(job.slot_id).bind(job.generation_id).bind(job.study_id).execute(&mut *tx).await?.rows_affected();
+        if installed!=1 {return Err(DbError::Json("continuous candidate cannot overwrite an existing pending generation".into()));}
+    } else {
+        sqlx::query("update continuous_slots set active_generation_id=null,pending_generation_id=null,pending_status=null,pending_error=null,readiness_frontier=null,status='rejected',study_id=$2,mean_expectancy=$3,selected_cell=$4,updated_at=now() where id=$1")
+            .bind(job.slot_id).bind(job.study_id).bind(mean).bind(selected).execute(&mut *tx).await?;
+        super::live::retire_inactive_checkpoints(&mut tx,&job.lease.owner_id,&job.algorithm_id,Some(job.slot_id)).await?;
+        sqlx::query("update adaptive_live_warmup_lane set slot_id=null,generation_id=null,lease_owner=null,lease_until=null,lease_token=lease_token+1 where slot_id=$1")
+            .bind(job.slot_id).execute(&mut *tx).await?;
+    }
     sqlx::query("update continuous_processes set active_generation_id=null,active_study_id=null,phase='queued',status='running',retry_count=0,error=null,next_slot=(next_slot+1)%jsonb_array_length(config->'minSetupsPerDay'),next_attempt_at=now()+interval '1 second',updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(&job.lease.owner_id).bind(&job.algorithm_id).execute(&mut *tx).await?;
     if !owns(&mut tx,&job.lease).await? {return Ok(false);}

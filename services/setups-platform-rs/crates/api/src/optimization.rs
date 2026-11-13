@@ -371,7 +371,7 @@ async fn delete_study(
         }
         Ok(Some(db::DeleteStudyOutcome::Referenced)) => response(
             StatusCode::CONFLICT,
-            json!({"error":"continuous_history_referenced"}),
+            json!({"error":"continuous_history_referenced","message":"Stop and drain continuous processes, then use confirmed continuous history cleanup before deleting linked history"}),
         ),
         Ok(None) => response(StatusCode::NOT_FOUND, json!({"error":"not_found"})),
         Err(error) => internal_error("delete", error),

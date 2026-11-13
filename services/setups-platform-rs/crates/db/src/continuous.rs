@@ -1,5 +1,8 @@
 //! Durable continuous ownership. All mutating transitions fence by owner/revision/lease.
 pub mod scheduler;
+pub mod live;
+pub mod outbox;
+pub mod cleanup;
 use crate::DbError;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -15,6 +18,12 @@ pub struct ContinuousSlot {
     pub min_setups_per_day: f64,
     pub status: String,
     pub active_generation_id: Option<i64>,
+    pub active_status: String,
+    pub pending_generation_id: Option<i64>,
+    pub pending_status: Option<String>,
+    pub readiness_frontier: Option<i64>,
+    pub pending_error: Option<Value>,
+    pub live_watermark: Option<i64>,
     pub study_id: Option<i64>,
     pub mean_expectancy: Option<f64>,
     pub selected_cell: Option<Value>,
@@ -56,6 +65,10 @@ pub async fn get(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Option<C
     result.slots = slots.into_iter().map(|row| Ok(ContinuousSlot {
         id: row.try_get("id")?, min_setups_per_day: row.try_get("frequency")?,
         status: row.try_get("status")?, active_generation_id: row.try_get("active_generation_id")?,
+        active_status: if row.try_get::<Option<i64>,_>("active_generation_id")?.is_some() {"active"} else {"inactive"}.into(),
+        pending_generation_id: row.try_get("pending_generation_id")?, pending_status: row.try_get("pending_status")?,
+        readiness_frontier: row.try_get("readiness_frontier")?, pending_error: row.try_get("pending_error")?,
+        live_watermark: row.try_get("live_watermark")?,
         study_id: row.try_get("study_id")?, mean_expectancy: row.try_get("mean_expectancy")?,
         selected_cell: row.try_get("selected_cell")?, updated_at: row.try_get("updated_at")?,
     })).collect::<Result<_,DbError>>()?;
@@ -101,8 +114,10 @@ pub async fn configure(pool: &PgPool, owner: &str, algorithm: &str, config: &Val
     }
     sqlx::query("insert into continuous_processes(owner_id,algorithm_id,config) values($1,$2,$3) on conflict(owner_id,algorithm_id) do update set config=excluded.config,config_revision=continuous_processes.config_revision+1,status='stopped',phase=null,error=null,next_slot=0,updated_at=now()")
         .bind(owner).bind(algorithm).bind(config).execute(&mut *tx).await?;
-    sqlx::query("update continuous_slots set enabled=false,active_generation_id=null,status='stopped',updated_at=now() where owner_id=$1 and algorithm_id=$2")
+    sqlx::query("update continuous_slots set enabled=false,active_generation_id=null,pending_generation_id=null,pending_status=null,pending_error=null,readiness_frontier=null,live_watermark=null,status='stopped',updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(owner).bind(algorithm).execute(&mut *tx).await?;
+    live::retire_inactive_checkpoints(&mut tx,owner,algorithm,None).await?;
+    live::invalidate_warmup(&mut tx,owner,algorithm).await?;
     for frequency in thresholds {
         sqlx::query("insert into continuous_slots(owner_id,algorithm_id,min_setups_per_day) values($1,$2,$3::text::numeric) on conflict(owner_id,algorithm_id,min_setups_per_day) do update set enabled=true,status='idle',updated_at=now()")
             .bind(owner).bind(algorithm).bind(frequency.to_string()).execute(&mut *tx).await?;
@@ -116,6 +131,9 @@ pub async fn start(pool: &PgPool, owner: &str, algorithm: &str) -> Result<bool,D
     owner_lock(&mut tx, owner).await?;
     let changed = sqlx::query("update continuous_processes set desired_running=true,status='running',error=null,retry_count=0,next_attempt_at=now(),phase=coalesce(phase,'queued'),updated_at=now() where owner_id=$1 and algorithm_id=$2 and status<>'stopping'")
         .bind(owner).bind(algorithm).execute(&mut *tx).await?.rows_affected()>0;
+    // Also repair inactive cursors persisted before retirement was implemented;
+    // retrying a technical failure must leave every accepted incumbent intact.
+    if changed {live::retire_inactive_checkpoints(&mut tx,owner,algorithm,None).await?;}
     tx.commit().await?;
     Ok(changed)
 }
@@ -136,8 +154,10 @@ pub async fn stop(pool: &PgPool, owner: &str, algorithm: &str) -> Result<bool,Db
         .bind(owner).bind(algorithm).fetch_all(&mut *tx).await?;
     sqlx::query("update continuous_processes set desired_running=false,status='stopping',config_revision=config_revision+1,phase='stopping',cleanup_targets=$3,updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(owner).bind(algorithm).bind(json!({"studies":studies,"runs":runs,"batches":batches})).execute(&mut *tx).await?;
-    sqlx::query("update continuous_slots set active_generation_id=null,status='stopped',updated_at=now() where owner_id=$1 and algorithm_id=$2")
+    sqlx::query("update continuous_slots set active_generation_id=null,pending_generation_id=null,pending_status=null,pending_error=null,readiness_frontier=null,status='stopped',updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(owner).bind(algorithm).execute(&mut *tx).await?;
+    live::retire_inactive_checkpoints(&mut tx,owner,algorithm,None).await?;
+    live::invalidate_warmup(&mut tx,owner,algorithm).await?;
     sqlx::query("update optimization_studies set status='cancel_requested',updated_at=now() where id=any($1)")
         .bind(&studies).execute(&mut *tx).await?;
     sqlx::query("update replay_runs set status='cancel_requested',updated_at=now() where id=any($1)")
@@ -339,7 +359,10 @@ pub async fn commit_adaptive_scan_cas(
             .bind(serde_json::to_value(&row.setup.details).map_err(crate::json_error)?)
             .bind(expected.slot_id).bind(expected.generation_id).bind(&row.recommendation).bind(&expected.external_name)
             .fetch_optional(&mut *tx).await?;
-        if let Some(id)=id { inserted.push(AdaptiveInserted{index,id:i64::from(id)}); }
+        if let Some(id)=id {
+            outbox::enqueue(&mut tx,expected,id,row).await?;
+            inserted.push(AdaptiveInserted{index,id:i64::from(id)});
+        }
     }
     sqlx::query("insert into adaptive_live_checkpoints(slot_id,instrument_key,generation_id,state) values($1,$2,$3,$4) on conflict(slot_id,instrument_key) do update set generation_id=excluded.generation_id,state=excluded.state,updated_at=now()")
         .bind(expected.slot_id).bind(instrument_key).bind(expected.generation_id).bind(checkpoint)

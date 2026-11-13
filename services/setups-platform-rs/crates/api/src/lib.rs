@@ -12,6 +12,7 @@ pub mod continuous;
 pub mod optimization;
 pub mod replay;
 pub mod restore;
+pub mod resources;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};

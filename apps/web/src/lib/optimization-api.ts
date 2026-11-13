@@ -103,7 +103,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const detail = await response.json().catch(() => null) as { error?: unknown; message?: string; activeStudyId?: number; resource?: string; requested?: number; limit?: number } | null;
   const activeId = detail?.activeStudyId;
   let message = `Не удалось выполнить запрос оптимизации: HTTP ${response.status}`;
-  if (response.status === 409 && detail?.error === "continuous_history_referenced") message = "Нельзя удалить исследование: оно связано с адаптивным профилем или сохраняемой непрерывной цепочкой. Завершённая история сохранена.";
+  if (response.status === 401) message = "Сессия истекла. Войдите заново перед изменением исследований.";
+  else if (response.status === 409 && detail?.error === "continuous_history_referenced") message = "Нельзя удалить исследование: оно связано с адаптивным профилем или сохраняемой непрерывной цепочкой. Завершённая история сохранена.";
   else if (response.status === 409 && detail?.error === "continuous_owner_stop_required") message = "Непрерывное исследование нельзя остановить отдельно. Используйте общую остановку непрерывного процесса алгоритма.";
   else if (response.status === 409) message = init.method === "DELETE" ? "Нельзя удалить активное исследование. Сначала остановите его и дождитесь завершения."
     : activeId !== undefined ? `Исследование #${activeId} уже выполняется. Восстановлен его статус.` : "Версия алгоритма изменилась. Обновите страницу перед новым запуском.";

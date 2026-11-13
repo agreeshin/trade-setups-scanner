@@ -1,9 +1,10 @@
+import { useRef, useState } from "react";
 import { localTime, localTimezoneLabel, type SetupRow } from "./platform-controls";
 import { Badge } from "../components/ui/badge";
 import { EmptyState } from "../components/ui/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { formatSetupRecommendation } from "../lib/setup-recommendation";
-import { SetupRecommendationPreview } from "./setup-recommendation-preview";
+import { SetupRecommendationDialog, SetupRecommendationPreview, type SelectedSetupRecommendation } from "./setup-recommendation-preview";
 
 function SetupDetails({ setup }: { setup: SetupRow }) {
   const metrics = setup.details;
@@ -25,8 +26,11 @@ function SetupDetails({ setup }: { setup: SetupRow }) {
 }
 
 export function SetupTable({ setups }: { setups: SetupRow[] }) {
-  if (!setups.length) return <EmptyState className="mt-3" title="Сетапы не найдены." />;
-  return <div className="mt-1 overflow-x-auto rounded-md border border-input/60">
+  const [selection, setSelection] = useState<SelectedSetupRecommendation | null>(null);
+  const container = useRef<HTMLDivElement>(null);
+  return <div ref={container} role="region" aria-label="Список сетапов" tabIndex={-1} className="min-w-0">
+    {selection && <SetupRecommendationDialog selection={selection} onClose={() => setSelection(null)} onRestoreFocus={() => (document.getElementById(selection.triggerId) ?? container.current)?.focus()} />}
+    {!setups.length ? <EmptyState className="mt-3" title="Сетапы не найдены." /> : <div className="mt-1 overflow-x-auto rounded-md border border-input/60">
     <Table>
       <caption className="px-3 py-2 text-left text-xs text-muted-foreground">Время: {localTimezoneLabel()}</caption>
       <TableHeader>
@@ -46,9 +50,10 @@ export function SetupTable({ setups }: { setups: SetupRow[] }) {
         <TableCell className="whitespace-nowrap tabular-nums">{localTime(setup.openTimeUnix)}</TableCell>
         <TableCell className="whitespace-nowrap tabular-nums">{localTime(setup.closeTimeUnix)}</TableCell>
         <TableCell numeric>{setup.closePrice}</TableCell>
-        <TableCell><SetupRecommendationPreview setup={setup} /><SetupDetails setup={setup} /></TableCell>
+        <TableCell><SetupRecommendationPreview setup={setup} onOpen={setSelection} dialogOpen={selection !== null} /><SetupDetails setup={setup} /></TableCell>
         <TableCell>{setup.exchange === "bybit" && setup.category === "linear" ? <div className="flex flex-wrap gap-x-3 gap-y-1"><a className="text-primary underline-offset-4 hover:underline" href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(`BYBIT:${setup.symbol}.P`)}`} target="_blank" rel="noopener noreferrer">TradingView</a><a className="text-primary underline-offset-4 hover:underline" href={`https://www.bybit.com/trade/usdt/${encodeURIComponent(setup.symbol)}`} target="_blank" rel="noopener noreferrer">Bybit</a></div> : <span className="text-muted-foreground">Нет ссылки</span>}</TableCell>
       </TableRow>)}</TableBody>
     </Table>
+    </div>}
   </div>;
 }

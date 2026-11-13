@@ -38,8 +38,8 @@ pub struct ReplayRunFull {
 
 const RUN_COLUMNS: &str = "id, name, batch_id, exchange_code, category, symbol, status, cache_hit, setups, warmup_minutes, \
      processed_minutes, error, algorithm_id, algorithm_version, from_ts, to_ts, created_at, params, \
-     quality, quality_source_run_id, quality_computed_at, origin, continuous_generation_id, \
-     (select study_id from continuous_generations where id=replay_runs.continuous_generation_id) as continuous_study_id";
+     quality, quality_source_run_id, quality_computed_at, origin, coalesce(continuous_generation_id,(continuous_archive->>'generationId')::bigint) as continuous_generation_id, \
+     coalesce((select study_id from continuous_generations where id=replay_runs.continuous_generation_id),(continuous_archive->>'studyId')::bigint) as continuous_study_id";
 
 fn run_full_from_row(row: &PgRow) -> Result<ReplayRunFull, DbError> {
     let algorithm_id: String = row.try_get("algorithm_id")?;
@@ -103,6 +103,14 @@ pub async fn get_run_full(pool: &PgPool, run_id: i64) -> Result<Option<ReplayRun
     .fetch_optional(pool)
     .await?;
     row.as_ref().map(run_full_from_row).transpose()
+}
+
+/// Only the batch detail endpoint reads these bounded, potentially large output
+/// archives. Lists retain compact provenance IDs and never load analytical JSON.
+pub async fn replay_batch_archive(pool:&PgPool,batch_id:i64)->Result<Option<Value>,DbError> {
+    let Ok(id)=i32::try_from(batch_id) else {return Ok(None);};
+    Ok(sqlx::query_scalar("select jsonb_build_object('provenance',continuous_archive,'analytics',continuous_analytics_archive,'analyticsPresent',continuous_analytics_archive is not null,'context',continuous_analytics_context_archive,'replayManifest',continuous_replay_archive) from replay_batches where id=$1 and continuous_archive is not null")
+        .bind(id).fetch_optional(pool).await?)
 }
 
 pub async fn rename_replay_run(pool: &PgPool, run_id: i64, name: &str) -> Result<bool, DbError> {
@@ -197,8 +205,8 @@ pub struct BatchSummary {
     pub continuous_study_id: Option<i64>,
 }
 
-const BATCH_SELECT: &str = "select b.id, b.name, b.exchange_code, b.category, b.algorithm_id, b.algorithm_version, b.params, b.from_ts, b.to_ts, b.instrument_count, b.created_at, b.origin,b.continuous_generation_id, \
-     (select study_id from continuous_generations where id=b.continuous_generation_id) as continuous_study_id, \
+const BATCH_SELECT: &str = "select b.id, b.name, b.exchange_code, b.category, b.algorithm_id, b.algorithm_version, b.params, b.from_ts, b.to_ts, b.instrument_count, b.created_at, b.origin,coalesce(b.continuous_generation_id,(b.continuous_archive->>'generationId')::bigint) as continuous_generation_id, \
+     coalesce((select study_id from continuous_generations where id=b.continuous_generation_id),(b.continuous_archive->>'studyId')::bigint) as continuous_study_id, \
      count(*) filter (where r.status in ('queued','running','cancel_requested')) as active_instruments, \
      count(*) filter (where r.status = 'done') as done_instruments, \
      count(*) filter (where r.status = 'failed') as failed_instruments, \
@@ -484,13 +492,17 @@ pub async fn get_algorithm_params(
     pool: &PgPool,
     algorithm_id: &str,
 ) -> Result<AlgorithmParams, DbError> {
+    let stored = crate::settings_get(pool, &format!("algorithm:{algorithm_id}")).await?;
+    Ok(algorithm_params_from_settings(algorithm_id,stored.as_ref()))
+}
+
+pub(crate) fn algorithm_params_from_settings(algorithm_id: &str, stored: Option<&Value>) -> AlgorithmParams {
     let mut value = match algorithm_id {
         SPIKE_DROP_ALGORITHM_ID => serde_json::to_value(SpikeDropParams::default()),
         _ => serde_json::to_value(SpikeParams::default()),
     }
     .unwrap_or(Value::Null);
-    let stored = crate::settings_get(pool, &format!("algorithm:{algorithm_id}")).await?;
-    if let Some(stored_params) = stored.as_ref().and_then(|stored| stored.get("params"))
+    if let Some(stored_params) = stored.and_then(|stored| stored.get("params"))
         && let (Some(target), Some(source)) = (value.as_object_mut(), stored_params.as_object())
     {
         for (key, entry) in source {
@@ -503,10 +515,10 @@ pub async fn get_algorithm_params(
         }
         _ => serde_json::from_value::<SpikeParams>(value).map(AlgorithmParams::Spike),
     };
-    Ok(params.unwrap_or_else(|_| match algorithm_id {
+    params.unwrap_or_else(|_| match algorithm_id {
         SPIKE_DROP_ALGORITHM_ID => AlgorithmParams::SpikeDrop(SpikeDropParams::default()),
         _ => AlgorithmParams::Spike(SpikeParams::default()),
-    }))
+    })
 }
 
 pub async fn get_replay_batch(
@@ -802,7 +814,7 @@ pub async fn live_setups_search(
     let total: i64 = count_row.try_get("total")?;
     let page_sql = format!(
         "select id, exchange_code, category, symbol, algorithm_id, algorithm_version, \
-         open_time, close_time, close_price, params, details, adaptive_slot_id, adaptive_generation_id, recommendation, external_name from live_setups where {filter} \
+         open_time, close_time, close_price, params, details, adaptive_slot_id, coalesce(adaptive_generation_id,(adaptive_generation_archive->>'generationId')::bigint) as adaptive_generation_id, recommendation, external_name from live_setups where {filter} \
          order by close_time desc, id desc offset {offset_ph} limit {limit_ph}"
     );
     let page = sqlx::query(&page_sql).bind(snapshot_id as i32);

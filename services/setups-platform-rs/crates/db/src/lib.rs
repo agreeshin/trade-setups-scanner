@@ -38,7 +38,7 @@ impl From<sqlx::Error> for DbError {
     }
 }
 
-pub(crate) fn algorithm_name(algorithm_id: &str) -> String {
+pub fn algorithm_name(algorithm_id: &str) -> String {
     if algorithm_id == setups_domain::SPIKE_ALGORITHM_ID {
         "Всплеск цены и оборота".to_string()
     } else if algorithm_id == setups_domain::SPIKE_DROP_ALGORITHM_ID {

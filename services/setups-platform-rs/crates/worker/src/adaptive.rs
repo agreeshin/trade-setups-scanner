@@ -12,8 +12,10 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod runtime;
+mod state;
+pub use state::{AdaptiveRuntime, AdaptiveRuntimeLimits};
 pub(crate) use runtime::adaptive_live_loop;
-pub use runtime::{AdaptiveLiveBootstrap, PgAdaptiveStore, adaptive_live_tick};
+pub use runtime::{AdaptiveLiveBootstrap, AdaptiveLiveRuntime, PgAdaptiveStore, adaptive_live_tick};
 
 pub const ADAPTIVE_PAGE_LIMIT: usize = 256;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024;
@@ -27,7 +29,8 @@ pub struct AdaptiveFence {
     pub config_revision: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AdaptiveInstrument {
     pub exchange: String,
     pub category: String,
@@ -63,6 +66,13 @@ pub struct AdaptiveSetup {
 #[allow(async_fn_in_trait)]
 pub trait AdaptiveStore: Send + Sync {
     async fn current(&self, fence: &AdaptiveFence) -> Result<bool, WorkerError>;
+    async fn checkpoint(
+        &self,
+        _: &AdaptiveFence,
+        _: &AdaptiveInstrument,
+    ) -> Result<Option<AdaptiveCheckpoint>, WorkerError> {
+        Err(invalid("store does not support uncertain-commit checkpoint recovery"))
+    }
     async fn commit_page(
         &self,
         fence: &AdaptiveFence,

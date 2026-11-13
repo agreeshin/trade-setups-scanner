@@ -16,6 +16,7 @@ pub struct PlatformConfig {
     pub replay_limits: ReplayAdmissionLimits,
     pub replay_workers: usize,
     pub optimization: OptimizationConfig,
+    pub resources: crate::resources::RuntimeResources,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +198,7 @@ impl PlatformConfig {
             _ => 2,
         };
         let optimization = OptimizationConfig::from_lookup(&mut get)?;
+        let resources = crate::resources::RuntimeResources::from_lookup(&mut get)?;
         Ok(PlatformConfig {
             database_url,
             api_keys,
@@ -212,6 +214,7 @@ impl PlatformConfig {
             replay_limits,
             replay_workers,
             optimization,
+            resources,
         })
     }
 }

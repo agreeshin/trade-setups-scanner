@@ -1,7 +1,10 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { ContinuousConfig, ContinuousProcess } from "../lib/continuous-api";
+import type { ContinuousConfig, ContinuousProcess, ContinuousSlot } from "../lib/continuous-api";
+import { applyInterfaceSettings, formatUnix } from "../lib/datetime-format";
+import { ContinuousResearch } from "./continuous-study";
+import type { ContinuousController } from "./use-continuous-study";
 import { summarizeOptimizationStudy, type OptimizationSpec, type OptimizationStudy } from "../lib/optimization-api";
 import { AlgorithmsPage } from "./algorithms-page";
 import type { Algorithm } from "./platform-controls";
@@ -62,7 +65,7 @@ beforeEach(() => {
     return json({});
   }));
 });
-afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); applyInterfaceSettings({ timezone: "auto" }); });
 
 async function configure() {
   const button = await screen.findByRole("button", { name: "Настроить непрерывное исследование" });
@@ -72,6 +75,80 @@ async function configure() {
   await waitFor(() => expect(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" })).toBeEnabled());
   return dialog;
 }
+
+const closedBoundary = Date.parse("2026-11-12T12:00:00Z") / 1000;
+function profileView(patch: Partial<ContinuousSlot> = {}) {
+  const controller: ContinuousController = {
+    process: { ownerId: "admin", algorithmId: "future", status: "running", configRevision: 1,
+      config: { lookbackDays: 30, minSetupsPerDay: [4], minMeanExpectancy: 0.15, adaptiveEnabled: true, study: spec }, activeStudyId: null, phase: "queued", error: null,
+      slots: [{ id: 1, minSetupsPerDay: 4, status: "warming", activeGenerationId: 7, studyId: 42, meanExpectancy: 0.21,
+        selectedCell: { tpPct: 14, slPct: 4, rawR: 0.32, meanR: 0.21, robustScore: 0.01 }, updatedAt: "2026-11-12T12:00:00Z", ...patch }] },
+    available: true, loading: false, error: null, busy: null, revision: 0,
+    refresh: vi.fn(), save: vi.fn(() => Promise.resolve(true)), start: vi.fn(() => Promise.resolve(true)), stop: vi.fn(() => Promise.resolve(true)),
+  };
+  return <ContinuousResearch algorithm={algorithm} controller={controller} />;
+}
+it("separates successful research, incumbent live and the warming candidate without relabelling its study as the incumbent", () => {
+  render(profileView({ activeStatus: "active", pendingGenerationId: 8, pendingStatus: "warming", readinessFrontier: null, pendingError: null, liveWatermark: closedBoundary }));
+  const table = within(screen.getByRole("table", { name: "Адаптивные профили · Мой алгоритм" }));
+  const incumbent = table.getByRole("cell", { name: /Действующее поколение #7/ });
+  const candidate = table.getByRole("cell", { name: /Кандидат #8/ });
+  expect(table.getByText("Исследование успешно · допуск пройден")).toBeInTheDocument();
+  expect(table.getByText("Сохранённое исследование #42")).toBeInTheDocument();
+  expect(incumbent).not.toHaveTextContent("#8"); expect(incumbent).not.toHaveTextContent("#42");
+  expect(candidate).toHaveTextContent("Прогрев / догоняющая обработка");
+  expect(candidate).not.toHaveTextContent("Готов к переключению");
+  expect(table.getByText("SHORT · TP 14% / SL 4% · 0.32 R")).toBeInTheDocument();
+  expect(requests).toHaveLength(0);
+});
+it("distinguishes ready-to-switch from active and shows exact CLOSED frontier/watermark without adding a minute", () => {
+  applyInterfaceSettings({ timezone: "UTC" });
+  const view = render(profileView({ activeStatus: "active", pendingGenerationId: 8, pendingStatus: "ready", readinessFrontier: closedBoundary, pendingError: null, liveWatermark: 0 }));
+  const candidate = screen.getByRole("cell", { name: /Кандидат #8/ });
+  expect(candidate).toHaveTextContent("Готов к переключению · ещё не действует");
+  expect(candidate).toHaveTextContent(`Граница готовности (закрытие минуты): ${formatUnix(closedBoundary)} (UTC)`);
+  expect(screen.getByRole("cell", { name: /Действующее поколение #7/ })).toHaveTextContent(`Watermark переключения: ${formatUnix(0)} (UTC)`);
+  view.rerender(profileView({ status: "active", activeStatus: "active", activeGenerationId: 8, pendingGenerationId: null, pendingStatus: null, readinessFrontier: null, pendingError: null, liveWatermark: closedBoundary }));
+  expect(screen.getByRole("cell", { name: /Действующее поколение #8/ })).toHaveTextContent(`Watermark переключения: ${formatUnix(closedBoundary)} (UTC)`);
+  expect(screen.queryByText(/Действующее поколение #7/)).not.toBeInTheDocument();
+  expect(screen.getByText("Нет кандидата на замену")).toBeInTheDocument();
+});
+it("keeps the incumbent during a candidate error and renders only bounded public error text", () => {
+  render(profileView({ activeStatus: "active", pendingGenerationId: 8, pendingStatus: "error", readinessFrontier: null,
+    pendingError: { code: "history_missing", message: "Недостаточно истории. " + "x".repeat(1000), debug: "do-not-render-raw-payload" }, liveWatermark: closedBoundary }));
+  expect(screen.getByRole("cell", { name: /Действующее поколение #7/ })).toBeInTheDocument();
+  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Ошибка прогрева");
+  const error = screen.getByRole("alert");
+  expect(error).toHaveTextContent("history_missing"); expect(error).toHaveTextContent("Недостаточно истории.");
+  expect(error.textContent.length).toBeLessThan(420); expect(error).not.toHaveTextContent("do-not-render-raw-payload");
+  expect(screen.getByText("SHORT · TP 14% / SL 4% · 0.32 R")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Остановить непрерывное исследование" })).toBeEnabled();
+  expect(requests).toHaveLength(0);
+});
+it("does not turn a first successful candidate into an active generation before promotion", () => {
+  render(profileView({ activeGenerationId: null, activeStatus: "inactive", pendingGenerationId: 8, pendingStatus: "warming", readinessFrontier: null, pendingError: null, liveWatermark: null }));
+  expect(screen.getByText("Нет действующего поколения")).toBeInTheDocument();
+  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Прогрев / догоняющая обработка");
+  expect(screen.queryByText(/Действующее поколение #8/)).not.toBeInTheDocument();
+  expect(screen.queryByText("SHORT · TP 14% / SL 4% · 0.32 R")).not.toBeInTheDocument();
+});
+it("labels legacy and partially rolled-out readiness as unknown rather than ready", () => {
+  const view = render(profileView({ status: "active" }));
+  expect(screen.getByText("Принятое поколение #7")).toBeInTheDocument();
+  expect(screen.getByText("Состояние live неизвестно (старый API)")).toBeInTheDocument();
+  expect(screen.getByText("Статус прогрева неизвестен (старый API)")).toBeInTheDocument();
+  expect(screen.queryByText(/Действующее поколение #7/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/Готов к переключению/)).not.toBeInTheDocument();
+  view.rerender(profileView({ pendingGenerationId: 8 }));
+  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Статус прогрева неизвестен");
+});
+it("shows an unrecognised candidate wait state without treating it as ready or dropping the incumbent", () => {
+  render(profileView({ activeStatus: "active", pendingGenerationId: 8, pendingStatus: "waiting_resource", pendingError: "Ожидание ресурсного допуска" }));
+  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("waiting_resource");
+  expect(screen.queryByText(/Готов к переключению/)).not.toBeInTheDocument();
+  expect(screen.getByRole("cell", { name: /Действующее поколение #7/ })).toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent("Ожидание ресурсного допуска");
+});
 
 it("saves actual metadata controls, date-free list/gate config and locked maturity without starting work", async () => {
   render(<AlgorithmsPage />);

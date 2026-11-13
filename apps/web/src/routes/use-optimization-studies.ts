@@ -17,6 +17,7 @@ export function useOptimizationStudies(algorithmIds: string[]) {
   const snapshotRef = useRef<StudySnapshot>({ byAlgorithm: {}, latestByAlgorithm: {}, active: null });
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [cancelling, setCancelling] = useState<number | null>(null);
   const [deleting, setDeleting] = useState<number | null>(null);
@@ -82,10 +83,10 @@ export function useOptimizationStudies(algorithmIds: string[]) {
         }
         activeRef.current = active; readyRef.current = true;
         const next = { byAlgorithm, latestByAlgorithm, active }; snapshotRef.current = next;
-        setSnapshot(next); setReady(true); setError(null);
+        setSnapshot(next); setReady(true); setDiscoveryError(null);
       } catch (cause) {
         if (!disposed && !current.signal.aborted && revision === version.current) {
-          setError(`Статус оптимизации недоступен: ${errorText(cause)}. Последний снимок сохранён.`);
+          setDiscoveryError(`Статус оптимизации недоступен: ${errorText(cause)}. Последний снимок сохранён.`);
           readyRef.current = false; setReady(false);
         }
       } finally {
@@ -168,15 +169,20 @@ export function useOptimizationStudies(algorithmIds: string[]) {
       setRevision((value) => value + 1); refreshRef.current();
       return true;
     } catch (cause) {
-      if (mounted.current && !controller.signal.aborted) setError(errorText(cause));
+      if (mounted.current && !controller.signal.aborted) {
+        setError(errorText(cause));
+        if (cause instanceof OptimizationApiError && (cause.status === 409 || cause.status === 404)) {
+          setRevision((value) => value + 1); refreshRef.current();
+        }
+      }
     } finally {
       if (mutation.current === controller) mutation.current = null;
       if (mounted.current && !controller.signal.aborted) setDeleting(null);
     }
     return false;
   }
-  const refresh = useCallback(() => { setRevision((value) => value + 1); refreshRef.current(); }, []);
-  return { ...snapshot, ready, error, creating, cancelling, deleting, revision, start, stop, remove,
-    clearError: () => setError(null), refresh };
+  const refresh = useCallback(() => { version.current += 1; setRevision((value) => value + 1); refreshRef.current(); }, []);
+  return { ...snapshot, ready, error: error ?? discoveryError, creating, cancelling, deleting, revision, start, stop, remove,
+    clearError: () => { setError(null); setDiscoveryError(null); }, refresh };
 }
 export type OptimizationController = ReturnType<typeof useOptimizationStudies>;

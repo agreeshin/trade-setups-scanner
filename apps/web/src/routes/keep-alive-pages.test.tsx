@@ -68,7 +68,7 @@ describe("keep-alive navigation tabs", () => {
     expect(requests.filter((path) => path === "/v1/algorithms")).toHaveLength(1);
   });
 
-  it("keeps page state and skips refetch when switching tabs and back", async () => {
+  it("keeps the setups filter and refreshes follow-live immediately when returning to its tab", async () => {
     const user = userEvent.setup();
     const view = renderAppAt("/setups");
     const filter = await screen.findByRole<HTMLInputElement>("textbox");
@@ -86,7 +86,8 @@ describe("keep-alive navigation tabs", () => {
     const filterAfter = screen.getByRole<HTMLInputElement>("textbox");
     expect(filterAfter.value).toBe("BTC");
     const setupsCallsAfter = requests.filter((path) => path.startsWith("/v1/setups?")).length;
-    expect(setupsCallsAfter).toBe(setupsCallsBefore);
+    expect(setupsCallsAfter).toBe(setupsCallsBefore + 1);
+    expect(requests.filter((path) => path.startsWith("/v1/setups?")).at(-1)).toBe("/v1/setups?offset=0&limit=25&q=BTC");
   });
 
   it("restores window scroll offset when returning to a tab", async () => {

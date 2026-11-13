@@ -26,6 +26,8 @@ pub struct ContinuousRuntimeConfig {
     /// This lane never borrows the manual optimizer's admission or worker budget.
     pub optimizer: OptimizationConfig,
     pub workers: usize,
+    /// Actual admission for complete resident chains, including CPU and frozen input.
+    pub max_concurrent_chains: usize,
     pub poll: Duration,
     pub max_database_bytes: i64,
     pub replay_admission: setups_db::admission::ReplayAdmissionLimits,
@@ -42,6 +44,7 @@ impl Default for ContinuousRuntimeConfig {
                 ..OptimizationConfig::default()
             },
             workers: 1,
+            max_concurrent_chains: 1,
             poll: Duration::from_millis(250),
             max_database_bytes: 48 * 1024 * 1024 * 1024,
             replay_admission: Default::default(),
@@ -57,6 +60,7 @@ impl ContinuousRuntimeConfig {
         let mut config = Self::default();
         for (key, target, max) in [
             ("CONTINUOUS_WORKERS", &mut config.workers, 4),
+            ("CONTINUOUS_MAX_CONCURRENT_CHAINS", &mut config.max_concurrent_chains, 4),
             (
                 "CONTINUOUS_MAX_SNAPSHOT_BYTES",
                 &mut config.optimizer.max_snapshot_bytes,
@@ -218,6 +222,7 @@ pub fn continuous_router(state: Arc<ContinuousState>) -> Router {
     let cap = state.config.optimizer.max_request_bytes;
     Router::new()
         .route("/v1/continuous-studies", get(list))
+        .route("/v1/continuous-studies/cleanup", get(cleanup_preview).post(cleanup_history))
         .route(
             "/v1/continuous-studies/{algorithm}",
             get(detail).put(configure),
@@ -226,6 +231,32 @@ pub fn continuous_router(state: Arc<ContinuousState>) -> Router {
         .route("/v1/continuous-studies/{algorithm}/stop", post(stop))
         .layer(DefaultBodyLimit::max(cap))
         .with_state(state)
+}
+
+async fn cleanup_preview(State(state): State<Arc<ContinuousState>>, headers: HeaderMap) -> Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,false) {return error;}
+    match db::cleanup::preview(&state.pool,ADMIN_OWNER).await {
+        Ok(preview)=>response(StatusCode::OK,json!(preview)),
+        Err(error)=>failure("cleanup preview",error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupRequest {confirm:bool,fingerprint:String}
+
+async fn cleanup_history(State(state):State<Arc<ContinuousState>>,headers:HeaderMap,body:String)->Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,true) {return error;}
+    let request=match serde_json::from_str::<CleanupRequest>(&body) {
+        Ok(request) if request.confirm && request.fingerprint.len()==32 && request.fingerprint.bytes().all(|b|b.is_ascii_hexdigit())=>request,
+        _=>return response(StatusCode::BAD_REQUEST,json!({"error":"continuous_cleanup_confirmation_required"})),
+    };
+    match db::cleanup::purge(&state.pool,ADMIN_OWNER,&request.fingerprint).await {
+        Ok(db::cleanup::Outcome::Deleted(result))=>response(StatusCode::OK,json!(result)),
+        Ok(db::cleanup::Outcome::Blocked(preview))=>response(StatusCode::CONFLICT,json!({"error":"continuous_cleanup_blocked","message":"Stop and drain all continuous processes and deliveries before cleanup","preview":preview})),
+        Ok(db::cleanup::Outcome::Stale(preview))=>response(StatusCode::CONFLICT,json!({"error":"continuous_cleanup_preview_stale","preview":preview})),
+        Err(error)=>failure("cleanup",error),
+    }
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

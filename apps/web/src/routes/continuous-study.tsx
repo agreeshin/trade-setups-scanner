@@ -8,9 +8,9 @@ import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { Spinner } from "../components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
-import { formatIsoDateTime } from "../lib/datetime-format";
+import { effectiveTimezone, formatIsoDateTime, formatUnix } from "../lib/datetime-format";
 import { fetchPlatform } from "../lib/platform-api";
-import { MAX_CONTINUOUS_LOOKBACK_DAYS, MIN_CONTINUOUS_LOOKBACK_DAYS } from "../lib/continuous-api";
+import { MAX_CONTINUOUS_LOOKBACK_DAYS, MIN_CONTINUOUS_LOOKBACK_DAYS, type ContinuousSlot } from "../lib/continuous-api";
 import { getOptimizationDraft } from "../lib/optimization-api";
 import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildContinuousConfig, initialDomains, initialScope, restoreDomains, type ContinuousDraft, type ScopeDraft } from "./optimization-form";
 import { OptimizationFields } from "./optimization-fields";
@@ -21,7 +21,44 @@ import { applyOptimizationDraftScope, createOptimizationDraft, restoreOptimizati
 
 const statuses = { stopped: "Остановлено", running: "Непрерывное исследование включено", stopping: "Останавливается", error: "Ошибка непрерывного исследования" };
 const phases: Record<string, string> = { queued: "Ожидание очереди", idle: "Ожидание следующего исследования", research: "Исследование", acquiring: "Подготовка снимка", replay: "Служебный replay", analytics: "Аналитика сохранённого набора", cleanup: "Очистка незавершённых данных" };
-const slotStatuses: Record<string, string> = { idle: "Ожидает исследования", active: "Профиль принят", inactive: "Профиль неактивен", pending: "Ожидает исследования", running: "Подготовка поколения", researching: "Исследование", error: "Техническая ошибка", failed: "Техническая ошибка", nonpass: "Допуск не пройден", no_winner: "Нет оценимого победителя", stopped: "Остановлен" };
+const slotStatuses: Record<string, string> = { idle: "Ожидает исследования", active: "Допуск пройден", warming: "Исследование успешно · допуск пройден", inactive: "Профиль неактивен", pending: "Ожидает исследования", running: "Подготовка поколения", researching: "Исследование", error: "Техническая ошибка", failed: "Техническая ошибка", nonpass: "Допуск не пройден", rejected: "Допуск не пройден", no_winner: "Нет оценимого победителя", stopped: "Остановлен" };
+const pendingStatuses: Record<string, string> = { warming: "Прогрев / догоняющая обработка", ready: "Готов к переключению · ещё не действует", error: "Ошибка прогрева" };
+const closedTime = (time: number) => `${formatUnix(time)} (${effectiveTimezone()})`;
+
+function SlotIncumbent({ slot }: { slot: ContinuousSlot }) {
+  if (slot.activeGenerationId === null) return <span>Нет действующего поколения</span>;
+  return <div className="grid gap-1 text-xs">
+    <span className="text-sm">{slot.activeStatus === "active" ? "Действующее" : "Принятое"} поколение #{slot.activeGenerationId}</span>
+    <Badge>{slot.activeStatus === "active" ? "Активно" : slot.activeStatus === "inactive" ? "Неактивно" : "Состояние live неизвестно (старый API)"}</Badge>
+    <span>Принятое поколение сохранено</span>
+    <span>{slot.liveWatermark == null ? "Watermark переключения неизвестен" : `Watermark переключения: ${closedTime(slot.liveWatermark)}`}</span>
+  </div>;
+}
+
+function pendingErrorMessage(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" && value.trim()) return value.slice(0, 300);
+  if (typeof value === "object" && !Array.isArray(value)) {
+    const detail = value as { code?: unknown; message?: unknown };
+    const parts = [typeof detail.code === "string" ? detail.code.slice(0, 80) : "", typeof detail.message === "string" ? detail.message.slice(0, 300) : ""].filter(Boolean);
+    if (parts.length) return parts.join(": ");
+  }
+  // serde_json::Value can be a scalar/array too; never dump opaque payload or invent readiness.
+  return "Сервер не передал текстовое описание ошибки.";
+}
+
+function SlotPending({ slot }: { slot: ContinuousSlot }) {
+  const legacy = slot.pendingGenerationId === undefined && slot.pendingStatus === undefined;
+  const absent = slot.pendingGenerationId === null && slot.pendingStatus === null;
+  const error = pendingErrorMessage(slot.pendingError) ?? (slot.pendingStatus === "error" ? "Описание ошибки не передано." : null);
+  return <div className="grid gap-1 text-xs">
+    {slot.pendingGenerationId != null && <span className="text-sm">Кандидат #{slot.pendingGenerationId}</span>}
+    {absent ? <span>Нет кандидата на замену</span> : <Badge variant={slot.pendingStatus === "error" ? "danger" : "neutral"}>{legacy ? "Статус прогрева неизвестен (старый API)" : slot.pendingStatus ? pendingStatuses[slot.pendingStatus] ?? `Состояние кандидата: ${slot.pendingStatus.slice(0, 120)}` : "Статус прогрева неизвестен"}</Badge>}
+    {!legacy && !absent && <span>{slot.readinessFrontier === undefined ? "Граница готовности неизвестна" : slot.readinessFrontier === null ? "Граница готовности ещё не подтверждена" : `Граница готовности (закрытие минуты): ${closedTime(slot.readinessFrontier)}`}</span>}
+    {error && <p role="alert" className="text-destructive">Ошибка кандидата: {error}</p>}
+  </div>;
+}
+
 
 export function AdaptiveLive({ controller }: { controller: ContinuousController }) {
   const savedPermission = controller.process?.config?.adaptiveEnabled ?? false;
@@ -129,12 +166,14 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
     {process && <>
       <p className="text-sm">Ревизия конфигурации: {process.configRevision}{process.activeStudyId !== null ? ` · Исследование #${process.activeStudyId}` : ""}{process.phase ? ` · ${phases[process.phase] ?? process.phase}` : ""}</p>
       {process.error && <Alert variant="destructive">{process.error.code}: {process.error.message}. Технический сбой не означает непрохождение допуска; прежний принятый профиль может сохраняться.</Alert>}
+      <p className="text-xs text-muted-foreground">Успех исследования не означает готовый live. Сохранённое исследование может относиться к кандидату; при сохранённом принятом поколении среднее и рекомендация относятся к нему. Границы — время закрытия минуты: новое поколение действует после watermark.</p>
       <div className="overflow-x-auto"><Table aria-label={`Адаптивные профили · ${algorithmDisplayName(algorithm)}`}>
-        <TableHeader><TableRow>{["Минимум сетапов в день", "Состояние", "Поколение / исследование", "Среднее матрицы", "Рекомендация", "Обновлено"].map((title) => <TableHead key={title}>{title}</TableHead>)}</TableRow></TableHeader>
+        <TableHeader><TableRow>{["Минимум сетапов в день", "Исследование / допуск", "Принятое поколение / live", "Кандидат / прогрев", "Среднее матрицы", "Рекомендация", "Обновлено"].map((title) => <TableHead key={title}>{title}</TableHead>)}</TableRow></TableHeader>
         <TableBody>{process.slots.map((slot) => <TableRow key={slot.id}>
           <TableCell>{slot.minSetupsPerDay === 0 ? "0 · без частотного допуска" : slot.minSetupsPerDay}</TableCell>
-          <TableCell><Badge>{slotStatuses[slot.status] ?? slot.status}</Badge>{slot.activeGenerationId !== null && <span className="block text-xs">Принятое поколение сохранено</span>}</TableCell>
-          <TableCell>{slot.activeGenerationId === null ? "—" : `#${slot.activeGenerationId}`} / {slot.studyId === null ? "—" : `#${slot.studyId}`}</TableCell>
+          <TableCell><div className="grid gap-1"><Badge>{slotStatuses[slot.status] ?? slot.status}</Badge><span className="text-xs">{slot.studyId === null ? "Сохранённое исследование не указано" : `Сохранённое исследование #${slot.studyId}`}</span></div></TableCell>
+          <TableCell><SlotIncumbent slot={slot} /></TableCell>
+          <TableCell><SlotPending slot={slot} /></TableCell>
           <TableCell>{slot.meanExpectancy === null ? "—" : `${slot.meanExpectancy.toFixed(2)} R`}</TableCell>
           <TableCell>{slot.activeGenerationId !== null && slot.selectedCell ? `${process.config?.study.direction.toUpperCase() ?? ""} · TP ${slot.selectedCell.tpPct}% / SL ${slot.selectedCell.slPct}% · ${slot.selectedCell.rawR.toFixed(2)} R` : "Нет пригодного результата"}</TableCell>
           <TableCell>{slot.updatedAt ? formatIsoDateTime(slot.updatedAt) : "—"}</TableCell>

@@ -306,7 +306,15 @@ export function RunsPage() {
     setDeleting(true); setDeleteError(null);
     try {
       const response = await apiFetch(deleteTarget.isBatch ? `/v1/replay-batches/${deleteTarget.id}` : `/v1/replay-runs/${deleteTarget.id}`, { method: "DELETE" });
-      if (!response.ok) throw new Error(response.status === 409 ? "Запуск ещё активен: сначала отмените его." : `Не удалось удалить запуск: HTTP ${response.status}`);
+      if (!response.ok) {
+        const detail = await response.json().catch(() => null) as { error?: unknown } | null;
+        if (response.status === 409 || response.status === 404) setReload((value) => value + 1);
+        throw new Error(response.status === 401 ? "Сессия истекла. Войдите заново перед удалением запуска."
+          : response.status === 409 && detail?.error === "continuous_history_referenced" ? "Нельзя удалить запуск: он связан с адаптивным профилем или сохраняемой непрерывной цепочкой. Сначала остановите непрерывный процесс и выполните отдельную очистку его истории."
+          : response.status === 409 ? "Запуск ещё активен: сначала остановите его и дождитесь завершения. Для непрерывного запуска используйте общую остановку процесса алгоритма."
+          : response.status === 404 ? "Запуск не найден или уже удалён. Список обновлён."
+          : `Не удалось удалить запуск: HTTP ${response.status}`);
+      }
       setMessage(`Запуск #${deleteTarget.id} удалён.`);
       if (selected?.id === deleteTarget.id && selected.isBatch === deleteTarget.isBatch) setSelected(null);
       setDeleteTarget(null);

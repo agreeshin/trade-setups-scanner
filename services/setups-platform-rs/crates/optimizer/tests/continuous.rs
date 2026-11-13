@@ -97,6 +97,49 @@ fn context(spec: &StudyRequest) -> ContinuousContext {
 }
 
 #[test]
+fn frozen_prefix_fingerprint_binds_exact_values_bounds_and_gaps_not_raw_seed_only() {
+    let bars = vec![DetectorBar {open_time_unix:0,close:"100.000".into(),quote_turnover:"10.0".into()},
+        DetectorBar {open_time_unix:120,close:"100.000000000000000001".into(),quote_turnover:"20".into()}];
+    let original = detector_prefix_fingerprint(&bars,0,180).unwrap();
+    let mut normalized = bars.clone(); normalized[0].close="100".into(); normalized[0].quote_turnover="10.000000".into();
+    assert_eq!(detector_prefix_fingerprint(&normalized,0,180).unwrap(),original);
+    let mut changed = bars.clone(); changed[1].close="100.000000000000000002".into();
+    assert_ne!(detector_prefix_fingerprint(&changed,0,180).unwrap(),original);
+    changed=bars.clone(); changed[0].quote_turnover="10.000000000000000001".into();
+    assert_ne!(detector_prefix_fingerprint(&changed,0,180).unwrap(),original);
+    changed=bars.clone(); changed.insert(1,DetectorBar {open_time_unix:60,close:"100".into(),quote_turnover:"0".into()});
+    assert_ne!(detector_prefix_fingerprint(&changed,0,180).unwrap(),original);
+    assert_ne!(detector_prefix_fingerprint(&bars,0,240).unwrap(),original);
+    changed=bars.clone(); changed.reverse();
+    assert!(detector_prefix_fingerprint(&changed,0,180).is_err());
+    changed=bars.clone(); changed.push(bars[1].clone());
+    assert!(detector_prefix_fingerprint(&changed,0,180).is_err());
+    assert_eq!(original.bar_count,2);
+    assert_eq!(original.sha256.len(),64);
+}
+
+#[test]
+fn frozen_prefix_manifest_is_compact_roundtrips_and_legacy_is_explicitly_unverified() {
+    let spec=request(); let input=snapshot(1500); let context=context(&spec);
+    let replay=materialize_continuous(&spec,&input,&candidate(&spec),context,&StudyLimits::default(),&CancelToken::new()).unwrap().unwrap();
+    let legacy=continuous_bootstrap(&spec,&replay).unwrap();
+    assert!(legacy.frozen_prefix.is_none());
+    let bootstrap=continuous_bootstrap_with_frozen_prefix(&spec,&replay,&input).unwrap();
+    let prefix=bootstrap.frozen_prefix.as_ref().unwrap();
+    assert_eq!(prefix.version,1);
+    assert_eq!(prefix.from_open_unix,bootstrap.detector_warmup_from_unix);
+    assert_eq!(prefix.to_open_unix,bootstrap.next_open_unix);
+    assert_eq!(prefix.instruments.len(),1);
+    let fingerprint=detector_prefix_fingerprint(&input.instruments[0].detector_bars,prefix.from_open_unix,prefix.to_open_unix).unwrap();
+    assert_eq!(prefix.instruments[0].sha256,fingerprint.sha256);
+    assert_eq!(prefix.instruments[0].bar_count,fingerprint.bar_count);
+    let json=serde_json::to_vec(&bootstrap).unwrap(); assert!(json.len()<2048);
+    assert_eq!(serde_json::from_slice::<ContinuousBootstrap>(&json).unwrap(),bootstrap);
+    let mut wrong=input.clone(); wrong.snapshot_hash="another-input".into();
+    assert!(continuous_bootstrap_with_frozen_prefix(&spec,&replay,&wrong).is_err());
+}
+
+#[test]
 fn continuous_search_materialization_and_reanalysis_preserve_exact_scope_and_axes() {
     let mut spec = request();
     spec.from_unix += 17;

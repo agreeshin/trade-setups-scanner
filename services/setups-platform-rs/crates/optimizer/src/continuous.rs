@@ -84,6 +84,80 @@ pub struct ContinuousBootstrap {
     pub emit_from_close_unix: i64,
     pub provenance: Provenance,
     pub instruments: Vec<ContinuousInstrumentBootstrap>,
+    /// Missing only on legacy generations. Never interpret absence as a matching prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_prefix: Option<ContinuousFrozenPrefix>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContinuousFrozenPrefix {
+    pub version: u32,
+    pub from_open_unix: i64,
+    pub to_open_unix: i64,
+    pub instruments: Vec<ContinuousInstrumentPrefix>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContinuousInstrumentPrefix {
+    pub instrument: StudyInstrument,
+    pub bar_count: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectorPrefixFingerprint {
+    pub bar_count: u64,
+    pub sha256: String,
+}
+
+/// Canonical v1: domain, signed i64 BE OPEN bounds, u64 BE row count; then each
+/// ordered i64 BE timestamp and (i128 BE coefficient, u32 BE scale) for close
+/// and turnover. Trailing decimal zeroes are removed; zero has scale zero.
+/// Bounds plus timestamps bind gaps. No float conversion or OHLC reconstruction.
+pub fn detector_prefix_fingerprint(bars: &[setups_domain::DetectorBar], from_open_unix: i64, to_open_unix: i64) -> Result<DetectorPrefixFingerprint, StudyError> {
+    use sha2::{Digest, Sha256};
+    use setups_domain::decimal::Decimal;
+    if from_open_unix > to_open_unix || from_open_unix%60!=0 || to_open_unix%60!=0 {
+        return Err(StudyError::InvalidInput("invalid frozen detector prefix bounds".into()));
+    }
+    let selected = |bar: &&setups_domain::DetectorBar| bar.open_time_unix>=from_open_unix && bar.open_time_unix<to_open_unix;
+    let bar_count = bars.iter().filter(selected).count() as u64;
+    let mut hash = Sha256::new();
+    hash.update(b"continuous-detector-prefix-v1\0");
+    hash.update(from_open_unix.to_be_bytes()); hash.update(to_open_unix.to_be_bytes()); hash.update(bar_count.to_be_bytes());
+    let mut previous = None;
+    for bar in bars.iter().filter(selected) {
+        if bar.open_time_unix%60!=0 || previous.is_some_and(|time| time>=bar.open_time_unix) {
+            return Err(StudyError::InvalidInput("frozen detector prefix is not strictly ordered on minute boundaries".into()));
+        }
+        previous = Some(bar.open_time_unix);
+        hash.update(bar.open_time_unix.to_be_bytes());
+        for text in [&bar.close,&bar.quote_turnover] {
+            let mut number = Decimal::parse(text).map_err(|_|StudyError::InvalidInput("invalid exact decimal in frozen detector prefix".into()))?;
+            while number.scale>0 && number.int%10==0 {number.int/=10;number.scale-=1;}
+            hash.update(number.int.to_be_bytes()); hash.update(number.scale.to_be_bytes());
+        }
+    }
+    Ok(DetectorPrefixFingerprint {bar_count,sha256:format!("{:x}",hash.finalize())})
+}
+
+/// Capture while the one immutable input is still owned by the generation.
+pub fn continuous_bootstrap_with_frozen_prefix(spec: &StudyRequest, replay: &ContinuousReplay, input: &StudyInput) -> Result<ContinuousBootstrap, StudyError> {
+    let mut bootstrap = continuous_bootstrap(spec,replay)?;
+    if input.snapshot_hash!=replay.provenance.snapshot_hash || input.captured_at!=replay.provenance.captured_at
+        || input.instruments.len()!=spec.instruments.len() || input.instruments.len()>1000 {
+        return Err(StudyError::InvalidInput("frozen prefix input differs from generation provenance/scope".into()));
+    }
+    let mut instruments = Vec::with_capacity(input.instruments.len());
+    for (raw,instrument) in input.instruments.iter().zip(&spec.instruments) {
+        if &raw.instrument!=instrument {return Err(StudyError::InvalidInput("frozen prefix instrument order differs from generation".into()));}
+        let digest = detector_prefix_fingerprint(&raw.detector_bars,bootstrap.detector_warmup_from_unix,bootstrap.next_open_unix)?;
+        instruments.push(ContinuousInstrumentPrefix {instrument:instrument.clone(),bar_count:digest.bar_count,sha256:digest.sha256});
+    }
+    bootstrap.frozen_prefix = Some(ContinuousFrozenPrefix {version:1,from_open_unix:bootstrap.detector_warmup_from_unix,to_open_unix:bootstrap.next_open_unix,instruments});
+    Ok(bootstrap)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -258,6 +332,7 @@ pub fn continuous_bootstrap(
         emit_from_close_unix: replay.context.observation_cutoff + 60,
         provenance: replay.provenance.clone(),
         instruments,
+        frozen_prefix: None,
     })
 }
 

@@ -13,6 +13,7 @@ setups-replay.workspace = true
 rayon.workspace = true
 rand.workspace = true
 chrono.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

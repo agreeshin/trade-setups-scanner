@@ -5,7 +5,9 @@ const BASELINE: &str = "0010_baseline.sql";
 const RUN_NAMES: &str = "0011_run_names.sql";
 const OPTIMIZATION_STUDIES: &str = "0012_optimization_studies.sql";
 const CONTINUOUS_STUDIES: &str = "0013_continuous_studies.sql";
-const MIGRATIONS: &[&str] = &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES];
+const ADAPTIVE_LIVE_READINESS: &str = "0014_adaptive_live_readiness.sql";
+const CONTINUOUS_HISTORY_CLEANUP: &str = "0015_continuous_history_cleanup.sql";
+const MIGRATIONS: &[&str] = &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP];
 
 fn migration_source(name: &str) -> &'static str {
     match name {
@@ -13,6 +15,8 @@ fn migration_source(name: &str) -> &'static str {
         RUN_NAMES => include_str!("../migrations/0011_run_names.sql"),
         OPTIMIZATION_STUDIES => include_str!("../migrations/0012_optimization_studies.sql"),
         CONTINUOUS_STUDIES => include_str!("../migrations/0013_continuous_studies.sql"),
+        ADAPTIVE_LIVE_READINESS => include_str!("../migrations/0014_adaptive_live_readiness.sql"),
+        CONTINUOUS_HISTORY_CLEANUP => include_str!("../migrations/0015_continuous_history_cleanup.sql"),
         other => unreachable!("unknown migration {other}"),
     }
 }
@@ -72,7 +76,7 @@ mod tests {
 
     #[test]
     fn run_names_migration_is_registered_after_baseline() {
-        assert_eq!(MIGRATIONS, &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES]);
+        assert_eq!(MIGRATIONS, &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP]);
         let source = migration_source(RUN_NAMES);
         assert!(
             source.contains("ALTER TABLE public.replay_runs ADD COLUMN IF NOT EXISTS name text")

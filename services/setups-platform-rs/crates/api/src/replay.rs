@@ -710,7 +710,7 @@ async fn delete_run(
         Ok(Some(setups_db::admission::DeleteRunOutcome::Active)) => {
             error_response(StatusCode::CONFLICT, "run active")
         }
-        Ok(Some(setups_db::admission::DeleteRunOutcome::Referenced))=>error_response(StatusCode::CONFLICT,"continuous_history_referenced"),
+        Ok(Some(setups_db::admission::DeleteRunOutcome::Referenced))=>(StatusCode::CONFLICT,[("cache-control","no-store")],Json(json!({"error":"continuous_history_referenced","message":"Stop and drain continuous processes, then use confirmed continuous history cleanup before deleting linked history"}))).into_response(),
         Ok(Some(setups_db::admission::DeleteRunOutcome::Deleted {
             quality_intervals_deleted,
         })) => Json(json!({

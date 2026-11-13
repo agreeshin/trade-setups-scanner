@@ -22,7 +22,7 @@ export function OptimizationTrashIcon() {
 /** One replaceable page of compact summaries per card; no full detail or page archive. */
 export function OptimizationHistory({ algorithmId, algorithmName, controller, onSelect, onDelete, pageSize = 10, pagination = true, active = true }: {
   algorithmId: string; algorithmName: string; controller: OptimizationController;
-  onSelect: (id: number, triggerId: string) => void; onDelete: (study: OptimizationStudyAction) => void;
+  onSelect: (id: number, triggerId: string, continuous: boolean) => void; onDelete: (study: OptimizationStudyAction) => void;
   pageSize?: number; pagination?: boolean; active?: boolean;
 }) {
   const instanceId = useId();
@@ -76,7 +76,7 @@ export function OptimizationHistory({ algorithmId, algorithmName, controller, on
       <Table aria-label={`Исследования · ${algorithmName}`} aria-busy={loading}>
         <TableHeader><TableRow>{["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
         <TableBody>{page?.studies.map((study) => <TableRow key={study.id}>
-          <TableCell><Button id={`${instanceId}-study-${study.id}`} type="button" variant="outline" size="sm" aria-label={`Результат исследования ${study.id}`} onClick={() => onSelect(study.id, `${instanceId}-study-${study.id}`)}>#{study.id}</Button></TableCell>
+          <TableCell><Button id={`${instanceId}-study-${study.id}`} type="button" variant="outline" size="sm" aria-label={`Результат исследования ${study.id}`} onClick={() => onSelect(study.id, `${instanceId}-study-${study.id}`, isContinuousStudy(study))}>#{study.id}</Button></TableCell>
           <TableCell><Badge>{isContinuousStudy(study) ? "Непрерывное" : "Ручное"}</Badge></TableCell>
           <TableCell className="whitespace-nowrap">[{formatUnix(study.spec.fromUnix)}, {formatUnix(study.spec.toUnix)})</TableCell>
           <TableCell className="whitespace-nowrap">{formatElapsedDuration(study.progress.elapsedSeconds)}</TableCell>

@@ -4,7 +4,7 @@ import { errorText } from "./platform-controls";
 import { RouteActiveContext } from "./route-active";
 
 /** One replaceable process snapshot per algorithm. Polling only observes server work. */
-export function useContinuousStudy(algorithmId: string) {
+export function useContinuousStudy(algorithmId: string, refreshRevision = 0) {
   const routeActive = useContext(RouteActiveContext);
   const [process, setProcess] = useState<ContinuousProcess | null>(null);
   const [available, setAvailable] = useState(false);
@@ -60,7 +60,7 @@ export function useContinuousStudy(algorithmId: string) {
       disposed = true; request?.abort(); clearTimeout(timer); document.removeEventListener("visibilitychange", visibility);
       if (refreshRef.current === refresh) refreshRef.current = () => undefined;
     };
-  }, [algorithmId, routeActive]);
+  }, [algorithmId, routeActive, refreshRevision]);
 
   async function command(action: "save" | "start" | "stop", config?: ContinuousConfig): Promise<boolean> {
     if (action === "save" && !config) throw new Error("Continuous save requires its configuration.");

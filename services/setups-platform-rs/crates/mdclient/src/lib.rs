@@ -4,8 +4,11 @@ use std::fmt;
 use std::time::Duration;
 
 pub mod source;
+mod tail;
 
 pub use source::ApiCandleSource;
+pub use tail::{TAIL_MAX_BYTES, TAIL_MAX_INSTRUMENTS, TailBatchQuery, TailBatchResponse, TailCandle, TailInstrument, TailMissingRange,
+    TailReadGuard, TailReadGuardQuery, TailReadGuardStatus, TailReadToken};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +103,7 @@ impl fmt::Display for MdClientError {
 
 impl std::error::Error for MdClientError {}
 
+#[derive(Clone)]
 pub struct MarketDataClient {
     base_url: String,
     api_key: String,
@@ -153,7 +157,7 @@ impl MarketDataClient {
             .send()
             .await
             .map_err(|error| MdClientError::Network(error.to_string()))?;
-        Self::decode(response).await
+        Self::decode_limited(response, TAIL_MAX_BYTES).await
     }
 
     pub async fn ready(&self) -> Result<bool, MdClientError> {

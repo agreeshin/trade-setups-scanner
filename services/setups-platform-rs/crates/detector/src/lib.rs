@@ -1,4 +1,5 @@
 pub mod quality;
+pub mod shared;
 
 use std::collections::VecDeque;
 

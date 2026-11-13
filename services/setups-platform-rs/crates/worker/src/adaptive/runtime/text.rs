@@ -42,7 +42,7 @@ pub fn recommendation_message(
             .ok_or_else(|| invalid("invalid entry timestamp"))?;
         lines.push(format!(
             "Рекомендуемое время входа: {} UTC (через {} мин после сигнала)",
-            time.format("%Y-%m-%d %H:%M"),
+            time.format("%Y-%m-%d %H:%M:%S"),
             snapshot.time_shift_minutes
         ));
     }
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn adaptive_push_text_uses_saved_direction_risks_name_and_raw_time() {
-        let raw = SpikeSetup {
+        let mut raw = SpikeSetup {
             algorithm_id: "price_volume_spike".into(),
             algorithm_version: "1.1.1".into(),
             open_time_unix: 86340,
@@ -249,13 +249,24 @@ mod tests {
             "rawSignalAt":86400,"recommendedEntryAt":86580});
         let message = recommendation_message(&instrument, &raw, &snapshot).unwrap();
         assert!(message.contains("BTCUSDT · SHORT · Bybit"));
-        assert!(message.contains("1970-01-02 00:03 UTC"));
+        assert!(message.contains("1970-01-02 00:03:00 UTC"));
         assert!(message.contains("не опустится ниже 101,00 USDT"));
         assert!(message.contains("TP = 14%, SL = 4% (от фактической цены входа)"));
         assert!(message.contains("+0,32 R · матрица +0,21 R"));
         assert!(message.contains("Алгоритм: <b>*plain name*"));
         assert!(message.contains("Исследование №42"));
         assert!(!message.contains("0,29"));
+
+        // A chart candle labelled 17:24 closes at 17:25; shift 3 enters at 17:28.
+        raw.open_time_unix = DateTime::parse_from_rfc3339("2026-11-13T17:24:00Z")
+            .unwrap()
+            .timestamp();
+        raw.close_time_unix = raw.open_time_unix + 60;
+        snapshot["rawSignalAt"] = json!(raw.close_time_unix);
+        snapshot["recommendedEntryAt"] = json!(raw.close_time_unix + 3 * 60);
+        let message = recommendation_message(&instrument, &raw, &snapshot).unwrap();
+        assert!(message.contains("2026-11-13 17:28:00 UTC"));
+
         snapshot["direction"] = json!("long");
         snapshot["priceChangePct"] = json!(-1);
         snapshot["timeShiftMinutes"] = json!(0);
