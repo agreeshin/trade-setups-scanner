@@ -246,6 +246,14 @@ pub fn validate_request(
     spec: &StudyRequest,
     fields: &BTreeMap<String, ParameterDescriptor>,
 ) -> Result<(), StudyError> {
+    validate_request_mode(spec, fields, false)
+}
+
+pub(crate) fn validate_request_mode(
+    spec: &StudyRequest,
+    fields: &BTreeMap<String, ParameterDescriptor>,
+    continuous: bool,
+) -> Result<(), StudyError> {
     let params = parse_params(&spec.algorithm_id, &spec.algorithm_params)?;
     if spec.algorithm_version != params.algorithm_version() {
         return Err(invalid("algorithm_version_changed"));
@@ -253,8 +261,7 @@ pub fn validate_request(
     if spec.from_unix < 0
         || spec.to_unix > 253_402_300_740
         || spec.from_unix >= spec.to_unix
-        || spec.from_unix % 60 != 0
-        || spec.to_unix % 60 != 0
+        || (!continuous && (spec.from_unix % 60 != 0 || spec.to_unix % 60 != 0))
     {
         return Err(invalid(
             "signal bounds must be increasing minute-aligned Unix seconds",
@@ -353,6 +360,10 @@ pub fn validate_request(
 
 pub fn required_input_bounds(spec: &StudyRequest) -> Result<InputBounds, StudyError> {
     validate_request(spec, &default_parameter_descriptors(&spec.algorithm_id)?)?;
+    input_bounds_inner(spec)
+}
+
+pub(crate) fn input_bounds_inner(spec: &StudyRequest) -> Result<InputBounds, StudyError> {
     let baseline = parse_params(&spec.algorithm_id, &spec.algorithm_params)?;
     let mut max_days = i64::from(baseline.baseline_long_days());
     // The module adapter is the only component interpreting its warmup field.

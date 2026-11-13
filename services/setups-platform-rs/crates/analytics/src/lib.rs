@@ -6,6 +6,48 @@ pub const DEFAULT_CLUSTER_GAP_HOURS: i64 = 8;
 pub const DEFAULT_HORIZON_MINUTES: i64 = 10_080;
 pub const MINUTE_SECONDS: i64 = 60;
 
+/// One scalar state per instrument/slot, owned and cleared by its caller.
+/// Every raw detector signal advances it, including unpublished/filtered ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CausalCluster {
+    gap_seconds: i64,
+    last_raw_close_unix: Option<i64>,
+}
+
+impl CausalCluster {
+    pub fn new(gap_seconds: i64, last_raw_close_unix: Option<i64>) -> Result<Self, EngineError> {
+        if gap_seconds <= 0 || last_raw_close_unix.is_some_and(|time| time < 0) {
+            return Err(EngineError::InvalidCausalCluster);
+        }
+        Ok(Self {
+            gap_seconds,
+            last_raw_close_unix,
+        })
+    }
+
+    pub fn observe_raw(&mut self, close_time_unix: i64) -> Result<bool, EngineError> {
+        if self.gap_seconds <= 0
+            || self.last_raw_close_unix.is_some_and(|last| last < 0)
+            || close_time_unix < 0
+            || self
+                .last_raw_close_unix
+                .is_some_and(|last| close_time_unix <= last)
+        {
+            return Err(EngineError::InvalidCausalCluster);
+        }
+        let first = self
+            .last_raw_close_unix
+            .is_none_or(|last| close_time_unix - last > self.gap_seconds);
+        self.last_raw_close_unix = Some(close_time_unix);
+        Ok(first)
+    }
+
+    pub fn last_raw_close_unix(&self) -> Option<i64> {
+        self.last_raw_close_unix
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalyticsSetup {
@@ -77,6 +119,7 @@ pub struct MaturitySelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineError {
+    InvalidCausalCluster,
     InvalidMonthKey(String),
     InvalidDayRange(String, String),
 }
@@ -84,6 +127,9 @@ pub enum EngineError {
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            EngineError::InvalidCausalCluster => {
+                write!(f, "invalid causal cluster gap or raw signal order")
+            }
             EngineError::InvalidMonthKey(key) => write!(f, "invalid month key: {key}"),
             EngineError::InvalidDayRange(from, to) => write!(f, "invalid day range: {from}..{to}"),
         }

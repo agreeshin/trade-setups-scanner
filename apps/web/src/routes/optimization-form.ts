@@ -1,4 +1,5 @@
 import type { OptimizationAnalytics, OptimizationSpec, OptimizationValue } from "../lib/optimization-api";
+import { isContinuousLookbackDays, MAX_CONTINUOUS_THRESHOLDS, type ContinuousConfig, type ContinuousStudySpec } from "../lib/continuous-api";
 import type { Algorithm } from "./platform-controls";
 import { replayRange } from "./platform-controls";
 import type { CatalogInstrument } from "./instrument-picker";
@@ -103,9 +104,16 @@ export interface ScopeDraft {
   setupMaturity: string; horizonMinutes: string; tpLevels: string; slLevels: string;
   minClosedPerCell: string; minSetupsPerDay: string; seed: string; maxTrials: string; maxSeconds: string;
 }
-export function buildOptimizationSpec(algorithm: Algorithm, scope: ScopeDraft, catalog: CatalogInstrument[], params: DomainDrafts, analytics: DomainDrafts): OptimizationSpec {
-  const range = replayRange(scope.from, scope.to);
-  if (range.fromUnix % 60 !== 0 || range.toUnix % 60 !== 0) throw new Error("Границы периода должны совпадать с минутной сеткой.");
+export const initialScope = (): ScopeDraft => ({ from: "", to: "", symbols: "", direction: "short", setupMaturity: "0", horizonMinutes: "10080", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, minClosedPerCell: "1", minSetupsPerDay: "4", seed: "42", maxTrials: "256", maxSeconds: "3600" });
+
+export function restoreDomains(fields: SearchField[], baseline: Record<string, OptimizationValue>, search: Record<string, OptimizationValue[]>): DomainDrafts {
+  return Object.fromEntries(fields.map((field) => [field.key, {
+    baseline: String(baseline[field.key] ?? "null"), search: Object.hasOwn(search, field.key),
+    values: (search[field.key] ?? field.optimization?.values ?? [baseline[field.key] ?? null]).map(String).join(", "),
+  }]));
+}
+
+function buildStudyParameters(algorithm: Algorithm, scope: ScopeDraft, catalog: CatalogInstrument[], params: DomainDrafts, analytics: DomainDrafts): ContinuousStudySpec {
   const symbols = [...new Set(scope.symbols.split(/[\s,;]+/).filter(Boolean))];
   if (!symbols.length) throw new Error("Выберите хотя бы один исторический инструмент.");
   const instruments = symbols.map((symbol) => {
@@ -126,18 +134,38 @@ export function buildOptimizationSpec(algorithm: Algorithm, scope: ScopeDraft, c
   if (analyticsValues.search.clusterGapMinutes) analyticsSearch.clusterGapMinutes = analyticsValues.search.clusterGapMinutes.map(numberValue);
   if (analyticsValues.search.timeShiftMinutes) analyticsSearch.timeShiftMinutes = analyticsValues.search.timeShiftMinutes.map(numberValue);
   if (analyticsValues.search.priceChangePct) analyticsSearch.priceChangePct = analyticsValues.search.priceChangePct.map(nullableValue);
-  const maturity = Number(scope.setupMaturity);
-  if (!scope.setupMaturity.trim() || !Number.isFinite(maturity) || maturity < 0 || maturity > 1 || Math.abs(maturity * 10 - Math.round(maturity * 10)) > 1e-8) throw new Error("Зрелость: число от 0 до 1 с шагом 0.1, фиксированное для исследования.");
   return {
     algorithmId: algorithm.id, algorithmVersion: algorithm.version,
     algorithmParams: { ...algorithm.params, ...algorithmValues.baseline }, algorithmSearch: algorithmValues.search,
     analyticsParams, analyticsSearch,
-    instruments, ...range, direction: scope.direction, setupMaturity: maturity,
+    instruments, direction: scope.direction,
     horizonMinutes: integerInput(scope.horizonMinutes, "Горизонт", 1, 43200),
     tpLevels: parseAxis(scope.tpLevels, "TP"), slLevels: parseAxis(scope.slLevels, "SL"),
     minClosedPerCell: integerInput(scope.minClosedPerCell, "Минимум закрытых на ячейку", 1),
-    minSetupsPerDay: nonnegativeDecimalInput(scope.minSetupsPerDay, "Минимум сетапов в день"),
     seed: integerInput(scope.seed, "Seed", 0),
     maxTrials: integerInput(scope.maxTrials, "Бюджет trials", 1, 4096), maxSeconds: integerInput(scope.maxSeconds, "Бюджет времени", 1, 86400),
   };
+}
+
+export function buildOptimizationSpec(algorithm: Algorithm, scope: ScopeDraft, catalog: CatalogInstrument[], params: DomainDrafts, analytics: DomainDrafts): OptimizationSpec {
+  const range = replayRange(scope.from, scope.to);
+  if (range.fromUnix % 60 !== 0 || range.toUnix % 60 !== 0) throw new Error("Границы периода должны совпадать с минутной сеткой.");
+  const maturity = Number(scope.setupMaturity);
+  if (!scope.setupMaturity.trim() || !Number.isFinite(maturity) || maturity < 0 || maturity > 1 || Math.abs(maturity * 10 - Math.round(maturity * 10)) > 1e-8) throw new Error("Зрелость: число от 0 до 1 с шагом 0.1, фиксированное для исследования.");
+  return { ...buildStudyParameters(algorithm, scope, catalog, params, analytics), ...range, setupMaturity: maturity,
+    minSetupsPerDay: nonnegativeDecimalInput(scope.minSetupsPerDay, "Минимум сетапов в день") };
+}
+
+export interface ContinuousDraft { lookbackDays: string; minSetupsPerDay: string; minMeanExpectancy: string; adaptiveEnabled: boolean }
+export function buildContinuousConfig(algorithm: Algorithm, scope: ScopeDraft, catalog: CatalogInstrument[], params: DomainDrafts, analytics: DomainDrafts, draft: ContinuousDraft): ContinuousConfig {
+  const parts = draft.minSetupsPerDay.split(",");
+  if (draft.minSetupsPerDay.length > 8192 || parts.length > MAX_DOMAIN_VALUES) throw new Error("Список порогов: не больше 256 значений.");
+  const thresholds = [...new Set(parts.map((part) => nonnegativeDecimalInput(part, "Список минимума сетапов в день")))];
+  if (thresholds.length > MAX_CONTINUOUS_THRESHOLDS) throw new Error(`Список порогов: не больше ${MAX_CONTINUOUS_THRESHOLDS} уникальных профилей.`);
+  const lookbackDays = nonnegativeDecimalInput(draft.lookbackDays, "Последние N дней");
+  if (!isContinuousLookbackDays(lookbackDays)) throw new Error("Последние N дней: период от 1 минуты до 3660 суток, длительность в целых секундах. Дробные сутки разрешены.");
+  const mean = Number(draft.minMeanExpectancy);
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(draft.minMeanExpectancy.trim()) || !Number.isFinite(mean)) throw new Error("Минимальное среднее матожидание: требуется конечное число с десятичной точкой.");
+  return { lookbackDays, minSetupsPerDay: thresholds,
+    minMeanExpectancy: mean, adaptiveEnabled: draft.adaptiveEnabled, study: buildStudyParameters(algorithm, scope, catalog, params, analytics) };
 }

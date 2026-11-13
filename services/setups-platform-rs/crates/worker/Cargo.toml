@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 setups-domain.workspace = true
+setups-analytics.workspace = true
+setups-optimizer.workspace = true
 setups-detector.workspace = true
 setups-replay.workspace = true
 setups-mdclient.workspace = true
@@ -16,3 +18,6 @@ sqlx.workspace = true
 chrono.workspace = true
 tokio.workspace = true
 web-push.workspace = true
+
+[dev-dependencies]
+axum.workspace = true

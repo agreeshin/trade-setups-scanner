@@ -1,9 +1,11 @@
 import { effectiveTimezone, formatUnix } from "../lib/datetime-format";
 import { apiFetch } from "../lib/platform-api";
+import type { AdaptiveRecommendation } from "../lib/setup-recommendation";
 
 export interface Algorithm {
   id: string;
   name: string;
+  externalName?: string;
   version: string;
   description: string;
   enabled: boolean;
@@ -11,11 +13,19 @@ export interface Algorithm {
   fields: { key: string; label: string; type: "decimal" | "integer"; min: number; max: number; unit: string; optimization?: { enabledByDefault: boolean; values: (string | number)[] } }[];
 }
 
+export const algorithmDisplayName = (algorithm: Pick<Algorithm, "name" | "externalName">): string => algorithm.externalName ?? algorithm.name;
+
 export interface SetupRow {
+  id?: number;
   exchange: string;
   category?: string;
   symbol: string;
   algorithmId: string;
+  externalName?: string | null;
+  origin?: string;
+  adaptiveSlotId?: number | null;
+  adaptiveGenerationId?: number | null;
+  recommendation?: AdaptiveRecommendation | null;
   algorithmVersion?: string;
   params?: Record<string, string | number>;
   details?: {
@@ -25,7 +35,7 @@ export interface SetupRow {
     overLong: boolean;
     overShort: boolean;
     missingMinutes: number;
-  };
+  } | null;
   openTimeUnix: number;
   closeTimeUnix: number;
   closePrice: string;

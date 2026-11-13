@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 
+pub mod adaptive;
 pub mod live;
 
 const CACHE_LOCK_KEY: i64 = 72_423_411;

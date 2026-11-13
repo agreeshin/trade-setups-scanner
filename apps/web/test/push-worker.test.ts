@@ -39,4 +39,15 @@ describe("push service worker", () => {
     expect(close).toHaveBeenCalledOnce();
     expect(openWindow).toHaveBeenCalledWith("https://platform.test/setups");
   });
+  it("uses saved adaptive text and separate setup identity without resetting raw-close expiry to future entry", () => {
+    const { listeners, showNotification } = worker();
+    const now = Date.now();
+    const payload = { symbol: "COINUSDT", timestamp: now - 1000, expiresAt: now + 59_000, setupId: 42, recommendation: { direction: "short", entryAt: now + 180_000 }, message: "Цена: 100,00 USDT\nTP = 14%, SL = 4%\nТолько если цена не ниже 101,00" };
+    listeners.get("push")?.({ data: { json: () => payload }, waitUntil: vi.fn() });
+    expect(showNotification).toHaveBeenCalledWith("SHORT COINUSDT", expect.objectContaining({ timestamp: payload.timestamp, body: payload.message, tag: "setup-42" }));
+    listeners.get("push")?.({ data: { json: () => ({ ...payload, setupId: 43 }) }, waitUntil: vi.fn() });
+    expect(showNotification.mock.calls[1]?.[1]).toMatchObject({ tag: "setup-43" });
+    listeners.get("push")?.({ data: { json: () => ({ ...payload, expiresAt: now - 1 }) }, waitUntil: vi.fn() });
+    expect(showNotification).toHaveBeenCalledTimes(2);
+  });
 });

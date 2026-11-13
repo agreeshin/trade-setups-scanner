@@ -485,6 +485,7 @@ fn make_best(
     candidate: &StudyCandidate,
     evaluation: CandidateEvaluation,
     trial: usize,
+    continuous: bool,
 ) -> StudyBest {
     StudyBest {
         score: evaluation.summary.score.expect("scorable evaluation"),
@@ -508,7 +509,12 @@ fn make_best(
         support: evaluation.summary,
         trial_index: trial,
         provenance: Provenance {
-            optimizer_version: OPTIMIZER_VERSION.into(),
+            optimizer_version: if continuous {
+                CONTINUOUS_OPTIMIZER_VERSION
+            } else {
+                OPTIMIZER_VERSION
+            }
+            .into(),
             seed: spec.seed,
             snapshot_hash: input.snapshot_hash.clone(),
             captured_at: input.captured_at.clone(),
@@ -522,9 +528,24 @@ pub fn run_study(
     input: &StudyInput,
     limits: &StudyLimits,
     cancel: &CancelToken,
-    mut progress: impl FnMut(StudyUpdate),
+    progress: impl FnMut(StudyUpdate),
 ) -> Result<StudyOutcome, StudyError> {
-    validate_request(spec, &default_parameter_descriptors(&spec.algorithm_id)?)?;
+    run_study_mode(spec, input, limits, cancel, progress, None)
+}
+
+pub(crate) fn run_study_mode(
+    spec: &StudyRequest,
+    input: &StudyInput,
+    limits: &StudyLimits,
+    cancel: &CancelToken,
+    mut progress: impl FnMut(StudyUpdate),
+    continuous: Option<ContinuousContext>,
+) -> Result<StudyOutcome, StudyError> {
+    if let Some(context) = continuous {
+        validate_continuous_request(spec, context)?;
+    } else {
+        validate_request(spec, &default_parameter_descriptors(&spec.algorithm_id)?)?;
+    }
     if limits.cpu_threads == 0
         || limits.cpu_threads > 64
         || limits.batch_size == 0
@@ -585,6 +606,9 @@ pub fn run_study(
         event: None,
     });
     let stats = validate_input(spec, input, limits, cancel)?;
+    if let Some(context) = continuous {
+        crate::continuous::validate_frozen_cutoff(input, context, cancel)?;
+    }
     let mut search = Search::new(spec)?;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(limits.cpu_threads)
@@ -651,14 +675,62 @@ pub fn run_study(
                         .iter()
                         .map(|&index| &batch[index].candidate)
                         .collect();
-                    let evaluated = evaluate_group(
-                        spec,
-                        input,
-                        &candidates,
-                        &worker_limits,
-                        stats.as_ref().expect("validated stats"),
-                        &control,
-                    )?;
+                    let evaluated = if let Some(context) = continuous {
+                        let mut continuous_limits = worker_limits.clone();
+                        let retained_matrices = candidates.len().saturating_sub(1)
+                            * spec.tp_levels.len()
+                            * spec.sl_levels.len()
+                            * std::mem::size_of::<MatrixCell>();
+                        continuous_limits.max_working_bytes = worker_limits
+                            .max_working_bytes
+                            .saturating_sub(retained_matrices);
+                        let raw = crate::continuous::materialize_inner(
+                            spec,
+                            input,
+                            candidates[0],
+                            context,
+                            &continuous_limits,
+                            stats.as_ref().expect("validated stats"),
+                            &control,
+                        )?;
+                        match raw {
+                            None => vec![None; candidates.len()],
+                            Some(raw) => {
+                                let mut evaluations = Vec::with_capacity(candidates.len());
+                                limit(
+                                    "continuous_packet_bytes",
+                                    candidates.len()
+                                        * spec.tp_levels.len()
+                                        * spec.sl_levels.len()
+                                        * std::mem::size_of::<MatrixCell>(),
+                                    worker_limits.max_working_bytes,
+                                )?;
+                                for candidate in &candidates {
+                                    evaluations.push(
+                                        crate::continuous::analyze_inner(
+                                            spec,
+                                            input,
+                                            &raw,
+                                            candidate,
+                                            &continuous_limits,
+                                            &control,
+                                        )?
+                                        .map(|result| result.evaluation),
+                                    );
+                                }
+                                evaluations
+                            }
+                        }
+                    } else {
+                        evaluate_group(
+                            spec,
+                            input,
+                            &candidates,
+                            &worker_limits,
+                            stats.as_ref().expect("validated stats"),
+                            &control,
+                        )?
+                    };
                     Ok(indexes.iter().copied().zip(evaluated).collect())
                 })
                 .collect()
@@ -694,6 +766,7 @@ pub fn run_study(
                     &batch[index].candidate,
                     evaluation,
                     trial,
+                    continuous.is_some(),
                 ));
                 best.clone()
             } else {

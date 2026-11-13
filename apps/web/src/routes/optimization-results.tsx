@@ -3,7 +3,7 @@ import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { formatIsoDateTime, formatUnix } from "../lib/datetime-format";
-import { isActiveStudy, type OptimizationStudy } from "../lib/optimization-api";
+import { isActiveStudy, isContinuousStudy, type OptimizationStudy } from "../lib/optimization-api";
 import { parameterLabels } from "../lib/parameter-labels";
 import type { Algorithm } from "./platform-controls";
 import type { OptimizationController } from "./use-optimization-studies";
@@ -30,7 +30,9 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
     <div className="flex flex-wrap items-center gap-2">
       <h3 className="font-semibold">Исследование #{study.id}</h3>
       <Badge variant={study.status === "failed" ? "danger" : study.status === "completed" ? "success" : "info"}>{statusLabels[study.status]}</Badge>
+      <Badge>{isContinuousStudy(study) ? "Непрерывное" : "Ручное"}</Badge>
     </div>
+    {isContinuousStudy(study) && <p className="text-sm text-muted-foreground">Непрерывная оценка последних N суток: R учитывает только наблюдавшиеся закрытые TP/SL-сделки. На правом крае возможны будущие входы и незакрытые сделки; это не нулевая доходность, не принудительный SL и не полностью созревшая оценка всей выборки.</p>}
     <p className="text-sm" role="status">{phaseLabels[progress.phase] ?? progress.phase}</p>
     <dl className="grid gap-2 text-sm sm:grid-cols-2">
       <div><dt className="text-muted-foreground">Завершено trials / бюджет</dt><dd>{progress.evaluatedCandidates} / {progress.maxTrials}</dd></div>
@@ -47,7 +49,7 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
     </section>
     <div className="flex flex-wrap gap-2">
       <Button type="button" variant="outline" onClick={controller.refresh}>Обновить статус</Button>
-      {isActiveStudy(study) ? <Button type="button" variant="outline" disabled={study.status === "cancel_requested" || controller.cancelling !== null || controller.deleting !== null || controller.creating} onClick={() => { void controller.stop(study); }}>{controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить исследование"}</Button>
+      {isActiveStudy(study) ? isContinuousStudy(study) ? <p className="text-sm">Непрерывное исследование останавливается только общей командой алгоритма.</p> : <Button type="button" variant="outline" disabled={study.status === "cancel_requested" || controller.cancelling !== null || controller.deleting !== null || controller.creating} onClick={() => { void controller.stop(study); }}>{controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить исследование"}</Button>
         : onNew && <Button type="button" disabled={!controller.ready || controller.active !== null} onClick={onNew}>Новое исследование</Button>}
     </div>
     {study.status === "cancel_requested" && <Alert role="status">Сервер завершает текущие задачи и очистку. Остановка ещё не завершена.</Alert>}
@@ -91,6 +93,6 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
       <h4 className="font-medium">Главные события · последние {Math.min(study.events.length, 50)}</h4>
       <ol className="grid max-h-64 gap-2 overflow-y-auto text-xs">{study.events.slice(-50).map((event, index) => <li key={`${event.at}:${index}`} className="break-words">{formatIsoDateTime(event.at)} · {event.kind} · {event.message.slice(0, 1000)}</li>)}</ol>
     </section>
-    <p className="text-xs text-muted-foreground">Результат не применяется к live-алгоритму или настройкам аналитики. Закрытие окна не останавливает серверную работу.</p>
+    <p className="text-xs text-muted-foreground">{isContinuousStudy(study) ? "Адаптивный профиль допускается только после готовности всей серверной цепочки и гейта при отдельном разрешении live. Постоянные настройки не меняются." : "Результат не применяется к live-алгоритму или настройкам аналитики."} Закрытие окна не останавливает серверную работу.</p>
   </section>;
 }

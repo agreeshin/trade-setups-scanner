@@ -1,5 +1,5 @@
 //! Server-owned optimizer lifecycle, isolated from ordinary replay and analytics.
-mod snapshot;
+pub(crate) mod snapshot;
 
 use crate::{
     auth::SessionAuth, config::OptimizationConfig, controls::optimization_descriptors,
@@ -293,6 +293,7 @@ async fn delete_study(
         Ok(Some(db::DeleteStudyOutcome::Active)) => {
             response(StatusCode::CONFLICT, json!({"error":"study_active"}))
         }
+        Ok(Some(db::DeleteStudyOutcome::Referenced)) => response(StatusCode::CONFLICT,json!({"error":"continuous_history_referenced"})),
         Ok(None) => response(StatusCode::NOT_FOUND, json!({"error":"not_found"})),
         Err(error) => internal_error("delete", error),
     }
@@ -311,6 +312,7 @@ async fn cancel_study(
     }
     match db::cancel(&state.pool, id).await {
         Ok(Some((record, accepted))) => {
+            if record.origin=="continuous" { return response(StatusCode::CONFLICT,json!({"error":"continuous_owner_stop_required"})); }
             state.notify.notify_one();
             record_response(
                 if accepted {
@@ -663,12 +665,12 @@ async fn finish_retry(
 }
 
 #[derive(Debug)]
-struct JobError {
-    code: &'static str,
-    message: String,
+pub(crate) struct JobError {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 impl JobError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into().chars().take(500).collect(),

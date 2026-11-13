@@ -99,6 +99,9 @@ fn run_dto(run: &ReplayRunFull) -> Value {
         "error": run.error.clone(),
         "algorithmId": run.algorithm_id,
         "algorithmVersion": run.algorithm_version,
+        "origin":run.origin,
+        "continuousGenerationId":run.continuous_generation_id,
+        "continuousStudyId":run.continuous_study_id,
         "params": run.params.clone(),
         "fromUnix": run.from_ts.timestamp(),
         "toUnix": run.to_ts.timestamp(),
@@ -125,6 +128,9 @@ pub(crate) fn batch_dto(batch: &BatchSummary) -> Value {
         },
         "algorithmId": batch.algorithm_id,
         "algorithmVersion": batch.algorithm_version,
+        "origin":batch.origin,
+        "continuousGenerationId":batch.continuous_generation_id,
+        "continuousStudyId":batch.continuous_study_id,
         "fromUnix": batch.from_ts.timestamp(),
         "toUnix": batch.to_ts.timestamp(),
         "createdAt": iso8601(&batch.created_at),
@@ -602,6 +608,7 @@ async fn cancel_run(
     let Some(run_id) = parse_id(&id) else {
         return error_response(StatusCode::BAD_REQUEST, "invalid_id");
     };
+    match setups_db::continuous::is_service_run(&state.pool,run_id).await {Ok(true)=>return error_response(StatusCode::CONFLICT,"continuous_owner_stop_required"),Ok(false)=>{},Err(_)=>return internal_error()}
     match cancel_replay_run(&state.pool, run_id).await {
         Ok(None) => error_response(StatusCode::NOT_FOUND, "run not found"),
         Ok(Some(run)) => match get_run_full(&state.pool, run.id).await {
@@ -703,6 +710,7 @@ async fn delete_run(
         Ok(Some(setups_db::admission::DeleteRunOutcome::Active)) => {
             error_response(StatusCode::CONFLICT, "run active")
         }
+        Ok(Some(setups_db::admission::DeleteRunOutcome::Referenced))=>error_response(StatusCode::CONFLICT,"continuous_history_referenced"),
         Ok(Some(setups_db::admission::DeleteRunOutcome::Deleted {
             quality_intervals_deleted,
         })) => Json(json!({

@@ -58,6 +58,9 @@ export interface OptimizationBest {
 }
 export interface OptimizationStudy {
   id: number;
+  origin?: "manual" | "continuous";
+  continuousGenerationId?: number | null;
+  continuousSlotId?: number | null;
   status: "queued" | "running" | "cancel_requested" | "completed" | "cancelled" | "failed";
   spec: OptimizationSpec;
   progress: OptimizationProgress;
@@ -75,16 +78,20 @@ export interface OptimizationStudyPage {
   limit: number;
   offset: number;
 }
-export type OptimizationStudyAction = Pick<OptimizationStudy, "id" | "status">;
+export type OptimizationStudyAction = Pick<OptimizationStudy, "id" | "status" | "origin">;
 
 // Project mutation responses explicitly: a compact summary must not retain matrix/events.
 export function summarizeOptimizationStudy(study: OptimizationStudy): OptimizationStudySummary {
   return { id: study.id, status: study.status, spec: study.spec, progress: study.progress, error: study.error,
+    ...(study.origin ? { origin: study.origin } : {}),
+    ...(study.continuousGenerationId !== undefined ? { continuousGenerationId: study.continuousGenerationId } : {}),
+    ...(study.continuousSlotId !== undefined ? { continuousSlotId: study.continuousSlotId } : {}),
     createdAt: study.createdAt, updatedAt: study.updatedAt, bestScore: study.result?.best?.score ?? study.progress.bestScore ?? null };
 }
 
 export const isActiveStudy = (study: Pick<OptimizationStudy, "status">): boolean =>
   study.status === "queued" || study.status === "running" || study.status === "cancel_requested";
+export const isContinuousStudy = (study: Pick<OptimizationStudy, "origin">): boolean => study.origin === "continuous";
 
 export class OptimizationApiError extends Error {
   constructor(message: string, readonly status: number, readonly activeStudyId?: number) { super(message); }
@@ -96,7 +103,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const detail = await response.json().catch(() => null) as { error?: unknown; message?: string; activeStudyId?: number; resource?: string; requested?: number; limit?: number } | null;
   const activeId = detail?.activeStudyId;
   let message = `Не удалось выполнить запрос оптимизации: HTTP ${response.status}`;
-  if (response.status === 409) message = init.method === "DELETE" ? "Нельзя удалить активное исследование. Сначала остановите его и дождитесь завершения."
+  if (response.status === 409 && detail?.error === "continuous_history_referenced") message = "Нельзя удалить исследование: оно связано с адаптивным профилем или сохраняемой непрерывной цепочкой. Завершённая история сохранена.";
+  else if (response.status === 409 && detail?.error === "continuous_owner_stop_required") message = "Непрерывное исследование нельзя остановить отдельно. Используйте общую остановку непрерывного процесса алгоритма.";
+  else if (response.status === 409) message = init.method === "DELETE" ? "Нельзя удалить активное исследование. Сначала остановите его и дождитесь завершения."
     : activeId !== undefined ? `Исследование #${activeId} уже выполняется. Восстановлен его статус.` : "Версия алгоритма изменилась. Обновите страницу перед новым запуском.";
   else if (response.status === 404) message = "Исследование не найдено или уже удалено.";
   else if (response.status === 429) message = `Превышен ресурсный допуск${detail?.resource ? ` (${detail.resource}: ${String(detail.requested)} > ${String(detail.limit)})` : ""}. Уменьшите scope или бюджет исследования.`;

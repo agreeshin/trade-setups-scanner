@@ -184,7 +184,10 @@ impl Control<'_> {
     }
 }
 
-fn numerical_budget(params: &AlgorithmParams, stats: &InputStats) -> Result<(), StudyError> {
+pub(crate) fn numerical_budget(
+    params: &AlgorithmParams,
+    stats: &InputStats,
+) -> Result<(), StudyError> {
     let overflow = || {
         StudyError::Detector(
             "input/parameter combination exceeds exact i128 arithmetic budget".into(),
@@ -290,7 +293,7 @@ pub fn score_matrix(matrix: &[MatrixCell], min_closed_per_cell: usize) -> Option
     score.is_finite().then_some(score)
 }
 
-fn empty_matrix(spec: &StudyRequest) -> Vec<MatrixCell> {
+pub(crate) fn empty_matrix(spec: &StudyRequest) -> Vec<MatrixCell> {
     spec.tp_levels
         .iter()
         .flat_map(|&tp| {
@@ -355,17 +358,17 @@ fn selected_indexes(
     Some(selected)
 }
 
-fn accumulate_setup(
+pub(crate) fn accumulate_setup(
     spec: &StudyRequest,
     analytics: &AnalyticsParams,
-    data: &InstrumentInput,
+    candles: &[setups_analytics::OhlcCandle],
     setup: &AnalyticsSetup,
     matrix: &mut [MatrixCell],
     selected_count: &mut usize,
     control: &Control<'_>,
 ) -> bool {
     let Some(entry) = find_candle_by_open_time(
-        &data.candles,
+        candles,
         setup.open_time_unix + analytics.time_shift_minutes * 60,
     ) else {
         for cell in matrix {
@@ -414,10 +417,8 @@ fn accumulate_setup(
     let mut sl_first = vec![None; sl_prices.len()];
     let mut remaining_tp = tp_first.len();
     let mut remaining_sl = sl_first.len();
-    let start = data
-        .candles
-        .partition_point(|bar| bar.open_time_unix < entry_time);
-    for (offset, candle) in data.candles[start..].iter().enumerate() {
+    let start = candles.partition_point(|bar| bar.open_time_unix < entry_time);
+    for (offset, candle) in candles[start..].iter().enumerate() {
         if offset % 128 == 0 && control.stopped() {
             return false;
         }
@@ -615,7 +616,7 @@ pub(crate) fn evaluate_group(
                     || !accumulate_setup(
                         spec,
                         &candidate.analytics,
-                        data,
+                        &data.candles,
                         &setups[index],
                         &mut matrices[candidate_index],
                         &mut selected_counts[candidate_index],
@@ -741,7 +742,7 @@ mod tests {
         assert!(accumulate_setup(
             &spec,
             &analytics,
-            &data,
+            &data.candles,
             &setup,
             &mut matrix,
             &mut selected_count,
@@ -911,7 +912,7 @@ mod tests {
         assert!(!accumulate_setup(
             &spec,
             &AnalyticsParams::default(),
-            &data,
+            &data.candles,
             &setup,
             &mut empty_matrix(&spec),
             &mut selected_count,

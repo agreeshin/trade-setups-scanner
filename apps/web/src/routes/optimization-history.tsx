@@ -1,11 +1,12 @@
 import { useContext, useEffect, useId, useState } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
+import { Badge } from "../components/ui/badge";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { formatUnix } from "../lib/datetime-format";
 import { formatElapsedDuration } from "../lib/format-duration";
-import { isActiveStudy, listOptimizationStudies, type OptimizationStudyAction, type OptimizationStudyPage } from "../lib/optimization-api";
+import { isActiveStudy, isContinuousStudy, listOptimizationStudies, type OptimizationStudyAction, type OptimizationStudyPage } from "../lib/optimization-api";
 import { errorText } from "./platform-controls";
 import { RouteActiveContext } from "./route-active";
 import type { OptimizationController } from "./use-optimization-studies";
@@ -31,7 +32,7 @@ export function OptimizationHistory({ algorithmId, algorithmName, controller, on
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
-  const latest = controller.byAlgorithm[algorithmId];
+  const latest = controller.latestByAlgorithm[algorithmId] ?? controller.byAlgorithm[algorithmId];
   // Active first-page rows follow compact discovery polling; terminal pages do not
   // refetch just because unrelated polling produced a new object identity.
   const observed = offset === 0 && latest && isActiveStudy(latest) ? latest : latest?.updatedAt;
@@ -73,15 +74,16 @@ export function OptimizationHistory({ algorithmId, algorithmName, controller, on
     {error && <Alert variant="destructive" role="alert">{error}<Button type="button" variant="outline" onClick={() => setRetry((value) => value + 1)}>Повторить загрузку истории</Button></Alert>}
     <div className="overflow-x-auto">
       <Table aria-label={`Исследования · ${algorithmName}`} aria-busy={loading}>
-        <TableHeader><TableRow>{["ID", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
+        <TableHeader><TableRow>{["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
         <TableBody>{page?.studies.map((study) => <TableRow key={study.id}>
           <TableCell><Button id={`${instanceId}-study-${study.id}`} type="button" variant="outline" size="sm" aria-label={`Результат исследования ${study.id}`} onClick={() => onSelect(study.id, `${instanceId}-study-${study.id}`)}>#{study.id}</Button></TableCell>
+          <TableCell><Badge>{isContinuousStudy(study) ? "Непрерывное" : "Ручное"}</Badge></TableCell>
           <TableCell className="whitespace-nowrap">[{formatUnix(study.spec.fromUnix)}, {formatUnix(study.spec.toUnix)})</TableCell>
           <TableCell className="whitespace-nowrap">{formatElapsedDuration(study.progress.elapsedSeconds)}</TableCell>
           <TableCell>{study.spec.minSetupsPerDay ?? "Гейт не применялся"}</TableCell>
           <TableCell>{study.bestScore === null || !Number.isFinite(study.bestScore) ? "—" : `${scoreFormatter.format(study.bestScore)} R`}</TableCell>
           <TableCell>{isActiveStudy(study)
-            ? <Button type="button" variant="outline" size="sm" disabled={busy || study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested")} aria-label={`Остановить исследование ${study.id}`} onClick={() => { void controller.stop(study); }}>{study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested") ? "Остановка запрошена" : controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить"}</Button>
+            ? isContinuousStudy(study) ? <span className="text-xs text-muted-foreground">Общая остановка в настройках алгоритма</span> : <Button type="button" variant="outline" size="sm" disabled={busy || study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested")} aria-label={`Остановить исследование ${study.id}`} onClick={() => { void controller.stop(study); }}>{study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested") ? "Остановка запрошена" : controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить"}</Button>
             : <Button type="button" variant="outline" size="sm" disabled={busy} aria-label={`Удалить исследование ${study.id}`} onClick={() => onDelete(study)}><OptimizationTrashIcon /></Button>}</TableCell>
         </TableRow>)}</TableBody>
       </Table>

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Algorithm } from "./platform-controls";
-import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildOptimizationSpec, DEFAULT_AXIS, initialDomains, parseAxis, type ScopeDraft } from "./optimization-form";
+import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildContinuousConfig, buildOptimizationSpec, DEFAULT_AXIS, initialDomains, parseAxis, type ScopeDraft } from "./optimization-form";
 
 const algorithm: Algorithm = {
   id: "unknown", version: "1", enabled: true, name: "Unknown", description: "",
@@ -12,6 +12,35 @@ const algorithm: Algorithm = {
 };
 const scope: ScopeDraft = { from: "2026-10-01T00:00", to: "2026-10-02T00:00", symbols: "OLDUSDT", direction: "short", setupMaturity: "0", horizonMinutes: "10080", minClosedPerCell: "1", minSetupsPerDay: "4", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, maxTrials: "256", maxSeconds: "3600", seed: "42" };
 const catalog = [{ id: 1, exchange: "bybit", category: "linear", symbol: "OLDUSDT", status: "Delisted" }];
+
+describe("continuous configuration", () => {
+  function continuous(overrides: { lookbackDays?: string; minSetupsPerDay?: string; minMeanExpectancy?: string } = {}) {
+    return buildContinuousConfig(algorithm, scope, catalog, initialDomains(algorithm.fields, algorithm.params), initialDomains(ANALYTICS_SEARCH_FIELDS, { ...ANALYTICS_BASELINE }), {
+      lookbackDays: "30", minSetupsPerDay: "0, 0.6, 4, 4.0", minMeanExpectancy: "0.15", adaptiveEnabled: false, ...overrides,
+    });
+  }
+  it("reuses metadata and analytics, sends a separate unique threshold list and never sends dates or maturity", () => {
+    const result = continuous();
+    expect(result).toMatchObject({ lookbackDays: 30, minSetupsPerDay: [0, 0.6, 4], minMeanExpectancy: 0.15, adaptiveEnabled: false,
+      study: { algorithmParams: algorithm.params, algorithmSearch: { addedDecimal: ["0.25", "1.5"] }, analyticsParams: ANALYTICS_BASELINE, direction: "short" },
+    });
+    for (const field of ["fromUnix", "toUnix", "setupMaturity", "minSetupsPerDay"]) expect(result.study).not.toHaveProperty(field);
+    expect(result.study.analyticsSearch).not.toHaveProperty("setupMaturity");
+  });
+  it.each([{ lookbackDays: "0" }, { lookbackDays: "NaN" }, { minSetupsPerDay: "" }, { minSetupsPerDay: "1,,2" }, { minSetupsPerDay: "-1" }, { minSetupsPerDay: "Infinity" }, { minMeanExpectancy: "NaN" }])("rejects invalid continuous controls %j", (overrides) => {
+    expect(() => continuous(overrides)).toThrow();
+  });
+  it.each(["0.5", "3660"])("accepts the API's fractional and maximum lookback %s", (lookbackDays) => {
+    expect(continuous({ lookbackDays }).lookbackDays).toBe(Number(lookbackDays));
+  });
+  it.each(["3661", "0.0001", "0.33333"])("rejects unsupported or fractional-second windows %s", (lookbackDays) => {
+    expect(() => continuous({ lookbackDays })).toThrow("Последние N дней");
+  });
+  it("matches the canonical 64-slot limit without changing algorithm search-domain limits", () => {
+    expect(continuous({ minSetupsPerDay: Array.from({ length: 64 }, (_, index) => String(index)).join(",") }).minSetupsPerDay).toHaveLength(64);
+    expect(() => continuous({ minSetupsPerDay: Array.from({ length: 65 }, (_, index) => String(index)).join(",") })).toThrow("64");
+  });
+});
 function build(overrides: Partial<ScopeDraft> = {}, mutate?: (domains: ReturnType<typeof initialDomains>) => void) {
   const params = initialDomains(algorithm.fields, algorithm.params);
   mutate?.(params);

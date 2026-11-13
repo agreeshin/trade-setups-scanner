@@ -9,6 +9,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 pub mod admission;
 pub mod analytics;
 pub mod controls;
+pub mod continuous;
 pub mod migrate;
 pub mod optimization;
 pub mod push;
@@ -281,7 +282,7 @@ pub async fn claim_next_queued_run(pool: &PgPool) -> Result<Option<ReplayRun>, D
     let mut tx = pool.begin().await?;
     let row = sqlx::query(
         "select id, batch_id, exchange_code, category, symbol, from_ts, to_ts, algorithm_id, algorithm_version, params, status, cache_hit \
-         from replay_runs where status = 'queued' order by id for update skip locked limit 1",
+         from replay_runs where origin='manual' and status = 'queued' order by id for update skip locked limit 1",
     )
     .fetch_optional(&mut *tx)
     .await?;
@@ -301,7 +302,7 @@ pub async fn claim_next_queued_run(pool: &PgPool) -> Result<Option<ReplayRun>, D
 pub async fn fail_interrupted_runs(pool: &PgPool) -> Result<u64, DbError> {
     let result = sqlx::query(
         "update replay_runs set status = 'failed', error = 'interrupted by application restart', updated_at = now() \
-         where status = 'running'",
+         where origin='manual' and status = 'running'",
     )
     .execute(pool)
     .await?;

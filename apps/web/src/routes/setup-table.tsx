@@ -2,6 +2,8 @@ import { localTime, localTimezoneLabel, type SetupRow } from "./platform-control
 import { Badge } from "../components/ui/badge";
 import { EmptyState } from "../components/ui/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
+import { formatSetupRecommendation } from "../lib/setup-recommendation";
+import { SetupRecommendationPreview } from "./setup-recommendation-preview";
 
 function SetupDetails({ setup }: { setup: SetupRow }) {
   const metrics = setup.details;
@@ -38,13 +40,13 @@ export function SetupTable({ setups }: { setups: SetupRow[] }) {
           <TableHead>График</TableHead>
         </TableRow>
       </TableHeader>
-      <TableBody>{setups.map((setup, index) => <TableRow key={`${setup.exchange}-${setup.symbol}-${setup.algorithmId}-${setup.closeTimeUnix}-${index}`}>
+      <TableBody>{setups.map((setup, index) => <TableRow key={setup.id ?? `${setup.exchange}-${setup.symbol}-${setup.algorithmId}-${setup.closeTimeUnix}-${index}`}>
         <TableCell className="font-medium">{setup.exchange} · {setup.symbol}</TableCell>
-        <TableCell><Badge title="Нейтральное событие наблюдения, не LONG или SHORT">WATCH</Badge></TableCell>
+        <TableCell><div className="flex flex-wrap gap-1"><Badge title="Исходное нейтральное событие детектора">WATCH</Badge>{setup.recommendation && formatSetupRecommendation(setup)?.kind === "ready" && <Badge variant={setup.recommendation.direction === "short" ? "danger" : "success"} aria-label={`Рекомендация ${setup.recommendation.direction.toUpperCase()}`}>{setup.recommendation.direction.toUpperCase()}</Badge>}</div></TableCell>
         <TableCell className="whitespace-nowrap tabular-nums">{localTime(setup.openTimeUnix)}</TableCell>
         <TableCell className="whitespace-nowrap tabular-nums">{localTime(setup.closeTimeUnix)}</TableCell>
         <TableCell numeric>{setup.closePrice}</TableCell>
-        <TableCell>{setup.algorithmId}<SetupDetails setup={setup} /></TableCell>
+        <TableCell><SetupRecommendationPreview setup={setup} /><SetupDetails setup={setup} /></TableCell>
         <TableCell>{setup.exchange === "bybit" && setup.category === "linear" ? <div className="flex flex-wrap gap-x-3 gap-y-1"><a className="text-primary underline-offset-4 hover:underline" href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(`BYBIT:${setup.symbol}.P`)}`} target="_blank" rel="noopener noreferrer">TradingView</a><a className="text-primary underline-offset-4 hover:underline" href={`https://www.bybit.com/trade/usdt/${encodeURIComponent(setup.symbol)}`} target="_blank" rel="noopener noreferrer">Bybit</a></div> : <span className="text-muted-foreground">Нет ссылки</span>}</TableCell>
       </TableRow>)}</TableBody>
     </Table>

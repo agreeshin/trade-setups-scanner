@@ -183,13 +183,28 @@ impl LiveHandle {
 pub fn start_live_runtime(pool: PgPool, market_url: String, market_key: String) -> LiveHandle {
     let stopped = Arc::new(AtomicBool::new(false));
     let notify = Arc::new(Notify::new());
-    let task = tokio::spawn(live_loop(
-        pool,
-        market_url,
-        market_key,
-        stopped.clone(),
-        notify.clone(),
-    ));
+    let task_stopped = stopped.clone();
+    let task_notify = notify.clone();
+    let task = tokio::spawn(async move {
+        // Independent timers: an expensive fixed catch-up must not keep an
+        // otherwise current adaptive slot waiting for the next closed minute.
+        tokio::join!(
+            live_loop(
+                pool.clone(),
+                market_url.clone(),
+                market_key.clone(),
+                task_stopped.clone(),
+                task_notify.clone()
+            ),
+            crate::adaptive::adaptive_live_loop(
+                pool,
+                market_url,
+                market_key,
+                task_stopped,
+                task_notify
+            ),
+        );
+    });
     LiveHandle {
         stopped,
         notify,

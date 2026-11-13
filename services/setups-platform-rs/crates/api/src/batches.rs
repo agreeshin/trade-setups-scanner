@@ -175,6 +175,7 @@ async fn cancel_batch(
     let Some(batch_id) = parse_id(&id) else {
         return error_response(StatusCode::BAD_REQUEST, "invalid_id");
     };
+    match setups_db::continuous::is_service_batch(&state.pool,batch_id).await {Ok(true)=>return error_response(StatusCode::CONFLICT,"continuous_owner_stop_required"),Ok(false)=>{},Err(_)=>return internal_error()}
     match cancel_replay_batch(&state.pool, batch_id).await {
         Ok(None) => error_response(StatusCode::NOT_FOUND, "batch not found"),
         Ok(Some((cancelled, cancel_requested))) => {
@@ -224,6 +225,7 @@ async fn delete_batch(
         Ok(Some(BatchDeleteOutcome::Active)) => {
             error_response(StatusCode::CONFLICT, "batch active")
         }
+        Ok(Some(BatchDeleteOutcome::Referenced))=>error_response(StatusCode::CONFLICT,"continuous_history_referenced"),
         Ok(Some(BatchDeleteOutcome::Deleted {
             runs_deleted,
             quality_intervals_deleted,
@@ -542,6 +544,11 @@ async fn get_live_setups(
                 "symbol": row.symbol,
                 "algorithmId": row.algorithm_id,
                 "algorithmVersion": row.algorithm_version,
+                "externalName": row.external_name,
+                "origin": row.origin,
+                "adaptiveSlotId": row.adaptive_slot_id,
+                "adaptiveGenerationId": row.adaptive_generation_id,
+                "recommendation": row.recommendation,
                 "openTimeUnix": row.open_time.timestamp(),
                 "params": row.params,
                 "details": row.details.clone().unwrap_or(Value::Null),
@@ -574,6 +581,7 @@ pub fn batches_router(state: Arc<ReplayState>) -> Router {
         .route("/v1/replay-runs/{id}/export.csv", get(export_run_csv))
         .route("/v1/export/setups.csv", get(export_live_setups_csv))
         .route("/v1/setups", get(get_live_setups))
+        .route("/v1/live/setups", get(get_live_setups))
         .route(
             "/v1/settings/notifications",
             get(get_notifications_settings).put(put_notifications_settings),

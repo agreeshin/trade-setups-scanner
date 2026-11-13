@@ -31,11 +31,15 @@ pub struct ReplayRunFull {
     pub quality: Option<Value>,
     pub quality_source_run_id: Option<i64>,
     pub quality_computed_at: Option<DateTime<Utc>>,
+    pub origin: String,
+    pub continuous_generation_id: Option<i64>,
+    pub continuous_study_id: Option<i64>,
 }
 
 const RUN_COLUMNS: &str = "id, name, batch_id, exchange_code, category, symbol, status, cache_hit, setups, warmup_minutes, \
      processed_minutes, error, algorithm_id, algorithm_version, from_ts, to_ts, created_at, params, \
-     quality, quality_source_run_id, quality_computed_at";
+     quality, quality_source_run_id, quality_computed_at, origin, continuous_generation_id, \
+     (select study_id from continuous_generations where id=replay_runs.continuous_generation_id) as continuous_study_id";
 
 fn run_full_from_row(row: &PgRow) -> Result<ReplayRunFull, DbError> {
     let algorithm_id: String = row.try_get("algorithm_id")?;
@@ -71,6 +75,9 @@ fn run_full_from_row(row: &PgRow) -> Result<ReplayRunFull, DbError> {
             .try_get::<Option<i32>, _>("quality_source_run_id")?
             .map(i64::from),
         quality_computed_at: row.try_get("quality_computed_at")?,
+        origin: row.try_get("origin")?,
+        continuous_generation_id: row.try_get("continuous_generation_id")?,
+        continuous_study_id: row.try_get("continuous_study_id")?,
     })
 }
 
@@ -185,9 +192,13 @@ pub struct BatchSummary {
     pub done_instruments: i64,
     pub failed_instruments: i64,
     pub cancelled_instruments: i64,
+    pub origin: String,
+    pub continuous_generation_id: Option<i64>,
+    pub continuous_study_id: Option<i64>,
 }
 
-const BATCH_SELECT: &str = "select b.id, b.name, b.exchange_code, b.category, b.algorithm_id, b.algorithm_version, b.params, b.from_ts, b.to_ts, b.instrument_count, b.created_at, \
+const BATCH_SELECT: &str = "select b.id, b.name, b.exchange_code, b.category, b.algorithm_id, b.algorithm_version, b.params, b.from_ts, b.to_ts, b.instrument_count, b.created_at, b.origin,b.continuous_generation_id, \
+     (select study_id from continuous_generations where id=b.continuous_generation_id) as continuous_study_id, \
      count(*) filter (where r.status in ('queued','running','cancel_requested')) as active_instruments, \
      count(*) filter (where r.status = 'done') as done_instruments, \
      count(*) filter (where r.status = 'failed') as failed_instruments, \
@@ -229,6 +240,9 @@ fn batch_from_row(row: &PgRow) -> Result<BatchSummary, DbError> {
         done_instruments: done,
         failed_instruments: failed,
         cancelled_instruments: row.try_get("cancelled_instruments").unwrap_or(0),
+        origin: row.try_get("origin")?,
+        continuous_generation_id: row.try_get("continuous_generation_id")?,
+        continuous_study_id: row.try_get("continuous_study_id")?,
     })
 }
 
@@ -520,7 +534,7 @@ pub async fn cancel_replay_batch(
         .bind(QUEUE_LOCK_KEY)
         .execute(&mut *tx)
         .await?;
-    let batch = sqlx::query("select id from replay_batches where id = $1")
+    let batch = sqlx::query("select id,origin from replay_batches where id = $1")
         .bind(batch_id as i32)
         .fetch_optional(&mut *tx)
         .await?;
@@ -528,6 +542,7 @@ pub async fn cancel_replay_batch(
         tx.commit().await?;
         return Ok(None);
     }
+    if batch.as_ref().unwrap().try_get::<String,_>("origin")?=="continuous" {return Ok(Some((0,0)));}
     let cancelled = sqlx::query(
         "update replay_runs set status = 'cancelled', updated_at = now() \
          where batch_id = $1 and status = 'queued'",
@@ -555,6 +570,7 @@ pub enum BatchDeleteOutcome {
         quality_intervals_deleted: u64,
     },
     Active,
+    Referenced,
 }
 
 pub async fn delete_replay_batch(
@@ -574,6 +590,8 @@ pub async fn delete_replay_batch(
         tx.commit().await?;
         return Ok(None);
     }
+    if sqlx::query_scalar::<_,bool>("select exists(select 1 from continuous_generations where replay_batch_id=$1)")
+        .bind(batch_id as i32).fetch_one(&mut *tx).await? {return Ok(Some(BatchDeleteOutcome::Referenced));}
     let children = sqlx::query("select status from replay_runs where batch_id = $1")
         .bind(batch_id as i32)
         .fetch_all(&mut *tx)
@@ -751,6 +769,11 @@ pub struct LiveSetupFull {
     pub close_price: String,
     pub params: Value,
     pub details: Option<Value>,
+    pub origin: String,
+    pub adaptive_slot_id: Option<i64>,
+    pub adaptive_generation_id: Option<i64>,
+    pub recommendation: Option<Value>,
+    pub external_name: String,
 }
 
 pub async fn live_setups_search(
@@ -779,7 +802,7 @@ pub async fn live_setups_search(
     let total: i64 = count_row.try_get("total")?;
     let page_sql = format!(
         "select id, exchange_code, category, symbol, algorithm_id, algorithm_version, \
-         open_time, close_time, close_price, params, details from live_setups where {filter} \
+         open_time, close_time, close_price, params, details, adaptive_slot_id, adaptive_generation_id, recommendation, external_name from live_setups where {filter} \
          order by close_time desc, id desc offset {offset_ph} limit {limit_ph}"
     );
     let page = sqlx::query(&page_sql).bind(snapshot_id as i32);
@@ -800,6 +823,11 @@ pub async fn live_setups_search(
                 close_price: row.try_get("close_price")?,
                 params: row.try_get("params")?,
                 details: row.try_get("details")?,
+                origin: if row.try_get::<Option<i64>,_>("adaptive_slot_id")?.is_some() { "continuous".into() } else { "manual".into() },
+                adaptive_slot_id: row.try_get("adaptive_slot_id")?,
+                adaptive_generation_id: row.try_get("adaptive_generation_id")?,
+                recommendation: row.try_get("recommendation")?,
+                external_name: row.try_get::<Option<String>,_>("external_name")?.unwrap_or_else(||crate::algorithm_name(&row.get::<String,_>("algorithm_id"))),
             })
         })
         .collect::<Result<Vec<_>, DbError>>()?;
@@ -818,7 +846,7 @@ pub async fn last_live_setup_open_time(
     let row = sqlx::query(
         "select open_time from live_setups where exchange_code = $1 and category = $2 \
          and symbol = $3 and algorithm_id = $4 and algorithm_version = $5 \
-         and params = $6::jsonb order by open_time desc limit 1",
+         and params = $6::jsonb and adaptive_slot_id is null order by open_time desc limit 1",
     )
     .bind(exchange)
     .bind(category)
@@ -854,8 +882,8 @@ pub async fn insert_live_setup(
         DateTime::<Utc>::from_timestamp(setup.close_time_unix, 0).unwrap_or_else(Utc::now);
     let row = sqlx::query(
         "insert into live_setups (exchange_code, category, symbol, algorithm_id, algorithm_version, \
-         params, open_time, close_time, close_price, details) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-         on conflict (exchange_code, category, symbol, algorithm_id, algorithm_version, open_time) \
+         params, open_time, close_time, close_price, details, external_name) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, coalesce((select value->>'externalName' from settings where key='algorithm:'||$4),$11)) \
+         on conflict (exchange_code, category, symbol, algorithm_id, algorithm_version, open_time) where adaptive_slot_id is null \
          do nothing returning id",
     )
     .bind(exchange)
@@ -868,6 +896,7 @@ pub async fn insert_live_setup(
     .bind(close_time)
     .bind(&setup.close_price)
     .bind(details)
+    .bind(crate::algorithm_name(&setup.algorithm_id))
     .fetch_optional(pool)
     .await?;
     match row {

@@ -12,6 +12,46 @@ pub const SPIKE_DROP_ALGORITHM_VERSION: &str = "1.1.1";
 
 pub const MINUTE_SECONDS: i64 = 60;
 
+/// A recommendation annotates a neutral detector WATCH; it is not an order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecommendationDirection {
+    Short,
+    Long,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecommendationProvenance {
+    pub algorithm_id: String,
+    pub algorithm_version: String,
+    pub optimizer_version: String,
+    pub seed: u64,
+    pub snapshot_hash: String,
+    pub captured_at: String,
+    pub from_unix: i64,
+    pub to_unix: i64,
+    pub observation_cutoff: i64,
+}
+
+/// Bounded immutable payload. Persistence IDs/slot ownership are attached by
+/// the caller, not guessed by this pure compute layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdaptiveRecommendationSnapshot {
+    pub direction: RecommendationDirection,
+    pub tp_pct: f64,
+    pub sl_pct: f64,
+    pub raw_r: f64,
+    pub mean_r: f64,
+    pub robust_score: f64,
+    pub time_shift_minutes: i64,
+    pub price_change_pct: Option<f64>,
+    pub cluster_enabled: bool,
+    pub cluster_gap_minutes: Option<i64>,
+    pub provenance: RecommendationProvenance,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpikeParams {

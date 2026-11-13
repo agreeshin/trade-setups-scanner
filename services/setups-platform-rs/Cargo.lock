@@ -2483,13 +2483,16 @@ dependencies = [
 name = "setups-worker"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "serde",
  "serde_json",
+ "setups-analytics",
  "setups-db",
  "setups-detector",
  "setups-domain",
  "setups-mdclient",
+ "setups-optimizer",
  "setups-replay",
  "sha2",
  "sqlx",

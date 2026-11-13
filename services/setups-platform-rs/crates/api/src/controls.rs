@@ -116,9 +116,15 @@ fn algorithm_dto(id: &str, stored: Option<Value>) -> Value {
         .as_ref()
         .and_then(|value| value.get("enabled"))
         .is_none_or(|value| *value != Value::Bool(false));
+    let external_name = stored
+        .as_ref()
+        .and_then(|value| value.get("externalName"))
+        .and_then(Value::as_str)
+        .unwrap_or(name);
     json!({
         "id": id,
         "name": name,
+        "externalName": external_name,
         "version": version,
         "description": description,
         "params": params,
@@ -160,6 +166,7 @@ async fn export_config(State(state): State<Arc<ControlsState>>, headers: HeaderM
             Ok(Some(value)) => algorithms_entries.push(json!({
                 "id": value["id"],
                 "version": value["version"],
+                "externalName": value["externalName"],
                 "params": value["params"],
                 "enabled": value["enabled"],
             })),
@@ -215,52 +222,75 @@ async fn update_algorithm(
     if let Err(response) = guard(&state, &headers, true) {
         return response;
     }
-    if get_algorithm(&state.pool, &id)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
+    if !ALGORITHM_IDS.contains(&id.as_str()) {
         return error_response(StatusCode::NOT_FOUND, "unknown_algorithm");
     }
     let parsed: AlgorithmUpdateBody = match serde_json::from_str(&body) {
         Ok(value) => value,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_body"),
     };
-    let params: AlgorithmParams = if id == SPIKE_DROP_ALGORITHM_ID {
-        match serde_json::from_value::<SpikeDropParams>(parsed.params.clone()) {
-            Ok(value) => AlgorithmParams::SpikeDrop(value),
-            Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_body"),
-        }
-    } else {
-        match serde_json::from_value::<SpikeParams>(parsed.params) {
-            Ok(value) => AlgorithmParams::Spike(value),
-            Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_body"),
-        }
+    let value = match algorithm_update_value(&id, parsed) {
+        Ok(value) => value,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
-    if let Some(error) = validate_algorithm_params(&params) {
-        return error_response(StatusCode::BAD_REQUEST, error);
-    }
-    let value = json!({
-        "params": serde_json::to_value(&params).unwrap_or(Value::Null),
-        "enabled": parsed.enabled,
-    });
-    if settings_set(&state.pool, &format!("algorithm:{id}"), &value)
-        .await
-        .is_err()
-    {
-        return internal_error();
-    }
-    match get_algorithm(&state.pool, &id).await {
-        Ok(Some(algorithm)) => Json(algorithm).into_response(),
-        _ => internal_error(),
+    // Merge only submitted fields atomically: renaming must not race a settings save.
+    let stored = sqlx::query_scalar::<_, Value>(
+        "insert into settings (key, value, updated_at) values ($1, $2, now()) \
+         on conflict (key) do update set value = settings.value || excluded.value, \
+         updated_at = now() returning value",
+    )
+    .bind(format!("algorithm:{id}"))
+    .bind(value)
+    .fetch_one(&state.pool)
+    .await;
+    match stored {
+        Ok(value) => Json(algorithm_dto(&id, Some(value))).into_response(),
+        Err(_) => internal_error(),
     }
 }
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AlgorithmUpdateBody {
-    params: Value,
-    enabled: bool,
+    params: Option<Value>,
+    enabled: Option<bool>,
+    external_name: Option<String>,
+}
+
+fn algorithm_update_value(id: &str, body: AlgorithmUpdateBody) -> Result<Value, &'static str> {
+    let mut value = serde_json::Map::new();
+    if let Some(raw) = body.params {
+        let params = if id == SPIKE_DROP_ALGORITHM_ID {
+            AlgorithmParams::SpikeDrop(
+                serde_json::from_value::<SpikeDropParams>(raw).map_err(|_| "invalid_body")?,
+            )
+        } else {
+            AlgorithmParams::Spike(
+                serde_json::from_value::<SpikeParams>(raw).map_err(|_| "invalid_body")?,
+            )
+        };
+        if let Some(error) = validate_algorithm_params(&params) {
+            return Err(error);
+        }
+        value.insert(
+            "params".into(),
+            serde_json::to_value(params).map_err(|_| "invalid_body")?,
+        );
+    }
+    if let Some(enabled) = body.enabled {
+        value.insert("enabled".into(), json!(enabled));
+    }
+    if let Some(name) = body.external_name {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 120 || name.chars().any(char::is_control) {
+            return Err("invalid_external_name");
+        }
+        value.insert("externalName".into(), json!(name));
+    }
+    if value.is_empty() {
+        return Err("invalid_body");
+    }
+    Ok(Value::Object(value))
 }
 
 async fn get_ui_settings(State(state): State<Arc<ControlsState>>, headers: HeaderMap) -> Response {
@@ -1030,6 +1060,154 @@ mod tests {
         assert_eq!(dto["enabled"], json!(true));
         let dto = algorithm_dto(SPIKE_ALGORITHM_ID, None);
         assert_eq!(dto["enabled"], json!(true));
+    }
+
+    #[test]
+    fn external_name_is_additive_and_does_not_change_algorithm_identity() {
+        let original = algorithm_dto(SPIKE_ALGORITHM_ID, None);
+        assert_eq!(original["externalName"], original["name"]);
+        let renamed = algorithm_dto(
+            SPIKE_ALGORITHM_ID,
+            Some(json!({"externalName": "My <strategy>", "enabled": false})),
+        );
+        assert_eq!(renamed["externalName"], json!("My <strategy>"));
+        for key in ["id", "name", "version", "params", "fields"] {
+            assert_eq!(renamed[key], original[key], "changed {key}");
+        }
+        assert_eq!(renamed["enabled"], json!(false));
+    }
+
+    #[test]
+    fn rename_update_contains_only_the_name() {
+        let body = serde_json::from_value(json!({"externalName": "  Strategy  "})).unwrap();
+        assert_eq!(
+            algorithm_update_value(SPIKE_ALGORITHM_ID, body),
+            Ok(json!({"externalName": "Strategy"})),
+        );
+    }
+
+    #[test]
+    fn external_name_validation_is_bounded_plain_text() {
+        for name in [String::new(), "   ".into(), "a\nb".into(), "x".repeat(121)] {
+            let body = serde_json::from_value(json!({"externalName": name})).unwrap();
+            assert_eq!(
+                algorithm_update_value(SPIKE_ALGORITHM_ID, body),
+                Err("invalid_external_name"),
+            );
+        }
+        let name = "Ж".repeat(120);
+        let body = serde_json::from_value(json!({"externalName": name})).unwrap();
+        assert_eq!(
+            algorithm_update_value(SPIKE_ALGORITHM_ID, body).unwrap()["externalName"],
+            json!(name),
+        );
+    }
+
+    #[test]
+    fn parameter_save_does_not_overwrite_external_name() {
+        let body = serde_json::from_value(json!({
+            "params": SpikeDropParams::default(), "enabled": false,
+        }))
+        .unwrap();
+        let value = algorithm_update_value(SPIKE_DROP_ALGORITHM_ID, body).unwrap();
+        assert!(value.get("externalName").is_none());
+        assert_eq!(value["enabled"], json!(false));
+        assert_eq!(value["params"], json!(SpikeDropParams::default()));
+        let empty = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(
+            algorithm_update_value(SPIKE_ALGORITHM_ID, empty),
+            Err("invalid_body")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+    async fn name_and_fixed_settings_updates_are_independent() {
+        use axum::{body::Body, http::Request};
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        use tower::ServiceExt;
+
+        let options: PgConnectOptions = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL required")
+            .parse()
+            .unwrap();
+        assert!(
+            options
+                .get_database()
+                .is_some_and(|name| name.ends_with("_test"))
+        );
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        let name = format!(
+            "algorithm_name_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        sqlx::query(&format!("create database {name}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options.database(&name))
+            .await
+            .unwrap();
+        sqlx::query("create table settings (key text primary key, value jsonb not null, updated_at timestamptz not null default now())")
+            .execute(&pool).await.unwrap();
+        let app = controls_router(Arc::new(ControlsState {
+            pool: pool.clone(),
+            auth: Arc::new(SessionAuth::new(&["test-key".into()])),
+            market_url: "http://127.0.0.1:1".into(),
+            market_key: "unused".into(),
+        }));
+        let send = |body: Value| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/v1/algorithms/{SPIKE_ALGORITHM_ID}"))
+                        .header("x-api-key", "test-key")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (renamed, configured) = tokio::join!(
+            send(json!({"externalName": "Independent alias"})),
+            send(json!({"params": SpikeParams::default(), "enabled": false})),
+        );
+        assert_eq!(renamed.status(), StatusCode::OK);
+        assert_eq!(configured.status(), StatusCode::OK);
+        let key = format!("algorithm:{SPIKE_ALGORITHM_ID}");
+        let saved = settings_get(&pool, &key).await.unwrap().unwrap();
+        assert_eq!(saved["externalName"], json!("Independent alias"));
+        assert_eq!(saved["params"], json!(SpikeParams::default()));
+        assert_eq!(saved["enabled"], json!(false));
+        assert_eq!(
+            send(json!({"externalName": "a\nb"})).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(settings_get(&pool, &key).await.unwrap().unwrap(), saved);
+        let dto = get_algorithm(&pool, SPIKE_ALGORITHM_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dto["externalName"], saved["externalName"]);
+        assert_ne!(dto["name"], dto["externalName"]);
+        drop(app);
+        pool.close().await;
+        sqlx::query(&format!("drop database {name}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
     }
 
     #[test]

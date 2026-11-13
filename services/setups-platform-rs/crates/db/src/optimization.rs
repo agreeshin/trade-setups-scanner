@@ -25,6 +25,10 @@ pub struct StudyRecord {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub events: Value,
+    pub origin: String,
+    pub owner_id: String,
+    pub continuous_generation_id: Option<i64>,
+    pub continuous_slot_id: Option<i64>,
 }
 
 impl StudyRecord {
@@ -47,6 +51,10 @@ fn record(row: PgRow) -> Result<StudyRecord, DbError> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         events: row.try_get("events")?,
+        origin: row.try_get("origin")?,
+        owner_id: row.try_get("owner_id")?,
+        continuous_generation_id: row.try_get("continuous_generation_id")?,
+        continuous_slot_id: row.try_get("continuous_slot_id")?,
     })
 }
 
@@ -67,7 +75,7 @@ pub async fn create(
         .execute(&mut *tx)
         .await?;
     let active: Option<i64> = sqlx::query_scalar(
-        "select id from optimization_studies where status in ('queued','running','cancel_requested') limit 1",
+        "select id from optimization_studies where origin='manual' and owner_id='admin' and status in ('queued','running','cancel_requested') limit 1",
     ).fetch_optional(&mut *tx).await?;
     if let Some(id) = active {
         tx.commit().await?;
@@ -100,6 +108,10 @@ pub struct StudySummary {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub best_score: Option<f64>,
+    pub origin: String,
+    pub owner_id: String,
+    pub continuous_generation_id: Option<i64>,
+    pub continuous_slot_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -132,7 +144,7 @@ pub async fn list(
     // Extract only the scalar winner score in PostgreSQL. Never transfer or
     // retain full result matrices/events for a history page (at most 100 rows).
     let rows = sqlx::query(
-        "select id,status,spec,progress,error,created_at,updated_at, \
+        "select id,status,spec,progress,error,created_at,updated_at,origin,owner_id,continuous_generation_id,continuous_slot_id, \
          (case when status in ('queued','running','cancel_requested') \
           then progress->>'bestScore' else result#>>'{best,score}' end)::double precision as best_score \
          from optimization_studies where ($1::text is null or algorithm_id=$1) \
@@ -156,6 +168,10 @@ pub async fn list(
                 created_at: row.try_get("created_at")?,
                 updated_at: row.try_get("updated_at")?,
                 best_score: row.try_get("best_score")?,
+                origin: row.try_get("origin")?,
+                owner_id: row.try_get("owner_id")?,
+                continuous_generation_id: row.try_get("continuous_generation_id")?,
+                continuous_slot_id: row.try_get("continuous_slot_id")?,
             })
         })
         .collect::<Result<_, DbError>>()?;
@@ -171,6 +187,7 @@ pub async fn list(
 pub enum DeleteStudyOutcome {
     Deleted,
     Active,
+    Referenced,
 }
 
 pub async fn delete(pool: &PgPool, id: i64) -> Result<Option<DeleteStudyOutcome>, DbError> {
@@ -188,6 +205,8 @@ pub async fn delete(pool: &PgPool, id: i64) -> Result<Option<DeleteStudyOutcome>
         tx.commit().await?;
         return Ok(Some(DeleteStudyOutcome::Active));
     }
+    if sqlx::query_scalar::<_,bool>("select exists(select 1 from continuous_generations where study_id=$1)")
+        .bind(id).fetch_one(&mut *tx).await? { return Ok(Some(DeleteStudyOutcome::Referenced)); }
     sqlx::query("delete from optimization_studies where id=$1")
         .bind(id)
         .execute(&mut *tx)
@@ -199,7 +218,7 @@ pub async fn delete(pool: &PgPool, id: i64) -> Result<Option<DeleteStudyOutcome>
 pub async fn claim(pool: &PgPool) -> Result<Option<StudyRecord>, DbError> {
     sqlx::query(
         "update optimization_studies set status='running',updated_at=now() \
-         where id=(select id from optimization_studies where status='queued' order by id \
+         where id=(select id from optimization_studies where origin='manual' and status='queued' order by id \
          for update skip locked limit 1) and status='queued' returning *",
     )
     .fetch_optional(pool)
@@ -212,6 +231,9 @@ pub async fn cancel(pool: &PgPool, id: i64) -> Result<Option<(StudyRecord, bool)
     // Queued work has no retained input or admitted CPU work. Running work keeps
     // its active slot until its owner drains and calls finish.
     let mut tx = pool.begin().await?;
+    if let Some(row)=sqlx::query("select * from optimization_studies where id=$1 and origin='continuous' for update").bind(id).fetch_optional(&mut *tx).await? {
+        return Ok(Some((record(row)?,false)));
+    }
     let previous: Option<String> =
         sqlx::query_scalar("select status from optimization_studies where id=$1 for update")
             .bind(id)
@@ -330,7 +352,7 @@ pub async fn interrupt(pool: &PgPool) -> Result<u64, DbError> {
     let error = json!({"code":"interrupted_by_restart","message":"Исследование прервано перезапуском сервера; запустите новое исследование."});
     Ok(sqlx::query(
         "update optimization_studies set status='failed',result=null,error=$1,updated_at=now() \
-         where status in ('queued','running','cancel_requested')",
+         where origin='manual' and status in ('queued','running','cancel_requested')",
     )
     .bind(error)
     .execute(pool)

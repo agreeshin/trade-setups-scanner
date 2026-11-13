@@ -106,6 +106,12 @@ async fn main() {
         notify: optimization_runtime.notify.clone(),
         available: optimization_runtime.available.clone(),
     });
+    let mut continuous_config=setups_api::continuous::ContinuousRuntimeConfig::from_env().unwrap_or_else(|error|{eprintln!("{error}");std::process::exit(1)});
+    continuous_config.replay_admission=config.replay_limits;
+    // Continuous storage cannot consume the ordinary lane's final five-percent reserve.
+    continuous_config.max_database_bytes=continuous_config.max_database_bytes.min(config.replay_limits.max_database_bytes.saturating_sub(config.replay_limits.max_database_bytes/20));
+    let continuous_runtime=setups_api::continuous::runtime::start_continuous_runtime(pool.clone(),config.market_data_url.clone(),config.market_data_api_key.clone(),continuous_config.clone()).await.unwrap_or_else(|error|{eprintln!("continuous runtime failed to start: {error}");std::process::exit(1)});
+    let continuous_state=Arc::new(setups_api::continuous::ContinuousState{pool:pool.clone(),auth:auth.clone(),config:continuous_config,notify:continuous_runtime.notify.clone(),available:continuous_runtime.available.clone()});
     let analytics_state = std::sync::Arc::new(setups_api::analytics::AnalyticsState {
         pool: pool.clone(),
         auth: auth.clone(),
@@ -139,6 +145,7 @@ async fn main() {
         .merge(setups_api::optimization::optimization_router(
             optimization_state,
         ))
+        .merge(setups_api::continuous::continuous_router(continuous_state))
         .merge(setups_api::backup::backup_router(backup_state));
     let listener = match tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await {
         Ok(value) => value,
@@ -152,7 +159,7 @@ async fn main() {
         config.host, config.port
     );
     if let Err(error) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(jobs, live_runtime, optimization_runtime))
+        .with_graceful_shutdown(shutdown_signal(jobs, live_runtime, optimization_runtime,continuous_runtime))
         .await
     {
         eprintln!("server error: {error}");
@@ -164,6 +171,7 @@ async fn shutdown_signal(
     jobs: setups_worker::JobsHandle,
     live: setups_worker::live::LiveHandle,
     optimization: setups_api::optimization::OptimizationHandle,
+    continuous: setups_api::continuous::runtime::ContinuousHandle,
 ) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -183,5 +191,5 @@ async fn shutdown_signal(
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-    tokio::join!(live.stop(), jobs.stop(), optimization.stop());
+    tokio::join!(live.stop(), jobs.stop(), optimization.stop(),continuous.stop());
 }

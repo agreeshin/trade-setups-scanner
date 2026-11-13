@@ -154,24 +154,26 @@ fn work_minutes_of(row: &PgRow) -> Result<i64, QueueError> {
     Ok(replay_work_minutes(from, to, &params))
 }
 
-async fn active_reservation_bytes(
+pub(crate) async fn active_reservation_bytes(
     tx: &mut PgConnection,
     limits: &ReplayAdmissionLimits,
     exclude_run_id: Option<i64>,
 ) -> Result<i64, QueueError> {
     let rows = sqlx::query(
         "select from_ts, to_ts, params from replay_runs \
-         where status = any($1) and cache_hit = false and ($2::int4 is null or id <> $2)",
+         where origin='manual' and status = any($1) and cache_hit = false and ($2::int4 is null or id <> $2)",
     )
     .bind(PENDING.as_slice())
     .bind(exclude_run_id.map(|id| id as i32))
-    .fetch_all(tx)
+    .fetch_all(&mut *tx)
     .await?;
     let mut total: i64 = 0;
     for row in rows {
         total = total
             .saturating_add(work_minutes_of(&row)? * limits.estimated_bytes_per_work_minute + 4096);
     }
+    let continuous:i64=sqlx::query_scalar("select coalesce(sum(reserved_bytes),0)::bigint from continuous_generations where status='running'").fetch_one(tx).await?;
+    total=total.saturating_add(continuous);
     Ok(total)
 }
 
@@ -194,7 +196,7 @@ pub async fn reserve_replay_runs(
         .execute(&mut *tx)
         .await?;
     let count_row =
-        sqlx::query("select count(*)::bigint as n from replay_runs where status = any($1)")
+        sqlx::query("select count(*)::bigint as n from replay_runs where origin='manual' and status = any($1)")
             .bind(PENDING.as_slice())
             .fetch_one(&mut *tx)
             .await?;
@@ -372,7 +374,7 @@ pub async fn cancel_replay_run(
 ) -> Result<Option<ReplayRun>, QueueError> {
     let mut tx = pool.begin().await?;
     let row = sqlx::query(
-        "select id, batch_id, exchange_code, category, symbol, from_ts, to_ts, algorithm_id, algorithm_version, params, status, cache_hit \
+        "select id, batch_id, exchange_code, category, symbol, from_ts, to_ts, algorithm_id, algorithm_version, params, status, cache_hit, origin \
          from replay_runs where id = $1 for update",
     )
     .bind(run_id as i32)
@@ -383,6 +385,7 @@ pub async fn cancel_replay_run(
         return Ok(None);
     };
     let run = replay_run_from_row(&row)?;
+    if row.try_get::<String,_>("origin")?=="continuous" {return Ok(Some(run));}
     if !PENDING.contains(&run.status.as_str()) {
         tx.commit().await?;
         return Ok(Some(run));
@@ -427,20 +430,20 @@ pub async fn purge_replay_runs(pool: &PgPool) -> Result<PurgeOutcome, QueueError
         .execute(&mut *tx)
         .await?;
     let count_row =
-        sqlx::query("select count(*)::bigint as n from replay_runs where status = any($1)")
+        sqlx::query("select count(*)::bigint as n from replay_runs where origin='manual' and status = any($1)")
             .bind(["running", "cancel_requested"].as_slice())
             .fetch_one(&mut *tx)
             .await?;
     let active: i64 = count_row.try_get("n")?;
     if active > 0 {
         let queued = sqlx::query(
-            "update replay_runs set status = 'cancelled', updated_at = now() where status = 'queued'",
+            "update replay_runs set status = 'cancelled', updated_at = now() where origin='manual' and status = 'queued'",
         )
         .execute(&mut *tx)
         .await?
         .rows_affected();
         let running = sqlx::query(
-            "update replay_runs set status = 'cancel_requested', updated_at = now() where status = 'running'",
+            "update replay_runs set status = 'cancel_requested', updated_at = now() where origin='manual' and status = 'running'",
         )
         .execute(&mut *tx)
         .await?
@@ -452,7 +455,7 @@ pub async fn purge_replay_runs(pool: &PgPool) -> Result<PurgeOutcome, QueueError
             running_cancel_requested: running,
         });
     }
-    let quality_intervals_deleted = sqlx::query("delete from replay_quality_intervals")
+    let quality_intervals_deleted = sqlx::query("delete from replay_quality_intervals where run_id in (select id from replay_runs where origin='manual')")
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -460,11 +463,11 @@ pub async fn purge_replay_runs(pool: &PgPool) -> Result<PurgeOutcome, QueueError
         .execute(&mut *tx)
         .await?
         .rows_affected();
-    let runs_deleted = sqlx::query("delete from replay_runs")
+    let runs_deleted = sqlx::query("delete from replay_runs where origin='manual'")
         .execute(&mut *tx)
         .await?
         .rows_affected();
-    let batches_deleted = sqlx::query("delete from replay_batches")
+    let batches_deleted = sqlx::query("delete from replay_batches where origin='manual'")
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -481,6 +484,7 @@ pub async fn purge_replay_runs(pool: &PgPool) -> Result<PurgeOutcome, QueueError
 pub enum DeleteRunOutcome {
     Deleted { quality_intervals_deleted: u64 },
     Active,
+    Referenced,
 }
 
 pub async fn delete_replay_run(
@@ -492,7 +496,7 @@ pub async fn delete_replay_run(
         .bind(QUEUE_LOCK_KEY)
         .execute(&mut *tx)
         .await?;
-    let row = sqlx::query("select status from replay_runs where id = $1")
+    let row = sqlx::query("select status,continuous_generation_id from replay_runs where id = $1")
         .bind(run_id as i32)
         .fetch_optional(&mut *tx)
         .await?;
@@ -501,6 +505,7 @@ pub async fn delete_replay_run(
         return Ok(None);
     };
     let status: String = row.try_get("status")?;
+    if row.try_get::<Option<i64>,_>("continuous_generation_id")?.is_some() {return Ok(Some(DeleteRunOutcome::Referenced));}
     if PENDING.contains(&status.as_str()) {
         tx.commit().await?;
         return Ok(Some(DeleteRunOutcome::Active));
@@ -523,7 +528,7 @@ pub async fn delete_replay_run(
 
 pub async fn interrupt_queued_runs(pool: &PgPool) -> Result<u64, QueueError> {
     let result = sqlx::query(
-        "update replay_runs set status = 'cancelled', updated_at = now() where status = 'queued'",
+        "update replay_runs set status = 'cancelled', updated_at = now() where origin='manual' and status = 'queued'",
     )
     .execute(pool)
     .await?;

@@ -459,7 +459,8 @@ async fn frequency_gate_legacy_running_and_completed_records_remain_raw() {
                     &json!({
                         "id":before.id,"status":before.status,"spec":before.spec,
                         "progress":before.progress,"error":before.error,
-                        "createdAt":before.created_at,"updatedAt":before.updated_at,"bestScore":1.0
+                        "createdAt":before.created_at,"updatedAt":before.updated_at,"bestScore":1.0,
+                        "origin":"manual","ownerId":"admin","continuousGenerationId":null,"continuousSlotId":null
                     })
                 );
             } else {
@@ -543,7 +544,7 @@ async fn history_list_is_paginated_filtered_ordered_and_compact() {
         [active, drop, failed, cancelled, completed]
     );
     for summary in summaries {
-        assert_eq!(summary.as_object().unwrap().len(), 8);
+        assert_eq!(summary.as_object().unwrap().len(), 12);
         for field in [
             "id",
             "status",

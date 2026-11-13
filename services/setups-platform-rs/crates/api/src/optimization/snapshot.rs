@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use setups_analytics::OhlcCandle;
 use setups_domain::DetectorBar;
 use setups_mdclient::InstrumentsResponse;
-use setups_optimizer::{InstrumentInput, StudyInput, StudyRequest};
+use setups_optimizer::{ContinuousContext, InputBounds, InstrumentInput, StudyInput, StudyRequest};
 use sha2::{Digest, Sha256};
 use std::{mem::size_of, time::Duration};
 
@@ -124,6 +124,16 @@ pub(super) async fn acquire(
 ) -> Result<StudyInput, JobError> {
     let bounds = setups_optimizer::required_input_bounds(spec)
         .map_err(|error| JobError::new("invalid_request", error.to_string()))?;
+    acquire_bounds(spec,url,key,config,bounds).await
+}
+
+pub(crate) async fn acquire_continuous(spec: &StudyRequest, context: ContinuousContext, url: &str, key: &str, config: &OptimizationConfig) -> Result<StudyInput,JobError> {
+    let bounds=setups_optimizer::required_continuous_input_bounds(spec,context)
+        .map_err(|error|JobError::new("invalid_request",error.to_string()))?;
+    acquire_bounds(spec,url,key,config,bounds).await
+}
+
+async fn acquire_bounds(spec: &StudyRequest, url: &str, key: &str, config: &OptimizationConfig, bounds: InputBounds) -> Result<StudyInput,JobError> {
     let client = reqwest::Client::new();
     let url = url.trim_end_matches('/');
     let cap = config.max_snapshot_bytes;

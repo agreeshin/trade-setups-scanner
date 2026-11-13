@@ -108,7 +108,7 @@ function enterDates() {
   fireEvent.change(screen.getByLabelText("Конец периода сигналов"), { target: { value: "2026-10-03T00:00" } });
 }
 
-it("shows three separated card sections and only the existing constant-live checkbox persists", async () => {
+it("shows three separated sections and keeps fixed controls independent when the continuous backend is unavailable", async () => {
   render(<AlgorithmsPage />);
   const first = within((await screen.findByText("Новый алгоритм · 2.0")).closest("form")!);
   expect(first.getAllByRole("heading", { level: 4 }).map((heading) => heading.textContent)).toEqual([
@@ -117,9 +117,8 @@ it("shows three separated card sections and only the existing constant-live chec
   expect(first.getAllByRole("separator")).toHaveLength(2);
   const constant = within(first.getByRole("region", { name: "Live-сканирование с постоянными параметрами" }));
   const flexible = within(first.getByRole("region", { name: "Live-сканирование с гибкими параметрами" }));
-  expect(flexible.getByText(/автоматических оптимизаций.*следующем шаге/)).toBeInTheDocument();
-  expect(flexible.queryByRole("checkbox")).not.toBeInTheDocument();
-  expect(flexible.queryByRole("button")).not.toBeInTheDocument();
+  expect(flexible.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" })).toBeDisabled();
+  expect(flexible.getByRole("button", { name: "Сохранить разрешение адаптивного live" })).toBeDisabled();
   expect(first.getByRole("button", { name: "Оптимизировать Новый алгоритм" })).toHaveTextContent("Оптимизировать");
   expect(first.getByRole("button", { name: "Посмотреть весь список" })).toHaveAttribute("type", "button");
   expect(screen.queryByText("Статус / результат оптимизации")).not.toBeInTheDocument();
@@ -434,7 +433,8 @@ it("discovers compact summaries without loading matrices until a dialog opens an
   render(<AlgorithmsPage />);
   await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   const lists = requests.filter((request) => request.path.startsWith("/v1/optimization-studies?"));
-  expect(lists.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "1")).toHaveLength(3);
+  expect(lists.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "1")).toHaveLength(1);
+  expect(lists.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "20")).toHaveLength(2);
   expect(lists.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "5")).toHaveLength(2);
   expect(lists.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "10")).toHaveLength(0);
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(0);
@@ -459,10 +459,10 @@ it("shows five inline summaries without pagination and all history in an open pa
   render(<AlgorithmsPage />);
   const table = within(await screen.findByRole("table", { name: "Исследования · Новый алгоритм" }));
   await table.findByRole("button", { name: "Результат исследования 30" });
-  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"]);
+  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"]);
   expect(table.getAllByRole("row")).toHaveLength(6);
   const first = within(table.getAllByRole("row")[1]!);
-  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#30", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "Менее 1 мин", "0", "0.00 R", ""]);
+  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#30", "Ручное", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "Менее 1 мин", "0", "0.00 R", ""]);
   expect(table.getAllByRole("row")[2]).toHaveTextContent("Гейт не применялся");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("—");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("1 дн 1 ч 1 мин");
