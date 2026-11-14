@@ -281,8 +281,10 @@ async fn continuous_acquisition_does_not_block_real_manual_admission_or_owner_st
     assert_eq!(status,StatusCode::ACCEPTED,"manual admission rejected during continuous work: {study}");
     let manual_id=study["id"].as_i64().unwrap();assert_eq!(study["origin"],"manual");
     assert_eq!(request(&router,"POST",&format!("/v1/optimization-studies/{continuous_study}/cancel"),Value::Null).await.0,StatusCode::CONFLICT);
+    let stop_started=std::time::Instant::now();
     request(&router,"POST",&path("/stop"),Value::Null).await;
     wait_sql(&database.pool,"select to_jsonb(p) from continuous_processes p where status='stopped'").await;
+    assert!(stop_started.elapsed()<Duration::from_secs(2),"authoritative Stop was delayed by monitor grace");
     assert!(setups_db::optimization::get(&database.pool,continuous_study).await.unwrap().is_none());
     assert!(setups_db::optimization::get(&database.pool,manual_id).await.unwrap().is_some());
     runtime.stop().await;manual.stop().await;market.task.abort();let _=market.task.await;database.cleanup().await;
@@ -431,4 +433,96 @@ async fn exhausted_continuous_storage_is_explicit_and_does_not_read_market_or_de
     wait_sql(&database.pool,"select to_jsonb(p) from continuous_processes p where status='stopped'").await;
     assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from optimization_studies where status='failed'").fetch_one(&database.pool).await.unwrap(),1);
     runtime.stop().await;market.task.abort();let _=market.task.await;database.cleanup().await;
+}
+
+// Exercise the actual acquisition/monitor path, not a simulated CancelToken.
+async fn monitor_recovers_from_short_database_stall(stall: &str) {
+    let database=TestDb::new().await;
+    let market=Market::start(true).await;
+    let runtime_pool=PgPoolOptions::new().max_connections(4)
+        .connect_with(database.pool.connect_options().as_ref().clone()).await.unwrap();
+    let runtime=start_continuous_runtime(runtime_pool.clone(),market.url.clone(),"key".into(),ContinuousRuntimeConfig::default()).await.unwrap();
+    let router=continuous_router(state(database.pool.clone()));
+    let mut body=config();body["study"]["maxSeconds"]=json!(30);
+    assert_eq!(request(&router,"PUT",&path(""),body).await.0,StatusCode::OK);
+    request(&router,"POST",&path("/start"),Value::Null).await;
+    let generation=wait_sql(&database.pool,"select to_jsonb(g) from continuous_generations g where status='running'").await;
+    let id=generation["id"].as_i64().unwrap();
+    tokio::time::timeout(Duration::from_secs(3),async {
+        while market.state.catalog_calls.load(Ordering::SeqCst)==0 {tokio::time::sleep(Duration::from_millis(10)).await;}
+    }).await.unwrap();
+    let mut locked=None;
+    let mut held=Vec::new();
+    match stall {
+        "heartbeat_lock"=>{
+            let mut tx=database.pool.begin().await.unwrap();
+            sqlx::query("select owner_id from continuous_owner_lanes where owner_id='admin' for update").fetch_one(&mut *tx).await.unwrap();
+            locked=Some(tx);
+        }
+        "pool"=>for _ in 0..4 {held.push(runtime_pool.acquire().await.unwrap());},
+        "heartbeat_error"=>{
+            sqlx::raw_sql("create function reject_test_heartbeat() returns trigger language plpgsql as $$begin raise exception 'fixture transient heartbeat' using errcode='40001';end$$;create trigger reject_test_heartbeat before update of lease_until on continuous_owner_lanes for each row when(new.lease_until>old.lease_until) execute function reject_test_heartbeat()")
+                .execute(&database.pool).await.unwrap();
+        }
+        _=>panic!("unknown fixture stall"),
+    }
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    if let Some(tx)=locked {tx.rollback().await.unwrap();}
+    drop(held);
+    if stall=="heartbeat_error" {sqlx::query("drop trigger reject_test_heartbeat on continuous_owner_lanes").execute(&database.pool).await.unwrap();}
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after:String=sqlx::query_scalar("select status from continuous_generations where id=$1").bind(id).fetch_one(&database.pool).await.unwrap();
+    market.state.blocked.store(false,Ordering::SeqCst);
+    let terminal=wait_sql(&database.pool,&format!("select to_jsonb(g) from continuous_generations g where id={id} and status in ('completed','failed')")).await;
+    db::stop(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap();
+    runtime.stop().await;market.task.abort();let _=market.task.await;
+    runtime_pool.close().await;database.cleanup().await;
+    assert_eq!(after,"running","{stall}: a short monitor failure cancelled valid acquisition");
+    assert_eq!(terminal["status"],"completed","{stall}: acquisition did not recover: {terminal}");
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn monitor_recovers_from_heartbeat_query_timeout() {monitor_recovers_from_short_database_stall("heartbeat_lock").await;}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn monitor_recovers_from_current_pool_timeout() {monitor_recovers_from_short_database_stall("pool").await;}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn monitor_recovers_from_transient_heartbeat_database_error() {monitor_recovers_from_short_database_stall("heartbeat_error").await;}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn slow_idle_stop_housekeeping_does_not_starve_active_heartbeat() {
+    let database=TestDb::new().await;let market=Market::start(true).await;
+    let runtime=start_continuous_runtime(database.pool.clone(),market.url.clone(),"key".into(),ContinuousRuntimeConfig::default()).await.unwrap();
+    let router=continuous_router(state(database.pool.clone()));
+    let mut body=config();body["study"]["maxSeconds"]=json!(30);
+    request(&router,"PUT",&path(""),body.clone()).await;
+    request(&router,"POST",&path("/start"),Value::Null).await;
+    let generation=wait_sql(&database.pool,"select to_jsonb(g) from continuous_generations g where status='running'").await;
+    let id=generation["id"].as_i64().unwrap();
+    let other="price_drop_volume_spike";
+    body["study"]["algorithmId"]=json!(other);
+    body["study"]["algorithmParams"].as_object_mut().unwrap().remove("priceGrowthPct");
+    body["study"]["algorithmParams"]["priceDropPct"]=json!("0");
+    let normalized=normalize_config(serde_json::from_value(body).unwrap(),other,&ContinuousRuntimeConfig::default().optimizer).unwrap();
+    db::configure(&database.pool,ADMIN_OWNER,other,&json!(normalized),&[0.0]).await.unwrap();
+    db::start(&database.pool,ADMIN_OWNER,other).await.unwrap();
+    sqlx::raw_sql("create function slow_test_idle_stop() returns trigger language plpgsql as $$begin perform pg_sleep(4);return new;end$$;create trigger slow_test_idle_stop before update of status on continuous_processes for each row when(new.algorithm_id='price_drop_volume_spike' and new.status='stopped' and old.status='stopping') execute function slow_test_idle_stop()")
+        .execute(&database.pool).await.unwrap();
+    let before:f64=sqlx::query_scalar("select extract(epoch from lease_until)::double precision from continuous_owner_lanes where owner_id='admin'").fetch_one(&database.pool).await.unwrap();
+    db::stop(&database.pool,ADMIN_OWNER,other).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2700)).await;
+    let after:f64=sqlx::query_scalar("select extract(epoch from lease_until)::double precision from continuous_owner_lanes where owner_id='admin'").fetch_one(&database.pool).await.unwrap();
+    sqlx::query("drop trigger slow_test_idle_stop on continuous_processes").execute(&database.pool).await.unwrap();
+    wait_sql(&database.pool,"select to_jsonb(p) from continuous_processes p where algorithm_id='price_drop_volume_spike' and status='stopped'").await;
+    market.state.blocked.store(false,Ordering::SeqCst);
+    let terminal=wait_sql(&database.pool,&format!("select to_jsonb(g) from continuous_generations g where id={id} and status in ('completed','failed')")).await;
+    db::stop(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap();
+    runtime.stop().await;market.task.abort();let _=market.task.await;database.cleanup().await;
+    assert!(after>before+1.0,"idle housekeeping starved heartbeat: before={before} after={after}");
+    assert_eq!(terminal["status"],"completed","idle housekeeping cancelled the active job: {terminal}");
 }

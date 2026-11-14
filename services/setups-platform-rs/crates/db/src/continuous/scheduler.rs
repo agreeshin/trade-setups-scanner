@@ -59,16 +59,16 @@ async fn fenced(tx: &mut Transaction<'_,Postgres>, job: &ChainJob) -> Result<boo
         .bind(&job.lease.owner_id).bind(&job.algorithm_id).bind(job.config_revision).bind(job.generation_id).fetch_optional(&mut **tx).await?.is_some())
 }
 
-pub async fn heartbeat(pool: &PgPool, lease: &OwnerLease) -> Result<bool,DbError> {
+pub async fn heartbeat<'e>(executor: impl sqlx::PgExecutor<'e>, lease: &OwnerLease) -> Result<bool,DbError> {
     Ok(sqlx::query("update continuous_owner_lanes set lease_until=clock_timestamp()+$4::bigint*interval '1 second' where owner_id=$1 and lease_owner=$2 and lease_token=$3 and lease_until>clock_timestamp()")
-        .bind(&lease.owner_id).bind(&lease.worker).bind(lease.token).bind(LEASE_SECONDS).execute(pool).await?.rows_affected()==1)
+        .bind(&lease.owner_id).bind(&lease.worker).bind(lease.token).bind(LEASE_SECONDS).execute(executor).await?.rows_affected()==1)
 }
 
-pub async fn current(pool: &PgPool, job: &ChainJob) -> Result<bool,DbError> {
+pub async fn current<'e>(executor: impl sqlx::PgExecutor<'e>, job: &ChainJob) -> Result<bool,DbError> {
     // Advisory liveness only: never wait behind this executor's own materialization lock.
     // Every mutation still takes owner_lock and checks fenced() authoritatively.
     Ok(sqlx::query_scalar("select exists(select 1 from continuous_owner_lanes l join continuous_processes p using(owner_id) where l.owner_id=$1 and l.lease_owner=$2 and l.lease_token=$3 and l.lease_until>clock_timestamp() and p.algorithm_id=$4 and p.desired_running and p.config_revision=$5 and p.active_generation_id=$6)")
-        .bind(&job.lease.owner_id).bind(&job.lease.worker).bind(job.lease.token).bind(&job.algorithm_id).bind(job.config_revision).bind(job.generation_id).fetch_one(pool).await?)
+        .bind(&job.lease.owner_id).bind(&job.lease.worker).bind(job.lease.token).bind(&job.algorithm_id).bind(job.config_revision).bind(job.generation_id).fetch_one(executor).await?)
 }
 
 pub async fn release(pool: &PgPool, lease: &OwnerLease) -> Result<(),DbError> {

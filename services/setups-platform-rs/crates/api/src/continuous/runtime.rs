@@ -7,6 +7,7 @@ use setups_optimizer::{self as core,CancelToken,StudyRequest,StudyCandidate,Cont
 use sqlx::PgPool;
 use std::{sync::{Arc,atomic::{AtomicBool,Ordering}},time::{Duration,Instant}};
 use tokio::sync::{Notify,watch};
+use tokio::time::Instant as LeaseInstant;
 use tokio_util::sync::CancellationToken;
 
 pub struct ContinuousHandle {
@@ -43,10 +44,11 @@ pub async fn start_continuous_runtime(pool:PgPool,market_url:String,market_key:S
                 // A permit owns the entire snapshot/CPU lifecycle, through the final join.
                 // Extra pollers cannot multiply resident snapshots or CPU kernels.
                 let permit=tokio::select!{_=stop.cancelled()=>break,result=resident.clone().acquire_owned()=>match result {Ok(permit)=>permit,Err(_)=>break}};
+                let claim_started=LeaseInstant::now();
                 match db::claim_owner(&pool,&worker).await {
                     Ok(Some(lease))=>{
                         available.store(true,Ordering::SeqCst);
-                        if let Err(error)=run_owner(&pool,&lease,&url,&key,&config,&stop).await {
+                        if let Err(error)=run_owner(&pool,&lease,&url,&key,&config,&stop,claim_started).await {
                             eprintln!("continuous owner failed: owner={} code={}",lease.owner_id,error.code);
                         }
                         if let Err(error)=db::release(&pool,&lease).await {eprintln!("continuous lease release failed: {error}");}
@@ -76,42 +78,173 @@ fn compute_error(error:core::StudyError)->JobError {
     JobError::new(code,error.to_string())
 }
 
-async fn run_owner(pool:&PgPool,lease:&OwnerLease,url:&str,key:&str,config:&ContinuousRuntimeConfig,stop:&CancellationToken)->Result<(),JobError> {
+async fn run_owner(pool:&PgPool,lease:&OwnerLease,url:&str,key:&str,config:&ContinuousRuntimeConfig,stop:&CancellationToken,claim_started:LeaseInstant)->Result<(),JobError> {
     db::recover_owner(pool,lease).await.map_err(database)?;
     if stop.is_cancelled() {return Ok(());}
     let Some(job)=db::prepare_next(pool,lease).await.map_err(database)? else {return Ok(());};
     let started=Instant::now();
-    println!("continuous chain start: owner={} generation={} study={}",lease.owner_id,job.generation_id,job.study_id);
+    println!("continuous chain start: owner={} generation={} study={} revision={} leaseToken={} phase=acquiring",lease.owner_id,job.generation_id,job.study_id,job.config_revision,lease.token);
     let cancel=CancellationToken::new();
-    // A dedicated monitor cannot stop polling the pending materialization/CPU join.
+    // Keep renewing while cooperative CPU/materialization work joins, including Stop.
     let monitor_stop=CancellationToken::new();
-    let monitor=tokio::spawn(monitor_job(pool.clone(),job.clone(),stop.clone(),cancel.clone(),monitor_stop.clone()));
+    let monitor=tokio::spawn(monitor_job(pool.clone(),job.clone(),stop.clone(),cancel.clone(),monitor_stop.clone(),claim_started));
     let outcome=run_chain(pool,&job,url,key,config,&cancel).await;
     monitor_stop.cancel();
-    if let Err(error)=monitor.await {return Err(JobError::new("monitor_failed",error.to_string()));}
-    // All blocking stages have JOINED, and run_chain's final Arc<StudyInput> is gone.
+    let monitor_reason=monitor.await.map_err(|error|JobError::new("monitor_failed",error.to_string()))?;
+    // A final current=false can race a successful finalizer clearing its pointer.
+    // Never replace success or another precise computation/database error.
+    let outcome=chain_outcome(outcome,monitor_reason);
+    let outcome_kind=if outcome.is_ok() {"completed"}else{"interrupted_or_failed"};
     if let Err(error)=outcome {
         eprintln!("continuous chain failed: generation={} code={}",job.generation_id,error.code);
         db::fail(pool,&job,&json!({"code":if stop.is_cancelled(){"interrupted_by_restart"}else{error.code},"message":error.message})).await.map_err(database)?;
     }
     db::drain_stops(pool,lease).await.map_err(database)?;
-    println!("continuous chain resources released: generation={} elapsedSeconds={:.3}",job.generation_id,started.elapsed().as_secs_f64());
+    println!("continuous chain resources released: generation={} elapsedSeconds={:.3} outcome={outcome_kind}",job.generation_id,started.elapsed().as_secs_f64());
     Ok(())
 }
 
-async fn monitor_job(pool:PgPool,job:ChainJob,shutdown:CancellationToken,cancel:CancellationToken,stop:CancellationToken) {
+fn chain_outcome(outcome:Result<(),JobError>,reason:Option<JobError>)->Result<(),JobError> {
+    match (outcome,reason) {
+        (Err(error),Some(reason)) if error.code=="chain_interrupted"=>Err(reason),
+        (outcome,_)=>outcome,
+    }
+}
+
+const MONITOR_QUERY_TIMEOUT:Duration=Duration::from_secs(2);
+// No longer than the existing 30s DB lease, with 5s reserved before expiry.
+const MONITOR_CONFIRMED_WINDOW:Duration=Duration::from_secs(db::LEASE_SECONDS as u64-5);
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+enum MonitorOperation {Heartbeat,Current,IdleStopDrain}
+impl MonitorOperation {
+    fn index(self)->usize {match self {Self::Heartbeat=>0,Self::Current=>1,Self::IdleStopDrain=>2}}
+    fn name(self)->&'static str {match self {Self::Heartbeat=>"heartbeat",Self::Current=>"current",Self::IdleStopDrain=>"idle_stop_drain"}}
+}
+#[derive(Debug)]
+struct MonitorIssue {operation:MonitorOperation,stage:&'static str,cause:String,transient:bool,acquire_ms:Option<u128>,elapsed_ms:u128}
+impl MonitorIssue {
+    fn summary(&self)->String {format!("operation={} stage={} cause={} acquireMs={} elapsedMs={}",self.operation.name(),self.stage,self.cause,self.acquire_ms.map_or_else(||"unknown".into(),|ms|ms.to_string()),self.elapsed_ms)}
+}
+fn monitor_db_cause(error:setups_db::DbError)->(String,bool) {
+    use setups_db::DbError;
+    match error {
+        DbError::Sqlx(sqlx::Error::PoolTimedOut)=>("pool_acquire_timeout".into(),true),
+        DbError::Sqlx(sqlx::Error::Io(_))=>("connection_io".into(),true),
+        DbError::Sqlx(sqlx::Error::PoolClosed)=>("pool_closed".into(),false),
+        DbError::Sqlx(sqlx::Error::Database(error))=>{
+            // SQLSTATE only: never log server detail, SQL parameters or payloads.
+            let code=error.code().filter(|code|code.len()==5 && code.bytes().all(|b|b.is_ascii_alphanumeric()));
+            let transient=code.as_deref().is_some_and(|code|code.starts_with("08") || code.starts_with("40") || matches!(code,"55P03"|"57014"|"53300"));
+            (format!("sqlstate_{}",code.as_deref().unwrap_or("unknown")),transient)
+        }
+        DbError::Json(_)=>("invalid_database_state".into(),false),
+        _=>("database_error".into(),false),
+    }
+}
+struct MonitorProof {
+    confirmed:[LeaseInstant;3],
+    pending:[bool;3],
+    issue:Option<MonitorIssue>,
+    failures:u32,
+}
+impl MonitorProof {
+    fn new(claim_started:LeaseInstant)->Self {Self{confirmed:[claim_started;3],pending:[false;3],issue:None,failures:0}}
+    fn deadline(&self)->LeaseInstant {*self.confirmed.iter().min().unwrap()+MONITOR_CONFIRMED_WINDOW}
+    fn confirm(&mut self,operation:MonitorOperation,request_started:LeaseInstant,ack:LeaseInstant)->bool {
+        // Request START is a lower bound on clock_timestamp()+30s; ACK is not.
+        // Do not revive local permission with an ACK arriving after the old bound.
+        if ack>=self.deadline() || ack>=request_started+MONITOR_CONFIRMED_WINDOW {return false;}
+        self.confirmed[operation.index()]=request_started;
+        self.pending[operation.index()]=false;
+        true
+    }
+    fn expired(&self)->JobError {
+        let oldest=if self.confirmed[0]<=self.confirmed[1] && self.confirmed[0]<=self.confirmed[2] {MonitorOperation::Heartbeat}
+            else if self.confirmed[1]<=self.confirmed[2] {MonitorOperation::Current}else{MonitorOperation::IdleStopDrain};
+        JobError::new(match oldest {MonitorOperation::Heartbeat=>"monitor_lease_unconfirmed",MonitorOperation::Current=>"monitor_current_unconfirmed",MonitorOperation::IdleStopDrain=>"monitor_idle_stop_unconfirmed"},
+            format!("Не удалось подтвердить {} до безопасной границы lease; lastIssue={:?}",oldest.name(),self.issue.as_ref().map(MonitorIssue::summary)))
+    }
+}
+
+async fn monitor_probe(pool:&PgPool,job:&ChainJob,operation:MonitorOperation,safe_deadline:LeaseInstant)->Result<bool,MonitorIssue> {
+    let started=LeaseInstant::now();
+    let deadline=safe_deadline.min(started+MONITOR_QUERY_TIMEOUT);
+    let issue=|stage,cause,transient,acquire_ms|MonitorIssue{operation,stage,cause,transient,acquire_ms,elapsed_ms:started.elapsed().as_millis()};
+    if operation==MonitorOperation::IdleStopDrain {
+        // Other idle algorithms' Stop cleanup is not proof of this job's fence.
+        return match tokio::time::timeout_at(deadline,db::drain_idle_stops(pool,&job.lease,&job.algorithm_id)).await {
+            Ok(Ok(()))=>Ok(true),
+            Ok(Err(error))=>{let (cause,transient)=monitor_db_cause(error);Err(issue("housekeeping",cause,transient,None))},
+            Err(_)=>Err(issue("housekeeping","query_timeout".into(),true,None)),
+        };
+    }
+    let mut connection=match tokio::time::timeout_at(deadline,pool.acquire()).await {
+        Ok(Ok(connection))=>connection,
+        Ok(Err(error))=>{let (cause,transient)=monitor_db_cause(error.into());return Err(issue("acquire",cause,transient,Some(started.elapsed().as_millis())));},
+        Err(_)=>return Err(issue("acquire","acquire_timeout".into(),true,Some(started.elapsed().as_millis()))),
+    };
+    let acquire_ms=Some(started.elapsed().as_millis());
+    match tokio::time::timeout_at(deadline,async {
+        match operation {MonitorOperation::Heartbeat=>db::heartbeat(&mut *connection,&job.lease).await,MonitorOperation::Current=>db::current(&mut *connection,job).await,MonitorOperation::IdleStopDrain=>unreachable!()}
+    }).await {
+        Ok(Ok(accepted))=>Ok(accepted),
+        Ok(Err(error))=>{let (cause,transient)=monitor_db_cause(error);Err(issue("query",cause,transient,acquire_ms))},
+        Err(_)=>Err(issue("query","query_timeout".into(),true,acquire_ms)),
+    }
+}
+fn monitor_log(event:&str,pool:&PgPool,job:&ChainJob,proof:&MonitorProof,code:&str) {
+    eprintln!("continuous monitor {event}: owner={} generation={} study={} revision={} leaseToken={} code={} poolSize={} poolIdle={} poolMax={} failures={} issue={:?}",
+        job.lease.owner_id,job.generation_id,job.study_id,job.config_revision,job.lease.token,code,pool.size(),pool.num_idle(),pool.options().get_max_connections(),proof.failures,proof.issue.as_ref().map(MonitorIssue::summary));
+}
+fn monitor_cancel(reason:&mut Option<JobError>,error:JobError,cancel:&CancellationToken,pool:&PgPool,job:&ChainJob,proof:&MonitorProof) {
+    if reason.is_none() {monitor_log("cancelled",pool,job,proof,error.code);*reason=Some(error);cancel.cancel();}
+}
+async fn monitor_job(pool:PgPool,job:ChainJob,shutdown:CancellationToken,cancel:CancellationToken,stop:CancellationToken,claim_started:LeaseInstant)->Option<JobError> {
     let mut interval=tokio::time::interval(Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_heartbeat=Instant::now();
-    loop {
-        tokio::select!{_=stop.cancelled()=>break,_=interval.tick()=>{}}
-        if shutdown.is_cancelled() {cancel.cancel();}
-        if last_heartbeat.elapsed()>=Duration::from_secs(1) {
-            if !matches!(tokio::time::timeout(Duration::from_secs(2),db::heartbeat(&pool,&job.lease)).await,Ok(Ok(true))) {cancel.cancel();}
-            last_heartbeat=Instant::now();
+    let mut proof=MonitorProof::new(claim_started);
+    let mut reason=None;
+    let mut last_heartbeat=None;
+    'monitor: loop {
+        tokio::select!{biased;
+            _=stop.cancelled()=>return reason,
+            _=shutdown.cancelled(),if reason.is_none()=>{monitor_cancel(&mut reason,JobError::new("interrupted_by_restart","Цепочка прервана остановкой сервера"),&cancel,&pool,&job,&proof);},
+            _=tokio::time::sleep_until(proof.deadline()),if reason.is_none()=>{let error=proof.expired();monitor_cancel(&mut reason,error,&cancel,&pool,&job,&proof);},
+            _=interval.tick()=>{},
         }
-        if !matches!(tokio::time::timeout(Duration::from_secs(2),db::current(&pool,&job)).await,Ok(Ok(true))) {cancel.cancel();}
-        if let Err(error)=db::drain_idle_stops(&pool,&job.lease,&job.algorithm_id).await {eprintln!("continuous idle Stop drain failed: {error}");cancel.cancel();}
+        for operation in [MonitorOperation::Heartbeat,MonitorOperation::Current,MonitorOperation::IdleStopDrain] {
+            if operation==MonitorOperation::Heartbeat && last_heartbeat.is_some_and(|last:LeaseInstant|last.elapsed()<Duration::from_secs(1)) {continue;}
+            if reason.is_some() && operation!=MonitorOperation::Heartbeat {continue;}
+            let started=LeaseInstant::now();
+            if operation==MonitorOperation::Heartbeat {last_heartbeat=Some(started);}
+            let deadline=if reason.is_some() {started+MONITOR_QUERY_TIMEOUT}else{proof.deadline()};
+            let result=tokio::select!{biased;
+                _=stop.cancelled()=>return reason,
+                _=shutdown.cancelled(),if reason.is_none()=>{monitor_cancel(&mut reason,JobError::new("interrupted_by_restart","Цепочка прервана остановкой сервера"),&cancel,&pool,&job,&proof);continue 'monitor;},
+                result=monitor_probe(&pool,&job,operation,deadline)=>result,
+            };
+            // Cancel is irreversible, but the owner must stay leased through join.
+            if reason.is_some() {continue;}
+            match result {
+                Ok(true)=>{if !proof.confirm(operation,started,LeaseInstant::now()) {let error=proof.expired();monitor_cancel(&mut reason,error,&cancel,&pool,&job,&proof);continue 'monitor;}},
+                Ok(false)=>{
+                    let code=if operation==MonitorOperation::Heartbeat {"continuous_lease_lost"}else{"continuous_fence_lost"};
+                    monitor_cancel(&mut reason,JobError::new(code,format!("{}: authoritative predicate rejected owner/revision/generation",operation.name())),&cancel,&pool,&job,&proof);
+                    continue 'monitor;
+                }
+                Err(issue)=>{
+                    let first=proof.issue.is_none();let transient=issue.transient;
+                    proof.pending[operation.index()]=true;proof.failures=proof.failures.saturating_add(1);proof.issue=Some(issue);
+                    if first {monitor_log("degraded",&pool,&job,&proof,"monitor_probe_failed");}
+                    if !transient {monitor_cancel(&mut reason,JobError::new("monitor_database_error",format!("Контроль цепочки завершился ошибкой: {:?}",proof.issue.as_ref().map(MonitorIssue::summary))),&cancel,&pool,&job,&proof);continue 'monitor;}
+                    if LeaseInstant::now()>=proof.deadline() {let error=proof.expired();monitor_cancel(&mut reason,error,&cancel,&pool,&job,&proof);continue 'monitor;}
+                }
+            }
+        }
+        // Current must have succeeded after uncertainty, not only heartbeat.
+        if reason.is_none() && proof.issue.is_some() && proof.pending.iter().all(|pending|!*pending) {
+            monitor_log("recovered",&pool,&job,&proof,"monitor_recovered");proof.issue=None;
+        }
     }
 }
 
@@ -131,7 +264,10 @@ async fn blocking<T:Send+'static>(cancel:&CancellationToken,deadline:Option<toki
 }
 
 async fn change_phase(pool:&PgPool,job:&ChainJob,phase:&str)->Result<(),JobError> {
-    if db::phase(pool,job,phase,None).await.map_err(database)? {Ok(())}else{Err(interrupted())}
+    if db::phase(pool,job,phase,None).await.map_err(database)? {
+        println!("continuous chain phase: generation={} study={} phase={phase}",job.generation_id,job.study_id);
+        Ok(())
+    }else{Err(interrupted())}
 }
 
 async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&ContinuousRuntimeConfig,cancel:&CancellationToken)->Result<(),JobError> {
@@ -232,4 +368,70 @@ async fn persisted_batch_id(pool:&PgPool,job:&ChainJob)->Result<i64,JobError> {
 fn replay_manifest(replay:&ContinuousReplay)->Value {
     json!({"fromUnix":replay.from_unix,"toUnix":replay.to_unix,"context":replay.context,"params":replay.params,"provenance":replay.provenance,
         "instruments":replay.instruments.iter().map(|raw|json!({"instrument":raw.instrument,"previousRawCloseUnix":raw.previous_raw_close_unix,"lastRawCloseUnix":raw.last_raw_close_unix,"evaluatedMinutes":raw.evaluated_minutes,"warmupMinutes":raw.warmup_minutes})).collect::<Vec<_>>()})
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+
+    #[test]
+    fn initial_confirmation_is_anchored_before_claim_not_monitor_creation() {
+        let now=LeaseInstant::now();
+        let proof=MonitorProof::new(now-Duration::from_secs(24));
+        assert_eq!(proof.deadline(),now+Duration::from_secs(1));
+    }
+
+    #[test]
+    fn heartbeat_ack_uses_request_start_and_cannot_revive_expired_permission() {
+        let start=LeaseInstant::now();let mut proof=MonitorProof::new(start);
+        assert!(proof.confirm(MonitorOperation::Heartbeat,start+Duration::from_secs(1),start+Duration::from_secs(3)));
+        assert_eq!(proof.confirmed[0],start+Duration::from_secs(1));
+        // Current/housekeeping still have their independent earlier bounds.
+        assert_eq!(proof.deadline(),start+MONITOR_CONFIRMED_WINDOW);
+        let mut stale=MonitorProof::new(start);
+        assert!(!stale.confirm(MonitorOperation::Heartbeat,start+Duration::from_secs(24),start+Duration::from_secs(26)));
+        assert_eq!(stale.confirmed[0],start);
+    }
+
+    #[test]
+    fn successful_heartbeats_do_not_extend_unknown_current_or_housekeeping() {
+        for missing in [MonitorOperation::Current,MonitorOperation::IdleStopDrain] {
+            let start=LeaseInstant::now();let mut proof=MonitorProof::new(start);
+            for seconds in [5,10,15,20,24] {
+                let at=start+Duration::from_secs(seconds);
+                for operation in [MonitorOperation::Heartbeat,MonitorOperation::Current,MonitorOperation::IdleStopDrain] {
+                    if operation!=missing {assert!(proof.confirm(operation,at,at));}
+                }
+            }
+            assert_eq!(proof.deadline(),start+MONITOR_CONFIRMED_WINDOW);
+            assert_eq!(proof.expired().code,if missing==MonitorOperation::Current {"monitor_current_unconfirmed"}else{"monitor_idle_stop_unconfirmed"});
+        }
+    }
+
+    #[test]
+    fn successful_current_checks_do_not_extend_unknown_heartbeat() {
+        let start=LeaseInstant::now();let mut proof=MonitorProof::new(start);
+        for seconds in [5,10,15,20,24] {
+            let at=start+Duration::from_secs(seconds);
+            assert!(proof.confirm(MonitorOperation::Current,at,at));
+            assert!(proof.confirm(MonitorOperation::IdleStopDrain,at,at));
+        }
+        assert_eq!(proof.deadline(),start+MONITOR_CONFIRMED_WINDOW);
+        assert_eq!(proof.expired().code,"monitor_lease_unconfirmed");
+    }
+
+    #[test]
+    fn finalizer_success_and_other_precise_errors_win_monitor_races() {
+        assert!(chain_outcome(Ok(()),Some(JobError::new("continuous_fence_lost","final current=false"))).is_ok());
+        let error=chain_outcome(Err(JobError::new("resource_limit","original limit")),Some(JobError::new("monitor_lease_unconfirmed","later"))).unwrap_err();
+        assert_eq!(error.code,"resource_limit");assert_eq!(error.message,"original limit");
+        assert_eq!(chain_outcome(Err(interrupted()),Some(JobError::new("monitor_current_unconfirmed","current timeout"))).unwrap_err().code,"monitor_current_unconfirmed");
+    }
+
+    #[test]
+    fn database_issue_classification_does_not_expose_payloads_or_hide_invariants() {
+        assert_eq!(monitor_db_cause(setups_db::DbError::Sqlx(sqlx::Error::PoolTimedOut)),("pool_acquire_timeout".into(),true));
+        assert_eq!(monitor_db_cause(setups_db::DbError::Json("private diagnostic payload".into())),("invalid_database_state".into(),false));
+        assert_eq!(monitor_db_cause(setups_db::DbError::Sqlx(sqlx::Error::PoolClosed)),("pool_closed".into(),false));
+    }
 }

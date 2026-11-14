@@ -437,6 +437,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn continuous_working_accepts_half_gib_within_enforced_resident_budget() {
+        let mut settings = config(&[
+            ("CONTINUOUS_MAX_SNAPSHOT_BYTES", "8589934592"),
+            ("CONTINUOUS_MAX_WORKING_BYTES", "536870912"),
+        ]).unwrap();
+        assert_eq!(settings.optimizer.max_working_bytes, 512 * 1024 * 1024);
+        assert_eq!(settings.optimizer.max_snapshot_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(settings.optimizer.max_setups_per_candidate, 10_000);
+        assert_eq!(settings.optimizer.cpu_threads, 1);
+        assert_eq!(settings.optimizer.batch_size, 1);
+        assert_eq!(settings.max_concurrent_chains, 1);
+        let mut resources = crate::resources::RuntimeResources::from_lookup(&mut |_| None).unwrap();
+        assert_eq!(resources.background_memory_bytes, 16 * 1024 * 1024 * 1024);
+        resources.validate_continuous(&settings).unwrap();
+        // A larger local working ceiling does not bypass aggregate admission.
+        settings.workers = 2;
+        settings.max_concurrent_chains = 2;
+        resources.background_cpu_threads = 2;
+        resources.continuous_db_connections = 8;
+        assert!(resources.validate_continuous(&settings).unwrap_err().contains("resident"));
+    }
+
+    #[test]
     fn continuous_snapshot_rejects_invalid_and_above_eight_gib_values() {
         for value in [
             "",
@@ -488,6 +512,9 @@ mod tests {
         assert!(signals.contains("CONTINUOUS_WORKERS: \"1\""));
         assert!(signals.contains(
             "CONTINUOUS_MAX_SNAPSHOT_BYTES: ${CONTINUOUS_MAX_SNAPSHOT_BYTES:-8589934592}"
+        ));
+        assert!(signals.contains(
+            "CONTINUOUS_MAX_WORKING_BYTES: ${CONTINUOUS_MAX_WORKING_BYTES:-67108864}"
         ));
     }
 }
