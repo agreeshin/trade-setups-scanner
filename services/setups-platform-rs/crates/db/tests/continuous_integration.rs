@@ -700,6 +700,144 @@ async fn adaptive_cas_is_atomic_fenced_and_deduplicates_across_generations() {
     }).await;
 }
 
+async fn adaptive_batch_profile(pool:&PgPool,close:i64)->db::ActiveAdaptiveSlot {
+    setups_db::migrate::ensure_migrations(pool).await.unwrap();
+    let profile=accepted(pool).await;
+    let symbols=["BTCUSDT","ETHUSDT","ZZZUSDT","WAITUSDT","UNSEENUSDT"];
+    let instruments:Vec<_>=symbols.iter().map(|symbol|json!({"exchange":"bybit","category":"linear","symbol":symbol})).collect();
+    let readiness:Vec<_>=symbols[..4].iter().map(|symbol|json!({"instrumentKey":format!("bybit/linear/{symbol}"),
+        "status":if *symbol=="WAITUSDT" {"waiting"}else{"ready"},"reason":if *symbol=="WAITUSDT" {json!("waiting_tail")}else{Value::Null},
+        "publicationFloorCloseUnix":close-180})).collect();
+    sqlx::query("update continuous_generations set spec=jsonb_set(spec,'{instruments}',$2),live_readiness=$3 where id=$1")
+        .bind(profile.generation_id).bind(json!(instruments)).bind(json!(readiness)).execute(pool).await.unwrap();
+    setups_db::settings_set(pool,"notifications",&json!({"maxAgeSeconds":3600})).await.unwrap();
+    db::active_adaptive_slots(pool,OWNER).await.unwrap().remove(0)
+}
+
+fn adaptive_batch_scan(profile:&db::ActiveAdaptiveSlot,symbol:&str,close:i64)->db::AdaptiveScanWrite {
+    let mut row=adaptive_write(close-60);row.symbol=symbol.into();
+    db::AdaptiveScanWrite {instrument_key:format!("bybit/linear/{symbol}"),previous:None,
+        checkpoint:promotion_state(profile.generation_id,close),setups:vec![row]}
+}
+
+async fn adaptive_batch_state(pool:&PgPool)->Value {
+    sqlx::query_scalar("select jsonb_build_object('setups',(select jsonb_agg(to_jsonb(s) order by id) from live_setups s),'checkpoints',(select jsonb_agg(to_jsonb(c) order by slot_id,instrument_key) from adaptive_live_checkpoints c),'outbox',(select jsonb_agg(to_jsonb(o) order by id) from adaptive_notification_outbox o),'budget',(select to_jsonb(b) from adaptive_notification_budget b))")
+        .fetch_one(pool).await.unwrap()
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn adaptive_batch_atomic_order_local_indices_exact_ack_and_single_wrapper_parity() {
+    isolated(|pool|async move {
+        let close=chrono::Utc::now().timestamp().div_euclid(60)*60;
+        let profile=adaptive_batch_profile(&pool,close).await;
+        let seed=adaptive_batch_scan(&profile,"BTCUSDT",close-60);
+        assert!(db::commit_adaptive_scan(&pool,&profile,&seed.instrument_key,None,&seed.checkpoint,&seed.setups).await.unwrap().applied);
+        let previous=db::get_adaptive_checkpoint(&pool,profile.slot_id,&seed.instrument_key).await.unwrap().unwrap();
+        let mut scans=vec![adaptive_batch_scan(&profile,"ZZZUSDT",close),adaptive_batch_scan(&profile,"BTCUSDT",close),adaptive_batch_scan(&profile,"ETHUSDT",close)];
+        scans[1].previous=Some(previous);scans[1].setups.insert(0,seed.setups[0].clone());
+        // Captured operation name is authoritative, not a later settings lookup.
+        setups_db::settings_set(&pool,&format!("algorithm:{ALGORITHM}"),&json!({"externalName":"renamed later"})).await.unwrap();
+        let results=db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.unwrap();
+        assert!(results.iter().all(|result|result.applied));
+        assert_eq!(results.iter().map(|r|r.inserted.iter().map(|i|i.index).collect::<Vec<_>>()).collect::<Vec<_>>(),vec![vec![0],vec![1],vec![0]]);
+        assert!(results[1].inserted[0].id<results[2].inserted[0].id && results[2].inserted[0].id<results[0].inserted[0].id,"writes lock/order by key, results remain in input order");
+        let ids:Vec<_>=results.iter().flat_map(|result|result.inserted.iter().map(|row|row.id as i32)).collect();
+        for (scan,result) in scans.iter().zip(&results) {
+            let stored:Value=sqlx::query_scalar("select to_jsonb(s) from live_setups s where id=$1").bind(result.inserted[0].id as i32).fetch_one(&pool).await.unwrap();
+            assert_eq!(format!("bybit/linear/{}",stored["symbol"].as_str().unwrap()),scan.instrument_key);
+            assert_eq!(stored["external_name"],profile.external_name);
+            assert_eq!(db::get_adaptive_checkpoint(&pool,profile.slot_id,&scan.instrument_key).await.unwrap(),Some(db::AdaptiveCheckpoint {generation_id:profile.generation_id,state:scan.checkpoint.clone()}));
+        }
+        let transaction_count:i64=sqlx::query_scalar("select count(distinct xid) from (select xmin::text xid from live_setups where id=any($1) union all select xmin::text from adaptive_notification_outbox where setup_id=any($1) union all select xmin::text from adaptive_live_checkpoints where slot_id=$2) writes")
+            .bind(&ids).bind(profile.slot_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(transaction_count,1,"all new setup/outbox/checkpoint writes share one transaction");
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_notification_outbox where setup_id=any($1)").bind(&ids).fetch_one(&pool).await.unwrap(),3);
+        let committed=adaptive_batch_state(&pool).await;
+        // Model a lost ACK: an exact retry may be stale, but exact durable state
+        // above permits worker adoption without inventing newly inserted IDs.
+        let retried=db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.unwrap();
+        assert!(retried.iter().all(|result|!result.applied&&result.inserted.is_empty()));
+        assert_eq!(adaptive_batch_state(&pool).await,committed);
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn adaptive_batch_partial_cas_durable_readiness_global_fences_promotion_and_stop() {
+    isolated(|pool|async move {
+        let close=chrono::Utc::now().timestamp().div_euclid(60)*60;
+        let mut profile=adaptive_batch_profile(&pool,close).await;
+        let seed=adaptive_batch_scan(&profile,"ETHUSDT",close-60);
+        assert!(db::commit_adaptive_scan_cas(&pool,&profile,&seed.instrument_key,None,&seed.checkpoint,&seed.setups).await.unwrap().applied);
+        for entry in &mut profile.live_readiness {entry.status="ready".into();}
+        let mut scans:Vec<_>=["ETHUSDT","BTCUSDT","WAITUSDT","UNSEENUSDT"].iter().map(|symbol|adaptive_batch_scan(&profile,symbol,close)).collect();
+        let result=db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.unwrap();
+        assert_eq!(result.iter().map(|r|r.applied).collect::<Vec<_>>(),vec![false,true,false,false],"stale or caller-forged readiness cannot exclude a valid sibling or apply waiting/absent metadata");
+        assert!(result[0].inserted.is_empty()&&result[2].inserted.is_empty()&&result[3].inserted.is_empty());
+        scans[0].previous=db::get_adaptive_checkpoint(&pool,profile.slot_id,&scans[0].instrument_key).await.unwrap();
+        scans[1].previous=Some(db::AdaptiveCheckpoint {generation_id:profile.generation_id,state:json!({"stale":true})});
+        assert_eq!(db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.unwrap().iter().map(|r|r.applied).collect::<Vec<_>>(),vec![true,false,false,false]);
+        for (disable,enable) in [
+            ("update settings set value='{}' where key='live'","update settings set value='{\"enabled\":true}' where key='live'"),
+            ("update continuous_processes set config_revision=config_revision+1","update continuous_processes set config_revision=config_revision-1"),
+            ("update continuous_slots set enabled=false","update continuous_slots set enabled=true"),
+            ("update continuous_processes set config=jsonb_set(config,'{adaptiveEnabled}','false')","update continuous_processes set config=jsonb_set(config,'{adaptiveEnabled}','true')"),
+        ] {
+            sqlx::query(disable).execute(&pool).await.unwrap();let before=adaptive_batch_state(&pool).await;
+            assert!(db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.unwrap().iter().all(|r|!r.applied&&r.inserted.is_empty()));
+            assert_eq!(adaptive_batch_state(&pool).await,before);sqlx::query(enable).execute(&pool).await.unwrap();
+        }
+        let pending=pending_fixture(&pool,&profile).await;
+        let fence=db::live::claim_pending_warmup_at(&pool,&pending,"batch-promotion",close).await.unwrap().unwrap();
+        assert!(db::live::report_warmup(&pool,&fence,"ready",Some(close),None).await.unwrap());
+        let mut expected=Vec::new();
+        for symbol in ["BTCUSDT","ETHUSDT","ZZZUSDT","WAITUSDT","UNSEENUSDT"] {
+            let key=format!("bybit/linear/{symbol}");let checkpoint=db::get_adaptive_checkpoint(&pool,profile.slot_id,&key).await.unwrap();
+            expected.push(db::live::CheckpointExpectation {instrument_key:key,checkpoint});
+        }
+        let initial=[db::live::InitialAdaptiveCheckpoint {instrument_key:INSTRUMENT.into(),state:promotion_state(fence.generation_id,close)}];
+        assert!(db::live::promote_pending(&pool,&fence,Some(profile.generation_id),&expected,close,&initial).await.unwrap());
+        let before=adaptive_batch_state(&pool).await;
+        assert!(db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.unwrap().iter().all(|r|!r.applied));
+        assert_eq!(adaptive_batch_state(&pool).await,before);
+        let promoted=db::active_adaptive_slots(&pool,OWNER).await.unwrap().remove(0);
+        assert!(db::stop(&pool,OWNER,ALGORITHM).await.unwrap());let stopped=adaptive_batch_state(&pool).await;
+        let scan=adaptive_batch_scan(&promoted,"BTCUSDT",close+60);
+        assert!(!db::commit_adaptive_scans_cas(&pool,&promoted,&[scan]).await.unwrap()[0].applied);
+        assert_eq!(adaptive_batch_state(&pool).await,stopped);
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn adaptive_batch_late_validation_outbox_failure_and_statement_timeout_roll_back_every_item() {
+    isolated(|pool|async move {
+        let close=chrono::Utc::now().timestamp().div_euclid(60)*60;
+        let profile=adaptive_batch_profile(&pool,close).await;
+        let mut scans=vec![adaptive_batch_scan(&profile,"ZZZUSDT",close),adaptive_batch_scan(&profile,"BTCUSDT",close)];
+        sqlx::raw_sql("create sequence fixture_outbox_attempts; create function fixture_batch_outbox() returns trigger language plpgsql as $$begin perform nextval('fixture_outbox_attempts'); if new.payload#>>'{instrument,symbol}'='ZZZUSDT' then raise exception 'batch_outbox_rollback_sentinel'; end if; return new; end$$; create trigger fixture_batch_outbox before insert on adaptive_notification_outbox for each row execute function fixture_batch_outbox();")
+            .execute(&pool).await.unwrap();
+        let original=adaptive_batch_state(&pool).await;
+        scans[0].setups[0].setup.algorithm_id="wrong_algorithm".into();
+        assert!(db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.err().unwrap().to_string().contains("differs from generation"));
+        assert_eq!(sqlx::query_scalar::<_,i64>("select last_value from fixture_outbox_attempts").fetch_one(&pool).await.unwrap(),1,"the earlier sorted item really reached outbox before validation failed");
+        assert_eq!(adaptive_batch_state(&pool).await,original);
+        scans[0].setups[0].setup.algorithm_id=ALGORITHM.into();
+        assert!(db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.err().unwrap().to_string().contains("batch_outbox_rollback_sentinel"));
+        assert_eq!(sqlx::query_scalar::<_,i64>("select last_value from fixture_outbox_attempts").fetch_one(&pool).await.unwrap(),3);
+        assert_eq!(adaptive_batch_state(&pool).await,original,"outbox budgets, setups and checkpoints all roll back");
+        sqlx::raw_sql("drop trigger fixture_batch_outbox on adaptive_notification_outbox; create function fixture_batch_timeout() returns trigger language plpgsql as $$begin if new.instrument_key='bybit/linear/ZZZUSDT' then perform pg_sleep(3); end if; return new; end$$; create trigger fixture_batch_timeout before insert on adaptive_live_checkpoints for each row execute function fixture_batch_timeout();")
+            .execute(&pool).await.unwrap();
+        let error=db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.err().unwrap();
+        assert!(error.to_string().contains("statement timeout"),"{error}");
+        assert_eq!(adaptive_batch_state(&pool).await,original,"timed-out bulk checkpoint cannot leave earlier setup/outbox writes");
+        // SET LOCAL does not impose the new batch timeout on a legacy scan.
+        let scan=&scans[0];
+        assert!(db::commit_adaptive_scan_cas(&pool,&profile,&scan.instrument_key,None,&scan.checkpoint,&scan.setups).await.unwrap().applied);
+    }).await;
+}
+
 async fn pending_fixture(pool: &PgPool, active: &db::ActiveAdaptiveSlot) -> db::live::PendingAdaptiveSlot {
     let generation = generation(pool,OWNER,ALGORITHM,active.slot_id,"completed").await;
     let mut result = active.result.clone();

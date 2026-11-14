@@ -13,6 +13,8 @@ mod delivery;
 mod profile;
 mod store;
 mod source;
+mod schedule;
+mod batch;
 mod promotion;
 mod text;
 use profile::{LiveProfile,RecommendationEnvelope};
@@ -23,6 +25,8 @@ const HISTORY_PAGE_LIMIT:u32=5000;
 const IO_CONCURRENCY:usize=4;
 const COMMIT_CONCURRENCY:usize=16;
 const WARMUP_TIME_SLICE:Duration=Duration::from_secs(1);
+const JOIN_MAX_PER_TURN:usize=8;
+const JOIN_TIME_SLICE:Duration=Duration::from_millis(100);
 
 fn instrument_key(instrument:&AdaptiveInstrument)->String {format!("{}/{}/{}",instrument.exchange,instrument.category,instrument.symbol)}
 fn instrument(item:&CatalogInstrument)->AdaptiveInstrument {AdaptiveInstrument {exchange:item.exchange.clone(),category:item.category.clone(),symbol:item.symbol.clone()}}
@@ -51,13 +55,14 @@ pub struct AdaptiveLiveRuntime {
     warmup:Option<Warmup>,
     worker:String,
     next_pending:usize,
-    warm_cursor:usize,
+    cold_schedule:schedule::ColdSchedule,
+    join_cursor:usize,
     peak_staging_epochs:usize,
 }
 impl AdaptiveLiveRuntime {
     pub fn new(limits:AdaptiveRuntimeLimits)->Self {
         Self {state:AdaptiveRuntime::new(limits),warmup:None,
-            worker:format!("adaptive-live-{}",std::process::id()),next_pending:0,warm_cursor:0,peak_staging_epochs:0}
+            worker:format!("adaptive-live-{}",std::process::id()),next_pending:0,cold_schedule:schedule::ColdSchedule::default(),join_cursor:0,peak_staging_epochs:0}
     }
     pub fn peak_staging_epochs(&self)->usize {self.peak_staging_epochs}
     pub fn retained_history_epochs(&self)->usize {self.state.retained_history_epochs()}
@@ -242,9 +247,16 @@ impl AdaptiveLiveRuntime {
         } else {self.state.invalidate(&plan.epoch,None);}
     }
     async fn join_ready_waiting(&mut self,pool:&PgPool,plans:&[SymbolPlan],frontier:i64)->Result<(),WorkerError> {
-        for plan in plans {
-            for spec in plan.specs.iter().filter(|spec|spec.waiting) {
-                if !self.state.ready(&plan.epoch,&spec.key(),frontier) {continue;}
+        let eligible:Vec<_>=plans.iter().flat_map(|plan|plan.specs.iter().filter(|spec|spec.waiting)
+            .filter(|spec|self.state.ready(&plan.epoch,&spec.key(),frontier)).map(move |spec|(plan,spec))).collect();
+        let started=Instant::now();
+        for _ in 0..JOIN_MAX_PER_TURN.min(eligible.len()) {
+                if started.elapsed()>=JOIN_TIME_SLICE {break;}
+                let (plan,spec)=eligible[self.join_cursor%eligible.len()];
+                // Advance before IO: one failed join cannot reset the next turn
+                // to the first instrument. The slice does not abort owned IO.
+                self.join_cursor=(self.join_cursor+1)%eligible.len();
+                if !self.state.has_epoch(&plan.epoch) {continue;}
                 let slot=plan.slots.get(&spec.key()).ok_or_else(||invalid("waiting instrument store missing"))?;
                 let key=instrument_key(&plan.instrument);
                 let previous=continuous::get_adaptive_checkpoint(pool,slot.slot_id,&key).await?;
@@ -254,7 +266,6 @@ impl AdaptiveLiveRuntime {
                     // publication floor and durable ownership change.
                     self.state.activate(&plan.epoch,&spec.key(),frontier)?;
                 } else {self.state.invalidate(&plan.epoch,None);break;}
-            }
         }
         Ok(())
     }
@@ -350,8 +361,7 @@ impl AdaptiveLiveRuntime {
         while !cold.is_empty() && pages<self.state.limits.warmup_pages_per_turn && started.elapsed()<WARMUP_TIME_SLICE && !stopped.load(Ordering::SeqCst) {
             let count=IO_CONCURRENCY.min(self.state.limits.warmup_pages_per_turn-pages).min(cold.len());
             let mut reads=tokio::task::JoinSet::new();
-            for offset in 0..count {
-                let index=(self.warm_cursor+offset)%cold.len();
+            for index in self.cold_schedule.select(&cold,count) {
                 let mut plan=cold[index].clone();
                 if !self.state.has_epoch(&plan.epoch) {
                     for spec in plan.specs.iter_mut().filter(|spec|!spec.pending) {
@@ -370,7 +380,6 @@ impl AdaptiveLiveRuntime {
                     (plan,result)
                 });
             }
-            self.warm_cursor=(self.warm_cursor+count)%cold.len();
             let mut first_error=None;
             while let Some(result)=reads.join_next().await {
                 let (plan,response)=result.map_err(|e|invalid(&e.to_string()))?;
@@ -433,6 +442,7 @@ impl AdaptiveLiveRuntime {
     async fn hot_tail_snapshots(&mut self,pool:&PgPool,client:&MarketDataClient,batches:Vec<Vec<SymbolPlan>>,target:i64,stopped:&AtomicBool)->Result<(),WorkerError> {
         let mut batches=batches.into_iter();let mut first_error=None;
         loop {
+            if stopped.load(Ordering::SeqCst) {break;}
             let mut reads=tokio::task::JoinSet::new();
             for batch in batches.by_ref().take(IO_CONCURRENCY) {
                 let ids:Vec<_>=batch.iter().map(|plan|plan.catalog_id).collect();
@@ -458,22 +468,36 @@ impl AdaptiveLiveRuntime {
                         first_error.get_or_insert_with(||invalid(&error.to_string()));continue;
                     }
                 };
+                let batch_store=batch::PgBatchStore {pool};
+                let mut window=batch::Window::new(&mut self.state,&batch_store);
+                let mut response_failed=false;
                 for item in response.instruments {
-                    if stopped.load(Ordering::SeqCst) {return Ok(());}
+                    if stopped.load(Ordering::SeqCst) {response_failed=true;break;}
                     let plan=batch.iter().find(|plan|plan.catalog_id==item.instrument_id).ok_or_else(||invalid("requested source epoch missing"))?;
                     let guard=guards.iter().find(|guard|guard.instrument_id==item.instrument_id).ok_or_else(||invalid("requested source guard missing"))?;
                     let token=guard.validated_token(item.read_guard.as_ref());
                     if item.status!="known" || token.is_none() {
-                        self.state.invalidate(&plan.epoch,None);
+                        window.reject(&plan.epoch);
                         if item.status!="known" || !item.read_guard.as_ref().is_some_and(|guard|guard.status==setups_mdclient::TailReadGuardStatus::Invalid) {
                             first_error.get_or_insert_with(||invalid("source causal history changed or repair coverage is unknown"));
                         }
                         continue;
                     }
                     let bars:Vec<_>=item.candles.into_iter().map(|row|DetectorBar {open_time_unix:row.candle.open_time_unix,close:row.candle.close,quote_turnover:row.candle.quote_turnover}).collect();
-                    self.state.acknowledge_source(&plan.epoch,token.unwrap())?;
-                    if let Err(error)=process_page(&mut self.state,pool,plan,&bars,target,true).await {first_error.get_or_insert(error);continue;}
-                    self.park_waiting(plan,target);
+                    window.state.acknowledge_source(&plan.epoch,token.unwrap())?;
+                    if let Err(error)=window.prepare(plan,&bars,target).await {
+                        first_error.get_or_insert(error);
+                        response_failed=true;
+                        // Drop invalidates every speculative epoch in this
+                        // response. Other source batches are still drained.
+                        break;
+                    }
+                }
+                if response_failed {
+                    drop(window);
+                } else {
+                    if let Err(error)=window.finish().await {first_error.get_or_insert(error);}
+                    for plan in &batch {self.park_waiting(plan,target);}
                 }
             }
         }
@@ -570,9 +594,13 @@ async fn process_chunk(state:&mut AdaptiveRuntime,pool:&PgPool,plan:&SymbolPlan,
         Err(error)=>{state.invalidate(&plan.epoch,None);return Err(error);}
     };
     let mut tasks=tokio::task::JoinSet::new();
+    let mut first_error=None;
     for prepared in prepared {
+        if !state.has_epoch(&plan.epoch) {continue;}
         if !prepared.should_commit() {state.accept(&plan.epoch,prepared,false);continue;}
-        let slot=plan.slots.get(&prepared.key).cloned().ok_or_else(||invalid("active store missing"))?;
+        let Some(slot)=plan.slots.get(&prepared.key).cloned() else {
+            first_error.get_or_insert_with(||invalid("active store missing"));state.invalidate(&plan.epoch,None);continue;
+        };
         let pool=pool.clone();let instrument=plan.instrument.clone();
         tasks.spawn(async move {
             let mut prepared=prepared;
@@ -580,9 +608,13 @@ async fn process_chunk(state:&mut AdaptiveRuntime,pool:&PgPool,plan:&SymbolPlan,
             let result=store::persist(&store,&instrument,&mut prepared).await;
             (prepared,result)
         });
-        if tasks.len()>=COMMIT_CONCURRENCY {accept_result(state,&plan.epoch,tasks.join_next().await.unwrap())?;}
+        if tasks.len()>=COMMIT_CONCURRENCY
+            && let Err(error)=accept_result(state,&plan.epoch,tasks.join_next().await.unwrap()) {first_error.get_or_insert(error);}
     }
-    while let Some(result)=tasks.join_next().await {accept_result(state,&plan.epoch,result)?;}
+    while let Some(result)=tasks.join_next().await {
+        if let Err(error)=accept_result(state,&plan.epoch,result) {first_error.get_or_insert(error);}
+    }
+    if let Some(error)=first_error {state.invalidate(&plan.epoch,None);return Err(error);}
     Ok(())
 }
 fn accept_result(state:&mut AdaptiveRuntime,epoch:&str,result:Result<(PreparedProfile,Result<bool,WorkerError>),tokio::task::JoinError>)->Result<(),WorkerError> {

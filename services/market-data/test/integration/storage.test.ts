@@ -5,7 +5,8 @@ import { createDb } from "../../src/db/db.js";
 import { createMigrator } from "../../src/db/migrator.js";
 import type { MarketDataDB } from "../../src/db/schema.js";
 import { ensureInstrument } from "../../src/storage/instruments.js";
-import { insertCandles, readCandles, type CandleInsert } from "../../src/storage/candles.js";
+import { insertCandleBatch, insertCandles, readCandles, type CandleInsert } from "../../src/storage/candles.js";
+import { readGuards } from "../../src/storage/read-guards.js";
 import { getCoverage } from "../../src/storage/coverage.js";
 import { ensureMonthPartitions } from "../../src/storage/partitions.js";
 
@@ -121,6 +122,68 @@ describe.skipIf(!TEST_DATABASE_URL)("market data storage", () => {
     await insertCandles(db, instrumentId, [candle(minute(0), "100")]);
     const same = await insertCandles(db, instrumentId, [candle(minute(0), "100.00")]);
     expect(same).toEqual({ inserted: 0, conflicting: 0 });
+  });
+
+  it("preserves first canonical and differing OHLCV/turnover observations inside one batch", async () => {
+    const first = candle(minute(0), "100");
+    const result = await insertCandles(db, instrumentId, [first,
+      { ...first, close: "100.00", volume: "1.500" },
+      { ...first, close: "999", quoteTurnover: "999.001" },
+    ]);
+    expect(result).toEqual({ inserted: 1, conflicting: 1 });
+    const stored = await readCandles(db, { instrumentId, from: minute(0), to: minute(1) });
+    expect(stored.candles[0]).toMatchObject({ close: "100", volume: "1.5", quoteTurnover: "1500.25" });
+    expect(await db.selectFrom("candle_conflicts").selectAll().execute()).toHaveLength(1);
+    const head = await db.selectFrom("candle_insert_heads").where("instrument_id", "=", instrumentId).selectAll().executeTakeFirstOrThrow();
+    expect(head.revision).toBe("1");
+    await insertCandleBatch(db, [{ instrumentId, candle: first }, { instrumentId, candle: first }]);
+    expect((await db.selectFrom("candle_insert_heads").where("instrument_id", "=", instrumentId).selectAll().executeTakeFirstOrThrow()).revision).toBe("1");
+  });
+
+  it("serializes overlapping multi-instrument WS/REST writes and journals actual inserted ranges across months", async () => {
+    const secondId = await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: "BATCHSECONDUSDT" });
+    await insertCandles(db, instrumentId, [candle(minute(0), "100")]);
+    const previous = (await readGuards(db, [{ instrumentId, fromUnix: minute(0).getTime() / 1000,
+      toUnix: minute(1).getTime() / 1000, previous: null }])).get(instrumentId)!.token;
+    const results = await Promise.all([
+      insertCandleBatch(db, [{ instrumentId: secondId, candle: candle(minute(3), "201") },
+        { instrumentId, candle: candle(minute(0), "999") }, { instrumentId, candle: candle(minute(3), "103") }]),
+      insertCandleBatch(db, [{ instrumentId, candle: candle(minute(3), "104") },
+        { instrumentId: secondId, candle: candle(minute(3), "202") }]),
+      insertCandles(db, secondId, [candle(minute(4), "205")]),
+    ]);
+    expect(results.reduce((n, r) => n + r.inserted, 0)).toBe(3);
+    expect((await readCandles(db, { instrumentId, from: minute(0), to: minute(1) })).candles[0]?.close).toBe("100");
+    const journal = await db.selectFrom("candle_insert_journal").where("instrument_id", "=", instrumentId).orderBy("revision").selectAll().execute();
+    expect(journal).toHaveLength(2);
+    expect(journal[1]).toMatchObject({ from_ts: minute(3), to_ts: minute(4) });
+    const checked = await readGuards(db, [{ instrumentId, fromUnix: minute(0).getTime() / 1000,
+      toUnix: minute(1).getTime() / 1000, previous }]);
+    expect(checked.get(instrumentId)?.status).toBe("valid");
+    const affected = await readGuards(db, [{ instrumentId, fromUnix: minute(3).getTime() / 1000,
+      toUnix: minute(4).getTime() / 1000, previous }]);
+    expect(affected.get(instrumentId)?.status).toBe("invalid");
+    expect(await db.selectFrom("candles").where("instrument_id", "=", secondId).selectAll().execute()).toHaveLength(2);
+  });
+
+  it("cancels a blocked batch on the server and cannot commit later after timeout", async () => {
+    await insertCandles(db, instrumentId, [candle(minute(0), "100")]);
+    let unlock!: () => void;
+    let locked!: () => void;
+    const acquired = new Promise<void>((resolve) => { locked = resolve; });
+    const release = new Promise<void>((resolve) => { unlock = resolve; });
+    const blocker = db.transaction().execute(async (tx) => {
+      await tx.selectFrom("instrument_watermarks").where("instrument_id", "=", instrumentId)
+        .select("instrument_id").forUpdate().execute();
+      locked(); await release;
+    });
+    await acquired;
+    try {
+      await expect(insertCandleBatch(db, [{ instrumentId, candle: candle(minute(1), "101") }], 50))
+        .rejects.toThrow(/timeout|deadline/);
+    } finally { unlock(); await blocker; }
+    expect(await db.selectFrom("candles").where("instrument_id", "=", instrumentId).selectAll().execute()).toHaveLength(1);
+    expect((await db.selectFrom("candle_insert_heads").where("instrument_id", "=", instrumentId).selectAll().executeTakeFirstOrThrow()).revision).toBe("1");
   });
 
   it("computes coverage intervals and gaps from stored candles", async () => {

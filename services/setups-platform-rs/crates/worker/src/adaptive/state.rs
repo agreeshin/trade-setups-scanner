@@ -102,6 +102,7 @@ pub(crate) struct PreparedProfile {
     next: CachedProfile,
 }
 impl PreparedProfile {
+    pub(crate) fn retained_scalar_bytes(&self)->usize { self.next.retained_bytes()+self.key.len() }
     pub(crate) fn should_commit(&self)->bool {
         !self.next.spec.pending && !self.next.spec.waiting && self.next.initialized
             && (self.expected.as_ref()!=Some(&self.checkpoint) || !self.setups.is_empty())

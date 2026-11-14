@@ -2,7 +2,7 @@ import { sql, type Kysely } from "kysely";
 import type { MarketDataDB, CandleRecordJson } from "../db/schema.js";
 import { ensureMonthPartitions } from "./partitions.js";
 import { ensureWatermarks } from "./watermarks.js";
-import { recordCanonicalInsert } from "./read-guards.js";
+import { recordCanonicalInserts } from "./read-guards.js";
 
 export interface CandleInsert {
   openTime: Date;
@@ -35,7 +35,7 @@ interface StoredShape {
 }
 
 function normalizeDecimal(value: string): string {
-  const trimmed = value.trim();
+  const trimmed = value.trim().replace(/^0+(?=\d)/, "");
   if (!trimmed.includes(".")) {
     return trimmed;
   }
@@ -84,116 +84,83 @@ export async function insertCandles(
   instrumentId: number,
   candles: CandleInsert[],
 ): Promise<InsertResult> {
-  if (candles.length === 0) {
-    return { inserted: 0, conflicting: 0 };
+  return insertCandleBatch(db, candles.map((candle) => ({ instrumentId, candle })));
+}
+
+export interface CandleObservation { instrumentId: number; candle: CandleInsert }
+
+/** Exact normalized observation identity; differing duplicates must survive. */
+export function candleObservationKey(instrumentId: number, candle: CandleInsert): string {
+  return JSON.stringify([instrumentId, candle.openTime.getTime(), ...[candle.open, candle.high, candle.low,
+    candle.close, candle.volume, candle.quoteTurnover].map(normalizeDecimal)]);
+}
+
+/** Shared WS/REST add-only writer. Input order chooses the first offered value,
+ * while database lock order is always instrument/time ascending. */
+export async function insertCandleBatch(
+  db: Kysely<MarketDataDB>, observations: CandleObservation[], statementTimeoutMs?: number,
+): Promise<InsertResult> {
+  if (!observations.length) return { inserted: 0, conflicting: 0 };
+  const distinct = new Map<string, CandleObservation>();
+  const canonical = new Map<string, CandleObservation>();
+  const key = (id: number, time: Date) => `${id}:${time.getTime()}`;
+  for (const observation of observations) {
+    distinct.set(candleObservationKey(observation.instrumentId, observation.candle), observation);
+    const k = key(observation.instrumentId, observation.candle.openTime);
+    if (!canonical.has(k)) canonical.set(k, observation);
   }
-
-  const uniqueByTime = new Map<number, CandleInsert>();
-  for (const candle of candles) {
-    uniqueByTime.set(candle.openTime.getTime(), candle);
-  }
-  const uniqueCandles = [...uniqueByTime.values()];
-
-  const times = uniqueCandles.map((candle) => candle.openTime.getTime());
-  await ensureWatermarks(db, [instrumentId]);
-  await ensureMonthPartitions(
-    db,
-    new Date(Math.min(...times)),
-    new Date(Math.max(...times)),
-  );
-
-  const write = async (db: Kysely<MarketDataDB>): Promise<InsertResult> => {
-  // Serialize BEFORE any canonical insertion. Revision allocation after an
-  // unlocked insert would permit commit-order gaps across concurrent writers.
-  await db.selectFrom("instrument_watermarks").where("instrument_id", "=", instrumentId)
-    .select("instrument_id").forUpdate().executeTakeFirstOrThrow();
-  const journal = await db.selectFrom("candle_insert_heads").where("instrument_id", "=", instrumentId)
-    .select("instrument_id").executeTakeFirst();
-  if (!journal) throw new Error(`canonical insert metadata missing for instrument ${instrumentId}`);
-  const inserted = await db
-    .insertInto("candles")
-    .values(uniqueCandles.map((candle) => candleValues(instrumentId, candle)))
-    .onConflict((oc) => oc.constraint("candles_pkey").doNothing())
-    .returning("open_time")
-    .execute();
-  await recordCanonicalInsert(db, instrumentId, inserted.map((row) => row.open_time));
-
-  // Read after ON CONFLICT has waited for concurrent writers. Comparing a
-  // pre-insert snapshot would miss WS/REST conflicts under READ COMMITTED.
-  const existingRows = await db
-    .selectFrom("candles")
-    .where((eb) =>
-      eb.and([
-        eb("instrument_id", "=", instrumentId),
-        eb(
-          "open_time",
-          "in",
-          uniqueCandles.map((candle) => candle.openTime),
-        ),
-      ]),
-    )
-    .select([
-      "open_time",
-      "open",
-      "high",
-      "low",
-      "close",
-      "volume",
-      "quote_turnover",
-    ])
-    .execute();
-
-  const existingByTime = new Map(
-    existingRows.map((row) => [row.open_time.getTime(), row]),
-  );
-
-  const conflicts = uniqueCandles.filter((candle) => {
-    const existing = existingByTime.get(candle.openTime.getTime());
-    return existing !== undefined && differsFromStored(existing, candle);
-  });
-
-  if (conflicts.length > 0) {
-    await db
-      .insertInto("candle_conflicts")
-      .values(
-        conflicts.map((candle) => {
-          const existing = existingByTime.get(candle.openTime.getTime());
-          if (existing === undefined) {
-            throw new Error("conflict row missing existing record");
-          }
-          return {
-            instrument_id: instrumentId,
-            open_time: candle.openTime,
-            existing_record: toConflictJson(existing),
-            incoming_record: toConflictJson({
-              open: candle.open,
-              high: candle.high,
-              low: candle.low,
-              close: candle.close,
-              volume: candle.volume,
-              quote_turnover: candle.quoteTurnover,
-            }),
-          };
-        }),
-      )
-      .onConflict((oc) => oc.constraint("candle_conflicts_unique").doNothing())
-      .execute();
-  }
-
-  const latest = new Date(Math.max(...times));
-  await sql`INSERT INTO instrument_watermarks (instrument_id, latest_open_time, latest_received_at)
-    VALUES (${instrumentId}, ${latest}, statement_timestamp())
-    ON CONFLICT (instrument_id) DO UPDATE SET
-      latest_open_time = greatest(instrument_watermarks.latest_open_time, excluded.latest_open_time),
-      latest_received_at = CASE WHEN instrument_watermarks.latest_open_time IS NULL
-        OR excluded.latest_open_time > instrument_watermarks.latest_open_time
-        THEN excluded.latest_received_at ELSE instrument_watermarks.latest_received_at END`.execute(db);
-  await sql`UPDATE collection_targets SET last_collected_ts = greatest(last_collected_ts, ${latest})
-    WHERE instrument_id = ${instrumentId}`.execute(db);
-  return {
-    inserted: inserted.length,
-    conflicting: conflicts.length,
-  };
+  const ordered = [...canonical.values()].sort((a, b) => a.instrumentId - b.instrumentId || a.candle.openTime.getTime() - b.candle.openTime.getTime());
+  const ids = [...new Set(ordered.map((row) => row.instrumentId))];
+  const times = ordered.map((row) => row.candle.openTime.getTime());
+  const write = async (connection: Kysely<MarketDataDB>): Promise<InsertResult> => {
+    const deadline = statementTimeoutMs === undefined ? Infinity : Date.now() + statementTimeoutMs;
+    const checkDeadline = () => { if (Date.now() >= deadline) throw new Error("candle batch transaction deadline exceeded"); };
+    // Server-side cancellation plus cooperative checks BETWEEN queries. Never
+    // race an uncancelled transaction against a JS timeout and report it done.
+    const tx = connection.withPlugin({
+      transformQuery: (args) => { checkDeadline(); return args.node; },
+      transformResult: (args) => { checkDeadline(); return Promise.resolve(args.result); },
+    });
+    if (statementTimeoutMs !== undefined)
+      await sql`SELECT set_config('statement_timeout', ${String(statementTimeoutMs)}, true),
+        set_config('lock_timeout', ${String(statementTimeoutMs)}, true),
+        set_config('idle_in_transaction_session_timeout', ${String(statementTimeoutMs)}, true)`.execute(tx);
+    await ensureMonthPartitions(tx, new Date(Math.min(...times)), new Date(Math.max(...times)));
+    await ensureWatermarks(tx, ids);
+    const locked = await tx.selectFrom("instrument_watermarks").where("instrument_id", "in", ids)
+      .orderBy("instrument_id").select("instrument_id").forUpdate().execute();
+    if (locked.length !== ids.length) throw new Error("candle batch watermark missing");
+    const heads = await tx.selectFrom("candle_insert_heads").where("instrument_id", "in", ids).select("instrument_id").execute();
+    if (heads.length !== ids.length) throw new Error("canonical insert metadata missing for batch");
+    const inserted = await tx.insertInto("candles").values(ordered.map((row) => candleValues(row.instrumentId, row.candle)))
+      .onConflict((oc) => oc.constraint("candles_pkey").doNothing()).returning(["instrument_id", "open_time"]).execute();
+    await recordCanonicalInserts(tx, inserted);
+    // Read back AFTER the serialized insert, including concurrent REST values.
+    const keys = ordered.map((row) => ({ id: row.instrumentId, at: row.candle.openTime.toISOString() }));
+    const existing = await sql<StoredShape & { instrument_id: number; open_time: Date }>`SELECT c.* FROM
+      jsonb_to_recordset(${JSON.stringify(keys)}::jsonb) AS k(id integer, at timestamptz)
+      JOIN candles c ON c.instrument_id = k.id AND c.open_time = k.at`.execute(tx);
+    const byKey = new Map(existing.rows.map((row) => [key(row.instrument_id, row.open_time), row]));
+    const conflicts = [...distinct.values()].filter((row) => {
+      const stored = byKey.get(key(row.instrumentId, row.candle.openTime));
+      if (!stored) throw new Error("canonical candle missing after insertion");
+      return differsFromStored(stored, row.candle);
+    });
+    if (conflicts.length) await tx.insertInto("candle_conflicts").values(conflicts.map(({ instrumentId, candle }) => ({
+      instrument_id: instrumentId, open_time: candle.openTime,
+      existing_record: toConflictJson(byKey.get(key(instrumentId, candle.openTime))!),
+      incoming_record: toConflictJson({ ...candle, quote_turnover: candle.quoteTurnover }),
+    }))).onConflict((oc) => oc.constraint("candle_conflicts_unique").doNothing()).execute();
+    const latest = new Map<number, Date>();
+    for (const row of ordered) latest.set(row.instrumentId, row.candle.openTime);
+    const values = [...latest].map(([id, at]) => ({ id, at: at.toISOString() }));
+    await sql`UPDATE instrument_watermarks w SET latest_open_time = k.at, latest_received_at = statement_timestamp()
+      FROM jsonb_to_recordset(${JSON.stringify(values)}::jsonb) AS k(id integer, at timestamptz)
+      WHERE w.instrument_id = k.id AND (w.latest_open_time IS NULL OR w.latest_open_time < k.at)`.execute(tx);
+    await sql`UPDATE collection_targets t SET last_collected_ts = k.at
+      FROM jsonb_to_recordset(${JSON.stringify(values)}::jsonb) AS k(id integer, at timestamptz)
+      WHERE t.instrument_id = k.id AND (t.last_collected_ts IS NULL OR t.last_collected_ts < k.at)`.execute(tx);
+    return { inserted: inserted.length, conflicting: conflicts.length };
   };
   return db.isTransaction ? write(db) : db.transaction().execute(write);
 }

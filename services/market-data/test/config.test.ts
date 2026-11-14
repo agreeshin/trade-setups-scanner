@@ -22,4 +22,12 @@ describe("market-data resource config", () => {
       expect(() => loadConfig({ DATABASE_URL: "postgresql://example/market", [key!]: value })).toThrow(key);
     }
   });
+  it("bounds fresh microbatch rows, bytes, dwell and transaction timeout", () => {
+    expect(loadConfig({ DATABASE_URL: "postgresql://example/market" }).bybit.fresh).toMatchObject({
+      batchMaxRows: 64, batchMaxBytes: 65536, batchDwellMs: 25, batchTransactionTimeoutMs: 5000,
+    });
+    for (const [key, value] of [["BYBIT_FRESH_BATCH_MAX_ROWS", "257"], ["BYBIT_FRESH_BATCH_MAX_BYTES", "1048577"],
+      ["BYBIT_FRESH_BATCH_DWELL_MS", "0"], ["BYBIT_FRESH_BATCH_TRANSACTION_TIMEOUT_MS", "30001"]])
+      expect(() => loadConfig({ DATABASE_URL: "postgresql://example/market", [key!]: value })).toThrow(key);
+  });
 });

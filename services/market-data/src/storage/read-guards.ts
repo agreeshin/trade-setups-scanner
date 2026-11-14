@@ -18,22 +18,34 @@ export interface ReadGuardResult {
 export async function recordCanonicalInsert(
   db: Kysely<MarketDataDB>, instrumentId: number, times: Date[],
 ): Promise<void> {
-  if (times.length === 0) return;
-  const next = await sql<{ revision: string }>`UPDATE candle_insert_heads
+  await recordCanonicalInserts(db, times.map((open_time) => ({ instrument_id: instrumentId, open_time })));
+}
+
+/** All corresponding watermark locks are held, in ascending instrument order. */
+export async function recordCanonicalInserts(
+  db: Kysely<MarketDataDB>, inserted: { instrument_id: number; open_time: Date }[],
+): Promise<void> {
+  if (inserted.length === 0) return;
+  const ranges = new Map<number, { from: number; to: number }>();
+  for (const row of inserted) {
+    const at = row.open_time.getTime();
+    const old = ranges.get(row.instrument_id);
+    ranges.set(row.instrument_id, { from: Math.min(old?.from ?? at, at), to: Math.max(old?.to ?? at + 60_000, at + 60_000) });
+  }
+  const ids = [...ranges.keys()].sort((a, b) => a - b);
+  const next = await sql<{ instrument_id: number; revision: string }>`UPDATE candle_insert_heads
     SET revision = revision + 1,
       pruned_through_revision = greatest(pruned_through_revision, revision + 1 - ${INSERT_JOURNAL_LIMIT})
-    WHERE instrument_id = ${instrumentId} RETURNING revision::text`.execute(db);
-  const revision = next.rows[0]?.revision;
-  if (revision === undefined) throw new Error(`canonical insert metadata missing for instrument ${instrumentId}`);
-  let fromMs = Infinity;
-  let toMs = -Infinity;
-  for (const time of times) { fromMs = Math.min(fromMs, time.getTime()); toMs = Math.max(toMs, time.getTime() + 60_000); }
-  await db.insertInto("candle_insert_journal").values({
-    instrument_id: instrumentId, revision, from_ts: new Date(fromMs), to_ts: new Date(toMs),
-  }).execute();
-  const floor = BigInt(revision) - BigInt(INSERT_JOURNAL_LIMIT);
-  if (floor > 0n) await db.deleteFrom("candle_insert_journal")
-    .where("instrument_id", "=", instrumentId).where("revision", "<=", floor.toString()).execute();
+    WHERE instrument_id = ANY(${ids}::int[]) RETURNING instrument_id, revision::text`.execute(db);
+  if (next.rows.length !== ids.length) throw new Error("canonical insert metadata missing for batch");
+  await db.insertInto("candle_insert_journal").values(next.rows.map((row) => {
+    const range = ranges.get(row.instrument_id)!;
+    return { instrument_id: row.instrument_id, revision: row.revision, from_ts: new Date(range.from), to_ts: new Date(range.to) };
+  })).execute();
+  if (next.rows.some((row) => BigInt(row.revision) > BigInt(INSERT_JOURNAL_LIMIT)))
+    await sql`DELETE FROM candle_insert_journal j USING candle_insert_heads h
+      WHERE j.instrument_id = h.instrument_id AND h.instrument_id = ANY(${ids}::int[])
+        AND j.revision <= h.pruned_through_revision`.execute(db);
 }
 
 /** Must share the candle reader's REPEATABLE READ transaction/snapshot. */

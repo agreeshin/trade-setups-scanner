@@ -1,11 +1,12 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Kysely } from "kysely";
 import { createDb } from "../../src/db/db.js";
 import { createMigrator } from "../../src/db/migrator.js";
 import type { MarketDataDB } from "../../src/db/schema.js";
-import { ensureInstrument } from "../../src/storage/instruments.js";
+import { ensureInstrument, ensureInstruments } from "../../src/storage/instruments.js";
 import { insertCandles } from "../../src/storage/candles.js";
-import { collectOnce, setCollectionTarget } from "../../src/ingest/continuous.js";
+import * as candleStorage from "../../src/storage/candles.js";
+import { collectOnce, setCollectionTarget, setCollectionTargets } from "../../src/ingest/continuous.js";
 import { BybitClient, type KlineBar } from "../../src/ingest/bybit.js";
 import { AdaptiveGate, DEFAULT_GATE_LIMITS } from "../../src/ingest/gate.js";
 import { FakeClock } from "../../src/ingest/clock.js";
@@ -132,6 +133,9 @@ describe.skipIf(!TEST_DATABASE_URL)("independent fresh collector", () => {
     expect(await db.selectFrom("candle_conflicts").where("instrument_id", "=", id).selectAll().execute()).toHaveLength(1);
   });
   it("rechecks a publication-lag tail after restart at the final checkpoint", async () => {
+    // The worker claims globally; other serial integration files can leave
+    // runnable fixture jobs. This case must claim its own publication-lag job.
+    await db.deleteFrom("backfill_jobs").execute();
     const id = await target(); await insertCandles(db, id, Array.from({ length: 9 }, (_, n) => candle(n)));
     await db.updateTable("collection_targets").set({ tail_next_ts: minute(1), tail_initialized: true }).where("instrument_id", "=", id).execute();
     await db.insertInto("backfill_jobs").values({ instrument_id: id, from_ts: minute(1), to_ts: minute(9), checkpoint_ts: minute(9),
@@ -155,5 +159,38 @@ describe.skipIf(!TEST_DATABASE_URL)("independent fresh collector", () => {
     await insertCandles(db, id, [candle(0)]);
     const state = await db.selectFrom("instrument_watermarks").where("instrument_id", "=", id).selectAll().executeTakeFirstOrThrow();
     expect(state.latest_open_time).toEqual(minute(9));
+  });
+  it("commits a full 819-instrument WS burst in 13 real multi-instrument transactions", async () => {
+    const rows = await ensureInstruments(db, { exchangeCode: "bybit", category: "linear" },
+      Array.from({ length: 819 }, (_, n) => `BURST${n}USDT`));
+    ids.push(...rows.map((row) => row.id));
+    await setCollectionTargets(db, ids, true);
+    const fresh = make(empty); await fresh.pollOnce(); await fresh.idle();
+    const transactions = vi.spyOn(db, "transaction");
+    try {
+      for (const row of rows) expect(fresh.enqueue(row.symbol, candle(9))).toBe(true);
+      await fresh.idle();
+      expect(transactions).toHaveBeenCalledTimes(13);
+      expect(await db.selectFrom("candles").where("instrument_id", "in", ids).select("instrument_id").execute()).toHaveLength(819);
+      expect(await db.selectFrom("candle_insert_journal").where("instrument_id", "in", ids).select("instrument_id").execute()).toHaveLength(819);
+      expect(fresh.diagnostics()).toMatchObject({ batches: 13, committed: 819, overflow: 0, pending: 0, bufferedBytes: 0 });
+    } finally { transactions.mockRestore(); }
+  }, 30_000);
+  it("reconciles a committed batch after ACK loss without another journal revision", async () => {
+    const id = await target();
+    const fresh = make(empty); await fresh.pollOnce(); await fresh.idle();
+    const original = candleStorage.insertCandleBatch;
+    const write = vi.spyOn(candleStorage, "insertCandleBatch").mockImplementationOnce(async (...args) => {
+      await original(...args);
+      throw new Error("fixture: commit ACK lost");
+    });
+    try {
+      fresh.enqueue("FRESHUSDT", candle(9)); await fresh.idle();
+      expect(write).toHaveBeenCalledTimes(2);
+      expect(await db.selectFrom("candles").where("instrument_id", "=", id).selectAll().execute()).toHaveLength(1);
+      expect(await db.selectFrom("candle_insert_journal").where("instrument_id", "=", id).selectAll().execute()).toHaveLength(1);
+      expect((await db.selectFrom("candle_insert_heads").where("instrument_id", "=", id).selectAll().executeTakeFirstOrThrow()).revision).toBe("1");
+      expect(fresh.diagnostics()).toMatchObject({ retries: 1, committed: 1, failed: 0, pending: 0, bufferedBytes: 0 });
+    } finally { write.mockRestore(); }
   });
 });

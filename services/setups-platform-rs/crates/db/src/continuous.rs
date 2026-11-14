@@ -270,7 +270,7 @@ pub async fn active_adaptive_slots(pool: &PgPool, owner: &str) -> Result<Vec<Act
     })).collect()
 }
 
-#[derive(Debug,Clone,PartialEq)]
+#[derive(Debug,Clone,PartialEq,Serialize)]
 pub struct AdaptiveCheckpoint {
     /// May be the preceding generation: caller must preserve slot signal dedup/cooldown.
     pub generation_id: i64,
@@ -283,7 +283,7 @@ pub async fn get_adaptive_checkpoint(pool: &PgPool, slot_id: i64, instrument_key
         .map(|row|Ok(AdaptiveCheckpoint{generation_id:row.try_get("generation_id")?,state:row.try_get("state")?})).transpose()
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug,Clone,Serialize)]
 pub struct AdaptiveSetupWrite {
     pub exchange_code: String,
     pub category: String,
@@ -305,6 +305,56 @@ pub struct AdaptiveCommit {
     pub applied: bool,
     /// Only newly inserted rows are eligible for notification, never duplicates.
     pub inserted: Vec<AdaptiveInserted>,
+}
+
+pub const ADAPTIVE_COMMIT_MAX_INSTRUMENTS: usize = 32;
+/// Sum of serialized scan bytes, including predecessors, raw setups and recommendations.
+/// Legacy single-scan entry points retain their existing per-item limits instead.
+pub const ADAPTIVE_COMMIT_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub const ADAPTIVE_COMMIT_STATEMENT_TIMEOUT_MS: u64 = 2_000;
+pub const ADAPTIVE_COMMIT_LOCK_TIMEOUT_MS: u64 = 1_000;
+/// Checked between DB operations; an in-flight statement retains its server timeout.
+pub const ADAPTIVE_COMMIT_TRANSACTION_BUDGET_MS: u64 = 10_000;
+
+#[derive(Debug,Clone,Serialize)]
+pub struct AdaptiveScanWrite {
+    pub instrument_key: String,
+    pub previous: Option<AdaptiveCheckpoint>,
+    pub checkpoint: Value,
+    pub setups: Vec<AdaptiveSetupWrite>,
+}
+
+#[derive(Clone,Copy,Serialize)]
+struct AdaptiveScanRef<'a> {
+    instrument_key: &'a str,
+    previous: Option<&'a AdaptiveCheckpoint>,
+    checkpoint: &'a Value,
+    setups: &'a [AdaptiveSetupWrite],
+}
+
+impl<'a> From<&'a AdaptiveScanWrite> for AdaptiveScanRef<'a> {
+    fn from(scan: &'a AdaptiveScanWrite) -> Self {
+        Self {instrument_key:&scan.instrument_key,previous:scan.previous.as_ref(),checkpoint:&scan.checkpoint,setups:&scan.setups}
+    }
+}
+
+#[derive(Default)]
+struct AdaptiveScanBytes(usize);
+impl std::io::Write for AdaptiveScanBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0=self.0.checked_add(bytes.len()).filter(|size|*size<=ADAPTIVE_COMMIT_MAX_BYTES)
+            .ok_or_else(||std::io::Error::new(std::io::ErrorKind::InvalidInput,"adaptive commit exceeds byte limit"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {Ok(())}
+}
+
+/// Allocation-free byte accounting for worker microbatch admission. Batch size is
+/// the sum of this value for its scans, without array/separator overhead.
+pub fn adaptive_scan_write_bytes(scan: &AdaptiveScanWrite) -> Result<usize,DbError> {
+    let mut bytes=AdaptiveScanBytes::default();
+    serde_json::to_writer(&mut bytes,scan).map_err(crate::json_error)?;
+    Ok(bytes.0)
 }
 
 fn validate_scan(instrument_key: &str, checkpoint: &Value, setups: &[AdaptiveSetupWrite]) -> Result<(),DbError> {
@@ -345,8 +395,46 @@ pub async fn commit_adaptive_scan_cas(
     checkpoint: &Value,
     setups: &[AdaptiveSetupWrite],
 ) -> Result<AdaptiveCommit,DbError> {
-    validate_scan(instrument_key,checkpoint,setups)?;
+    // No full setup/checkpoint clone and no new aggregate cap for existing callers.
+    let scan=AdaptiveScanRef {instrument_key,previous,checkpoint,setups};
+    Ok(commit_adaptive_scan_refs(pool,expected,&[scan],false).await?.remove(0))
+}
+
+/// One fenced transaction for one captured slot/generation/revision. Results are
+/// in INPUT order; inserted indices are local to each scan. Stale predecessors or
+/// non-ready instruments return applied=false without excluding valid siblings.
+/// Any validation/write/outbox error rolls back ALL siblings. Ambiguous COMMIT
+/// errors must be reconciled against exact durable successors before RAM adoption.
+pub async fn commit_adaptive_scans_cas(
+    pool: &PgPool,
+    expected: &ActiveAdaptiveSlot,
+    scans: &[AdaptiveScanWrite],
+) -> Result<Vec<AdaptiveCommit>,DbError> {
+    if scans.is_empty() || scans.len()>ADAPTIVE_COMMIT_MAX_INSTRUMENTS {
+        return Err(DbError::Json("adaptive commit instrument count must be in 1..=32".into()));
+    }
+    let scans:Vec<_>=scans.iter().map(AdaptiveScanRef::from).collect();
+    commit_adaptive_scan_refs(pool,expected,&scans,true).await
+}
+
+async fn commit_adaptive_scan_refs(
+    pool: &PgPool,
+    expected: &ActiveAdaptiveSlot,
+    scans: &[AdaptiveScanRef<'_>],
+    bounded: bool,
+) -> Result<Vec<AdaptiveCommit>,DbError> {
+    let keys=validate_adaptive_scan_batch(scans,bounded)?;
+    let deadline=bounded.then(||std::time::Instant::now()+std::time::Duration::from_millis(ADAPTIVE_COMMIT_TRANSACTION_BUDGET_MS));
+    let mut results=vec![AdaptiveCommit{applied:false,inserted:Vec::new()};scans.len()];
     let mut tx = pool.begin().await?;
+    if bounded {
+        // PG16 has no transaction_timeout. Bound server statements/locks, then
+        // check the transaction budget between operations, never drop COMMIT.
+        sqlx::query("select set_config('statement_timeout',$1,true),set_config('lock_timeout',$2,true)")
+            .bind(ADAPTIVE_COMMIT_STATEMENT_TIMEOUT_MS.to_string()).bind(ADAPTIVE_COMMIT_LOCK_TIMEOUT_MS.to_string())
+            .execute(&mut *tx).await?;
+    }
+    adaptive_commit_budget(deadline)?;
     // Same process -> slot lock order as atomic promotion; no locks are held during CPU/I/O.
     let process = sqlx::query("select desired_running,config,config_revision from continuous_processes where owner_id=$1 and algorithm_id=$2 for share")
         .bind(&expected.owner_id).bind(&expected.algorithm_id).fetch_optional(&mut *tx).await?;
@@ -362,24 +450,76 @@ pub async fn commit_adaptive_scan_cas(
             && g.try_get::<Value,_>("value")?["enabled"]==json!(true),
         _ => false,
     };
-    if !enabled { return Ok(AdaptiveCommit{applied:false,inserted:Vec::new()}); }
+    if !enabled {return Ok(results);}
     // Read the current durable projection, not the caller's possibly stale copy.
     // Waiting instruments may join only through the real-state fenced join API.
     let readiness:Value=sqlx::query_scalar("select live_readiness from continuous_generations where id=$1")
         .bind(expected.generation_id).fetch_one(&mut *tx).await?;
     let readiness:Vec<live::LiveInstrumentReadiness>=serde_json::from_value(readiness).map_err(crate::json_error)?;
-    let publication_floor=if !readiness.is_empty() {
-        let Some(entry)=readiness.iter().find(|entry|entry.instrument_key==instrument_key && entry.status=="ready") else {
-            return Ok(AdaptiveCommit{applied:false,inserted:Vec::new()});
-        };
-        Some(entry.publication_floor_close_unix)
-    }else{None};
-    let current = sqlx::query("select generation_id,state from adaptive_live_checkpoints where slot_id=$1 and instrument_key=$2 for update")
-        .bind(expected.slot_id).bind(instrument_key).fetch_optional(&mut *tx).await?
-        .map(|r|Ok::<_,DbError>(AdaptiveCheckpoint{generation_id:r.try_get("generation_id")?,state:r.try_get("state")?})).transpose()?;
-    if current.as_ref()!=previous { return Ok(AdaptiveCommit{applied:false,inserted:Vec::new()}); }
+    let current=sqlx::query("select instrument_key,generation_id,state from adaptive_live_checkpoints where slot_id=$1 and instrument_key=any($2) order by instrument_key for update")
+        .bind(expected.slot_id).bind(&keys).fetch_all(&mut *tx).await?
+        .into_iter().map(|row|Ok::<_,DbError>((row.try_get::<String,_>("instrument_key")?,AdaptiveCheckpoint {
+            generation_id:row.try_get("generation_id")?,state:row.try_get("state")?,
+        }))).collect::<Result<std::collections::BTreeMap<_,_>,_>>()?;
+    let mut order:Vec<_>=(0..scans.len()).collect();
+    order.sort_unstable_by_key(|&index|scans[index].instrument_key);
+    let mut applied=Vec::with_capacity(scans.len());
+    for index in order {
+        adaptive_commit_budget(deadline)?;
+        let scan=scans[index];
+        let publication_floor=if !readiness.is_empty() {
+            let Some(entry)=readiness.iter().find(|entry|entry.instrument_key==scan.instrument_key && entry.status=="ready") else {continue;};
+            Some(entry.publication_floor_close_unix)
+        }else{None};
+        if current.get(scan.instrument_key)!=scan.previous {continue;}
+        let inserted=persist_adaptive_setups(&mut tx,expected,publication_floor,scan.setups,deadline).await?;
+        results[index]=AdaptiveCommit{applied:true,inserted};
+        applied.push(scan);
+    }
+    if applied.is_empty() {return Ok(results);}
+    adaptive_commit_budget(deadline)?;
+    let mut checkpoints=sqlx::QueryBuilder::<Postgres>::new("insert into adaptive_live_checkpoints(slot_id,instrument_key,generation_id,state) ");
+    checkpoints.push_values(applied,|mut row,scan| {
+        row.push_bind(expected.slot_id).push_bind(scan.instrument_key).push_bind(expected.generation_id).push_bind(scan.checkpoint);
+    });
+    checkpoints.push(" on conflict(slot_id,instrument_key) do update set generation_id=excluded.generation_id,state=excluded.state,updated_at=now()")
+        .build().execute(&mut *tx).await?;
+    adaptive_commit_budget(deadline)?;
+    tx.commit().await?;
+    Ok(results)
+}
+
+fn adaptive_commit_budget(deadline: Option<std::time::Instant>) -> Result<(),DbError> {
+    if deadline.is_some_and(|deadline|std::time::Instant::now()>=deadline) {
+        return Err(DbError::Json("adaptive commit transaction budget exceeded".into()));
+    }
+    Ok(())
+}
+
+fn validate_adaptive_scan_batch<'a>(scans: &[AdaptiveScanRef<'a>], bounded: bool) -> Result<Vec<&'a str>,DbError> {
+    if scans.is_empty() || scans.len()>ADAPTIVE_COMMIT_MAX_INSTRUMENTS {
+        return Err(DbError::Json("adaptive commit instrument count must be in 1..=32".into()));
+    }
+    let mut keys=std::collections::BTreeSet::new();
+    let mut bytes=AdaptiveScanBytes::default();
+    for scan in scans {
+        if !keys.insert(scan.instrument_key) {return Err(DbError::Json("duplicate adaptive commit instrument key".into()));}
+        if bounded {serde_json::to_writer(&mut bytes,scan).map_err(crate::json_error)?;}
+        validate_scan(scan.instrument_key,scan.checkpoint,scan.setups)?;
+    }
+    Ok(keys.into_iter().collect())
+}
+
+async fn persist_adaptive_setups(
+    tx: &mut Transaction<'_,Postgres>,
+    expected: &ActiveAdaptiveSlot,
+    publication_floor: Option<i64>,
+    setups: &[AdaptiveSetupWrite],
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<AdaptiveInserted>,DbError> {
     let mut inserted = Vec::new();
     for (index,row) in setups.iter().enumerate() {
+        adaptive_commit_budget(deadline)?;
         if row.setup.algorithm_id!=expected.algorithm_id
             || Some(row.setup.algorithm_version.as_str())!=expected.spec["algorithmVersion"].as_str() {
             return Err(DbError::Json("adaptive setup differs from generation algorithm/version".into()));
@@ -390,7 +530,7 @@ pub async fn commit_adaptive_scan_cas(
             .ok_or_else(||DbError::Json("invalid adaptive setup close timestamp".into()))?;
         if publication_floor.is_some_and(|floor|row.setup.close_time_unix<=floor) {
             let duplicate:bool=sqlx::query_scalar("select exists(select 1 from live_setups where adaptive_slot_id=$1 and exchange_code=$2 and category=$3 and symbol=$4 and open_time=$5)")
-                .bind(expected.slot_id).bind(&row.exchange_code).bind(&row.category).bind(&row.symbol).bind(open).fetch_one(&mut *tx).await?;
+                .bind(expected.slot_id).bind(&row.exchange_code).bind(&row.category).bind(&row.symbol).bind(open).fetch_one(&mut **tx).await?;
             if duplicate {continue;}
             return Err(DbError::Json("adaptive emission precedes instrument publication floor".into()));
         }
@@ -400,17 +540,15 @@ pub async fn commit_adaptive_scan_cas(
             .bind(open).bind(close).bind(&row.setup.close_price)
             .bind(serde_json::to_value(&row.setup.details).map_err(crate::json_error)?)
             .bind(expected.slot_id).bind(expected.generation_id).bind(&row.recommendation).bind(&expected.external_name)
-            .fetch_optional(&mut *tx).await?;
+            .fetch_optional(&mut **tx).await?;
+        adaptive_commit_budget(deadline)?;
         if let Some(id)=id {
-            outbox::enqueue(&mut tx,expected,id,row).await?;
+            outbox::enqueue(tx,expected,id,row).await?;
+            adaptive_commit_budget(deadline)?;
             inserted.push(AdaptiveInserted{index,id:i64::from(id)});
         }
     }
-    sqlx::query("insert into adaptive_live_checkpoints(slot_id,instrument_key,generation_id,state) values($1,$2,$3,$4) on conflict(slot_id,instrument_key) do update set generation_id=excluded.generation_id,state=excluded.state,updated_at=now()")
-        .bind(expected.slot_id).bind(instrument_key).bind(expected.generation_id).bind(checkpoint)
-        .execute(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(AdaptiveCommit{applied:true,inserted})
+    Ok(inserted)
 }
 
 fn without_live_permission(value: &Value) -> Value {
@@ -439,6 +577,48 @@ pub async fn is_service_batch(pool:&PgPool,id:i64)->Result<bool,DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adaptive_batch_preflight_bounds_keys_items_and_exact_serialized_bytes() {
+        let scan=AdaptiveScanWrite {instrument_key:"bybit/linear/BTCUSDT".into(),previous:Some(AdaptiveCheckpoint {
+            generation_id:7,state:json!({"nextOpenUnix":60}),
+        }),checkpoint:json!({"nextOpenUnix":120}),setups:Vec::new()};
+        assert_eq!(adaptive_scan_write_bytes(&scan).unwrap(),serde_json::to_vec(&scan).unwrap().len());
+        let borrowed=AdaptiveScanRef::from(&scan);
+        assert!(validate_adaptive_scan_batch(&[],true).is_err());
+        assert!(validate_adaptive_scan_batch(&[borrowed;ADAPTIVE_COMMIT_MAX_INSTRUMENTS+1],true).is_err());
+        assert!(validate_adaptive_scan_batch(&[borrowed,borrowed],true).is_err());
+        let writes:Vec<_>=(0..ADAPTIVE_COMMIT_MAX_INSTRUMENTS).map(|index|AdaptiveScanWrite {
+            instrument_key:format!("bybit/linear/S{index:02}"),..scan.clone()
+        }).collect();
+        let refs:Vec<_>=writes.iter().rev().map(AdaptiveScanRef::from).collect();
+        let keys=validate_adaptive_scan_batch(&refs,true).unwrap();
+        assert_eq!(keys.first().copied(),Some("bybit/linear/S00"));
+        assert_eq!(keys.len(),ADAPTIVE_COMMIT_MAX_INSTRUMENTS);
+        let mut invalid=scan.clone();invalid.instrument_key.clear();
+        assert!(validate_adaptive_scan_batch(&[AdaptiveScanRef::from(&invalid)],true).is_err());
+        invalid=scan;invalid.checkpoint=json!({"oversize":"x".repeat(16384)});
+        assert!(validate_adaptive_scan_batch(&[AdaptiveScanRef::from(&invalid)],true).is_err());
+    }
+
+    #[test]
+    fn adaptive_batch_byte_limit_does_not_tighten_legacy_single_scan_validation() {
+        let setup=AdaptiveSetupWrite {exchange_code:"bybit".into(),category:"linear".into(),symbol:"BTCUSDT".into(),
+            setup:setups_domain::SpikeSetup {algorithm_id:"price_volume_spike".into(),algorithm_version:"1.1.1".into(),
+                open_time_unix:0,close_time_unix:60,close_price:"x".repeat(ADAPTIVE_COMMIT_MAX_BYTES),
+                params:setups_domain::AlgorithmParams::Spike(setups_domain::SpikeParams::default()),details:None},
+            recommendation:json!({})};
+        let scan=AdaptiveScanWrite {instrument_key:"bybit/linear/BTCUSDT".into(),previous:None,checkpoint:json!({}),setups:vec![setup]};
+        assert!(validate_scan(&scan.instrument_key,&scan.checkpoint,&scan.setups).is_ok());
+        assert!(adaptive_scan_write_bytes(&scan).is_err());
+        assert!(validate_adaptive_scan_batch(&[AdaptiveScanRef::from(&scan)],true).is_err());
+        assert!(validate_adaptive_scan_batch(&[AdaptiveScanRef::from(&scan)],false).is_ok());
+        let mut small=scan.setups[0].clone();small.setup.close_price="100".into();
+        let oversized=vec![small;257];
+        assert!(validate_scan(&scan.instrument_key,&scan.checkpoint,&oversized).is_err());
+        assert!(adaptive_commit_budget(Some(std::time::Instant::now())).is_err());
+        assert!(adaptive_commit_budget(None).is_ok());
+    }
 
     #[test]
     fn bounded_scan_rejects_identity_state_and_batch_overflow_before_database() {

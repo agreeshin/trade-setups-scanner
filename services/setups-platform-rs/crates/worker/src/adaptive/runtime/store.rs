@@ -93,6 +93,22 @@ pub struct PgAdaptiveStore<'a> {
     pub slot: &'a ActiveAdaptiveSlot,
 }
 
+pub(super) async fn capture_slot(pool:&PgPool,slot:&ActiveAdaptiveSlot)->Result<ActiveAdaptiveSlot,WorkerError> {
+    let mut captured=slot.clone();
+    let settings=settings_get(pool,&format!("algorithm:{}",slot.algorithm_id)).await?;
+    captured.external_name=settings.as_ref().and_then(|value|value["externalName"].as_str()).map(str::to_owned)
+        .unwrap_or_else(||match slot.algorithm_id.as_str() {
+            setups_domain::SPIKE_ALGORITHM_ID=>"Всплеск цены и оборота".into(),
+            setups_domain::SPIKE_DROP_ALGORITHM_ID=>"Падение цены и всплеск оборота".into(),
+            _=>slot.external_name.clone(),
+        });
+    if captured.external_name.trim().is_empty() || captured.external_name.chars().count()>120
+        || captured.external_name.len()>480 || captured.external_name.chars().any(char::is_control) {
+        return Err(invalid("invalid external algorithm name at setup creation"));
+    }
+    Ok(captured)
+}
+
 impl AdaptiveStore for PgAdaptiveStore<'_> {
     async fn current(&self, _: &AdaptiveFence) -> Result<bool, WorkerError> {
         Ok(continuous::adaptive_notification_permitted(self.pool, self.slot).await?)

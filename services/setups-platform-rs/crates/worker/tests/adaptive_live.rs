@@ -308,17 +308,13 @@ async fn spawn_market(state:Market)->(String,tokio::task::JoinHandle<()>) {
     (url,server)
 }
 async fn catalog() -> Json<Value> {
-    Json(json!({"instruments":[
-        {"id":1,"exchange":"bybit","category":"linear","symbol":"BTCUSDT","status":"active"},
-        {"id":2,"exchange":"bybit","category":"linear","symbol":"DELISTUSDT","status":"inactive"},
-        {"id":3,"exchange":"bybit","category":"linear","symbol":"NOTINSTUDYUSDT","status":"active"},
-        {"id":4,"exchange":"bybit","category":"linear","symbol":"EXTRA4USDT","status":"active"},
-        {"id":5,"exchange":"bybit","category":"linear","symbol":"EXTRA5USDT","status":"active"},
-        {"id":6,"exchange":"bybit","category":"linear","symbol":"EXTRA6USDT","status":"active"},
-        {"id":7,"exchange":"bybit","category":"linear","symbol":"EXTRA7USDT","status":"active"},
-        {"id":8,"exchange":"bybit","category":"linear","symbol":"EXTRA8USDT","status":"active"},
-        {"id":9,"exchange":"bybit","category":"linear","symbol":"EXTRA9USDT","status":"active"}
-    ]}))
+    let mut instruments=vec![
+        json!({"id":1,"exchange":"bybit","category":"linear","symbol":"BTCUSDT","status":"active"}),
+        json!({"id":2,"exchange":"bybit","category":"linear","symbol":"DELISTUSDT","status":"inactive"}),
+        json!({"id":3,"exchange":"bybit","category":"linear","symbol":"NOTINSTUDYUSDT","status":"active"}),
+    ];
+    instruments.extend((4..=47).map(|id|json!({"id":id,"exchange":"bybit","category":"linear","symbol":format!("EXTRA{id}USDT"),"status":"active"})));
+    Json(json!({"instruments":instruments}))
 }
 
 #[tokio::test]
@@ -1184,4 +1180,63 @@ async fn replacement_preserves_a_waiting_sibling_and_does_not_publish_its_warmup
     assert_eq!(sqlx::query_scalar::<_,i64>("select adaptive_generation_id from live_setups where adaptive_slot_id=$1 and extract(epoch from close_time)::bigint=$2").bind(f.slot).bind(f.now+60).fetch_one(&f.db.pool).await.unwrap(),candidate);
     assert_eq!(f.runtime.retained_history_epochs(),1);
     f.close().await;
+}
+
+#[tokio::test]
+async fn hot_microbatches_and_delayed_join_cohort_keep_servicing_ready_instrument() {
+    let Some(db)=Database::new("bounded_hot_join").await else {return;};configure(&db.pool).await;
+    let now=chrono::Utc::now().timestamp().div_euclid(60)*60;
+    let mut scope=vec!["BTCUSDT".to_string()];scope.extend((4..44).map(|id|format!("EXTRA{id}USDT")));
+    let names:Vec<_>=scope.iter().map(String::as_str).collect();
+    let (spec,result)=scoped_profile(now,&names);
+    let slot:i64=sqlx::query_scalar("select min(id) from continuous_slots").fetch_one(&db.pool).await.unwrap();
+    activate(&db.pool,slot,&spec,&result).await;
+    let generation:i64=sqlx::query_scalar("select active_generation_id from continuous_slots where id=$1").bind(slot).fetch_one(&db.pool).await.unwrap();
+    let market=Market::new(now);let (url,server)=spawn_market(market.clone()).await;
+    let client=setups_mdclient::MarketDataClient::new(url,"fixture");
+    let mut runtime=AdaptiveLiveRuntime::new(AdaptiveRuntimeLimits {max_history_bytes:128*1024*1024,max_symbols:64,
+        max_profile_bytes:32*1024*1024,..AdaptiveRuntimeLimits::default()});
+    for _ in 0..16 {
+        runtime.tick_at(&db.pool,&client,&AtomicBool::new(false),now+5).await.unwrap();
+        let count:i64=sqlx::query_scalar("select count(*) from adaptive_live_checkpoints where slot_id=$1").bind(slot).fetch_one(&db.pool).await.unwrap();
+        if count==41 {break;}
+    }
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_live_checkpoints where slot_id=$1").bind(slot).fetch_one(&db.pool).await.unwrap(),41);
+    // Statement-level instrumentation distinguishes a genuine multirow commit
+    // from 41 ordinary transactions without a wall-clock performance assertion.
+    sqlx::raw_sql("create table fixture_hot_calls(id bigserial); create function fixture_hot_call() returns trigger language plpgsql as $$ begin insert into fixture_hot_calls default values; return null; end $$; create trigger fixture_hot_call after insert on adaptive_live_checkpoints for each statement execute function fixture_hot_call();")
+        .execute(&db.pool).await.unwrap();
+    settings_set(&db.pool,"algorithm:price_volume_spike",&json!({"enabled":false,"externalName":"Captured batch name"})).await.unwrap();
+    market.journal.lock().unwrap().available_through=Some(now+60);
+    runtime.tick_at(&db.pool,&client,&AtomicBool::new(false),now+65).await.unwrap();
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from fixture_hot_calls").fetch_one(&db.pool).await.unwrap(),2,
+        "41 hot symbols require two 32-instrument microbatches, not 41 transactions");
+    let rows=sqlx::query("select external_name,recommendation from live_setups where adaptive_slot_id=$1 and extract(epoch from close_time)::bigint=$2")
+        .bind(slot).bind(now+60).fetch_all(&db.pool).await.unwrap();
+    assert_eq!(rows.len(),41);
+    for row in rows {assert_eq!(row.get::<String,_>("external_name"),"Captured batch name");assert_eq!(row.get::<Value,_>("recommendation")["externalName"],"Captured batch name");}
+    runtime.tick_at(&db.pool,&client,&AtomicBool::new(false),now+66).await.unwrap();
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from fixture_hot_calls").fetch_one(&db.pool).await.unwrap(),2,"unchanged hot polls do not write checkpoints");
+    // Own-fixture operational state: a large cohort is warm in RAM but waiting
+    // for its fenced join. A delay on each readiness write reproduces the old
+    // monopolizing loop. Assertions use counts/progress, not timing thresholds.
+    sqlx::query("update continuous_generations set live_readiness=(select jsonb_agg(case when e->>'instrumentKey'='bybit/linear/BTCUSDT' then e else e||'{\"status\":\"waiting\",\"reason\":\"waiting_tail\"}'::jsonb end) from jsonb_array_elements(live_readiness) e) where id=$1")
+        .bind(generation).execute(&db.pool).await.unwrap();
+    sqlx::raw_sql("create function fixture_slow_join() returns trigger language plpgsql as $$ begin if new.live_readiness is distinct from old.live_readiness then perform pg_sleep(0.02); end if; return new; end $$; create trigger fixture_slow_join before update of live_readiness on continuous_generations for each row execute function fixture_slow_join();")
+        .execute(&db.pool).await.unwrap();
+    let mut previous=1i64;let mut complete=false;
+    for turn in 2..=49 {
+        let target=now+turn*60;
+        market.journal.lock().unwrap().available_through=Some(target);
+        runtime.tick_at(&db.pool,&client,&AtomicBool::new(false),target+5).await.unwrap();
+        let ready:i64=sqlx::query_scalar("select count(*) from continuous_generations g cross join lateral jsonb_array_elements(g.live_readiness) e where g.id=$1 and e->>'status'='ready'")
+            .bind(generation).fetch_one(&db.pool).await.unwrap();
+        assert!(ready>previous && ready-previous<=8,"join quantum must make progress without draining the entire cohort: previous={previous}, ready={ready}");
+        assert_eq!(continuous::get_adaptive_checkpoint(&db.pool,slot,"bybit/linear/BTCUSDT").await.unwrap().unwrap().state["nextOpenUnix"],target,
+            "the ready instrument must be serviced between delayed join quanta");
+        previous=ready;if ready==41 {complete=true;break;}
+    }
+    assert!(complete,"persistent join cursor must eventually reach the last waiting symbol");
+    assert!(runtime.retained_history_bytes()<128*1024*1024);
+    server.abort();let _=server.await;db.close().await;
 }
