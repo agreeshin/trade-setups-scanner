@@ -226,6 +226,9 @@ struct Journal {
     starts:std::collections::BTreeMap<i64,i64>,
     ends:std::collections::BTreeMap<i64,i64>,
     history_error:bool,
+    // A truthful smaller source page keeps one instrument unresolved across
+    // turns while another has already joined canonical shared history.
+    history_page_limits:std::collections::BTreeMap<i64,usize>,
 }
 impl Journal {
     fn repair(&mut self,open:i64) {
@@ -250,9 +253,10 @@ async fn candles(State(state): State<Market>, Query(query): Query<CandleQuery>) 
     if journal.history_error {return Err(axum::http::StatusCode::GATEWAY_TIMEOUT);}
     let start=query.from_unix.max(state.now-3*86400).max(journal.starts.get(&query.instrument_id).copied().unwrap_or(0));
     let end=query.to_unix.min(journal.ends.get(&query.instrument_id).copied().unwrap_or(journal.available_through.unwrap_or(state.now)));
+    let limit=query.limit.unwrap_or(256).min(journal.history_page_limits.get(&query.instrument_id).copied().unwrap_or(usize::MAX));
     let mut candles:Vec<_>=(start..end).step_by(60).filter(|time|query.after_unix.is_none_or(|after|*time>after) && !journal.gaps.contains(time))
-        .take(query.limit.unwrap_or(256)+1).map(|time|json!({"openTimeUnix":time,"open":"100","high":"100","low":"100","close":"100","volume":"1","quoteTurnover":if journal.quiet.contains(&time){"0"}else{"1"}})).collect();
-    let more = candles.len() > query.limit.unwrap_or(256);
+        .take(limit+1).map(|time|json!({"openTimeUnix":time,"open":"100","high":"100","low":"100","close":"100","volume":"1","quoteTurnover":if journal.quiet.contains(&time){"0"}else{"1"}})).collect();
+    let more = candles.len() > limit;
     if more {
         candles.pop();
     }
@@ -952,6 +956,131 @@ async fn pending_late_final_preserves_incumbent_through_watermark_and_new_genera
     f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+65).await.unwrap();
     assert_eq!(sqlx::query_scalar::<_,i64>("select adaptive_generation_id from live_setups where adaptive_slot_id=$1 and extract(epoch from close_time)::bigint=$2").bind(f.slot).bind(f.now+60).fetch_one(&f.db.pool).await.unwrap(),candidate);
     assert_eq!(f.runtime.retained_history_epochs(),1);f.close().await;
+}
+
+#[tokio::test]
+async fn partially_adopted_candidate_survives_delayed_tail_cleanup_and_reconnect() {
+    let Some(mut f)=LiveFixture::new("partial_adopt_reconnect",false).await else {return;};
+    let limits=AdaptiveRuntimeLimits {max_history_bytes:32*1024*1024,max_symbols:10,
+        max_profile_bytes:4*1024*1024,warmup_pages_per_turn:1,..AdaptiveRuntimeLimits::default()};
+    f.runtime=AdaptiveLiveRuntime::new(limits);
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now).await.unwrap();
+    let incumbent=f.durable().await;
+    let incumbent_bytes=f.runtime.retained_profile_bytes();
+    let candidate_slot:i64=sqlx::query_scalar("select max(id) from continuous_slots").fetch_one(&f.db.pool).await.unwrap();
+    let (spec,result)=scoped_profile(f.now,&["BTCUSDT","NOTINSTUDYUSDT"]);
+    let candidate=stage(&f.db.pool,candidate_slot,&spec,&result).await;
+    f.market.journal.lock().unwrap().history_page_limits.insert(3,1);
+
+    // Exactly one page: BTC's verified candidate+incumbent shadow is adopted
+    // into the populated canonical ring, but the other instrument is unread.
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+5).await.unwrap();
+    assert_eq!(f.runtime.retained_history_epochs(),1,"the ready staging ring was adopted, not left duplicated");
+    assert!(f.runtime.retained_profile_bytes()>incumbent_bytes,"the pending candidate is attached beside the incumbent");
+    assert_eq!(f.durable().await,incumbent);
+    assert_eq!(sqlx::query_scalar::<_,Option<i64>>("select pending_generation_id from continuous_slots where id=$1")
+        .bind(candidate_slot).fetch_one(&f.db.pool).await.unwrap(),Some(candidate));
+    assert!(continuous::get_adaptive_checkpoint(&f.db.pool,candidate_slot,"bybit/linear/BTCUSDT").await.unwrap().is_none());
+
+    // New closed frontier, final OPEN now delayed. Real hot-tail parking runs
+    // while NOTINSTUDY is still mid-pagination: no promotion can hide refresh.
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+60).await.unwrap();
+    assert_eq!(f.durable().await,incumbent,"absence is not a processed minute");
+    assert_eq!(sqlx::query_scalar::<_,Option<i64>>("select pending_generation_id from continuous_slots where id=$1")
+        .bind(candidate_slot).fetch_one(&f.db.pool).await.unwrap(),Some(candidate));
+    let refreshed=f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+65).await;
+    assert!(refreshed.is_ok(),"partial adoption -> next frontier -> waiting-tail park -> refresh must preserve the verified candidate: {refreshed:?}");
+    let initialization:Value=sqlx::query_scalar("select live_initialization from continuous_generations where id=$1")
+        .bind(candidate).fetch_one(&f.db.pool).await.unwrap();
+    let btc_reads=||f.market.reads.lock().unwrap().iter().filter(|&&id|id==1).count();
+    let before_detach_reads=btc_reads();
+
+    // A real source transport failure on the unresolved instrument exercises
+    // report-failure -> discard: remove the candidate scalar and duplicate
+    // ring, not accepted research/result or the healthy incumbent's history.
+    f.market.journal.lock().unwrap().history_error=true;
+    let failed=f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+66).await;
+    assert!(failed.is_err(),"the injected HTTP 504 must be a technical retry, not waiting data");
+    assert_eq!(f.runtime.retained_history_epochs(),1);
+    assert_eq!(f.runtime.retained_profile_bytes(),incumbent_bytes,"discard must actually release candidate and shadow profiles");
+    assert_eq!(f.durable().await,incumbent);
+    assert_eq!(btc_reads(),before_detach_reads,"cleanup must not reconstruct healthy incumbent history");
+    let retry=sqlx::query("select live_init_status,live_init_attempts from continuous_generations where id=$1")
+        .bind(candidate).fetch_one(&f.db.pool).await.unwrap();
+    assert_eq!(retry.get::<String,_>("live_init_status"),"retry");assert_eq!(retry.get::<i32,_>("live_init_attempts"),1);
+    assert!(sqlx::query_scalar::<_,Option<String>>("select lease_owner from adaptive_live_warmup_lane where id=1")
+        .fetch_one(&f.db.pool).await.unwrap().is_none());
+
+    // Reclaim exactly the SAME completed candidate after its real DB backoff,
+    // without another study/result/replay or resetting any retry counter.
+    tokio::time::sleep(std::time::Duration::from_millis(5100)).await;
+    {let mut journal=f.market.journal.lock().unwrap();journal.history_error=false;journal.available_through=Some(f.now+60);journal.repair(f.now);}
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+67).await.unwrap();
+    assert_eq!(f.runtime.retained_history_epochs(),1,"reconnected ready candidate is verified and adopted again");
+    assert!(f.runtime.retained_profile_bytes()>incumbent_bytes);
+    assert_eq!(btc_reads(),before_detach_reads+1,"only the deliberately detached candidate needs another verified stage");
+    assert_eq!(f.durable().await.1.unwrap().state["nextOpenUnix"],f.now+60);
+
+    // Park that adopted candidate again on the NEXT delayed final, then let
+    // the other instrument finish. All-scope promotion is legal with BTC
+    // explicitly waiting; it must not leave its retained scalar muted forever.
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+120).await.unwrap();
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+125).await.unwrap();
+    {let mut journal=f.market.journal.lock().unwrap();journal.history_page_limits.remove(&3);journal.ends.insert(3,f.now+120);}
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+126).await.unwrap();
+    let active=continuous::active_adaptive_slots(&f.db.pool,"admin").await.unwrap().into_iter()
+        .find(|slot|slot.slot_id==candidate_slot).expect("partially ready candidate must activate");
+    assert_eq!(active.generation_id,candidate);
+    assert_eq!(serde_json::to_value(active.live_initialization.as_ref().unwrap()).unwrap(),initialization);
+    assert_eq!(active.live_readiness.len(),2,"scope cannot be reduced to the ready instrument");
+    let waiting=active.live_readiness.iter().find(|r|r.instrument_key=="bybit/linear/BTCUSDT").unwrap();
+    assert_eq!(waiting.status,"waiting");assert_eq!(waiting.reason.as_deref(),Some("waiting_tail"));
+    assert_eq!(waiting.publication_floor_close_unix,f.now+120);
+    assert!(continuous::get_adaptive_checkpoint(&f.db.pool,candidate_slot,"bybit/linear/BTCUSDT").await.unwrap().is_none(),"promotion cannot invent a waiting checkpoint");
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups where adaptive_slot_id=$1")
+        .bind(candidate_slot).fetch_one(&f.db.pool).await.unwrap(),0,"candidate warmup and promotion remain muted");
+
+    {let mut journal=f.market.journal.lock().unwrap();journal.available_through=Some(f.now+120);journal.repair(f.now+60);}
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+127).await.unwrap();
+    let joined=continuous::active_adaptive_slots(&f.db.pool,"admin").await.unwrap().into_iter()
+        .find(|slot|slot.slot_id==candidate_slot).unwrap();
+    let ready=joined.live_readiness.iter().find(|r|r.instrument_key=="bybit/linear/BTCUSDT").unwrap();
+    assert_eq!(ready.status,"ready","post-promotion waiting join must unmute the retained pending scalar");
+    assert_eq!(ready.publication_floor_close_unix,f.now+120);
+    assert_eq!(continuous::get_adaptive_checkpoint(&f.db.pool,candidate_slot,"bybit/linear/BTCUSDT").await.unwrap().unwrap().state["nextOpenUnix"],f.now+120);
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups where adaptive_slot_id=$1")
+        .bind(candidate_slot).fetch_one(&f.db.pool).await.unwrap(),0,"the late joining minute is not back-published");
+    assert_eq!(btc_reads(),before_detach_reads+1,"waiting join reuses verified canonical scalar/history, not another stage");
+
+    {let mut journal=f.market.journal.lock().unwrap();journal.available_through=Some(f.now+180);journal.ends.insert(3,f.now+180);journal.repair(f.now+120);}
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+185).await.unwrap();
+    let mut reference=setups_detector::PriceVolumeSpikeDetector::with_params(params(),None).unwrap();
+    let (_,original)=profile(f.now);let bootstrap=&original["bootstrap"];
+    let mut expected=Vec::new();
+    for open in (f.anchor..f.now+180).step_by(60) {
+        let bar=setups_domain::DetectorBar {open_time_unix:open,close:"100".into(),quote_turnover:"1".into()};
+        if let Some(raw)=reference.push(&bar).unwrap().setup
+            && raw.open_time_unix>=bootstrap["nextOpenUnix"].as_i64().unwrap()
+            && raw.close_time_unix>=bootstrap["emitFromCloseUnix"].as_i64().unwrap() {expected.push(serde_json::to_value(raw).unwrap());}
+    }
+    let actual:Vec<Value>=sqlx::query_scalar("select jsonb_build_object('algorithmId',algorithm_id,'algorithmVersion',algorithm_version,'openTimeUnix',extract(epoch from open_time)::bigint,'closeTimeUnix',extract(epoch from close_time)::bigint,'closePrice',close_price,'params',params,'details',details) from live_setups where adaptive_slot_id=$1 order by close_time")
+        .bind(f.slot).fetch_all(&f.db.pool).await.unwrap();
+    assert_eq!(actual,expected,"incumbent causal future outputs must match uninterrupted reference, without dropped/duplicate minutes");
+    let candidate_closes:Vec<i64>=sqlx::query_scalar("select extract(epoch from close_time)::bigint from live_setups where adaptive_slot_id=$1 and symbol='BTCUSDT' order by close_time")
+        .bind(candidate_slot).fetch_all(&f.db.pool).await.unwrap();
+    assert_eq!(candidate_closes,vec![f.now+180],"retained pending flag must clear and publish only strictly after its own floor");
+    assert_eq!(sqlx::query_scalar::<_,Value>("select result from continuous_generations where id=$1").bind(candidate).fetch_one(&f.db.pool).await.unwrap(),result);
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from optimization_studies").fetch_one(&f.db.pool).await.unwrap(),2);
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from replay_runs").fetch_one(&f.db.pool).await.unwrap(),0);
+    assert_eq!(f.runtime.retained_history_epochs(),2);assert!(f.runtime.peak_staging_epochs()<=4);
+    let steady_bytes=f.runtime.retained_profile_bytes();let before_repeat=f.durable().await;
+    for _ in 0..8 {f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+186).await.unwrap();}
+    assert_eq!(f.runtime.retained_profile_bytes(),steady_bytes,"repeated turns cannot accumulate candidate copies");
+    assert_eq!(f.durable().await,before_repeat);assert_eq!(btc_reads(),before_detach_reads+1);
+    settings_set(&f.db.pool,"live",&json!({"enabled":false})).await.unwrap();
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+187).await.unwrap();
+    assert_eq!(f.runtime.retained_history_bytes(),0);assert_eq!(f.runtime.retained_profile_bytes(),0);
+    f.close().await;
 }
 
 #[tokio::test]

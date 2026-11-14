@@ -240,11 +240,15 @@ impl AdaptiveLiveRuntime {
         if !plan.specs.iter().any(|spec|spec.key()==warmup.candidate_key) {return;}
         let Some(reason)=self.state.waiting_reason(&plan.epoch,&warmup.candidate_key,frontier) else {return;};
         warmup.waiting.insert(instrument_key(&plan.instrument),reason.into());
-        // Keep the declared scope/disposition, not a permanently occupied
-        // duplicate ring. Never evict an incumbent's canonical live state.
-        if plan.epoch==AdaptiveRuntime::epoch_key(&plan.instrument,None) {
-            self.state.remove_profile(&plan.epoch,&warmup.candidate_key);
-        } else {self.state.invalidate(&plan.epoch,None);}
+        // Release duplicate staging rings so waiting instruments cannot block
+        // admission. An already adopted candidate instead owns bounded scalar
+        // state in canonical history: keep its verified origin/proof and muted
+        // pending flag. Removing it would make refresh attach a new profile to
+        // populated incumbent history. Promotion/join activates it; discard and
+        // reconcile release it without rebuilding the healthy incumbent.
+        if plan.epoch!=AdaptiveRuntime::epoch_key(&plan.instrument,None) {
+            self.state.invalidate(&plan.epoch,None);
+        }
     }
     async fn join_ready_waiting(&mut self,pool:&PgPool,plans:&[SymbolPlan],frontier:i64)->Result<(),WorkerError> {
         let eligible:Vec<_>=plans.iter().flat_map(|plan|plan.specs.iter().filter(|spec|spec.waiting)
