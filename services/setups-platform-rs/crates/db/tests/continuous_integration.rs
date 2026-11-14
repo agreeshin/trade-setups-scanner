@@ -508,7 +508,7 @@ async fn migration_preserves_fixed_manual_history_and_separates_active_lanes() {
         let manual_before: Value = sqlx::query_scalar("select to_jsonb(s) from optimization_studies s where id=$1")
             .bind(manual).fetch_one(&pool).await.unwrap();
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
-        assert_eq!(setups_db::migrate::ensure_migrations(&pool).await.unwrap(), "0 applied, 8 up to date");
+        assert_eq!(setups_db::migrate::ensure_migrations(&pool).await.unwrap(), "0 applied, 9 up to date");
         let fixed_after: Value = sqlx::query_scalar("select to_jsonb(s)-array['adaptive_slot_id','adaptive_generation_id','recommendation','external_name','notification_delivery_status','notification_delivery_error','notification_delivery_updated_at','adaptive_generation_archive'] from live_setups s where id=$1")
             .bind(fixed).fetch_one(&pool).await.unwrap();
         let manual_after: Value = sqlx::query_scalar("select to_jsonb(s)-array['origin','owner_id','continuous_generation_id','continuous_slot_id'] from optimization_studies s where id=$1")
@@ -912,6 +912,203 @@ async fn independent_initialization_retries_keep_anchor_bound_attempts_and_recov
     }).await;
 }
 
+async fn exhausted_live_candidate(pool:&PgPool)->(db::ActiveAdaptiveSlot,db::live::PendingAdaptiveSlot,db::live::LiveInitialization) {
+    setups_db::migrate::ensure_migrations(pool).await.unwrap();
+    let old=accepted(pool).await;let pending=pending_fixture(pool,&old).await;
+    let mut initialization=None;
+    for attempt in 1..=3 {
+        sqlx::query("update continuous_generations set live_init_next_attempt_at=null where id=$1").bind(pending.profile.generation_id).execute(pool).await.unwrap();
+        let fence=db::live::claim_pending_warmup_at(pool,&pending,"exhaust-fixture",CUTOFF).await.unwrap().unwrap();
+        assert_eq!(fence.attempt,attempt);initialization=Some(fence.initialization.clone());
+        assert!(db::live::report_warmup_failure(pool,&fence,&json!({"code":"observed_terminal_error","attempt":attempt}),true).await.unwrap());
+    }
+    (old,pending,initialization.unwrap())
+}
+fn live_readmission_request(generation:i64,key:&str)->db::readmission::LiveReadmissionRequest {
+    db::readmission::LiveReadmissionRequest {expected_generation_id:generation,expected_config_revision:1,request_id:key.into()}
+}
+async fn readmission_snapshot(pool:&PgPool)->Value {
+    sqlx::query_scalar("select jsonb_build_object('processes',(select jsonb_agg(to_jsonb(p) order by owner_id,algorithm_id) from continuous_processes p),'generations',(select jsonb_agg(to_jsonb(g) order by id) from continuous_generations g),'slots',(select jsonb_agg(to_jsonb(s) order by id) from continuous_slots s),'lane',(select to_jsonb(w) from adaptive_live_warmup_lane w),'grants',(select jsonb_agg(to_jsonb(r) order by id) from continuous_live_readmissions r))")
+        .fetch_one(pool).await.unwrap()
+}
+async fn granted_live(pool:&PgPool,slot:i64,request:&db::readmission::LiveReadmissionRequest)->db::readmission::LiveReadmissionReceipt {
+    match db::readmission::grant(pool,OWNER,ALGORITHM,slot,request).await.unwrap() {
+        db::readmission::LiveReadmissionOutcome::Granted(receipt)=>receipt,outcome=>panic!("expected grant: {outcome:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn live_readmission_preserves_scientific_origin_ongoing_other_slot_research_and_promotes_normally() {
+    isolated(|pool|async move {
+        let (old,pending,origin)=exhausted_live_candidate(&pool).await;let id=pending.profile.generation_id;
+        let other_slot:i64=sqlx::query_scalar("insert into continuous_slots(owner_id,algorithm_id,min_setups_per_day) values($1,$2,5) returning id")
+            .bind(OWNER).bind(ALGORITHM).fetch_one(&pool).await.unwrap();
+        let research=generation(&pool,OWNER,ALGORITHM,other_slot,"running").await;
+        let study=study(&pool,OWNER,ALGORITHM,"running",Some(research),Some(other_slot)).await;
+        sqlx::query("update continuous_generations set research_deadline=now()+interval '10 minutes',resume_version=1 where id=$1").bind(research).execute(&pool).await.unwrap();
+        sqlx::query("update continuous_processes set active_generation_id=$1,active_study_id=$2,retry_count=2,next_slot=1,phase='optimizing' where owner_id=$3 and algorithm_id=$4")
+            .bind(research).bind(study).bind(OWNER).bind(ALGORITHM).execute(&pool).await.unwrap();
+        sqlx::query("update continuous_owner_lanes set lease_owner='research22',lease_token=19,lease_until=now()+interval '10 minutes' where owner_id=$1").bind(OWNER).execute(&pool).await.unwrap();
+        sqlx::query("insert into continuous_runtime_artifacts(generation_id,identity) values($1,'{\"keep\":true}')").bind(research).execute(&pool).await.unwrap();
+        sqlx::query("insert into continuous_maintenance(owner_id,admission_paused) values($1,true)").bind(OWNER).execute(&pool).await.unwrap();
+        let preserved=sqlx::query_scalar::<_,Value>("select jsonb_build_object('process',(select to_jsonb(p) from continuous_processes p),'research',(select to_jsonb(g) from continuous_generations g where id=$1),'study',(select to_jsonb(s) from optimization_studies s where id=$2),'lease',(select to_jsonb(l) from continuous_owner_lanes l),'artifact',(select to_jsonb(a) from continuous_runtime_artifacts a),'maintenance',(select to_jsonb(m) from continuous_maintenance m))")
+            .bind(research).bind(study).fetch_one(&pool).await.unwrap();
+        let immutable:Value=sqlx::query_scalar("select jsonb_build_object('spec',spec,'result',result,'accepted',accepted,'status',status,'study',study_id,'updatedAt',updated_at,'cutoff',observation_cutoff) from continuous_generations where id=$1")
+            .bind(id).fetch_one(&pool).await.unwrap();
+        let request=live_readmission_request(id,"restore-study-21-original");let receipt=granted_live(&pool,old.slot_id,&request).await;
+        assert!(!receipt.duplicate);assert_eq!(receipt.attempts_before,3);assert_eq!(receipt.limit_before,3);assert_eq!(receipt.attempt_limit,6);
+        let state=readmission_snapshot(&pool).await;
+        let mut duplicate=receipt.clone();duplicate.duplicate=true;
+        assert_eq!(granted_live(&pool,old.slot_id,&request).await,duplicate);assert_eq!(readmission_snapshot(&pool).await,state);
+        let evidence:Value=sqlx::query_scalar("select prior_state from continuous_live_readmissions where id=$1").bind(receipt.grant_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(evidence["attempts"],3);assert_eq!(evidence["lastError"]["attempt"],3);assert_eq!(evidence["liveInitStatus"],"exhausted");assert!(evidence["slotUpdatedAt"].is_string());
+        let pending=db::live::pending_adaptive_slots(&pool,OWNER).await.unwrap().remove(0);
+        let fence=db::live::claim_pending_warmup_at(&pool,&pending,"ordinary-worker",CUTOFF+3600).await.unwrap().unwrap();
+        assert_eq!(fence.attempt,4);assert_eq!(fence.initialization,origin);
+        assert!(db::live::report_warmup(&pool,&fence,"ready",Some(CUTOFF+600),None).await.unwrap());
+        let expected=[db::live::CheckpointExpectation {instrument_key:INSTRUMENT.into(),checkpoint:None}];
+        let initial=[db::live::InitialAdaptiveCheckpoint {instrument_key:INSTRUMENT.into(),state:promotion_state(id,CUTOFF+600)}];
+        assert!(db::live::promote_pending(&pool,&fence,Some(old.generation_id),&expected,CUTOFF+600,&initial).await.unwrap());
+        assert_eq!(db::active_adaptive_slots(&pool,OWNER).await.unwrap()[0].generation_id,id);
+        assert_eq!(sqlx::query_scalar::<_,Value>("select jsonb_build_object('spec',spec,'result',result,'accepted',accepted,'status',status,'study',study_id,'updatedAt',updated_at,'cutoff',observation_cutoff) from continuous_generations where id=$1").bind(id).fetch_one(&pool).await.unwrap(),immutable);
+        assert_eq!(sqlx::query_scalar::<_,Value>("select jsonb_build_object('process',(select to_jsonb(p) from continuous_processes p),'research',(select to_jsonb(g) from continuous_generations g where id=$1),'study',(select to_jsonb(s) from optimization_studies s where id=$2),'lease',(select to_jsonb(l) from continuous_owner_lanes l),'artifact',(select to_jsonb(a) from continuous_runtime_artifacts a),'maintenance',(select to_jsonb(m) from continuous_maintenance m))").bind(research).bind(study).fetch_one(&pool).await.unwrap(),preserved);
+        assert_eq!(sqlx::query_scalar::<_,Value>("select prior_state from continuous_live_readmissions where id=$1").bind(receipt.grant_id).fetch_one(&pool).await.unwrap(),evidence,"promotion cannot erase observed prior failure evidence");
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn live_readmission_idempotency_races_three_attempt_cycle_and_neutral_yield_preserve_charged_budget() {
+    isolated(|pool|async move {
+        let (old,pending,origin)=exhausted_live_candidate(&pool).await;let id=pending.profile.generation_id;
+        let request=live_readmission_request(id,"readmit-concurrent-key-1");
+        let (first,second)=tokio::join!(granted_live(&pool,old.slot_id,&request),granted_live(&pool,old.slot_id,&request));
+        assert_eq!(first.grant_id,second.grant_id);assert_ne!(first.duplicate,second.duplicate);
+        let new_key=live_readmission_request(id,"readmit-concurrent-key-2");
+        assert!(matches!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&new_key).await.unwrap(),db::readmission::LiveReadmissionOutcome::Conflict("live_readmission_ineligible")));
+        for attempt in 4..=6 {
+            sqlx::query("update continuous_generations set live_init_next_attempt_at=null where id=$1").bind(id).execute(&pool).await.unwrap();
+            let mut fence=db::live::claim_pending_warmup_at(&pool,&pending,"new-cycle",CUTOFF+3600).await.unwrap().unwrap();
+            assert_eq!(fence.attempt,attempt);assert_eq!(fence.initialization,origin);
+            if attempt==4 {
+                assert!(db::live::release_pending_warmup(&pool,&fence).await.unwrap());
+                let charged:(i32,i32)=sqlx::query_as("select live_init_attempts,live_init_attempt_limit from continuous_generations where id=$1").bind(id).fetch_one(&pool).await.unwrap();
+                assert_eq!(charged,(3,6),"benign fourth claim refunds exactly one charged attempt");
+                assert!(!db::live::report_warmup_failure(&pool,&fence,&json!({"code":"stale-yielded-worker"}),true).await.unwrap());
+                fence=db::live::claim_pending_warmup_at(&pool,&pending,"reclaim-fourth",CUTOFF+3600).await.unwrap().unwrap();
+                assert_eq!(fence.attempt,4);
+            }
+            if attempt<6 {assert!(db::live::report_warmup_failure(&pool,&fence,&json!({"code":"new_cycle_failure"}),true).await.unwrap());}
+            else {sqlx::query("update adaptive_live_warmup_lane set lease_until=clock_timestamp()-interval '1 second'").execute(&pool).await.unwrap();assert_eq!(db::live::recover_pending_warmups(&pool,OWNER).await.unwrap(),1);}
+        }
+        assert!(db::live::claim_pending_warmup_at(&pool,&pending,"no-seventh-auto",CUTOFF+7200).await.unwrap().is_none());
+        let before=readmission_snapshot(&pool).await;let replay=granted_live(&pool,old.slot_id,&request).await;
+        assert!(replay.duplicate);assert_eq!(replay.attempt_limit,6);assert_eq!(readmission_snapshot(&pool).await,before);
+        let racing_key=live_readmission_request(id,"readmit-concurrent-key-3");
+        let (left,right)=tokio::join!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&new_key),db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&racing_key));
+        let fresh=match (left.unwrap(),right.unwrap()) {
+            (db::readmission::LiveReadmissionOutcome::Granted(receipt),db::readmission::LiveReadmissionOutcome::Conflict(_))
+            | (db::readmission::LiveReadmissionOutcome::Conflict(_),db::readmission::LiveReadmissionOutcome::Granted(receipt))=>receipt,
+            outcomes=>panic!("distinct concurrent keys must grant only once per exhaustion: {outcomes:?}"),
+        };
+        assert_eq!(fresh.attempts_before,6);assert_eq!(fresh.attempt_limit,9);
+        let fence=db::live::claim_pending_warmup_at(&pool,&pending,"neutral-yield",CUTOFF+7200).await.unwrap().unwrap();assert_eq!(fence.attempt,7);
+        assert!(db::live::release_pending_warmup(&pool,&fence).await.unwrap());
+        let row=sqlx::query("select live_init_attempts,live_init_attempt_limit from continuous_generations where id=$1").bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(sqlx::Row::get::<i32,_>(&row,"live_init_attempts"),6);assert_eq!(sqlx::Row::get::<i32,_>(&row,"live_init_attempt_limit"),9);
+        let next=db::live::claim_pending_warmup_at(&pool,&pending,"after-yield",CUTOFF+7200).await.unwrap().unwrap();assert_eq!(next.attempt,7);
+        assert!(db::live::report_warmup_failure(&pool,&next,&json!({"code":"first_charged_failure"}),true).await.unwrap());
+        let wait:i64=sqlx::query_scalar("select ceil(extract(epoch from live_init_next_attempt_at-clock_timestamp()))::bigint from continuous_generations where id=$1").bind(id).fetch_one(&pool).await.unwrap();assert!((29..=30).contains(&wait),"later charged failures retain ordinary 30s backoff");
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from continuous_live_readmissions").fetch_one(&pool).await.unwrap(),2);
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn live_readmission_guards_stale_controls_pending_lane_and_slot_scoped_authority() {
+    isolated(|pool|async move {
+        let (old,pending,_)=exhausted_live_candidate(&pool).await;let id=pending.profile.generation_id;
+        let request=live_readmission_request(id,"guarded-readmission-key");
+        assert!(matches!(db::readmission::grant(&pool,"foreign",ALGORITHM,old.slot_id,&request).await.unwrap(),db::readmission::LiveReadmissionOutcome::NotFound));
+        let mut stale=request.clone();stale.expected_config_revision+=1;
+        assert!(matches!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&stale).await.unwrap(),db::readmission::LiveReadmissionOutcome::Conflict(_)));
+        for (disable,restore) in [
+            ("update continuous_processes set desired_running=false","update continuous_processes set desired_running=true"),
+            ("update continuous_processes set config_revision=config_revision+1","update continuous_processes set config_revision=config_revision-1"),
+            ("update continuous_processes set config=jsonb_set(config,'{adaptiveEnabled}','false')","update continuous_processes set config=jsonb_set(config,'{adaptiveEnabled}','true')"),
+            ("update continuous_slots set enabled=false","update continuous_slots set enabled=true"),
+            ("update settings set value='{}' where key='live'","update settings set value='{\"enabled\":true}' where key='live'"),
+        ] {sqlx::query(disable).execute(&pool).await.unwrap();let before=readmission_snapshot(&pool).await;
+            assert!(matches!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&request).await.unwrap(),db::readmission::LiveReadmissionOutcome::Conflict(_)));
+            assert_eq!(readmission_snapshot(&pool).await,before);sqlx::query(restore).execute(&pool).await.unwrap();}
+        sqlx::query("update continuous_slots set pending_generation_id=$2 where id=$1").bind(old.slot_id).bind(old.generation_id).execute(&pool).await.unwrap();
+        assert!(matches!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&request).await.unwrap(),db::readmission::LiveReadmissionOutcome::Conflict("live_readmission_pending_conflict")));
+        sqlx::query("update continuous_slots set pending_generation_id=null where id=$1").bind(old.slot_id).execute(&pool).await.unwrap();
+        sqlx::query("update adaptive_live_warmup_lane set slot_id=$1,generation_id=$2,lease_owner='competing-worker',lease_until=clock_timestamp()+interval '30 seconds'").bind(old.slot_id).bind(old.generation_id).execute(&pool).await.unwrap();
+        assert!(matches!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&request).await.unwrap(),db::readmission::LiveReadmissionOutcome::Conflict("live_readmission_lane_busy")));
+        sqlx::query("update adaptive_live_warmup_lane set slot_id=null,generation_id=null,lease_owner=null,lease_until=null").execute(&pool).await.unwrap();
+        for accepted in [Some(true),Some(false),None] {
+            let newer=generation(&pool,OWNER,ALGORITHM,old.slot_id,"completed").await;
+            sqlx::query("update continuous_generations set accepted=$2 where id=$1").bind(newer).bind(accepted).execute(&pool).await.unwrap();
+            assert!(matches!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&request).await.unwrap(),db::readmission::LiveReadmissionOutcome::Conflict("live_readmission_superseded")));
+            sqlx::query("delete from continuous_generations where id=$1").bind(newer).execute(&pool).await.unwrap();
+        }
+        sqlx::query("update continuous_generations set live_init_status='superseded' where id=$1").bind(id).execute(&pool).await.unwrap();
+        assert!(matches!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&request).await.unwrap(),db::readmission::LiveReadmissionOutcome::Conflict("live_readmission_ineligible")));
+        sqlx::query("update continuous_generations set live_init_status='exhausted' where id=$1").bind(id).execute(&pool).await.unwrap();
+        let receipt=granted_live(&pool,old.slot_id,&request).await;
+        let mut changed=request.clone();changed.expected_generation_id=old.generation_id;
+        assert!(matches!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&changed).await.unwrap(),db::readmission::LiveReadmissionOutcome::Conflict("live_readmission_key_conflict")));
+        assert!(db::stop(&pool,OWNER,ALGORITHM).await.unwrap());let stopped=readmission_snapshot(&pool).await;
+        let replay=granted_live(&pool,old.slot_id,&request).await;assert!(replay.duplicate);assert_eq!(replay.grant_id,receipt.grant_id);
+        assert_eq!(readmission_snapshot(&pool).await,stopped,"a receipt replay after Stop is evidence, not resurrection");
+        let fresh=live_readmission_request(id,"after-stop-new-operation");
+        assert!(matches!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&fresh).await.unwrap(),db::readmission::LiveReadmissionOutcome::Conflict("live_readmission_stale_process")));
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn live_readmission_ordinary_claim_and_promotion_reject_newer_same_slot_but_not_other_slot_outcomes() {
+    isolated(|pool|async move {
+        let (old,pending,_)=exhausted_live_candidate(&pool).await;let id=pending.profile.generation_id;
+        let other_slot:i64=sqlx::query_scalar("insert into continuous_slots(owner_id,algorithm_id,min_setups_per_day) values($1,$2,5) returning id").bind(OWNER).bind(ALGORITHM).fetch_one(&pool).await.unwrap();
+        let other=generation(&pool,OWNER,ALGORITHM,other_slot,"completed").await;
+        sqlx::query("update continuous_generations set accepted=true where id=$1").bind(other).execute(&pool).await.unwrap();
+        granted_live(&pool,old.slot_id,&live_readmission_request(id,"slot-scoped-readmission")).await;
+        let newer=generation(&pool,OWNER,ALGORITHM,old.slot_id,"completed").await;
+        assert!(db::live::claim_pending_warmup_at(&pool,&pending,"fenced-claim",CUTOFF).await.unwrap().is_none());
+        sqlx::query("delete from continuous_generations where id=$1").bind(newer).execute(&pool).await.unwrap();
+        let fence=db::live::claim_pending_warmup_at(&pool,&pending,"ordinary-claim",CUTOFF).await.unwrap().unwrap();
+        assert!(db::live::report_warmup(&pool,&fence,"ready",Some(CUTOFF+600),None).await.unwrap());
+        let newer=generation(&pool,OWNER,ALGORITHM,old.slot_id,"completed").await;
+        let expected=[db::live::CheckpointExpectation {instrument_key:INSTRUMENT.into(),checkpoint:None}];
+        let initial=[db::live::InitialAdaptiveCheckpoint {instrument_key:INSTRUMENT.into(),state:promotion_state(id,CUTOFF+600)}];
+        assert!(!db::live::promote_pending(&pool,&fence,Some(old.generation_id),&expected,CUTOFF+600,&initial).await.unwrap());
+        sqlx::query("delete from continuous_generations where id=$1").bind(newer).execute(&pool).await.unwrap();
+        assert!(db::live::promote_pending(&pool,&fence,Some(old.generation_id),&expected,CUTOFF+600,&initial).await.unwrap());
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn live_readmission_additive_migration_and_failed_pending_write_preserve_prior_state() {
+    isolated(|pool|async move {
+        let (old,pending,origin)=exhausted_live_candidate(&pool).await;let id=pending.profile.generation_id;
+        let before=readmission_snapshot(&pool).await;
+        sqlx::raw_sql("drop table continuous_live_readmissions; drop index continuous_generations_completed_slot; alter table continuous_generations drop constraint continuous_generations_live_init_budget_check,drop column live_init_attempt_limit; alter table continuous_generations add constraint continuous_generations_live_init_attempts_check check(live_init_attempts between 0 and 3); delete from kysely_migration where name='0018_live_readmission.sql';").execute(&pool).await.unwrap();
+        assert_eq!(setups_db::migrate::ensure_migrations(&pool).await.unwrap(),"1 applied, 8 up to date");assert_eq!(readmission_snapshot(&pool).await,before);
+        sqlx::raw_sql("create function fixture_reject_readmission() returns trigger language plpgsql as $$begin raise exception 'readmission_rollback_sentinel'; end$$; create trigger fixture_reject_readmission before update on continuous_slots for each row execute function fixture_reject_readmission();").execute(&pool).await.unwrap();
+        let request=live_readmission_request(id,"readmission-rollback-key");
+        assert!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&request).await.err().unwrap().to_string().contains("readmission_rollback_sentinel"));
+        assert_eq!(readmission_snapshot(&pool).await,before,"receipt and budget cannot survive a failed pending write");
+        sqlx::query("drop trigger fixture_reject_readmission on continuous_slots").execute(&pool).await.unwrap();
+        assert!(!granted_live(&pool,old.slot_id,&request).await.duplicate);
+        assert_eq!(db::live::pending_adaptive_slots(&pool,OWNER).await.unwrap()[0].profile.live_initialization.as_ref(),Some(&origin));
+    }).await;
+}
+
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn independent_live_migration_keeps_legacy_anchor_and_immutable_research_across_restart() {
@@ -931,7 +1128,7 @@ async fn independent_live_migration_keeps_legacy_anchor_and_immutable_research_a
         // Emulate the actual pre-0016 schema in this disposable child database.
         sqlx::raw_sql("alter table continuous_generations drop column live_initialization,drop column live_readiness,drop column live_init_attempts,drop column live_init_status,drop column live_init_deadline,drop column live_init_next_attempt_at,drop column live_init_error; delete from kysely_migration where name='0016_independent_live_initialization.sql';")
             .execute(&pool).await.unwrap();
-        assert_eq!(setups_db::migrate::ensure_migrations(&pool).await.unwrap(),"1 applied, 7 up to date");
+        assert_eq!(setups_db::migrate::ensure_migrations(&pool).await.unwrap(),"1 applied, 8 up to date");
         let active=db::active_adaptive_slots(&pool,OWNER).await.unwrap().remove(0);
         let anchor=active.live_initialization.unwrap();
         assert_eq!(active.live_readiness.len(),2,"legacy full scope needs explicit disposition");

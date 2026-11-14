@@ -203,7 +203,7 @@ pub async fn claim_pending_warmup_with_budget(pool: &PgPool, pending: &PendingAd
     if !lock_pending(&mut tx,&fence).await? { return Ok(None); }
     // Process -> slot -> global lane -> generation: no long reads under locks.
     sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update").execute(&mut *tx).await?;
-    let eligible: bool = sqlx::query_scalar("select exists(select 1 from continuous_generations where id=$1 and status='completed' and accepted=true and live_init_attempts<3 and live_init_status is distinct from 'exhausted' and live_init_status is distinct from 'superseded' and (live_init_next_attempt_at is null or live_init_next_attempt_at<=clock_timestamp()))")
+    let eligible: bool = sqlx::query_scalar("select exists(select 1 from continuous_generations g where id=$1 and status='completed' and accepted=true and live_init_attempts<live_init_attempt_limit and live_init_status is distinct from 'exhausted' and live_init_status is distinct from 'superseded' and (live_init_next_attempt_at is null or live_init_next_attempt_at<=clock_timestamp()) and not exists(select 1 from continuous_generations newer where newer.owner_id=g.owner_id and newer.algorithm_id=g.algorithm_id and newer.slot_id=g.slot_id and newer.config_revision=g.config_revision and newer.status='completed' and newer.id>g.id))")
         .bind(p.generation_id).fetch_one(&mut *tx).await?;
     if !eligible { return Ok(None); }
     let token: Option<i64> = sqlx::query_scalar("update adaptive_live_warmup_lane set slot_id=$1,generation_id=$2,lease_owner=$3,lease_token=lease_token+1,lease_until=clock_timestamp()+$4::bigint*interval '1 second' where id=1 and (lease_owner is null or lease_until<=clock_timestamp()) returning lease_token")
@@ -244,7 +244,7 @@ pub async fn report_warmup(pool: &PgPool, fence: &WarmupLease, status: &str, rea
 }
 
 async fn finish_failed_attempt(tx: &mut Transaction<'_,Postgres>, generation: i64, slot: i64, error: &Value, retryable: bool) -> Result<(),DbError> {
-    let exhausted:bool=sqlx::query_scalar("update continuous_generations set live_init_status=case when not $3 or live_init_attempts>=3 then 'exhausted' else 'retry' end,live_init_error=$2,live_init_deadline=null,live_init_next_attempt_at=clock_timestamp()+(case when live_init_attempts<=1 then 5 else 30 end)*interval '1 second' where id=$1 returning live_init_status='exhausted'")
+    let exhausted:bool=sqlx::query_scalar("update continuous_generations set live_init_status=case when not $3 or live_init_attempts>=live_init_attempt_limit then 'exhausted' else 'retry' end,live_init_error=$2,live_init_deadline=null,live_init_next_attempt_at=clock_timestamp()+(case when live_init_attempts<=1 then 5 else 30 end)*interval '1 second' where id=$1 returning live_init_status='exhausted'")
         .bind(generation).bind(error).bind(retryable).fetch_one(&mut **tx).await?;
     sqlx::query("update continuous_slots set pending_generation_id=case when $3 then null else pending_generation_id end,pending_status='error',pending_error=$4,readiness_frontier=null,status=case when active_generation_id is not null then 'active' else 'error' end,updated_at=now() where id=$1 and pending_generation_id=$2")
         .bind(slot).bind(generation).bind(exhausted).bind(error).execute(&mut **tx).await?;
@@ -359,7 +359,7 @@ pub async fn promote_pending_with_dispositions(pool: &PgPool, fence: &WarmupLeas
     if !lock_pending(&mut tx,fence).await? { return Ok(false); }
     sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update").execute(&mut *tx).await?;
     if !lease_current(&mut tx,fence).await? { return Ok(false); }
-    let ready: bool = sqlx::query_scalar("select exists(select 1 from continuous_slots s join continuous_generations g on g.id=s.pending_generation_id where s.id=$1 and s.active_generation_id is not distinct from $2 and s.pending_status='ready' and s.readiness_frontier=$3 and g.status='completed' and g.accepted=true and g.owner_id=$4 and g.algorithm_id=$5 and g.config_revision=$6 and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb))")
+    let ready: bool = sqlx::query_scalar("select exists(select 1 from continuous_slots s join continuous_generations g on g.id=s.pending_generation_id where s.id=$1 and s.active_generation_id is not distinct from $2 and s.pending_status='ready' and s.readiness_frontier=$3 and g.status='completed' and g.accepted=true and g.owner_id=$4 and g.algorithm_id=$5 and g.config_revision=$6 and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb) and not exists(select 1 from continuous_generations newer where newer.owner_id=g.owner_id and newer.algorithm_id=g.algorithm_id and newer.slot_id=g.slot_id and newer.config_revision=g.config_revision and newer.status='completed' and newer.id>g.id))")
         .bind(fence.slot_id).bind(expected_active_generation_id).bind(readiness_frontier).bind(&fence.owner_id).bind(&fence.algorithm_id).bind(fence.config_revision).fetch_one(&mut *tx).await?;
     if !ready { return Ok(false); }
     let candidate_spec: Value=sqlx::query_scalar("select spec from continuous_generations where id=$1").bind(fence.generation_id).fetch_one(&mut *tx).await?;

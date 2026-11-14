@@ -48,7 +48,7 @@ fn continuous_config_locks_owned_coordinates_and_normalizes_manual_defaults() {
 async fn continuous_routes_authenticate_and_validate_before_database() {
     let pool=PgPoolOptions::new().connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test").unwrap();
     let router=continuous_router(state(pool));
-    for (method,url) in [("GET",path("")),("PUT",path("")),("POST",path("/start")),("POST",path("/stop")),("GET","/v1/continuous-studies/cleanup".into()),("POST","/v1/continuous-studies/cleanup".into()),("GET","/v1/continuous-studies/maintenance".into()),("POST","/v1/continuous-studies/maintenance/drain".into()),("POST","/v1/continuous-studies/maintenance/resume".into())] {
+    for (method,url) in [("GET",path("")),("PUT",path("")),("POST",path("/start")),("POST",path("/stop")),("POST",path("/slots/1/live-readmission")),("GET","/v1/continuous-studies/cleanup".into()),("POST","/v1/continuous-studies/cleanup".into()),("GET","/v1/continuous-studies/maintenance".into()),("POST","/v1/continuous-studies/maintenance/drain".into()),("POST","/v1/continuous-studies/maintenance/resume".into())] {
         let response=router.clone().oneshot(Request::builder().method(method).uri(url).header("content-type","application/json").body(Body::from(config().to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
     }
@@ -58,6 +58,15 @@ async fn continuous_routes_authenticate_and_validate_before_database() {
     for body in [json!({}),json!({"confirm":false,"fingerprint":"0".repeat(32)}),json!({"confirm":true,"fingerprint":"bad"}),json!({"confirm":true,"fingerprint":"0".repeat(32),"ownerId":"other"})] {
         assert_eq!(request(&router,"POST","/v1/continuous-studies/cleanup",body).await.0,StatusCode::BAD_REQUEST);
     }
+    let valid=json!({"expectedGenerationId":17,"expectedConfigRevision":1,"requestId":"restore-study-21-stable-key"});
+    for key in ["ownerId","budget","params","origin"] {
+        let mut body=valid.clone();body[key]=json!("forbidden");
+        assert_eq!(request(&router,"POST",&path("/slots/1/live-readmission"),body).await.0,StatusCode::BAD_REQUEST);
+    }
+    for body in [json!({}),json!({"expectedGenerationId":0,"expectedConfigRevision":1,"requestId":"valid-key-00000000"}),json!({"expectedGenerationId":17,"expectedConfigRevision":1,"requestId":"short"})] {
+        assert_eq!(request(&router,"POST",&path("/slots/1/live-readmission"),body).await.0,StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(request(&router,"POST",&path("/slots/not-an-id/live-readmission"),valid).await.0,StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -66,7 +75,7 @@ async fn continuous_cleanup_rejects_cookie_mutation_without_browser_origin_befor
     let s=state(pool);
     let setups_api::auth::PostSessionResult::Issued{token,..}=s.auth.post_session(Some("test-key"),setups_api::now_ms()) else {panic!("fixture login failed")};
     let router=continuous_router(s);
-    for path in ["/v1/continuous-studies/cleanup","/v1/continuous-studies/maintenance/drain","/v1/continuous-studies/maintenance/resume"] {
+    for path in ["/v1/continuous-studies/cleanup","/v1/continuous-studies/maintenance/drain","/v1/continuous-studies/maintenance/resume","/v1/continuous-studies/price_volume_spike/slots/1/live-readmission"] {
         let response=router.clone().oneshot(Request::builder().method("POST").uri(path).header("cookie",format!("{}={token}",setups_api::COOKIE_NAME)).header("content-type","application/json").body(Body::from(json!({"confirm":true,"fingerprint":"0".repeat(32)}).to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(),StatusCode::FORBIDDEN);
     }
@@ -88,6 +97,64 @@ impl TestDb {
         Self{admin,pool,name}
     }
     async fn cleanup(self) {self.pool.close().await;sqlx::query(&format!("drop database {} with(force)",self.name)).execute(&self.admin).await.unwrap();self.admin.close().await;}
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn live_readmission_http_grants_exact_budget_replays_receipts_and_never_restarts_research_or_stopped_live() {
+    let fixture=TestDb::new().await;
+    let database=state(fixture.pool.clone());
+    let result=tokio::spawn(async move {
+    let router=continuous_router(database.clone());
+    assert_eq!(request(&router,"PUT",&path(""),config()).await.0,StatusCode::OK);
+    assert_eq!(request(&router,"POST",&path("/start"),Value::Null).await.0,StatusCode::ACCEPTED);
+    setups_db::settings_set(&database.pool,"live",&json!({"enabled":true})).await.unwrap();
+    let slot=db::get(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap().slots[0].id;
+    let origin=json!({"version":1,"anchorCloseUnix":1_700_000_040i64,"detectorFromOpenUnix":1_697_000_040i64,"emitFromCloseUnix":1_700_000_100i64});
+    let result=json!({"best":{"params":config()["study"]["algorithmParams"],"analytics":config()["study"]["analyticsParams"]},"meanExpectancy":0.21,"selectedCell":{"tpPct":1,"slPct":1},"immutable":"original accepted study"});
+    let generation:i64=sqlx::query_scalar("insert into continuous_generations(owner_id,algorithm_id,slot_id,config_revision,lease_token,status,spec,execution_started_at,observation_cutoff,accepted,result,live_initialization,live_init_status,live_init_attempts,live_init_error) values('admin',$1,$2,1,1,'completed',$3,now(),0,true,$4,$5,'exhausted',3,'{\"code\":\"last_observed_failure\"}') returning id")
+        .bind(ALGORITHM).bind(slot).bind(&config()["study"]).bind(&result).bind(&origin).fetch_one(&database.pool).await.unwrap();
+    let study:i64=sqlx::query_scalar("insert into optimization_studies(algorithm_id,status,spec,progress,origin,owner_id,continuous_generation_id,continuous_slot_id) values($1,'completed',$2,'{}','continuous','admin',$3,$4) returning id")
+        .bind(ALGORITHM).bind(&config()["study"]).bind(generation).bind(slot).fetch_one(&database.pool).await.unwrap();
+    sqlx::query("update continuous_generations set study_id=$2 where id=$1").bind(generation).bind(study).execute(&database.pool).await.unwrap();
+    sqlx::query("update continuous_slots set status='error',pending_status='error',pending_error='{\"code\":\"last_observed_failure\"}',study_id=$2 where id=$1").bind(slot).bind(study).execute(&database.pool).await.unwrap();
+    let process_before:Value=sqlx::query_scalar("select to_jsonb(p) from continuous_processes p").fetch_one(&database.pool).await.unwrap();
+    let url=path(&format!("/slots/{slot}/live-readmission"));
+    let body=json!({"expectedGenerationId":generation,"expectedConfigRevision":1,"requestId":"http-study21-first-grant"});
+    let (status,receipt)=request(&router,"POST",&url,body.clone()).await;
+    assert_eq!(status,StatusCode::OK,"{receipt}");assert_eq!(receipt["attemptsBefore"],3);assert_eq!(receipt["attemptLimit"],6);assert_eq!(receipt["duplicate"],false);
+    assert_eq!(db::get(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap().slots[0].pending_attempts,3);
+    let mut expected=receipt.clone();expected["duplicate"]=json!(true);
+    assert_eq!(request(&router,"POST",&url,body.clone()).await,(StatusCode::OK,expected.clone()));
+    assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(p) from continuous_processes p").fetch_one(&database.pool).await.unwrap(),process_before);
+    let stored=sqlx::query("select result,live_initialization from continuous_generations where id=$1").bind(generation).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(stored.get::<Value,_>("result"),result);assert_eq!(stored.get::<Value,_>("live_initialization"),origin);
+    let mut stale=body.clone();stale["requestId"]=json!("stale-revision-new-grant");stale["expectedConfigRevision"]=json!(2);
+    assert_eq!(request(&router,"POST",&url,stale).await.0,StatusCode::CONFLICT);
+    let mut collision=body.clone();collision["expectedGenerationId"]=json!(generation+1);
+    assert_eq!(request(&router,"POST",&url,collision).await.1["error"],"live_readmission_key_conflict");
+    let missing_url=path(&format!("/slots/{}/live-readmission",slot+100));
+    assert_eq!(request(&router,"POST",&missing_url,body.clone()).await.0,StatusCode::CONFLICT);
+    let mut missing=body.clone();missing["requestId"]=json!("missing-slot-fresh-grant");
+    assert_eq!(request(&router,"POST",&missing_url,missing).await.0,StatusCode::NOT_FOUND);
+    // DB tests exercise ordinary claims 4/5/6; this HTTP case focuses on immutable
+    // replay receipts after the corresponding later durable exhaustion state.
+    sqlx::query("update continuous_generations set live_init_attempts=6,live_init_status='exhausted' where id=$1").bind(generation).execute(&database.pool).await.unwrap();
+    sqlx::query("update continuous_slots set pending_generation_id=null where id=$1").bind(slot).execute(&database.pool).await.unwrap();
+    assert_eq!(request(&router,"POST",&url,body.clone()).await,(StatusCode::OK,expected.clone()));
+    let mut fresh=body.clone();fresh["requestId"]=json!("http-study21-second-grant");
+    let (status,second)=request(&router,"POST",&url,fresh).await;assert_eq!(status,StatusCode::OK);assert_eq!(second["attemptsBefore"],6);assert_eq!(second["attemptLimit"],9);
+    assert!(db::stop(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap());
+    sqlx::query("update continuous_processes set config_revision=config_revision+1").execute(&database.pool).await.unwrap();
+    assert_eq!(request(&router,"POST",&url,body.clone()).await,(StatusCode::OK,expected),"Stop/revision changes cannot turn receipt replay into another grant");
+    let stopped=db::get(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap();
+    assert!(stopped.slots.iter().all(|slot|slot.active_generation_id.is_none()&&slot.pending_generation_id.is_none()),"Stop retains configured slots, but replay cannot restore active/pending pointers");
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from continuous_live_readmissions").fetch_one(&database.pool).await.unwrap(),2);
+    let mut after_stop=body;after_stop["requestId"]=json!("after-stop-distinct-grant");
+    assert_eq!(request(&router,"POST",&url,after_stop).await.0,StatusCode::CONFLICT);
+    }).await;
+    fixture.cleanup().await;
+    result.expect("HTTP readmission assertion failed after fixture cleanup");
 }
 
 #[tokio::test]

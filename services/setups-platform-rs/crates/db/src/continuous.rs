@@ -1,6 +1,7 @@
 //! Durable continuous ownership. All mutating transitions fence by owner/revision/lease.
 pub mod scheduler;
 pub mod live;
+pub mod readmission;
 pub mod outbox;
 pub mod cleanup;
 pub mod maintenance;

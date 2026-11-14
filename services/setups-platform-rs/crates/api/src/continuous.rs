@@ -240,8 +240,25 @@ pub fn continuous_router(state: Arc<ContinuousState>) -> Router {
         )
         .route("/v1/continuous-studies/{algorithm}/start", post(start))
         .route("/v1/continuous-studies/{algorithm}/stop", post(stop))
+        .route("/v1/continuous-studies/{algorithm}/slots/{slot}/live-readmission",post(live_readmission))
         .layer(DefaultBodyLimit::max(cap))
         .with_state(state)
+}
+
+async fn live_readmission(State(state):State<Arc<ContinuousState>>,headers:HeaderMap,Path((algorithm,slot)):Path<(String,String)>,body:String)->Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,true) {return error;}
+    let Ok(slot)=slot.parse::<i64>() else {return response(StatusCode::BAD_REQUEST,json!({"error":"invalid_live_readmission"}));};
+    let parsed=serde_json::from_str::<db::readmission::LiveReadmissionRequest>(&body);
+    let request=match parsed {
+        Ok(request) if registered(&algorithm) && slot>0 && request.validate().is_ok()=>request,
+        _=>return response(StatusCode::BAD_REQUEST,json!({"error":"invalid_live_readmission"})),
+    };
+    match db::readmission::grant(&state.pool,ADMIN_OWNER,&algorithm,slot,&request).await {
+        Ok(db::readmission::LiveReadmissionOutcome::Granted(receipt))=>response(StatusCode::OK,json!(receipt)),
+        Ok(db::readmission::LiveReadmissionOutcome::NotFound)=>response(StatusCode::NOT_FOUND,json!({"error":"live_readmission_not_found"})),
+        Ok(db::readmission::LiveReadmissionOutcome::Conflict(code))=>response(StatusCode::CONFLICT,json!({"error":code})),
+        Err(error)=>failure("live readmission",error),
+    }
 }
 
 async fn maintenance_status(State(state):State<Arc<ContinuousState>>,headers:HeaderMap)->Response {
