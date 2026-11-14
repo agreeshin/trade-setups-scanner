@@ -42,6 +42,9 @@ struct Warmup {
     candidate_key:String,
     cohort:BTreeSet<String>,
     barrier_attempts:u32,
+    // At most one bounded disposition per declared old/new scope member.
+    waiting:BTreeMap<String,String>,
+    retired:BTreeMap<String,String>,
 }
 pub struct AdaptiveLiveRuntime {
     state:AdaptiveRuntime,
@@ -65,9 +68,9 @@ impl AdaptiveLiveRuntime {
         let mut plans:BTreeMap<String,SymbolPlan>=BTreeMap::new();
         for slot in slots {
             let profile=LiveProfile::parse(slot)?;
-            for seed in &profile.bootstrap.instruments {
-                let matches:Vec<_>=catalog.iter().filter(|c|c.status=="active" && c.exchange==seed.instrument.exchange
-                    && c.category==seed.instrument.category && c.symbol==seed.instrument.symbol).collect();
+            for scoped in &profile.instruments {
+                let matches:Vec<_>=catalog.iter().filter(|c|c.status=="active" && c.exchange==scoped.exchange
+                    && c.category==scoped.category && c.symbol==scoped.symbol).collect();
                 if matches.len()>1 {return Err(invalid("ambiguous active listing"));}
                 let Some(item)=matches.first() else {continue;};
                 let instrument=instrument(item);
@@ -77,7 +80,7 @@ impl AdaptiveLiveRuntime {
                     Some(checkpoint)=>checkpoint,
                     None=>store::load_checkpoint(pool,slot.slot_id,&instrument).await?,
                 };
-                let spec=profile.spec(seed,checkpoint,false)?;
+                let spec=profile.spec(scoped,checkpoint,false)?;
                 let plan=plans.entry(epoch.clone()).or_insert_with(||SymbolPlan {epoch,instrument,catalog_id:item.id,specs:Vec::new(),slots:BTreeMap::new()});
                 plan.slots.insert(spec.key(),slot.clone());plan.specs.push(spec);
             }
@@ -89,32 +92,34 @@ impl AdaptiveLiveRuntime {
         let candidate_key=profile.fence_key();
         let incumbent=slots.iter().find(|slot|slot.slot_id==candidate.profile.slot_id).cloned();
         let old=incumbent.as_ref().map(|slot|LiveProfile::parse(slot)).transpose()?;
-        let mut scope:BTreeSet<_>=profile.bootstrap.instruments.iter().map(|seed|seed.instrument.clone()).collect();
-        if let Some(old)=&old {scope.extend(old.bootstrap.instruments.iter().map(|seed|seed.instrument.clone()));}
+        let mut scope:BTreeSet<_>=profile.instruments.iter().cloned().collect();
+        if let Some(old)=&old {scope.extend(old.instruments.iter().cloned());}
         let mut plans=Vec::new();
         for scoped in scope {
             let matches:Vec<_>=catalog.iter().filter(|item|item.exchange==scoped.exchange && item.category==scoped.category && item.symbol==scoped.symbol).collect();
-            if matches.len()!=1 {return Err(invalid("pending old/new scope missing or ambiguous in source catalog"));}
-            let item=matches[0];let instrument=instrument(item);
-            let candidate_seed=profile.bootstrap.instruments.iter().find(|seed|seed.instrument==scoped);
-            let epoch=AdaptiveRuntime::epoch_key(&instrument,if candidate_seed.is_none() && item.status=="active" {None}else{Some(candidate.profile.generation_id)});
+            if matches.len()>1 {return Err(invalid("ambiguous pending source catalog identity"));}
+            let item=matches.first().copied();
+            let instrument=AdaptiveInstrument {exchange:scoped.exchange.clone(),category:scoped.category.clone(),symbol:scoped.symbol.clone()};
+            let listed=item.is_some_and(|item|item.status=="active");
+            let candidate_seed=profile.instruments.iter().find(|seed|**seed==scoped);
+            let epoch=AdaptiveRuntime::epoch_key(&instrument,if candidate_seed.is_none() && listed {None}else{Some(candidate.profile.generation_id)});
             let mut specs:BTreeMap<String,ProfileSpec>=BTreeMap::new();let mut stores=BTreeMap::new();
-            for plan in active.iter().filter(|plan|plan.catalog_id==item.id) {
+            for plan in active.iter().filter(|plan|plan.instrument==instrument) {
                 for spec in &plan.specs {let mut shadow=spec.clone();shadow.pending=epoch!=AdaptiveRuntime::epoch_key(&instrument,None);specs.insert(shadow.key(),shadow);}
                 stores.extend(plan.slots.clone());
             }
             if let (Some(old),Some(slot))=(&old,&incumbent)
-                && let Some(seed)=old.bootstrap.instruments.iter().find(|seed|seed.instrument==scoped)
+                && let Some(seed)=old.instruments.iter().find(|seed|**seed==scoped)
                 && !specs.contains_key(&old.fence_key()) {
                 let checkpoint=store::load_checkpoint(pool,slot.slot_id,&instrument).await?;
-                let mut shadow=old.spec(seed,checkpoint,true)?;shadow.publish_enabled=item.status=="active";
+                let mut shadow=old.spec(seed,checkpoint,true)?;shadow.publish_enabled=listed;
                 stores.insert(shadow.key(),slot.clone());specs.insert(shadow.key(),shadow);
             }
-            if let Some(seed)=profile.bootstrap.instruments.iter().find(|seed|seed.instrument==scoped) {
-                let mut pending=profile.spec(seed,None,true)?;pending.publish_enabled=item.status=="active";
+            if let Some(seed)=candidate_seed {
+                let mut pending=profile.spec(seed,None,true)?;pending.publish_enabled=listed;
                 specs.insert(pending.key(),pending);
             }
-            plans.push(SymbolPlan {epoch,instrument,catalog_id:item.id,specs:specs.into_values().collect(),slots:stores});
+            plans.push(SymbolPlan {epoch,instrument,catalog_id:item.map_or(0,|item|item.id),specs:specs.into_values().collect(),slots:stores});
         }
         if plans.is_empty() {return Err(invalid("pending universe is empty"));}
         self.check_warmup_admission(active,&plans)?;
@@ -135,24 +140,56 @@ impl AdaptiveLiveRuntime {
         if total>self.state.limits.max_history_bytes {return Err(invalid("complete pending universe plus staging exceeds history byte admission budget"));}
         Ok(())
     }
-    async fn refresh_warmup(&mut self,pool:&PgPool,pending:Vec<live::PendingAdaptiveSlot>,catalog:&[CatalogInstrument],active:&[SymbolPlan],slots:&[Arc<ActiveAdaptiveSlot>])->Result<(),WorkerError> {
+    async fn refresh_warmup(&mut self,pool:&PgPool,pending:Vec<live::PendingAdaptiveSlot>,catalog:&[CatalogInstrument],active:&[SymbolPlan],slots:&[Arc<ActiveAdaptiveSlot>],target:i64)->Result<(),WorkerError> {
         let cohort:BTreeSet<_>=slots.iter().map(|slot|json!([slot.owner_id,slot.algorithm_id,slot.slot_id,slot.generation_id,slot.config_revision]).to_string()).collect();
         if let Some(warmup)=&self.warmup {
             let current=warmup.cohort==cohort && pending.iter().any(|p|p.profile.slot_id==warmup.lease.slot_id && p.profile.generation_id==warmup.lease.generation_id
                 && p.profile.config_revision==warmup.lease.config_revision);
-            if current && live::report_warmup(pool,&warmup.lease,"warming",None,None).await? {return Ok(());}
+            if current && live::report_warmup(pool,&warmup.lease,"warming",None,None).await? {
+                // A waiting sibling may have joined while this candidate was
+                // warming. Refresh only durable control fields, NEVER origins
+                // or reconstructed scalar state from the candidate's recipe.
+                let warmup=self.warmup.as_mut().unwrap();
+                let all_waiting=warmup.plans.iter().filter(|p|p.specs.iter().any(|s|s.key()==warmup.candidate_key))
+                    .all(|p|warmup.waiting.contains_key(&instrument_key(&p.instrument)));
+                if all_waiting {
+                    // Recheck recoverable quality/tail waits on the next turn,
+                    // but only after every declared candidate had a fair turn.
+                    warmup.waiting.retain(|_,reason|matches!(reason.as_str(),"not_listed"|"unavailable_catalog"));
+                }
+                for plan in &mut warmup.plans {
+                    for spec in plan.specs.iter_mut().filter(|spec|spec.key()!=warmup.candidate_key) {
+                        if let Some((fresh,slot))=active.iter().filter(|p|p.instrument==plan.instrument)
+                            .find_map(|p|p.specs.iter().find(|s|s.key()==spec.key()).map(|s|(s,p.slots.get(&s.key())))) {
+                            spec.waiting=fresh.waiting;spec.emit_from_close=fresh.emit_from_close;
+                            if let Some(slot)=slot {plan.slots.insert(spec.key(),slot.clone());}
+                        }
+                    }
+                    if self.state.has_epoch(&plan.epoch) {self.state.install(&plan.epoch,&plan.specs)?;}
+                }
+                return Ok(());
+            }
+            live::release_pending_warmup(pool,&warmup.lease).await?;
             self.discard_warmup();
         }
         if pending.is_empty() {return Ok(());}
         for offset in 0..pending.len() {
             let index=(self.next_pending+offset)%pending.len();
-            let candidate=&pending[index];
-            let Some(lease)=live::claim_pending_warmup(pool,candidate,&self.worker).await? else {continue;};
+            let mut candidate=pending[index].clone();
+            let Some(lease)=live::claim_pending_warmup_at(pool,&candidate,&self.worker,target).await? else {continue;};
+            // The claim, not the pre-claim pending DTO, owns the stable anchor.
+            candidate.profile.live_initialization=Some(lease.initialization.clone());
             self.next_pending=(index+1)%pending.len();
-            let build=self.build_warmup_plans(pool,candidate,active,slots,catalog).await;
+            let build=self.build_warmup_plans(pool,&candidate,active,slots,catalog).await;
             match build {
-                Ok((plans,candidate_key))=>self.warmup=Some(Warmup {pending:candidate.clone(),lease,plans,candidate_key,cohort:cohort.clone(),barrier_attempts:0}),
-                Err(error)=>{live::report_warmup(pool,&lease,"error",None,Some(&json!({"code":"invalid_live_candidate","message":error.to_string().chars().take(240).collect::<String>()}))).await?;}
+                Ok((plans,candidate_key))=>{
+                    let waiting=plans.iter().filter(|p|p.specs.iter().any(|s|s.key()==candidate_key) && !p.specs.iter().any(|s|s.publish_enabled))
+                        .map(|p|(instrument_key(&p.instrument),if p.catalog_id==0 {"unavailable_catalog".into()}else{"not_listed".into()})).collect();
+                    let retired=plans.iter().filter(|p|!p.specs.iter().any(|s|s.key()==candidate_key) && !p.specs.iter().any(|s|s.publish_enabled))
+                        .map(|p|(instrument_key(&p.instrument),if p.catalog_id==0 {"unavailable_catalog".into()}else{"not_listed".into()})).collect();
+                    self.warmup=Some(Warmup {pending:candidate,lease,plans,candidate_key,cohort:cohort.clone(),barrier_attempts:0,waiting,retired});
+                },
+                Err(error)=>{live::report_warmup_failure(pool,&lease,&json!({"code":"invalid_live_candidate","message":error.to_string().chars().take(240).collect::<String>()}),false).await?;}
             }
             break;
         }
@@ -172,6 +209,8 @@ impl AdaptiveLiveRuntime {
         if let Some(warmup)=&self.warmup {
             let mut resident=warmup.plans.iter().filter(|p|p.epoch!=AdaptiveRuntime::epoch_key(&p.instrument,None) && self.state.has_epoch(&p.epoch)).count();
             for plan in &warmup.plans {
+                if !plan.specs.iter().any(|s|s.publish_enabled) {continue;}
+                if warmup.waiting.contains_key(&instrument_key(&plan.instrument)) {continue;}
                 let canonical=plan.epoch==AdaptiveRuntime::epoch_key(&plan.instrument,None);
                 let exists=self.state.has_epoch(&plan.epoch);
                 if !canonical && !exists {
@@ -191,6 +230,34 @@ impl AdaptiveLiveRuntime {
         }
         cold.into_values().collect()
     }
+    fn park_waiting(&mut self,plan:&SymbolPlan,frontier:i64) {
+        let Some(warmup)=self.warmup.as_mut() else {return;};
+        if !plan.specs.iter().any(|spec|spec.key()==warmup.candidate_key) {return;}
+        let Some(reason)=self.state.waiting_reason(&plan.epoch,&warmup.candidate_key,frontier) else {return;};
+        warmup.waiting.insert(instrument_key(&plan.instrument),reason.into());
+        // Keep the declared scope/disposition, not a permanently occupied
+        // duplicate ring. Never evict an incumbent's canonical live state.
+        if plan.epoch==AdaptiveRuntime::epoch_key(&plan.instrument,None) {
+            self.state.remove_profile(&plan.epoch,&warmup.candidate_key);
+        } else {self.state.invalidate(&plan.epoch,None);}
+    }
+    async fn join_ready_waiting(&mut self,pool:&PgPool,plans:&[SymbolPlan],frontier:i64)->Result<(),WorkerError> {
+        for plan in plans {
+            for spec in plan.specs.iter().filter(|spec|spec.waiting) {
+                if !self.state.ready(&plan.epoch,&spec.key(),frontier) {continue;}
+                let slot=plan.slots.get(&spec.key()).ok_or_else(||invalid("waiting instrument store missing"))?;
+                let key=instrument_key(&plan.instrument);
+                let previous=continuous::get_adaptive_checkpoint(pool,slot.slot_id,&key).await?;
+                let checkpoint=self.state.checkpoint_for(&plan.epoch,&spec.key()).ok_or_else(||invalid("waiting live state missing"))?;
+                if store::join(&store::PgJoin {pool,slot,instrument_key:&key,previous:previous.as_ref(),frontier,state:&serde_json::to_value(&checkpoint)?}).await? {
+                    // Preserve the detector/cluster just warmed. Only its
+                    // publication floor and durable ownership change.
+                    self.state.activate(&plan.epoch,&spec.key(),frontier)?;
+                } else {self.state.invalidate(&plan.epoch,None);break;}
+            }
+        }
+        Ok(())
+    }
     async fn adopt_ready_staging(&mut self,pool:&PgPool,frontier:i64)->Result<(),WorkerError> {
         let Some(warmup)=&self.warmup else {return Ok(());};
         let candidate=warmup.candidate_key.clone();
@@ -201,19 +268,26 @@ impl AdaptiveLiveRuntime {
             for spec in plan.specs.iter().filter(|spec|spec.key()!=candidate) {
                 let staged=self.state.checkpoint_for(&plan.epoch,&spec.key()).ok_or_else(||invalid("staged incumbent checkpoint missing"))?;
                 let durable=store::load_checkpoint(pool,spec.fence.slot_id,&plan.instrument).await?;
+                if spec.waiting {
+                    let production=AdaptiveRuntime::epoch_key(&plan.instrument,None);
+                    // A waiting sibling has no publication authority yet.
+                    // Require exact canonical scalar AND durable predecessor
+                    // parity, without fabricating a committed checkpoint.
+                    if self.state.checkpoint_for(&production,&spec.key()).as_ref()!=Some(&staged)
+                        || self.state.cached_checkpoint(&production,&spec.key())!=Some(durable) {caught_up=false;break;}
+                    expected.insert(spec.key(),staged);continue;
+                }
                 if durable.as_ref()!=Some(&staged) {
-                    if spec.publish_enabled {caught_up=false;break;}
-                    // A delisted incumbent has no live emissions. Its explicit
-                    // not-listed source accounting may drain a control cursor.
-                    let slot=plan.slots.get(&spec.key()).ok_or_else(||invalid("inactive incumbent store missing"))?;
-                    let mut page=self.state.adoption_page(&plan.epoch,&spec.key(),durable)?;
-                    if !store::persist(&PgAdaptiveStore {pool,slot},&plan.instrument,&mut page).await? {caught_up=false;break;}
+                    caught_up=false;break;
                 }
                 expected.insert(spec.key(),staged);
             }
             if !caught_up {continue;}
             let production=AdaptiveRuntime::epoch_key(&plan.instrument,None);
-            self.state.adopt_staging(&plan.epoch,&production,&candidate,&expected)?;
+            if !self.state.adopt_staging(&plan.epoch,&production,&candidate,&expected)? {
+                if let Some(warmup)=&self.warmup {live::release_pending_warmup(pool,&warmup.lease).await?;}
+                self.discard_warmup();break;
+            }
             if let Some(warmup)=&mut self.warmup
                 && let Some(staged)=warmup.plans.iter_mut().find(|p|p.epoch==plan.epoch) {
                     staged.epoch=production;
@@ -231,7 +305,7 @@ impl AdaptiveLiveRuntime {
         let result=self.tick_observed(pool,client,stopped,observation_unix).await;
         if let Err(error)=&result && let Some(warmup)=&self.warmup {
             let report=json!({"code":"adaptive_warmup_failed","message":error.to_string().chars().take(240).collect::<String>()});
-            if let Err(report_error)=live::report_warmup(pool,&warmup.lease,"error",None,Some(&report)).await {
+            if let Err(report_error)=live::report_warmup_failure(pool,&warmup.lease,&report,true).await {
                 eprintln!("[adaptive-live] warmup error report failed: {}",report_error.to_string().chars().take(200).collect::<String>());
             }
             self.discard_warmup();
@@ -242,12 +316,14 @@ impl AdaptiveLiveRuntime {
         if stopped.load(Ordering::SeqCst) || settings_get(pool,"live").await?.unwrap_or(json!({}))["enabled"]!=true {
             self.state.clear();self.warmup=None;return Ok(());
         }
+        live::recover_pending_warmups(pool,continuous::ADMIN_OWNER).await?;
+        let target=observation_unix.div_euclid(60)*60;
         let slots:Vec<_>=continuous::active_adaptive_slots(pool,continuous::ADMIN_OWNER).await?.into_iter().map(Arc::new).collect();
         let pending=live::pending_adaptive_slots(pool,continuous::ADMIN_OWNER).await?;
         if slots.is_empty() && pending.is_empty() {self.state.clear();self.warmup=None;return Ok(());}
         let catalog=client.instruments().await.map_err(|e|invalid(&e.to_string()))?;
         let active=self.active_plans(pool,&slots,&catalog).await?;
-        self.refresh_warmup(pool,pending,&catalog,&active,&slots).await?;
+        self.refresh_warmup(pool,pending,&catalog,&active,&slots,target).await?;
         let mut wanted:BTreeMap<String,BTreeSet<String>>=BTreeMap::new();
         for plan in active.iter().chain(self.warmup.iter().flat_map(|w|w.plans.iter())) {
             wanted.entry(plan.epoch.clone()).or_default().extend(plan.specs.iter().map(ProfileSpec::key));
@@ -261,9 +337,8 @@ impl AdaptiveLiveRuntime {
             if self.state.needs_reconstruction(&plan.epoch,&plan.specs) {self.state.invalidate(&plan.epoch,None);}
             self.state.install(&plan.epoch,&plan.specs)?;
         }
-        let target=observation_unix.div_euclid(60)*60;
         let mut hot=active.clone();
-        if let Some(warmup)=&self.warmup {hot.extend(warmup.plans.iter().filter(|p|self.state.is_current(&p.epoch,target-1800)).cloned());}
+        if let Some(warmup)=&self.warmup {hot.extend(warmup.plans.iter().filter(|p|!warmup.waiting.contains_key(&instrument_key(&p.instrument)) && self.state.is_current(&p.epoch,target-1800)).cloned());}
         self.hot_tail(pool,client,&hot,target,stopped).await?;
         self.adopt_ready_staging(pool,target).await?;
         // Active hot work wins; at most four duplicate staging rings exist.
@@ -289,34 +364,43 @@ impl AdaptiveLiveRuntime {
                 let client=client.clone();
                 let (from,_)=self.state.fetch_bounds(&plan.epoch,target)?;
                 let guard=self.state.source_guard(&plan.epoch,plan.catalog_id)?;
-                let frozen_boundary=if plan.specs.iter().any(|spec|spec.publish_enabled) {self.state.frozen_boundary(&plan.epoch)?}else{target};
+                let warmup_boundary=self.state.warmup_boundary(&plan.epoch)?;
                 reads.spawn(async move {
-                    let result=source::read_history(&client,plan.catalog_id,from,target,guard,frozen_boundary).await;
+                    let result=source::read_history(&client,plan.catalog_id,from,target,guard,warmup_boundary).await;
                     (plan,result)
                 });
             }
             self.warm_cursor=(self.warm_cursor+count)%cold.len();
+            let mut first_error=None;
             while let Some(result)=reads.join_next().await {
                 let (plan,response)=result.map_err(|e|invalid(&e.to_string()))?;
                 let page=match response {
                     Ok(page)=>page,
                     Err(failure)=>{
                         if failure.invalidate {self.state.invalidate(&plan.epoch,None);}
-                        return Err(failure.error);
+                        // Drain the owned batch before releasing a lease. A
+                        // repair invalidation retries from the same live
+                        // origin; transport/schema failures stay errors.
+                        if !failure.rebuild {first_error.get_or_insert(failure.error);}
+                        completed.insert(plan.epoch.clone());continue;
                     }
                 };
                 self.state.acknowledge_source(&plan.epoch,page.token)?;
-                process_page(&mut self.state,pool,&plan,&page.bars,target,page.complete).await?;
+                if let Err(error)=process_page(&mut self.state,pool,&plan,&page.bars,target,page.complete).await {
+                    first_error.get_or_insert(error);continue;
+                }
                 if page.complete {
                     completed.insert(plan.epoch.clone());
-                    if !plan.specs.iter().any(|spec|spec.publish_enabled) {self.state.account_not_listed(&plan.epoch,target)?;}
+                    self.park_waiting(&plan,target);
                 }
                 pages+=1;
             }
+            if let Some(error)=first_error {return Err(error);}
             self.adopt_ready_staging(pool,target).await?;
             cold=self.cold_plans(&active,target,&completed);
             tokio::task::yield_now().await;
         }
+        self.join_ready_waiting(pool,&active,target).await?;
         self.try_promote(pool,&slots,&catalog,target,stopped).await?;
         Ok(())
     }
@@ -381,27 +465,28 @@ impl AdaptiveLiveRuntime {
                     let token=guard.validated_token(item.read_guard.as_ref());
                     if item.status!="known" || token.is_none() {
                         self.state.invalidate(&plan.epoch,None);
-                        first_error.get_or_insert_with(||invalid("source causal history changed or repair coverage is unknown"));continue;
+                        if item.status!="known" || !item.read_guard.as_ref().is_some_and(|guard|guard.status==setups_mdclient::TailReadGuardStatus::Invalid) {
+                            first_error.get_or_insert_with(||invalid("source causal history changed or repair coverage is unknown"));
+                        }
+                        continue;
                     }
                     let bars:Vec<_>=item.candles.into_iter().map(|row|DetectorBar {open_time_unix:row.candle.open_time_unix,close:row.candle.close,quote_turnover:row.candle.quote_turnover}).collect();
                     self.state.acknowledge_source(&plan.epoch,token.unwrap())?;
                     if let Err(error)=process_page(&mut self.state,pool,plan,&bars,target,true).await {first_error.get_or_insert(error);continue;}
-                    if !plan.specs.iter().any(|spec|spec.publish_enabled) {
-                        self.state.account_not_listed(&plan.epoch,target)?;
-                        if let Err(error)=process_chunk(&mut self.state,pool,plan,&[],target,false).await {first_error.get_or_insert(error);}
-                    }
+                    self.park_waiting(plan,target);
                 }
             }
         }
         first_error.map_or(Ok(()),Err)
     }
-    async fn try_promote(&mut self,pool:&PgPool,_active:&[Arc<ActiveAdaptiveSlot>],catalog:&[CatalogInstrument],frontier:i64,stopped:&AtomicBool)->Result<(),WorkerError> {
+    async fn try_promote(&mut self,pool:&PgPool,_active:&[Arc<ActiveAdaptiveSlot>],_catalog:&[CatalogInstrument],frontier:i64,stopped:&AtomicBool)->Result<(),WorkerError> {
         let Some(warmup)=self.warmup.as_ref() else {return Ok(());};
         if stopped.load(Ordering::SeqCst) {return Ok(());}
         for plan in &warmup.plans {
+            if !plan.specs.iter().any(|s|s.publish_enabled) {continue;}
+            if warmup.waiting.contains_key(&instrument_key(&plan.instrument)) {continue;}
             if plan.epoch!=AdaptiveRuntime::epoch_key(&plan.instrument,None) || !self.state.is_current(&plan.epoch,frontier) {return Ok(());}
             if plan.specs.iter().any(|spec|spec.key()==warmup.candidate_key)
-                && catalog.iter().any(|item|item.id==plan.catalog_id && item.status=="active")
                 && !self.state.ready(&plan.epoch,&warmup.candidate_key,frontier) {return Ok(());}
         }
         // The owner has joined all active commits. This short CAS is the slot
@@ -410,23 +495,28 @@ impl AdaptiveLiveRuntime {
         for plan in &warmup.plans {
             let key=instrument_key(&plan.instrument);
             let checkpoint=continuous::get_adaptive_checkpoint(pool,warmup.lease.slot_id,&key).await?;
-            if checkpoint.as_ref().is_some_and(|row|row.state["nextOpenUnix"].as_i64()!=Some(frontier)) {return Ok(());}
+            if !warmup.waiting.contains_key(&key) && !warmup.retired.contains_key(&key)
+                && checkpoint.as_ref().is_some_and(|row|row.state["nextOpenUnix"].as_i64()!=Some(frontier)) {return Ok(());}
             expected.push(live::CheckpointExpectation {instrument_key:key,checkpoint});
         }
         let mut initial=Vec::new();
-        for plan in warmup.plans.iter().filter(|plan|plan.specs.iter().any(|spec|spec.key()==warmup.candidate_key)) {
+        for plan in warmup.plans.iter().filter(|plan|!warmup.waiting.contains_key(&instrument_key(&plan.instrument))
+            && plan.specs.iter().any(|spec|spec.key()==warmup.candidate_key)) {
             let checkpoint=self.state.checkpoint_for(&plan.epoch,&warmup.candidate_key).ok_or_else(||invalid("ready candidate checkpoint missing"))?;
             if checkpoint.next_open_unix!=frontier {return Ok(());}
             initial.push(live::InitialAdaptiveCheckpoint {instrument_key:instrument_key(&plan.instrument),state:serde_json::to_value(checkpoint)?});
         }
+        if initial.is_empty() {return Ok(());}
+        let waiting:Vec<_>=warmup.waiting.iter().map(|(key,reason)|live::WaitingInstrument {instrument_key:key.clone(),reason:reason.clone()}).collect();
+        let retired:Vec<_>=warmup.retired.iter().map(|(key,reason)|live::WaitingInstrument {instrument_key:key.clone(),reason:reason.clone()}).collect();
         if !live::report_warmup(pool,&warmup.lease,"ready",Some(frontier),None).await? {self.discard_warmup();return Ok(());}
         let result=promotion::persist(&promotion::PgPromotion {pool,lease:&warmup.lease,
-            predecessor:warmup.pending.expected_active_generation_id,expected:&expected,frontier,initial:&initial}).await;
+            predecessor:warmup.pending.expected_active_generation_id,expected:&expected,frontier,initial:&initial,waiting:&waiting,retired:&retired}).await;
         match result {
             Ok(promotion::Outcome::Adopt)=>{
                 let warmup=self.warmup.take().unwrap();
                 for plan in &warmup.plans {
-                    if plan.specs.iter().any(|spec|spec.key()==warmup.candidate_key) {self.state.activate(&plan.epoch,&warmup.candidate_key,frontier)?;}
+                    if initial.iter().any(|entry|entry.instrument_key==instrument_key(&plan.instrument)) {self.state.activate(&plan.epoch,&warmup.candidate_key,frontier)?;}
                     for spec in plan.specs.iter().filter(|spec|spec.fence.slot_id==warmup.lease.slot_id && spec.key()!=warmup.candidate_key) {
                         self.state.remove_profile(&plan.epoch,&spec.key());
                     }
@@ -439,7 +529,10 @@ impl AdaptiveLiveRuntime {
             Ok(promotion::Outcome::Lost)=>self.discard_warmup(),
             Ok(promotion::Outcome::Retry)=>{
                 let warmup=self.warmup.as_mut().unwrap();warmup.barrier_attempts+=1;
-                if warmup.barrier_attempts>=3 {self.discard_warmup();}
+                if warmup.barrier_attempts>=3 {
+                    live::release_pending_warmup(pool,&warmup.lease).await?;
+                    self.discard_warmup();
+                }
             },
             Err(error)=>{
                 // Do not leave a possibly committed candidate missing from a
@@ -540,9 +633,7 @@ mod tests {
     async fn independent_epoch_proofs_keep_long_revision_two_and_short_revision_one_valid() {
         use axum::{Json,Router,routing::post};
         use setups_mdclient::TailReadToken;
-        let mut f=fixture();f.spec.bootstrap_next=60;f.spec.emit_from_close=120;
-        let digest=setups_optimizer::detector_prefix_fingerprint(&f.bars[..1],0,60).unwrap();
-        f.spec.prefix.bar_count=digest.bar_count;f.spec.prefix.sha256=digest.sha256;
+        let mut f=fixture();f.spec.warmup_through=60;f.spec.emit_from_close=120;
         f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
         feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars[..2],120).unwrap();
         f.runtime.acknowledge_source(&f.epoch,TailReadToken {epoch:"proof-fixture".into(),revision:"2".into()}).unwrap();
@@ -593,7 +684,7 @@ mod tests {
         crate::adaptive::state::tests::mark_legacy_consumed(&mut f.runtime,&f.epoch,f.frontier+120);
         let mut other=f.instrument.clone();other.symbol="OTHERUSDT".into();
         let other_epoch=AdaptiveRuntime::epoch_key(&other,None);
-        let mut other_spec=f.spec.clone();other_spec.prefix.instrument.symbol=other.symbol.clone();
+        let other_spec=f.spec.clone();
         f.runtime.install(&other_epoch,&[other_spec]).unwrap();
         feed(&mut f.runtime,&other_epoch,&other,&f.bars,f.frontier).unwrap();
         let other_bytes=f.runtime.retained_history_bytes();

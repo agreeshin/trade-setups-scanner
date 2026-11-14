@@ -2,6 +2,64 @@
 use super::*;
 use setups_db::continuous::AdaptiveSetupWrite;
 use crate::adaptive::state::PreparedProfile;
+use sqlx::Row;
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(super) enum JoinDurable {Successor,Predecessor,Changed}
+#[allow(async_fn_in_trait)]
+pub(super) trait JoinStore {
+    async fn attempt(&self)->Result<bool,WorkerError>;
+    async fn reread(&self)->Result<JoinDurable,WorkerError>;
+}
+/// An uncertain join never unmutes RAM based only on generation identity.
+pub(super) async fn join(store:&impl JoinStore)->Result<bool,WorkerError> {
+    let mut last_error=None;
+    for _ in 0..2 {
+        match store.attempt().await {Ok(true)=>return Ok(true),Ok(false)=>{},Err(error)=>last_error=Some(error)}
+        match store.reread().await? {
+            JoinDurable::Successor=>return Ok(true),
+            JoinDurable::Changed=>return Ok(false),
+            JoinDurable::Predecessor=>{},
+        }
+    }
+    last_error.map_or(Ok(false),Err)
+}
+pub(super) struct PgJoin<'a> {
+    pub pool:&'a PgPool,
+    pub slot:&'a ActiveAdaptiveSlot,
+    pub instrument_key:&'a str,
+    pub previous:Option<&'a continuous::AdaptiveCheckpoint>,
+    pub frontier:i64,
+    pub state:&'a Value,
+}
+impl JoinStore for PgJoin<'_> {
+    async fn attempt(&self)->Result<bool,WorkerError> {
+        Ok(live::join_waiting_adaptive_instrument(self.pool,self.slot,self.instrument_key,self.previous,self.frontier,self.state).await?)
+    }
+    async fn reread(&self)->Result<JoinDurable,WorkerError> {
+        // One MVCC statement observes permission, generation, readiness/floor
+        // and the checkpoint together. A later cohort must never be adopted.
+        let row=sqlx::query("select s.active_generation_id,s.enabled,p.desired_running,p.config_revision,p.config,g.live_readiness,c.generation_id checkpoint_generation,c.state,exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb) permitted from continuous_slots s join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id left join continuous_generations g on g.id=s.active_generation_id left join adaptive_live_checkpoints c on c.slot_id=s.id and c.instrument_key=$4 where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3")
+            .bind(self.slot.slot_id).bind(&self.slot.owner_id).bind(&self.slot.algorithm_id).bind(self.instrument_key).fetch_optional(self.pool).await?;
+        let Some(row)=row else {return Ok(JoinDurable::Changed);};
+        if !row.try_get::<bool,_>("enabled")? || !row.try_get::<bool,_>("desired_running")? || !row.try_get::<bool,_>("permitted")?
+            || row.try_get::<Option<i64>,_>("active_generation_id")?!=Some(self.slot.generation_id)
+            || row.try_get::<i64,_>("config_revision")?!=self.slot.config_revision || row.try_get::<Value,_>("config")?["adaptiveEnabled"]!=true {
+            return Ok(JoinDurable::Changed);
+        }
+        let readiness:Vec<live::LiveInstrumentReadiness>=serde_json::from_value(row.try_get("live_readiness")?)?;
+        let Some(entry)=readiness.iter().find(|entry|entry.instrument_key==self.instrument_key) else {return Ok(JoinDurable::Changed);};
+        let actual=row.try_get::<Option<i64>,_>("checkpoint_generation")?.map(|generation_id|
+            Ok::<_,WorkerError>(continuous::AdaptiveCheckpoint {generation_id,state:row.try_get("state")?})).transpose()?;
+        if entry.status=="ready" && entry.reason.is_none() && entry.publication_floor_close_unix==self.frontier
+            && actual.as_ref().is_some_and(|state|state.generation_id==self.slot.generation_id && &state.state==self.state) {
+            return Ok(JoinDurable::Successor);
+        }
+        Ok(if entry.status=="waiting" && entry.publication_floor_close_unix<=self.frontier && actual.as_ref()==self.previous {
+            JoinDurable::Predecessor
+        } else {JoinDurable::Changed})
+    }
+}
 
 pub(super) async fn load_checkpoint(pool:&PgPool,slot:i64,instrument:&AdaptiveInstrument)->Result<Option<AdaptiveCheckpoint>,WorkerError> {
     continuous::get_adaptive_checkpoint(pool,slot,&instrument_key(instrument)).await?

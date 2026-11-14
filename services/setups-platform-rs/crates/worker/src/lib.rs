@@ -473,7 +473,7 @@ pub async fn start_replay_jobs(
     interrupt_queued_runs(&pool).await?;
     sqlx::query(
         "update replay_runs set status = 'cancelled', updated_at = now() \
-         where status = 'cancel_requested'",
+         where origin='manual' and status = 'cancel_requested'",
     )
     .execute(&pool)
     .await?;

@@ -7,12 +7,13 @@ edition.workspace = true
 setups-domain.workspace = true
 setups-detector.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 sqlx.workspace = true
 chrono.workspace = true
 rand.workspace = true
 p256.workspace = true
 base64.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

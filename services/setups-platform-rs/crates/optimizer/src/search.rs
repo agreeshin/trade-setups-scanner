@@ -1,8 +1,10 @@
+use crate::checkpoint::{BoundedBytes, SearchRng};
 use crate::evaluation::{Control, evaluate_group, limit, validate_input};
 use crate::validation::{analytics_with_value, invalid, normalized_decimal, parse_params};
 use crate::*;
-use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
+use rand::{Rng, seq::SliceRandom};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,19 +12,22 @@ use std::time::{Duration, Instant};
 
 type PacketEvaluation = Result<Vec<(usize, Option<CandidateEvaluation>)>, StudyError>;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Dimension {
     key: String,
     algorithm: bool,
     values: Vec<Value>,
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Record {
     coordinates: Vec<usize>,
     score: Option<f64>,
     trial: usize,
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Proposal {
     candidate: StudyCandidate,
     coordinates: Option<Vec<usize>>,
@@ -30,7 +35,8 @@ struct Proposal {
     phase: StudyPhase,
     packet_child: bool,
 }
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Influence {
     total_difference: f64,
     comparisons: usize,
@@ -39,6 +45,8 @@ struct Influence {
 
 /// All retained state is bounded by dimensions/domain values and maxTrials.
 /// It stores coordinates/scores and canonical identities, never trial matrices.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Search {
     baseline: StudyCandidate,
     baseline_coordinates: Option<Vec<usize>>,
@@ -50,9 +58,10 @@ struct Search {
     refinement_step: usize,
     records: Vec<Record>,
     influence: Vec<Influence>,
+    #[serde(with = "crate::checkpoint::sorted_strings")]
     seen: HashSet<String>,
     pending: VecDeque<Proposal>,
-    random: StdRng,
+    random: SearchRng,
     enumeration: Vec<usize>,
     enumeration_finished: bool,
     attempts: usize,
@@ -64,6 +73,10 @@ struct Search {
 
 impl Search {
     fn new(spec: &StudyRequest) -> Result<Self, StudyError> {
+        Self::with_rng(spec, false)
+    }
+
+    fn with_rng(spec: &StudyRequest, durable: bool) -> Result<Self, StudyError> {
         let baseline = StudyCandidate {
             params: spec.algorithm_params.clone(),
             analytics: spec.analytics_params.clone(),
@@ -155,7 +168,7 @@ impl Search {
                     .position(|candidate| candidate == &value)
             })
             .collect();
-        let mut random = StdRng::seed_from_u64(spec.seed);
+        let mut random = SearchRng::new(spec.seed, durable);
         let initial_count = spec
             .max_trials
             .saturating_sub(1)
@@ -538,9 +551,76 @@ pub(crate) fn run_study_mode(
     input: &StudyInput,
     limits: &StudyLimits,
     cancel: &CancelToken,
-    mut progress: impl FnMut(StudyUpdate),
+    progress: impl FnMut(StudyUpdate),
     continuous: Option<ContinuousContext>,
 ) -> Result<StudyOutcome, StudyError> {
+    match run_engine(
+        spec,
+        input,
+        limits,
+        cancel,
+        progress,
+        EngineMode {
+            continuous,
+            resume: None,
+        },
+    )? {
+        ContinuousSearchExit::Completed(outcome) => Ok(outcome),
+        ContinuousSearchExit::Suspended(_) => {
+            Err(StudyError::Execution("unexpected manual suspension".into()))
+        }
+    }
+}
+
+type CheckpointCallback<'a> =
+    dyn FnMut(&ContinuousCheckpointInfo, &[u8]) -> Result<CheckpointAction, StudyError> + 'a;
+struct ResumeHooks<'a> {
+    control: ContinuousSearchControl<'a>,
+    checkpoint: &'a mut CheckpointCallback<'a>,
+}
+struct EngineMode<'a> {
+    continuous: Option<ContinuousContext>,
+    resume: Option<ResumeHooks<'a>>,
+}
+
+/// Continuous-only private recovery. Callback MUST durably commit/ack before
+/// returning. Maintenance drain does not pause admitted work; `pause` is only an
+/// explicit process-shutdown boundary. Original wall deadline belongs to runtime.
+pub fn search_continuous_resumable(
+    spec: &StudyRequest,
+    input: &StudyInput,
+    context: ContinuousContext,
+    limits: &StudyLimits,
+    control: ContinuousSearchControl<'_>,
+    progress: impl FnMut(StudyUpdate),
+    mut checkpoint: impl FnMut(&ContinuousCheckpointInfo, &[u8]) -> Result<CheckpointAction, StudyError>,
+) -> Result<ContinuousSearchExit, StudyError> {
+    let cancel = control.cancel;
+    run_engine(
+        spec,
+        input,
+        limits,
+        cancel,
+        progress,
+        EngineMode {
+            continuous: Some(context),
+            resume: Some(ResumeHooks {
+                control,
+                checkpoint: &mut checkpoint,
+            }),
+        },
+    )
+}
+
+fn run_engine(
+    spec: &StudyRequest,
+    input: &StudyInput,
+    limits: &StudyLimits,
+    cancel: &CancelToken,
+    mut progress: impl FnMut(StudyUpdate),
+    mut mode: EngineMode<'_>,
+) -> Result<ContinuousSearchExit, StudyError> {
+    let continuous = mode.continuous;
     if let Some(context) = continuous {
         validate_continuous_request(spec, context)?;
     } else {
@@ -586,38 +666,138 @@ pub(crate) fn run_study_mode(
         limits.max_working_bytes,
     )?;
     let start = Instant::now();
-    let passes = AtomicUsize::new(0);
+    let restored = if let Some(hooks) = &mode.resume {
+        if hooks.control.remaining_budget > Duration::from_secs(spec.max_seconds)
+            || hooks.control.max_checkpoint_bytes == 0
+        {
+            return Err(checkpoint_error("invalid remaining/checkpoint budget"));
+        }
+        hooks
+            .control
+            .resume_checkpoint
+            .map(|bytes| {
+                decode_checkpoint(
+                    bytes,
+                    spec,
+                    input,
+                    continuous.expect("continuous resume"),
+                    limits,
+                    hooks.control.max_checkpoint_bytes,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let (
+        mut search,
+        mut snapshot,
+        mut best,
+        mut baseline,
+        mut submitted,
+        mut sequence,
+        elapsed_before,
+        prior_passes,
+    ) = match restored {
+        Some(state) => (
+            state.search,
+            state.progress,
+            state.best,
+            state.baseline,
+            state.submitted,
+            state.sequence,
+            Duration::from_nanos(state.elapsed_nanos),
+            state.detector_passes,
+        ),
+        None => (
+            if mode.resume.is_some() {
+                Search::with_rng(spec, true)?
+            } else {
+                Search::new(spec)?
+            },
+            StudyProgress {
+                phase: StudyPhase::Initial,
+                evaluated_candidates: 0,
+                scorable_candidates: 0,
+                max_trials: spec.max_trials,
+                elapsed_seconds: 0.0,
+                best_score: None,
+            },
+            None,
+            None,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+        ),
+    };
+    let elapsed = || elapsed_before.saturating_add(start.elapsed());
+    let passes = AtomicUsize::new(prior_passes);
     let control = Control {
         cancel,
-        deadline: start + Duration::from_secs(spec.max_seconds),
+        deadline: start
+            + mode
+                .resume
+                .as_ref()
+                .map_or(Duration::from_secs(spec.max_seconds), |h| {
+                    h.control.remaining_budget
+                }),
         detector_passes: &passes,
-    };
-    let mut snapshot = StudyProgress {
-        phase: StudyPhase::Initial,
-        evaluated_candidates: 0,
-        scorable_candidates: 0,
-        max_trials: spec.max_trials,
-        elapsed_seconds: 0.0,
-        best_score: None,
     };
     progress(StudyUpdate {
         progress: snapshot.clone(),
         incumbent: None,
         event: None,
     });
-    let stats = validate_input(spec, input, limits, cancel)?;
+    let stats = if mode.resume.is_some() && control.stopped() {
+        None
+    } else {
+        validate_input(spec, input, limits, cancel)?
+    };
     if let Some(context) = continuous {
         crate::continuous::validate_frozen_cutoff(input, context, cancel)?;
     }
-    let mut search = Search::new(spec)?;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(limits.cpu_threads)
         .stack_size(512 * 1024)
         .build()
         .map_err(|error| StudyError::Execution(error.to_string()))?;
-    let mut best: Option<StudyBest> = None;
-    let mut baseline = None;
-    let mut submitted = 0;
+    if let Some(hooks) = &mut mode.resume {
+        if hooks.control.resume_checkpoint.is_none() {
+            snapshot.elapsed_seconds = elapsed().as_secs_f64();
+            let info = ContinuousCheckpointInfo {
+                sequence,
+                progress: snapshot.clone(),
+            };
+            let bytes = encode_checkpoint(
+                &search,
+                spec,
+                input,
+                continuous.unwrap(),
+                limits,
+                &info,
+                &best,
+                &baseline,
+                submitted,
+                elapsed(),
+                passes.load(Ordering::Relaxed),
+                hooks.control.max_checkpoint_bytes,
+            )?;
+            let action = (hooks.checkpoint)(&info, &bytes)?;
+            if !cancel.is_cancelled()
+                && !control.stopped()
+                && (action == CheckpointAction::Suspend || hooks.control.pause.is_cancelled())
+            {
+                return Ok(ContinuousSearchExit::Suspended(info));
+            }
+        } else if hooks.control.pause.is_cancelled() && !cancel.is_cancelled() && !control.stopped()
+        {
+            return Ok(ContinuousSearchExit::Suspended(ContinuousCheckpointInfo {
+                sequence,
+                progress: snapshot.clone(),
+            }));
+        }
+    }
     let reason = 'search: loop {
         if cancel.is_cancelled() {
             break TerminationReason::Cancelled;
@@ -651,7 +831,7 @@ pub(crate) fn run_study_mode(
             };
         }
         snapshot.phase = batch[0].phase;
-        snapshot.elapsed_seconds = start.elapsed().as_secs_f64();
+        snapshot.elapsed_seconds = elapsed().as_secs_f64();
         progress(StudyUpdate {
             progress: snapshot.clone(),
             incumbent: None,
@@ -773,7 +953,7 @@ pub(crate) fn run_study_mode(
                 None
             };
             snapshot.best_score = best.as_ref().map(|value| value.score);
-            snapshot.elapsed_seconds = start.elapsed().as_secs_f64();
+            snapshot.elapsed_seconds = elapsed().as_secs_f64();
             progress(StudyUpdate {
                 progress: snapshot.clone(),
                 incumbent,
@@ -788,9 +968,40 @@ pub(crate) fn run_study_mode(
                 TerminationReason::TimeBudget
             };
         }
+        // NO checkpoint after an interrupted/partially observed batch: Search
+        // has already removed pending proposals/inserted seen identities.
+        if let Some(hooks) = &mut mode.resume {
+            sequence += 1;
+            snapshot.elapsed_seconds = elapsed().as_secs_f64();
+            let info = ContinuousCheckpointInfo {
+                sequence,
+                progress: snapshot.clone(),
+            };
+            let bytes = encode_checkpoint(
+                &search,
+                spec,
+                input,
+                continuous.unwrap(),
+                limits,
+                &info,
+                &best,
+                &baseline,
+                submitted,
+                elapsed(),
+                passes.load(Ordering::Relaxed),
+                hooks.control.max_checkpoint_bytes,
+            )?;
+            let action = (hooks.checkpoint)(&info, &bytes)?;
+            if !cancel.is_cancelled()
+                && !control.stopped()
+                && (action == CheckpointAction::Suspend || hooks.control.pause.is_cancelled())
+            {
+                return Ok(ContinuousSearchExit::Suspended(info));
+            }
+        }
     };
     snapshot.phase = StudyPhase::Cleanup;
-    snapshot.elapsed_seconds = start.elapsed().as_secs_f64();
+    snapshot.elapsed_seconds = elapsed().as_secs_f64();
     if let Some(best) = &mut best {
         best.partial = reason == TerminationReason::Cancelled;
         best.conclusions = search.conclusions(snapshot.evaluated_candidates);
@@ -821,19 +1032,308 @@ pub(crate) fn run_study_mode(
         incumbent: None,
         event,
     });
-    Ok(StudyOutcome {
+    Ok(ContinuousSearchExit::Completed(StudyOutcome {
         progress: snapshot,
         best,
         reason,
         baseline,
         invalid_proposals: search.invalid,
         detector_passes: passes.load(Ordering::Relaxed),
-    })
+    }))
+}
+
+fn checkpoint_error(message: impl std::fmt::Display) -> StudyError {
+    StudyError::InvalidInput(format!("continuous checkpoint: {message}"))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Checkpoint<S> {
+    version: u32,
+    optimizer_version: String,
+    rng_version: String,
+    word_bits: u32,
+    request_hash: String,
+    input_hash: String,
+    captured_at: String,
+    observation_cutoff: i64,
+    execution_limits: [usize; 6],
+    sequence: u64,
+    submitted: usize,
+    progress: StudyProgress,
+    best: Option<StudyBest>,
+    baseline: Option<TrialSummary>,
+    detector_passes: usize,
+    elapsed_nanos: u64,
+    search: S,
+}
+fn execution_limits(limits: &StudyLimits) -> [usize; 6] {
+    [
+        limits.cpu_threads,
+        limits.batch_size,
+        limits.max_snapshot_bytes,
+        limits.max_working_bytes,
+        limits.max_setups_per_candidate,
+        limits.max_domain_values,
+    ]
+}
+fn request_hash(spec: &StudyRequest) -> Result<String, StudyError> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(spec).map_err(checkpoint_error)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+fn checkpoint_cap(limits: &StudyLimits, requested: usize) -> usize {
+    // Reserve room for decoded collections, encoding, validation and incumbent
+    // copies. The frozen input is under its SEPARATE max_snapshot_bytes budget.
+    requested.min(limits.max_working_bytes / 32)
+}
+#[allow(clippy::too_many_arguments)]
+fn encode_checkpoint(
+    search: &Search,
+    spec: &StudyRequest,
+    input: &StudyInput,
+    context: ContinuousContext,
+    limits: &StudyLimits,
+    info: &ContinuousCheckpointInfo,
+    best: &Option<StudyBest>,
+    baseline: &Option<TrialSummary>,
+    submitted: usize,
+    elapsed: Duration,
+    detector_passes: usize,
+    max_bytes: usize,
+) -> Result<Vec<u8>, StudyError> {
+    let checkpoint = Checkpoint {
+        version: crate::checkpoint::FORMAT_VERSION,
+        optimizer_version: CONTINUOUS_OPTIMIZER_VERSION.into(),
+        rng_version: crate::checkpoint::RNG_VERSION.into(),
+        word_bits: usize::BITS,
+        request_hash: request_hash(spec)?,
+        input_hash: input.snapshot_hash.clone(),
+        captured_at: input.captured_at.clone(),
+        observation_cutoff: context.observation_cutoff,
+        execution_limits: execution_limits(limits),
+        sequence: info.sequence,
+        submitted,
+        progress: info.progress.clone(),
+        best: best.clone(),
+        baseline: baseline.clone(),
+        detector_passes,
+        elapsed_nanos: u64::try_from(elapsed.as_nanos()).map_err(checkpoint_error)?,
+        search,
+    };
+    let mut writer = BoundedBytes {
+        bytes: Vec::new(),
+        limit: checkpoint_cap(limits, max_bytes),
+    };
+    ciborium::ser::into_writer(&checkpoint, &mut writer).map_err(checkpoint_error)?;
+    Ok(writer.bytes)
+}
+
+fn decode_checkpoint(
+    bytes: &[u8],
+    spec: &StudyRequest,
+    input: &StudyInput,
+    context: ContinuousContext,
+    limits: &StudyLimits,
+    max_bytes: usize,
+) -> Result<Checkpoint<Search>, StudyError> {
+    limit(
+        "checkpoint_bytes",
+        bytes.len(),
+        checkpoint_cap(limits, max_bytes),
+    )?;
+    let mut reader = std::io::Cursor::new(bytes);
+    let state: Checkpoint<Search> =
+        ciborium::de::from_reader(&mut reader).map_err(checkpoint_error)?;
+    if reader.position() != bytes.len() as u64 {
+        return Err(checkpoint_error("trailing checkpoint bytes"));
+    }
+    if state.version != crate::checkpoint::FORMAT_VERSION
+        || state.optimizer_version != CONTINUOUS_OPTIMIZER_VERSION
+        || state.rng_version != crate::checkpoint::RNG_VERSION
+        || state.word_bits != usize::BITS
+        || state.execution_limits != execution_limits(limits)
+        || state.observation_cutoff != context.observation_cutoff
+        || state.request_hash != request_hash(spec)?
+        || state.input_hash != input.snapshot_hash
+        || state.captured_at != input.captured_at
+    {
+        return Err(checkpoint_error(
+            "incompatible version/request/input/context/limits",
+        ));
+    }
+    let expected = Search::with_rng(spec, true)?;
+    let search = &state.search;
+    let dimensions = search.dimensions.len();
+    if search.baseline != expected.baseline
+        || search.baseline_coordinates != expected.baseline_coordinates
+        || search.dimensions != expected.dimensions
+        || search.initial != expected.initial
+        || search.max_attempts != expected.max_attempts
+        || search.max_trials != spec.max_trials
+        || search.algorithm_id != spec.algorithm_id
+        || search.initial_index > search.initial.len()
+        || search.attempts > search.max_attempts
+        || search.invalid > search.attempts
+        || search.sensitivity_step > search.attempts
+        || search.refinement_step > search.attempts
+    {
+        return Err(checkpoint_error("invalid frontier/configuration/cursors"));
+    }
+    let valid_coords = |coords: &[usize]| {
+        coords.len() == dimensions
+            && coords
+                .iter()
+                .zip(&search.dimensions)
+                .all(|(&i, d)| i < d.values.len())
+    };
+    if !valid_coords(&search.enumeration)
+        || search
+            .baseline_coordinates
+            .as_ref()
+            .is_some_and(|c| !valid_coords(c))
+        || search.initial.iter().any(|c| !valid_coords(c))
+    {
+        return Err(checkpoint_error("invalid coordinate dimensions/index"));
+    }
+    if state.submitted > spec.max_trials
+        || state.progress.evaluated_candidates != state.submitted
+        || search.seen.len() != state.submitted
+        || state.progress.scorable_candidates > state.submitted
+        || state.progress.max_trials != spec.max_trials
+        || !state.progress.elapsed_seconds.is_finite()
+        || state.progress.elapsed_seconds < 0.0
+        || state.progress.best_score.is_some_and(|v| !v.is_finite())
+        || state.sequence > state.submitted as u64
+        || (state.submitted == 0) != (state.sequence == 0)
+        || search.baseline_sent != (state.submitted > 0)
+        || state.baseline.is_some() != (state.submitted > 0)
+        || search.records.len()
+            != state
+                .submitted
+                .saturating_sub(usize::from(search.baseline_coordinates.is_none()))
+        || search.pending.len() > spec.max_trials.saturating_mul(2).saturating_add(2)
+        || search.influence.len() != dimensions
+    {
+        return Err(checkpoint_error("inconsistent committed batch counters"));
+    }
+    if !matches!(
+        state.progress.phase,
+        StudyPhase::Initial | StudyPhase::Sensitivity | StudyPhase::Refinement
+    ) {
+        return Err(checkpoint_error("non-search phase"));
+    }
+    let mut previous = None;
+    for record in &search.records {
+        if record.trial >= state.submitted
+            || previous.is_some_and(|old| old >= record.trial)
+            || !valid_coords(&record.coordinates)
+            || record.score.is_some_and(|v| !v.is_finite())
+        {
+            return Err(checkpoint_error("invalid record/index/score"));
+        }
+        let proposal = search.build(record.coordinates.clone(), StudyPhase::Initial, None)?;
+        if !search
+            .seen
+            .contains(&canonical_candidate_key(&proposal.candidate)?)
+        {
+            return Err(checkpoint_error("observed record absent from seen"));
+        }
+        previous = Some(record.trial);
+    }
+    for proposal in &search.pending {
+        let Some(coords) = &proposal.coordinates else {
+            return Err(checkpoint_error("pending coordinates absent"));
+        };
+        if !valid_coords(coords)
+            || proposal.comparison.is_some_and(|(trial, dim, score)| {
+                trial >= state.submitted
+                    || dim >= dimensions
+                    || score.is_some_and(|v| !v.is_finite())
+            })
+        {
+            return Err(checkpoint_error("invalid pending coordinates/comparison"));
+        }
+        if search
+            .build(coords.clone(), proposal.phase, proposal.comparison)?
+            .candidate
+            != proposal.candidate
+        {
+            return Err(checkpoint_error(
+                "pending candidate differs from coordinates",
+            ));
+        }
+    }
+    for effect in &search.influence {
+        if !effect.total_difference.is_finite()
+            || effect.total_difference < 0.0
+            || effect.comparisons > state.submitted
+            || effect.contexts.len() > effect.comparisons
+            || effect.contexts.iter().any(|&i| i >= state.submitted)
+        {
+            return Err(checkpoint_error("invalid influence"));
+        }
+    }
+    let finite_summary = |summary: &TrialSummary| {
+        summary.score.is_none_or(f64::is_finite)
+            && summary
+                .avg_setups_per_day
+                .is_none_or(|v| v.is_finite() && v >= 0.0)
+    };
+    if state.baseline.as_ref().is_some_and(|b| !finite_summary(b)) {
+        return Err(checkpoint_error("invalid baseline"));
+    }
+    let scorable = search.records.iter().filter(|r| r.score.is_some()).count()
+        + usize::from(
+            search.baseline_coordinates.is_none()
+                && state.baseline.as_ref().is_some_and(|b| b.score.is_some()),
+        );
+    if scorable != state.progress.scorable_candidates
+        || state.best.is_some() != (scorable > 0)
+        || state.best.as_ref().map(|b| b.score.to_bits())
+            != state.progress.best_score.map(f64::to_bits)
+    {
+        return Err(checkpoint_error("incumbent/scorable mismatch"));
+    }
+    if let Some(best) = &state.best {
+        let provenance = &best.provenance;
+        if !best.score.is_finite()
+            || best.trial_index >= state.submitted
+            || !finite_summary(&best.support)
+            || best.support.score != Some(best.score)
+            || best.matrix.len() != spec.tp_levels.len() * spec.sl_levels.len()
+            || best.conclusions.len() > 6
+            || provenance.optimizer_version != CONTINUOUS_OPTIMIZER_VERSION
+            || provenance.seed != spec.seed
+            || provenance.snapshot_hash != input.snapshot_hash
+            || provenance.captured_at != input.captured_at
+            || best
+                .analytics
+                .price_change_pct
+                .is_some_and(|v| !v.is_finite())
+            || best
+                .analytics
+                .setup_maturity
+                .is_some_and(|v| !v.is_finite())
+            || best.matrix.iter().any(|cell| {
+                !cell.tp_pct.is_finite()
+                    || !cell.sl_pct.is_finite()
+                    || cell.risk_expectancy.is_some_and(|v| !v.is_finite())
+                    || cell.avg_move_pct.is_some_and(|v| !v.is_finite())
+            })
+            || score_matrix(&best.matrix, spec.min_closed_per_cell) != Some(best.score)
+        {
+            return Err(checkpoint_error("invalid incumbent/matrix/provenance"));
+        }
+        parse_params(&spec.algorithm_id, &best.params).map_err(checkpoint_error)?;
+    }
+    Ok(state)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{SeedableRng, rngs::StdRng};
     use serde_json::json;
 
     fn toy_spec() -> StudyRequest {

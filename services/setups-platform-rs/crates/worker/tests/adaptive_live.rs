@@ -171,6 +171,18 @@ async fn activate(pool: &PgPool, slot_id: i64, spec: &Value, result: &Value) {
         .bind(slot_id).bind(spec).bind(spec["toUnix"].as_i64().unwrap()).bind(study).bind(result).fetch_one(pool).await.unwrap();
     sqlx::query("update continuous_slots set active_generation_id=$2,study_id=$3,mean_expectancy=0.21,selected_cell=$4,status='active' where id=$1")
         .bind(slot_id).bind(generation).bind(study).bind(&result["selectedCell"]).execute(pool).await.unwrap();
+    // Explicit operational fixture metadata. Production derives and persists
+    // this independently at live claim; tests choose a matching reference
+    // origin here so existing incremental/restart parity remains comparable.
+    let anchor=spec["toUnix"].as_i64().unwrap();
+    let initialization=json!({"version":1,"anchorCloseUnix":anchor,
+        "detectorFromOpenUnix":result["bootstrap"]["detectorWarmupFromUnix"],"emitFromCloseUnix":anchor+60});
+    let readiness:Vec<_>=spec["instruments"].as_array().unwrap().iter().map(|instrument|json!({
+        "instrumentKey":format!("{}/{}/{}",instrument["exchange"].as_str().unwrap(),instrument["category"].as_str().unwrap(),instrument["symbol"].as_str().unwrap()),
+        "status":if instrument["symbol"]=="DELISTUSDT" {"waiting"}else{"ready"},
+        "reason":if instrument["symbol"]=="DELISTUSDT" {json!("not_listed")}else{Value::Null},"publicationFloorCloseUnix":anchor})).collect();
+    sqlx::query("update continuous_generations set live_initialization=$2,live_readiness=$3,live_init_status='active' where id=$1")
+        .bind(generation).bind(initialization).bind(json!(readiness)).execute(pool).await.unwrap();
 }
 
 fn scoped_profile(now:i64,symbols:&[&str])->(Value,Value) {
@@ -211,6 +223,9 @@ struct Journal {
     repair_during_history:Option<i64>,
     arrival_before_guard:Option<(usize,i64)>,
     guard_requests:Vec<Value>,
+    starts:std::collections::BTreeMap<i64,i64>,
+    ends:std::collections::BTreeMap<i64,i64>,
+    history_error:bool,
 }
 impl Journal {
     fn repair(&mut self,open:i64) {
@@ -229,11 +244,13 @@ struct CandleQuery {
     after_unix: Option<i64>,
     limit: Option<usize>,
 }
-async fn candles(State(state): State<Market>, Query(query): Query<CandleQuery>) -> Json<Value> {
+async fn candles(State(state): State<Market>, Query(query): Query<CandleQuery>) -> Result<Json<Value>,axum::http::StatusCode> {
     state.reads.lock().unwrap().push(query.instrument_id);
-    let start = query.from_unix.max(state.now - 3 * 86400);
     let mut journal=state.journal.lock().unwrap();
-    let mut candles:Vec<_>=(start..query.to_unix.min(journal.available_through.unwrap_or(state.now))).step_by(60).filter(|time|query.after_unix.is_none_or(|after|*time>after) && !journal.gaps.contains(time))
+    if journal.history_error {return Err(axum::http::StatusCode::GATEWAY_TIMEOUT);}
+    let start=query.from_unix.max(state.now-3*86400).max(journal.starts.get(&query.instrument_id).copied().unwrap_or(0));
+    let end=query.to_unix.min(journal.ends.get(&query.instrument_id).copied().unwrap_or(journal.available_through.unwrap_or(state.now)));
+    let mut candles:Vec<_>=(start..end).step_by(60).filter(|time|query.after_unix.is_none_or(|after|*time>after) && !journal.gaps.contains(time))
         .take(query.limit.unwrap_or(256)+1).map(|time|json!({"openTimeUnix":time,"open":"100","high":"100","low":"100","close":"100","volume":"1","quoteTurnover":if journal.quiet.contains(&time){"0"}else{"1"}})).collect();
     let more = candles.len() > query.limit.unwrap_or(256);
     if more {
@@ -243,7 +260,7 @@ async fn candles(State(state): State<Market>, Query(query): Query<CandleQuery>) 
     // The legacy page is an earlier snapshot; mutate canonical history before
     // its post-read guard response to reproduce a warmup epoch race exactly.
     if let Some(open)=journal.repair_during_history.take() {journal.repair(open);}
-    Json(json!({"candles":candles,"nextCursorUnix":next}))
+    Ok(Json(json!({"candles":candles,"nextCursorUnix":next})))
 }
 async fn tail(State(state):State<Market>,Json(request):Json<Value>)->Json<Value> {
     let from=request["fromUnix"].as_i64().unwrap();let to=request["toUnix"].as_i64().unwrap();
@@ -257,14 +274,16 @@ async fn tail(State(state):State<Market>,Json(request):Json<Value>)->Json<Value>
     journal.guard_requests.push(request.clone());
     let instruments:Vec<_>=request["instrumentIds"].as_array().unwrap().iter().map(|id| {
         let id=id.as_i64().unwrap();let mut missing=Vec::new();let mut cursor=from;let mut contiguous=None;
-        let candles:Vec<_>=(from..to.min(journal.available_through.unwrap_or(state.now))).step_by(60).filter(|open|!journal.gaps.contains(open)).map(|open| {
+        let start=journal.starts.get(&id).copied().unwrap_or(state.now-3*86400);
+        let end=journal.ends.get(&id).copied().unwrap_or(journal.available_through.unwrap_or(state.now));
+        let candles:Vec<_>=(from.max(start)..to.min(end)).step_by(60).filter(|open|!journal.gaps.contains(open)).map(|open| {
             if cursor<open {missing.push(json!({"fromUnix":cursor,"toUnix":open}));}
             if missing.is_empty() {contiguous=Some(open);}
             cursor=open+60;
             json!({"instrumentId":id,"openTimeUnix":open,"open":"100","high":"100","low":"100","close":"100","volume":"1","quoteTurnover":if journal.quiet.contains(&open){"0"}else{"1"}})
         }).collect();
         if cursor<to {missing.push(json!({"fromUnix":cursor,"toUnix":to}));}
-        let mut result=json!({"instrumentId":id,"status":"known","latestStoredOpenTimeUnix":journal.available_through.unwrap_or(state.now)-60,
+        let mut result=json!({"instrumentId":id,"status":"known","latestStoredOpenTimeUnix":(start<end).then_some(end-60),
             "contiguousThroughOpenTimeUnix":contiguous,"candles":candles,"missingRanges":missing});
         if !journal.omit_guard && let Some(guard)=guards.iter().find(|guard|guard.instrument_id==id) {
             let token=json!({"epoch":"worker-market-fixture","revision":journal.revision.to_string()});
@@ -303,7 +322,7 @@ async fn catalog() -> Json<Value> {
 }
 
 #[tokio::test]
-async fn actual_tick_uses_frozen_seeds_listing_intersection_and_independent_live_permission() {
+async fn actual_tick_uses_live_initialization_listing_intersection_and_independent_live_permission() {
     let Some(db) = Database::new("runtime").await else {
         return;
     };
@@ -630,46 +649,32 @@ impl LiveFixture {
 }
 
 #[tokio::test]
-async fn causal_repair_older_than_retained_baseline_invalidates_before_effects_and_preserves_frozen_mismatch() {
+async fn current_live_repair_older_than_retained_baseline_rebuilds_without_research_revalidation() {
     let Some(mut f)=LiveFixture::new("oldrepair",true).await else {return;};
     f.tick().await.unwrap();assert!(f.runtime.retained_history_bytes()>0);
-    assert!(f.anchor+60<f.now-86400,"repair lies OUTSIDE the one-day retained baseline but inside the causal prefix");
-    let before=f.durable().await;let reads=f.market.reads.lock().unwrap().len();
+    assert!(f.anchor+60<f.now-86400,"repair lies outside retained baseline but inside the live causal interval");
+    let before=f.durable().await;
+    let original:Value=sqlx::query_scalar("select result from continuous_generations where id=$1").bind(f.generation).fetch_one(&f.db.pool).await.unwrap();
     f.market.journal.lock().unwrap().repair(f.anchor+60);
-    let error=f.tick().await.unwrap_err();assert!(error.to_string().contains("causal history changed"));
-    assert_eq!(f.runtime.retained_history_bytes(),0);assert_eq!(f.runtime.retained_profile_bytes(),0);
-    assert_eq!(f.durable().await,before);assert_eq!(f.market.reads.lock().unwrap().len(),reads);
-    assert_eq!(f.market.journal.lock().unwrap().guard_requests.last().unwrap()["readGuards"][0]["fromUnix"],f.anchor);
-    // Rebuilding cannot substitute journal evidence for the original manifest:
-    // the now-filled ORIGINAL gap changes the frozen prefix and stays an error.
-    let error=f.tick().await.unwrap_err();assert!(error.to_string().contains("frozen detector prefix fingerprint mismatch"));
-    assert_eq!(f.durable().await,before);
+    f.tick().await.unwrap();f.tick().await.unwrap();
+    assert_eq!(f.durable().await.0,before.0,"repair must not republish historical effects");
+    assert_eq!(f.durable().await.1.unwrap().state["nextOpenUnix"],f.now);
     assert_eq!(continuous::active_adaptive_slots(&f.db.pool,"admin").await.unwrap()[0].generation_id,f.generation);
+    assert_eq!(sqlx::query_scalar::<_,Value>("select result from continuous_generations where id=$1").bind(f.generation).fetch_one(&f.db.pool).await.unwrap(),original);
+    assert_eq!(f.runtime.retained_history_epochs(),1);
     f.close().await;
 }
 
 #[tokio::test]
-async fn original_prefix_repair_requires_explicit_stop_start_and_new_verified_candidate() {
+async fn research_prefix_late_insert_allows_independent_candidate_without_stop_or_analytics_rewrite() {
     let Some(mut f)=LiveFixture::new("explicitrecovery",true).await else {return;};
     f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now).await.unwrap();
     let history:Vec<Value>=sqlx::query_scalar("select to_jsonb(s) from live_setups s order by id").fetch_all(&f.db.pool).await.unwrap();
     let original:Value=sqlx::query_scalar("select result->'bootstrap'->'frozenPrefix' from continuous_generations where id=$1")
         .bind(f.generation).fetch_one(&f.db.pool).await.unwrap();
     f.market.journal.lock().unwrap().repair(f.anchor+60);
-    assert!(f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+5).await.unwrap_err().to_string().contains("causal history changed"));
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+5).await.unwrap();
     let (spec,result)=scoped_profile(f.now,&["BTCUSDT","NOTINSTUDYUSDT"]);
-    let blocked=stage(&f.db.pool,f.slot,&spec,&result).await;
-    let error=f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+6).await.unwrap_err();
-    assert!(error.to_string().contains("frozen detector prefix fingerprint mismatch"),"a valid candidate cannot shadow an invalid incumbent manifest: {error}");
-    assert_eq!(sqlx::query_scalar::<_,i64>("select active_generation_id from continuous_slots where id=$1").bind(f.slot).fetch_one(&f.db.pool).await.unwrap(),f.generation);
-    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups where adaptive_generation_id=$1").bind(blocked).fetch_one(&f.db.pool).await.unwrap(),0);
-    let lease=continuous::scheduler::claim_owner(&f.db.pool,"worker-explicit-recovery").await.unwrap().unwrap();
-    assert!(continuous::stop(&f.db.pool,"admin","price_volume_spike").await.unwrap());
-    assert!(continuous::get_adaptive_checkpoint(&f.db.pool,f.slot,"bybit/linear/BTCUSDT").await.unwrap().is_none());
-    assert!(!continuous::start(&f.db.pool,"admin","price_volume_spike").await.unwrap());
-    continuous::cleanup_stopped(&f.db.pool,"admin","price_volume_spike",&lease).await.unwrap();
-    assert!(continuous::start(&f.db.pool,"admin","price_volume_spike").await.unwrap());
-    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+7).await.unwrap();
     let candidate=stage(&f.db.pool,f.slot,&spec,&result).await;
     f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+8).await.unwrap();
     assert_eq!(sqlx::query_scalar::<_,i64>("select active_generation_id from continuous_slots where id=$1").bind(f.slot).fetch_one(&f.db.pool).await.unwrap(),candidate);
@@ -709,8 +714,9 @@ async fn irrelevant_backfill_before_original_anchor_is_acknowledged_without_rewa
 async fn warmup_repair_after_legacy_page_snapshot_rejects_before_materialization_or_publication() {
     let Some(mut f)=LiveFixture::new("warmrepair",true).await else {return;};
     f.market.journal.lock().unwrap().repair_during_history=Some(f.anchor+60);
-    assert!(f.tick().await.unwrap_err().to_string().contains("causal history changed"));
+    f.tick().await.unwrap();
     assert_eq!(f.runtime.retained_history_bytes(),0);assert_eq!(f.durable().await,(Vec::new(),None));
+    f.tick().await.unwrap();assert!(f.durable().await.1.is_some(),"current-source race recovers from the same live origin");
     {
         let journal=f.market.journal.lock().unwrap();
         assert!(journal.guard_requests[0]["readGuards"][0]["previous"].is_null());
@@ -820,7 +826,7 @@ async fn cluster_enabled_repair_restart_preserves_chain_and_emits_the_real_next_
     f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now).await.unwrap();
     assert!(f.durable().await.0.is_empty(),"the prehistory raw chain must suppress non-first members");
     f.market.journal.lock().unwrap().repair(repaired);
-    assert!(f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+5).await.unwrap_err().to_string().contains("causal history changed"));
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+5).await.unwrap();
     f.runtime=AdaptiveLiveRuntime::new(AdaptiveRuntimeLimits {max_history_bytes:32*1024*1024,max_symbols:10,max_profile_bytes:4*1024*1024,..AdaptiveRuntimeLimits::default()});
     {let mut journal=f.market.journal.lock().unwrap();journal.available_through=Some(f.now+60);journal.repair(f.now);}
     f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+65).await.unwrap();
@@ -875,7 +881,7 @@ async fn repaired_post_frozen_gap_recomputes_durable_cooldown_phase_and_future_m
     let gap=gap.unwrap();f.market.journal.lock().unwrap().gaps.insert(gap);
     f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now).await.unwrap();let before=f.durable().await;
     f.market.journal.lock().unwrap().repair(gap);
-    assert!(f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+5).await.is_err());
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+5).await.unwrap();
     f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+6).await.unwrap();
     assert_eq!(f.durable().await.0,before.0,"source repair must not rewrite or republish historical setups");
     assert_ne!(f.durable().await.1.unwrap().state,before.1.unwrap().state,"recomputed cooldown phase must replace the stale derived seed");
@@ -953,20 +959,23 @@ async fn pending_late_final_preserves_incumbent_through_watermark_and_new_genera
 }
 
 #[tokio::test]
-async fn candidate_prefix_failure_reports_error_and_keeps_incumbent_hot_and_history_immutable() {
+async fn research_hash_and_raw_seeds_are_not_live_admission_conditions() {
     let Some(mut f)=LiveFixture::new("badcandidate",false).await else {return;};
     f.tick().await.unwrap();let before=f.durable().await.0;
     let (spec,mut result)=scoped_profile(f.now,&["BTCUSDT"]);
     result["bootstrap"]["frozenPrefix"]["instruments"][0]["sha256"]="0".repeat(64).into();
+    result["bootstrap"]["instruments"][0]["lastRawOpenUnix"]=Value::Null;
+    result["bootstrap"]["instruments"][0]["lastRawClusterTime"]=Value::Null;
     let candidate=stage(&f.db.pool,f.slot,&spec,&result).await;
-    assert!(f.tick().await.unwrap_err().to_string().contains("fingerprint mismatch"));
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now).await.unwrap();
     let row=sqlx::query("select active_generation_id,pending_generation_id,pending_status,pending_error from continuous_slots where id=$1").bind(f.slot).fetch_one(&f.db.pool).await.unwrap();
-    assert_eq!(row.get::<i64,_>("active_generation_id"),f.generation);assert_eq!(row.get::<i64,_>("pending_generation_id"),candidate);
-    assert_eq!(row.get::<String,_>("pending_status"),"error");assert!(row.get::<Value,_>("pending_error")["message"].as_str().unwrap().contains("fingerprint mismatch"));
+    assert_eq!(row.get::<i64,_>("active_generation_id"),candidate);assert!(row.get::<Option<i64>,_>("pending_generation_id").is_none());
+    assert!(row.get::<Option<Value>,_>("pending_error").is_none());
+    assert_eq!(sqlx::query_scalar::<_,Value>("select result from continuous_generations where id=$1").bind(candidate).fetch_one(&f.db.pool).await.unwrap(),result);
     assert_eq!(f.durable().await.0,before);
     {let mut journal=f.market.journal.lock().unwrap();journal.available_through=Some(f.now+60);journal.repair(f.now);}
     f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+65).await.unwrap();
-    assert_eq!(sqlx::query_scalar::<_,i64>("select adaptive_generation_id from live_setups where adaptive_slot_id=$1 and extract(epoch from close_time)::bigint=$2").bind(f.slot).bind(f.now+60).fetch_one(&f.db.pool).await.unwrap(),f.generation);
+    assert_eq!(sqlx::query_scalar::<_,i64>("select adaptive_generation_id from live_setups where adaptive_slot_id=$1 and extract(epoch from close_time)::bigint=$2").bind(f.slot).bind(f.now+60).fetch_one(&f.db.pool).await.unwrap(),candidate);
     assert_eq!(f.runtime.retained_history_epochs(),1);f.close().await;
 }
 
@@ -1020,5 +1029,159 @@ async fn pending_promotes_explicit_candidate_with_union_absence_and_reuses_one_e
         .bind(f.slot).bind(f.now+60).fetch_all(&f.db.pool).await.unwrap();
     assert_eq!(generations,vec![final_generation,final_generation]);
     assert_eq!(continuous::get_adaptive_checkpoint(&f.db.pool,sibling,"bybit/linear/BTCUSDT").await.unwrap().unwrap().state["nextOpenUnix"],f.now+60);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn mixed_scope_fifth_ready_activates_and_waiting_listing_joins_without_back_publication() {
+    let Some(db)=Database::new("mixed_scope").await else {return;};configure(&db.pool).await;
+    let now=chrono::Utc::now().timestamp().div_euclid(60)*60;
+    let scope=["EXTRA4USDT","EXTRA5USDT","EXTRA6USDT","EXTRA7USDT","EXTRA8USDT","EXTRA9USDT","MISSINGUSDT","DELISTUSDT"];
+    let (spec,result)=scoped_profile(now,&scope);
+    let slot:i64=sqlx::query_scalar("select min(id) from continuous_slots").fetch_one(&db.pool).await.unwrap();
+    let candidate=stage(&db.pool,slot,&spec,&result).await;
+    let market=Market::new(now);
+    {
+        let mut journal=market.journal.lock().unwrap();
+        for id in 4..=7 {journal.ends.insert(id,now-600);}
+        journal.starts.insert(9,now-120);
+    }
+    let (url,server)=spawn_market(market.clone()).await;
+    let client=setups_mdclient::MarketDataClient::new(url,"fixture");
+    let limits=AdaptiveRuntimeLimits {max_history_bytes:32*1024*1024,max_symbols:10,max_profile_bytes:4*1024*1024,..AdaptiveRuntimeLimits::default()};
+    let mut runtime=AdaptiveLiveRuntime::new(limits.clone());
+    for _ in 0..12 {
+        runtime.tick_at(&db.pool,&client,&AtomicBool::new(false),now+5).await.unwrap();
+        if !continuous::active_adaptive_slots(&db.pool,"admin").await.unwrap().is_empty() {break;}
+    }
+    let active=continuous::active_adaptive_slots(&db.pool,"admin").await.unwrap().remove(0);
+    assert_eq!(active.generation_id,candidate,"four stale staging rings cannot starve the fifth ready symbol");
+    assert!(runtime.peak_staging_epochs()<=4);
+    assert_eq!(active.live_readiness.len(),scope.len(),"never trim the configured universe");
+    assert_eq!(active.live_readiness.iter().filter(|entry|entry.status=="ready").count(),1);
+    for (symbol,reason) in [("EXTRA4USDT","waiting_tail"),("EXTRA9USDT","insufficient_history"),("MISSINGUSDT","unavailable_catalog"),("DELISTUSDT","not_listed")] {
+        let entry=active.live_readiness.iter().find(|entry|entry.instrument_key.ends_with(&format!("/{symbol}"))).unwrap();
+        assert_eq!(entry.status,"waiting");assert_eq!(entry.reason.as_deref(),Some(reason));
+        assert_eq!(entry.publication_floor_close_unix,now);
+    }
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_live_checkpoints where slot_id=$1").bind(slot).fetch_one(&db.pool).await.unwrap(),1);
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups").fetch_one(&db.pool).await.unwrap(),0);
+    assert_eq!(sqlx::query_scalar::<_,Value>("select result from continuous_generations where id=$1").bind(candidate).fetch_one(&db.pool).await.unwrap(),result);
+    let initialization=active.live_initialization.unwrap();
+    // A no-checkpoint waiting instrument must remain schedulable after crash.
+    runtime=AdaptiveLiveRuntime::new(limits.clone());
+    {
+        let mut journal=market.journal.lock().unwrap();journal.starts.insert(9,now-2*86400);
+        journal.ends.insert(9,now+60);journal.available_through=Some(now+60);
+    }
+    runtime.tick_at(&db.pool,&client,&AtomicBool::new(false),now+65).await.unwrap();
+    let active=continuous::active_adaptive_slots(&db.pool,"admin").await.unwrap().remove(0);
+    assert_eq!(active.live_initialization.as_ref(),Some(&initialization),"restart must not move the live origin");
+    let joined=active.live_readiness.iter().find(|entry|entry.instrument_key=="bybit/linear/EXTRA9USDT").unwrap();
+    assert_eq!(joined.status,"ready");assert_eq!(joined.publication_floor_close_unix,now+60);
+    assert_eq!(continuous::get_adaptive_checkpoint(&db.pool,slot,"bybit/linear/EXTRA9USDT").await.unwrap().unwrap().state["nextOpenUnix"],now+60);
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups where symbol='EXTRA9USDT'").fetch_one(&db.pool).await.unwrap(),0);
+    for target in [now+120,now+180] {
+        {let mut journal=market.journal.lock().unwrap();journal.ends.insert(9,target);journal.available_through=Some(target);}
+        runtime.tick_at(&db.pool,&client,&AtomicBool::new(false),target+5).await.unwrap();
+        runtime=AdaptiveLiveRuntime::new(limits.clone());
+        runtime.tick_at(&db.pool,&client,&AtomicBool::new(false),target+10).await.unwrap();
+    }
+    let closes:Vec<i64>=sqlx::query_scalar("select extract(epoch from close_time)::bigint from live_setups where symbol='EXTRA9USDT' order by close_time").fetch_all(&db.pool).await.unwrap();
+    assert_eq!(closes,vec![now+120,now+180],"join and restart preserve the durable floor and emit each fresh signal once");
+    assert!(runtime.retained_history_bytes()<32*1024*1024);
+    server.abort();let _=server.await;db.close().await;
+}
+
+#[tokio::test]
+async fn actual_legacy_migration_restores_incumbent_and_sibling_without_duplicate_effects() {
+    let Some(mut f)=LiveFixture::new("migrated_active",false).await else {return;};
+    let sibling:i64=sqlx::query_scalar("select max(id) from continuous_slots").fetch_one(&f.db.pool).await.unwrap();
+    let (spec,result)=scoped_profile(f.now,&["BTCUSDT"]);activate(&f.db.pool,sibling,&spec,&result).await;
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now).await.unwrap();
+    let history:Value=sqlx::query_scalar("select coalesce(jsonb_agg(to_jsonb(s) order by id),'[]') from live_setups s").fetch_one(&f.db.pool).await.unwrap();
+    let checkpoints:Value=sqlx::query_scalar("select jsonb_agg(to_jsonb(c) order by slot_id,instrument_key) from adaptive_live_checkpoints c").fetch_one(&f.db.pool).await.unwrap();
+    let research:Value=sqlx::query_scalar("select jsonb_agg(jsonb_build_object('id',id,'spec',spec,'result',result) order by id) from continuous_generations").fetch_one(&f.db.pool).await.unwrap();
+    // Recreate the actual shipped pre-0016 schema/state, then execute the real
+    // migration. Neither a hand-built DTO nor anchor-only SQL is sufficient.
+    sqlx::raw_sql("alter table continuous_generations drop column live_initialization,drop column live_readiness,drop column live_init_attempts,drop column live_init_status,drop column live_init_deadline,drop column live_init_next_attempt_at,drop column live_init_error; delete from kysely_migration where name='0016_independent_live_initialization.sql';")
+        .execute(&f.db.pool).await.unwrap();
+    setups_db::migrate::ensure_migrations(&f.db.pool).await.unwrap();
+    f.runtime=AdaptiveLiveRuntime::new(AdaptiveRuntimeLimits {max_history_bytes:32*1024*1024,max_symbols:10,max_profile_bytes:4*1024*1024,..AdaptiveRuntimeLimits::default()});
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+5).await.unwrap();
+    assert_eq!(f.runtime.retained_history_epochs(),1);
+    assert_eq!(sqlx::query_scalar::<_,Value>("select coalesce(jsonb_agg(to_jsonb(s) order by id),'[]') from live_setups s").fetch_one(&f.db.pool).await.unwrap(),history);
+    assert_eq!(sqlx::query_scalar::<_,Value>("select jsonb_agg(to_jsonb(c) order by slot_id,instrument_key) from adaptive_live_checkpoints c").fetch_one(&f.db.pool).await.unwrap(),checkpoints);
+    assert_eq!(sqlx::query_scalar::<_,Value>("select jsonb_agg(jsonb_build_object('id',id,'spec',spec,'result',result) order by id) from continuous_generations").fetch_one(&f.db.pool).await.unwrap(),research);
+    {let mut journal=f.market.journal.lock().unwrap();journal.available_through=Some(f.now+60);journal.repair(f.now);}
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+65).await.unwrap();
+    let count=sqlx::query_scalar::<_,i64>("select count(*) from live_setups where extract(epoch from close_time)::bigint=$1").bind(f.now+60).fetch_one(&f.db.pool).await.unwrap();
+    assert_eq!(count,2,"both migrated incumbent and sibling continue exactly once");
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+66).await.unwrap();
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups where extract(epoch from close_time)::bigint=$1").bind(f.now+60).fetch_one(&f.db.pool).await.unwrap(),2);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn source_timeout_is_a_released_retryable_error_not_a_waiting_data_success() {
+    let Some(db)=Database::new("source_timeout").await else {return;};configure(&db.pool).await;
+    let now=chrono::Utc::now().timestamp().div_euclid(60)*60;
+    let (spec,result)=scoped_profile(now,&["BTCUSDT"]);
+    let slot:i64=sqlx::query_scalar("select min(id) from continuous_slots").fetch_one(&db.pool).await.unwrap();
+    let generation=stage(&db.pool,slot,&spec,&result).await;
+    let market=Market::new(now);market.journal.lock().unwrap().history_error=true;
+    let (url,server)=spawn_market(market).await;let client=setups_mdclient::MarketDataClient::new(url,"fixture");
+    let mut runtime=AdaptiveLiveRuntime::new(AdaptiveRuntimeLimits {max_history_bytes:8*1024*1024,..AdaptiveRuntimeLimits::default()});
+    assert!(runtime.tick_at(&db.pool,&client,&AtomicBool::new(false),now).await.is_err());
+    assert!(continuous::active_adaptive_slots(&db.pool,"admin").await.unwrap().is_empty());
+    let row=sqlx::query("select live_init_status,live_init_attempts,live_readiness from continuous_generations where id=$1").bind(generation).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row.get::<String,_>("live_init_status"),"retry");assert_eq!(row.get::<i32,_>("live_init_attempts"),1);
+    assert_eq!(row.get::<Value,_>("live_readiness"),json!([]));
+    assert!(sqlx::query_scalar::<_,Option<String>>("select lease_owner from adaptive_live_warmup_lane where id=1").fetch_one(&db.pool).await.unwrap().is_none());
+    assert_eq!(runtime.retained_history_bytes(),0);
+    server.abort();let _=server.await;db.close().await;
+}
+
+#[tokio::test]
+async fn replacement_retires_delisted_old_only_cursor_without_faking_frontier() {
+    let Some(mut f)=LiveFixture::new("retired_old_only",false).await else {return;};
+    f.tick().await.unwrap();let history=f.durable().await.0;
+    let retained=json!({"generationId":f.generation,"nextOpenUnix":f.now-600,"lastRawOpenUnix":null,"lastRawClusterTime":null});
+    sqlx::query("insert into adaptive_live_checkpoints(slot_id,instrument_key,generation_id,state) values($1,'bybit/linear/DELISTUSDT',$2,$3)")
+        .bind(f.slot).bind(f.generation).bind(&retained).execute(&f.db.pool).await.unwrap();
+    sqlx::raw_sql("create table fixture_retired(state jsonb); create function fixture_retired_cursor() returns trigger language plpgsql as $$ begin if old.instrument_key='bybit/linear/DELISTUSDT' then insert into fixture_retired values(old.state); end if; return old; end $$; create trigger fixture_retired before delete on adaptive_live_checkpoints for each row execute function fixture_retired_cursor();")
+        .execute(&f.db.pool).await.unwrap();
+    let (spec,result)=scoped_profile(f.now,&["BTCUSDT"]);let candidate=stage(&f.db.pool,f.slot,&spec,&result).await;
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+5).await.unwrap();
+    let active=continuous::active_adaptive_slots(&f.db.pool,"admin").await.unwrap().remove(0);
+    assert_eq!(active.generation_id,candidate);assert_eq!(active.live_readiness.len(),1);
+    assert_eq!(active.live_readiness[0].instrument_key,"bybit/linear/BTCUSDT");
+    assert_eq!(sqlx::query_scalar::<_,Value>("select state from fixture_retired").fetch_one(&f.db.pool).await.unwrap(),retained,"exact old cursor is retired, not advanced through absent candles");
+    assert!(continuous::get_adaptive_checkpoint(&f.db.pool,f.slot,"bybit/linear/DELISTUSDT").await.unwrap().is_none());
+    assert_eq!(f.durable().await.0,history);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn replacement_preserves_a_waiting_sibling_and_does_not_publish_its_warmup() {
+    let Some(mut f)=LiveFixture::new("waiting_sibling",false).await else {return;};
+    let sibling:i64=sqlx::query_scalar("select max(id) from continuous_slots").fetch_one(&f.db.pool).await.unwrap();
+    let (mut spec,mut result)=scoped_profile(f.now,&["BTCUSDT"]);
+    let mut params=params();if let AlgorithmParams::Spike(p)=&mut params {p.baseline_long_days=2;}
+    spec["algorithmParams"]=serde_json::to_value(&params).unwrap();result["best"]["params"]=spec["algorithmParams"].clone();
+    activate(&f.db.pool,sibling,&spec,&result).await;
+    sqlx::query("update continuous_generations set live_readiness=jsonb_set(jsonb_set(live_readiness,'{0,status}','\"waiting\"'),'{0,reason}','\"insufficient_history\"') where id=(select active_generation_id from continuous_slots where id=$1)")
+        .bind(sibling).execute(&f.db.pool).await.unwrap();
+    f.market.journal.lock().unwrap().starts.insert(1,f.now-86400-120);
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now).await.unwrap();
+    let (spec,result)=scoped_profile(f.now,&["BTCUSDT"]);let candidate=stage(&f.db.pool,f.slot,&spec,&result).await;
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+5).await.unwrap();
+    assert_eq!(sqlx::query_scalar::<_,i64>("select active_generation_id from continuous_slots where id=$1").bind(f.slot).fetch_one(&f.db.pool).await.unwrap(),candidate);
+    {let mut journal=f.market.journal.lock().unwrap();journal.available_through=Some(f.now+60);journal.repair(f.now);}
+    f.runtime.tick_at(&f.db.pool,&f.client,&AtomicBool::new(false),f.now+65).await.unwrap();
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups where adaptive_slot_id=$1").bind(sibling).fetch_one(&f.db.pool).await.unwrap(),0);
+    assert!(continuous::get_adaptive_checkpoint(&f.db.pool,sibling,"bybit/linear/BTCUSDT").await.unwrap().is_none());
+    assert_eq!(sqlx::query_scalar::<_,i64>("select adaptive_generation_id from live_setups where adaptive_slot_id=$1 and extract(epoch from close_time)::bigint=$2").bind(f.slot).bind(f.now+60).fetch_one(&f.db.pool).await.unwrap(),candidate);
+    assert_eq!(f.runtime.retained_history_epochs(),1);
     f.close().await;
 }

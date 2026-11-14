@@ -77,6 +77,7 @@ beforeEach(() => {
     }
     if (path === "/v1/replay-preflight") data = { checkedAt: "2026-10-10T10:00:00Z", algorithmVersion: "snapshot-v2", requiredHistoryMinutes: 43200, canRun: true, request: { ...(JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>), async: true, algorithmVersion: "snapshot-v2", params: { priceGrowthPct: "17", windowMinutes: 9 } }, results: [] };
     if (path === "/v1/settings/notifications") data = { maxAgeSeconds: 60 };
+    if (path === "/v1/continuous-studies/maintenance") data = { admissionPaused: false, state: "running", activeChains: 0, resumableChains: 0, updatedAt: null };
     if (path === "/v1/live/status") data = { enabled: false, running: false, lastScanAt: null, lastError: null };
     if (path === "/v1/replay-cache/stats") data = { entries: 3, bytes: 1024 };
     if (path === "/v1/replay-cache") data = { removed: 3 };
@@ -319,12 +320,15 @@ describe("platform screens", () => {
     expect(screen.queryByRole("tab", { name: "Алгоритмы" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Рост цены (%)")).not.toBeInTheDocument();
     expect(requests.some((request) => request.path === "/v1/algorithms")).toBe(false);
+    expect(requests.some((request) => request.path === "/v1/continuous-studies/maintenance")).toBe(false);
     await userEvent.click(screen.getByRole("tab", { name: "Уведомления" }));
     const age = await screen.findByRole("spinbutton", { name: "Максимальный возраст уведомления (секунд)" });
     fireEvent.change(age, { target: { value: "99" } });
     expect(screen.getByText(/Telegram не подключён/)).toBeVisible();
     expect(screen.getByText(/Web Push недоступен по обычному HTTP/)).toHaveTextContent("localhost");
     await userEvent.click(screen.getByRole("tab", { name: "Обслуживание" }));
+    expect(screen.getByRole("heading", { name: "Обслуживание непрерывных исследований" })).toBeVisible();
+    expect(await screen.findByText("Допуск новых непрерывных цепочек открыт")).toBeVisible();
     expect(screen.getByRole("button", { name: "Очистить кеш" })).toBeDisabled();
     await userEvent.click(screen.getByLabelText("Подтверждаю очистку всего кеша"));
     await userEvent.click(screen.getByRole("button", { name: "Очистить кеш" }));

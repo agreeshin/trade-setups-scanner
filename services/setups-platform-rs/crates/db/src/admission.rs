@@ -172,7 +172,7 @@ pub(crate) async fn active_reservation_bytes(
         total = total
             .saturating_add(work_minutes_of(&row)? * limits.estimated_bytes_per_work_minute + 4096);
     }
-    let continuous:i64=sqlx::query_scalar("select coalesce(sum(reserved_bytes),0)::bigint from continuous_generations where status='running'").fetch_one(tx).await?;
+    let continuous:i64=sqlx::query_scalar("select coalesce(sum(g.reserved_bytes),0)::bigint + coalesce(sum(greatest(coalesce(a.reserved_bytes,0)-coalesce(a.snapshot_bytes,0)-coalesce(octet_length(a.checkpoint),0),0)),0)::bigint from continuous_generations g left join continuous_runtime_artifacts a on a.generation_id=g.id where g.status='running'").fetch_one(tx).await?;
     total=total.saturating_add(continuous);
     Ok(total)
 }

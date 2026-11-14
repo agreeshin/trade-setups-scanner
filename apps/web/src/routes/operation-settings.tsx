@@ -42,7 +42,7 @@ export function OperationSettings() {
       {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка состояния очереди…</p>}
       {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Очередь недоступна ({state.detail})</Alert>}
       {state.kind === "ready" && <><p>{state.data.paused ? "Исторические расчёты приостановлены" : "Очередь исторических расчётов работает"}</p><div><Button variant="outline" disabled={busy} onClick={() => { void toggle(); }}>{state.data.paused ? "Продолжить расчёты" : "Приостановить расчёты"}</Button></div></>}
-      <p className="text-sm text-muted-foreground">Пауза сохраняется в БД; выполняющийся расчёт остановится между страницами. Уже рассчитанные результаты не удаляются. При перезапуске сервиса прерванные расчёты отмечаются ошибкой и требуют нового запуска.</p>
+      <p className="text-sm text-muted-foreground">Пауза сохраняется в БД; выполняющийся расчёт остановится между страницами. Уже рассчитанные результаты не удаляются. При перезапуске сервиса прерванные обычные replay-расчёты отмечаются ошибкой и требуют нового запуска. Для непрерывных исследований обслуживание и восстановление по сохранённому снимку показаны отдельно.</p>
       <div><Button variant="outline" disabled={busy} onClick={() => { void download(); }}>Экспорт конфигурации без секретов</Button></div>
       <p className="text-sm text-muted-foreground">Экспорт включает параметры алгоритма, списки инструментов и режимы работы. Это не резервная копия БД: история свечей и данные платформы резервируются отдельно администратором.</p>
       {error && <Alert variant="destructive" role="alert">{error}</Alert>}

@@ -53,6 +53,33 @@ it("accepts canonical configured and unconfigured endpoint responses", async () 
 const closedBoundary = Date.parse("2026-11-12T12:00:00Z") / 1000;
 const incumbentSlot = { id: 5, minSetupsPerDay: 4, status: "warming", activeGenerationId: 7, studyId: 42, meanExpectancy: 0.21,
   selectedCell: { tpPct: 14, slPct: 4, rawR: 0.32, meanR: 0.21, robustScore: 0.01 }, updatedAt: "2026-11-12T12:00:00Z" };
+const readinessSummary = { generationId: 7, totalInstruments: 822, readyInstruments: 815, waitingInstruments: 7,
+  waitingReasons: [{ reason: "insufficient_history", count: 5 }, { reason: "waiting_tail", count: 2 }], otherWaitingInstruments: 0 };
+it.each([readinessSummary, null])("accepts the optional active-generation readiness summary without changing its scope: %j", async (liveReadinessSummary) => {
+  const configured = { ...process, slots: [{ ...incumbentSlot, liveReadinessSummary }] };
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(configured)))));
+  expect(await getContinuousStudy("future", new AbortController().signal)).toEqual(configured);
+});
+it("preserves generation mismatches for unknown-readiness rendering rather than assigning candidate counts to the incumbent", async () => {
+  const liveReadinessSummary = { ...readinessSummary, generationId: 8 };
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ...process, slots: [{ ...incumbentSlot, liveReadinessSummary }] })))));
+  expect((await getContinuousStudy("future", new AbortController().signal)).slots[0]).toMatchObject({ activeGenerationId: 7, liveReadinessSummary });
+});
+it.each([
+  true, { ...readinessSummary, generationId: 0 }, { ...readinessSummary, generationId: "7" },
+  { ...readinessSummary, totalInstruments: -1 }, { ...readinessSummary, totalInstruments: 822.5 },
+  { ...readinessSummary, readyInstruments: Number.MAX_SAFE_INTEGER + 1 }, { ...readinessSummary, readyInstruments: "815" },
+  { ...readinessSummary, waitingInstruments: 6 }, { ...readinessSummary, otherWaitingInstruments: -1 },
+  { ...readinessSummary, otherWaitingInstruments: 1 }, { ...readinessSummary, waitingReasons: null },
+  { ...readinessSummary, waitingReasons: [null] }, { ...readinessSummary, waitingReasons: [{ reason: 7, count: 7 }] },
+  { ...readinessSummary, waitingReasons: [{ reason: "unknown", count: "7" }] },
+  { ...readinessSummary, waitingReasons: [{ reason: "unknown", count: -1 }] },
+  { ...readinessSummary, waitingReasons: [{ reason: "unknown", count: 8 }] },
+  { ...readinessSummary, readyInstruments: 813, waitingInstruments: 9, waitingReasons: Array.from({ length: 9 }, (_, index) => ({ reason: `reason-${index}`, count: 1 })) },
+])("rejects malformed or inconsistent readiness summaries: %j", async (liveReadinessSummary) => {
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ...process, slots: [{ ...incumbentSlot, liveReadinessSummary }] })))));
+  await expect(getContinuousStudy("future", new AbortController().signal)).rejects.toThrow("неподдерживаемый статус");
+});
 it.each(["warming", "ready", "error", "waiting_resource"])("preserves incumbent, pending %s and exact closed-boundary timestamps", async (pendingStatus) => {
   const configured = { ...process, slots: [{ ...incumbentSlot, activeStatus: "active", pendingGenerationId: 8, pendingStatus,
     readinessFrontier: closedBoundary, pendingError: pendingStatus === "error" ? { code: "history_missing", message: "Missing history" } : null, liveWatermark: 0 }] };
@@ -67,7 +94,7 @@ it("accepts explicit inactive/null fields and leaves legacy readiness absent rat
   expect((await getContinuousStudy("future", new AbortController().signal)).slots).toEqual([inactive]);
   vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ...process, slots: [incumbentSlot] })))));
   const legacy = (await getContinuousStudy("future", new AbortController().signal)).slots[0];
-  expect(legacy).not.toHaveProperty("pendingStatus"); expect(legacy).not.toHaveProperty("activeStatus");
+  expect(legacy).not.toHaveProperty("pendingStatus"); expect(legacy).not.toHaveProperty("activeStatus"); expect(legacy).not.toHaveProperty("liveReadinessSummary");
 });
 it.each([
   { activeStatus: "warming" }, { activeStatus: null }, { pendingGenerationId: 0 }, { pendingGenerationId: -1 }, { pendingGenerationId: "8" }, { pendingGenerationId: 1.5 },

@@ -24,6 +24,14 @@ export interface RecommendedCell {
   meanR: number;
   robustScore: number;
 }
+export interface LiveReadinessSummary {
+  generationId: number;
+  totalInstruments: number;
+  readyInstruments: number;
+  waitingInstruments: number;
+  waitingReasons: { reason: string; count: number }[];
+  otherWaitingInstruments: number;
+}
 export interface ContinuousSlot {
   id: number;
   minSetupsPerDay: number;
@@ -38,6 +46,8 @@ export interface ContinuousSlot {
   /** Opaque serde_json::Value from response.json(); do not assume an error-object schema. */
   pendingError?: unknown;
   liveWatermark?: number | null;
+  /** Active-generation initialization coverage; absence is unknown, never all-ready. */
+  liveReadinessSummary?: LiveReadinessSummary | null;
   studyId: number | null;
   meanExpectancy: number | null;
   selectedCell: RecommendedCell | null;
@@ -68,6 +78,18 @@ export class ContinuousApiError extends Error {
   constructor(message: string, readonly status?: number) { super(message); }
 }
 
+function isLiveReadinessSummary(value: unknown): value is LiveReadinessSummary {
+  if (value === null || typeof value !== "object") return false;
+  const summary = value as LiveReadinessSummary;
+  const count = (number: unknown): number is number => typeof number === "number" && Number.isSafeInteger(number) && number >= 0;
+  return count(summary.generationId) && summary.generationId > 0
+    && count(summary.totalInstruments) && count(summary.readyInstruments) && count(summary.waitingInstruments) && count(summary.otherWaitingInstruments)
+    && summary.readyInstruments + summary.waitingInstruments === summary.totalInstruments
+    && Array.isArray(summary.waitingReasons) && summary.waitingReasons.length <= 8
+    && summary.waitingReasons.every((entry) => entry !== null && typeof entry === "object" && typeof entry.reason === "string" && entry.reason.trim().length > 0 && count(entry.count))
+    && summary.waitingReasons.reduce((total, entry) => total + entry.count, summary.otherWaitingInstruments) === summary.waitingInstruments;
+}
+
 function isProcess(value: unknown): value is ContinuousProcess {
   if (value === null || typeof value !== "object") return false;
   const process = value as Partial<ContinuousProcess>;
@@ -92,6 +114,7 @@ function isProcess(value: unknown): value is ContinuousProcess {
       && (slot.pendingGenerationId === undefined || nullableId(slot.pendingGenerationId))
       && (slot.pendingStatus === undefined || slot.pendingStatus === null || typeof slot.pendingStatus === "string")
       && optionalClosedBoundary(slot.readinessFrontier) && optionalClosedBoundary(slot.liveWatermark)
+      && (slot.liveReadinessSummary == null || isLiveReadinessSummary(slot.liveReadinessSummary))
       && (slot.meanExpectancy === null || Number.isFinite(slot.meanExpectancy))
       && typeof slot.updatedAt === "string" && Number.isFinite(Date.parse(slot.updatedAt))
       && (slot.selectedCell === null || (typeof slot.selectedCell === "object" && slot.selectedCell !== undefined && [slot.selectedCell.tpPct, slot.selectedCell.slPct, slot.selectedCell.rawR, slot.selectedCell.meanR, slot.selectedCell.robustScore].every(Number.isFinite))));

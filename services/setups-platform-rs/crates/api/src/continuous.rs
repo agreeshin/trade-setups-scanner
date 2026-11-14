@@ -1,5 +1,6 @@
 //! Authenticated process API. Research identity and independent live permission are separate.
 pub mod runtime;
+pub mod frozen;
 use crate::{SessionAuth, config::OptimizationConfig, replay::guard_auth};
 use axum::{
     Json, Router,
@@ -30,6 +31,8 @@ pub struct ContinuousRuntimeConfig {
     pub max_concurrent_chains: usize,
     pub poll: Duration,
     pub max_database_bytes: i64,
+    /// Private durable snapshots/checkpoints, separate from resident RAM and history.
+    pub max_runtime_bytes: i64,
     pub replay_admission: setups_db::admission::ReplayAdmissionLimits,
 }
 impl Default for ContinuousRuntimeConfig {
@@ -47,6 +50,7 @@ impl Default for ContinuousRuntimeConfig {
             max_concurrent_chains: 1,
             poll: Duration::from_millis(250),
             max_database_bytes: 48 * 1024 * 1024 * 1024,
+            max_runtime_bytes: 16 * 1024 * 1024 * 1024,
             replay_admission: Default::default(),
         }
     }
@@ -94,6 +98,10 @@ impl ContinuousRuntimeConfig {
                 .ok()
                 .filter(|value| *value > 0)
                 .ok_or("CONTINUOUS_MAX_DATABASE_BYTES must be a positive integer")?;
+        }
+        if let Some(value)=get("CONTINUOUS_MAX_RUNTIME_BYTES") {
+            config.max_runtime_bytes=value.parse::<i64>().ok().filter(|value|*value>0 && *value<=64*1024*1024*1024)
+                .ok_or("CONTINUOUS_MAX_RUNTIME_BYTES must be in 1..=68719476736")?;
         }
         Ok(config)
     }
@@ -223,6 +231,9 @@ pub fn continuous_router(state: Arc<ContinuousState>) -> Router {
     Router::new()
         .route("/v1/continuous-studies", get(list))
         .route("/v1/continuous-studies/cleanup", get(cleanup_preview).post(cleanup_history))
+        .route("/v1/continuous-studies/maintenance",get(maintenance_status))
+        .route("/v1/continuous-studies/maintenance/drain",post(maintenance_drain))
+        .route("/v1/continuous-studies/maintenance/resume",post(maintenance_resume))
         .route(
             "/v1/continuous-studies/{algorithm}",
             get(detail).put(configure),
@@ -232,6 +243,21 @@ pub fn continuous_router(state: Arc<ContinuousState>) -> Router {
         .layer(DefaultBodyLimit::max(cap))
         .with_state(state)
 }
+
+async fn maintenance_status(State(state):State<Arc<ContinuousState>>,headers:HeaderMap)->Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,false) {return error;}
+    match db::maintenance::status(&state.pool,ADMIN_OWNER).await {
+        Ok(status)=>response(StatusCode::OK,json!(status)),Err(error)=>failure("maintenance status",error),
+    }
+}
+async fn maintenance_change(state:Arc<ContinuousState>,headers:HeaderMap,paused:bool)->Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,true) {return error;}
+    match db::maintenance::set_paused(&state.pool,ADMIN_OWNER,paused).await {
+        Ok(status)=>{state.notify.notify_waiters();response(StatusCode::OK,json!(status))},Err(error)=>failure("maintenance change",error),
+    }
+}
+async fn maintenance_drain(State(state):State<Arc<ContinuousState>>,headers:HeaderMap)->Response {maintenance_change(state,headers,true).await}
+async fn maintenance_resume(State(state):State<Arc<ContinuousState>>,headers:HeaderMap)->Response {maintenance_change(state,headers,false).await}
 
 async fn cleanup_preview(State(state): State<Arc<ContinuousState>>, headers: HeaderMap) -> Response {
     if let Err(error)=guard_auth(&state.auth,&headers,false) {return error;}
@@ -285,7 +311,10 @@ async fn list(
         );
     }
     match db::list(&state.pool, ADMIN_OWNER, query.algorithm_id.as_deref()).await {
-        Ok(processes) => response(StatusCode::OK, json!({"processes":processes})),
+        Ok(processes) => match db::maintenance::status(&state.pool,ADMIN_OWNER).await {
+            Ok(maintenance)=>response(StatusCode::OK,json!({"processes":processes,"maintenance":maintenance})),
+            Err(error)=>failure("maintenance list",error),
+        },
         Err(e) => failure("list", e),
     }
 }
@@ -500,6 +529,42 @@ mod tests {
     }
 
     #[test]
+    fn continuous_runtime_defaults_to_sixteen_gib() {
+        assert_eq!(config(&[]).unwrap().max_runtime_bytes, 16 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn continuous_runtime_accepts_tight_positive_and_maximum_budgets() {
+        for (value, expected) in [("1", 1_i64), ("68719476736", 68_719_476_736)] {
+            let settings = config(&[("CONTINUOUS_MAX_RUNTIME_BYTES", value)]).unwrap();
+            assert_eq!(settings.max_runtime_bytes, expected);
+            assert_eq!(settings.optimizer.max_snapshot_bytes, 256 * 1024 * 1024);
+            assert_eq!(settings.optimizer.max_working_bytes, 64 * 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn continuous_runtime_rejects_invalid_and_above_sixty_four_gib_values() {
+        for value in [
+            "",
+            "0",
+            "-1",
+            "1.5",
+            "NaN",
+            "16GiB",
+            "68719476737",
+            "9223372036854775808",
+            "18446744073709551616",
+        ] {
+            let error = config(&[("CONTINUOUS_MAX_RUNTIME_BYTES", value)]).unwrap_err();
+            assert!(
+                error.contains("CONTINUOUS_MAX_RUNTIME_BYTES"),
+                "{value}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn production_compose_explicitly_passes_eight_gib_and_one_continuous_worker() {
         let compose = include_str!("../../../../../infra/prod/docker-compose.yml");
         let signals = compose
@@ -512,6 +577,9 @@ mod tests {
         assert!(signals.contains("CONTINUOUS_WORKERS: \"1\""));
         assert!(signals.contains(
             "CONTINUOUS_MAX_SNAPSHOT_BYTES: ${CONTINUOUS_MAX_SNAPSHOT_BYTES:-8589934592}"
+        ));
+        assert!(signals.contains(
+            "CONTINUOUS_MAX_RUNTIME_BYTES: ${CONTINUOUS_MAX_RUNTIME_BYTES:-17179869184}"
         ));
         assert!(signals.contains(
             "CONTINUOUS_MAX_WORKING_BYTES: ${CONTINUOUS_MAX_WORKING_BYTES:-67108864}"

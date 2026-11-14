@@ -14,6 +14,7 @@ import { apiFetch, fetchPlatform, type PlatformState } from "../lib/platform-api
 import { errorText, localTime, savePreference, writePlatform } from "./platform-controls";
 import { LiveInstruments } from "./live-instruments";
 import { OperationSettings } from "./operation-settings";
+import { ContinuousMaintenance } from "./continuous-maintenance";
 import { PushSettings } from "../components/push-settings";
 import { BackupSettings } from "./backup-settings";
 
@@ -232,7 +233,7 @@ export function SettingsPage() {
       </form>
       <Separator /><PushSettings />
     </PageSidebarPanel>
-    <PageSidebarPanel value="maintenance"><CacheSettings /><Separator /><OperationSettings /><Separator /><BackupSettings /></PageSidebarPanel>
+    <PageSidebarPanel value="maintenance"><ContinuousMaintenance active={section === "maintenance"} /><Separator /><CacheSettings /><Separator /><OperationSettings /><Separator /><BackupSettings /></PageSidebarPanel>
     <PageSidebarPanel value="interface"><InterfaceSettingsSection /></PageSidebarPanel>
     </PageSidebar>
   </section>;

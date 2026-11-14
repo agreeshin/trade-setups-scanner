@@ -21,16 +21,45 @@ import { applyOptimizationDraftScope, createOptimizationDraft, restoreOptimizati
 
 const statuses = { stopped: "Остановлено", running: "Непрерывное исследование включено", stopping: "Останавливается", error: "Ошибка непрерывного исследования" };
 const phases: Record<string, string> = { queued: "Ожидание очереди", idle: "Ожидание следующего исследования", research: "Исследование", acquiring: "Подготовка снимка", replay: "Служебный replay", analytics: "Аналитика сохранённого набора", cleanup: "Очистка незавершённых данных" };
-const slotStatuses: Record<string, string> = { idle: "Ожидает исследования", active: "Допуск пройден", warming: "Исследование успешно · допуск пройден", inactive: "Профиль неактивен", pending: "Ожидает исследования", running: "Подготовка поколения", researching: "Исследование", error: "Техническая ошибка", failed: "Техническая ошибка", nonpass: "Допуск не пройден", rejected: "Допуск не пройден", no_winner: "Нет оценимого победителя", stopped: "Остановлен" };
-const pendingStatuses: Record<string, string> = { warming: "Прогрев / догоняющая обработка", ready: "Готов к переключению · ещё не действует", error: "Ошибка прогрева" };
+const slotStatuses: Record<string, string> = { idle: "Ожидает исследования", active: "Исследование принято", warming: "Исследование принято", inactive: "Профиль неактивен", pending: "Ожидает исследования", running: "Подготовка поколения", researching: "Исследование", error: "Техническая ошибка", failed: "Техническая ошибка", nonpass: "Допуск не пройден", rejected: "Допуск не пройден", no_winner: "Нет оценимого победителя", stopped: "Остановлен" };
+const pendingStatuses: Record<string, string> = { warming: "Инициализация live по текущим данным", ready: "Готов к переключению · ещё не действует", error: "Ошибка инициализации live" };
 const closedTime = (time: number) => `${formatUnix(time)} (${effectiveTimezone()})`;
+const waitingReasonLabels: Record<string, string> = {
+  insufficient_history: "Недостаточно истории", history_missing: "Недостаточно истории", waiting_tail: "Ожидание свежих закрытых минут",
+  waiting_data: "Ожидание данных", recent_gap: "Пропуски последних минут", gap_tolerance: "Превышен допуск пропусков",
+  missing_price_reference: "Нет опорной цены", waiting_resource: "Ожидание ресурса", instrument_unavailable: "Инструмент недоступен",
+  readiness_unknown: "Готовность неизвестна", unknown: "Готовность неизвестна",
+};
+function waitingReasonLabel(reason: string): string {
+  if (Object.hasOwn(waitingReasonLabels, reason)) return waitingReasonLabels[reason]!;
+  return `Другая причина: ${reason.slice(0, 120).replace(/\s+/g, " ")}${reason.length > 120 ? "…" : ""}`;
+}
+
+function SlotReadiness({ slot }: { slot: ContinuousSlot }) {
+  const summary = slot.liveReadinessSummary;
+  if (!summary || slot.activeGenerationId === null || slot.activeStatus === "inactive" || summary.generationId !== slot.activeGenerationId) return <span>Готовность инструментов неизвестна.</span>;
+  const shown = [...summary.waitingReasons].filter((entry) => entry.count > 0).sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason)).slice(0, 3);
+  const other = summary.waitingInstruments - shown.reduce((total, entry) => total + entry.count, 0);
+  return <div className="grid gap-1">
+    <span>Готовы {summary.readyInstruments} из {summary.totalInstruments} · ожидают {summary.waitingInstruments}</span>
+    {summary.waitingInstruments > 0 && <>
+      <ul aria-label="Причины ожидания инструментов" className="grid gap-1">
+        {shown.map((entry, index) => <li key={index} className="break-words">{waitingReasonLabel(entry.reason)}: {entry.count}</li>)}
+        {other > 0 && <li>Другие причины ожидания: {other}</li>}
+      </ul>
+      <span>Ожидающие инструменты остаются в наборе и подключаются к тому же поколению после инициализации.</span>
+    </>}
+    <span className="text-muted-foreground">Это готовность инициализации, не подтверждение формирования или доставки сигналов.</span>
+  </div>;
+}
 
 function SlotIncumbent({ slot }: { slot: ContinuousSlot }) {
-  if (slot.activeGenerationId === null) return <span>Нет действующего поколения</span>;
+  if (slot.activeGenerationId === null) return <div className="grid gap-1 text-xs"><span className="text-sm">Нет действующего поколения</span><span>Адаптивные сигналы этого профиля не формируются.</span><SlotReadiness slot={slot} /></div>;
   return <div className="grid gap-1 text-xs">
     <span className="text-sm">{slot.activeStatus === "active" ? "Действующее" : "Принятое"} поколение #{slot.activeGenerationId}</span>
     <Badge>{slot.activeStatus === "active" ? "Активно" : slot.activeStatus === "inactive" ? "Неактивно" : "Состояние live неизвестно (старый API)"}</Badge>
     <span>Принятое поколение сохранено</span>
+    <SlotReadiness slot={slot} />
     <span>{slot.liveWatermark == null ? "Watermark переключения неизвестен" : `Watermark переключения: ${closedTime(slot.liveWatermark)}`}</span>
   </div>;
 }
@@ -53,7 +82,7 @@ function SlotPending({ slot }: { slot: ContinuousSlot }) {
   const error = pendingErrorMessage(slot.pendingError) ?? (slot.pendingStatus === "error" ? "Описание ошибки не передано." : null);
   return <div className="grid gap-1 text-xs">
     {slot.pendingGenerationId != null && <span className="text-sm">Кандидат #{slot.pendingGenerationId}</span>}
-    {absent ? <span>Нет кандидата на замену</span> : <Badge variant={slot.pendingStatus === "error" ? "danger" : "neutral"}>{legacy ? "Статус прогрева неизвестен (старый API)" : slot.pendingStatus ? pendingStatuses[slot.pendingStatus] ?? `Состояние кандидата: ${slot.pendingStatus.slice(0, 120)}` : "Статус прогрева неизвестен"}</Badge>}
+    {absent ? <span>Нет кандидата на замену</span> : <Badge variant={slot.pendingStatus === "error" ? "danger" : "neutral"}>{legacy ? "Статус инициализации live неизвестен (старый API)" : slot.pendingStatus ? pendingStatuses[slot.pendingStatus] ?? `Состояние кандидата: ${slot.pendingStatus.slice(0, 120)}` : "Статус инициализации live неизвестен"}</Badge>}
     {!legacy && !absent && <span>{slot.readinessFrontier === undefined ? "Граница готовности неизвестна" : slot.readinessFrontier === null ? "Граница готовности ещё не подтверждена" : `Граница готовности (закрытие минуты): ${closedTime(slot.readinessFrontier)}`}</span>}
     {error && <p role="alert" className="text-destructive">Ошибка кандидата: {error}</p>}
   </div>;
@@ -75,7 +104,7 @@ export function AdaptiveLive({ controller }: { controller: ContinuousController 
   return <div className="grid gap-3">
     <label className="flex items-center gap-2 text-sm"><Checkbox checked={enabled} disabled={!controller.available || controller.busy !== null} onCheckedChange={(checked) => { setDraft(checked === true); setSaved(false); }} />Разрешить адаптивное live-сканирование</label>
     <p className="text-sm text-muted-foreground">Отдельное разрешение; исследование не включает live автоматически. Постоянные параметры не меняются. Готовность данных и общий выключатель live проверяются отдельно.</p>
-    <p role="status" className="text-sm">{!controller.available ? "Состояние адаптивного live не подтверждено." : !savedPermission ? "Адаптивный live не разрешён." : accepted === 0 ? "Адаптивный live разрешён · ожидание пригодного профиля." : `Адаптивный live разрешён · принято профилей: ${accepted}.`}</p>
+    <p role="status" className="text-sm">{!controller.available ? "Состояние адаптивного live не подтверждено." : !savedPermission ? "Адаптивный live не разрешён." : accepted === 0 ? "Адаптивный live разрешён · действующих профилей нет, ожидается инициализация." : `Адаптивный live разрешён · принято профилей: ${accepted}.`}</p>
     <div><Button type="button" variant="outline" disabled={!controller.available || !controller.process?.config || controller.busy !== null || enabled === savedPermission} onClick={() => {
       const config = controller.process?.config;
       if (config) void controller.save({ ...config, adaptiveEnabled: enabled }).then((ok) => { if (ok) { setDraft(null); setSaved(true); } });
@@ -163,6 +192,8 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
 export function ContinuousResearch({ algorithm, controller }: { algorithm: Algorithm; controller: ContinuousController }) {
   const [open, setOpen] = useState(false);
   const process = controller.process;
+  const recoveryExhausted = process?.status === "error" && process.error?.code === "durable_resume_retry_exhausted"
+    && process.config !== null && process.activeStudyId !== null;
   return <section aria-label="Непрерывные исследования" className="grid min-w-0 gap-3">
     <h5 className="font-semibold">Настроенные адаптивные профили</h5>
     {controller.loading && <Spinner label="Проверка непрерывного процесса" />}
@@ -172,10 +203,10 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
     {process && <>
       <p className="text-sm">Ревизия конфигурации: {process.configRevision}{process.activeStudyId !== null ? ` · Исследование #${process.activeStudyId}` : ""}{process.phase ? ` · ${phases[process.phase] ?? process.phase}` : ""}</p>
       {process.error && <Alert variant="destructive">{process.error.code}: {process.error.message}. Технический сбой не означает непрохождение допуска; прежний принятый профиль может сохраняться.</Alert>}
-      <p className="text-xs text-muted-foreground">Успех исследования не означает готовый live. Сохранённое исследование может относиться к кандидату; при сохранённом принятом поколении среднее и рекомендация относятся к нему. Границы — время закрытия минуты: новое поколение действует после watermark.</p>
+      <p className="text-xs text-muted-foreground">Исследование принято — это готовность рекомендаций, а не live. Кандидат независимо инициализируется по текущим закрытым свечам, без повторной проверки исторического результата. Сохранённое исследование может относиться к кандидату; при сохранённом принятом поколении среднее и рекомендация относятся к нему. Новые рекомендации поступят после следующего полного исследования слота. Новое поколение действует после watermark закрытой минуты.</p>
       <p className="text-xs text-muted-foreground">Это настроенные пороги, а не история исследований. Очистка сохраняет их настройки. Дата ниже — изменение состояния профиля, включая сброс при очистке, а не дата исследования.</p>
       <div className="overflow-x-auto"><Table aria-label={`Настроенные адаптивные профили · ${algorithmDisplayName(algorithm)}`}>
-        <TableHeader><TableRow>{["Минимум сетапов в день", "Исследование / допуск", "Принятое поколение / live", "Кандидат / прогрев", "Среднее матрицы", "Рекомендация", "Изменение состояния профиля"].map((title) => <TableHead key={title}>{title}</TableHead>)}</TableRow></TableHeader>
+        <TableHeader><TableRow>{["Минимум сетапов в день", "Исследование / допуск", "Принятое поколение / live", "Кандидат / инициализация live", "Среднее матрицы", "Рекомендация", "Изменение состояния профиля"].map((title) => <TableHead key={title}>{title}</TableHead>)}</TableRow></TableHeader>
         <TableBody>{process.slots.map((slot) => <TableRow key={slot.id}>
           <TableCell>{slot.minSetupsPerDay === 0 ? "0 · без частотного допуска" : slot.minSetupsPerDay}</TableCell>
           <TableCell><div className="grid gap-1"><Badge>{slotStatuses[slot.status] ?? slot.status}</Badge><span className="text-xs">{hasNoProfileResults(slot) ? "Результатов нет" : slot.studyId === null ? "Сохранённое исследование не указано" : `Сохранённое исследование #${slot.studyId}`}</span></div></TableCell>
@@ -193,7 +224,9 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
       <Button type="button" variant="outline" onClick={() => setOpen(true)} disabled={!controller.available || controller.busy !== null}>Настроить непрерывное исследование</Button>
       {process && process.status !== "stopped" ? <Button type="button" variant="outline" disabled={!controller.available || controller.busy !== null || process.status === "stopping"} onClick={() => { void controller.stop(); }}>{process.status === "stopping" ? "Остановка запрошена · ожидаем drain" : "Остановить непрерывное исследование"}</Button>
         : <Button type="button" disabled={!controller.available || !process?.config || controller.busy !== null} onClick={() => { void controller.start(); }}>Запустить непрерывное исследование</Button>}
+      {recoveryExhausted && <Button type="button" variant="outline" disabled={!controller.available || controller.busy !== null} onClick={() => { void controller.start(); }}>Повторить восстановление исследования</Button>}
     </div>
+    {recoveryExhausted && <p className="text-xs text-muted-foreground">Повтор восстановления сохраняет тот же ID исследования, сохранённый вход и исходный абсолютный дедлайн, без нового окна. Эта явная команда Start сбрасывает бюджет попыток; возобновление допуска обслуживания его не сбрасывает.</p>}
     <p className="text-xs text-muted-foreground">Остановка общая для алгоритма: деактивирует его адаптивные профили. После drain очищаются только незавершённые дочерние данные; завершённая история и постоянный live сохраняются.</p>
     <p className="text-xs text-muted-foreground">R рассчитан только по наблюдавшимся закрытым TP/SL-сделкам. Правый край последних N суток может быть незрелым: будущие входы, незакрытые сделки и пропуски не подменяются нулевой доходностью или SL. Частота eligible-входов и доходность — разные показатели.</p>
     <Dialog open={open} onOpenChange={setOpen}>

@@ -3,6 +3,9 @@ pub mod scheduler;
 pub mod live;
 pub mod outbox;
 pub mod cleanup;
+pub mod maintenance;
+pub mod recovery;
+pub mod frozen;
 use crate::DbError;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -24,6 +27,12 @@ pub struct ContinuousSlot {
     pub readiness_frontier: Option<i64>,
     pub pending_error: Option<Value>,
     pub live_watermark: Option<i64>,
+    pub live_initialization: Option<live::LiveInitialization>,
+    pub live_readiness_summary: Option<live::LiveReadinessSummary>,
+    pub pending_initialization: Option<live::LiveInitialization>,
+    pub pending_attempts: i32,
+    pub pending_next_attempt_at: Option<DateTime<Utc>>,
+    pub pending_attempt_deadline: Option<DateTime<Utc>>,
     pub study_id: Option<i64>,
     pub mean_expectancy: Option<f64>,
     pub selected_cell: Option<Value>,
@@ -60,7 +69,7 @@ pub async fn get(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Option<C
         .bind(owner).bind(algorithm).fetch_optional(&mut *tx).await?;
     let Some(row) = row else { return Ok(None); };
     let mut result = process(&row)?;
-    let slots = sqlx::query("select *,min_setups_per_day::double precision as frequency from continuous_slots where owner_id=$1 and algorithm_id=$2 and enabled order by id")
+    let slots = sqlx::query("select s.*,s.min_setups_per_day::double precision as frequency,a.spec active_spec,a.live_initialization,coalesce(a.live_readiness,'[]'::jsonb) live_readiness,n.live_initialization pending_initialization,coalesce(n.live_init_attempts,0) pending_attempts,n.live_init_next_attempt_at pending_next_attempt_at,n.live_init_deadline pending_attempt_deadline from continuous_slots s left join continuous_generations a on a.id=s.active_generation_id left join continuous_generations n on n.id=s.pending_generation_id where s.owner_id=$1 and s.algorithm_id=$2 and s.enabled order by s.id")
         .bind(owner).bind(algorithm).fetch_all(&mut *tx).await?;
     result.slots = slots.into_iter().map(|row| Ok(ContinuousSlot {
         id: row.try_get("id")?, min_setups_per_day: row.try_get("frequency")?,
@@ -69,6 +78,12 @@ pub async fn get(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Option<C
         pending_generation_id: row.try_get("pending_generation_id")?, pending_status: row.try_get("pending_status")?,
         readiness_frontier: row.try_get("readiness_frontier")?, pending_error: row.try_get("pending_error")?,
         live_watermark: row.try_get("live_watermark")?,
+        live_initialization:live::decode_live_metadata(&row)?.0,
+        live_readiness_summary:row.try_get::<Option<i64>,_>("active_generation_id")?.map(|generation|live::readiness_summary(generation,&row.try_get::<Value,_>("active_spec")?,&live::decode_live_metadata(&row)?.1)).transpose()?,
+        pending_initialization:row.try_get::<Option<Value>,_>("pending_initialization")?.map(serde_json::from_value).transpose().map_err(crate::json_error)?,
+        pending_attempts:row.try_get("pending_attempts")?,
+        pending_next_attempt_at:row.try_get("pending_next_attempt_at")?,
+        pending_attempt_deadline:row.try_get("pending_attempt_deadline")?,
         study_id: row.try_get("study_id")?, mean_expectancy: row.try_get("mean_expectancy")?,
         selected_cell: row.try_get("selected_cell")?, updated_at: row.try_get("updated_at")?,
     })).collect::<Result<_,DbError>>()?;
@@ -133,7 +148,11 @@ pub async fn start(pool: &PgPool, owner: &str, algorithm: &str) -> Result<bool,D
         .bind(owner).bind(algorithm).execute(&mut *tx).await?.rows_affected()>0;
     // Also repair inactive cursors persisted before retirement was implemented;
     // retrying a technical failure must leave every accepted incumbent intact.
-    if changed {live::retire_inactive_checkpoints(&mut tx,owner,algorithm,None).await?;}
+    if changed {
+        sqlx::query("update continuous_generations g set recovery_pending=false,error=null from continuous_processes p where p.owner_id=$1 and p.algorithm_id=$2 and p.active_generation_id=g.id and g.status='running'")
+            .bind(owner).bind(algorithm).execute(&mut *tx).await?;
+        live::retire_inactive_checkpoints(&mut tx,owner,algorithm,None).await?;
+    }
     tx.commit().await?;
     Ok(changed)
 }
@@ -199,6 +218,8 @@ async fn cleanup_stopped_inner(pool:&PgPool,owner:&str,algorithm:&str,lease:&sch
         .bind(batches).bind(owner).execute(&mut *tx).await?;
     sqlx::query("update continuous_generations set status='cancelled',phase='cancelled',updated_at=now() where owner_id=$1 and algorithm_id=$2 and status='running'")
         .bind(owner).bind(algorithm).execute(&mut *tx).await?;
+    sqlx::query("delete from continuous_runtime_artifacts a using continuous_generations g where a.generation_id=g.id and g.owner_id=$1 and g.algorithm_id=$2 and g.status<>'running'")
+        .bind(owner).bind(algorithm).execute(&mut *tx).await?;
     sqlx::query("update continuous_processes set status='stopped',phase=null,active_generation_id=null,active_study_id=null,cleanup_targets='{\"studies\":[],\"runs\":[],\"batches\":[]}',updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(owner).bind(algorithm).execute(&mut *tx).await?;
     if !scheduler::owns(&mut tx,lease).await? {return Ok(());}
@@ -227,10 +248,12 @@ pub struct ActiveAdaptiveSlot {
     pub mean_expectancy: f64,
     pub direction: String,
     pub external_name: String,
+    pub live_initialization: Option<live::LiveInitialization>,
+    pub live_readiness: Vec<live::LiveInstrumentReadiness>,
 }
 
 pub async fn active_adaptive_slots(pool: &PgPool, owner: &str) -> Result<Vec<ActiveAdaptiveSlot>,DbError> {
-    let rows = sqlx::query("select s.id slot_id,s.owner_id,s.algorithm_id,s.min_setups_per_day::double precision frequency,g.id generation_id,g.study_id,g.config_revision,g.spec,g.result,g.result#>'{best,params}' as params,g.result#>'{best,analytics}' as analytics,g.result->'selectedCell' as selected_cell,s.mean_expectancy,g.spec->>'direction' as direction,n.value->>'externalName' external_name from continuous_slots s join continuous_generations g on g.id=s.active_generation_id join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id left join settings n on n.key='algorithm:'||s.algorithm_id where s.owner_id=$1 and s.enabled and p.desired_running and coalesce((p.config->>'adaptiveEnabled')::boolean,false) and g.accepted=true and g.status='completed' order by s.id")
+    let rows = sqlx::query("select s.id slot_id,s.owner_id,s.algorithm_id,s.min_setups_per_day::double precision frequency,g.id generation_id,g.study_id,g.config_revision,g.spec,g.result,g.live_initialization,g.live_readiness,g.result#>'{best,params}' as params,g.result#>'{best,analytics}' as analytics,g.result->'selectedCell' as selected_cell,s.mean_expectancy,g.spec->>'direction' as direction,n.value->>'externalName' external_name from continuous_slots s join continuous_generations g on g.id=s.active_generation_id join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id left join settings n on n.key='algorithm:'||s.algorithm_id where s.owner_id=$1 and s.enabled and p.desired_running and coalesce((p.config->>'adaptiveEnabled')::boolean,false) and g.accepted=true and g.status='completed' order by s.id")
         .bind(owner).fetch_all(pool).await?;
     rows.into_iter().map(|r|Ok(ActiveAdaptiveSlot {
         owner_id:r.try_get("owner_id")?,algorithm_id:r.try_get("algorithm_id")?,
@@ -241,6 +264,8 @@ pub async fn active_adaptive_slots(pool: &PgPool, owner: &str) -> Result<Vec<Act
         params:r.try_get("params")?,analytics:r.try_get("analytics")?,
         selected_cell:r.try_get("selected_cell")?,mean_expectancy:r.try_get("mean_expectancy")?,
         direction:r.try_get("direction")?,
+        live_initialization:live::decode_live_metadata(&r)?.0,
+        live_readiness:live::decode_live_metadata(&r)?.1,
         external_name:r.try_get::<Option<String>,_>("external_name")?.unwrap_or_else(||crate::algorithm_name(&r.get::<String,_>("algorithm_id"))),
     })).collect()
 }
@@ -338,6 +363,17 @@ pub async fn commit_adaptive_scan_cas(
         _ => false,
     };
     if !enabled { return Ok(AdaptiveCommit{applied:false,inserted:Vec::new()}); }
+    // Read the current durable projection, not the caller's possibly stale copy.
+    // Waiting instruments may join only through the real-state fenced join API.
+    let readiness:Value=sqlx::query_scalar("select live_readiness from continuous_generations where id=$1")
+        .bind(expected.generation_id).fetch_one(&mut *tx).await?;
+    let readiness:Vec<live::LiveInstrumentReadiness>=serde_json::from_value(readiness).map_err(crate::json_error)?;
+    let publication_floor=if !readiness.is_empty() {
+        let Some(entry)=readiness.iter().find(|entry|entry.instrument_key==instrument_key && entry.status=="ready") else {
+            return Ok(AdaptiveCommit{applied:false,inserted:Vec::new()});
+        };
+        Some(entry.publication_floor_close_unix)
+    }else{None};
     let current = sqlx::query("select generation_id,state from adaptive_live_checkpoints where slot_id=$1 and instrument_key=$2 for update")
         .bind(expected.slot_id).bind(instrument_key).fetch_optional(&mut *tx).await?
         .map(|r|Ok::<_,DbError>(AdaptiveCheckpoint{generation_id:r.try_get("generation_id")?,state:r.try_get("state")?})).transpose()?;
@@ -352,6 +388,12 @@ pub async fn commit_adaptive_scan_cas(
             .ok_or_else(||DbError::Json("invalid adaptive setup open timestamp".into()))?;
         let close = DateTime::<Utc>::from_timestamp(row.setup.close_time_unix,0)
             .ok_or_else(||DbError::Json("invalid adaptive setup close timestamp".into()))?;
+        if publication_floor.is_some_and(|floor|row.setup.close_time_unix<=floor) {
+            let duplicate:bool=sqlx::query_scalar("select exists(select 1 from live_setups where adaptive_slot_id=$1 and exchange_code=$2 and category=$3 and symbol=$4 and open_time=$5)")
+                .bind(expected.slot_id).bind(&row.exchange_code).bind(&row.category).bind(&row.symbol).bind(open).fetch_one(&mut *tx).await?;
+            if duplicate {continue;}
+            return Err(DbError::Json("adaptive emission precedes instrument publication floor".into()));
+        }
         let id: Option<i32> = sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,details,adaptive_slot_id,adaptive_generation_id,recommendation,external_name) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) on conflict(adaptive_slot_id,exchange_code,category,symbol,open_time) where adaptive_slot_id is not null do nothing returning id")
             .bind(&row.exchange_code).bind(&row.category).bind(&row.symbol).bind(&row.setup.algorithm_id)
             .bind(&row.setup.algorithm_version).bind(serde_json::to_value(&row.setup.params).map_err(crate::json_error)?)

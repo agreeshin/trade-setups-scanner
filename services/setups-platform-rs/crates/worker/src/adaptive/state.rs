@@ -2,8 +2,9 @@
 //! Nothing in this module performs IO or keeps a borrowed frame across await.
 use super::*;
 use setups_detector::shared::{HistoryIdentity, HistoryLimits, SharedHistory, SharedProfile};
-use setups_domain::{PushStatus, decimal::Decimal};
-use setups_optimizer::ContinuousInstrumentPrefix;
+use setups_domain::{PushStatus, SkipReason};
+#[cfg(test)]
+use setups_domain::decimal::Decimal;
 use setups_mdclient::{TailReadGuardQuery,TailReadToken};
 use std::{collections::{BTreeMap, BTreeSet}, mem::size_of, sync::Arc};
 
@@ -31,12 +32,13 @@ pub(crate) struct ProfileSpec {
     pub recommendation: Arc<Value>,
     pub cluster_gap_minutes: Option<u32>,
     pub from_open: i64,
-    pub bootstrap_next: i64,
-    pub bootstrap_raw_open: Option<i64>,
+    /// Stable live-owned warmup target, unrelated to the research bootstrap.
+    pub warmup_through: i64,
     pub emit_from_close: i64,
     pub checkpoint: Option<AdaptiveCheckpoint>,
-    pub prefix: ContinuousInstrumentPrefix,
     pub pending: bool,
+    /// Durable per-instrument readiness, independent of a temporary shadow mute.
+    pub waiting: bool,
     // Catalog eligibility only. Pending muting and live permission fences are
     // independent; false is reserved for an explicitly not-listed instrument.
     pub publish_enabled: bool,
@@ -49,83 +51,45 @@ impl ProfileSpec {
 }
 
 #[derive(Clone)]
-struct PrefixDigest {
-    hash: Sha256,
-    count: u64,
-    expected: ContinuousInstrumentPrefix,
-    from: i64,
-    to: i64,
-}
-impl PrefixDigest {
-    fn new(spec: &ProfileSpec) -> Self {
-        let mut hash=Sha256::new();
-        hash.update(b"continuous-detector-prefix-v1\0");
-        hash.update(spec.from_open.to_be_bytes()); hash.update(spec.bootstrap_next.to_be_bytes());
-        hash.update(spec.prefix.bar_count.to_be_bytes());
-        Self { hash,count:0,expected:spec.prefix.clone(),from:spec.from_open,to:spec.bootstrap_next }
-    }
-    fn observe(&mut self, open: i64, close: Decimal, turnover: Decimal) {
-        if open<self.from || open>=self.to { return; }
-        self.hash.update(open.to_be_bytes());
-        for mut value in [close,turnover] {
-            while value.scale>0 && value.int%10==0 {value.int/=10;value.scale-=1;}
-            self.hash.update(value.int.to_be_bytes());self.hash.update(value.scale.to_be_bytes());
-        }
-        self.count+=1;
-    }
-    fn verify(&self) -> Result<(), WorkerError> {
-        if self.count!=self.expected.bar_count || format!("{:x}",self.hash.clone().finalize())!=self.expected.sha256 {
-            return Err(invalid("frozen detector prefix fingerprint mismatch"));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
 struct CachedProfile {
     spec: ProfileSpec,
     detector: Option<SharedProfile>,
     cluster: CausalCluster,
     checkpoint: AdaptiveCheckpoint,
     expected: Option<AdaptiveCheckpoint>,
-    digest: PrefixDigest,
-    prefix_verified: bool,
+    initialized: bool,
     checkpoint_verified: bool,
     last_status: Option<PushStatus>,
+    last_skip: Option<SkipReason>,
 }
 impl CachedProfile {
     fn new(spec: ProfileSpec) -> Result<Self, WorkerError> {
         let cluster=CausalCluster::new(i64::from(spec.cluster_gap_minutes.unwrap_or(1))*60,None)
             .map_err(|error|invalid(&error.to_string()))?;
-        let digest=PrefixDigest::new(&spec);
         let checkpoint=AdaptiveCheckpoint {generation_id:spec.fence.generation_id,next_open_unix:spec.from_open,
             last_raw_open_unix:None,last_raw_cluster_time:None};
         let expected=spec.checkpoint.clone();
-        Ok(Self {spec,detector:None,cluster,checkpoint,expected,digest,prefix_verified:false,
-            checkpoint_verified:false,last_status:None})
+        Ok(Self {spec,detector:None,cluster,checkpoint,expected,initialized:false,
+            checkpoint_verified:false,last_status:None,last_skip:None})
     }
     fn check_boundaries(&mut self, through_open: i64) -> Result<(),WorkerError> {
-        if !self.prefix_verified && through_open>=self.spec.bootstrap_next {
-            self.digest.verify()?;
-            if self.checkpoint.last_raw_open_unix!=self.spec.bootstrap_raw_open {
-                return Err(invalid("frozen prefix raw seed differs from original replay"));
-            }
-            self.prefix_verified=true;
-        }
+        // Only the current live-owned interval matters. Research fingerprints
+        // and raw seeds are immutable evidence, never operational live state.
+        if through_open>=self.spec.warmup_through {self.initialized=true;}
         if !self.checkpoint_verified && let Some(expected)=&self.expected
             && expected.generation_id==self.spec.fence.generation_id && through_open>=expected.next_open_unix {
             // The durable cursor is the publication boundary, not proof that
             // its derived cooldown/cluster seeds still match canonical data.
-            // Reconstruct them from the original frozen prefix and guarded
+            // Reconstruct them from this profile's live origin and guarded
             // input, suppress pre-cursor effects, then CAS the fresh state.
-            // A genuine post-frozen repair can change cooldown indefinitely.
+            // A current-source repair can change cooldown indefinitely.
             self.checkpoint_verified=true;
         }
         Ok(())
     }
     fn retained_bytes(&self) -> usize {
         size_of::<Self>()+self.detector.as_ref().map_or(0,SharedProfile::retained_bytes)
-            + self.spec.key().len()+self.spec.prefix.sha256.capacity()
+            + self.spec.key().len()
     }
 }
 
@@ -139,9 +103,9 @@ pub(crate) struct PreparedProfile {
 }
 impl PreparedProfile {
     pub(crate) fn should_commit(&self)->bool {
-        !self.next.spec.pending && self.next.prefix_verified
+        !self.next.spec.pending && !self.next.spec.waiting && self.next.initialized
             && (self.expected.as_ref()!=Some(&self.checkpoint) || !self.setups.is_empty())
-            && self.checkpoint.next_open_unix>=self.next.spec.bootstrap_next
+            && self.checkpoint.next_open_unix>=self.next.spec.warmup_through
             && self.expected.as_ref().filter(|c|c.generation_id==self.fence.generation_id)
                 .is_none_or(|c|self.next.checkpoint_verified && self.checkpoint.next_open_unix>=c.next_open_unix)
     }
@@ -185,12 +149,12 @@ impl AdaptiveRuntime {
         let symbol=self.symbols.get(epoch).ok_or_else(||invalid("missing source history owner"))?;
         // This is the ORIGINAL reconstruction anchor, not the rolling ring
         // anchor: old input can change the phase of an indefinite cooldown.
-        let to=symbol.profiles.values().map(|p|p.checkpoint.next_open_unix.max(if p.prefix_verified {p.spec.bootstrap_next}else{p.spec.from_open})).max().unwrap_or(symbol.read_from);
+        let to=symbol.profiles.values().map(|p|p.checkpoint.next_open_unix).max().unwrap_or(symbol.read_from);
         let from=symbol.profiles.values().map(|p|p.spec.from_open).min().unwrap_or(symbol.read_from);
         Ok(TailReadGuardQuery {instrument_id,from_unix:from,to_unix:to,previous:symbol.source_token.clone()})
     }
-    pub(crate) fn frozen_boundary(&self,epoch:&str)->Result<i64,WorkerError> {
-        self.symbols.get(epoch).and_then(|s|s.profiles.values().map(|p|p.spec.bootstrap_next).max()).ok_or_else(||invalid("missing frozen boundary"))
+    pub(crate) fn warmup_boundary(&self,epoch:&str)->Result<i64,WorkerError> {
+        self.symbols.get(epoch).and_then(|s|s.profiles.values().map(|p|p.spec.warmup_through).max()).ok_or_else(||invalid("missing live warmup boundary"))
     }
     pub(crate) fn acknowledge_source(&mut self,epoch:&str,token:TailReadToken)->Result<(),WorkerError> {
         token.validate().map_err(shared_error)?;
@@ -199,24 +163,12 @@ impl AdaptiveRuntime {
     }
     pub(crate) fn is_current(&self,epoch:&str,through:i64)->bool {
         self.symbols.get(epoch).is_some_and(|s|s.source_token.is_some()
-            && s.profiles.values().all(|p|p.prefix_verified && p.checkpoint.next_open_unix>=through))
-    }
-    pub(crate) fn account_not_listed(&mut self,epoch:&str,frontier:i64)->Result<(),WorkerError> {
-        let symbol=self.symbols.get_mut(epoch).ok_or_else(||invalid("not-listed history owner missing"))?;
-        if symbol.source_token.is_none() || symbol.observed_through<frontier
-            || symbol.profiles.values().any(|p|p.spec.publish_enabled || !p.prefix_verified) {
-            return Err(invalid("not-listed accounting requires verified source absence and an inactive catalog listing"));
-        }
-        // This is explicit not-listed accounting, NOT an ordinary active-tail
-        // observation. The caller has proved the entire interval through W.
-        // No real frame, rolling sum or raw seed is fabricated.
-        for profile in symbol.profiles.values_mut() {profile.checkpoint.next_open_unix=frontier;}
-        Ok(())
+            && s.profiles.values().all(|p|p.initialized && p.checkpoint.next_open_unix>=through))
     }
     pub(crate) fn activate(&mut self,epoch:&str,profile:&str,frontier:i64)->Result<(),WorkerError> {
         let p=self.symbols.get_mut(epoch).and_then(|s|s.profiles.get_mut(profile)).ok_or_else(||invalid("promoted profile RAM missing"))?;
-        if !p.prefix_verified || p.checkpoint.next_open_unix!=frontier {return Err(invalid("promoted profile not ready at watermark"));}
-        p.spec.pending=false;p.spec.emit_from_close=frontier+60;p.expected=Some(p.checkpoint.clone());p.checkpoint_verified=true;
+        if !p.initialized || p.checkpoint.next_open_unix!=frontier {return Err(invalid("promoted profile not ready at watermark"));}
+        p.spec.pending=false;p.spec.waiting=false;p.spec.emit_from_close=frontier+60;p.expected=Some(p.checkpoint.clone());p.checkpoint_verified=true;
         let parts:Vec<Value>=serde_json::from_str(epoch)?;
         self.locations.insert((serde_json::to_string(&parts[..3])?,profile.into()),epoch.into());
         Ok(())
@@ -264,10 +216,12 @@ impl AdaptiveRuntime {
             if let Some(profile)=symbol.profiles.get_mut(&profile_key) {
                 profile.spec.recommendation=spec.recommendation.clone();
                 profile.spec.publish_enabled=spec.publish_enabled;
+                profile.spec.waiting=spec.waiting;
+                profile.spec.emit_from_close=spec.emit_from_close;
                 continue;
             }
-            // A newly attached profile must verify its entire frozen prefix in
-            // this epoch, not inherit another generation's unchecked identity.
+            // A newly attached profile must replay from its OWN live origin;
+            // it cannot inherit another generation's cooldown/cluster state.
             if !symbol.history.is_empty() {return Err(invalid("new profile requires verified staged history epoch"));}
             symbol.profiles.insert(profile_key.clone(),CachedProfile::new(spec.clone())?);
             if !spec.pending {self.locations.insert((symbol_key.clone(),profile_key),key.into());}
@@ -280,23 +234,18 @@ impl AdaptiveRuntime {
         let consumed=s.profiles.values().map(|p|p.checkpoint.next_open_unix).min().unwrap_or(s.read_from);
         Ok((consumed.max(s.read_from),target))
     }
-    pub(crate) fn adoption_page(&self,epoch:&str,profile:&str,expected:Option<AdaptiveCheckpoint>)->Result<PreparedProfile,WorkerError> {
-        let mut next=self.symbols.get(epoch).and_then(|s|s.profiles.get(profile)).ok_or_else(||invalid("staging consumer missing"))?.clone();
-        next.spec.pending=false;next.expected=expected.clone();next.checkpoint_verified=true;
-        Ok(PreparedProfile {key:profile.into(),fence:next.spec.fence.clone(),expected,checkpoint:next.checkpoint.clone(),setups:Vec::new(),next})
-    }
-    pub(crate) fn adopt_staging(&mut self,staging:&str,production:&str,candidate:&str,expected:&BTreeMap<String,AdaptiveCheckpoint>)->Result<(),WorkerError> {
+    pub(crate) fn adopt_staging(&mut self,staging:&str,production:&str,candidate:&str,expected:&BTreeMap<String,AdaptiveCheckpoint>)->Result<bool,WorkerError> {
         let staged=self.symbols.get(staging).ok_or_else(||invalid("staging epoch missing"))?;
-        if staged.source_token.is_none() || staged.profiles.values().any(|p|!p.prefix_verified) {
+        if staged.source_token.is_none() || staged.profiles.values().any(|p|!p.initialized) {
             return Err(invalid("staging epoch is not fully verified"));
         }
         if let Some(current)=self.symbols.get(production)
             && current.profiles.keys().any(|key|key!=candidate && !staged.profiles.contains_key(key)) {
-            return Err(invalid("active consumer cohort changed while staging"));
+            return Ok(false);
         }
         for (key,profile) in &staged.profiles {
             if key!=candidate && expected.get(key)!=Some(&profile.checkpoint) {
-                return Err(invalid("incumbent checkpoint differs from staged reconstruction"));
+                return Ok(false);
             }
         }
         let mut staged=self.symbols.remove(staging).unwrap();
@@ -310,12 +259,13 @@ impl AdaptiveRuntime {
         let symbol=serde_json::to_string(&parts[..3])?;
         for (key,profile) in &mut staged.profiles {
             if key!=candidate {
-                profile.spec.pending=false;profile.expected=Some(profile.checkpoint.clone());profile.checkpoint_verified=true;
+                profile.spec.pending=false;
+                if !profile.spec.waiting {profile.expected=Some(profile.checkpoint.clone());profile.checkpoint_verified=true;}
                 self.locations.insert((symbol.clone(),key.clone()),production.into());
             }
         }
         self.symbols.insert(production.into(),staged);
-        Ok(())
+        Ok(true)
     }
     pub(crate) fn remove_profile(&mut self,epoch:&str,candidate:&str) {
         if let Some(symbol)=self.symbols.get_mut(epoch) {symbol.profiles.remove(candidate);}
@@ -330,7 +280,20 @@ impl AdaptiveRuntime {
     }
     pub(crate) fn ready(&self,key:&str,profile:&str,frontier:i64)->bool {
         self.symbols.get(key).and_then(|s|s.profiles.get(profile)).is_some_and(|p|
-            p.prefix_verified && p.checkpoint.next_open_unix==frontier && p.last_status==Some(PushStatus::Evaluated))
+            p.initialized && p.checkpoint.next_open_unix==frontier && p.last_status==Some(PushStatus::Evaluated)
+            && !matches!(p.last_skip,Some(SkipReason::GapToleranceExceeded | SkipReason::PriceReferenceMissing)))
+    }
+    pub(crate) fn waiting_reason(&self,key:&str,profile:&str,frontier:i64)->Option<&'static str> {
+        if self.ready(key,profile,frontier) {return None;}
+        let p=self.symbols.get(key)?.profiles.get(profile)?;
+        Some(if p.checkpoint.next_open_unix<frontier {"waiting_tail"} else {
+            match p.last_skip {
+                Some(SkipReason::RecentGap)=>"recent_gap",
+                Some(SkipReason::GapToleranceExceeded)=>"gap_tolerance",
+                Some(SkipReason::PriceReferenceMissing)=>"missing_price_reference",
+                _=>"insufficient_history",
+            }
+        })
     }
     /// Build owned effects and speculative scalar clones. History borrows end
     /// here, BEFORE the caller performs persistence or promotion IO.
@@ -359,25 +322,24 @@ impl AdaptiveRuntime {
                 Some(anchor)=>symbol.history.push_retaining(bar,target,anchor),
                 None=>symbol.history.push(bar,target),
             }.map_err(shared_error)?;
-            let frame=symbol.history.frame(position).map_err(shared_error)?.ok_or_else(||invalid("ingested frame missing"))?;
             for (key,profile) in &mut next {
                 if bar.open_time_unix<profile.spec.from_open || bar.open_time_unix<profile.checkpoint.next_open_unix {continue;}
                 profile.check_boundaries(bar.open_time_unix)?;
-                profile.digest.observe(bar.open_time_unix,frame.close(),frame.quote_turnover());
                 let detector=match profile.detector.as_mut() {
                     Some(detector)=>detector,
                     None=>profile.detector.insert(SharedProfile::new(profile.spec.params.clone(),symbol.history.identity(),position,None).map_err(shared_error)?),
                 };
                 let pushed=detector.push(&symbol.history,position).map_err(shared_error)?;
                 profile.last_status=Some(pushed.status);
+                profile.last_skip=pushed.skip_reason;
                 profile.checkpoint.next_open_unix=bar.open_time_unix+60;
                 if let Some(raw)=pushed.setup {
                     let first=profile.cluster.observe_raw(raw.close_time_unix).map_err(|e|invalid(&e.to_string()))?;
                     profile.checkpoint.last_raw_open_unix=Some(raw.open_time_unix);
                     profile.checkpoint.last_raw_cluster_time=Some(raw.close_time_unix);
                     let emit_after=profile.expected.as_ref().filter(|c|c.generation_id==profile.spec.fence.generation_id)
-                        .map_or(profile.spec.bootstrap_next,|c|c.next_open_unix);
-                    if !profile.spec.pending && profile.spec.publish_enabled && profile.prefix_verified && raw.open_time_unix>=emit_after
+                        .map_or(profile.spec.warmup_through,|c|c.next_open_unix);
+                    if !profile.spec.pending && !profile.spec.waiting && profile.spec.publish_enabled && profile.initialized && raw.open_time_unix>=emit_after
                         && raw.close_time_unix>=profile.spec.emit_from_close && (first || profile.spec.cluster_gap_minutes.is_none()) {
                         let mut recommendation=(*profile.spec.recommendation).clone();
                         let shift=recommendation["timeShiftMinutes"].as_i64().ok_or_else(||invalid("missing recommended shift"))?;
@@ -416,7 +378,6 @@ fn shared_error(error:impl std::fmt::Display)->WorkerError {invalid(&error.to_st
 pub(crate) mod tests {
     use super::*;
     use setups_domain::SpikeParams;
-    use setups_optimizer::{StudyInstrument,detector_prefix_fingerprint};
 
     pub(crate) struct Fixture {
         pub runtime:AdaptiveRuntime,
@@ -430,14 +391,11 @@ pub(crate) mod tests {
         let instrument=AdaptiveInstrument {exchange:"test".into(),category:"linear".into(),symbol:"TESTUSDT".into()};
         let frontier=1445*60;
         let bars:Vec<_>=(0..frontier).step_by(60).map(|open_time_unix|DetectorBar {open_time_unix,close:"100".into(),quote_turnover:"1".into()}).collect();
-        let digest=detector_prefix_fingerprint(&bars,0,frontier).unwrap();
         let params=AlgorithmParams::Spike(SpikeParams {baseline_long_days:1,baseline_short_days:1,window_minutes:1,
             price_growth_pct:"0".into(),volume_multiplier:"2".into(),cooldown_minutes:1,required_recent_minutes:0,..SpikeParams::default()});
         let spec=ProfileSpec {fence:AdaptiveFence {owner_id:"test".into(),algorithm_id:params.algorithm_id().into(),slot_id:1,generation_id:1,config_revision:1},
             params,recommendation:Arc::new(serde_json::json!({"timeShiftMinutes":3})),cluster_gap_minutes:None,
-            from_open:0,bootstrap_next:frontier,bootstrap_raw_open:None,emit_from_close:frontier+60,checkpoint:None,
-            prefix:ContinuousInstrumentPrefix {instrument:StudyInstrument {exchange:instrument.exchange.clone(),category:instrument.category.clone(),symbol:instrument.symbol.clone()},
-                bar_count:digest.bar_count,sha256:digest.sha256},pending:false,publish_enabled:true};
+            from_open:0,warmup_through:frontier,emit_from_close:frontier+60,checkpoint:None,pending:false,waiting:false,publish_enabled:true};
         let epoch=AdaptiveRuntime::epoch_key(&instrument,None);
         let runtime=AdaptiveRuntime::new(AdaptiveRuntimeLimits {max_history_bytes:8*1024*1024,max_symbols:2,max_profiles:4,
             max_profile_bytes:1024*1024,..AdaptiveRuntimeLimits::default()});
@@ -465,8 +423,8 @@ pub(crate) mod tests {
             profile.checkpoint.next_open_unix=through;profile.expected=Some(profile.checkpoint.clone());
         }
     }
-    fn profile_snapshot(profile:&CachedProfile)->(AdaptiveCheckpoint,Option<AdaptiveCheckpoint>,String,u64) {
-        (profile.checkpoint.clone(),profile.expected.clone(),format!("{:?}",profile.detector),profile.digest.count)
+    fn profile_snapshot(profile:&CachedProfile)->(AdaptiveCheckpoint,Option<AdaptiveCheckpoint>,String,bool) {
+        (profile.checkpoint.clone(),profile.expected.clone(),format!("{:?}",profile.detector),profile.initialized)
     }
     type HistorySnapshot=(u64,u64,Option<u64>,usize,Vec<(i64,Decimal,Decimal,String)>);
     fn history_snapshot(history:&SharedHistory)->HistorySnapshot {
@@ -488,7 +446,7 @@ pub(crate) mod tests {
         let production=history_snapshot(&f.runtime.symbols[&f.epoch].history);
         let staging=history_snapshot(&f.runtime.symbols[&staged].history);
         let expected=BTreeMap::from([(f.spec.key(),f.runtime.checkpoint_for(&f.epoch,&f.spec.key()).unwrap())]);
-        assert!(f.runtime.adopt_staging(&staged,&f.epoch,&candidate.key(),&expected).unwrap_err().to_string().contains("cohort changed"));
+        assert!(!f.runtime.adopt_staging(&staged,&f.epoch,&candidate.key(),&expected).unwrap());
         assert_eq!(history_snapshot(&f.runtime.symbols[&f.epoch].history),production);
         assert_eq!(history_snapshot(&f.runtime.symbols[&staged].history),staging);
         assert_eq!(f.runtime.retained_history_epochs(),2);
@@ -563,5 +521,63 @@ pub(crate) mod tests {
             let effects=feed(&mut f.runtime,&f.epoch,&f.instrument,std::slice::from_ref(&bar),bar.open_time_unix+60).unwrap();
             assert_eq!(effects.into_iter().map(|effect|effect.raw).collect::<Vec<_>>(),expected.setup.into_iter().collect::<Vec<_>>());
         }
+    }
+
+    #[test]
+    fn staging_preserves_distinct_live_origins_and_promotion_preserves_causal_phase() {
+        let mut f=fixture();
+        if let AlgorithmParams::Spike(params)=&mut f.spec.params {params.volume_multiplier="0.5".into();params.cooldown_minutes=7;}
+        let target=f.frontier+1200;
+        f.bars=(0..target).step_by(60).map(|open_time_unix|DetectorBar {open_time_unix,close:"100".into(),quote_turnover:"1".into()}).collect();
+        f.runtime.install(&f.epoch,&[f.spec.clone()]).unwrap();
+        feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars,target).unwrap();
+        let incumbent=f.runtime.checkpoint_for(&f.epoch,&f.spec.key()).unwrap();
+        let mut shadow=f.spec.clone();shadow.pending=true;shadow.checkpoint=Some(incumbent.clone());
+        let mut candidate=f.spec.clone();candidate.fence.generation_id=2;candidate.from_open=600;
+        candidate.recommendation=Arc::new(serde_json::json!({"timeShiftMinutes":3,"generationId":2}));
+        candidate.warmup_through=target;candidate.emit_from_close=target+60;candidate.pending=true;
+        let staging=AdaptiveRuntime::epoch_key(&f.instrument,Some(2));
+        f.runtime.install(&staging,&[shadow,candidate.clone()]).unwrap();
+        assert!(feed(&mut f.runtime,&staging,&f.instrument,&f.bars,target).unwrap().is_empty());
+        let candidate_before=f.runtime.checkpoint_for(&staging,&candidate.key()).unwrap();
+        assert_ne!(candidate_before.last_raw_open_unix,incumbent.last_raw_open_unix,"distinct origins must not borrow another profile's cooldown phase");
+        assert_eq!(f.runtime.checkpoint_for(&staging,&f.spec.key()),Some(incumbent.clone()));
+        f.runtime.acknowledge_source(&staging,TailReadToken {epoch:"fixture".into(),revision:"1".into()}).unwrap();
+        assert!(f.runtime.adopt_staging(&staging,&f.epoch,&candidate.key(),&BTreeMap::from([(f.spec.key(),incumbent)])).unwrap());
+        f.runtime.activate(&f.epoch,&candidate.key(),target).unwrap();
+        assert_eq!(f.runtime.checkpoint_for(&f.epoch,&candidate.key()),Some(candidate_before),"promotion changes ownership, not raw state");
+        let mut reference=PriceVolumeSpikeDetector::with_params(candidate.params.clone(),None).unwrap();
+        for bar in f.bars.iter().filter(|bar|bar.open_time_unix>=candidate.from_open) {reference.push(bar).unwrap();}
+        for open in (target..target+1200).step_by(60) {
+            let bar=DetectorBar {open_time_unix:open,close:"100".into(),quote_turnover:"1".into()};
+            let expected=reference.push(&bar).unwrap().setup;
+            let effects=feed(&mut f.runtime,&f.epoch,&f.instrument,&[bar],open+60).unwrap();
+            assert_eq!(effects.iter().filter(|effect|effect.recommendation["generationId"]==2)
+                .map(|effect|effect.raw.clone()).collect::<Vec<_>>(),expected.into_iter().collect::<Vec<_>>());
+        }
+        f.runtime.clear();assert_eq!(f.runtime.retained_history_bytes(),0);assert_eq!(f.runtime.retained_profile_bytes(),0);
+    }
+
+    #[test]
+    fn adopting_shadow_does_not_unmute_a_durably_waiting_sibling() {
+        let mut f=fixture();let mut sibling=f.spec.clone();sibling.fence.slot_id=3;sibling.waiting=true;
+        f.runtime.install(&f.epoch,&[f.spec.clone(),sibling.clone()]).unwrap();
+        feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars,f.frontier).unwrap();
+        let current=f.runtime.checkpoint_for(&f.epoch,&f.spec.key()).unwrap();
+        let waiting=f.runtime.checkpoint_for(&f.epoch,&sibling.key()).unwrap();
+        let mut shadow=f.spec.clone();shadow.pending=true;shadow.checkpoint=Some(current.clone());
+        let mut waiting_shadow=sibling.clone();waiting_shadow.pending=true;
+        let mut candidate=f.spec.clone();candidate.fence.generation_id=2;candidate.pending=true;
+        let staging=AdaptiveRuntime::epoch_key(&f.instrument,Some(2));
+        f.runtime.install(&staging,&[shadow,waiting_shadow,candidate.clone()]).unwrap();
+        feed(&mut f.runtime,&staging,&f.instrument,&f.bars,f.frontier).unwrap();
+        f.runtime.acknowledge_source(&staging,TailReadToken {epoch:"fixture".into(),revision:"1".into()}).unwrap();
+        assert!(f.runtime.adopt_staging(&staging,&f.epoch,&candidate.key(),&BTreeMap::from([(f.spec.key(),current),(sibling.key(),waiting)])).unwrap());
+        assert_eq!(f.runtime.cached_checkpoint(&f.epoch,&sibling.key()),Some(None),"staging cannot invent durable waiting state");
+        let bar=DetectorBar {open_time_unix:f.frontier,close:"100".into(),quote_turnover:"100".into()};
+        let pages=f.runtime.prepare(&f.epoch,&f.instrument,&[bar],f.frontier+60,true).unwrap();
+        let waiting=pages.iter().find(|page|page.key==sibling.key()).unwrap();
+        assert!(waiting.setups.is_empty());assert!(!waiting.should_commit());
+        assert_eq!(pages.iter().filter(|page|page.should_commit()).count(),1);
     }
 }

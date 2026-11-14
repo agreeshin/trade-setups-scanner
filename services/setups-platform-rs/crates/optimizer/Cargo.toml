@@ -11,7 +11,10 @@ setups-detector.workspace = true
 setups-analytics.workspace = true
 setups-replay.workspace = true
 rayon.workspace = true
-rand.workspace = true
+# Distribution/shuffle semantics are part of the private checkpoint version.
+rand = "=0.9.5"
+rand_chacha = "=0.9.0"
+ciborium = "=0.2.2"
 chrono.workspace = true
 sha2.workspace = true
 

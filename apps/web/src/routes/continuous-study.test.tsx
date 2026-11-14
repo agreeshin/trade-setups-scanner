@@ -77,17 +77,128 @@ async function configure() {
 }
 
 const closedBoundary = Date.parse("2026-11-12T12:00:00Z") / 1000;
-function profileView(patch: Partial<ContinuousSlot> = {}) {
+const readinessSummary = { generationId: 7, totalInstruments: 822, readyInstruments: 815, waitingInstruments: 7,
+  waitingReasons: [{ reason: "insufficient_history", count: 5 }, { reason: "waiting_tail", count: 2 }], otherWaitingInstruments: 0 };
+function profileController(patch: Partial<ContinuousSlot> = {}, processPatch: Partial<ContinuousProcess> = {}, controllerPatch: Partial<ContinuousController> = {}): ContinuousController {
   const controller: ContinuousController = {
     process: { ownerId: "admin", algorithmId: "future", status: "running", configRevision: 1,
       config: { lookbackDays: 30, minSetupsPerDay: [4], minMeanExpectancy: 0.15, adaptiveEnabled: true, study: spec }, activeStudyId: null, phase: "queued", error: null,
       slots: [{ id: 1, minSetupsPerDay: 4, status: "warming", activeGenerationId: 7, studyId: 42, meanExpectancy: 0.21,
-        selectedCell: { tpPct: 14, slPct: 4, rawR: 0.32, meanR: 0.21, robustScore: 0.01 }, updatedAt: "2026-11-12T12:00:00Z", ...patch }] },
+        selectedCell: { tpPct: 14, slPct: 4, rawR: 0.32, meanR: 0.21, robustScore: 0.01 }, updatedAt: "2026-11-12T12:00:00Z", ...patch }], ...processPatch },
     available: true, loading: false, error: null, busy: null, revision: 0,
     refresh: vi.fn(), save: vi.fn(() => Promise.resolve(true)), start: vi.fn(() => Promise.resolve(true)), stop: vi.fn(() => Promise.resolve(true)),
+    ...controllerPatch,
   };
-  return <ContinuousResearch algorithm={algorithm} controller={controller} />;
+  return controller;
 }
+function profileView(patch: Partial<ContinuousSlot> = {}) {
+  return <ContinuousResearch algorithm={algorithm} controller={profileController(patch)} />;
+}
+const exhaustedRecovery: Partial<ContinuousProcess> = { status: "error", activeStudyId: 42,
+  error: { code: "durable_resume_retry_exhausted", message: "Исчерпан бюджет восстановления." } };
+const recoveryLabel = "Повторить восстановление исследования";
+
+it("explicitly retries an exhausted same-study recovery via Start POST, never Stop, maintenance Resume or a configuration write", async () => {
+  process = profileController({ activeStatus: "active" }, exhaustedRecovery).process;
+  const initialConfig = process?.config;
+  render(<AlgorithmsPage />);
+  const retry = await screen.findByRole("button", { name: recoveryLabel });
+  await waitFor(() => expect(retry).toBeEnabled());
+  expect(screen.getByRole("button", { name: "Остановить непрерывное исследование" })).toBeEnabled();
+  expect(screen.getByText(/Повтор восстановления сохраняет тот же ID/)).toHaveTextContent("сохранённый вход и исходный абсолютный дедлайн, без нового окна");
+  expect(screen.getByText(/Повтор восстановления сохраняет тот же ID/)).toHaveTextContent("возобновление допуска обслуживания его не сбрасывает");
+  expect(requests.filter((request) => request.method !== "GET")).toHaveLength(0);
+  await userEvent.click(retry);
+  await waitFor(() => expect(requests.filter((request) => request.method !== "GET")).toEqual([
+    { path: "/v1/continuous-studies/future/start", method: "POST", body: null },
+  ]));
+  expect(process?.activeStudyId).toBe(42);
+  expect(process?.slots[0]?.activeGenerationId).toBe(7);
+  expect(process?.config).toEqual(initialConfig);
+  await waitFor(() => expect(screen.queryByRole("button", { name: recoveryLabel })).not.toBeInTheDocument());
+});
+
+it.each([{ available: false }, { busy: "save" as const }, { busy: "start" as const }, { busy: "stop" as const }])("disables recovery retry for a stale snapshot or a busy controller: %j", (patch) => {
+  const controller = profileController({}, exhaustedRecovery, patch);
+  render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
+  const retry = screen.getByRole("button", { name: recoveryLabel });
+  expect(retry).toBeDisabled(); fireEvent.click(retry);
+  expect(controller.start).not.toHaveBeenCalled(); expect(controller.stop).not.toHaveBeenCalled(); expect(controller.save).not.toHaveBeenCalled();
+});
+
+it.each(["source_unavailable", "durable_resume_corrupt"])("leaves ordinary process error %s with its existing Stop and no additional Start", (code) => {
+  render(<ContinuousResearch algorithm={algorithm} controller={profileController({}, { ...exhaustedRecovery, error: { code, message: "Ошибка источника или снимка." } })} />);
+  expect(screen.queryByRole("button", { name: recoveryLabel })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Запустить непрерывное исследование" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Остановить непрерывное исследование" })).toBeEnabled();
+  expect(screen.getByText(/Технический сбой не означает непрохождение допуска/)).toHaveTextContent(code);
+});
+
+it.each([{ config: null }, { activeStudyId: null }, { status: "running" as const }, { error: null }])("does not offer exhausted recovery without the precise error state, configuration and retained study: %j", (patch) => {
+  render(<ContinuousResearch algorithm={algorithm} controller={profileController({}, { ...exhaustedRecovery, ...patch })} />);
+  expect(screen.queryByRole("button", { name: recoveryLabel })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Остановить непрерывное исследование" })).toBeEnabled();
+});
+it("shows partial initialization readiness for the full active-generation scope, not a claim that all instruments emit", () => {
+  render(profileView({ activeStatus: "active", liveReadinessSummary: readinessSummary, pendingGenerationId: 8, pendingStatus: "warming" }));
+  const live = within(screen.getByRole("cell", { name: /Действующее поколение #7/ }));
+  expect(live.getByText("Готовы 815 из 822 · ожидают 7")).toBeInTheDocument();
+  expect(live.getByText("Недостаточно истории: 5")).toBeInTheDocument();
+  expect(live.getByText("Ожидание свежих закрытых минут: 2")).toBeInTheDocument();
+  expect(live.getByText(/не подтверждение формирования или доставки сигналов/)).toBeInTheDocument();
+  expect(live.getByText(/Ожидающие инструменты остаются в наборе/)).toBeInTheDocument();
+  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).not.toHaveTextContent("815");
+  expect(screen.getAllByRole("row")).toHaveLength(2);
+  expect(requests).toHaveLength(0);
+});
+it("renders at most three bounded reasons and aggregates all other waiting instruments", () => {
+  const longReason = "unknown-" + "x".repeat(2000);
+  render(profileView({ activeStatus: "active", liveReadinessSummary: { ...readinessSummary, totalInstruments: 12, readyInstruments: 1, waitingInstruments: 11,
+    waitingReasons: [{ reason: longReason, count: 3 }, { reason: "waiting_tail", count: 1 }, { reason: "insufficient_history", count: 1 },
+      ...Array.from({ length: 5 }, (_, index) => ({ reason: `other-${index}`, count: 1 }))], otherWaitingInstruments: 1 } }));
+  const reasons = within(screen.getByRole("list", { name: "Причины ожидания инструментов" }));
+  expect(reasons.getAllByRole("listitem")).toHaveLength(4);
+  expect(reasons.getByText("Другие причины ожидания: 6")).toBeInTheDocument();
+  expect(reasons.getByText(/Другая причина: unknown-/).textContent.length).toBeLessThan(160);
+  expect(screen.queryByText(longReason)).not.toBeInTheDocument();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(requests).toHaveLength(0);
+});
+it.each([null, { ...readinessSummary, generationId: 8 }])("shows unknown readiness for absent or different-generation summaries: %j", (liveReadinessSummary) => {
+  render(profileView({ activeStatus: "active", liveReadinessSummary, pendingGenerationId: 8, pendingStatus: "ready" }));
+  expect(screen.getByText("Готовность инструментов неизвестна.")).toBeInTheDocument();
+  expect(screen.queryByText(/Готовы \d+ из/)).not.toBeInTheDocument();
+});
+it.each(["toString", "__proto__"])("renders unfamiliar reason code %s as public text, never an inherited object property", (reason) => {
+  render(profileView({ activeStatus: "active", liveReadinessSummary: { ...readinessSummary, waitingReasons: [{ reason, count: 7 }] } }));
+  expect(screen.getByText(`Другая причина: ${reason}: 7`)).toBeInTheDocument();
+});
+it("never assumes legacy or candidate-only readiness belongs to an active generation", () => {
+  const view = render(profileView({ activeStatus: "active" }));
+  expect(screen.getByText("Готовность инструментов неизвестна.")).toBeInTheDocument();
+  view.rerender(profileView({ activeGenerationId: null, pendingGenerationId: 7, pendingStatus: "ready", liveReadinessSummary: readinessSummary }));
+  expect(screen.getByText("Готовность инструментов неизвестна.")).toBeInTheDocument();
+  expect(screen.queryByText(/Готовы \d+ из/)).not.toBeInTheDocument();
+  expect(screen.getByText("Адаптивные сигналы этого профиля не формируются.")).toBeInTheDocument();
+});
+it("does not label an explicitly inactive generation as having active initialization coverage", () => {
+  render(profileView({ activeStatus: "inactive", liveReadinessSummary: readinessSummary }));
+  expect(screen.getByText("Готовность инструментов неизвестна.")).toBeInTheDocument();
+  expect(screen.queryByText(/Готовы \d+ из/)).not.toBeInTheDocument();
+});
+it("updates readiness as waiting instruments join the same generation without inferring unknown instruments ready", () => {
+  const view = render(profileView({ activeStatus: "active", liveReadinessSummary: { ...readinessSummary, waitingReasons: [{ reason: "readiness_unknown", count: 7 }] } }));
+  expect(screen.getByText("Готовность неизвестна: 7")).toBeInTheDocument();
+  expect(screen.getByText("Готовы 815 из 822 · ожидают 7")).toBeInTheDocument();
+  view.rerender(profileView({ activeStatus: "active", liveReadinessSummary: { ...readinessSummary, readyInstruments: 822, waitingInstruments: 0, waitingReasons: [] } }));
+  expect(screen.getByText("Действующее поколение #7")).toBeInTheDocument();
+  expect(screen.getByText("Готовы 822 из 822 · ожидают 0")).toBeInTheDocument();
+  expect(screen.queryByRole("list", { name: "Причины ожидания инструментов" })).not.toBeInTheDocument();
+  view.rerender(profileView({ activeGenerationId: 8, activeStatus: "active", liveReadinessSummary: readinessSummary }));
+  expect(screen.getByText("Готовность инструментов неизвестна.")).toBeInTheDocument();
+  expect(screen.queryByText(/Готовы \d+ из/)).not.toBeInTheDocument();
+  expect(requests).toHaveLength(0);
+});
 it("labels configured profiles separately from research history and marks cleared results without deleting the slot", () => {
   render(profileView({ status: "stopped", activeGenerationId: null, activeStatus: "inactive", studyId: null, meanExpectancy: null, selectedCell: null,
     pendingGenerationId: null, pendingStatus: null, readinessFrontier: null, pendingError: null, liveWatermark: null }));
@@ -104,11 +215,13 @@ it("separates successful research, incumbent live and the warming candidate with
   const table = within(screen.getByRole("table", { name: "Настроенные адаптивные профили · Мой алгоритм" }));
   const incumbent = table.getByRole("cell", { name: /Действующее поколение #7/ });
   const candidate = table.getByRole("cell", { name: /Кандидат #8/ });
-  expect(table.getByText("Исследование успешно · допуск пройден")).toBeInTheDocument();
+  expect(table.getByText("Исследование принято")).toBeInTheDocument();
   expect(table.getByText("Сохранённое исследование #42")).toBeInTheDocument();
   expect(incumbent).not.toHaveTextContent("#8"); expect(incumbent).not.toHaveTextContent("#42");
-  expect(candidate).toHaveTextContent("Прогрев / догоняющая обработка");
+  expect(candidate).toHaveTextContent("Инициализация live по текущим данным");
   expect(candidate).not.toHaveTextContent("Готов к переключению");
+  expect(screen.getByText(/Кандидат независимо инициализируется по текущим закрытым свечам/)).toHaveTextContent("без повторной проверки исторического результата");
+  expect(screen.queryByText("Адаптивные сигналы этого профиля не формируются.")).not.toBeInTheDocument();
   expect(table.getByText("SHORT · TP 14% / SL 4% · 0.32 R")).toBeInTheDocument();
   expect(requests).toHaveLength(0);
 });
@@ -128,30 +241,44 @@ it("keeps the incumbent during a candidate error and renders only bounded public
   render(profileView({ activeStatus: "active", pendingGenerationId: 8, pendingStatus: "error", readinessFrontier: null,
     pendingError: { code: "history_missing", message: "Недостаточно истории. " + "x".repeat(1000), debug: "do-not-render-raw-payload" }, liveWatermark: closedBoundary }));
   expect(screen.getByRole("cell", { name: /Действующее поколение #7/ })).toBeInTheDocument();
-  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Ошибка прогрева");
+  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Ошибка инициализации live");
   const error = screen.getByRole("alert");
   expect(error).toHaveTextContent("history_missing"); expect(error).toHaveTextContent("Недостаточно истории.");
   expect(error.textContent.length).toBeLessThan(420); expect(error).not.toHaveTextContent("do-not-render-raw-payload");
   expect(screen.getByText("SHORT · TP 14% / SL 4% · 0.32 R")).toBeInTheDocument();
+  expect(screen.queryByText("Адаптивные сигналы этого профиля не формируются.")).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Остановить непрерывное исследование" })).toBeEnabled();
   expect(requests).toHaveLength(0);
 });
 it("does not turn a first successful candidate into an active generation before promotion", () => {
   render(profileView({ activeGenerationId: null, activeStatus: "inactive", pendingGenerationId: 8, pendingStatus: "warming", readinessFrontier: null, pendingError: null, liveWatermark: null }));
   expect(screen.getByText("Нет действующего поколения")).toBeInTheDocument();
-  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Прогрев / догоняющая обработка");
+  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Инициализация live по текущим данным");
   expect(screen.queryByText(/Действующее поколение #8/)).not.toBeInTheDocument();
   expect(screen.queryByText("SHORT · TP 14% / SL 4% · 0.32 R")).not.toBeInTheDocument();
+});
+it("keeps accepted research visible but explicitly shows no adaptive emission after the first live initialization fails", () => {
+  render(profileView({ minSetupsPerDay: 1, studyId: 16, activeGenerationId: null, activeStatus: "inactive", pendingGenerationId: 8,
+    pendingStatus: "error", readinessFrontier: null, pendingError: { code: "current_data_unavailable", message: "Недостаточно текущих закрытых свечей." }, liveWatermark: null }));
+  expect(screen.getByText("Исследование принято")).toBeInTheDocument();
+  expect(screen.getByText("Сохранённое исследование #16")).toBeInTheDocument();
+  const live = screen.getByRole("cell", { name: /Нет действующего поколения/ });
+  expect(live).toHaveTextContent("Адаптивные сигналы этого профиля не формируются.");
+  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Ошибка инициализации live");
+  expect(screen.getByRole("alert")).toHaveTextContent("current_data_unavailable");
+  expect(screen.queryByText(/Действующее поколение #8/)).not.toBeInTheDocument();
+  expect(screen.queryByText("SHORT · TP 14% / SL 4% · 0.32 R")).not.toBeInTheDocument();
+  expect(requests).toHaveLength(0);
 });
 it("labels legacy and partially rolled-out readiness as unknown rather than ready", () => {
   const view = render(profileView({ status: "active" }));
   expect(screen.getByText("Принятое поколение #7")).toBeInTheDocument();
   expect(screen.getByText("Состояние live неизвестно (старый API)")).toBeInTheDocument();
-  expect(screen.getByText("Статус прогрева неизвестен (старый API)")).toBeInTheDocument();
+  expect(screen.getByText("Статус инициализации live неизвестен (старый API)")).toBeInTheDocument();
   expect(screen.queryByText(/Действующее поколение #7/)).not.toBeInTheDocument();
   expect(screen.queryByText(/Готов к переключению/)).not.toBeInTheDocument();
   view.rerender(profileView({ pendingGenerationId: 8 }));
-  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Статус прогрева неизвестен");
+  expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Статус инициализации live неизвестен");
 });
 it("shows an unrecognised candidate wait state without treating it as ready or dropping the incumbent", () => {
   render(profileView({ activeStatus: "active", pendingGenerationId: 8, pendingStatus: "waiting_resource", pendingError: "Ожидание ресурсного допуска" }));
@@ -234,7 +361,7 @@ it("keeps adaptive permission independent and drains only through the common alg
   expect(requests.some((request) => request.path.endsWith("/start"))).toBe(false);
   await userEvent.click(screen.getByRole("button", { name: "Запустить непрерывное исследование" }));
   await screen.findByText("Непрерывное исследование включено");
-  expect(screen.getByText("Адаптивный live разрешён · ожидание пригодного профиля.")).toBeInTheDocument();
+  expect(screen.getByText("Адаптивный live разрешён · действующих профилей нет, ожидается инициализация.")).toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "Остановить непрерывное исследование" }));
   await screen.findByText("Останавливается");
   expect(screen.getByRole("button", { name: "Остановка запрошена · ожидаем drain" })).toBeDisabled();
