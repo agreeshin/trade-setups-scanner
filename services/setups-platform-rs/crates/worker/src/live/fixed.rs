@@ -540,6 +540,7 @@ struct Entry {
     // At most 30 raw bars/symbol, fetched once for BOTH fixed profiles. Cleared
     // on consumption/removal/Stop; network response bytes are capped by mdclient.
     prefetched: Option<Prefetched>,
+    preparation: Option<crate::preparation::ColdDiscovery>,
 }
 
 struct Prefetched {
@@ -625,6 +626,7 @@ impl Runtime {
                         error: None,
                         next_poll: Instant::now(),
                         prefetched: None,
+                        preparation: None,
                     },
                 );
             }
@@ -916,6 +918,21 @@ async fn work(
         }
         let frontier = recent.bars.last().map_or(now, |b| b.open_time_unix + 60);
         entry.symbol = Some(Symbol::load(pool, &entry.item, algorithms, now, frontier).await?);
+        // Distinguish proven empty from populated cold reconstruction. The
+        // latter may prepare history ONLY if the background preflight proves
+        // the collection target absent; existing true/false rows never repair.
+        let source_empty=if recent.bars.is_empty() {
+            match crate::preparation::source_is_empty(client,entry.item.id,now).await {
+                Ok(empty)=>empty,
+                Err(error)=>{entry.symbol=None;return Err(detector(error));},
+            }
+        } else {false};
+        let symbol=entry.symbol.as_ref().unwrap();
+        // Reuse the loaded causal origins/checkpoint boundaries, including on
+        // restart. Do not extend a recovered history job to fresh wall clock.
+        let to_unix=if source_empty {now} else {symbol.profiles.iter().map(|profile|profile.emit_from).max().unwrap_or(now)};
+        entry.preparation=Some(crate::preparation::ColdDiscovery {source_empty,
+            demand:setups_mdclient::HistoryDemand {instrument_id:entry.item.id,from_unix:symbol.read_from,to_unix}});
     }
     let symbol = entry.symbol.as_mut().expect("loaded symbol");
     if symbol.needs_rebuild {
@@ -996,6 +1013,7 @@ pub(super) async fn run(
         Err(_) => DEFAULT_HISTORY_BYTES,
     };
     let mut runtime = Runtime::default();
+    let mut preparation = crate::preparation::Preparation::default();
     let client = Arc::new(MarketDataClient::new(&url, &key));
     let mut catalog = Vec::new();
     let mut catalog_at = Instant::now() - Duration::from_secs(60);
@@ -1052,6 +1070,7 @@ pub(super) async fn run(
             .await;
             match refresh {
                 Ok((next_algorithms, instruments)) => {
+                    let preparation_scope=instruments.iter().map(|item|item.id).collect();
                     let next_plan = json!([
                         next_algorithms
                             .iter()
@@ -1064,6 +1083,7 @@ pub(super) async fn run(
                     // cannot hold fresh symbols behind its I/O timeout. Drain
                     // only for a real settings/universe ownership transition.
                     if next_plan != plan_signature {
+                        preparation.clear();
                         while let Some(result) = tasks.join_next().await {
                             if let Ok((id, entry, _)) = result {
                                 runtime.put(id, entry);
@@ -1087,12 +1107,25 @@ pub(super) async fn run(
                     if let Err(error) = prefetch(&mut runtime, &client, &stopped).await {
                         global_error = Some(error.to_string());
                     }
+                    // runtime.entries excludes in-flight cold workers. Scope
+                    // is the admitted selection, not the currently idle subset.
+                    preparation.retain_scope(&preparation_scope);
+                    for entry in runtime.entries.values() {
+                        if let Some(discovery)=entry.preparation {
+                            let ready=entry.symbol.as_ref().is_some_and(|symbol|symbol.caught_up && symbol.profiles.iter().all(|profile|profile.ready));
+                            if let Err(code)=preparation.observe_cold(discovery.demand,discovery.source_empty,ready) {
+                                global_error=Some(code.into());
+                            }
+                        }
+                    }
+                    preparation.poll(client.as_ref(),stopped.load(Ordering::SeqCst));
                 }
                 Err(error) => {
                     global_error = Some(error.to_string().chars().take(300).collect::<String>());
                 }
             }
             let mut status = runtime.status();
+            status["preparation"]=preparation.status();
             if global_error.is_some() {
                 status["lastError"] = serde_json::to_value(&global_error).unwrap_or(Value::Null);
             }
@@ -1157,6 +1190,7 @@ pub(super) async fn run(
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     runtime.clear();
+    preparation.clear();
     let _ = settings_set(
         &pool,
         "live-status",

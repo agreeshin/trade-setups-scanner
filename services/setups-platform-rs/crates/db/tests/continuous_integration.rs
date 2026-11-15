@@ -252,6 +252,148 @@ fn adaptive_write(open: i64) -> db::AdaptiveSetupWrite {
     }
 }
 
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn telegram_fixed_independent_enqueue_raw_bytes_fences_capacity_expiry_and_rollback() {
+    isolated(|pool|async move {
+        use setups_db::telegram as tg;
+        let legacy=fixed_setup(&pool,CUTOFF-60).await;
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id=$1").bind(legacy).fetch_one(&pool).await.unwrap(),"not_requested");
+        assert!(tg::claim(&pool,"tg",1).await.unwrap().is_empty());
+        setups_db::settings_set(&pool,"live",&json!({"enabled":true})).await.unwrap();
+        let now=chrono::Utc::now().timestamp().div_euclid(60)*60;
+        let raw=adaptive_write(now-60).setup;
+        let disabled=db::outbox::commit_fixed_setup(&pool,"bybit","linear","DISABLED",&raw).await.unwrap().unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id::bigint=$1").bind(disabled).fetch_one(&pool).await.unwrap(),"disabled");
+        assert!(matches!(tg::set_config(&pool,0,true,"https://relay.example").await.unwrap(),tg::ConfigUpdate::Updated(_)));
+        let reference=fixed_setup(&pool,now+60).await;
+        assert!(tg::claim(&pool,"tg",1).await.unwrap().is_empty(),"enable never backfills old or reference inserts");
+        assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id=$1").bind(reference).fetch_one(&pool).await.unwrap(),"not_requested");
+        db::outbox::configure_limits(&pool,1,65536).await.unwrap();
+        let id=db::outbox::commit_fixed_setup(&pool,"bybit","linear","FRESH",&raw).await.unwrap().unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("select notification_delivery_status from live_setups where id::bigint=$1").bind(id).fetch_one(&pool).await.unwrap(),"skipped_capacity","WebPush capacity must not suppress Telegram");
+        let before:Value=sqlx::query_scalar("select to_jsonb(o)-'endpoint_url'-'settings_revision' from telegram_delivery_outbox o").fetch_one(&pool).await.unwrap();
+        assert!(matches!(tg::set_config(&pool,1,true,"https://other.example").await.unwrap(),tg::ConfigUpdate::Updated(_)));
+        assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(o)-'endpoint_url'-'settings_revision' from telegram_delivery_outbox o").fetch_one(&pool).await.unwrap(),before);
+        let job=tg::claim(&pool,"tg",1).await.unwrap().remove(0);assert_eq!(job.setup_id,id);assert_eq!(job.endpoint_url,"https://other.example/");
+        assert!(tg::permitted(&pool,"tg",&job).await.unwrap());assert!(!tg::permitted(&pool,"wrong",&job).await.unwrap());
+        assert!(matches!(tg::set_config(&pool,2,true,"https://third.example").await.unwrap(),tg::ConfigUpdate::EndpointBusy));
+        let body=format!(" {} \n",json!({"version":1,"id":job.delivery_id,"text":"\u{1d11e}".repeat(4096),"expiresAt":job.expires_at_unix,"attachment":null}));
+        assert!(body.len()>16384&&body.len()<32768);
+        let quota:i64=sqlx::query_scalar("select pending_bytes from telegram_delivery_budget").fetch_one(&pool).await.unwrap();
+        assert_eq!(tg::freeze_message(&pool,"tg",&job,body.as_bytes()).await.unwrap().unwrap(),body.as_bytes());
+        assert_eq!(tg::freeze_message(&pool,"tg",&job,b"changed renderer bytes").await.unwrap().unwrap(),body.as_bytes());
+        assert_eq!(sqlx::query_scalar::<_,i64>("select pending_bytes from telegram_delivery_budget").fetch_one(&pool).await.unwrap(),quota);
+        assert_eq!(sqlx::query_scalar::<_,String>("select request_body_hash from telegram_delivery_outbox").fetch_one(&pool).await.unwrap().len(),64);
+        assert!(!tg::finish(&pool,"wrong",&job,tg::TelegramOutcome::Sent).await.unwrap());
+        assert!(tg::finish(&pool,"tg",&job,tg::TelegramOutcome::Retry {delay_seconds:1,reason:tg::TelegramReason::new("transient","Retry")}).await.unwrap());
+        assert!(matches!(tg::set_config(&pool,2,true,"https://third.example").await.unwrap(),tg::ConfigUpdate::EndpointBusy),"attempted but unleased work blocks changing origin");
+        for attempt in 2..=5 {
+            sqlx::query("update telegram_delivery_outbox set not_before=clock_timestamp()-interval '1 second'").execute(&pool).await.unwrap();
+            let next=tg::claim(&pool,"tg",1).await.unwrap().remove(0);assert_eq!(next.attempts,attempt);assert_eq!(next.request_body.as_deref(),Some(body.as_bytes()));
+            assert!(tg::finish(&pool,"tg",&next,tg::TelegramOutcome::Retry {delay_seconds:1,reason:tg::TelegramReason::new("unconfirmed","Delivery unconfirmed")}).await.unwrap());
+        }
+        assert!(tg::claim(&pool,"tg",1).await.unwrap().is_empty());
+        assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id::bigint=$1").bind(id).fetch_one(&pool).await.unwrap(),"failed");
+        tg::configure_limits(&pool,1,65536).await.unwrap();
+        db::outbox::commit_fixed_setup(&pool,"bybit","linear","ONE",&raw).await.unwrap().unwrap();
+        let full=db::outbox::commit_fixed_setup(&pool,"bybit","linear","FULL",&raw).await.unwrap().unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id::bigint=$1").bind(full).fetch_one(&pool).await.unwrap(),"skipped_capacity");
+        sqlx::query("update telegram_delivery_outbox set expires_at=clock_timestamp()-interval '1 second'").execute(&pool).await.unwrap();assert!(tg::claim(&pool,"tg",1).await.unwrap().is_empty());
+        assert_eq!(sqlx::query_scalar::<_,i64>("select pending_bytes+pending_jobs from telegram_delivery_budget").fetch_one(&pool).await.unwrap(),0);
+        let expired=db::outbox::commit_fixed_setup(&pool,"bybit","linear","OLD",&adaptive_write(CUTOFF-60).setup).await.unwrap().unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id::bigint=$1").bind(expired).fetch_one(&pool).await.unwrap(),"expired");
+        let count:i64=sqlx::query_scalar("select count(*) from live_setups").fetch_one(&pool).await.unwrap();
+        sqlx::raw_sql("create function telegram_fault() returns trigger language plpgsql as $$ begin raise exception 'injected telegram transaction failure'; end $$;create trigger zz_telegram_fault before insert on telegram_delivery_outbox for each row execute function telegram_fault()").execute(&pool).await.unwrap();
+        assert!(db::outbox::commit_fixed_setup(&pool,"bybit","linear","ROLLBACK",&raw).await.is_err());
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups").fetch_one(&pool).await.unwrap(),count);
+        assert_eq!(sqlx::query_scalar::<_,i64>("select pending_jobs from telegram_delivery_budget").fetch_one(&pool).await.unwrap(),0);
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn telegram_adaptive_atomic_checkpoint_promotion_stop_and_confirmed_cleanup_preserve_publication() {
+    isolated(|pool|async move {
+        use setups_db::telegram as tg;
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();tg::set_config(&pool,0,true,"https://relay.example").await.unwrap();
+        let fixture=purge_fixture(&pool).await;
+        let rows=tg::claim(&pool,"tg",2).await.unwrap();assert_eq!(rows.len(),2,"both fixed and adaptive new writes registered independently");
+        let adaptive=rows.iter().find(|job|job.slot_id.is_some()).unwrap();
+        let output:Value=sqlx::query_scalar("select jsonb_build_object('id',id,'params',params,'details',details,'close_time',close_time,'external_name',external_name) from live_setups where id::bigint=$1").bind(fixture.signal).fetch_one(&pool).await.unwrap();
+        assert!(!tg::permitted(&pool,"tg",adaptive).await.unwrap(),"Stop blocks delivery");
+        let preview=db::cleanup::preview(&pool,OWNER).await.unwrap();assert!(!preview.eligible,"active Telegram lease must block research purge");
+        assert!(tg::finish(&pool,"tg",adaptive,tg::TelegramOutcome::Retry {delay_seconds:1,reason:tg::TelegramReason::new("stopped","Stopped")}).await.unwrap());
+        let preview=db::cleanup::preview(&pool,OWNER).await.unwrap();assert!(preview.eligible);
+        assert!(matches!(db::cleanup::purge(&pool,OWNER,&preview.fingerprint).await.unwrap(),db::cleanup::Outcome::Deleted(_)));
+        assert_eq!(sqlx::query_scalar::<_,Value>("select jsonb_build_object('id',id,'params',params,'details',details,'close_time',close_time,'external_name',external_name) from live_setups where id::bigint=$1").bind(fixture.signal).fetch_one(&pool).await.unwrap(),output);
+        assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id::bigint=$1").bind(fixture.signal).fetch_one(&pool).await.unwrap(),"disabled");
+        assert_eq!(sqlx::query_scalar::<_,i64>("select pending_jobs from telegram_delivery_budget").fetch_one(&pool).await.unwrap(),1,"fixed Telegram job survives adaptive cleanup");
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn telegram_pre_promotion_source_remains_deliverable_but_nonpass_and_stop_block() {
+    isolated(|pool|async move {
+        use setups_db::telegram as tg;
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();tg::set_config(&pool,0,true,"https://relay.example").await.unwrap();
+        let active=accepted(&pool).await;let now=chrono::Utc::now().timestamp().div_euclid(60)*60;
+        let saved=db::commit_adaptive_scan_cas(&pool,&active,INSTRUMENT,None,&promotion_state(active.generation_id,now),&[adaptive_write(now-60)]).await.unwrap();assert_eq!(saved.inserted.len(),1);
+        let new=tg::claim(&pool,"new",1).await.unwrap().remove(0);assert!(tg::permitted(&pool,"new",&new).await.unwrap());
+        let counts="select jsonb_build_array((select count(*) from live_setups),(select count(*) from adaptive_live_checkpoints),(select count(*) from adaptive_notification_outbox),(select pending_jobs from telegram_delivery_budget),(select pending_bytes from telegram_delivery_budget))";
+        let before:Value=sqlx::query_scalar(counts).fetch_one(&pool).await.unwrap();
+        sqlx::raw_sql("create function telegram_fault() returns trigger language plpgsql as $$ begin raise exception 'injected Telegram failure after checkpoint/setup'; end $$;create trigger zz_telegram_fault before insert on telegram_delivery_outbox for each row execute function telegram_fault()").execute(&pool).await.unwrap();
+        let mut second=adaptive_write(now-60);second.symbol="ETHUSDT".into();
+        assert!(db::commit_adaptive_scan_cas(&pool,&active,"bybit/linear/ETHUSDT",None,&promotion_state(active.generation_id,now),&[second]).await.is_err());
+        assert_eq!(sqlx::query_scalar::<_,Value>(counts).fetch_one(&pool).await.unwrap(),before,"checkpoint/setup and both queues roll back atomically");
+        sqlx::raw_sql("drop trigger zz_telegram_fault on telegram_delivery_outbox;drop function telegram_fault()").execute(&pool).await.unwrap();
+        let replacement=generation(&pool,OWNER,ALGORITHM,active.slot_id,"completed").await;
+        sqlx::query("update continuous_slots set active_generation_id=$2 where id=$1").bind(active.slot_id).bind(replacement).execute(&pool).await.unwrap();
+        assert!(tg::permitted(&pool,"new",&new).await.unwrap(),"pre-normal-promotion committed work remains deliverable");
+        sqlx::query("update continuous_slots set active_generation_id=null where id=$1").bind(active.slot_id).execute(&pool).await.unwrap();assert!(!tg::permitted(&pool,"new",&new).await.unwrap(),"nonpass disables delivery");
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn telegram_explicit_test_markers_use_original_expiry_clear_all_results_and_expire_without_rearming() {
+    isolated(|pool|async move {
+        use setups_db::telegram as tg;
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();tg::set_config(&pool,0,true,"https://a.example/").await.unwrap();
+        let boundary:(bool,bool,bool)=sqlx::query_as("select to_timestamp($1)>=date_trunc('second',to_timestamp($2)),to_timestamp($1)<date_trunc('second',to_timestamp($3)),to_timestamp($1)>to_timestamp($2)")
+            .bind(CUTOFF as f64).bind(CUTOFF as f64+0.875).bind(CUTOFF as f64+1.0).fetch_one(&pool).await.unwrap();
+        assert_eq!(boundary,(true,true,false),"fixed PG timestamps prove inclusive last-second expiry and next-second rejection without relaxing precise leases");
+        let trigger:String=sqlx::query_scalar("select pg_get_functiondef('telegram_delivery_account()'::regprocedure)").fetch_one(&pool).await.unwrap();
+        assert!(trigger.contains("NEW.expires_at<date_trunc('second',clock_timestamp())"));assert!(trigger.contains("telegram_delivery_updated_at=clock_timestamp()"));
+        for (state,key) in [("sent","aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),("unknown","bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),("error","cccccccc-cccc-4ccc-8ccc-cccccccccccc")] {
+            sqlx::query("update telegram_relay_config set test_started_at=null").execute(&pool).await.unwrap();
+            let config=tg::get_config(&pool).await.unwrap();
+            let tg::TestAdmission::Admitted(attempt)=tg::begin_test(&pool,config.revision,key).await.unwrap() else {panic!("test admission failed")};
+            let deadline:i64=sqlx::query_scalar("select extract(epoch from in_flight_until)::bigint from telegram_relay_tests where request_id=$1").bind(key).fetch_one(&pool).await.unwrap();
+            assert_eq!(deadline,attempt.expires_at_unix);assert_eq!(serde_json::from_slice::<Value>(&attempt.request_body).unwrap()["expiresAt"],deadline);
+            assert!(matches!(tg::begin_test(&pool,config.revision,key).await.unwrap(),tg::TestAdmission::Existing(_)));
+            assert_eq!(sqlx::query_scalar::<_,i64>("select extract(epoch from in_flight_until)::bigint from telegram_relay_tests where request_id=$1").bind(key).fetch_one(&pool).await.unwrap(),deadline,"replay never extends the original deadline");
+            assert!(matches!(tg::set_config(&pool,config.revision,true,"https://b.example/").await.unwrap(),tg::ConfigUpdate::EndpointBusy));
+            assert!(matches!(tg::set_config(&pool,config.revision,!config.enabled,&config.endpoint_url).await.unwrap(),tg::ConfigUpdate::Updated(_)),"enable/disable remains available while a diagnostic runs");
+            let result=tg::TelegramTestResult {request_id:key.into(),state:state.into(),reason:None};
+            assert!(!tg::record_test(&pool,&attempt,&result).await.unwrap(),"the completion is stale after a settings revision change");
+            assert!(sqlx::query_scalar::<_,bool>("select in_flight_until is null and state=$2 from telegram_relay_tests where request_id=$1").bind(key).bind(state).fetch_one(&pool).await.unwrap(),"all finished outcomes release the guard even when revision CAS is stale");
+        }
+        let config=tg::get_config(&pool).await.unwrap();let key="dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let expired=chrono::Utc::now().timestamp()-1;
+        let body=serde_json::to_vec(&json!({"version":1,"id":"test:abandoned","text":"Telegram relay delivery test.","expiresAt":expired,"attachment":null})).unwrap();
+        sqlx::query("insert into telegram_relay_tests(request_id,settings_revision,endpoint_url,delivery_id,request_body,in_flight_until,created_at) values($1,$2,$3,'test:abandoned',$4,to_timestamp($5),to_timestamp($5)-interval '60 seconds')")
+            .bind(key).bind(config.revision).bind(&config.endpoint_url).bind(&body).bind(expired as f64).execute(&pool).await.unwrap();
+        assert!(tg::claim(&pool,"idle",1).await.unwrap().is_empty(),"idle cleanup also expires abandoned diagnostics");
+        assert!(matches!(tg::begin_test(&pool,config.revision,key).await.unwrap(),tg::TestAdmission::Existing(_)),"an abandoned unknown receipt is never automatically retried");
+        assert!(sqlx::query_scalar::<_,bool>("select in_flight_until is null and request_body=$2 from telegram_relay_tests where request_id=$1").bind(key).bind(&body).fetch_one(&pool).await.unwrap(),"expiry clears only the marker, not the frozen original body/expiry");
+        assert!(matches!(tg::set_config(&pool,config.revision,true,"https://b.example/").await.unwrap(),tg::ConfigUpdate::Updated(_)));
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from telegram_relay_tests").fetch_one(&pool).await.unwrap(),4,"24-hour receipts do not hold the origin for 24 hours");
+    }).await;
+}
+
 fn ids(value: &Value) -> BTreeSet<i64> {
     serde_json::from_value::<Vec<i64>>(value.clone())
         .unwrap()
@@ -508,8 +650,8 @@ async fn migration_preserves_fixed_manual_history_and_separates_active_lanes() {
         let manual_before: Value = sqlx::query_scalar("select to_jsonb(s) from optimization_studies s where id=$1")
             .bind(manual).fetch_one(&pool).await.unwrap();
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
-        assert_eq!(setups_db::migrate::ensure_migrations(&pool).await.unwrap(), "0 applied, 9 up to date");
-        let fixed_after: Value = sqlx::query_scalar("select to_jsonb(s)-array['adaptive_slot_id','adaptive_generation_id','recommendation','external_name','notification_delivery_status','notification_delivery_error','notification_delivery_updated_at','adaptive_generation_archive'] from live_setups s where id=$1")
+        assert_eq!(setups_db::migrate::ensure_migrations(&pool).await.unwrap(), "0 applied, 10 up to date");
+        let fixed_after: Value = sqlx::query_scalar("select to_jsonb(s)-array['adaptive_slot_id','adaptive_generation_id','recommendation','external_name','notification_delivery_status','notification_delivery_error','notification_delivery_updated_at','telegram_delivery_status','telegram_delivery_error','telegram_delivery_updated_at','adaptive_generation_archive'] from live_setups s where id=$1")
             .bind(fixed).fetch_one(&pool).await.unwrap();
         let manual_after: Value = sqlx::query_scalar("select to_jsonb(s)-array['origin','owner_id','continuous_generation_id','continuous_slot_id'] from optimization_studies s where id=$1")
             .bind(manual).fetch_one(&pool).await.unwrap();
@@ -1098,7 +1240,7 @@ async fn live_readmission_additive_migration_and_failed_pending_write_preserve_p
         let (old,pending,origin)=exhausted_live_candidate(&pool).await;let id=pending.profile.generation_id;
         let before=readmission_snapshot(&pool).await;
         sqlx::raw_sql("drop table continuous_live_readmissions; drop index continuous_generations_completed_slot; alter table continuous_generations drop constraint continuous_generations_live_init_budget_check,drop column live_init_attempt_limit; alter table continuous_generations add constraint continuous_generations_live_init_attempts_check check(live_init_attempts between 0 and 3); delete from kysely_migration where name='0018_live_readmission.sql';").execute(&pool).await.unwrap();
-        assert_eq!(setups_db::migrate::ensure_migrations(&pool).await.unwrap(),"1 applied, 8 up to date");assert_eq!(readmission_snapshot(&pool).await,before);
+        assert_eq!(setups_db::migrate::ensure_migrations(&pool).await.unwrap(),"1 applied, 9 up to date");assert_eq!(readmission_snapshot(&pool).await,before);
         sqlx::raw_sql("create function fixture_reject_readmission() returns trigger language plpgsql as $$begin raise exception 'readmission_rollback_sentinel'; end$$; create trigger fixture_reject_readmission before update on continuous_slots for each row execute function fixture_reject_readmission();").execute(&pool).await.unwrap();
         let request=live_readmission_request(id,"readmission-rollback-key");
         assert!(db::readmission::grant(&pool,OWNER,ALGORITHM,old.slot_id,&request).await.err().unwrap().to_string().contains("readmission_rollback_sentinel"));
@@ -1128,7 +1270,7 @@ async fn independent_live_migration_keeps_legacy_anchor_and_immutable_research_a
         // Emulate the actual pre-0016 schema in this disposable child database.
         sqlx::raw_sql("alter table continuous_generations drop column live_initialization,drop column live_readiness,drop column live_init_attempts,drop column live_init_status,drop column live_init_deadline,drop column live_init_next_attempt_at,drop column live_init_error; delete from kysely_migration where name='0016_independent_live_initialization.sql';")
             .execute(&pool).await.unwrap();
-        assert_eq!(setups_db::migrate::ensure_migrations(&pool).await.unwrap(),"1 applied, 8 up to date");
+        assert_eq!(setups_db::migrate::ensure_migrations(&pool).await.unwrap(),"1 applied, 9 up to date");
         let active=db::active_adaptive_slots(&pool,OWNER).await.unwrap().remove(0);
         let anchor=active.live_initialization.unwrap();
         assert_eq!(active.live_readiness.len(),2,"legacy full scope needs explicit disposition");

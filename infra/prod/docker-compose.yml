@@ -86,6 +86,7 @@ services:
       CONTINUOUS_TOTAL_MEMORY_BYTES: ${CONTINUOUS_TOTAL_MEMORY_BYTES:-17179869184}
       LIVE_NOTIFICATION_MAX_PENDING: ${LIVE_NOTIFICATION_MAX_PENDING:-10000}
       LIVE_NOTIFICATION_MAX_PENDING_BYTES: ${LIVE_NOTIFICATION_MAX_PENDING_BYTES:-67108864}
+      TELEGRAM_RELAY_KEY_FILE: /run/telegram-relay/key
       REPLAY_MAX_PENDING_RUNS: ${REPLAY_MAX_PENDING_RUNS:-10000}
       REPLAY_MAX_WORK_MINUTES: ${REPLAY_MAX_WORK_MINUTES:-5270400000}
       REPLAY_MAX_DATABASE_BYTES: ${REPLAY_MAX_DATABASE_BYTES:-53687091200}
@@ -107,6 +108,8 @@ services:
       BACKUP_MAX_UPLOAD_BYTES: ${PLATFORM_BACKUP_MAX_UPLOAD_BYTES:-64424509440}
     volumes:
       - ./backups/platform-rust:/var/lib/trade-setups/backups
+      # Optional directory; it may stay empty while Telegram is disabled/unconfigured.
+      - ${TELEGRAM_RELAY_SECRETS_DIR:-./secrets/telegram-relay}:/run/telegram-relay:ro
     depends_on:
       postgres:
         condition: service_healthy

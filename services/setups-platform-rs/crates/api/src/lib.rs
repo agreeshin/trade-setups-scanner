@@ -13,6 +13,7 @@ pub mod optimization;
 pub mod replay;
 pub mod restore;
 pub mod resources;
+pub mod telegram;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};

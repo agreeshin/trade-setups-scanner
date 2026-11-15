@@ -39,6 +39,28 @@ struct SymbolPlan {
     specs:Vec<ProfileSpec>,
     slots:BTreeMap<String,Arc<ActiveAdaptiveSlot>>,
 }
+fn current_preparation_requirements<'a>(plans:impl Iterator<Item=&'a SymbolPlan>)->BTreeMap<i64,setups_mdclient::HistoryDemand> {
+    let mut required:BTreeMap<i64,setups_mdclient::HistoryDemand>=BTreeMap::new();
+    for plan in plans.filter(|plan|plan.catalog_id>0 && plan.specs.iter().any(|spec|spec.publish_enabled)) {
+        for spec in &plan.specs {
+            required.entry(plan.catalog_id).and_modify(|range| {
+                range.from_unix=range.from_unix.min(spec.from_open);
+                range.to_unix=range.to_unix.max(spec.warmup_through);
+            }).or_insert(setups_mdclient::HistoryDemand {instrument_id:plan.catalog_id,from_unix:spec.from_open,to_unix:spec.warmup_through});
+        }
+    }
+    required
+}
+fn preparation_source_ready<'a>(state:&AdaptiveRuntime,plans:impl Iterator<Item=&'a SymbolPlan>,id:i64,target:i64)->bool {
+    let mut found=false;
+    for plan in plans.filter(|plan|plan.catalog_id==id) {
+        for spec in plan.specs.iter().filter(|spec|spec.publish_enabled) {
+            found=true;
+            if !state.ready(&plan.epoch,&spec.key(),target) {return false;}
+        }
+    }
+    found
+}
 struct Warmup {
     pending:live::PendingAdaptiveSlot,
     lease:live::WarmupLease,
@@ -58,16 +80,18 @@ pub struct AdaptiveLiveRuntime {
     cold_schedule:schedule::ColdSchedule,
     join_cursor:usize,
     peak_staging_epochs:usize,
+    preparation:crate::preparation::Preparation,
 }
 impl AdaptiveLiveRuntime {
     pub fn new(limits:AdaptiveRuntimeLimits)->Self {
         Self {state:AdaptiveRuntime::new(limits),warmup:None,
-            worker:format!("adaptive-live-{}",std::process::id()),next_pending:0,cold_schedule:schedule::ColdSchedule::default(),join_cursor:0,peak_staging_epochs:0}
+            worker:format!("adaptive-live-{}",std::process::id()),next_pending:0,cold_schedule:schedule::ColdSchedule::default(),join_cursor:0,peak_staging_epochs:0,preparation:Default::default()}
     }
     pub fn peak_staging_epochs(&self)->usize {self.peak_staging_epochs}
     pub fn retained_history_epochs(&self)->usize {self.state.retained_history_epochs()}
     pub fn retained_history_bytes(&self)->usize {self.state.retained_history_bytes()}
     pub fn retained_profile_bytes(&self)->usize {self.state.retained_profile_bytes()}
+    pub fn preparation_status(&self)->Value {self.preparation.status()}
     async fn active_plans(&mut self,pool:&PgPool,slots:&[Arc<ActiveAdaptiveSlot>],catalog:&[CatalogInstrument])->Result<Vec<SymbolPlan>,WorkerError> {
         if slots.len()>self.state.limits.max_profiles {return Err(invalid("active live slot count exceeds admission budget"));}
         let mut plans:BTreeMap<String,SymbolPlan>=BTreeMap::new();
@@ -329,13 +353,13 @@ impl AdaptiveLiveRuntime {
     }
     async fn tick_observed(&mut self,pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool,observation_unix:i64)->Result<(),WorkerError> {
         if stopped.load(Ordering::SeqCst) || settings_get(pool,"live").await?.unwrap_or(json!({}))["enabled"]!=true {
-            self.state.clear();self.warmup=None;return Ok(());
+            self.state.clear();self.warmup=None;self.preparation.clear();return Ok(());
         }
         live::recover_pending_warmups(pool,continuous::ADMIN_OWNER).await?;
         let target=observation_unix.div_euclid(60)*60;
         let slots:Vec<_>=continuous::active_adaptive_slots(pool,continuous::ADMIN_OWNER).await?.into_iter().map(Arc::new).collect();
         let pending=live::pending_adaptive_slots(pool,continuous::ADMIN_OWNER).await?;
-        if slots.is_empty() && pending.is_empty() {self.state.clear();self.warmup=None;return Ok(());}
+        if slots.is_empty() && pending.is_empty() {self.state.clear();self.warmup=None;self.preparation.clear();return Ok(());}
         let catalog=client.instruments().await.map_err(|e|invalid(&e.to_string()))?;
         let active=self.active_plans(pool,&slots,&catalog).await?;
         self.refresh_warmup(pool,pending,&catalog,&active,&slots,target).await?;
@@ -344,6 +368,11 @@ impl AdaptiveLiveRuntime {
             wanted.entry(plan.epoch.clone()).or_default().extend(plan.specs.iter().map(ProfileSpec::key));
         }
         self.state.reconcile(&wanted);
+        // One current range per SOURCE, never alternating per-epoch origins.
+        // Recomputed from the actual cohort so departed profiles do not leave
+        // a min-ever origin or max-ever initialization boundary behind.
+        let preparation_requirements=current_preparation_requirements(active.iter().chain(self.warmup.iter().flat_map(|w|w.plans.iter())));
+        self.preparation.reconcile_requirements(&preparation_requirements);
         for plan in &active {
             // Re-enabling an already accepted profile has no pending research
             // lease. Never attach it to unchecked existing scalar history:
@@ -355,6 +384,13 @@ impl AdaptiveLiveRuntime {
         let mut hot=active.clone();
         if let Some(warmup)=&self.warmup {hot.extend(warmup.plans.iter().filter(|p|!warmup.waiting.contains_key(&instrument_key(&p.instrument)) && self.state.is_current(&p.epoch,target-1800)).cloned());}
         self.hot_tail(pool,client,&hot,target,stopped).await?;
+        for id in preparation_requirements.keys() {
+            if preparation_source_ready(&self.state,active.iter().chain(self.warmup.iter().flat_map(|warmup|warmup.plans.iter())),*id,target) {
+                if let Err(code)=self.preparation.retire_ready(*id) {eprintln!("[live-preparation] instrument_id={id} code={code}");}
+            }
+        }
+        // No preparation HTTP is awaited by this owner; hot traffic went first.
+        self.preparation.poll(client,stopped.load(Ordering::SeqCst));
         self.adopt_ready_staging(pool,target).await?;
         // Active hot work wins; at most four duplicate staging rings exist.
         // A completed empty observation is retried next tick, not in a loop.
@@ -398,9 +434,21 @@ impl AdaptiveLiveRuntime {
                         completed.insert(plan.epoch.clone());continue;
                     }
                 };
+                let source_empty=page.missing_source;
                 self.state.acknowledge_source(&plan.epoch,page.token)?;
                 if let Err(error)=process_page(&mut self.state,pool,&plan,&page.bars,target,page.complete).await {
                     first_error.get_or_insert(error);continue;
+                }
+                if plan.specs.iter().any(|spec|spec.publish_enabled) {
+                    if let Some(required)=preparation_requirements.get(&plan.catalog_id) {
+                        let ready=preparation_source_ready(&self.state,active.iter().chain(self.warmup.iter().flat_map(|warmup|warmup.plans.iter())),plan.catalog_id,target);
+                        // Nonempty restart recovery uses the immutable live
+                        // initialization boundary, not a later observation
+                        // clock that would expand the persisted required job.
+                        if let Err(code)=self.preparation.observe_required_cold(*required,source_empty,ready,target) {
+                            eprintln!("[live-preparation] instrument_id={} code={code}",plan.catalog_id);
+                        }
+                    }
                 }
                 if page.complete {
                     completed.insert(plan.epoch.clone());
@@ -415,6 +463,7 @@ impl AdaptiveLiveRuntime {
         }
         self.join_ready_waiting(pool,&active,target).await?;
         self.try_promote(pool,&slots,&catalog,target,stopped).await?;
+        self.preparation.poll(client,stopped.load(Ordering::SeqCst));
         Ok(())
     }
     async fn hot_tail(&mut self,pool:&PgPool,client:&MarketDataClient,plans:&[SymbolPlan],target:i64,stopped:&AtomicBool)->Result<(),WorkerError> {
@@ -665,6 +714,79 @@ pub(crate) async fn adaptive_live_loop(pool:PgPool,market_url:String,market_key:
 mod tests {
     use super::*;
     use crate::adaptive::state::tests::{fixture,feed};
+    #[test]
+    fn cold_preparation_uses_frozen_scope_bounds_not_restart_observation_clock() {
+        let f=fixture();let mut sibling=f.spec.clone();sibling.from_open=60;sibling.warmup_through+=60;
+        let frozen_end=sibling.warmup_through;
+        let plan=SymbolPlan {epoch:f.epoch,instrument:f.instrument,catalog_id:820,specs:vec![f.spec,sibling],slots:BTreeMap::new()};
+        let later=frozen_end+86400;
+        let required=current_preparation_requirements(std::iter::once(&plan));let demand=required[&820];
+        assert_eq!(demand,setups_mdclient::HistoryDemand {instrument_id:820,from_unix:0,to_unix:frozen_end});
+        assert!(demand.to_unix<later);
+        assert_eq!(current_preparation_requirements(std::iter::once(&plan))[&820],demand);
+    }
+    #[tokio::test]
+    async fn alternating_epoch_origins_share_one_task_and_departure_reconciles_actual_cohort_once() {
+        use crate::preparation::{Preparation,tests::{Fake,settle,posts}};
+        let f=fixture();let mut second=f.spec.clone();second.from_open=60;second.warmup_through+=60;
+        let mut first=f.spec.clone();first.warmup_through+=120;
+        let plans=vec![SymbolPlan {epoch:f.epoch.clone(),instrument:f.instrument.clone(),catalog_id:820,specs:vec![first],slots:BTreeMap::new()},
+            SymbolPlan {epoch:AdaptiveRuntime::epoch_key(&f.instrument,Some(2)),instrument:f.instrument,catalog_id:820,specs:vec![second],slots:BTreeMap::new()}];
+        let required=current_preparation_requirements(plans.iter());let combined=required[&820];
+        assert_eq!((combined.from_unix,combined.to_unix),(0,f.frontier+120));
+        let (backend,gate)=Fake::gated();let mut preparation=Preparation::default();
+        preparation.reconcile_requirements(&required);
+        preparation.observe_required_cold(combined,false,false,f.frontier+86400).unwrap();preparation.poll(&backend,false);tokio::task::yield_now().await;
+        let initial=preparation.operation_snapshot(820).unwrap();assert!(initial.2.is_some());
+        for index in 0..100 {
+            let plan=&plans[index%2];let ready=preparation_source_ready(&f.runtime,plans.iter(),plan.catalog_id,f.frontier);
+            preparation.reconcile_requirements(&required);
+            preparation.observe_required_cold(required[&plan.catalog_id],false,ready,f.frontier+86400).unwrap();preparation.poll(&backend,false);
+            tokio::task::yield_now().await;
+            assert_eq!(preparation.operation_snapshot(820).unwrap(),initial,"siblings must not abort/version/reset the same source operation");
+        }
+        assert_eq!(backend.call_count("state:"),1);
+        gate.notify_one();settle(&mut preparation,&backend).await;assert_eq!(posts(&backend),1);
+        let accepted=preparation.operation_snapshot(820).unwrap();assert!(accepted.3);
+        // Drop the earliest/longest profile: both ends now come from B, not a
+        // min-ever/max-ever cache. Exactly one new operation uses that cohort.
+        let remaining=current_preparation_requirements(std::iter::once(&plans[1]));
+        assert_eq!((remaining[&820].from_unix,remaining[&820].to_unix),(60,f.frontier+60));
+        preparation.reconcile_requirements(&remaining);assert!(preparation.operation_snapshot(820).is_none());
+        preparation.observe_required_cold(remaining[&820],false,false,f.frontier+172800).unwrap();preparation.poll(&backend,false);tokio::task::yield_now().await;
+        let changed=preparation.operation_snapshot(820).unwrap();assert_ne!(changed.0,accepted.0);
+        for _ in 0..50 {
+            preparation.reconcile_requirements(&remaining);preparation.observe_required_cold(remaining[&820],false,false,f.frontier+172800).unwrap();preparation.poll(&backend,false);
+            assert_eq!(preparation.operation_snapshot(820).unwrap(),changed);
+        }
+        gate.notify_one();settle(&mut preparation,&backend).await;
+        assert_eq!(posts(&backend),1,"persisted original covering job is reused after real cohort shrink");
+        assert_eq!(backend.call_count("state:"),2);assert_eq!(preparation.operation_snapshot(820).unwrap().1,remaining[&820]);
+    }
+    #[tokio::test]
+    async fn ready_epoch_does_not_retire_nonready_sibling_source_preparation() {
+        use crate::preparation::{Preparation,tests::{Fake,settle,posts}};
+        let mut f=fixture();f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars,f.frontier).unwrap();
+        assert!(f.runtime.ready(&f.epoch,&f.spec.key(),f.frontier));
+        let mut sibling=f.spec.clone();sibling.from_open=60;sibling.fence.generation_id=2;sibling.pending=true;
+        let epoch=AdaptiveRuntime::epoch_key(&f.instrument,Some(2));f.runtime.install(&epoch,std::slice::from_ref(&sibling)).unwrap();
+        feed(&mut f.runtime,&epoch,&f.instrument,&f.bars[1..2],f.frontier).unwrap();
+        assert!(!f.runtime.ready(&epoch,&sibling.key(),f.frontier));
+        let plans=vec![SymbolPlan {epoch:f.epoch,instrument:f.instrument.clone(),catalog_id:820,specs:vec![f.spec],slots:BTreeMap::new()},
+            SymbolPlan {epoch,instrument:f.instrument,catalog_id:820,specs:vec![sibling],slots:BTreeMap::new()}];
+        let required=current_preparation_requirements(plans.iter());let (backend,_gate)=Fake::gated();let mut preparation=Preparation::default();
+        preparation.reconcile_requirements(&required);preparation.observe_required_cold(required[&820],false,false,f.frontier).unwrap();preparation.poll(&backend,false);tokio::task::yield_now().await;
+        let initial=preparation.operation_snapshot(820).unwrap();
+        for index in 0..20 {
+            let plan=&plans[index%2];let ready=preparation_source_ready(&f.runtime,plans.iter(),plan.catalog_id,f.frontier);
+            assert!(!ready,"ready A is not whole-source readiness while B remains cold");
+            preparation.observe_required_cold(required[&820],false,ready,f.frontier).unwrap();preparation.poll(&backend,false);tokio::task::yield_now().await;
+            assert_eq!(preparation.operation_snapshot(820).unwrap(),initial);
+        }
+        assert_eq!(preparation.status()["collectionOnly"],0);
+        preparation.clear();settle(&mut preparation,&backend).await;assert_eq!(posts(&backend),0);
+    }
     #[tokio::test]
     async fn independent_epoch_proofs_keep_long_revision_two_and_short_revision_one_valid() {
         use axum::{Json,Router,routing::post};

@@ -58,7 +58,10 @@ pub(super) async fn enqueue(tx: &mut Transaction<'_,Postgres>, profile: &ActiveA
     // job or rollback; every other SQL error still fails this scan transaction.
     sqlx::query("insert into adaptive_notification_outbox(setup_id,owner_id,algorithm_id,slot_id,generation_id,config_revision,raw_close_unix,expires_at,payload) values($1,$2,$3,$4,$5,$6,$7,to_timestamp($8),$9)")
         .bind(setup_id).bind(&profile.owner_id).bind(&profile.algorithm_id).bind(profile.slot_id).bind(profile.generation_id)
-        .bind(profile.config_revision).bind(setup.setup.close_time_unix).bind(expiry as f64).bind(payload).execute(&mut **tx).await?;
+        .bind(profile.config_revision).bind(setup.setup.close_time_unix).bind(expiry as f64).bind(&payload).execute(&mut **tx).await?;
+    crate::telegram::enqueue(tx,crate::telegram::Enqueue {setup_id,owner_id:&profile.owner_id,algorithm_id:&profile.algorithm_id,
+        slot_id:Some(profile.slot_id),generation_id:Some(profile.generation_id),config_revision:Some(profile.config_revision),fixed_config:None,
+        raw_close_unix:setup.setup.close_time_unix,expires_at_unix:expiry,payload:&payload}).await?;
     Ok(())
 }
 
@@ -93,7 +96,10 @@ pub async fn commit_fixed_setup(pool: &PgPool, exchange: &str, category: &str, s
     let payload = json!({"instrument":{"exchange":exchange,"category":category,"symbol":symbol},"raw":setup,"recommendation":null,"externalName":external_name});
     let fence = json!({"algorithmVersion":setup.algorithm_version,"params":params});
     sqlx::query("insert into adaptive_notification_outbox(setup_id,owner_id,algorithm_id,fixed_config,raw_close_unix,expires_at,payload) values($1,'admin',$2,$3,$4,to_timestamp($5),$6)")
-        .bind(id).bind(&setup.algorithm_id).bind(fence).bind(setup.close_time_unix).bind(expiry as f64).bind(payload).execute(&mut *tx).await?;
+        .bind(id).bind(&setup.algorithm_id).bind(&fence).bind(setup.close_time_unix).bind(expiry as f64).bind(&payload).execute(&mut *tx).await?;
+    crate::telegram::enqueue(&mut tx,crate::telegram::Enqueue {setup_id:id,owner_id:"admin",algorithm_id:&setup.algorithm_id,
+        slot_id:None,generation_id:None,config_revision:None,fixed_config:Some(&fence),raw_close_unix:setup.close_time_unix,
+        expires_at_unix:expiry,payload:&payload}).await?;
     tx.commit().await?;
     Ok(Some(i64::from(id)))
 }

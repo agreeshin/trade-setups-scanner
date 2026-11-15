@@ -203,12 +203,13 @@ pub fn start_live_runtime(pool: PgPool, market_url: String, market_key: String) 
                 task_notify.clone()
             ),
             crate::adaptive::adaptive_live_loop(
-                pool,
+                pool.clone(),
                 market_url,
                 market_key,
-                task_stopped,
-                task_notify
+                task_stopped.clone(),
+                task_notify.clone()
             ),
+            crate::telegram::run(pool, task_stopped, task_notify),
         );
     });
     LiveHandle {

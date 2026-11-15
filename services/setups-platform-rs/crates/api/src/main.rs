@@ -11,6 +11,22 @@ use std::time::Duration;
 
 const REPLAY_POLL: Duration = Duration::from_millis(500);
 
+struct WorkerTelegramTransport;
+impl setups_api::telegram::TelegramTransport for WorkerTelegramTransport {
+    fn secret_configured(&self)->bool {setups_worker::telegram::key_presence()}
+    fn probe<'a>(&'a self,config:&'a setups_db::telegram::TelegramConfig)->futures::future::BoxFuture<'a,setups_db::telegram::TelegramStatusUpdate> {
+        Box::pin(setups_worker::telegram::probe_telegram_relay(config))
+    }
+    fn test<'a>(&'a self,attempt:&'a setups_db::telegram::TelegramTestAttempt)->futures::future::BoxFuture<'a,setups_db::telegram::TelegramTestResult> {
+        Box::pin(setups_worker::telegram::test_telegram_relay(attempt))
+    }
+}
+fn with_telegram_router(app:axum::Router,pool:sqlx::PgPool,auth:Arc<SessionAuth>)->axum::Router {
+    app.merge(setups_api::telegram::telegram_router(Arc::new(setups_api::telegram::TelegramState {
+        pool,auth,transport:Arc::new(WorkerTelegramTransport),
+    })))
+}
+
 #[tokio::main]
 async fn main() {
     let config = match PlatformConfig::from_env() {
@@ -144,7 +160,7 @@ async fn main() {
         http: reqwest::Client::new(),
     });
     let app = axum::Router::new()
-        .merge(setups_api::session_router(auth))
+        .merge(setups_api::session_router(auth.clone()))
         .merge(replay_router(replay_state.clone()))
         .merge(controls_router(controls_state))
         .merge(batches_router(replay_state))
@@ -154,6 +170,7 @@ async fn main() {
         ))
         .merge(setups_api::continuous::continuous_router(continuous_state))
         .merge(setups_api::backup::backup_router(backup_state));
+    let app=with_telegram_router(app,pool.clone(),auth);
     let listener = match tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await {
         Ok(value) => value,
         Err(error) => {
@@ -204,4 +221,22 @@ async fn shutdown_signal(
         _ = terminate => {},
     }
     tokio::join!(live.stop(), jobs.stop(), optimization.stop(),continuous.stop());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body,http::{Request,StatusCode}};
+    use tower::ServiceExt;
+    #[tokio::test]
+    async fn production_router_mounts_telegram_and_preserves_existing_session_guard() {
+        let pool=PgPoolOptions::new().connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test").unwrap();
+        let auth=Arc::new(SessionAuth::new(&["test-key".into()]));
+        let app=with_telegram_router(setups_api::session_router(auth.clone()),pool,auth);
+        for (method,path) in [("GET","/v1/session"),("GET","/v1/telegram-relay"),("PUT","/v1/telegram-relay"),("POST","/v1/telegram-relay/probe"),("POST","/v1/telegram-relay/test")] {
+            let response=app.clone().oneshot(Request::builder().method(method).uri(path).header("content-type","application/json").body(Body::from("{}")).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::UNAUTHORIZED,"production route {method} {path} must be mounted and guarded before DB/network");
+        }
+        assert_eq!(app.oneshot(Request::builder().uri("/not-a-route").body(Body::empty()).unwrap()).await.unwrap().status(),StatusCode::NOT_FOUND);
+    }
 }

@@ -8,6 +8,7 @@ pub(super) struct ValidatedPage {
     pub bars:Vec<DetectorBar>,
     pub complete:bool,
     pub token:TailReadToken,
+    pub missing_source:bool,
 }
 #[derive(Debug)]
 pub(super) struct ReadFailure {
@@ -43,6 +44,7 @@ pub(super) async fn read_history(client:&MarketDataClient,instrument_id:i64,from
     // The coherent canonical end bounds this read; later ordinary finals are
     // pending input, not a mutation of the page being materialized.
     let before=observe(client,&guard,target).await?;
+    let missing_source=before.latest_stored_open_time_unix.is_none();
     let previous=if guard.previous.is_some() {
         guard.validated_token(before.read_guard.as_ref())
             .ok_or_else(||ReadFailure::proof(before.read_guard.as_ref()))?
@@ -65,5 +67,5 @@ pub(super) async fn read_history(client:&MarketDataClient,instrument_id:i64,from
     let item=observe(client,&guard,target).await?;
     let token=guard.validated_token(item.read_guard.as_ref())
         .ok_or_else(||ReadFailure::proof(item.read_guard.as_ref()))?;
-    Ok(ValidatedPage {bars,complete,token})
+    Ok(ValidatedPage {bars,complete,token,missing_source})
 }

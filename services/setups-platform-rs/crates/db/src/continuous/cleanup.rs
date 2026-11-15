@@ -58,7 +58,7 @@ async fn snapshot(tx: &mut Transaction<'_, Postgres>, owner: &str) -> Result<Pre
           'generations',(select count(*) from continuous_generations where owner_id=$1),
           'profiles',(select count(*) from continuous_slots where owner_id=$1 and {DIRTY_PROFILE}),
           'checkpoints',(select count(*) from adaptive_live_checkpoints c join continuous_slots s on s.id=c.slot_id where s.owner_id=$1),
-          'notificationJobs',(select count(*) from adaptive_notification_outbox where owner_id=$1 and slot_id is not null),
+          'notificationJobs',((select count(*) from adaptive_notification_outbox where owner_id=$1 and slot_id is not null)+(select count(*) from telegram_delivery_outbox where owner_id=$1 and slot_id is not null)),
           'processesReset',(select count(*) from continuous_processes where owner_id=$1 and {DIRTY_PROCESS})),
         'retained',jsonb_build_object(
           'runs',(select count(*) from replay_runs where owner_id=$1 and origin='continuous'),
@@ -73,7 +73,8 @@ async fn snapshot(tx: &mut Transaction<'_, Postgres>, owner: &str) -> Result<Pre
           or exists(select 1 from optimization_studies where owner_id=$1 and origin='continuous' and status in ('queued','running','cancel_requested'))
           or exists(select 1 from replay_runs where owner_id=$1 and origin='continuous' and status in ('queued','running','cancel_requested'))
           or exists(select 1 from continuous_slots where owner_id=$1 and (active_generation_id is not null or pending_generation_id is not null))
-          or exists(select 1 from adaptive_notification_outbox where owner_id=$1 and slot_id is not null and lease_owner is not null and lease_until>clock_timestamp())),
+          or exists(select 1 from adaptive_notification_outbox where owner_id=$1 and slot_id is not null and lease_owner is not null and lease_until>clock_timestamp())
+          or exists(select 1 from telegram_delivery_outbox where owner_id=$1 and slot_id is not null and lease_owner is not null and lease_until>clock_timestamp())),
         'ownershipConflict',(
           exists(select 1 from optimization_studies s join continuous_generations g on g.id=s.continuous_generation_id where (g.owner_id=$1 and (s.owner_id<>$1 or s.origin<>'continuous')) or (s.owner_id=$1 and s.origin='continuous' and g.owner_id<>$1))
           or exists(select 1 from replay_runs r join continuous_generations g on g.id=r.continuous_generation_id where (g.owner_id=$1 and (r.owner_id<>$1 or r.origin<>'continuous')) or (r.owner_id=$1 and r.origin='continuous' and g.owner_id<>$1))
@@ -87,6 +88,7 @@ async fn snapshot(tx: &mut Transaction<'_, Postgres>, owner: &str) -> Result<Pre
         'slots',coalesce((select md5(string_agg(to_jsonb(s)::text,'' order by id)) from continuous_slots s where owner_id=$1),''),
         'studies',coalesce((select md5(string_agg(concat_ws(':',id,status,continuous_generation_id,updated_at),',' order by id)) from optimization_studies where owner_id=$1 and origin='continuous'),''),
         'generations',coalesce((select md5(string_agg(concat_ws(':',id,status,updated_at),',' order by id)) from continuous_generations where owner_id=$1),''),
+        'telegram',coalesce((select md5(string_agg(concat_ws(':',id,lease_token,attempts),',' order by id)) from telegram_delivery_outbox where owner_id=$1 and slot_id is not null),''),
         'notifications',coalesce((select md5(string_agg(concat_ws(':',id,lease_token,attempts),',' order by id)) from adaptive_notification_outbox where owner_id=$1 and slot_id is not null),''))
     "#)).bind(owner).fetch_one(&mut **tx).await?;
     let fingerprint: String = sqlx::query_scalar("select md5($1::jsonb::text)")
@@ -115,6 +117,7 @@ pub async fn purge(pool: &PgPool, owner: &str, fingerprint: &str) -> Result<Outc
     // Lock before job rows, matching claim/finish and trigger accounting. Fixed
     // delivery can continue before/after this short mutation transaction.
     sqlx::query("select id from adaptive_notification_budget where id=1 for update").execute(&mut *tx).await?;
+    sqlx::query("select id from telegram_delivery_budget where id=1 for update").execute(&mut *tx).await?;
     let before=snapshot(&mut tx,owner).await?;
     if !before.eligible { return Ok(Outcome::Blocked(before)); }
     if before.fingerprint!=fingerprint { return Ok(Outcome::Stale(before)); }
@@ -129,6 +132,7 @@ pub async fn purge(pool: &PgPool, owner: &str, fingerprint: &str) -> Result<Outc
     sqlx::query("update adaptive_live_warmup_lane set slot_id=null,generation_id=null,lease_owner=null,lease_until=null,lease_token=lease_token+1 where slot_id in(select id from continuous_slots where owner_id=$1) or generation_id in(select id from continuous_generations where owner_id=$1)").bind(owner).execute(&mut *tx).await?;
     sqlx::query("delete from adaptive_live_checkpoints where slot_id in(select id from continuous_slots where owner_id=$1)").bind(owner).execute(&mut *tx).await?;
     sqlx::query("with removed as(delete from adaptive_notification_outbox where owner_id=$1 and slot_id is not null returning setup_id) update live_setups l set notification_delivery_status='skipped',notification_delivery_error='continuous_history_purged',notification_delivery_updated_at=clock_timestamp() from removed r where l.id=r.setup_id and l.notification_delivery_status='pending'").bind(owner).execute(&mut *tx).await?;
+    sqlx::query("with removed as(delete from telegram_delivery_outbox where owner_id=$1 and slot_id is not null returning setup_id) update live_setups l set telegram_delivery_status='disabled',telegram_delivery_error='{\"code\":\"continuous_history_purged\",\"message\":\"Continuous delivery was cancelled by confirmed history cleanup.\"}'::jsonb,telegram_delivery_updated_at=clock_timestamp() from removed r where l.id=r.setup_id and l.telegram_delivery_status='pending'").bind(owner).execute(&mut *tx).await?;
     // Snapshot only protected output metadata. No research spec/best/bootstrap copy.
     let metadata="jsonb_build_object('generationId',g.id,'studyId',g.study_id,'slotId',g.slot_id,'ownerId',g.owner_id,'algorithmId',g.algorithm_id,'minSetupsPerDay',s.min_setups_per_day,'configRevision',g.config_revision,'executionStartedAt',g.execution_started_at,'observationCutoff',g.observation_cutoff)";
     sqlx::query(&format!("update replay_batches b set continuous_archive={metadata},continuous_analytics_archive=case when b.id=g.replay_batch_id then g.result->'analytics' end,continuous_analytics_context_archive=case when b.id=g.replay_batch_id then jsonb_build_object('effectiveAnalytics',g.result#>'{{best,analytics}}','direction',g.spec->'direction') end,continuous_replay_archive=case when b.id=g.replay_batch_id then g.replay_manifest end,continuous_generation_id=null from continuous_generations g join continuous_slots s on s.id=g.slot_id where b.continuous_generation_id=g.id and g.owner_id=$1 and b.owner_id=$1 and b.origin='continuous'"))

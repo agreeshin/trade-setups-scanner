@@ -309,7 +309,8 @@ export function registerManagementRoutes(app: FastifyInstance, { db, requireApiK
     onRequest: [requireApiKey],
     schema: {
       querystring: Type.Object({ limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })), afterInstrumentId: Type.Optional(Id) }),
-      response: { 200: Type.Object({ targets: Type.Array(Target), nextAfterInstrumentId: Type.Union([Id, Type.Null()]) }), 401: ErrorResponse },
+      description: "Read saved collection choices without mutation. onlyMissingSupported=true advertises atomic insert-only admission on the bulk PUT; clients must require this capability before sending onlyMissing to a producer of unknown version.",
+      response: { 200: Type.Object({ targets: Type.Array(Target), nextAfterInstrumentId: Type.Union([Id, Type.Null()]), onlyMissingSupported: Type.Literal(true) }), 401: ErrorResponse },
     },
   }, async (request) => {
     const limit = request.query.limit ?? 500;
@@ -320,6 +321,7 @@ export function registerManagementRoutes(app: FastifyInstance, { db, requireApiK
     return {
       targets: page.map((row) => ({ instrumentId: row.instrument_id, enabled: row.enabled, lastCollectedUnix: row.last_collected_ts ? row.last_collected_ts.getTime() / 1000 : null, updatedAt: row.updated_at.toISOString() })),
       nextAfterInstrumentId: rows.length > limit ? page.at(-1)!.instrument_id : null,
+      onlyMissingSupported: true,
     };
   });
 
@@ -334,17 +336,18 @@ export function registerManagementRoutes(app: FastifyInstance, { db, requireApiK
     return { instrumentId, enabled: request.body.enabled };
   });
 
-  app.put<{ Body: { instrumentIds: number[]; enabled: boolean } }>("/v1/collection-targets", {
+  app.put<{ Body: { instrumentIds: number[]; enabled: boolean; onlyMissing?: boolean } }>("/v1/collection-targets", {
     onRequest: [requireApiKey],
     schema: {
-      body: Type.Object({ instrumentIds: Type.Array(Id, { minItems: 1, maxItems: 1000, uniqueItems: true }), enabled: Type.Boolean() }, { additionalProperties: false }),
+      description: "Set explicit collection choices. onlyMissing=true inserts absent targets only and preserves existing enabled/disabled rows, including concurrent administrative changes. updated counts affected rows; enabled echoes the requested value, not every stored state. Read GET /v1/collection-targets for actual states.",
+      body: Type.Object({ instrumentIds: Type.Array(Id, { minItems: 1, maxItems: 1000, uniqueItems: true }), enabled: Type.Boolean(), onlyMissing: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
       response: { 200: Type.Object({ updated: Type.Integer(), enabled: Type.Boolean() }), 400: ErrorResponse, 401: ErrorResponse, 404: ErrorResponse },
     },
   }, async (request, reply) => {
-    const { instrumentIds, enabled } = request.body;
+    const { instrumentIds, enabled, onlyMissing = false } = request.body;
     const found = await db.selectFrom("instruments").select("id").where("id", "in", instrumentIds).execute();
     if (found.length !== instrumentIds.length) return reply.code(404).send({ error: "instrument_not_found" });
-    await setCollectionTargets(db, instrumentIds, enabled);
-    return { updated: instrumentIds.length, enabled };
+    const updated = await setCollectionTargets(db, instrumentIds, enabled, onlyMissing);
+    return { updated, enabled };
   });
 }

@@ -152,6 +152,14 @@ describe.skipIf(!url)("history management API", () => {
     expect(response.json<{ targets: { instrumentId: number; enabled: boolean; lastCollectedUnix: null }[] }>().targets[0]).toMatchObject({ instrumentId, enabled: false, lastCollectedUnix: null });
   });
 
+  it("advertises conditional collection admission on an empty read-only page", async () => {
+    const before = await db.selectFrom("collection_targets").selectAll().where("instrument_id", "=", instrumentId).execute();
+    const response = await app.inject({ method: "GET", url: "/v1/collection-targets?afterInstrumentId=2147483647&limit=1", headers });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ targets: [], nextAfterInstrumentId: null, onlyMissingSupported: true });
+    expect(await db.selectFrom("collection_targets").selectAll().where("instrument_id", "=", instrumentId).execute()).toEqual(before);
+  });
+
   it("bulk-updates collection targets for many instruments", async () => {
     const stamp = Date.now();
     const ids = [
@@ -173,6 +181,77 @@ describe.skipIf(!url)("history management API", () => {
     } finally {
       await db.deleteFrom("collection_targets").where("instrument_id", "in", ids).execute();
       await db.deleteFrom("instruments").where("id", "in", ids).execute();
+    }
+  });
+
+  it("conditionally creates missing collection targets without changing existing choices or scheduling history", async () => {
+    const stamp = Date.now();
+    const ids = await Promise.all(["NEW", "OFF", "ON"].map((suffix) =>
+      ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `ENS${stamp}${suffix}` })));
+    try {
+      for (const [instrumentId, enabled] of [[ids[1]!, false], [ids[2]!, true]] as const) {
+        expect((await app.inject({ method: "PUT", url: `/v1/collection-targets/${instrumentId}`, headers, payload: { enabled } })).statusCode).toBe(200);
+      }
+      const before = await db.selectFrom("collection_targets").selectAll().where("instrument_id", "in", ids.slice(1)).orderBy("instrument_id").execute();
+      const payload = { instrumentIds: ids, enabled: true, onlyMissing: true };
+      const invalid = await app.inject({ method: "PUT", url: "/v1/collection-targets", headers, payload: { ...payload, instrumentIds: [ids[0]!, 2147483000] } });
+      expect(invalid.statusCode).toBe(404);
+      expect(await db.selectFrom("collection_targets").select("instrument_id").where("instrument_id", "=", ids[0]!).execute()).toEqual([]);
+      for (const updated of [1, 0]) {
+        const response = await app.inject({ method: "PUT", url: "/v1/collection-targets", headers, payload });
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toEqual({ updated, enabled: true });
+      }
+      expect(await db.selectFrom("collection_targets").selectAll().where("instrument_id", "in", ids.slice(1)).orderBy("instrument_id").execute()).toEqual(before);
+      const targets = (await app.inject({ method: "GET", url: "/v1/collection-targets?limit=1000", headers })).json<{ targets: { instrumentId: number; enabled: boolean }[] }>().targets;
+      for (const [instrumentId, enabled] of [[ids[0]!, true], [ids[1]!, false], [ids[2]!, true]] as const)
+        expect(targets.find((row) => row.instrumentId === instrumentId)).toMatchObject({ enabled });
+      expect(await db.selectFrom("backfill_jobs").select("id").where("instrument_id", "in", ids).execute()).toEqual([]);
+      expect(await db.selectFrom("candles").select("instrument_id").where("instrument_id", "in", ids).execute()).toEqual([]);
+      // Explicit manual history remains independent of collection being disabled.
+      const history = await app.inject({ method: "POST", url: "/v1/backfill-jobs", headers, payload: { instrumentId: ids[1]!, fromUnix, toUnix: fromUnix + 60 } });
+      expect(history.statusCode).toBe(202);
+      expect((await db.selectFrom("collection_targets").select("enabled").where("instrument_id", "=", ids[1]!).executeTakeFirstOrThrow()).enabled).toBe(false);
+      const manual = await app.inject({ method: "PUT", url: "/v1/collection-targets", headers, payload: { ...payload, onlyMissing: false } });
+      expect(manual.json()).toEqual({ updated: 3, enabled: true });
+      expect((await db.selectFrom("collection_targets").select("enabled").where("instrument_id", "in", ids).execute()).every((row) => row.enabled)).toBe(true);
+    } finally {
+      await db.deleteFrom("backfill_jobs").where("instrument_id", "in", ids).execute();
+      await db.deleteFrom("collection_targets").where("instrument_id", "in", ids).execute();
+      await db.deleteFrom("instruments").where("id", "in", ids).execute();
+    }
+  });
+
+  it("never overwrites a concurrent administrative disable with repeated conditional admission", async () => {
+    const id = await ensureInstrument(db, { exchangeCode: "bybit", category: "linear", symbol: `RACE${Date.now()}USDT` });
+    const ensure = async () => app.inject({ method: "PUT", url: "/v1/collection-targets", headers, payload: { instrumentIds: [id], enabled: true, onlyMissing: true } });
+    let pending: ReturnType<typeof ensure> | undefined;
+    try {
+      // The consumer saw no row, but an administrator inserts disabled before
+      // its INSERT. Keep the disable uncommitted while admission is launched.
+      expect(await db.selectFrom("collection_targets").select("instrument_id").where("instrument_id", "=", id).execute()).toEqual([]);
+      await db.transaction().execute(async (tx) => {
+        await tx.insertInto("collection_targets").values({ instrument_id: id, enabled: false }).execute();
+        pending = ensure();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      });
+      if (!pending) throw new Error("conditional admission did not start");
+      expect((await pending).json<{ updated: number; enabled: boolean }>()).toEqual({ updated: 0, enabled: true });
+      const disabled = await db.selectFrom("collection_targets").selectAll().where("instrument_id", "=", id).executeTakeFirstOrThrow();
+      expect(disabled.enabled).toBe(false);
+      const repeated = await Promise.all([ensure(), ensure(), ensure()]);
+      expect(repeated.map((response) => response.json<{ updated: number; enabled: boolean }>())).toEqual(Array.from({ length: 3 }, () => ({ updated: 0, enabled: true })));
+      expect(await db.selectFrom("collection_targets").selectAll().where("instrument_id", "=", id).executeTakeFirstOrThrow()).toEqual(disabled);
+      // Ordinary manual enable still works. A concurrent manual disable wins
+      // regardless of which insert-only ensure encounters the existing row first.
+      expect((await app.inject({ method: "PUT", url: `/v1/collection-targets/${id}`, headers, payload: { enabled: true } })).json()).toEqual({ instrumentId: id, enabled: true });
+      const concurrent = await Promise.all([ensure(), app.inject({ method: "PUT", url: `/v1/collection-targets/${id}`, headers, payload: { enabled: false } }), ensure()]);
+      expect(concurrent.every((response) => response.statusCode === 200)).toBe(true);
+      expect((await db.selectFrom("collection_targets").select("enabled").where("instrument_id", "=", id).executeTakeFirstOrThrow()).enabled).toBe(false);
+    } finally {
+      await pending;
+      await db.deleteFrom("collection_targets").where("instrument_id", "=", id).execute();
+      await db.deleteFrom("instruments").where("id", "=", id).execute();
     }
   });
 

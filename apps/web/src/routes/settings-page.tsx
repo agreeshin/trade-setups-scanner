@@ -16,6 +16,7 @@ import { LiveInstruments } from "./live-instruments";
 import { OperationSettings } from "./operation-settings";
 import { ContinuousMaintenance } from "./continuous-maintenance";
 import { PushSettings } from "../components/push-settings";
+import { TelegramRelaySettingsSection } from "./telegram-relay-settings";
 import { BackupSettings } from "./backup-settings";
 
 interface LiveStatus { enabled: boolean; running: boolean; lastScanAt: string | null; lastError: string | null; stale?: boolean; scanned?: number; setupCount?: number; instruments?: { symbol: string; state: string; lastClosedUnix?: number; error?: string }[] }
@@ -220,7 +221,7 @@ export function SettingsPage() {
       <form className="grid gap-3" onSubmit={(event) => { void save(event); }} aria-labelledby="notifications-heading">
         <SectionHeader id="notifications-heading" title="Уведомления" />
         <div className="grid gap-3">
-          <p className="text-sm text-muted-foreground">Telegram не подключён. Настройка возраста задаёт порог свежести; подписка Web Push включается отдельно ниже и только по вашему действию.</p>
+          <p className="text-sm text-muted-foreground">Настройка возраста задаёт порог свежести; Telegram relay и подписка Web Push включаются отдельно ниже и только по вашему действию.</p>
           <p className="text-sm text-muted-foreground">Web Push недоступен по обычному HTTP: требуется HTTPS (исключение — localhost). Сохранение порога не запрашивает разрешение на уведомления.</p>
           <Field label="Максимальный возраст уведомления (секунд)">
             {(control) => <Input type="number" min="1" step="1" required disabled={!ready} value={maxAge} onChange={(event) => { setMaxAge(event.target.value); setMessage(null); }} {...control} />}
@@ -231,6 +232,7 @@ export function SettingsPage() {
           <div><Button type="submit" disabled={saving || !ready}>{saving ? "Сохранение…" : "Сохранить уведомления"}</Button></div>
         </div>
       </form>
+      <Separator /><TelegramRelaySettingsSection active={section === "notifications"} />
       <Separator /><PushSettings />
     </PageSidebarPanel>
     <PageSidebarPanel value="maintenance"><ContinuousMaintenance active={section === "maintenance"} /><Separator /><CacheSettings /><Separator /><OperationSettings /><Separator /><BackupSettings /></PageSidebarPanel>

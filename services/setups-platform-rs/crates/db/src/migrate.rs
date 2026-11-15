@@ -10,7 +10,8 @@ const CONTINUOUS_HISTORY_CLEANUP: &str = "0015_continuous_history_cleanup.sql";
 const INDEPENDENT_LIVE_INITIALIZATION: &str = "0016_independent_live_initialization.sql";
 const CONTINUOUS_RESUME: &str = "0017_continuous_resume.sql";
 const LIVE_READMISSION: &str = "0018_live_readmission.sql";
-const MIGRATIONS: &[&str] = &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP, INDEPENDENT_LIVE_INITIALIZATION, CONTINUOUS_RESUME, LIVE_READMISSION];
+const TELEGRAM_RELAY: &str = "0019_telegram_relay.sql";
+const MIGRATIONS: &[&str] = &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP, INDEPENDENT_LIVE_INITIALIZATION, CONTINUOUS_RESUME, LIVE_READMISSION, TELEGRAM_RELAY];
 
 fn migration_source(name: &str) -> &'static str {
     match name {
@@ -23,6 +24,7 @@ fn migration_source(name: &str) -> &'static str {
         INDEPENDENT_LIVE_INITIALIZATION => include_str!("../migrations/0016_independent_live_initialization.sql"),
         CONTINUOUS_RESUME => include_str!("../migrations/0017_continuous_resume.sql"),
         LIVE_READMISSION => include_str!("../migrations/0018_live_readmission.sql"),
+        TELEGRAM_RELAY => include_str!("../migrations/0019_telegram_relay.sql"),
         other => unreachable!("unknown migration {other}"),
     }
 }
@@ -82,7 +84,7 @@ mod tests {
 
     #[test]
     fn run_names_migration_is_registered_after_baseline() {
-        assert_eq!(MIGRATIONS, &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP, INDEPENDENT_LIVE_INITIALIZATION, CONTINUOUS_RESUME, LIVE_READMISSION]);
+        assert_eq!(MIGRATIONS, &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP, INDEPENDENT_LIVE_INITIALIZATION, CONTINUOUS_RESUME, LIVE_READMISSION, TELEGRAM_RELAY]);
         let source = migration_source(RUN_NAMES);
         assert!(
             source.contains("ALTER TABLE public.replay_runs ADD COLUMN IF NOT EXISTS name text")

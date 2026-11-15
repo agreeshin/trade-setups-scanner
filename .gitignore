@@ -11,6 +11,10 @@ playwright-report/
 test-results/
 
 # Local runtime and test configuration.
+.secrets/
+infra/prod/secrets/
+infra/telegram-relay/secrets/
+infra/telegram-relay/state/
 .env
 .env.*
 !.env.example

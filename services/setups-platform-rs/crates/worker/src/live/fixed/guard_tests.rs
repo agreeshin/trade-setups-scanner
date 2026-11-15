@@ -637,6 +637,7 @@ async fn durable_seeded_continuation_matches_reference_and_ignores_json_seed_evi
         error: None,
         next_poll: Instant::now(),
         prefetched: None,
+        preparation: None,
     };
     finish_work(&db, &fixture, &mut entry, &algorithms).await;
     let restored_seed = entry.symbol.as_ref().unwrap().profiles[0].previous_setup;

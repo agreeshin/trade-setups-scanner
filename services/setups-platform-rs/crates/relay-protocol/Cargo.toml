@@ -1,0 +1,10 @@
+[package]
+name = "setups-relay-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+hmac.workspace = true
+sha2.workspace = true

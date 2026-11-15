@@ -1,0 +1,20 @@
+# Deny everything, then admit only build inputs. No .env, secrets, artifacts,
+# node_modules, targets, local SQLite state or host-specific configuration.
+**
+!services/
+!services/setups-platform-rs/
+!services/setups-platform-rs/Cargo.toml
+!services/setups-platform-rs/Cargo.lock
+!services/setups-platform-rs/crates/
+!services/setups-platform-rs/crates/**/
+!services/setups-platform-rs/crates/**/Cargo.toml
+!services/setups-platform-rs/crates/**/*.rs
+!infra/
+!infra/telegram-relay/
+!infra/telegram-relay/Caddyfile
+# Final exclusions also cover nested per-crate build directories.
+**/target/**
+**/node_modules/**
+**/.git/**
+**/.env*
+**/secrets/**

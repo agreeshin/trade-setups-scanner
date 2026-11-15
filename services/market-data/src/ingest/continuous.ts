@@ -23,21 +23,22 @@ export async function setCollectionTarget(
     .execute();
 }
 
-/** Upserts collection targets for many instruments in one statement. */
+/** Returns affected rows; insert-only admission never overwrites an admin's choice. */
 export async function setCollectionTargets(
   db: Kysely<MarketDataDB>,
   instrumentIds: number[],
   enabled: boolean,
-): Promise<void> {
-  await db
+  onlyMissing = false,
+): Promise<number> {
+  const rows = await db
     .insertInto("collection_targets")
     .values(instrumentIds.map((instrument_id) => ({ instrument_id, enabled })))
-    .onConflict((oc) =>
-      oc
-        .column("instrument_id")
-        .doUpdateSet({ enabled, updated_at: new Date() }),
-    )
+    .onConflict((oc) => onlyMissing
+      ? oc.column("instrument_id").doNothing()
+      : oc.column("instrument_id").doUpdateSet({ enabled, updated_at: new Date() }))
+    .returning("instrument_id")
     .execute();
+  return rows.length;
 }
 
 /**

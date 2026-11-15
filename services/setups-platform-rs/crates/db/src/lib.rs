@@ -14,6 +14,7 @@ pub mod migrate;
 pub mod optimization;
 pub mod push;
 pub mod runs;
+pub mod telegram;
 
 #[derive(Debug)]
 pub enum DbError {

@@ -1,0 +1,50 @@
+{
+    admin off
+    http_port 8081
+    https_port 8443
+    auto_https disable_redirects
+    default_sni {$RELAY_DOMAIN}
+    log default {
+        format filter {
+            wrap json
+            fields {
+                request delete
+                headers delete
+            }
+        }
+    }
+    servers {
+        timeouts {
+            read_header 5s
+            read_body 5s
+            write 10s
+            idle 30s
+        }
+    }
+}
+
+https://{$RELAY_DOMAIN} {
+    tls {
+        issuer acme {
+            dir https://acme-v02.api.letsencrypt.org/directory
+            profile shortlived
+            disable_http_challenge
+            alt_tlsalpn_port 8443
+        }
+    }
+    request_body {
+        max_size 32KiB
+    }
+    @outside not path /v1/messages /v1/status
+    respond @outside 404
+    # Optional defence in depth, configured only after the sender IP is known:
+    # @untrusted not remote_ip <MAIN_PUBLIC_IP_OR_CIDR>
+    # respond @untrusted 403
+    # Never authorize based on client-controlled X-Forwarded-For.
+    reverse_proxy relay:8080 {
+        transport http {
+            dial_timeout 2s
+            response_header_timeout 6s
+        }
+    }
+}

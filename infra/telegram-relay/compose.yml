@@ -1,0 +1,76 @@
+name: setups-telegram-relay
+services:
+  relay:
+    build:
+      context: ../..
+      dockerfile: infra/telegram-relay/Dockerfile
+      target: relay
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: "1.0"
+    stop_grace_period: 15s
+    environment:
+      RELAY_LISTEN: 0.0.0.0:8080
+      RELAY_STATE_PATH: /var/lib/telegram-relay/relay.sqlite
+      RELAY_SIGNING_KEY_FILE: /run/secrets/relay-signing-key
+      RELAY_TOKEN_FILE: /run/secrets/telegram-token
+      RELAY_CHAT_ID: ${RELAY_CHAT_ID:?set the fixed private channel ID in local .env}
+    volumes:
+      - relay-state:/var/lib/telegram-relay
+      - type: bind
+        source: ${RELAY_SIGNING_KEY_FILE:?set an existing private signing-key file}
+        target: /run/secrets/relay-signing-key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RELAY_TOKEN_FILE:?set an existing private bot-token file}
+        target: /run/secrets/telegram-token
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m,uid=10001,gid=10001
+    networks: [backend, egress]
+    # Deliberately no published relay port. HMAC remains required behind Caddy.
+
+  edge:
+    build:
+      context: ../..
+      dockerfile: infra/telegram-relay/Dockerfile
+      target: edge
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: "0.5"
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:?set a public TLS domain in local .env}
+    ports:
+      - "443:8443"
+    volumes:
+      - edge-data:/data
+      - edge-config:/config
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m,uid=10001,gid=10001
+    networks: [backend, edge]
+    depends_on: [relay]
+
+volumes:
+  relay-state:
+  edge-data:
+  edge-config:
+networks:
+  backend:
+    internal: true
+  egress:
+  edge:

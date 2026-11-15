@@ -77,6 +77,8 @@ beforeEach(() => {
     }
     if (path === "/v1/replay-preflight") data = { checkedAt: "2026-10-10T10:00:00Z", algorithmVersion: "snapshot-v2", requiredHistoryMinutes: 43200, canRun: true, request: { ...(JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>), async: true, algorithmVersion: "snapshot-v2", params: { priceGrowthPct: "17", windowMinutes: 9 } }, results: [] };
     if (path === "/v1/settings/notifications") data = { maxAgeSeconds: 60 };
+    if (path === "/v1/telegram-relay") data = { settings: { enabled: false, endpointUrl: "", revision: 0 },
+      status: { endpointUrl: "", settingsRevision: 0, secretConfigured: false, state: "disabled", telegramChannel: "unknown", checkedAt: null, reason: null } };
     if (path === "/v1/continuous-studies/maintenance") data = { admissionPaused: false, state: "running", activeChains: 0, resumableChains: 0, updatedAt: null };
     if (path === "/v1/live/status") data = { enabled: false, running: false, lastScanAt: null, lastError: null };
     if (path === "/v1/replay-cache/stats") data = { entries: 3, bytes: 1024 };
@@ -321,10 +323,14 @@ describe("platform screens", () => {
     expect(screen.queryByLabelText("Рост цены (%)")).not.toBeInTheDocument();
     expect(requests.some((request) => request.path === "/v1/algorithms")).toBe(false);
     expect(requests.some((request) => request.path === "/v1/continuous-studies/maintenance")).toBe(false);
+    expect(requests.some((request) => request.path === "/v1/telegram-relay")).toBe(false);
     await userEvent.click(screen.getByRole("tab", { name: "Уведомления" }));
     const age = await screen.findByRole("spinbutton", { name: "Максимальный возраст уведомления (секунд)" });
     fireEvent.change(age, { target: { value: "99" } });
-    expect(screen.getByText(/Telegram не подключён/)).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Telegram relay" })).toBeVisible();
+    const relay = await screen.findByRole("textbox", { name: "HTTPS-адрес Telegram relay" });
+    await waitFor(() => expect(relay).toBeEnabled());
+    fireEvent.change(relay, { target: { value: "https://relay.example/" } });
     expect(screen.getByText(/Web Push недоступен по обычному HTTP/)).toHaveTextContent("localhost");
     await userEvent.click(screen.getByRole("tab", { name: "Обслуживание" }));
     expect(screen.getByRole("heading", { name: "Обслуживание непрерывных исследований" })).toBeVisible();
@@ -338,6 +344,9 @@ describe("platform screens", () => {
     await userEvent.click(screen.getByRole("tab", { name: "Уведомления" }));
     expect(screen.getByRole("spinbutton", { name: "Максимальный возраст уведомления (секунд)" })).toBe(age);
     expect(age).toHaveValue(99);
+    expect(screen.getByRole("textbox", { name: "HTTPS-адрес Telegram relay" })).toBe(relay);
+    expect(relay).toHaveValue("https://relay.example/");
+    expect(requests.filter((request) => request.path.startsWith("/v1/telegram-relay")).every((request) => request.method === "GET")).toBe(true);
     expect(requests.filter((request) => request.path === "/v1/settings/notifications")).toHaveLength(1);
   });
 

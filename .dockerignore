@@ -1,0 +1,5 @@
+# Private Telegram credentials and runtime state must not enter build contexts.
+.secrets/
+infra/prod/secrets/
+infra/telegram-relay/secrets/
+infra/telegram-relay/state/

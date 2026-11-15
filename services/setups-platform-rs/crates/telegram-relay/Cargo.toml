@@ -1,0 +1,21 @@
+[package]
+name = "setups-telegram-relay"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+setups-relay-protocol.workspace = true
+axum.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+
+[dev-dependencies]
+tower.workspace = true
+http-body-util.workspace = true
+
+[[bin]]
+name = "setups-telegram-relay"
+path = "src/main.rs"

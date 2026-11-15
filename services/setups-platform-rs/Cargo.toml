@@ -10,6 +10,8 @@ members = [
     "crates/db",
     "crates/api",
     "crates/worker",
+    "crates/relay-protocol",
+    "crates/telegram-relay",
 ]
 
 [workspace.package]
@@ -44,6 +46,8 @@ setups-mdclient = { path = "crates/mdclient" }
 setups-db = { path = "crates/db" }
 setups-worker = { path = "crates/worker" }
 setups-optimizer = { path = "crates/optimizer" }
+setups-relay-protocol = { path = "crates/relay-protocol" }
+setups-telegram-relay = { path = "crates/telegram-relay" }
 
 [profile.release]
 lto = "thin"

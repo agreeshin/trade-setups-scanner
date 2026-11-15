@@ -4,7 +4,10 @@ use std::fmt;
 use std::time::Duration;
 
 pub mod source;
+mod preparation;
 mod tail;
+
+pub use preparation::{BackfillAdmission, BackfillHistory, BackfillJob, BackfillStatus, CollectionAdmission, HistoryDemand};
 
 pub use source::ApiCandleSource;
 pub use tail::{TAIL_MAX_BYTES, TAIL_MAX_INSTRUMENTS, TailBatchQuery, TailBatchResponse, TailCandle, TailInstrument, TailMissingRange,
