@@ -407,7 +407,7 @@ function dayLabel(day: string): string {
 }
 
 /** Daily UTC expectancy with actual calendar spacing and equal-weight daily OLS. */
-function DailyExpectancyChart({ items, originUnix }: { items: DailyExpectancyPoint[]; originUnix: number }) {
+function DailyExpectancyChart({ items, originUnix, meanRisk }: { items: DailyExpectancyPoint[]; originUnix: number; meanRisk: number | null }) {
   if (items.length === 0) {
     return <p className="text-xs text-muted-foreground">График появится после расчёта первых строк.</p>;
   }
@@ -443,12 +443,17 @@ function DailyExpectancyChart({ items, originUnix }: { items: DailyExpectancyPoi
   const fittedLabel = (value: number) => formatRisk(Number(value.toFixed(2)));
 
   return (
+    <div className="grid gap-2">
+    <h3 className="text-sm font-medium">Дневное матожидание в рисках · Среднее МО: <span aria-label="Среднее МО за период" className={meanRisk !== null && meanRisk > 0 ? "text-success" : meanRisk !== null && meanRisk < 0 ? "text-danger" : "text-muted-foreground"}>{meanRisk === null ? "—" : fittedLabel(meanRisk)}</span></h3>
     <svg className="w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание в рисках">
       <desc>Среднее закрытых сделок по UTC-дням сигнала. Расстояния по оси X соответствуют календарным суткам; дни без закрытых сделок не равны нулю.</desc>
       <line className="stroke-muted-foreground/40" x1={left} y1={top} x2={left} y2={height - bottom} />
       <line className="stroke-muted-foreground/40" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
-      {zeroY !== null ? <line className="stroke-muted-foreground/50" x1={left} y1={zeroY} x2={width - right} y2={zeroY} /> : null}
-      {[yMin, (yMin + yMax) / 2, yMax].map((value) => (
+      {zeroY !== null ? <>
+        <line className="stroke-muted-foreground/50" x1={left} y1={zeroY} x2={width - right} y2={zeroY} />
+        <text className="fill-muted-foreground text-[10px]" x={left - 10} y={zeroY + 4} textAnchor="end" aria-label="Нулевой уровень">0 R</text>
+      </> : null}
+      {[yMin, (yMin + yMax) / 2, yMax].filter((value) => zeroY === null || Math.abs(yForValue(value) - zeroY) >= 14).map((value) => (
         <g key={value.toFixed(4)}>
           <line className="stroke-muted-foreground/20" x1={left} y1={yForValue(value)} x2={width - right} y2={yForValue(value)} />
           <text className="fill-muted-foreground text-[10px]" x={left - 10} y={yForValue(value) + 4} textAnchor="end">{formatRisk(value)}</text>
@@ -478,8 +483,9 @@ function DailyExpectancyChart({ items, originUnix }: { items: DailyExpectancyPoi
           </g>
         );
       })}
-      <text className="fill-muted-foreground text-[10px]" x={left + plotWidth / 2} y={height - 8} textAnchor="middle">Дата сигнала (UTC)</text>
+      <text className="fill-muted-foreground text-[10px]" x={left + plotWidth / 2} y={height - 8} textAnchor="middle">Дата сетапа (UTC)</text>
     </svg>
+    </div>
   );
 }
 
@@ -660,7 +666,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
         {summary.avgRisk !== null && <Badge>Матожидание: {formatRisk(summary.avgRisk)} по {summary.closed} закрытым</Badge>}
         {filteredCount > 0 && <Badge variant="warning">Отфильтровано смещением цены: {filteredCount}</Badge>}
       </div>
-      {rows.length > 0 && <DailyExpectancyChart items={dailyPoints} originUnix={chartOriginUnix} />}
+      {rows.length > 0 && <DailyExpectancyChart items={dailyPoints} originUnix={chartOriginUnix} meanRisk={summary.avgRisk} />}
       {rows.length === 0 && !running && !error && <EmptyState title="Нет рассчитанных сделок" description="Выберите параметры и нажмите «Рассчитать». Сначала загружаются кешированные строки, затем досчитываются остальные." />}
       {rows.length > 0 && (
         <div className="overflow-x-auto">

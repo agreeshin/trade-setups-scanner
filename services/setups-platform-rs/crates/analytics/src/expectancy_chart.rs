@@ -14,6 +14,8 @@ use std::{fmt, fmt::Write as _, io};
 
 pub use setups_domain::expectancy::ExpectancyImageKey;
 
+// Keep existing asset keys: claim_render would queue historical PNGs again on a
+// version bump. These presentation fixes apply only to future missing renders.
 pub const RENDER_VERSION: u32 = 1;
 pub const WIDTH: u32 = 900;
 pub const HEIGHT: u32 = 320;
@@ -205,6 +207,30 @@ fn risk_label(value: f64) -> String {
     }
 }
 
+fn period_mean_r(artifact: &ExpectancyArtifact, points: &[UtcDailyPoint]) -> f64 {
+    if let Some(mean) = artifact
+        .selected_cell
+        .as_ref()
+        .and_then(|cell| cell.raw_r.as_ref())
+    {
+        return *mean;
+    }
+    // Presentation fallback from validated sealed points, not a mean of daily
+    // means. Normalize weights first to avoid overflowing an intermediate sum.
+    let closed = points
+        .iter()
+        .map(|point| point.tp_count as f64 + point.sl_count as f64)
+        .sum::<f64>();
+    points
+        .iter()
+        .filter_map(|point| {
+            point
+                .mean_r
+                .map(|mean| mean * ((point.tp_count as f64 + point.sl_count as f64) / closed))
+        })
+        .sum()
+}
+
 fn render_svg(artifact: &ExpectancyArtifact) -> Result<String, RenderError> {
     artifact.validate().map_err(RenderError::InvalidArtifact)?;
     let points = artifact.daily.as_ref().ok_or_else(|| {
@@ -215,23 +241,36 @@ fn render_svg(artifact: &ExpectancyArtifact) -> Result<String, RenderError> {
         RenderError::SeriesUnavailable(*reason)
     })?;
     let geometry = Geometry::from_points(points, artifact.trend)?;
+    let mean = period_mean_r(artifact, points);
+    let title_color = if mean > 0.0 {
+        POSITIVE
+    } else if mean < 0.0 {
+        NEGATIVE
+    } else {
+        FOREGROUND
+    };
+    let mean_label = risk_label(mean);
     let mut svg = BoundedSvg(String::with_capacity(
         (points.len() * 128 + 8192).min(MAX_SVG_BYTES),
     ));
     write!(
         svg,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="320" viewBox="0 0 900 320" font-family="{FONT_FAMILY}"><rect width="900" height="320" fill="{BACKGROUND}"/><text id="title" x="450" y="28" text-anchor="middle" font-size="18" fill="{FOREGROUND}">{TITLE}</text>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="320" viewBox="0 0 900 320" font-family="{FONT_FAMILY}"><rect width="900" height="320" fill="{BACKGROUND}"/><text id="title" x="450" y="28" text-anchor="middle" font-size="18" fill="{title_color}">{TITLE} · Среднее МО: {mean_label}</text>"#
     )?;
     write!(
         svg,
         r#"<g fill="none" stroke="{AXIS}" stroke-width="1" stroke-opacity="0.4"><path d="M {LEFT} {TOP} V {BOTTOM} H {RIGHT}"/></g><text x="42" y="56" text-anchor="middle" font-size="12" fill="{AXIS}">R</text>"#
     )?;
+    let zero = geometry.y(0.0);
     for value in [
         geometry.y_min,
         (geometry.y_min / 2.0 + geometry.y_max / 2.0),
         geometry.y_max,
     ] {
         let y = geometry.y(value);
+        if (y - zero).abs() < 14.0 {
+            continue; // Reserve the explicit zero label; avoid overlapping ticks.
+        }
         write!(
             svg,
             r#"<line x1="{LEFT}" y1="{y:.3}" x2="{RIGHT}" y2="{y:.3}" stroke="{AXIS}" stroke-opacity="0.18"/><text x="70" y="{:.3}" text-anchor="end" font-size="11" fill="{AXIS}">{}</text>"#,
@@ -239,10 +278,10 @@ fn render_svg(artifact: &ExpectancyArtifact) -> Result<String, RenderError> {
             risk_label(value)
         )?;
     }
-    let zero = geometry.y(0.0);
     write!(
         svg,
-        r#"<line id="zero" x1="{LEFT}" y1="{zero:.3}" x2="{RIGHT}" y2="{zero:.3}" stroke="{AXIS}" stroke-opacity="0.55"/>"#
+        r#"<line id="zero" x1="{LEFT}" y1="{zero:.3}" x2="{RIGHT}" y2="{zero:.3}" stroke="{AXIS}" stroke-opacity="0.55"/><text id="zero-label" x="70" y="{:.3}" text-anchor="end" font-size="11" fill="{AXIS}">0 R</text>"#,
+        zero + 4.0,
     )?;
 
     // A null represented day ends a segment. Missing calendar dates are NOT
@@ -349,7 +388,7 @@ fn render_svg(artifact: &ExpectancyArtifact) -> Result<String, RenderError> {
     }
     write!(
         svg,
-        r#"<text x="476" y="308" text-anchor="middle" font-size="11" fill="{AXIS}">Дата сигнала (UTC)</text></svg>"#
+        r#"<text x="476" y="308" text-anchor="middle" font-size="11" fill="{AXIS}">Дата сетапа (UTC)</text></svg>"#
     )?;
     Ok(svg.0)
 }
@@ -499,7 +538,9 @@ mod tests {
         assert_eq!(svg.matches("class=\"daily-segment\"").count(), 1);
         assert!(svg.contains("+0.00 R</text>"));
         assert!(svg.contains("+1.50 R</text>"));
-        assert!(svg.contains(TITLE) && svg.contains("Дата сигнала (UTC)"));
+        assert!(svg.contains(&format!("{TITLE} · Среднее МО: +0.80 R</text>")));
+        assert!(svg.contains("Дата сетапа (UTC)"));
+        assert!(!svg.contains("Дата сигнала"));
         assert!(svg.contains("03.01</text>")); // represented null day remains on the date axis
         let line = format!(
             "{:.3},{:.3} {:.3},{:.3}",
@@ -536,12 +577,63 @@ mod tests {
                 .all(|pixel| pixel[3] == 255)
         );
         assert!(
-            count_color(&pixels, [236, 238, 240], (250, 5, 650, 35)) > 100,
-            "Cyrillic title rasterized"
+            count_color(&pixels, [24, 207, 152], (100, 5, 800, 35)) > 100,
+            "positive period mean colors the Cyrillic title green"
         );
         assert!(count_color(&pixels, [24, 207, 152], (70, 55, 880, 260)) > 20);
         assert!(count_color(&pixels, [240, 138, 127], (70, 55, 880, 260)) > 10);
         assert!(count_color(&pixels, [245, 176, 65], (70, 40, 880, 260)) > 30);
+    }
+
+    #[test]
+    fn period_mean_is_trade_weighted_and_zero_label_follows_the_axis_in_every_sign() {
+        let weighted = with_outcomes(2.0, 1.0, &[(0, 2, 1), (3, 0, 1), (9, 1, 0)]);
+        assert!((period_mean_r(&weighted, weighted.daily.as_ref().unwrap()) - 0.8).abs() < 1e-12);
+        assert!(
+            render_svg(&weighted)
+                .unwrap()
+                .contains("Среднее МО: +0.80 R</text>")
+        );
+        for (artifact, color, rgb, label) in [
+            (
+                with_outcomes(2.0, 1.0, &[(0, 2, 1)]),
+                POSITIVE,
+                [24, 207, 152],
+                "+1.00 R",
+            ),
+            (
+                with_outcomes(2.0, 1.0, &[(0, 0, 1)]),
+                NEGATIVE,
+                [240, 138, 127],
+                "-1.00 R",
+            ),
+            (
+                with_outcomes(1.0, 1.0, &[(0, 1, 1)]),
+                FOREGROUND,
+                [236, 238, 240],
+                "+0.00 R",
+            ),
+            (
+                with_outcomes(0.999, 1.0, &[(0, 1, 1)]),
+                NEGATIVE,
+                [240, 138, 127],
+                "+0.00 R",
+            ),
+        ] {
+            let svg = render_svg(&artifact).unwrap();
+            assert!(svg.contains(&format!(
+                "fill=\"{color}\">{TITLE} · Среднее МО: {label}</text>"
+            )));
+            let geometry =
+                Geometry::from_points(artifact.daily.as_ref().unwrap(), artifact.trend).unwrap();
+            assert!(svg.contains(&format!(
+                "id=\"zero-label\" x=\"70\" y=\"{:.3}\"",
+                geometry.y(0.0) + 4.0
+            )));
+            assert_eq!(svg.matches(">0 R</text>").count(), 1);
+            let (_, pixels) = decoded(&render_png(&artifact).unwrap());
+            assert!(count_color(&pixels, rgb, (100, 5, 800, 35)) > 100);
+        }
     }
 
     #[test]
@@ -612,6 +704,10 @@ mod tests {
         let second = render_png(&artifact).unwrap();
         assert_eq!(Sha256::digest(&first), Sha256::digest(&second));
         let key = image_key(&artifact);
+        assert_eq!(
+            key.render_version, 1,
+            "do not requeue historical assets for presentation-only fixes"
+        );
         assert_eq!(key, artifact.image_key(RENDER_VERSION));
         assert_eq!(
             key.timezone,

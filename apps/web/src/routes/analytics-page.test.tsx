@@ -399,13 +399,35 @@ it.each(["America/New_York", "Pacific/Auckland"])("renders calendar UTC spacing,
   expect(screen.getByLabelText("Начало тренда: +0.00R")).toHaveTextContent("+0.00R");
   expect(screen.getByLabelText("Конец тренда: +1.50R")).toHaveTextContent("+1.50R");
   expect(chart.querySelector('line[stroke-dasharray="4 4"] title')).toHaveTextContent("+0.17R/день UTC, за период +1.50R");
-  expect(chart).toHaveTextContent("Дата сигнала (UTC)");
+  expect(chart).toHaveTextContent("Дата сетапа (UTC)");
+  expect(chart).not.toHaveTextContent("Дата сигнала");
+  expect(screen.getByRole("heading", { name: /^Дневное матожидание в рисках/ })).toHaveTextContent("Среднее МО: +0.80R");
+  expect(screen.getByLabelText("Среднее МО за период")).toHaveClass("text-success");
+  const zero = screen.getByLabelText("Нулевой уровень");
+  expect(zero).toHaveTextContent("0 R");
+  expect(Number(zero.getAttribute("x"))).toBeLessThan(64);
+  expect(Number(chart.querySelector('line[class="stroke-muted-foreground/50"]')?.getAttribute("y1"))).toBeCloseTo(Number(zero.getAttribute("y")) - 4, 8);
   expect(circles[0]).toHaveClass("fill-success"); expect(circles[1]).toHaveClass("fill-danger");
   expect(screen.getByText("Win rate: 60.0%")).toBeInTheDocument();
   expect(screen.getByText("Матожидание: +0.80R по 5 закрытым")).toBeInTheDocument(); // Trade-weighted, not 2/3 daily mean.
   expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(1);
   expect(calls.some((call) => call.path.startsWith("/v1/analytics/trades/"))).toBe(false);
   expect(calls.some((call) => call.method !== "GET")).toBe(false);
+});
+
+it.each([
+  { risk: 1, label: "+1.00R", color: "text-success" },
+  { risk: -1, label: "-1.00R", color: "text-danger" },
+  { risk: 0, label: "+0.00R", color: "text-muted-foreground" },
+  { risk: -0.001, label: "+0.00R", color: "text-danger" },
+])("labels zero and colors the period mean before rounding ($risk)", async ({ risk, label, color }) => {
+  stubFetch(utcChartOptions([utcTrade("2026-01-04T12:00:00Z", risk, 0)]));
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByText("Сделок: 1 / 1");
+  const mean = screen.getByLabelText("Среднее МО за период");
+  expect(mean).toHaveTextContent(label); expect(mean).toHaveClass(color);
+  expect(screen.getByLabelText("Нулевой уровень")).toHaveTextContent("0 R");
 });
 
 it("renders a single UTC-day point centered without a fabricated trend or endpoint labels", async () => {
