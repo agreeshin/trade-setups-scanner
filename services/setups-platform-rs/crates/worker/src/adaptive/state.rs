@@ -87,9 +87,9 @@ impl CachedProfile {
         }
         Ok(())
     }
-    fn retained_bytes(&self) -> usize {
+    fn retained_bytes(&self, key_len:usize) -> usize {
         size_of::<Self>()+self.detector.as_ref().map_or(0,SharedProfile::retained_bytes)
-            + self.spec.key().len()
+            + key_len
     }
 }
 
@@ -102,7 +102,7 @@ pub(crate) struct PreparedProfile {
     next: CachedProfile,
 }
 impl PreparedProfile {
-    pub(crate) fn retained_scalar_bytes(&self)->usize { self.next.retained_bytes()+self.key.len() }
+    pub(crate) fn retained_scalar_bytes(&self)->usize { self.next.retained_bytes(self.key.len())+self.key.len() }
     pub(crate) fn should_commit(&self)->bool {
         !self.next.spec.pending && !self.next.spec.waiting && self.next.initialized
             && (self.expected.as_ref()!=Some(&self.checkpoint) || !self.setups.is_empty())
@@ -128,13 +128,19 @@ pub struct AdaptiveRuntime {
     symbols: BTreeMap<String,SymbolState>,
     locations: BTreeMap<(String,String),String>,
     epoch: u64,
+    // Valid only until an accounted profile footprint changes; the public limit
+    // must also match. Exact accounting remains independent of this admission proof.
+    profile_budget_validated_at_limit: Option<usize>,
+    #[cfg(test)]
+    profile_budget_checks: usize,
 }
 impl AdaptiveRuntime {
-    pub fn new(limits: AdaptiveRuntimeLimits) -> Self {Self {limits,symbols:BTreeMap::new(),locations:BTreeMap::new(),epoch:0}}
+    pub fn new(limits: AdaptiveRuntimeLimits) -> Self {Self {limits,symbols:BTreeMap::new(),locations:BTreeMap::new(),epoch:0,
+        profile_budget_validated_at_limit:None,#[cfg(test)] profile_budget_checks:0}}
     pub fn retained_history_epochs(&self)->usize {self.symbols.len()}
     pub fn retained_history_bytes(&self)->usize {self.symbols.values().map(|s|s.history.retained_bytes()).sum()}
-    pub fn retained_profile_bytes(&self)->usize {self.symbols.values().flat_map(|s|s.profiles.values()).map(CachedProfile::retained_bytes).sum()}
-    pub fn clear(&mut self) {self.symbols.clear();self.locations.clear();}
+    pub fn retained_profile_bytes(&self)->usize {self.symbols.values().flat_map(|s|s.profiles.iter()).map(|(key,p)|p.retained_bytes(key.len())).sum()}
+    pub fn clear(&mut self) {self.profile_budget_validated_at_limit=None;self.symbols.clear();self.locations.clear();}
     pub(crate) fn profile_epoch(&self,instrument:&AdaptiveInstrument,profile:&str)->Option<String> {
         let symbol=serde_json::json!([instrument.exchange,instrument.category,instrument.symbol]).to_string();
         self.locations.get(&(symbol,profile.into())).cloned()
@@ -178,9 +184,14 @@ impl AdaptiveRuntime {
         serde_json::json!([instrument.exchange,instrument.category,instrument.symbol,pending]).to_string()
     }
     pub(crate) fn reconcile(&mut self, wanted:&BTreeMap<String,BTreeSet<String>>) {
+        let validated=&mut self.profile_budget_validated_at_limit;
         self.symbols.retain(|key,symbol| {
-            if let Some(keep)=wanted.get(key) {symbol.profiles.retain(|key,_|keep.contains(key));!symbol.profiles.is_empty()}
-            else {false}
+            if let Some(keep)=wanted.get(key) {
+                symbol.profiles.retain(|key,_| {
+                    let retain=keep.contains(key);if !retain {*validated=None;} retain
+                });
+                if symbol.profiles.is_empty() {*validated=None;false}else{true}
+            }else {*validated=None;false}
         });
         self.locations.retain(|(_,profile),epoch|self.symbols.get(epoch).is_some_and(|s|s.profiles.contains_key(profile)));
     }
@@ -224,10 +235,16 @@ impl AdaptiveRuntime {
             // A newly attached profile must replay from its OWN live origin;
             // it cannot inherit another generation's cooldown/cluster state.
             if !symbol.history.is_empty() {return Err(invalid("new profile requires verified staged history epoch"));}
+            self.profile_budget_validated_at_limit=None;
             symbol.profiles.insert(profile_key.clone(),CachedProfile::new(spec.clone())?);
             if !spec.pending {self.locations.insert((symbol_key.clone(),profile_key),key.into());}
         }
-        if self.retained_profile_bytes()>self.limits.max_profile_bytes {return Err(invalid("live profile state exceeds byte admission budget"));}
+        if self.profile_budget_validated_at_limit!=Some(self.limits.max_profile_bytes) {
+            self.profile_budget_validated_at_limit=None;
+            #[cfg(test)] {self.profile_budget_checks+=1;}
+            if self.retained_profile_bytes()>self.limits.max_profile_bytes {return Err(invalid("live profile state exceeds byte admission budget"));}
+            self.profile_budget_validated_at_limit=Some(self.limits.max_profile_bytes);
+        }
         Ok(())
     }
     pub(crate) fn fetch_bounds(&self,key:&str,target:i64)->Result<(i64,i64),WorkerError> {
@@ -249,6 +266,7 @@ impl AdaptiveRuntime {
                 return Ok(false);
             }
         }
+        self.profile_budget_validated_at_limit=None;
         let mut staged=self.symbols.remove(staging).unwrap();
         if let Some(current)=self.symbols.remove(production) {
             for (key,profile) in &mut staged.profiles {
@@ -269,14 +287,18 @@ impl AdaptiveRuntime {
         Ok(true)
     }
     pub(crate) fn remove_profile(&mut self,epoch:&str,candidate:&str) {
-        if let Some(symbol)=self.symbols.get_mut(epoch) {symbol.profiles.remove(candidate);}
+        if let Some(symbol)=self.symbols.get_mut(epoch) && symbol.profiles.contains_key(candidate) {
+            self.profile_budget_validated_at_limit=None;symbol.profiles.remove(candidate);
+        }
         self.locations.retain(|(_,profile),owner|owner!=epoch || profile!=candidate);
-        if self.symbols.get(epoch).is_some_and(|s|s.profiles.is_empty()) {self.symbols.remove(epoch);}
+        if self.symbols.get(epoch).is_some_and(|s|s.profiles.is_empty()) {
+            self.profile_budget_validated_at_limit=None;self.symbols.remove(epoch);
+        }
     }
     pub(crate) fn invalidate(&mut self,key:&str,_profile:Option<&str>) {
         // A lost profile CAS may have retained an anchor while sibling states
         // advanced. Rebuild this symbol's epoch, never reuse that partial ring.
-        self.symbols.remove(key);
+        if self.symbols.contains_key(key) {self.profile_budget_validated_at_limit=None;self.symbols.remove(key);}
         self.locations.retain(|_,epoch|epoch!=key);
     }
     pub(crate) fn ready(&self,key:&str,profile:&str,frontier:i64)->bool {
@@ -368,7 +390,13 @@ impl AdaptiveRuntime {
     }
     pub(crate) fn accept(&mut self,key:&str,mut prepared:PreparedProfile,committed:bool) {
         if committed {prepared.next.expected=Some(prepared.checkpoint.clone());}
-        if let Some(symbol)=self.symbols.get_mut(key) {symbol.profiles.insert(prepared.key,prepared.next);}
+        if let Some(symbol)=self.symbols.get_mut(key) {
+            let bytes=prepared.next.retained_bytes(prepared.key.len());
+            if symbol.profiles.get(&prepared.key).is_none_or(|old|old.retained_bytes(prepared.key.len())!=bytes) {
+                self.profile_budget_validated_at_limit=None;
+            }
+            symbol.profiles.insert(prepared.key,prepared.next);
+        }
     }
 }
 impl Default for AdaptiveRuntime {fn default()->Self {Self::new(AdaptiveRuntimeLimits::default())}}
@@ -434,6 +462,203 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn repeated_install_and_unchanged_reconcile_refresh_controls_without_rescanning_or_resetting() {
+        let mut f=fixture();let key=f.spec.key();
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars,f.frontier).unwrap();
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        let checks=f.runtime.profile_budget_checks;
+        let before=profile_snapshot(&f.runtime.symbols[&f.epoch].profiles[&key]);
+        let history=history_snapshot(&f.runtime.symbols[&f.epoch].history);
+        let identity=f.runtime.symbols[&f.epoch].history.identity();
+        let bytes=f.runtime.retained_profile_bytes();
+        let wanted=BTreeMap::from([(f.epoch.clone(),BTreeSet::from([key.clone()]))]);
+        let mut fresh=f.spec.clone();fresh.waiting=true;fresh.publish_enabled=false;fresh.emit_from_close+=600;
+        fresh.recommendation=Arc::new(serde_json::json!({"timeShiftMinutes":7,"refreshed":true}));
+        for _ in 0..32 {
+            f.runtime.reconcile(&wanted);
+            f.runtime.install(&f.epoch,std::slice::from_ref(&fresh)).unwrap();
+        }
+        assert_eq!(f.runtime.profile_budget_checks,checks);
+        let profile=&f.runtime.symbols[&f.epoch].profiles[&key];
+        assert!(Arc::ptr_eq(&profile.spec.recommendation,&fresh.recommendation));
+        assert!(profile.spec.waiting);assert!(!profile.spec.publish_enabled);
+        assert_eq!(profile.spec.emit_from_close,fresh.emit_from_close);
+        assert_eq!(profile_snapshot(profile),before);
+        assert_eq!(profile.spec.from_open,f.spec.from_open);assert_eq!(profile.spec.params,f.spec.params);
+        assert_eq!(history_snapshot(&f.runtime.symbols[&f.epoch].history),history);
+        assert_eq!(f.runtime.symbols[&f.epoch].history.identity(),identity);
+        assert_eq!(f.runtime.retained_profile_bytes(),bytes);
+        let prepared=f.runtime.prepare(&f.epoch,&f.instrument,&[],f.frontier,true).unwrap().pop().unwrap();
+        let old_definition=size_of::<CachedProfile>()
+            +prepared.next.detector.as_ref().map_or(0,SharedProfile::retained_bytes)+prepared.next.spec.key().len();
+        assert_eq!(prepared.retained_scalar_bytes(),old_definition+prepared.key.len());
+        f.runtime.accept(&f.epoch,prepared,false);
+        f.runtime.install(&f.epoch,std::slice::from_ref(&fresh)).unwrap();
+        assert_eq!(f.runtime.profile_budget_checks,checks,"scalar-only accept preserves admission");
+    }
+
+    #[test]
+    fn owned_key_accounting_matches_original_sum_across_epochs_and_materialization() {
+        fn original_sum(runtime:&AdaptiveRuntime)->usize {
+            runtime.symbols.values().flat_map(|s|s.profiles.values()).map(|p|
+                size_of::<CachedProfile>()+p.detector.as_ref().map_or(0,SharedProfile::retained_bytes)
+                    +p.spec.key().len()).sum()
+        }
+        let mut f=fixture();let mut sibling=f.spec.clone();
+        sibling.fence.owner_id="another-owner-Ж".into();sibling.fence.generation_id=12345;
+        let staged=AdaptiveRuntime::epoch_key(&f.instrument,Some(2));
+        for epoch in [&f.epoch,&staged] {
+            f.runtime.install(epoch,&[f.spec.clone(),sibling.clone()]).unwrap();
+            assert_eq!(f.runtime.retained_profile_bytes(),original_sum(&f.runtime));
+            for prepared in f.runtime.prepare(epoch,&f.instrument,&f.bars[..1],60,false).unwrap() {
+                assert_eq!(prepared.retained_scalar_bytes(),size_of::<CachedProfile>()
+                    +prepared.next.detector.as_ref().map_or(0,SharedProfile::retained_bytes)
+                    +prepared.next.spec.key().len()+prepared.key.len());
+                f.runtime.accept(epoch,prepared,false);
+                assert_eq!(f.runtime.retained_profile_bytes(),original_sum(&f.runtime));
+            }
+        }
+        f.runtime.remove_profile(&staged,&sibling.key());
+        assert_eq!(f.runtime.retained_profile_bytes(),original_sum(&f.runtime));
+        f.runtime.invalidate(&staged,None);
+        assert_eq!(f.runtime.retained_profile_bytes(),original_sum(&f.runtime));
+        f.runtime.clear();assert_eq!(f.runtime.retained_profile_bytes(),original_sum(&f.runtime));
+    }
+
+    #[test]
+    fn detector_materialization_and_changed_limits_force_exact_recheck_including_retries() {
+        let mut f=fixture();
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        let cold=f.runtime.retained_profile_bytes();f.runtime.limits.max_profile_bytes=cold;
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        let checks=f.runtime.profile_budget_checks;
+        feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars[..1],60).unwrap();
+        let materialized=f.runtime.retained_profile_bytes();assert!(materialized>cold);
+        assert_eq!(f.runtime.profile_budget_validated_at_limit,None);
+        for retry in 1..=2 {
+            assert!(f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).is_err());
+            assert_eq!(f.runtime.profile_budget_checks,checks+retry);
+            assert_eq!(f.runtime.profile_budget_validated_at_limit,None);
+            assert_eq!(f.runtime.retained_profile_bytes(),materialized);
+        }
+        f.runtime.limits.max_profile_bytes=materialized;
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        let checks=f.runtime.profile_budget_checks;
+        feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars[1..2],120).unwrap();
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        assert_eq!(f.runtime.profile_budget_checks,checks,"initialized detector updates do not grow");
+        f.runtime.limits.max_profile_bytes=materialized-1;
+        assert!(f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).is_err());
+        assert_eq!(f.runtime.profile_budget_checks,checks+1);
+        assert_eq!(f.runtime.profile_budget_validated_at_limit,None);
+    }
+
+    #[test]
+    fn failed_insertion_and_partial_install_error_cannot_certify_an_identical_retry() {
+        let mut f=fixture();let mut sibling=f.spec.clone();sibling.fence.slot_id=2;
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        let bytes=f.runtime.retained_profile_bytes();f.runtime.limits.max_profile_bytes=bytes;
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        for _ in 0..2 {
+            let checks=f.runtime.profile_budget_checks;
+            assert!(f.runtime.install(&f.epoch,&[f.spec.clone(),sibling.clone()]).is_err());
+            assert_eq!(f.runtime.profile_budget_checks,checks+1);
+            assert_eq!(f.runtime.profile_budget_validated_at_limit,None);
+            assert_eq!(f.runtime.symbols[&f.epoch].profiles.len(),2,"no silent eviction on rejection");
+        }
+        f.runtime.remove_profile(&f.epoch,&sibling.key());
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        let mut invalid=sibling.clone();invalid.fence.slot_id=3;invalid.cluster_gap_minutes=Some(0);
+        let checks=f.runtime.profile_budget_checks;
+        assert!(f.runtime.install(&f.epoch,&[sibling,invalid]).is_err());
+        assert_eq!(f.runtime.profile_budget_checks,checks,"constructor failed before final admission");
+        assert_eq!(f.runtime.profile_budget_validated_at_limit,None);
+        assert!(f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).is_err(),
+            "earlier insertion survived the constructor error and must be counted");
+        assert_eq!(f.runtime.profile_budget_checks,checks+1);
+    }
+
+    #[test]
+    fn accept_of_missing_profile_invalidates_a_newer_admission_proof() {
+        let mut f=fixture();let mut sibling=f.spec.clone();sibling.fence.slot_id=2;
+        f.runtime.install(&f.epoch,&[f.spec.clone(),sibling.clone()]).unwrap();
+        let prepared=f.runtime.prepare(&f.epoch,&f.instrument,&[],0,false).unwrap().into_iter()
+            .find(|p|p.key==sibling.key()).unwrap();
+        f.runtime.remove_profile(&f.epoch,&sibling.key());
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        let bytes=f.runtime.retained_profile_bytes();let checks=f.runtime.profile_budget_checks;
+        f.runtime.accept(&f.epoch,prepared,false);
+        assert!(f.runtime.retained_profile_bytes()>bytes);
+        assert_eq!(f.runtime.profile_budget_validated_at_limit,None);
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        assert_eq!(f.runtime.profile_budget_checks,checks+1);
+    }
+
+    #[test]
+    fn removals_reconcile_invalidation_and_clear_release_memory_and_owned_references() {
+        let mut f=fixture();
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        let base_bytes=f.runtime.retained_profile_bytes();
+        let wanted=BTreeMap::from([(f.epoch.clone(),BTreeSet::from([f.spec.key()]))]);
+        let identity=f.runtime.symbols[&f.epoch].history.identity();
+        for explicit_remove in [true,false,true,false] {
+            let mut sibling=f.spec.clone();sibling.fence.slot_id=2;
+            sibling.recommendation=Arc::new(serde_json::json!({"owned":"candidate"}));
+            let weak=Arc::downgrade(&sibling.recommendation);let key=sibling.key();
+            f.runtime.install(&f.epoch,std::slice::from_ref(&sibling)).unwrap();drop(sibling);
+            assert!(weak.upgrade().is_some());assert!(f.runtime.retained_profile_bytes()>base_bytes);
+            let checks=f.runtime.profile_budget_checks;
+            f.runtime.remove_profile(&f.epoch,"absent");f.runtime.invalidate("absent",None);
+            assert!(f.runtime.profile_budget_validated_at_limit.is_some());
+            if explicit_remove {f.runtime.remove_profile(&f.epoch,&key);}else{f.runtime.reconcile(&wanted);}
+            assert_eq!(f.runtime.profile_budget_validated_at_limit,None);assert!(weak.upgrade().is_none());
+            assert_eq!(f.runtime.retained_profile_bytes(),base_bytes);
+            assert!(f.runtime.profile_epoch(&f.instrument,&key).is_none());
+            f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+            assert_eq!(f.runtime.profile_budget_checks,checks+1);
+        }
+        f.runtime.invalidate(&f.epoch,None);
+        assert_eq!(f.runtime.retained_profile_bytes(),0);assert_eq!(f.runtime.retained_history_bytes(),0);
+        assert!(f.runtime.locations.is_empty());assert_eq!(f.runtime.profile_budget_validated_at_limit,None);
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        assert_ne!(f.runtime.symbols[&f.epoch].history.identity(),identity);
+        f.runtime.remove_profile(&f.epoch,&f.spec.key());
+        assert_eq!(f.runtime.retained_history_epochs(),0);assert_eq!(f.runtime.retained_profile_bytes(),0);
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        f.runtime.reconcile(&BTreeMap::new());
+        assert_eq!(f.runtime.retained_history_bytes(),0);assert!(f.runtime.locations.is_empty());
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        f.runtime.clear();assert_eq!(f.runtime.profile_budget_validated_at_limit,None);
+        assert_eq!(f.runtime.retained_history_bytes(),0);assert_eq!(f.runtime.retained_profile_bytes(),0);
+        assert!(f.runtime.locations.is_empty());
+    }
+
+    #[test]
+    fn certified_install_still_enforces_profile_counts_capacity_and_revision_reconstruction() {
+        let mut f=fixture();f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        let mut revision=f.spec.clone();revision.fence.config_revision+=1;
+        f.runtime.limits.max_profiles=1;
+        assert!(f.runtime.install(&f.epoch,&[f.spec.clone(),revision.clone()]).is_err());
+        f.runtime.limits.max_profiles=4;
+        feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars[..1],60).unwrap();
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        let checks=f.runtime.profile_budget_checks;let bytes=f.runtime.retained_profile_bytes();
+        assert!(f.runtime.needs_reconstruction(&f.epoch,std::slice::from_ref(&revision)));
+        assert!(f.runtime.install(&f.epoch,&[revision]).is_err());
+        let mut larger=f.spec.clone();if let AlgorithmParams::Spike(p)=&mut larger.params {p.baseline_long_days+=1;}
+        assert!(f.runtime.install(&f.epoch,&[larger]).is_err());
+        assert_eq!(f.runtime.retained_profile_bytes(),bytes);assert_eq!(f.runtime.profile_budget_checks,checks);
+        f.runtime.limits.max_history_bytes=0;
+        let other=AdaptiveRuntime::epoch_key(&f.instrument,Some(2));
+        assert!(f.runtime.install(&other,std::slice::from_ref(&f.spec)).is_err());
+        assert!(!f.runtime.has_epoch(&other));
+        f.runtime.limits.max_history_bytes=8*1024*1024;f.runtime.limits.max_symbols=0;
+        assert!(f.runtime.install(&other,std::slice::from_ref(&f.spec)).is_err());
+        assert!(!f.runtime.has_epoch(&other));
+    }
+
+    #[test]
     fn changed_active_cohort_rejects_staging_adoption_without_replacing_either_epoch() {
         let mut f=fixture();let mut sibling=f.spec.clone();sibling.fence.slot_id=3;sibling.fence.generation_id=3;
         f.runtime.install(&f.epoch,&[f.spec.clone(),sibling.clone()]).unwrap();
@@ -447,7 +672,10 @@ pub(crate) mod tests {
         let production=history_snapshot(&f.runtime.symbols[&f.epoch].history);
         let staging=history_snapshot(&f.runtime.symbols[&staged].history);
         let expected=BTreeMap::from([(f.spec.key(),f.runtime.checkpoint_for(&f.epoch,&f.spec.key()).unwrap())]);
+        f.runtime.install(&staged,std::slice::from_ref(&candidate)).unwrap();
+        let admission=f.runtime.profile_budget_validated_at_limit;
         assert!(!f.runtime.adopt_staging(&staged,&f.epoch,&candidate.key(),&expected).unwrap());
+        assert_eq!(f.runtime.profile_budget_validated_at_limit,admission);
         assert_eq!(history_snapshot(&f.runtime.symbols[&f.epoch].history),production);
         assert_eq!(history_snapshot(&f.runtime.symbols[&staged].history),staging);
         assert_eq!(f.runtime.retained_history_epochs(),2);
@@ -544,7 +772,13 @@ pub(crate) mod tests {
         assert_ne!(candidate_before.last_raw_open_unix,incumbent.last_raw_open_unix,"distinct origins must not borrow another profile's cooldown phase");
         assert_eq!(f.runtime.checkpoint_for(&staging,&f.spec.key()),Some(incumbent.clone()));
         f.runtime.acknowledge_source(&staging,TailReadToken {epoch:"fixture".into(),revision:"1".into()}).unwrap();
+        f.runtime.install(&staging,std::slice::from_ref(&candidate)).unwrap();
+        assert!(f.runtime.profile_budget_validated_at_limit.is_some());
         assert!(f.runtime.adopt_staging(&staging,&f.epoch,&candidate.key(),&BTreeMap::from([(f.spec.key(),incumbent)])).unwrap());
+        assert_eq!(f.runtime.profile_budget_validated_at_limit,None);
+        let checks=f.runtime.profile_budget_checks;
+        f.runtime.install(&f.epoch,std::slice::from_ref(&candidate)).unwrap();
+        assert_eq!(f.runtime.profile_budget_checks,checks+1);
         f.runtime.activate(&f.epoch,&candidate.key(),target).unwrap();
         assert_eq!(f.runtime.checkpoint_for(&f.epoch,&candidate.key()),Some(candidate_before),"promotion changes ownership, not raw state");
         let mut reference=PriceVolumeSpikeDetector::with_params(candidate.params.clone(),None).unwrap();
