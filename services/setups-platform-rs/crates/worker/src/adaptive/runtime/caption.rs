@@ -223,9 +223,6 @@ fn format_caption(
             .ok_or_else(|| invalid("invalid entry timestamp"))?;
         out.plain("\n⏳ Рекомендуемое время входа: ")?;
         out.code(&format!("{} UTC", time.format("%H:%M:%S")))?;
-        out.plain(" (через ")?;
-        out.code(&snapshot.time_shift_minutes.to_string())?;
-        out.plain(" мин после сетапа)")?;
     }
     out.plain("\n🔖 TP = ")?;
     out.code(&format!("{}%", snapshot.tp_pct))?;
@@ -236,7 +233,7 @@ fn format_caption(
         let threshold = super::text::price_threshold(&raw.close_price, pct, snapshot.direction)?
             .replace(',', ".");
         out.plain(if short {
-            "\n⚠️ Заходить в сделку, только если цена не опустится ниже "
+            "\n⚠️ Заходить в сделку, если цена не опустится ниже "
         } else {
             "\n⚠️ Заходить в сделку, только если цена не поднимется выше "
         })?;
@@ -245,7 +242,11 @@ fn format_caption(
     }
     out.plain("\n\n")?;
     out.bold("Матожидание торговли:")?;
-    out.plain("\nПрогноз МО торговли: ")?;
+    out.plain(match metrics.forecast_r {
+        Some(value) if value < 0.0 => "\n📉 Прогноз МО: ",
+        Some(_) => "\n📈 Прогноз МО: ", // Zero consistently uses the rising icon.
+        None => "\nПрогноз МО: ",       // Unknown is not a directional forecast.
+    })?;
     optional_r(&mut out, metrics.forecast_r)?;
     out.plain("\nСреднее МО за последние ")?;
     out.code(&period_days)?;
@@ -325,8 +326,9 @@ mod tests {
         assert!(
             caption
                 .text
-                .contains("00:02:00 UTC (через 3 мин после сетапа)")
+                .contains("⏳ Рекомендуемое время входа: 00:02:00 UTC\n🔖 TP")
         );
+        assert!(!caption.text.contains("мин после сетапа"));
         assert!(
             caption
                 .text
@@ -335,9 +337,9 @@ mod tests {
         assert!(
             caption
                 .text
-                .contains("⚠️ Заходить в сделку, только если цена не опустится ниже 101.00 USDT")
+                .contains("⚠️ Заходить в сделку, если цена не опустится ниже 101.00 USDT")
         );
-        assert!(caption.text.contains("Прогноз МО торговли: недоступно\nСреднее МО за последние 1 суток: +0.32 R\nДинамика МО за последние 1 суток: недоступно\nСредний винрейт: недоступно\nВ среднем для других уровней TP и SL: +0.21 R"));
+        assert!(caption.text.contains("Прогноз МО: недоступно\nСреднее МО за последние 1 суток: +0.32 R\nДинамика МО за последние 1 суток: недоступно\nСредний винрейт: недоступно\nВ среднем для других уровней TP и SL: +0.21 R"));
         assert!(caption.text.ends_with("Алгоритм: <b>*plain name*😀"));
         assert!(!caption.text.contains("1970-") && !caption.text.contains("Исследование"));
         let headings: Vec<_> = caption
@@ -351,6 +353,53 @@ mod tests {
         assert_eq!(entity_text(&caption, &caption.entities[0]), "SKYUSDT");
         assert!(caption.fits_photo_caption());
         v2::validate_entities(&caption.text, &caption.entities).unwrap();
+    }
+
+    #[test]
+    fn forecast_icon_uses_unrounded_sign_and_keeps_metric_entities_exact() {
+        let (instrument, raw, value) = fixture();
+        let envelope: RecommendationEnvelope = serde_json::from_value(value).unwrap();
+        for (forecast, expected) in [
+            (Some(0.4), "📈 Прогноз МО: +0.40 R"),
+            (Some(-0.4), "📉 Прогноз МО: -0.40 R"),
+            (Some(0.0), "📈 Прогноз МО: +0.00 R"),
+            (Some(-0.001), "📉 Прогноз МО: -0.00 R"),
+            (None, "Прогноз МО: недоступно"),
+        ] {
+            let caption = format_caption(
+                &instrument,
+                &raw,
+                &envelope,
+                Metrics {
+                    forecast_r: forecast,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(caption.text.contains(expected));
+            assert!(!caption.text.contains("Прогноз МО торговли"));
+            assert!(!caption.text.contains("мин после сетапа"));
+            assert!(!caption.text.contains("только если цена не опустится ниже"));
+            v2::validate_entities(&caption.text, &caption.entities).unwrap();
+            if let Some(value) = forecast {
+                assert!(
+                    caption
+                        .entities
+                        .iter()
+                        .any(|entity| entity.kind == EntityKind::Code
+                            && entity_text(&caption, entity) == signed_r(value).unwrap())
+                );
+            } else {
+                assert!(!caption.text.contains('📈') && !caption.text.contains('📉'));
+            }
+            assert!(
+                caption
+                    .entities
+                    .iter()
+                    .any(|entity| entity.kind == EntityKind::Code
+                        && entity_text(&caption, entity) == "00:02:00 UTC")
+            );
+        }
     }
 
     #[test]
@@ -416,7 +465,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(caption.text.contains("Прогноз МО торговли: +0.40 R"));
+        assert!(caption.text.contains("📈 Прогноз МО: +0.40 R"));
         assert!(
             caption
                 .text

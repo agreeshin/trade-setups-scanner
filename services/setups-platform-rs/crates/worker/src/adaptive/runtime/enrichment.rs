@@ -813,7 +813,7 @@ mod tests {
             &setup.recommendation,
         )
         .unwrap();
-        assert!(caption.text.contains("Прогноз МО торговли: +2.11 R"));
+        assert!(caption.text.contains("📈 Прогноз МО: +2.11 R"));
         assert!(caption.text.contains("Средний винрейт: 71.11%"));
         assert!(
             caption
@@ -876,7 +876,7 @@ mod tests {
             &tampered,
         )
         .unwrap();
-        assert!(caption.text.contains("Прогноз МО торговли: недоступно"));
+        assert!(caption.text.contains("Прогноз МО: недоступно"));
         assert_eq!(
             caption.enrichment_unavailable_reason,
             Some("invalid_saved_enrichment")
@@ -1042,7 +1042,7 @@ mod tests {
         )
         .unwrap();
         assert!(caption.text.contains("Средний винрейт: 71.11%"));
-        assert!(caption.text.contains("Прогноз МО торговли: недоступно"));
+        assert!(caption.text.contains("Прогноз МО: недоступно"));
     }
 
     #[test]
@@ -1109,7 +1109,7 @@ mod tests {
             &setup.recommendation,
         )
         .unwrap();
-        assert!(caption.text.contains("Прогноз МО торговли: +2.11 R"));
+        assert!(caption.text.contains("📈 Прогноз МО: +2.11 R"));
         assert!(serde_json::to_vec(&saved).unwrap().len() < MAX_EXPECTANCY_SNAPSHOT_BYTES);
     }
 
