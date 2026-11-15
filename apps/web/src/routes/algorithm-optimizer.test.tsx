@@ -524,6 +524,7 @@ it("shows five inline summaries without pagination and all history in an open pa
   render(<AlgorithmsPage />);
   const table = within(await screen.findByRole("table", { name: "Исследования · Новый алгоритм" }));
   await table.findByRole("button", { name: "Результат исследования 30" });
+  expect(screen.queryByText("Загрузка истории исследований…")).not.toBeInTheDocument();
   expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"]);
   expect(table.getAllByRole("row")).toHaveLength(6);
   const first = within(table.getAllByRole("row")[1]!);
@@ -553,6 +554,8 @@ it("shows five inline summaries without pagination and all history in an open pa
   expect(fullTable.getAllByRole("row")[4]).toHaveTextContent("-0.13 R");
   expect(fullTable.getAllByRole("row")[5]).toHaveTextContent("1000000000000000000000.00 R");
   fireEvent.click(full.getByRole("button", { name: /Следующая страница/ }));
+  expect(screen.queryByText("Загрузка истории исследований…")).not.toBeInTheDocument();
+  expect(full.getByRole("table")).toHaveAttribute("aria-busy", "true");
   await fullTable.findByRole("button", { name: "Результат исследования 20" });
   expect(fullTable.getAllByRole("row")).toHaveLength(3);
   expect(full.getByRole("button", { name: /Следующая страница/ })).toBeDisabled();

@@ -55,7 +55,7 @@ function CoverageOverview({ revision }: { revision: number }) {
   const rows = all.filter((row) => (!withDataOnly || row.totalCandles > 0) && row.symbol.toLowerCase().includes(needle));
   return <section aria-labelledby="coverage-overview-heading" className="grid gap-3">
     <SectionHeader id="coverage-overview-heading" title="Обзор покрытия истории" />
-    <p className="text-xs text-muted-foreground">Инструментов со свечами: {withData} из {all.length}. «Пропущено минут» — суммарные разрывы между первой и последней сохранённой минутой инструмента; точные интервалы — в детальном покрытии ниже.</p>
+    <div className="flex flex-wrap items-center gap-2"><span className="text-xs text-muted-foreground">Инструментов со свечами: {withData} из {all.length}.</span><InfoNote>«Пропущено минут» — суммарные разрывы между первой и последней сохранённой минутой инструмента; точные интервалы — в детальном покрытии ниже.</InfoNote></div>
     <div className="flex flex-wrap items-end gap-4">
       <Field label="Фильтр по символу" className="min-w-48">{(control) => <Input value={filter} onChange={(event) => setFilter(event.target.value)} {...control} />}</Field>
       <label className="flex items-center gap-2 pb-1 text-sm"><Checkbox checked={withDataOnly} onCheckedChange={(checked) => setWithDataOnly(checked === true)} /> Только инструменты со свечами</label>

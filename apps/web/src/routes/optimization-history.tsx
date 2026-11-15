@@ -88,7 +88,6 @@ export function OptimizationHistory({ algorithmId, algorithmName, controller, on
         </TableRow>)}</TableBody>
       </Table>
     </div>
-    {loading && <p className="text-sm text-muted-foreground" role="status">Загрузка истории исследований…</p>}
     {pagination && page && <div className="flex flex-wrap items-center gap-2 text-sm">
       <Button type="button" variant="outline" size="sm" disabled={loading || page.offset === 0} aria-label={`Предыдущая страница исследований · ${algorithmName}`} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Назад</Button>
       <span>Страница {Math.floor(page.offset / pageSize) + 1} · всего {page.total}</span>

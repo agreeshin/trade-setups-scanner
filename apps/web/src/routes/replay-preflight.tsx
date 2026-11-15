@@ -23,7 +23,7 @@ export function ReplayPreflight({ preview }: { preview: PreflightResponse }) {
     <p className="text-sm">Проверено: {formatIsoDateTime(preview.checkedAt)}. Версия алгоритма: {preview.algorithmVersion}. Требуемая история: {preview.requiredHistoryMinutes} мин.</p>
     <p className="text-sm">Период расчёта: {localTime(preview.request.fromUnix)} – {localTime(preview.request.toUnix)} ({localTimezoneLabel()}).</p>
     <details><summary className="cursor-pointer">Снимок параметров для подтверждения</summary><dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">{Object.entries(preview.request.params).map(([key, value]) => <div key={key}><dt className="break-words text-muted-foreground">{key}</dt><dd>{value}</dd></div>)}</dl></details>
-    <p className="text-sm text-muted-foreground">Это снимок на момент проверки. Кеш и покрытие могут измениться до исполнения; исполнитель повторно проверяет кеш. Покрытие минут не гарантирует пригодность по допускам алгоритма. Частичный расчёт по имеющимся данным разрешён; история автоматически не догружается.</p>
+    <InfoNote>Это снимок на момент проверки. Кеш и покрытие могут измениться до исполнения; исполнитель повторно проверяет кеш. Покрытие минут не гарантирует пригодность по допускам алгоритма. Частичный расчёт по имеющимся данным разрешён; история автоматически не догружается.</InfoNote>
     {preview.results.length > 0 && <Dialog>
       <DialogTrigger asChild><Button variant="outline" className="h-auto whitespace-normal py-2 text-left">Показать проверенные наборы свечей</Button></DialogTrigger>
       <DialogContent className="max-w-2xl">
@@ -45,7 +45,7 @@ export function ReplayPreflight({ preview }: { preview: PreflightResponse }) {
               {item.coverage.presentMinutes === 0 && <p>Проверено: в этом входном диапазоне истории нет. Это не ошибка доступности; пригодных минут может не оказаться.</p>}
               {item.coverage.missingMinutes > 0 && <p>Есть отсутствующие минуты. При подтверждении будет выполнен расчёт по имеющимся данным; итог может быть частичным или без пригодных минут.</p>}
               <details><summary className="cursor-pointer">Пропуски: показано {Math.min(50, item.coverage.gaps.length)} из {item.coverage.gapCount} интервалов</summary>
-                <p className="mt-2 text-xs text-muted-foreground">Ограниченный предварительный список. Интервалы [начало, конец), на UTC-сетке открытия минут; показаны в {localTimezoneLabel()}.</p>
+                <InfoNote>Ограниченный предварительный список. Интервалы [начало, конец), на UTC-сетке открытия минут; показаны в {localTimezoneLabel()}.</InfoNote>
                 <ul className="mt-2 max-h-64 overflow-y-auto">{item.coverage.gaps.slice(0, 50).map((gap) => <li key={`${gap.fromUnix}-${gap.toUnix}`}>{localTime(gap.fromUnix)} – {localTime(gap.toUnix)}</li>)}</ul>
               </details>
             </> : <Alert variant="warning" role="alert">{item.status === "not_found" ? "Инструмент не найден" : "Покрытие недоступно или не получено"}{item.error ? `: ${item.error}` : ". Это не означает пустую историю."}</Alert>}
@@ -56,3 +56,4 @@ export function ReplayPreflight({ preview }: { preview: PreflightResponse }) {
     {!preview.canRun && <Alert variant="destructive" role="alert">Запуск недоступен: устраните ошибки проверки и проверьте данные снова.</Alert>}
   </section></Card>;
 }
+import { InfoNote } from "../components/ui/info-note";

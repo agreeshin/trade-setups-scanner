@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { RefreshCw, Settings, Square } from "lucide-react";
 import { Alert } from "../components/ui/alert";
-import { Badge } from "../components/ui/badge";
+import { Badge, type BadgeVariant } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Checkbox } from "../components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { InfoNote } from "../components/ui/info-note";
+import { IconButton } from "../components/ui/icon-button";
+import { Tooltip } from "../components/ui/tooltip";
 import { Spinner } from "../components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { effectiveTimezone, formatIsoDateTime, formatUnix } from "../lib/datetime-format";
@@ -54,16 +57,32 @@ function SlotReadiness({ slot }: { slot: ContinuousSlot }) {
   </div>;
 }
 
-function SlotIncumbent({ slot }: { slot: ContinuousSlot }) {
-  if (slot.activeGenerationId === null) return <div className="grid gap-1 text-xs"><span className="text-sm">Нет действующего поколения</span><span>Адаптивные сигналы этого профиля не формируются.</span><SlotReadiness slot={slot} /></div>;
-  return <div className="grid gap-1 text-xs">
-    <span className="text-sm">{slot.activeStatus === "active" ? "Действующее" : "Принятое"} поколение #{slot.activeGenerationId}</span>
-    <span>{slot.activeStudyId == null ? "Исследование действующего поколения неизвестно" : `Источник метрик и рекомендации: исследование #${slot.activeStudyId} · поколение #${slot.activeGenerationId}`}</span>
-    <Badge>{slot.activeStatus === "active" ? "Активно" : slot.activeStatus === "inactive" ? "Неактивно" : "Состояние live неизвестно (старый API)"}</Badge>
-    <span>Принятое поколение сохранено</span>
+function readinessVariant(slot: ContinuousSlot, problem: boolean): BadgeVariant {
+  const summary = slot.liveReadinessSummary;
+  if (problem || slot.activeGenerationId === null || slot.activeStatus !== "active" || summary?.generationId !== slot.activeGenerationId
+    || summary.totalInstruments <= 0 || !Number.isFinite(summary.readyInstruments) || summary.readyInstruments < 0 || summary.readyInstruments > summary.totalInstruments
+    || ["error", "failed"].includes(slot.status) || slot.pendingStatus === "error" || slot.pendingError != null) return "danger";
+  const ready = summary.readyInstruments / summary.totalInstruments;
+  return ready >= 0.95 ? "success" : ready >= 0.5 ? "warning" : "danger";
+}
+
+function SlotIncumbent({ slot, problem }: { slot: ContinuousSlot; problem: boolean }) {
+  const absent = slot.activeGenerationId === null;
+  return <Tooltip content={<div className="grid gap-2">
+    {absent ? <span>Адаптивные сигналы этого профиля не формируются.</span> : <>
+      <span>{slot.activeStudyId == null ? "Исследование действующего поколения неизвестно" : `Источник метрик и рекомендации: исследование #${slot.activeStudyId} · поколение #${slot.activeGenerationId}`}</span>
+      <span>Принятое поколение сохранено</span>
+    </>}
     <SlotReadiness slot={slot} />
-    <span>{slot.liveWatermark == null ? "Watermark переключения неизвестен" : `Watermark переключения: ${closedTime(slot.liveWatermark)}`}</span>
-  </div>;
+    {!absent && <span>{slot.liveWatermark == null ? "Watermark переключения неизвестен" : `Watermark переключения: ${closedTime(slot.liveWatermark)}`}</span>}
+  </div>}>
+    <button type="button" className="inline-flex cursor-help rounded-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
+      <Badge variant={readinessVariant(slot, problem)} className="flex-wrap justify-start whitespace-normal text-left underline decoration-dotted underline-offset-4">
+        <span>{absent ? "Нет действующего поколения" : `${slot.activeStatus === "active" ? "Действующее" : "Принятое"} поколение #${slot.activeGenerationId}`}</span>
+        {!absent && <><span aria-hidden="true">·</span><span>{slot.activeStatus === "active" ? "Активно" : slot.activeStatus === "inactive" ? "Неактивно" : "Состояние live неизвестно (старый API)"}</span></>}
+      </Badge>
+    </button>
+  </Tooltip>;
 }
 
 function pendingErrorMessage(value: unknown): string | null {
@@ -223,7 +242,7 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
         <TableBody>{process.slots.map((slot) => <TableRow key={slot.id}>
           <TableCell>{slot.minSetupsPerDay === 0 ? "0 · без частотного допуска" : slot.minSetupsPerDay}</TableCell>
           <TableCell><SlotResearch slot={slot} /></TableCell>
-          <TableCell><SlotIncumbent slot={slot} /></TableCell>
+          <TableCell><SlotIncumbent slot={slot} problem={!controller.available || process.status === "error" || process.error !== null} /></TableCell>
           <TableCell><SlotPending slot={slot} /></TableCell>
           <TableCell>{slot.meanExpectancy === null ? "—" : `${slot.meanExpectancy.toFixed(2)} R`}</TableCell>
           <TableCell>{slot.activeGenerationId !== null && slot.selectedCell ? `${process.config?.study.direction.toUpperCase() ?? ""} · TP ${slot.selectedCell.tpPct}% / SL ${slot.selectedCell.slPct}% · ${slot.selectedCell.rawR.toFixed(2)} R` : "Нет пригодного результата"}</TableCell>
@@ -233,13 +252,13 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
       {process.slots.length === 0 && <p className="text-sm text-muted-foreground">Настроенных профилей пока нет. Включённое исследование не означает готовый live.</p>}
     </>}
     <div className="flex flex-wrap gap-2">
-      <Button type="button" variant="outline" onClick={controller.refresh} disabled={controller.busy !== null}>Обновить статус непрерывного процесса</Button>
-      <Button type="button" variant="outline" onClick={() => setOpen(true)} disabled={!controller.available || controller.busy !== null}>Настроить непрерывное исследование</Button>
-      {process && process.status !== "stopped" ? <Button type="button" variant="outline" disabled={!controller.available || controller.busy !== null || process.status === "stopping"} onClick={() => { void controller.stop(); }}>{process.status === "stopping" ? "Остановка запрошена · ожидаем drain" : "Остановить непрерывное исследование"}</Button>
+      <IconButton label="Обновить статус непрерывного процесса" icon={RefreshCw} onClick={controller.refresh} disabled={controller.busy !== null} />
+      <IconButton label="Настроить непрерывное исследование" icon={Settings} onClick={() => setOpen(true)} disabled={!controller.available || controller.busy !== null} />
+      {process && process.status !== "stopped" ? <IconButton label={process.status === "stopping" ? "Остановка запрошена · ожидаем drain" : "Остановить непрерывное исследование"} icon={Square} disabled={!controller.available || controller.busy !== null || process.status === "stopping"} onClick={() => { void controller.stop(); }} />
         : <Button type="button" disabled={!controller.available || !process?.config || controller.busy !== null} onClick={() => { void controller.start(); }}>Запустить непрерывное исследование</Button>}
       {recoveryExhausted && <Button type="button" variant="outline" disabled={!controller.available || controller.busy !== null} onClick={() => { void controller.start(); }}>Повторить восстановление исследования</Button>}
     </div>
-    {recoveryExhausted && <p className="text-xs text-muted-foreground">Повтор восстановления сохраняет тот же ID исследования, сохранённый вход и исходный абсолютный дедлайн, без нового окна. Эта явная команда Start сбрасывает бюджет попыток; возобновление допуска обслуживания его не сбрасывает.</p>}
+    {recoveryExhausted && <InfoNote label="О повторе восстановления">Повтор восстановления сохраняет тот же ID исследования, сохранённый вход и исходный абсолютный дедлайн, без нового окна. Эта явная команда Start сбрасывает бюджет попыток; возобновление допуска обслуживания его не сбрасывает.</InfoNote>}
     <InfoNote label="Об остановке и расчёте доходности"><span className="grid gap-2"><span>Остановка общая для алгоритма: деактивирует его адаптивные профили. После drain очищаются только незавершённые дочерние данные; завершённая история и постоянный live сохраняются.</span><span>R рассчитан только по наблюдавшимся закрытым TP/SL-сделкам. Правый край последних N суток может быть незрелым: будущие входы, незакрытые сделки и пропуски не подменяются нулевой доходностью или SL. Частота eligible-входов и доходность — разные показатели.</span></span></InfoNote>
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="max-w-4xl">

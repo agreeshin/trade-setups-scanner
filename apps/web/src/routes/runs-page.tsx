@@ -333,7 +333,7 @@ export function RunsPage() {
           </Select>}
         </Field>
         {algorithms.kind === "unreachable" && <Alert variant="destructive" role="alert">Алгоритмы недоступны ({algorithms.detail})</Alert>}
-        <p className="text-sm text-muted-foreground">Запуск использует сохранённый снимок общих параметров. <Link className="font-medium text-primary underline underline-offset-2" to="/settings">Настроить алгоритмы</Link></p>
+        <div className="flex flex-wrap items-center gap-2"><InfoNote>Запуск использует сохранённый снимок общих параметров.</InfoNote><Link className="font-medium text-primary underline underline-offset-2" to="/settings">Настроить алгоритмы</Link></div>
         {catalog.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка инструментов из БД…</p>}
         {catalog.kind === "unreachable" && <Alert variant="warning" role="status">Каталог БД недоступен ({catalog.detail}). Проверка кеша возможна только для ранее сохранённых полных идентификаторов: {knownInstruments.map((item) => `${item.exchange}/${item.category}/${item.symbol}`).join(", ") || "не сохранены"}. Выбор: {form.symbols || "пусто"}.</Alert>}
         {catalog.kind === "ready" && <InstrumentPicker catalog={catalog.data.instruments} symbols={form.symbols} onChange={(symbols) => changeForm({ ...form, symbols })} disabled={!ready || busy} limit={null} />}

@@ -35,7 +35,7 @@ it("keeps an icon action named without visible text", async () => {
   render(<IconButton label="Обновить статус" icon={RefreshCw} />);
   const button = screen.getByRole("button", { name: "Обновить статус" });
   expect(button).toHaveClass("size-9");
-  expect(button).toHaveTextContent("");
+  expect(button.textContent).toBe("");
   await userEvent.hover(button);
   expect(screen.getByRole("tooltip")).toHaveTextContent("Обновить статус");
 });
