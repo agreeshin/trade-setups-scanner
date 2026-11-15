@@ -1,9 +1,11 @@
 import * as React from "react";
 import { cn } from "../../lib/utils";
+import { DateInput } from "./date-input";
 
 export type InputProps = React.InputHTMLAttributes<HTMLInputElement>;
 
 export function Input({ className, type, ...props }: InputProps) {
+  if (type === "date" || type === "datetime-local") return <DateInput type={type} className={cn("flex h-9 min-w-0 w-full items-center rounded-lg border border-input bg-background px-3 py-1 text-sm tabular-nums transition-colors hover:border-muted-foreground/50", className)} {...props} />;
   return (
     <input
       data-slot="input"

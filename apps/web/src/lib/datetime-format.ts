@@ -21,6 +21,7 @@ export const DEFAULT_INTERFACE_SETTINGS: InterfaceSettings = {
 };
 
 const STORAGE_KEY = "interface-datetime-settings-v1";
+const SETTINGS_CHANGED = "interface-datetime-settings-change";
 
 function sanitize(raw: unknown): InterfaceSettings {
   const value = raw === null || typeof raw !== "object" ? {} : raw as Partial<InterfaceSettings>;
@@ -49,6 +50,12 @@ export function interfaceSettings(): InterfaceSettings {
   return current;
 }
 
+/** Mounted date controls unsubscribe on disposal; no retained history/listener registry. */
+export function subscribeInterfaceSettings(listener: () => void): () => void {
+  window.addEventListener(SETTINGS_CHANGED, listener);
+  return () => window.removeEventListener(SETTINGS_CHANGED, listener);
+}
+
 /** Applies (and sanitizes) persisted settings; mirrors them to localStorage when available. */
 export function applyInterfaceSettings(raw: unknown): InterfaceSettings {
   current = sanitize(raw);
@@ -57,6 +64,7 @@ export function applyInterfaceSettings(raw: unknown): InterfaceSettings {
   } catch {
     // Storage may be unavailable; in-memory formatting still applies.
   }
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(SETTINGS_CHANGED));
   return current;
 }
 
@@ -92,12 +100,30 @@ function splitParts(date: Date, withTime: boolean): DateParts {
   };
 }
 
-function assembleDate(parts: DateParts): string {
+function assembleDate(parts: Pick<DateParts, "year" | "month" | "day">): string {
   const year = current.yearDigits === 2 ? parts.year.slice(-2) : parts.year;
   const separator = current.dateSeparator;
   if (current.dateOrder === "mdy") return [parts.month, parts.day, year].join(separator);
   if (current.dateOrder === "ymd") return [year, parts.month, parts.day].join(separator);
   return [parts.day, parts.month, year].join(separator);
+}
+
+/** A calendar input is a civil date, not an instant: never shift it through a timezone. */
+export function formatCalendarInput(value: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(\.\d+)?)?)?$/.exec(value);
+  if (!match) return value;
+  const date = assembleDate({ year: match[1]!, month: match[2]!, day: match[3]! });
+  if (match[4] === undefined) return date;
+  const hour = current.time24 ? match[4] : String(Number(match[4]) % 12 || 12).padStart(2, "0");
+  const seconds = match[6] === undefined ? "" : `:${match[6]}${match[7] ?? ""}`;
+  const period = current.time24 ? "" : Number(match[4]) >= 12 ? " PM" : " AM";
+  return `${date}, ${hour}:${match[5]}${seconds}${period}`;
+}
+
+export function calendarInputPlaceholder(withTime: boolean): string {
+  const year = current.yearDigits === 2 ? "ГГ" : "ГГГГ";
+  const parts = current.dateOrder === "dmy" ? ["ДД", "ММ", year] : current.dateOrder === "mdy" ? ["ММ", "ДД", year] : [year, "ММ", "ДД"];
+  return `${parts.join(current.dateSeparator)}${withTime ? current.time24 ? ", ЧЧ:ММ" : ", ЧЧ:ММ AM/PM" : ""}`;
 }
 
 function assembleTime(parts: DateParts): string {
