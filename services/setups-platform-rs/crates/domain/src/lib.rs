@@ -1,6 +1,7 @@
 pub mod decimal;
 pub mod expectancy;
 pub mod parameter_metadata;
+pub mod trend;
 pub use parameter_metadata::algorithm_fields;
 
 use serde::{Deserialize, Serialize};

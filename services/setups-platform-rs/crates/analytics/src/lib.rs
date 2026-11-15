@@ -1,4 +1,5 @@
 pub mod expectancy_chart;
+pub mod manual_trend;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

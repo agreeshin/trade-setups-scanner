@@ -3,10 +3,14 @@ use crate::replay::guard_auth;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::future::join_all;
 use serde_json::{Map, Value, json};
+use setups_analytics::manual_trend::{
+    TrendBendDays, TrendError, TrendInput, TrendMode, fit_daily_outcomes, fit_weighted_trend,
+    trend_matrix_scope,
+};
 use setups_analytics::{
     AnalyticsSetup, DEFAULT_CLUSTER_GAP_HOURS, DEFAULT_HORIZON_MINUTES, EvaluateLimitOptions,
     LimitEvaluation, LimitStatus, OhlcCandle, TradeDirection, aggregate_limit_outcomes,
@@ -228,6 +232,8 @@ struct RawAnalyticsQuery {
     price_change_pct: Option<String>,
     exchange: Option<String>,
     category: Option<String>,
+    trend_bend_days: Option<String>,
+    trend_mode: Option<String>,
 }
 
 fn parse_number(value: Option<&String>) -> Result<Option<f64>, String> {
@@ -295,6 +301,8 @@ struct ParsedAnalyticsParams {
     horizon_minutes: i64,
     price_change_pct: Option<f64>,
     compute: ComputeParams,
+    trend_bend_days: TrendBendDays,
+    trend_mode: TrendMode,
 }
 
 impl ParsedAnalyticsParams {
@@ -403,6 +411,12 @@ fn parse_analytics_query(
     let sl_pct = sl_pct.unwrap_or(0.0);
     let price_change_ppm = price_change_ppm_of(price_change_pct);
     let maturity_tenths = maturity_tenths_of(maturity);
+    let trend_bend_days = parse_trend_bend(query.trend_bend_days.as_deref())?;
+    let trend_mode = match query.trend_mode.as_deref() {
+        None | Some("mean") => TrendMode::Mean,
+        Some("forecast") => TrendMode::Forecast,
+        _ => return Err("trendMode must be mean or forecast".into()),
+    };
     Ok(ParsedAnalyticsParams {
         set_ref,
         direction,
@@ -416,6 +430,8 @@ fn parse_analytics_query(
         time_shift_minutes,
         horizon_minutes,
         price_change_pct,
+        trend_bend_days,
+        trend_mode,
         compute: ComputeParams {
             direction: match direction {
                 TradeDirection::Short => "short".to_string(),
@@ -782,7 +798,7 @@ fn aggregate_payload(
     eligible_count: usize,
     filtered_count: usize,
     evaluations: &[LimitEvaluation],
-) -> CachedPayload {
+) -> Result<CachedPayload, TrendError> {
     let aggregate = aggregate_limit_outcomes(
         &evaluations
             .iter()
@@ -836,7 +852,33 @@ fn aggregate_payload(
         json!(aggregate.median_close_minutes),
     );
     payload.insert("riskExpectancy".into(), json!(aggregate.risk_expectancy));
-    Value::Object(payload)
+    if params.trend_mode == TrendMode::Forecast {
+        let trend = fit_daily_outcomes(
+            selection
+                .rows
+                .iter()
+                .zip(evaluations)
+                .filter_map(|(setup, evaluation)| {
+                    (evaluation.status != LimitStatus::PriceChangeFiltered).then(|| {
+                        (
+                            setup.close_time_unix,
+                            risk_return(evaluation.status, params.tp_pct, params.sl_pct),
+                        )
+                    })
+                }),
+            params.trend_bend_days,
+        )?;
+        let endpoint = trend.as_ref().map(|fit| fit.endpoint());
+        payload.insert(
+            "meanRiskExpectancy".into(),
+            json!(aggregate.risk_expectancy),
+        );
+        payload.insert("riskExpectancy".into(), json!(endpoint.map(|p| p.value)));
+        payload.insert("endpointSe".into(), json!(endpoint.and_then(|p| p.se)));
+        payload.insert("trendMode".into(), json!(params.trend_mode));
+        payload.insert("trendBendDays".into(), json!(params.trend_bend_days));
+    }
+    Ok(Value::Object(payload))
 }
 
 fn setup_dto(setup: &AnalyticsSetup) -> Value {
@@ -885,6 +927,8 @@ fn raw_query(params: &HashMap<String, String>) -> RawAnalyticsQuery {
         price_change_pct: params.get("priceChangePct").cloned(),
         exchange: params.get("exchange").cloned(),
         category: params.get("category").cloned(),
+        trend_bend_days: params.get("trendBendDays").cloned(),
+        trend_mode: params.get("trendMode").cloned(),
     }
 }
 
@@ -1008,6 +1052,8 @@ fn grid_item(tp_pct: f64, sl_pct: f64, payload: &Value, cached: bool) -> Value {
         "avgMovePct": payload.get("avgMovePct").filter(|value| !value.is_null()).and_then(Value::as_f64),
         "riskExpectancy": payload.get("riskExpectancy").filter(|value| !value.is_null()).and_then(Value::as_f64),
         "cached": cached,
+        "endpointSe": payload.get("endpointSe").and_then(Value::as_f64),
+        "meanRiskExpectancy": payload.get("meanRiskExpectancy").and_then(Value::as_f64),
     })
 }
 
@@ -1050,7 +1096,11 @@ async fn analytics_matrix_grid(
     let in_scope = filter_setups_by_time(&setups, &base.time_filter);
     let selection = select_setup_rows(&state.pool, &setups, &base).await;
     let scope = compute_scope(&state, &setups, &base).await;
-    let scope_key = matrix_scope_key(&scope);
+    let scope_key = trend_matrix_scope(
+        &matrix_scope_key(&scope),
+        base.trend_mode,
+        base.trend_bend_days,
+    );
     let mut items: Vec<Value> = Vec::new();
     let mut missing: Vec<(f64, f64)> = Vec::new();
     for &tp_pct in &tp_list {
@@ -1077,14 +1127,17 @@ async fn analytics_matrix_grid(
         for (tp_pct, sl_pct) in missing {
             let cell_params = params_for_cell(&base, tp_pct, sl_pct);
             let evaluations = evaluate_prepared(&prepared, &cell_params);
-            let payload = aggregate_payload(
+            let payload = match aggregate_payload(
                 &cell_params,
                 &selection,
                 in_scope.len(),
                 prepared.eligible_count,
                 prepared.filtered_count,
                 &evaluations,
-            );
+            ) {
+                Ok(payload) => payload,
+                Err(error) => return error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+            };
             if !setups.is_empty()
                 && let Err(cache_error) = save_matrix_cell(
                     &state.pool,
@@ -1131,7 +1184,11 @@ async fn analytics_matrix_cells(
     let scope = compute_scope(&state, &setups, &params).await;
     let rows = list_matrix_cells(
         &state.pool,
-        &matrix_scope_key(&scope),
+        &trend_matrix_scope(
+            &matrix_scope_key(&scope),
+            params.trend_mode,
+            params.trend_bend_days,
+        ),
         &params.compute,
         &params.cache_time_key,
     )
@@ -1143,6 +1200,8 @@ async fn analytics_matrix_cells(
             "slPct": row.sl_pct,
             "avgMovePct": row.payload.get("avgMovePct").filter(|value| !value.is_null()).and_then(Value::as_f64),
             "riskExpectancy": row.payload.get("riskExpectancy").filter(|value| !value.is_null()).and_then(Value::as_f64),
+            "endpointSe": row.payload.get("endpointSe").and_then(Value::as_f64),
+            "meanRiskExpectancy": row.payload.get("meanRiskExpectancy").and_then(Value::as_f64),
         })).collect::<Vec<_>>(),
         "totalMatchingSetups": in_scope.len(),
         "filteredSetupsCount": selection.rows.len(),
@@ -1178,7 +1237,11 @@ async fn analytics_matrix_cell(
     let in_scope = filter_setups_by_time(&setups, &params.time_filter);
     let selection = select_setup_rows(&state.pool, &setups, &params).await;
     let scope = compute_scope(&state, &setups, &params).await;
-    let scope_key = matrix_scope_key(&scope);
+    let scope_key = trend_matrix_scope(
+        &matrix_scope_key(&scope),
+        params.trend_mode,
+        params.trend_bend_days,
+    );
     if !setups.is_empty()
         && let Ok(Some(cached)) = get_matrix_cell(
             &state.pool,
@@ -1195,14 +1258,17 @@ async fn analytics_matrix_cell(
     }
     let (evaluations, eligible_count, filtered_count) =
         evaluate_rows(&state, &selection.rows, &params).await;
-    let payload = aggregate_payload(
+    let payload = match aggregate_payload(
         &params,
         &selection,
         in_scope.len(),
         eligible_count,
         filtered_count,
         &evaluations,
-    );
+    ) {
+        Ok(payload) => payload,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
     if !setups.is_empty()
         && let Err(cache_error) = save_matrix_cell(
             &state.pool,
@@ -1444,6 +1510,52 @@ async fn analytics_trade_detail(
     Json(response).into_response()
 }
 
+fn parse_trend_bend(raw: Option<&str>) -> Result<TrendBendDays, String> {
+    match raw {
+        None | Some("linear") => Ok(TrendBendDays::Linear),
+        Some("7") => Ok(TrendBendDays::Seven),
+        Some("14") => Ok(TrendBendDays::Fourteen),
+        Some("30") => Ok(TrendBendDays::Thirty),
+        _ => Err("trendBendDays must be 7, 14, 30 or linear".into()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TrendRequest {
+    points: Vec<TrendInput>,
+    #[serde(default)]
+    trend_bend_days: TrendBendDays,
+}
+
+/// One domain solver for matrix forecasts and UI curves; no market or DB access.
+async fn analytics_trend(
+    State(state): State<Arc<AnalyticsState>>,
+    headers: HeaderMap,
+    Json(request): Json<TrendRequest>,
+) -> Response {
+    if let Err(response) = guard_auth(&state.auth, &headers, true) {
+        return response;
+    }
+    // Validate bounds before submitting CPU work, including an overlarge vector.
+    if request.points.len() > setups_analytics::manual_trend::MAX_TREND_DAYS {
+        return error_response(StatusCode::BAD_REQUEST, "trend: TooManyDays");
+    }
+    match tokio::task::spawn_blocking(move || {
+        fit_weighted_trend(&request.points, request.trend_bend_days)
+            .map(|fit| fit.map(|fit| fit.summary()))
+    })
+    .await
+    {
+        Ok(Ok(trend)) => Json(json!({ "trend": trend })).into_response(),
+        Ok(Err(error)) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+        Err(error) => {
+            eprintln!("analytics trend computation failed: {error}");
+            internal_error()
+        }
+    }
+}
+
 async fn analytics_cache_summary_handler(
     State(state): State<Arc<AnalyticsState>>,
     headers: HeaderMap,
@@ -1494,6 +1606,10 @@ pub fn analytics_router(state: Arc<AnalyticsState>) -> Router {
         .route("/v1/analytics/matrix-cell", get(analytics_matrix_cell))
         .route("/v1/analytics/trades", get(analytics_trades))
         .route(
+            "/v1/analytics/trend",
+            post(analytics_trend).layer(axum::extract::DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
             "/v1/analytics/trades/{symbol}/{closeTimeUnix}",
             get(analytics_trade_detail),
         )
@@ -1521,6 +1637,117 @@ mod tests {
         assert!(parse_analytics_query(&raw("batch-1"), false).is_ok());
         let error = parse_analytics_query(&raw("nope"), false).unwrap_err();
         assert_eq!(error, "invalid set id");
+    }
+
+    #[test]
+    fn trend_query_defaults_validation_and_cache_identities() {
+        let mut query = raw("run-2");
+        let default = parse_analytics_query(&query, false).unwrap();
+        assert_eq!(default.trend_mode, TrendMode::Mean);
+        assert_eq!(default.trend_bend_days, TrendBendDays::Linear);
+        for bend in ["7", "14", "30", "linear"] {
+            query.trend_bend_days = Some(bend.into());
+            let mean = parse_analytics_query(&query, false).unwrap();
+            assert_eq!(
+                trend_matrix_scope("old", mean.trend_mode, mean.trend_bend_days),
+                "old"
+            );
+            query.trend_mode = Some("forecast".into());
+            let forecast = parse_analytics_query(&query, false).unwrap();
+            assert_eq!(
+                trend_matrix_scope("old", forecast.trend_mode, forecast.trend_bend_days),
+                format!("old:trend:v1:forecast:{bend}")
+            );
+            assert_eq!(mean.compute, forecast.compute); // trade/selection identities unchanged
+            query.trend_mode = None;
+        }
+        query.trend_bend_days = Some("0".into());
+        assert!(parse_analytics_query(&query, false).is_err());
+        query.trend_bend_days = None;
+        query.trend_mode = Some("extrapolate".into());
+        assert!(parse_analytics_query(&query, false).is_err());
+    }
+
+    #[test]
+    fn matrix_forecast_uses_fitted_end_preserves_mean_and_exposes_se() {
+        let mut query = raw("run-2");
+        query.tp_pct = Some("2".into());
+        query.sl_pct = Some("1".into());
+        let mut params = parse_analytics_query(&query, true).unwrap();
+        let rows = (0..3)
+            .map(|i| AnalyticsSetup {
+                exchange_code: "bybit".into(),
+                category: "linear".into(),
+                symbol: "BTCUSDT".into(),
+                open_time_unix: i * 86400,
+                close_time_unix: i * 86400 + 60,
+                close_price: "100".into(),
+            })
+            .collect();
+        let selection = SelectionResult {
+            rows,
+            avg_selection_ordinal: None,
+            avg_selection_delay_minutes: None,
+            total_clusters_count: None,
+            cached_selection: false,
+        };
+        let evaluations: Vec<_> = [LimitStatus::Sl, LimitStatus::Tp, LimitStatus::Tp]
+            .into_iter()
+            .map(|status| LimitEvaluation {
+                status,
+                move_pct: Some(if status == LimitStatus::Tp { 2.0 } else { -1.0 }),
+                ..no_data_evaluation()
+            })
+            .collect();
+        let mean = aggregate_payload(&params, &selection, 3, 3, 0, &evaluations).unwrap();
+        assert_eq!(mean["riskExpectancy"], 1.0);
+        assert!(mean.get("trendMode").is_none());
+        for bend in [
+            TrendBendDays::Seven,
+            TrendBendDays::Fourteen,
+            TrendBendDays::Thirty,
+            TrendBendDays::Linear,
+        ] {
+            params.trend_bend_days = bend;
+            assert_eq!(
+                serde_json::to_vec(
+                    &aggregate_payload(&params, &selection, 3, 3, 0, &evaluations).unwrap()
+                )
+                .unwrap(),
+                serde_json::to_vec(&mean).unwrap()
+            );
+        }
+        params.trend_mode = TrendMode::Forecast;
+        let forecast = aggregate_payload(&params, &selection, 3, 3, 0, &evaluations).unwrap();
+        assert!((forecast["riskExpectancy"].as_f64().unwrap() - 2.5).abs() < 1e-10);
+        assert_eq!(forecast["meanRiskExpectancy"], mean["riskExpectancy"]);
+        assert!(forecast["endpointSe"].as_f64().unwrap() > 0.0);
+        let grid = grid_item(2.0, 1.0, &forecast, true);
+        assert_eq!(grid["endpointSe"], forecast["endpointSe"]);
+        // A one-day mean can exist while a forecast is honestly unavailable.
+        let one = aggregate_payload(&params, &selection, 1, 1, 0, &evaluations[..1]).unwrap();
+        assert!(one["riskExpectancy"].is_null());
+        assert_eq!(one["meanRiskExpectancy"], -1.0);
+    }
+
+    #[test]
+    fn pure_trend_request_has_strict_bounded_contract() {
+        let request: TrendRequest = serde_json::from_value(json!({"trendBendDays":"7", "points":[{"day":0,"value":1,"weight":1},{"day":7,"value":2,"weight":1}]})).unwrap();
+        let trend = fit_weighted_trend(&request.points, request.trend_bend_days)
+            .unwrap()
+            .unwrap()
+            .summary();
+        assert_eq!(trend.method, "linear");
+        assert_eq!(trend.end.day, 7.0);
+        assert!(trend.endpoint_se.is_none());
+        assert!(
+            serde_json::from_value::<TrendRequest>(json!({"points":[],"trendBendDays":"Infinity"}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<TrendRequest>(json!({"points":[],"unrecognized":true}))
+                .is_err()
+        );
     }
 
     #[test]
