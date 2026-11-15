@@ -27,12 +27,22 @@ impl BatchStore for PgBatchStore<'_> {
             Some(store::capture_slot(self.pool,slot).await?)
         }else{None};
         let slot=captured.as_ref().unwrap_or(slot);
+        // Optional evidence is loaded once for this commit, never into the
+        // scientific profile/readiness state or a process-wide cache.
+        let evidence=if indices.iter().any(|&i|scans[i].prepared.setups.iter().any(|setup|setup.recommendation.get("expectancy").is_none())) {
+            Some(super::enrichment::load(self.pool,slot).await)
+        }else{None};
+        let mut degraded=0usize;
         let mut writes=Vec::with_capacity(indices.len());
         for &index in indices {
             let scan=&mut scans[index];
             let mut setups=Vec::with_capacity(scan.prepared.setups.len());
             for setup in &mut scan.prepared.setups {
                 setup.recommendation["externalName"]=slot.external_name.clone().into();
+                let invalid=super::enrichment::attach(slot,&scan.instrument,setup,
+                    evidence.as_ref().and_then(|captured|captured.artifact.as_ref()),
+                    evidence.as_ref().and_then(|captured|captured.artifact_id))?;
+                if invalid || evidence.as_ref().is_some_and(|captured|captured.invalid_evidence) {degraded+=1;}
                 setups.push(AdaptiveSetupWrite {exchange_code:scan.instrument.exchange.clone(),category:scan.instrument.category.clone(),
                     symbol:scan.instrument.symbol.clone(),setup:setup.raw.clone(),recommendation:setup.recommendation.clone()});
             }
@@ -41,6 +51,7 @@ impl BatchStore for PgBatchStore<'_> {
                     generation_id:state.generation_id,state:serde_json::to_value(state)?})).transpose()?,
                 checkpoint:serde_json::to_value(&scan.prepared.checkpoint)?,setups});
         }
+        if degraded>0 {super::enrichment::report_degraded(slot,degraded);}
         let bytes=writes.iter().try_fold(0usize,|sum,write|Ok::<_,WorkerError>(sum.saturating_add(
             continuous::adaptive_scan_write_bytes(write)?)))?;
         if bytes>ADAPTIVE_COMMIT_MAX_BYTES {return Err(invalid("adaptive constructed writes exceed batch byte budget"));}
@@ -120,7 +131,7 @@ fn wire_bytes(prepared:&PreparedProfile,instrument:&AdaptiveInstrument)->Result<
     for setup in &prepared.setups {
         serde_json::to_writer(&mut bytes,&setup.raw)?;
         serde_json::to_writer(&mut bytes,&setup.recommendation)?;
-        bytes.0=bytes.0.checked_add(1536).ok_or_else(||invalid("adaptive write size overflow"))?;
+        bytes.0=bytes.0.checked_add(1536+super::enrichment::MAX_EXPECTANCY_SNAPSHOT_BYTES).ok_or_else(||invalid("adaptive write size overflow"))?;
     }
     Ok(bytes.0)
 }

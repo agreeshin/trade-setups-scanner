@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use setups_analytics::{AnalyticsSetup, CausalCluster, TradeDirection, find_candle_by_open_time};
 use setups_detector::PriceVolumeSpikeDetector;
 use setups_domain::{PushStatus, SpikeSetup};
+use setups_domain::expectancy::{
+    EXPECTANCY_MAX_PERIOD_DAYS, EXPECTANCY_MAX_POINTS, UTC_DAY_SECONDS, UtcDailyInput,
+    utc_midnight_unix,
+};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -35,6 +39,9 @@ pub struct ContinuousInstrumentReplay {
     /// All raw detector WATCHs in the original period, before analytics gates.
     pub setups: Vec<SpikeSetup>,
     /// Last raw signal before fromUnix; causal clustering MUST start with it.
+    /// Explicit null means proven-empty prehistory; a missing field is unknown,
+    /// not permission to restart clustering or use the end-of-period raw seed.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub previous_raw_close_unix: Option<i64>,
     pub last_raw_close_unix: Option<i64>,
     pub evaluated_minutes: u64,
@@ -179,6 +186,125 @@ pub struct ContinuousEvaluation {
     /// censored/gapped opened entries are reported separately below.
     pub evaluation: CandidateEvaluation,
     pub diagnostics: Vec<ContinuousCellDiagnostics>,
+}
+
+/// The caller supplies the already selected FINAL frozen pair. This opt-in
+/// capture does not select/rank a cell or change any admission/scientific value.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinuousCaptureCell {
+    pub tp_pct: f64,
+    pub sl_pct: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinuousSelectedDaily {
+    pub tp_pct: f64,
+    pub sl_pct: f64,
+    pub points: Vec<UtcDailyInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapturedContinuousAnalysis {
+    pub evaluation: ContinuousEvaluation,
+    pub selected_daily: Option<ContinuousSelectedDaily>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct DailyCaptureBucket {
+    rows: u64,
+    tp: u64,
+    sl: u64,
+    sum_r: f64,
+}
+
+/// One analysis owns these dense, bounded counters. They retain neither input
+/// candles nor setup references. Missing dates are omitted on finish; a date
+/// with rows but no observed closes is retained as mean_r=None (line break).
+/// None on all search/trial paths allocates nothing. Drop frees cancellation,
+/// deadline and failure state; no global/per-instrument cache survives a call.
+struct SelectedDailyCapture {
+    pair: ContinuousCaptureCell,
+    cell_index: usize,
+    origin: i64,
+    to_unix: i64,
+    days: Vec<DailyCaptureBucket>,
+}
+
+impl SelectedDailyCapture {
+    fn new(spec: &StudyRequest, pair: ContinuousCaptureCell, working_base: usize, limits: &StudyLimits) -> Result<Self, StudyError> {
+        spec.to_unix.checked_sub(spec.from_unix)
+            .filter(|duration| *duration > 0 && *duration <= EXPECTANCY_MAX_PERIOD_DAYS * UTC_DAY_SECONDS)
+            .ok_or_else(|| invalid("selected daily capture exceeds permitted research period"))?;
+        let tp = spec.tp_levels.iter().position(|level| *level == pair.tp_pct);
+        let sl = spec.sl_levels.iter().position(|level| *level == pair.sl_pct);
+        let (Some(tp), Some(sl)) = (tp, sl) else {
+            return Err(invalid("selected daily capture pair is outside original axes"));
+        };
+        if !(pair.tp_pct / pair.sl_pct).is_finite() {
+            return Err(invalid("selected daily capture R must be finite"));
+        }
+        let origin = utc_midnight_unix(spec.from_unix)
+            .map_err(|_| invalid("invalid selected daily capture UTC origin"))?;
+        let count = ((spec.to_unix - 1 - origin) / UTC_DAY_SECONDS + 1) as usize;
+        limit("selected_daily_points", count, EXPECTANCY_MAX_POINTS)?;
+        let capture_bytes = count.saturating_mul(size_of::<DailyCaptureBucket>() + size_of::<UtcDailyInput>())
+            .saturating_add(size_of::<Self>() + size_of::<ContinuousSelectedDaily>());
+        limit("continuous_working_bytes", working_base.saturating_add(capture_bytes), limits.max_working_bytes)?;
+        Ok(Self { pair, cell_index: tp * spec.sl_levels.len() + sl, origin,
+            to_unix: spec.to_unix, days: vec![DailyCaptureBucket::default(); count] })
+    }
+
+    fn working_bytes(&self) -> usize {
+        // Reserve dense scratch AND the maximum compact output simultaneously.
+        // Output has exact capacity; neither Vec grows beyond touched days.
+        self.days.len().saturating_mul(size_of::<DailyCaptureBucket>() + size_of::<UtcDailyInput>())
+            .saturating_add(size_of::<Self>() + size_of::<ContinuousSelectedDaily>())
+    }
+
+    fn record(&mut self, signal_close: i64, before: (usize, usize), after: &MatrixCell) -> Result<(), StudyError> {
+        let tp = after.tp_count.checked_sub(before.0);
+        let sl = after.sl_count.checked_sub(before.1);
+        let (Some(tp), Some(sl)) = (tp, sl) else {
+            return Err(StudyError::InvalidInput("selected daily counter moved backwards".into()));
+        };
+        if tp + sl > 1 || signal_close < self.origin || signal_close >= self.to_unix {
+            return Err(StudyError::InvalidInput("invalid selected daily outcome delta/time".into()));
+        }
+        let day = ((signal_close - self.origin) / UTC_DAY_SECONDS) as usize;
+        let bucket = &mut self.days[day];
+        bucket.rows += 1;
+        bucket.tp += tp as u64;
+        bucket.sl += sl as u64;
+        if tp == 1 { bucket.sum_r += self.pair.tp_pct / self.pair.sl_pct; }
+        if sl == 1 { bucket.sum_r -= 1.0; }
+        if !bucket.sum_r.is_finite() {
+            return Err(StudyError::InvalidInput("nonfinite selected daily outcome sum".into()));
+        }
+        Ok(())
+    }
+
+    fn finish(self, matrix: &[MatrixCell], control: &Control<'_>) -> Result<Option<ContinuousSelectedDaily>, StudyError> {
+        let mut points = Vec::with_capacity(self.days.len());
+        let (mut tp, mut sl) = (0u64, 0u64);
+        for (index, bucket) in self.days.into_iter().enumerate() {
+            if index % 128 == 0 && control.stopped() { return Ok(None); }
+            tp += bucket.tp; sl += bucket.sl;
+            if bucket.rows > 0 {
+                let closed = bucket.tp + bucket.sl;
+                points.push(UtcDailyInput { day_start_unix: self.origin + index as i64 * UTC_DAY_SECONDS,
+                    row_count: bucket.rows, tp_count: bucket.tp, sl_count: bucket.sl,
+                    mean_r: (closed > 0).then(|| bucket.sum_r / closed as f64) });
+            }
+        }
+        let cell = &matrix[self.cell_index];
+        if (tp, sl) != (cell.tp_count as u64, cell.sl_count as u64) {
+            return Err(StudyError::InvalidInput("selected daily capture differs from final cell counts".into()));
+        }
+        Ok(Some(ContinuousSelectedDaily { tp_pct: self.pair.tp_pct, sl_pct: self.pair.sl_pct, points }))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -634,13 +760,32 @@ pub(crate) fn analyze_inner(
     limits: &StudyLimits,
     control: &Control<'_>,
 ) -> Result<Option<ContinuousEvaluation>, StudyError> {
+    // Search/trials and existing callers never enable or allocate daily capture.
+    Ok(analyze_inner_with_daily(spec, input, replay, candidate, limits, control, None)?
+        .map(|result| result.evaluation))
+}
+
+fn analyze_inner_with_daily(
+    spec: &StudyRequest,
+    input: &StudyInput,
+    replay: &ContinuousReplay,
+    candidate: &StudyCandidate,
+    limits: &StudyLimits,
+    control: &Control<'_>,
+    capture: Option<ContinuousCaptureCell>,
+) -> Result<Option<CapturedContinuousAnalysis>, StudyError> {
     if control.stopped() {
         return Ok(None);
     }
     validate_analytics(&candidate.analytics)?;
+    let working_base = replay_bytes(replay)
+        .saturating_add(spec.tp_levels.len() * spec.sl_levels.len() * 256);
+    let mut capture = capture
+        .map(|pair| SelectedDailyCapture::new(spec, pair, working_base, limits))
+        .transpose()?;
     limit(
         "continuous_working_bytes",
-        replay_bytes(replay).saturating_add(spec.tp_levels.len() * spec.sl_levels.len() * 256),
+        working_base.saturating_add(capture.as_ref().map_or(0, SelectedDailyCapture::working_bytes)),
         limits.max_working_bytes,
     )?;
     let frequency = FrequencyGate::new(spec)?;
@@ -704,6 +849,10 @@ pub(crate) fn analyze_inner(
                 close_time_unix: setup.close_time_unix,
                 close_price: setup.close_price.clone(),
             };
+            let before = capture.as_ref().map(|capture| {
+                let cell = &result.evaluation.matrix[capture.cell_index];
+                (cell.tp_count, cell.sl_count)
+            });
             if !accumulate_observed(
                 spec,
                 &candidate.analytics,
@@ -714,6 +863,10 @@ pub(crate) fn analyze_inner(
                 control,
             ) {
                 return Ok(None);
+            }
+            if let Some(capture) = &mut capture {
+                capture.record(setup.close_time_unix, before.expect("capture took counters"),
+                    &result.evaluation.matrix[capture.cell_index])?;
             }
         }
     }
@@ -748,7 +901,14 @@ pub(crate) fn analyze_inner(
         .accepts(selected)
         .then(|| score_matrix(&result.evaluation.matrix, spec.min_closed_per_cell))
         .flatten();
-    Ok(Some(result))
+    let selected_daily = match capture {
+        Some(capture) => {
+            let Some(daily) = capture.finish(&result.evaluation.matrix, control)? else { return Ok(None); };
+            Some(daily)
+        }
+        None => None,
+    };
+    Ok(Some(CapturedContinuousAnalysis { evaluation: result, selected_daily }))
 }
 
 /// Recompute analytics from the materialized raw service replay and ORIGINAL
@@ -761,6 +921,22 @@ pub fn analyze_continuous(
     limits: &StudyLimits,
     cancel: &CancelToken,
 ) -> Result<Option<ContinuousEvaluation>, StudyError> {
+    Ok(analyze_continuous_with_daily(spec, input, replay, candidate, limits, cancel, None)?
+        .map(|result| result.evaluation))
+}
+
+/// Same original analysis/classifier and validation, with optional compact
+/// daily outcomes for the caller's FINAL selected pair. Not an ordinary-cache
+/// rerun, not used by optimization trials, and not a new selection/gate.
+pub fn analyze_continuous_with_daily(
+    spec: &StudyRequest,
+    input: &StudyInput,
+    replay: &ContinuousReplay,
+    candidate: &StudyCandidate,
+    limits: &StudyLimits,
+    cancel: &CancelToken,
+    capture: Option<ContinuousCaptureCell>,
+) -> Result<Option<CapturedContinuousAnalysis>, StudyError> {
     validate_continuous_request(spec, replay.context)?;
     if validate_input(spec, input, limits, cancel)?.is_none()
         || !validate_frozen_cutoff(input, replay.context, cancel)?
@@ -785,6 +961,75 @@ pub fn analyze_continuous(
             "service replay differs from frozen scope/provenance".into(),
         ));
     }
+    analyze_validated_continuous_with_daily(spec, input, replay, candidate, limits, cancel, capture)
+}
+
+/// Evaluate SAVED raw setups against separately identified available historical
+/// candles. This is NOT an original frozen replay or a new detector run. Keep
+/// original_replay.provenance immutable as the original raw-set anchor; input
+/// carries the actual historical read's own fingerprint and capture time.
+///
+/// The caller must persist both provenances and compare outcomes/counters with
+/// the saved original before publication. Equality of counts is not frozen-input
+/// proof. This does not select winners, recommend or admit/revalidate profiles.
+/// The inherited summary score is diagnostic, never a publication decision.
+///
+/// For bounded processing, pass one original instrument at a time in spec,
+/// original_replay and input, with empty detector_bars. Drop that instrument's
+/// candles after consuming the compact output. Preserve the original period,
+/// cutoff, effective analytics, axes and known pre-period raw seed; never use
+/// last_raw_close_unix or a live/end-of-period bootstrap as the initial seed.
+pub fn analyze_historical_continuous_with_daily(
+    spec: &StudyRequest,
+    input: &StudyInput,
+    original_replay: &ContinuousReplay,
+    candidate: &StudyCandidate,
+    limits: &StudyLimits,
+    cancel: &CancelToken,
+    capture: Option<ContinuousCaptureCell>,
+) -> Result<Option<CapturedContinuousAnalysis>, StudyError> {
+    validate_continuous_request(spec, original_replay.context)?;
+    if validate_input(spec, input, limits, cancel)?.is_none()
+        || !validate_frozen_cutoff(input, original_replay.context, cancel)?
+    {
+        return Ok(None);
+    }
+    if original_replay.from_unix != spec.from_unix
+        || original_replay.to_unix != spec.to_unix
+        || original_replay.params != candidate.params
+        || original_replay.provenance.snapshot_hash.is_empty()
+        || original_replay.provenance.snapshot_hash.len() > 256
+        || original_replay.provenance.captured_at.is_empty()
+        || original_replay.provenance.captured_at.len() > 64
+        || original_replay.provenance.seed != spec.seed
+        || original_replay.provenance.optimizer_version != CONTINUOUS_OPTIMIZER_VERSION
+        || original_replay.instruments.len() != spec.instruments.len()
+        || original_replay
+            .instruments
+            .iter()
+            .zip(&spec.instruments)
+            .any(|(raw, expected)| &raw.instrument != expected)
+    {
+        return Err(StudyError::InvalidInput(
+            "historical raw replay differs from original scope/provenance".into(),
+        ));
+    }
+    analyze_validated_continuous_with_daily(
+        spec, input, original_replay, candidate, limits, cancel, capture,
+    )
+}
+
+// Both public entries establish their DISTINCT input-provenance contract before
+// sharing original raw-set validation, causal selection and outcome arithmetic.
+fn analyze_validated_continuous_with_daily(
+    spec: &StudyRequest,
+    input: &StudyInput,
+    replay: &ContinuousReplay,
+    candidate: &StudyCandidate,
+    limits: &StudyLimits,
+    cancel: &CancelToken,
+    capture: Option<ContinuousCaptureCell>,
+) -> Result<Option<CapturedContinuousAnalysis>, StudyError> {
     let expected_params = parse_params(&spec.algorithm_id, &candidate.params)?;
     let mut total = 0usize;
     for raw in &replay.instruments {
@@ -833,7 +1078,7 @@ pub fn analyze_continuous(
         deadline: Instant::now() + Duration::from_secs(spec.max_seconds),
         detector_passes: &passes,
     };
-    analyze_inner(spec, input, replay, candidate, limits, &control)
+    analyze_inner_with_daily(spec, input, replay, candidate, limits, &control, capture)
 }
 
 pub fn evaluate_continuous(

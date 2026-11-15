@@ -101,7 +101,7 @@ pub async fn list(pool: &PgPool, owner: &str, algorithm: Option<&str>) -> Result
     Ok(out)
 }
 
-async fn owner_lock(tx: &mut Transaction<'_,Postgres>, owner: &str) -> Result<(),DbError> {
+pub(crate) async fn owner_lock(tx: &mut Transaction<'_,Postgres>, owner: &str) -> Result<(),DbError> {
     // Domain mutations and lease renewal deliberately use different locks.
     // Takeover must acquire this SAME advisory lock before changing its token.
     sqlx::query("select pg_advisory_xact_lock(hashtextextended($1,72423415))")
@@ -535,12 +535,14 @@ async fn persist_adaptive_setups(
             if duplicate {continue;}
             return Err(DbError::Json("adaptive emission precedes instrument publication floor".into()));
         }
-        let id: Option<i32> = sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,details,adaptive_slot_id,adaptive_generation_id,recommendation,external_name) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) on conflict(adaptive_slot_id,exchange_code,category,symbol,open_time) where adaptive_slot_id is not null do nothing returning id")
+        let expectancy_id=adaptive_expectancy_reference(tx,expected,row).await?;
+        let id: Option<i32> = sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,details,adaptive_slot_id,adaptive_generation_id,recommendation,external_name,expectancy_artifact_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) on conflict(adaptive_slot_id,exchange_code,category,symbol,open_time) where adaptive_slot_id is not null do nothing returning id")
             .bind(&row.exchange_code).bind(&row.category).bind(&row.symbol).bind(&row.setup.algorithm_id)
             .bind(&row.setup.algorithm_version).bind(serde_json::to_value(&row.setup.params).map_err(crate::json_error)?)
             .bind(open).bind(close).bind(&row.setup.close_price)
             .bind(serde_json::to_value(&row.setup.details).map_err(crate::json_error)?)
             .bind(expected.slot_id).bind(expected.generation_id).bind(&row.recommendation).bind(&expected.external_name)
+            .bind(expectancy_id)
             .fetch_optional(&mut **tx).await?;
         adaptive_commit_budget(deadline)?;
         if let Some(id)=id {
@@ -550,6 +552,79 @@ async fn persist_adaptive_setups(
         }
     }
     Ok(inserted)
+}
+
+/// Pin the exact evidence already frozen by the worker, never the current
+/// preferred pointer. A KEY SHARE lock protects captured A from concurrent GC
+/// until this transaction installs its real FK, even if B is now preferred.
+/// Absent/null IDs preserve the legacy trigger; malformed explicit IDs fail
+/// this transition instead of silently retaining an unrelated base artifact.
+async fn adaptive_expectancy_reference(
+    tx: &mut Transaction<'_,Postgres>,
+    expected: &ActiveAdaptiveSlot,
+    setup: &AdaptiveSetupWrite,
+) -> Result<Option<i64>,DbError> {
+    let snapshot=&setup.recommendation["expectancy"];
+    let Some(value)=snapshot.get("artifactId").filter(|value|!value.is_null()) else {return Ok(None);};
+    let invalid=||DbError::Json("adaptive_expectancy_reference_invalid".into());
+    let id=value.as_i64().filter(|id|*id>0).ok_or_else(invalid)?;
+    let row=sqlx::query("select artifact_key,owner_id,source_generation_id,source_study_id,source_slot_id,identity from study_expectancy_artifacts where id=$1 for key share")
+        .bind(id).fetch_optional(&mut **tx).await?.ok_or_else(invalid)?;
+    let identity:super::expectancy::ArtifactIdentity=serde_json::from_value(row.try_get("identity")?).map_err(|_|invalid())?;
+    let key:String=row.try_get("artifact_key")?;
+    let provenance=&setup.recommendation["provenance"];
+    if identity.owner_id!=expected.owner_id
+        || identity.generation_id!=expected.generation_id || identity.study_id!=expected.study_id || identity.slot_id!=expected.slot_id
+        || identity.tp_pct!=expected.selected_cell["tpPct"].as_f64().unwrap_or(f64::NAN)
+        || identity.sl_pct!=expected.selected_cell["slPct"].as_f64().unwrap_or(f64::NAN)
+        || identity.effective_analytics!=expected.analytics
+        || row.try_get::<String,_>("owner_id")?!=identity.owner_id
+        || row.try_get::<i64,_>("source_generation_id")?!=identity.generation_id
+        || row.try_get::<i64,_>("source_study_id")?!=identity.study_id
+        || row.try_get::<i64,_>("source_slot_id")?!=identity.slot_id
+        || super::expectancy::artifact_key(&identity).map_err(|_|invalid())?!=key
+        || snapshot["derivedSnapshotId"].as_str()!=Some(key.as_str())
+        || snapshot["studyId"].as_i64()!=Some(expected.study_id)
+        || snapshot["generationId"].as_i64()!=Some(expected.generation_id)
+        || snapshot["slotId"].as_i64()!=Some(expected.slot_id)
+        || setup.recommendation["ownerId"].as_str()!=Some(expected.owner_id.as_str())
+        || setup.recommendation["studyId"].as_i64()!=Some(expected.study_id)
+        || setup.recommendation["generationId"].as_i64()!=Some(expected.generation_id)
+        || setup.recommendation["slotId"].as_i64()!=Some(expected.slot_id)
+        || snapshot["calculationVersion"].as_u64().map(|version|version.to_string()).as_ref()!=Some(&identity.calculation_version)
+        || snapshot["sourceSnapshotHash"]!=identity.provenance["snapshotHash"]
+        || snapshot["sourceSnapshotHash"]!=provenance["snapshotHash"]
+        || identity.provenance["optimizerVersion"]!=provenance["optimizerVersion"]
+        || identity.provenance["seed"]!=provenance["seed"] || identity.provenance["capturedAt"]!=provenance["capturedAt"]
+        || snapshot["sourceCutoff"].as_i64()!=Some(identity.observation_cutoff)
+        || provenance["observationCutoff"].as_i64()!=Some(identity.observation_cutoff)
+        || snapshot["fromUnix"].as_i64()!=Some(identity.from_unix) || snapshot["toUnix"].as_i64()!=Some(identity.to_unix)
+        || provenance["fromUnix"].as_i64()!=Some(identity.from_unix) || provenance["toUnix"].as_i64()!=Some(identity.to_unix)
+        || setup.recommendation["tpPct"].as_f64()!=Some(identity.tp_pct)
+        || setup.recommendation["slPct"].as_f64()!=Some(identity.sl_pct)
+        || snapshot["forecastAtUnix"].as_i64()!=Some(setup.setup.close_time_unix)
+        || identity.observation_cutoff>setup.setup.close_time_unix
+    {return Err(invalid());}
+    match (&identity.historical_input_hash,snapshot.get("historicalRecalculation").filter(|value|!value.is_null())) {
+        (None,None)=>{},
+        (Some(hash),Some(historical))=>{
+            let actual:super::expectancy::HistoricalRecalculationProvenance=serde_json::from_value(historical["provenance"].clone()).map_err(|_|invalid())?;
+            actual.validate().map_err(|_|invalid())?;
+            let original_id=historical["originalArtifactId"].as_i64().filter(|original|*original>0 && *original!=id).ok_or_else(invalid)?;
+            let available=historical["availableFromUnix"].as_i64().ok_or_else(invalid)?;
+            if historical["revisionKey"].as_str()!=Some(hash.as_str()) || &actual.input_hash!=hash
+                || actual.read_to_unix>identity.observation_cutoff || available<actual.recalculated_at_unix || available>setup.setup.close_time_unix {
+                return Err(invalid());
+            }
+            // Validate immutable operation evidence for A, not B's publication.
+            let matched:bool=sqlx::query_scalar("select exists(select 1 from study_expectancy_recalculations where artifact_id=$1 and original_artifact_id=$2 and owner_id=$3 and generation_id=$4 and study_id=$5 and slot_id=$6 and revision_key=$7 and provenance=$8 and matched)")
+                .bind(id).bind(original_id).bind(&expected.owner_id).bind(expected.generation_id).bind(expected.study_id).bind(expected.slot_id)
+                .bind(hash).bind(&historical["provenance"]).fetch_one(&mut **tx).await?;
+            if !matched {return Err(invalid());}
+        },
+        _=>return Err(invalid()),
+    }
+    Ok(Some(id))
 }
 
 fn without_live_permission(value: &Value) -> Value {

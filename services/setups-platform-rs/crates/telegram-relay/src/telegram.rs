@@ -64,16 +64,16 @@ impl Telegram {
             origin: "https://api.telegram.org".into(),
         })
     }
+    fn request(&self, method: &'static str) -> reqwest::RequestBuilder {
+        // Neither URL nor reqwest error/Telegram description may leave this module.
+        self.client
+            .post(format!("{}/bot{}/{method}", self.origin, self.token))
+    }
     async fn call(&self, method: &'static str, body: Value) -> Result<Value, TelegramError> {
-        // Neither URL nor reqwest error/Telegram description may leave this method.
-        let url = format!("{}/bot{}/{method}", self.origin, self.token);
-        let mut response = self
-            .client
-            .post(url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(classify_transport)?;
+        self.response(self.request(method).json(&body)).await
+    }
+    async fn response(&self, request: reqwest::RequestBuilder) -> Result<Value, TelegramError> {
+        let mut response = request.send().await.map_err(classify_transport)?;
         let status = response.status().as_u16();
         if (300..400).contains(&status) {
             return Err(TelegramError::InvalidResponse);
@@ -115,11 +115,42 @@ impl Telegram {
     }
     pub async fn send(&self, text: &str) -> Result<i64, TelegramError> {
         let value=self.call("sendMessage",json!({"chat_id":self.chat_id,"text":text,"link_preview_options":{"is_disabled":true}})).await?;
-        value
-            .get("message_id")
-            .and_then(Value::as_i64)
-            .filter(|id| *id > 0)
-            .ok_or(TelegramError::InvalidResponse)
+        message_id(value)
+    }
+    pub async fn send_rich(
+        &self,
+        message: &setups_relay_protocol::v2::RelayMessage,
+        png: Option<Vec<u8>>,
+    ) -> Result<i64, TelegramError> {
+        // Only the authenticated protocol's validated inline bytes reach this
+        // boundary. No URL/file_id, parse_mode, second message or photo fallback.
+        let value = if let Some(png) = png {
+            let entities = serde_json::to_string(&message.entities)
+                .map_err(|_| TelegramError::InvalidResponse)?;
+            let photo = reqwest::multipart::Part::bytes(png)
+                .file_name("expectancy.png")
+                .mime_str("image/png")
+                .map_err(|_| TelegramError::InvalidResponse)?;
+            let form = reqwest::multipart::Form::new()
+                .text("chat_id", self.chat_id.to_string())
+                .text("caption", message.text.clone())
+                .text("caption_entities", entities)
+                .part("photo", photo);
+            self.response(self.request("sendPhoto").multipart(form))
+                .await?
+        } else {
+            self.call(
+                "sendMessage",
+                json!({
+                    "chat_id": self.chat_id,
+                    "text": message.text,
+                    "entities": message.entities,
+                    "link_preview_options": {"is_disabled": true},
+                }),
+            )
+            .await?
+        };
+        message_id(value)
     }
     pub async fn permission(&self) -> Result<(), TelegramError> {
         let value = self
@@ -151,6 +182,13 @@ impl Telegram {
             origin,
         }
     }
+}
+fn message_id(value: Value) -> Result<i64, TelegramError> {
+    value
+        .get("message_id")
+        .and_then(Value::as_i64)
+        .filter(|id| *id > 0)
+        .ok_or(TelegramError::InvalidResponse)
 }
 fn classify_transport(error: reqwest::Error) -> TelegramError {
     if error.is_timeout() {

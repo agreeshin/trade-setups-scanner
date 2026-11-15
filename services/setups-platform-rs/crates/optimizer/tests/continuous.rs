@@ -321,6 +321,197 @@ fn observed_fixture() -> (StudyRequest, StudyInput, ContinuousReplay) {
 }
 
 #[test]
+fn saved_replay_capture_needs_no_detector_bars_and_is_instrument_bounded() {
+    let (mut spec, mut historical, mut saved) = observed_fixture();
+    spec.analytics_params.cluster_enabled = true;
+    spec.analytics_params.cluster_gap_minutes = 1;
+    // A failed frequency score must not prevent evaluating these saved rows.
+    spec.min_setups_per_day = 100_000.0;
+    let mut second = identity();
+    second.symbol = "SECONDUSDT".into();
+    spec.instruments.push(second.clone());
+    saved.instruments[0].previous_raw_close_unix = Some(0);
+    let mut second_raw = saved.instruments[0].clone();
+    second_raw.instrument = second.clone();
+    second_raw.previous_raw_close_unix = None;
+    saved.instruments.push(second_raw);
+    historical.instruments[0].detector_bars.clear();
+    let mut second_data = historical.instruments[0].clone();
+    second_data.instrument = second;
+    // First instrument's pre-period seed suppresses its first raw signal.
+    // The second has a known-empty prehistory and takes the first signal's SL.
+    historical.instruments[0].candles[5].low = 90.0;
+    second_data.candles[1].high = 110.0;
+    historical.instruments.push(second_data);
+    let saved_bytes = serde_json::to_vec(&saved).unwrap();
+    let restored: ContinuousReplay = serde_json::from_slice(&saved_bytes).unwrap();
+    assert_ne!(restored.provenance.snapshot_hash, "available-history-v1");
+
+    // The saved raw-set anchor and actual historical-input proof are distinct.
+    // Do not relabel either one to make the native frozen entry accept them.
+    let canonical = analyze_continuous_with_daily(
+        &spec, &historical, &restored, &candidate(&spec), &StudyLimits::default(),
+        &CancelToken::new(), Some(ContinuousCaptureCell { tp_pct: 4.0, sl_pct: 4.0 }),
+    ).unwrap().unwrap();
+    historical.snapshot_hash = "available-history-v1".into();
+    historical.captured_at = "2026-11-15T12:00:00Z".into();
+    let limits = StudyLimits::default();
+    let cancel = CancelToken::new();
+    let pair = ContinuousCaptureCell { tp_pct: 4.0, sl_pct: 4.0 };
+    assert!(matches!(analyze_continuous_with_daily(
+        &spec, &historical, &restored, &candidate(&spec), &limits, &cancel, Some(pair),
+    ), Err(StudyError::InvalidInput(message)) if message.contains("frozen scope/provenance")));
+    let whole = analyze_historical_continuous_with_daily(
+        &spec, &historical, &restored, &candidate(&spec), &limits, &cancel, Some(pair),
+    ).unwrap().unwrap();
+    assert_eq!(whole, canonical);
+    assert_eq!(serde_json::to_vec(&whole).unwrap(), serde_json::to_vec(&canonical).unwrap());
+    assert_eq!(whole.evaluation.evaluation.summary.setup_count, 4);
+    assert_eq!(whole.evaluation.evaluation.summary.selected_setup_count, 3);
+    assert_eq!(whole.evaluation.evaluation.summary.score, None);
+    let cell = &whole.evaluation.evaluation.matrix[0];
+    assert_eq!((cell.closed_count, cell.tp_count, cell.sl_count), (2, 1, 1));
+    assert_eq!(cell.risk_expectancy, Some(0.0));
+    assert_eq!(whole.evaluation.diagnostics[0].right_censored_count, 1);
+
+    // A budget that rejects the whole input still admits each individual
+    // instrument. Production callers load/evaluate/drop in this same loop;
+    // no input reference or candle is retained in the compact output.
+    let probe_limits = StudyLimits { max_snapshot_bytes: 0, ..limits.clone() };
+    let requested = match analyze_historical_continuous_with_daily(
+        &spec, &historical, &restored, &candidate(&spec), &probe_limits, &cancel, Some(pair),
+    ).unwrap_err() {
+        StudyError::ResourceLimit { resource, requested, .. } if resource == "snapshot_bytes" => requested,
+        other => panic!("unexpected input budget failure: {other}"),
+    };
+    let bounded = StudyLimits { max_snapshot_bytes: requested - 1, ..limits };
+    assert!(matches!(analyze_historical_continuous_with_daily(
+        &spec, &historical, &restored, &candidate(&spec), &bounded, &cancel, Some(pair),
+    ), Err(StudyError::ResourceLimit { resource, .. }) if resource == "snapshot_bytes"));
+    let (mut raw_count, mut eligible, mut closed, mut tp, mut sl, mut censored) = (0, 0, 0, 0, 0, 0);
+    let mut daily_counts = BTreeMap::new();
+    for (raw, data) in restored.instruments.iter().zip(historical.instruments) {
+        let mut one_spec = spec.clone();
+        one_spec.instruments = vec![raw.instrument.clone()];
+        let one_input = StudyInput {
+            instruments: vec![data],
+            snapshot_hash: historical.snapshot_hash.clone(),
+            captured_at: historical.captured_at.clone(),
+        };
+        let mut one_replay = restored.clone();
+        one_replay.instruments = vec![raw.clone()];
+        let result = analyze_historical_continuous_with_daily(
+            &one_spec, &one_input, &one_replay, &candidate(&spec), &bounded, &cancel, Some(pair),
+        ).unwrap().unwrap();
+        raw_count += result.evaluation.evaluation.summary.setup_count;
+        eligible += result.evaluation.evaluation.summary.selected_setup_count;
+        let cell = &result.evaluation.evaluation.matrix[0];
+        closed += cell.closed_count;
+        tp += cell.tp_count;
+        sl += cell.sl_count;
+        censored += result.evaluation.diagnostics[0].right_censored_count;
+        for point in result.selected_daily.unwrap().points {
+            let counters = daily_counts.entry(point.day_start_unix).or_insert((0, 0, 0));
+            counters.0 += point.row_count;
+            counters.1 += point.tp_count;
+            counters.2 += point.sl_count;
+        }
+    }
+    assert_eq!((raw_count, eligible, closed, tp, sl, censored), (4, 3, 2, 1, 1, 1));
+    let whole_daily: BTreeMap<_, _> = whole.selected_daily.unwrap().points.into_iter()
+        .map(|p| (p.day_start_unix, (p.row_count, p.tp_count, p.sl_count))).collect();
+    assert_eq!(daily_counts, whole_daily);
+    assert_eq!(serde_json::to_vec(&restored).unwrap(), saved_bytes);
+    assert_eq!(serde_json::to_vec(&saved).unwrap(), saved_bytes);
+}
+
+#[test]
+fn saved_replay_capture_rejects_post_cutoff_candles_and_preserves_missing_history() {
+    let (mut spec, mut historical, raw) = observed_fixture();
+    spec.analytics_params.time_shift_minutes = 2;
+    spec.analytics_params.price_change_pct = Some(1.0);
+    historical.instruments[0].detector_bars.clear();
+    historical.snapshot_hash = "available-history-with-shift".into();
+    historical.captured_at = "2026-11-15T12:00:00Z".into();
+    historical.instruments[0].candles[2].close = 102.0;
+    historical.instruments[0].candles[2].high = 102.0;
+    historical.instruments[0].candles[3].low = 90.0;
+    let pair = ContinuousCaptureCell { tp_pct: 4.0, sl_pct: 4.0 };
+    let limits = StudyLimits::default();
+    let cancel = CancelToken::new();
+    let result = analyze_historical_continuous_with_daily(
+        &spec, &historical, &raw, &candidate(&spec), &limits, &cancel, Some(pair),
+    ).unwrap().unwrap();
+    assert_eq!(result.evaluation.evaluation.summary.selected_setup_count, 1);
+    assert_eq!(result.evaluation.evaluation.matrix[0].tp_count, 1);
+    assert_eq!(result.evaluation.diagnostics[0].future_entry_count, 1);
+
+    let mut beyond = historical.instruments[0].candles[5];
+    beyond.open_time_unix = raw.context.observation_cutoff;
+    historical.instruments[0].candles.push(beyond);
+    assert!(matches!(analyze_historical_continuous_with_daily(
+        &spec, &historical, &raw, &candidate(&spec), &limits, &cancel, Some(pair),
+    ), Err(StudyError::InvalidInput(message)) if message.contains("after observationCutoff")));
+
+    historical.instruments[0].candles.clear();
+    let missing = analyze_historical_continuous_with_daily(
+        &spec, &historical, &raw, &candidate(&spec), &limits, &cancel, Some(pair),
+    ).unwrap().unwrap();
+    assert_eq!(missing.evaluation.evaluation.summary.setup_count, 2);
+    assert_eq!(missing.evaluation.evaluation.summary.selected_setup_count, 0);
+    assert_eq!(missing.evaluation.evaluation.matrix[0].closed_count, 0);
+    assert_eq!(missing.evaluation.evaluation.matrix[0].risk_expectancy, None);
+    assert_eq!(missing.evaluation.diagnostics[0].missing_entry_count, 1);
+    assert_eq!(missing.evaluation.diagnostics[0].future_entry_count, 1);
+    let point = missing.selected_daily.unwrap().points.remove(0);
+    assert_eq!((point.row_count, point.tp_count, point.sl_count, point.mean_r), (2, 0, 0, None));
+}
+
+#[test]
+fn saved_replay_capture_requires_explicit_prehistory_not_end_of_period_bootstrap() {
+    let (mut spec, mut historical, mut saved) = observed_fixture();
+    spec.analytics_params.cluster_enabled = true;
+    spec.analytics_params.cluster_gap_minutes = 1;
+    historical.instruments[0].detector_bars.clear();
+    historical.snapshot_hash = "separate-historical-read".into();
+    historical.captured_at = "2026-11-15T12:00:00Z".into();
+    let pair = Some(ContinuousCaptureCell { tp_pct: 4.0, sl_pct: 4.0 });
+    let limits = StudyLimits::default();
+    let mut serialized = serde_json::to_value(&saved).unwrap();
+    assert!(serialized["instruments"][0]["previousRawCloseUnix"].is_null());
+    let known_empty: ContinuousReplay = serde_json::from_value(serialized.clone()).unwrap();
+    let empty = analyze_historical_continuous_with_daily(
+        &spec, &historical, &known_empty, &candidate(&spec), &limits, &CancelToken::new(), pair,
+    ).unwrap().unwrap();
+    assert_eq!(empty.selected_daily.unwrap().points[0].row_count, 2);
+    serialized["instruments"][0].as_object_mut().unwrap().remove("previousRawCloseUnix");
+    let missing = serde_json::from_value::<ContinuousReplay>(serialized).unwrap_err();
+    assert!(missing.to_string().contains("previousRawCloseUnix"));
+
+    saved.instruments[0].previous_raw_close_unix = Some(0);
+    let present: ContinuousReplay = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    let seeded = analyze_historical_continuous_with_daily(
+        &spec, &historical, &present, &candidate(&spec), &limits, &CancelToken::new(), pair,
+    ).unwrap().unwrap();
+    assert_eq!(seeded.selected_daily.unwrap().points[0].row_count, 1);
+    saved.instruments[0].previous_raw_close_unix = saved.instruments[0].last_raw_close_unix;
+    assert!(matches!(analyze_historical_continuous_with_daily(
+        &spec, &historical, &saved, &candidate(&spec), &limits, &CancelToken::new(), pair,
+    ), Err(StudyError::InvalidInput(message)) if message.contains("prehistory raw seed")));
+
+    saved.instruments[0].previous_raw_close_unix = Some(0);
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    assert!(analyze_historical_continuous_with_daily(
+        &spec, &historical, &saved, &candidate(&spec), &limits, &cancel, pair,
+    ).unwrap().is_none());
+    saved.provenance.snapshot_hash.clear();
+    assert!(matches!(analyze_historical_continuous_with_daily(
+        &spec, &historical, &saved, &candidate(&spec), &limits, &CancelToken::new(), pair,
+    ), Err(StudyError::InvalidInput(message)) if message.contains("original scope/provenance")));
+}
+
+#[test]
 fn observed_outcomes_distinguish_censoring_expiry_future_entry_and_holes_without_frequency_bias() {
     let (spec, mut data, raw) = observed_fixture();
     let limits = StudyLimits::default();
@@ -363,6 +554,142 @@ fn observed_outcomes_distinguish_censoring_expiry_future_entry_and_holes_without
         gap.evaluation.matrix[0].closed_count, 0,
         "a later TP cannot bridge unknown earlier outcomes"
     );
+}
+
+#[test]
+fn selected_daily_capture_preserves_whole_analysis_and_only_records_requested_pair() {
+    let (mut spec, mut data, raw) = observed_fixture();
+    spec.tp_levels = vec![4.0, 8.0]; spec.sl_levels = vec![4.0, 8.0];
+    // TP4 observes a TP before SL4, whereas TP8/SL4 observes the later SL.
+    data.instruments[0].candles[1].low = 95.0;
+    data.instruments[0].candles[2].high = 105.0;
+    let pair = ContinuousCaptureCell { tp_pct: 8.0, sl_pct: 4.0 };
+    let captured = capture_and_assert_identical(&spec, &data, &raw, &candidate(&spec), pair);
+    let daily = captured.selected_daily.unwrap();
+    assert_eq!((daily.tp_pct, daily.sl_pct), (8.0, 4.0));
+    assert_eq!(daily.points.len(), 1);
+    assert_eq!((daily.points[0].row_count, daily.points[0].tp_count, daily.points[0].sl_count), (2,0,1));
+    assert_eq!(daily.points[0].mean_r, Some(-1.0));
+    assert_eq!(captured.evaluation.evaluation.matrix[0].tp_count, 1);
+    assert_eq!(captured.evaluation.evaluation.matrix[2].sl_count, 1);
+}
+
+fn capture_and_assert_identical(spec: &StudyRequest, data: &StudyInput, replay: &ContinuousReplay,
+    candidate: &StudyCandidate, pair: ContinuousCaptureCell) -> CapturedContinuousAnalysis {
+    let limits = StudyLimits::default(); let cancel = CancelToken::new();
+    let original = analyze_continuous(spec, data, replay, candidate, &limits, &cancel).unwrap().unwrap();
+    let off = analyze_continuous_with_daily(spec, data, replay, candidate, &limits, &cancel, None).unwrap().unwrap();
+    assert!(off.selected_daily.is_none()); assert_eq!(off.evaluation, original);
+    let captured = analyze_continuous_with_daily(spec, data, replay, candidate, &limits, &cancel, Some(pair)).unwrap().unwrap();
+    // All scientific fields, original axis order, diagnostics and exact float
+    // serialization stay identical, not merely approximately equal averages.
+    assert_eq!(captured.evaluation, original);
+    assert_eq!(serde_json::to_vec(&captured.evaluation).unwrap(), serde_json::to_vec(&original).unwrap());
+    let daily = captured.selected_daily.as_ref().unwrap();
+    let cell = original.evaluation.matrix.iter().find(|cell| cell.tp_pct == pair.tp_pct && cell.sl_pct == pair.sl_pct).unwrap();
+    assert_eq!(daily.points.iter().map(|p|p.tp_count).sum::<u64>(), cell.tp_count as u64);
+    assert_eq!(daily.points.iter().map(|p|p.sl_count).sum::<u64>(), cell.sl_count as u64);
+    assert!(daily.points.len() <= setups_domain::expectancy::EXPECTANCY_MAX_POINTS);
+    captured
+}
+
+#[test]
+fn selected_daily_capture_keeps_censored_gap_filtered_and_missing_rows_null() {
+    let (spec, data, raw) = observed_fixture();
+    let pair = ContinuousCaptureCell { tp_pct: 4.0, sl_pct: 4.0 };
+    let result = capture_and_assert_identical(&spec, &data, &raw, &candidate(&spec), pair);
+    assert_eq!(result.evaluation.diagnostics[0].horizon_expired_count, 1);
+    assert_eq!(result.evaluation.diagnostics[0].right_censored_count, 1);
+    assert_eq!(result.selected_daily.unwrap().points[0].mean_r, None);
+
+    let mut shifted = candidate(&spec); shifted.analytics.time_shift_minutes = 2;
+    let result = capture_and_assert_identical(&spec, &data, &raw, &shifted, pair);
+    assert_eq!(result.evaluation.diagnostics[0].future_entry_count, 1);
+    assert_eq!(result.selected_daily.unwrap().points[0].mean_r, None);
+
+    let mut missing = data.clone(); missing.instruments[0].candles.remove(0);
+    let result = capture_and_assert_identical(&spec, &missing, &raw, &candidate(&spec), pair);
+    assert_eq!(result.evaluation.diagnostics[0].missing_entry_count, 1);
+    assert_eq!(result.selected_daily.unwrap().points[0].mean_r, None);
+
+    let mut filtered = candidate(&spec); filtered.analytics.price_change_pct = Some(1.0);
+    let result = capture_and_assert_identical(&spec, &data, &raw, &filtered, pair);
+    assert_eq!(result.evaluation.evaluation.summary.selected_setup_count, 0);
+    assert_eq!(result.evaluation.evaluation.matrix[0].price_change_filtered_count, 2);
+    let point = result.selected_daily.unwrap().points.remove(0);
+    assert_eq!((point.row_count,point.tp_count,point.sl_count,point.mean_r),(2,0,0,None));
+
+    let mut gap = data; gap.instruments[0].candles.remove(2);
+    gap.instruments[0].candles[2].low = 80.0;
+    let result = capture_and_assert_identical(&spec, &gap, &raw, &candidate(&spec), pair);
+    assert_eq!(result.evaluation.diagnostics[0].observation_gap_count, 1);
+    assert_eq!(result.selected_daily.unwrap().points[0].mean_r, None,
+        "a later TP cannot bridge an unknown earlier minute");
+}
+
+#[test]
+fn selected_daily_capture_uses_existing_simultaneous_touch_sl_classifier() {
+    let (spec, mut data, raw) = observed_fixture();
+    data.instruments[0].candles[1].low = 80.0;
+    data.instruments[0].candles[1].high = 120.0;
+    let result = capture_and_assert_identical(&spec, &data, &raw, &candidate(&spec),
+        ContinuousCaptureCell { tp_pct:4.0,sl_pct:4.0 });
+    let point = result.selected_daily.unwrap().points.remove(0);
+    assert_eq!((point.tp_count,point.sl_count,point.mean_r),(0,1,Some(-1.0)));
+}
+
+#[test]
+fn selected_daily_capture_follows_causal_cluster_prehistory_and_raw_chaining() {
+    let mut spec = request(); spec.analytics_params.cluster_enabled = true;
+    spec.analytics_params.cluster_gap_minutes = 8;
+    let data = snapshot(1500); let limits = StudyLimits::default(); let cancel = CancelToken::new();
+    let raw = materialize_continuous(&spec,&data,&candidate(&spec),context(&spec),&limits,&cancel).unwrap().unwrap();
+    assert!(raw.instruments[0].previous_raw_close_unix.is_some());
+    let pair = ContinuousCaptureCell {tp_pct:4.0,sl_pct:4.0};
+    let result = capture_and_assert_identical(&spec,&data,&raw,&candidate(&spec),pair);
+    assert!(result.selected_daily.unwrap().points.is_empty(),
+        "pre-period raw seed suppresses the whole chained cluster, not only its first row");
+    let mut off = candidate(&spec); off.analytics.cluster_enabled = false;
+    let result = capture_and_assert_identical(&spec,&data,&raw,&off,pair);
+    assert_eq!(result.selected_daily.unwrap().points.iter().map(|p|p.row_count).sum::<u64>(), raw.instruments[0].setups.len() as u64);
+}
+
+#[test]
+fn selected_daily_capture_groups_raw_close_utc_not_exit_and_omits_absent_days() {
+    let (mut spec, mut data, mut raw) = observed_fixture();
+    spec.from_unix=86_340; spec.to_unix=864_180; spec.horizon_minutes=1;
+    raw.from_unix=spec.from_unix; raw.to_unix=spec.to_unix; raw.context=context(&spec);
+    let template=raw.instruments[0].setups[0].clone();
+    raw.instruments[0].setups=[86_340,86_400,864_060].into_iter().map(|close| {
+        let mut setup=template.clone(); setup.open_time_unix=close-60; setup.close_time_unix=close; setup
+    }).collect();
+    raw.instruments[0].last_raw_close_unix=Some(864_060);
+    data.instruments[0].candles=[86_280,86_340,86_400,864_000,864_060].into_iter().map(|open| OhlcCandle {
+        open_time_unix:open,open:100.0,close:100.0,
+        high:if open==86_400 {110.0} else {100.0},
+        low:if open==86_340 || open==864_060 {90.0} else {100.0},
+    }).collect();
+    let result=capture_and_assert_identical(&spec,&data,&raw,&candidate(&spec),ContinuousCaptureCell {tp_pct:4.0,sl_pct:4.0});
+    let points=result.selected_daily.unwrap().points;
+    assert_eq!(points.iter().map(|p|p.day_start_unix).collect::<Vec<_>>(),[0,86_400,864_000]);
+    assert_eq!(points.iter().map(|p|p.mean_r).collect::<Vec<_>>(),[Some(1.0),Some(-1.0),Some(1.0)]);
+    assert_eq!(points.len(),3,"no fake zero buckets for days 2..9");
+}
+
+#[test]
+fn selected_daily_capture_is_admitted_bounded_cancelled_and_released_per_call() {
+    let (spec,data,raw)=observed_fixture(); let pair=ContinuousCaptureCell {tp_pct:4.0,sl_pct:4.0};
+    assert!(analyze_continuous_with_daily(&spec,&data,&raw,&candidate(&spec),&StudyLimits::default(),&CancelToken::new(),
+        Some(ContinuousCaptureCell {tp_pct:99.0,sl_pct:4.0})).is_err());
+    let cancel=CancelToken::new();cancel.cancel();
+    assert!(analyze_continuous_with_daily(&spec,&data,&raw,&candidate(&spec),&StudyLimits::default(),&cancel,Some(pair)).unwrap().is_none());
+    let mut long_spec=spec.clone(); long_spec.to_unix=long_spec.from_unix+3660*86_400;
+    let mut long_raw=raw.clone(); long_raw.to_unix=long_spec.to_unix;
+    let limits=StudyLimits {max_working_bytes:200_000,..StudyLimits::default()};
+    assert!(analyze_continuous(&long_spec,&data,&long_raw,&candidate(&long_spec),&limits,&CancelToken::new()).unwrap().is_some());
+    assert!(matches!(analyze_continuous_with_daily(&long_spec,&data,&long_raw,&candidate(&long_spec),&limits,&CancelToken::new(),Some(pair)),
+        Err(StudyError::ResourceLimit {resource,..}) if resource=="continuous_working_bytes"));
+    for _ in 0..8 {capture_and_assert_identical(&spec,&data,&raw,&candidate(&spec),pair);}
 }
 
 #[test]

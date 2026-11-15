@@ -80,12 +80,12 @@ pub async fn claim_owner(pool: &PgPool, worker: &str) -> Result<Option<OwnerLeas
     Ok(Some(OwnerLease{owner_id,worker:worker.into(),token}))
 }
 
-pub(super) async fn owns(tx: &mut Transaction<'_,Postgres>, lease: &OwnerLease) -> Result<bool,DbError> {
+pub(crate) async fn owns(tx: &mut Transaction<'_,Postgres>, lease: &OwnerLease) -> Result<bool,DbError> {
     Ok(sqlx::query_scalar("select exists(select 1 from continuous_owner_lanes where owner_id=$1 and lease_owner=$2 and lease_token=$3 and lease_until>clock_timestamp())")
         .bind(&lease.owner_id).bind(&lease.worker).bind(lease.token).fetch_one(&mut **tx).await?)
 }
 
-pub(super) async fn fenced(tx: &mut Transaction<'_,Postgres>, job: &ChainJob) -> Result<bool,DbError> {
+pub(crate) async fn fenced(tx: &mut Transaction<'_,Postgres>, job: &ChainJob) -> Result<bool,DbError> {
     owner_lock(tx,&job.lease.owner_id).await?;
     if !owns(tx,&job.lease).await? { return Ok(false); }
     // Protect revision/Stop without excluding live scanners during bulk replay
@@ -337,7 +337,7 @@ pub async fn finalize(pool: &PgPool, job: &ChainJob, result: &Value, accepted: b
     // Process -> slot, like scan commit and promotion. No market/CPU work here.
     sqlx::query("select owner_id from continuous_processes where owner_id=$1 and algorithm_id=$2 for update")
         .bind(&job.lease.owner_id).bind(&job.algorithm_id).execute(&mut *tx).await?;
-    let ready: bool=sqlx::query_scalar("select exists(select 1 from continuous_generations g join optimization_studies s on s.id=g.study_id where g.id=$1 and s.status='completed' and (not $2 or (g.replay_batch_id is not null and g.replay_manifest is not null and exists(select 1 from replay_runs r where r.batch_id=g.replay_batch_id) and not exists(select 1 from replay_runs r where r.batch_id=g.replay_batch_id and r.status<>'done'))))")
+    let ready: bool=sqlx::query_scalar("select exists(select 1 from continuous_generations g join optimization_studies s on s.id=g.study_id where g.id=$1 and s.status='completed' and not exists(select 1 from continuous_runtime_artifacts a where a.generation_id=g.id and a.gate_expectancy_required and g.expectancy_artifact_id is null) and (not $2 or (g.replay_batch_id is not null and g.replay_manifest is not null and exists(select 1 from replay_runs r where r.batch_id=g.replay_batch_id) and not exists(select 1 from replay_runs r where r.batch_id=g.replay_batch_id and r.status<>'done'))))")
         .bind(job.generation_id).bind(accepted).fetch_one(&mut *tx).await?;
     if !ready || (accepted && (!result["recommendation"].is_object() || !result["analytics"].is_object() || mean.is_none() || selected.is_none())) {
         return Err(DbError::Json("continuous generation is not fully ready for atomic finalization".into()));

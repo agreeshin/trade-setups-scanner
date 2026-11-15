@@ -33,7 +33,8 @@ import {
   type AnalyticsSectionKey,
   type AnalyticsUserSettings,
 } from "../lib/analytics-settings";
-import { dayKeyOf, formatUnix } from "../lib/datetime-format";
+import { formatUnix } from "../lib/datetime-format";
+import { buildDailyExpectancy, buildDailyExpectancyModel, type DailyExpectancyPoint } from "../lib/daily-expectancy";
 
 const SHORT_MATRIX_LEVELS = Array.from({ length: 14 }, (_, index) => 4 + index * 2);
 const LONG_TP_LEVELS = [1, 2, 3, ...SHORT_MATRIX_LEVELS, 35, 40, 45, 50, 60];
@@ -400,59 +401,24 @@ interface TradeRowWithSource extends TradeRow {
   fromCache: boolean;
 }
 
-interface DailyExpectancyPoint {
-  day: string;
-  riskExpectancy: number | null;
-  closedCount: number;
-  tpCount: number;
-  slCount: number;
-  computedCount: number;
-  cachedCount: number;
-}
-
-/** Groups closed trades into local-day points, like the reference project. */
-function buildDailyExpectancy(rows: TradeRowWithSource[]): DailyExpectancyPoint[] {
-  const buckets = new Map<string, { values: number[]; closedCount: number; tpCount: number; slCount: number; computedCount: number; cachedCount: number }>();
-  for (const row of rows) {
-    const day = dayKeyOf(row.setup.closeTimeUnix);
-    const bucket = buckets.get(day) ?? { values: [], closedCount: 0, tpCount: 0, slCount: 0, computedCount: 0, cachedCount: 0 };
-    bucket.computedCount += 1;
-    if (row.fromCache) bucket.cachedCount += 1;
-    if (row.riskReturn !== null) {
-      bucket.values.push(row.riskReturn);
-      bucket.closedCount += 1;
-      if (row.status === "tp") bucket.tpCount += 1;
-      else if (row.status === "sl") bucket.slCount += 1;
-    }
-    buckets.set(day, bucket);
-  }
-  return Array.from(buckets.entries())
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([day, bucket]) => ({
-      day,
-      riskExpectancy: bucket.values.length > 0 ? bucket.values.reduce((a, b) => a + b, 0) / bucket.values.length : null,
-      closedCount: bucket.closedCount,
-      tpCount: bucket.tpCount,
-      slCount: bucket.slCount,
-      computedCount: bucket.computedCount,
-      cachedCount: bucket.cachedCount,
-    }));
-}
-
 function dayLabel(day: string): string {
   const [, month, dayNumber] = day.split("-");
   return `${dayNumber}.${month}`;
 }
 
-/** Daily risk-expectancy line chart with a regression trend, ported from the reference project. */
-function DailyExpectancyChart({ items }: { items: DailyExpectancyPoint[] }) {
+/** Daily UTC expectancy with actual calendar spacing and equal-weight daily OLS. */
+function DailyExpectancyChart({ items, originUnix }: { items: DailyExpectancyPoint[]; originUnix: number }) {
   if (items.length === 0) {
     return <p className="text-xs text-muted-foreground">График появится после расчёта первых строк.</p>;
   }
+  const model = buildDailyExpectancyModel(items, originUnix);
+  const trend = model.trend;
   const values = items.map((item) => item.riskExpectancy).filter((value): value is number => value !== null && Number.isFinite(value));
   if (values.length === 0) {
     return <p className="text-xs text-muted-foreground">Пока нет дней с закрытыми TP/SL сделками.</p>;
   }
+  // Fitted endpoints may exceed observed extrema; keep the trend and both labels visible.
+  if (trend) values.push(trend.start.riskExpectancy, trend.end.riskExpectancy);
   const width = 760;
   const height = 280;
   const left = 64;
@@ -467,54 +433,18 @@ function DailyExpectancyChart({ items }: { items: DailyExpectancyPoint[] }) {
   const yMin = minValue === maxValue ? minValue - 0.5 : minValue - padding;
   const yMax = minValue === maxValue ? maxValue + 0.5 : maxValue + padding;
   const yRange = yMax - yMin;
-  const xForIndex = (index: number) => left + (items.length === 1 ? plotWidth / 2 : (index / (items.length - 1)) * plotWidth);
+  const firstX = model.points[0]!.x;
+  const xRange = model.points[model.points.length - 1]!.x - firstX;
+  const xForDay = (x: number) => left + (xRange === 0 ? plotWidth / 2 : ((x - firstX) / xRange) * plotWidth);
   const yForValue = (value: number) => top + ((yMax - value) / yRange) * plotHeight;
   const zeroY = yMin <= 0 && yMax >= 0 ? yForValue(0) : null;
   const labelStep = Math.max(1, Math.ceil(items.length / 8));
-  const segments: string[][] = [];
-  let current: string[] = [];
-  for (let index = 0; index < items.length; index += 1) {
-    const item = items[index]!;
-    if (item.riskExpectancy === null || !Number.isFinite(item.riskExpectancy)) {
-      if (current.length > 0) { segments.push(current); current = []; }
-      continue;
-    }
-    current.push(`${xForIndex(index)},${yForValue(item.riskExpectancy)}`);
-  }
-  if (current.length > 0) segments.push(current);
-
-  const trendPoints = items
-    .map((item, index) => ({ index, value: item.riskExpectancy }))
-    .filter((point): point is { index: number; value: number } => point.value !== null && Number.isFinite(point.value));
-  let trendLine: { x1: number; y1: number; x2: number; y2: number; slope: number; totalChange: number } | null = null;
-  if (trendPoints.length > 1) {
-    const count = trendPoints.length;
-    const meanX = trendPoints.reduce((sum, point) => sum + point.index, 0) / count;
-    const meanY = trendPoints.reduce((sum, point) => sum + point.value, 0) / count;
-    let covariance = 0;
-    let variance = 0;
-    for (const point of trendPoints) {
-      covariance += (point.index - meanX) * (point.value - meanY);
-      variance += (point.index - meanX) ** 2;
-    }
-    if (variance > 0) {
-      const slope = covariance / variance;
-      const trendYAt = (index: number) => meanY + slope * (index - meanX);
-      const first = trendPoints[0]!;
-      const last = trendPoints[count - 1]!;
-      trendLine = {
-        x1: xForIndex(first.index),
-        y1: yForValue(trendYAt(first.index)),
-        x2: xForIndex(last.index),
-        y2: yForValue(trendYAt(last.index)),
-        slope,
-        totalChange: trendYAt(last.index) - trendYAt(first.index),
-      };
-    }
-  }
+  // Round presentation only so floating-point residuals cannot produce a -0.00R label.
+  const fittedLabel = (value: number) => formatRisk(Number(value.toFixed(2)));
 
   return (
     <svg className="w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание в рисках">
+      <desc>Среднее закрытых сделок по UTC-дням сигнала. Расстояния по оси X соответствуют календарным суткам; дни без закрытых сделок не равны нулю.</desc>
       <line className="stroke-muted-foreground/40" x1={left} y1={top} x2={left} y2={height - bottom} />
       <line className="stroke-muted-foreground/40" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
       {zeroY !== null ? <line className="stroke-muted-foreground/50" x1={left} y1={zeroY} x2={width - right} y2={zeroY} /> : null}
@@ -524,38 +454,31 @@ function DailyExpectancyChart({ items }: { items: DailyExpectancyPoint[] }) {
           <text className="fill-muted-foreground text-[10px]" x={left - 10} y={yForValue(value) + 4} textAnchor="end">{formatRisk(value)}</text>
         </g>
       ))}
-      {segments.map((segment, index) =>
-        segment.length > 1 ? <polyline key={index} className="fill-none stroke-primary stroke-2" points={segment.join(" ")} /> : null,
-      )}
-      {trendLine !== null ? (
-        <line
-          className="stroke-warning"
-          strokeWidth={2}
-          strokeDasharray="4 4"
-          x1={trendLine.x1} y1={trendLine.y1} x2={trendLine.x2} y2={trendLine.y2}
-        >
-          <title>{`Тренд дневного матожидания: ${formatRisk(trendLine.slope)}/день, за период ${formatRisk(trendLine.totalChange)}`}</title>
+      {model.segments.map((segment, index) => segment.length > 1
+        ? <polyline key={index} className="fill-none stroke-primary stroke-2" points={segment.map((point) => `${xForDay(point.x)},${yForValue(point.riskExpectancy!)}`).join(" ")} /> : null)}
+      {trend !== null ? <>
+        <line className="stroke-warning" strokeWidth={2} strokeDasharray="4 4"
+          x1={xForDay(trend.start.x)} y1={yForValue(trend.start.riskExpectancy)} x2={xForDay(trend.end.x)} y2={yForValue(trend.end.riskExpectancy)}>
+          <title>{`Тренд дневного матожидания: ${formatRisk(trend.slopePerDay)}/день UTC, за период ${formatRisk(trend.totalChange)}`}</title>
         </line>
-      ) : null}
-      {items.map((item, index) => {
-        const x = xForIndex(index);
+        <text className="fill-warning font-mono text-[10px]" x={xForDay(trend.start.x)} y={yForValue(trend.start.riskExpectancy) - 10} textAnchor="start" aria-label={`Начало тренда: ${fittedLabel(trend.start.riskExpectancy)}`}>{fittedLabel(trend.start.riskExpectancy)}</text>
+        <text className="fill-warning font-mono text-[10px]" x={xForDay(trend.end.x)} y={yForValue(trend.end.riskExpectancy) - 10} textAnchor="end" aria-label={`Конец тренда: ${fittedLabel(trend.end.riskExpectancy)}`}>{fittedLabel(trend.end.riskExpectancy)}</text>
+      </> : null}
+      {model.points.map((item, index) => {
+        const x = xForDay(item.x);
         const showLabel = index % labelStep === 0 || index === items.length - 1;
         return (
           <g key={item.day}>
             {item.riskExpectancy !== null && Number.isFinite(item.riskExpectancy) ? (
-              <circle
-                className={item.riskExpectancy >= 0 ? "fill-success" : "fill-danger"}
-                cx={x} cy={yForValue(item.riskExpectancy)} r={4}
-              >
-                <title>
-                  {`${dayLabel(item.day)}: ${formatRisk(item.riskExpectancy)}, закрыто ${item.closedCount}, TP ${item.tpCount}, SL ${item.slCount}, из кеша ${item.cachedCount}/${item.computedCount}`}
-                </title>
+              <circle className={item.riskExpectancy >= 0 ? "fill-success" : "fill-danger"} cx={x} cy={yForValue(item.riskExpectancy)} r={4}>
+                <title>{`${dayLabel(item.day)} UTC: ${formatRisk(item.riskExpectancy)}, закрыто ${item.closedCount}, TP ${item.tpCount}, SL ${item.slCount}, из кеша ${item.cachedCount}/${item.computedCount}`}</title>
               </circle>
             ) : null}
             {showLabel ? <text className="fill-muted-foreground text-[10px]" x={x} y={height - 26} textAnchor="middle">{dayLabel(item.day)}</text> : null}
           </g>
         );
       })}
+      <text className="fill-muted-foreground text-[10px]" x={left + plotWidth / 2} y={height - 8} textAnchor="middle">Дата сигнала (UTC)</text>
     </svg>
   );
 }
@@ -693,6 +616,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
   }, [visibleRows]);
 
   const dailyPoints = useMemo(() => buildDailyExpectancy(visibleRows), [visibleRows]);
+  const chartOriginUnix = effectiveDays !== null ? Date.parse(`${effectiveDays.from}T00:00:00Z`) / 1000 : dailyPoints[0]?.dayStartUnix ?? 0;
 
   return <section className="grid min-w-0 gap-4">
       <div className="grid gap-1">
@@ -736,7 +660,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
         {summary.avgRisk !== null && <Badge>Матожидание: {formatRisk(summary.avgRisk)} по {summary.closed} закрытым</Badge>}
         {filteredCount > 0 && <Badge variant="warning">Отфильтровано смещением цены: {filteredCount}</Badge>}
       </div>
-      {rows.length > 0 && <DailyExpectancyChart items={dailyPoints} />}
+      {rows.length > 0 && <DailyExpectancyChart items={dailyPoints} originUnix={chartOriginUnix} />}
       {rows.length === 0 && !running && !error && <EmptyState title="Нет рассчитанных сделок" description="Выберите параметры и нажмите «Рассчитать». Сначала загружаются кешированные строки, затем досчитываются остальные." />}
       {rows.length > 0 && (
         <div className="overflow-x-auto">

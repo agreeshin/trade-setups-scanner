@@ -6,6 +6,7 @@ use setups_db::telegram::{
     self as db, TelegramConfig, TelegramJob, TelegramOutcome, TelegramReason, TelegramStatusUpdate,
     TelegramTestAttempt, TelegramTestResult,
 };
+use setups_relay_protocol::v2;
 use setups_relay_protocol::{
     self as protocol, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION,
     MAX_BODY_BYTES, MESSAGES_PATH, ResponseAuth, SecretKey,
@@ -297,6 +298,32 @@ impl<'key> RelaySession<'key> {
             status,
         })
     }
+    async fn authenticate_v2(&self) -> Result<AuthenticatedRelayV2<'_, 'key>, ClientFailure> {
+        let reply = self
+            .request(Method::GET, v2::STATUS_PATH, &[], None)
+            .await
+            .map_err(|error| ClientFailure::before(error.code))?;
+        if reply.status != 200 {
+            return Err(ClientFailure::before("relay_v2_unsupported"));
+        }
+        let status: v2::RelayStatus = serde_json::from_slice(&reply.body)
+            .map_err(|_| ClientFailure::before("invalid_relay_v2_status"))?;
+        status
+            .validate()
+            .map_err(|_| ClientFailure::before("invalid_relay_v2_status"))?;
+        if !status.capabilities.iter().any(|value| value == "text")
+            || !status
+                .capabilities
+                .iter()
+                .any(|value| value == "text_entities")
+        {
+            return Err(ClientFailure::before("relay_v2_unsupported"));
+        }
+        Ok(AuthenticatedRelayV2 {
+            session: self,
+            status,
+        })
+    }
     async fn request(
         &self,
         method: Method,
@@ -304,7 +331,13 @@ impl<'key> RelaySession<'key> {
         body: &[u8],
         expires_at: Option<i64>,
     ) -> Result<SignedReply, ClientFailure> {
-        if body.len() > MAX_BODY_BYTES {
+        let is_v2 = matches!(path, v2::STATUS_PATH | v2::MESSAGES_PATH);
+        let body_limit = if is_v2 {
+            v2::MAX_BODY_BYTES
+        } else {
+            MAX_BODY_BYTES
+        };
+        if body.len() > body_limit {
             return Err(ClientFailure::before("relay_body_too_large"));
         }
         let mut url = self.origin.clone();
@@ -315,13 +348,18 @@ impl<'key> RelaySession<'key> {
             return Err(ClientFailure::before("expired"));
         }
         let nonce = nonce();
-        let auth = protocol::sign_request(self.key, method.as_str(), path, now, &nonce, body)
-            .map_err(|_| ClientFailure::before("invalid_relay_request"))?;
+        let auth = if is_v2 {
+            v2::sign_request(self.key, method.as_str(), path, now, &nonce, body)
+                .map_err(|_| ClientFailure::before("invalid_relay_request"))
+        } else {
+            protocol::sign_request(self.key, method.as_str(), path, now, &nonce, body)
+                .map_err(|_| ClientFailure::before("invalid_relay_request"))
+        }?;
         let mut request = self.client.request(method, url);
         for (name, value) in auth.headers() {
             request = request.header(name, value);
         }
-        if path == MESSAGES_PATH {
+        if path == MESSAGES_PATH || path == v2::MESSAGES_PATH {
             request = request
                 .header("content-type", "application/json")
                 .body(body.to_vec());
@@ -339,11 +377,119 @@ impl<'key> RelaySession<'key> {
             return Err(ClientFailure::after("relay_response_too_large"));
         }
         let body = bounded_body(response.bytes_stream()).await?;
-        protocol::verify_response(self.key, &nonce, status, &auth, &body)
-            .map_err(|_| ClientFailure::after("relay_response_auth"))?;
+        let verified = if is_v2 {
+            v2::verify_response(self.key, &nonce, status, &auth, &body)
+                .map_err(|_| ClientFailure::after("relay_response_auth"))
+        } else {
+            protocol::verify_response(self.key, &nonce, status, &auth, &body)
+                .map_err(|_| ClientFailure::after("relay_response_auth"))
+        };
+        verified?;
         Ok(SignedReply { status, body })
     }
 }
+struct AuthenticatedRelayV2<'a, 'key> {
+    session: &'a RelaySession<'key>,
+    status: v2::RelayStatus,
+}
+impl AuthenticatedRelayV2<'_, '_> {
+    async fn post(&self, body: &[u8], expires_at: i64) -> Result<SignedReply, ClientFailure> {
+        if !self.status.telegram_ready {
+            return Err(ClientFailure::before("telegram_not_ready"));
+        }
+        // Reached only through a signed empty v2 GET on this same pinned client.
+        self.session
+            .request(Method::POST, v2::MESSAGES_PATH, body, Some(expires_at))
+            .await
+    }
+}
+
+/// Presentation-only seam: immutable saved metrics belong to the formatter and
+/// study artifact owner, never to the relay sender. Owned buffers live for one
+/// attempt and are dropped after freeze/send; no global image or payload cache.
+pub struct TelegramV2Presentation {
+    pub text: String,
+    pub entities: Vec<v2::TextEntity>,
+    pub png: Option<Vec<u8>>,
+    pub unavailable_reason: Option<&'static str>,
+}
+
+struct RenderedV2 {
+    body: Vec<u8>,
+    diagnostic: Option<TelegramReason>,
+}
+
+fn render_v2_message(
+    job: &TelegramJob,
+    now: i64,
+    presentation: TelegramV2Presentation,
+    photo_supported: bool,
+) -> Result<RenderedV2, ClientFailure> {
+    // Validate full text/entities first. A bad PNG must not turn invalid text
+    // into a successful fallback or silently remove required trading terms.
+    let mut message = v2::RelayMessage {
+        version: v2::VERSION,
+        id: job.delivery_id.clone(),
+        text: presentation.text,
+        entities: presentation.entities,
+        expires_at: job.expires_at_unix,
+        attachment: None,
+    };
+    let text_body = message
+        .encode(now)
+        .map_err(|_| ClientFailure::before("invalid_v2_text"))?;
+    // Fixed WATCH is ordinary text, not a missing expected adaptive chart.
+    // Only an explicit unavailable reason (or a rejected supplied image) marks
+    // a text-only publication as a chart fallback.
+    if presentation.png.is_none() && presentation.unavailable_reason.is_none() {
+        return Ok(RenderedV2 {
+            body: text_body,
+            diagnostic: None,
+        });
+    }
+    let mut unavailable = presentation.unavailable_reason.unwrap_or("png_unavailable");
+    if let Some(png) = presentation.png {
+        if !photo_supported {
+            unavailable = "relay_photo_unsupported";
+        } else if v2::utf16_len(&message.text) > v2::MAX_CAPTION_UTF16_UNITS {
+            unavailable = "caption_overflow";
+        } else {
+            // The shared protocol validates canonical base64, static RGB/RGBA
+            // PNG structure, the decoded byte cap and exact 900x320 dimensions.
+            // Artifact bytes are not fetched from a URL or re-rendered here.
+            match v2::Attachment::from_png(&png) {
+                Ok(attachment) => {
+                    message.attachment = Some(attachment);
+                    if let Ok(body) = message.encode(now) {
+                        return Ok(RenderedV2 {
+                            body,
+                            diagnostic: None,
+                        });
+                    }
+                    unavailable = "png_invalid";
+                }
+                Err(_) => unavailable = "png_invalid",
+            }
+        }
+    }
+    let code = match unavailable {
+        "caption_overflow" => "caption_overflow",
+        "relay_photo_unsupported" => "relay_photo_unsupported",
+        "png_invalid" => "png_invalid",
+        "png_identity_mismatch" => "png_identity_mismatch",
+        "png_hash_mismatch" => "png_hash_mismatch",
+        "png_lookup_unavailable" => "png_lookup_unavailable",
+        _ => "png_unavailable",
+    };
+    Ok(RenderedV2 {
+        body: text_body,
+        diagnostic: Some(TelegramReason::new(
+            code,
+            "Chart unavailable; delivery contains one complete formatted text message.",
+        )),
+    })
+}
+
 impl AuthenticatedRelay<'_, '_> {
     async fn post(&self, body: &[u8], expires_at: i64) -> Result<SignedReply, ClientFailure> {
         if !self.status.telegram_ready {
@@ -364,6 +510,148 @@ trait RelayAccess {
         origin: &str,
         key: &'key SecretKey,
     ) -> Result<RelaySession<'key>, ClientFailure>;
+    async fn presentation(
+        &self,
+        pool: &PgPool,
+        job: &TelegramJob,
+    ) -> Result<TelegramV2Presentation, ClientFailure> {
+        saved_presentation(pool, job).await
+    }
+}
+
+async fn saved_presentation(
+    pool: &PgPool,
+    job: &TelegramJob,
+) -> Result<TelegramV2Presentation, ClientFailure> {
+    // Validate saved identity/name/params using the unchanged v1 path too;
+    // rendering rich text must not weaken the original snapshot fence.
+    let body = render_message(job, chrono::Utc::now().timestamp())?;
+    let legacy = protocol::RelayMessage::parse(&body, chrono::Utc::now().timestamp())
+        .map_err(|_| ClientFailure::before("invalid_saved_payload"))?;
+    if job.slot_id.is_some() {
+        let instrument = serde_json::from_value(job.payload["instrument"].clone())
+            .map_err(|_| ClientFailure::before("invalid_saved_payload"))?;
+        let raw = serde_json::from_value(job.payload["raw"].clone())
+            .map_err(|_| ClientFailure::before("invalid_saved_payload"))?;
+        let caption = crate::adaptive::recommendation_telegram_caption(
+            &instrument,
+            &raw,
+            &job.payload["recommendation"],
+        )
+        .map_err(|_| ClientFailure::before("invalid_saved_payload"))?;
+        let (png, unavailable_reason) = match saved_chart_png(pool, job).await {
+            Ok(png) => (png, None),
+            Err(code) => (None, Some(code)),
+        };
+        return Ok(TelegramV2Presentation {
+            text: caption.text,
+            entities: caption.entities,
+            png,
+            unavailable_reason,
+        });
+    }
+    Ok(TelegramV2Presentation {
+        text: legacy.text,
+        entities: Vec::new(),
+        png: None,
+        unavailable_reason: None,
+    })
+}
+
+/// Read only the artifact named by this immutable recommendation. All decoded
+/// numerical JSON (<=1 MiB) and PNG bytes (<=256 KiB) belong to this one attempt
+/// and are released before its result; no current-profile lookup or cache here.
+async fn saved_chart_png(
+    pool: &PgPool,
+    job: &TelegramJob,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    use setups_domain::{AdaptiveRecommendationSnapshot, expectancy::ExpectancyArtifact};
+    let recommendation = &job.payload["recommendation"];
+    let saved = &recommendation["expectancy"];
+    let Some(id) = saved["artifactId"].as_i64().filter(|id| *id > 0) else {
+        return Err("png_unavailable");
+    };
+    if saved["imageKey"].is_null() {
+        return Err("png_unavailable");
+    }
+    let key: setups_domain::expectancy::ExpectancyImageKey =
+        serde_json::from_value(saved["imageKey"].clone()).map_err(|_| "png_identity_mismatch")?;
+    let snapshot: AdaptiveRecommendationSnapshot =
+        serde_json::from_value(recommendation.clone()).map_err(|_| "png_identity_mismatch")?;
+    let artifact = setups_db::expectancy::get(pool, &job.owner_id, id)
+        .await
+        .map_err(|_| "png_lookup_unavailable")?
+        .ok_or("png_unavailable")?;
+    let numerical: ExpectancyArtifact =
+        serde_json::from_value(artifact.numerical_snapshot).map_err(|_| "png_identity_mismatch")?;
+    numerical.validate().map_err(|_| "png_identity_mismatch")?;
+    let identity = &artifact.identity;
+    let source = &numerical.source;
+    let provenance = &snapshot.provenance;
+    if artifact.id != id
+        || identity.owner_id != job.owner_id
+        || Some(identity.generation_id) != job.generation_id
+        || Some(identity.slot_id) != job.slot_id
+        || recommendation["ownerId"].as_str() != Some(job.owner_id.as_str())
+        || recommendation["studyId"].as_i64() != Some(identity.study_id)
+        || identity.calculation_version != key.calculation_version.to_string()
+        || identity.tp_pct != snapshot.tp_pct
+        || identity.sl_pct != snapshot.sl_pct
+        || (
+            identity.from_unix,
+            identity.to_unix,
+            identity.observation_cutoff,
+        ) != (
+            provenance.from_unix,
+            provenance.to_unix,
+            provenance.observation_cutoff,
+        )
+        || setups_db::expectancy::artifact_key(identity).map_err(|_| "png_identity_mismatch")?
+            != artifact.key
+        || key.derived_snapshot_id != artifact.key
+        || numerical.image_key(key.render_version) != key
+        || key.render_version != 1
+        || source.generation_id.as_deref() != Some(identity.generation_id.to_string().as_str())
+        || source.profile_id.as_deref() != Some(identity.slot_id.to_string().as_str())
+        || source.provenance != *provenance
+        || source.direction != snapshot.direction
+        || source.tp_pct != snapshot.tp_pct
+        || source.sl_pct != snapshot.sl_pct
+        || source.analytics.cluster_enabled != snapshot.cluster_enabled
+        || source.analytics.cluster_gap_minutes != snapshot.cluster_gap_minutes
+        || source.analytics.time_shift_minutes != snapshot.time_shift_minutes
+        || source.analytics.price_change_pct != snapshot.price_change_pct
+        || numerical
+            .matrix_mean_r
+            .as_ref()
+            .is_some_and(|value| *value != snapshot.mean_r)
+        || numerical
+            .selected_cell
+            .as_ref()
+            .and_then(|cell| cell.raw_r.as_ref())
+            .is_some_and(|value| *value != snapshot.raw_r)
+        || !numerical
+            .daily
+            .as_ref()
+            .is_some_and(|days| days.iter().any(|day| day.mean_r.is_some()))
+    {
+        return Err("png_identity_mismatch");
+    }
+    let version = key.render_version.to_string();
+    let png = setups_db::expectancy::load_png_by_image_key(pool, &job.owner_id, &key)
+        .await
+        .map_err(|_| "png_lookup_unavailable")?
+        .ok_or("png_unavailable")?;
+    if png.len() > v2::MAX_PNG_BYTES {
+        return Err("png_invalid");
+    }
+    if !db::chart_png_checksum_matches(pool, &job.owner_id, id, &version, &png)
+        .await
+        .map_err(|_| "png_lookup_unavailable")?
+    {
+        return Err("png_hash_mismatch");
+    }
+    Ok(Some(png))
 }
 struct SecureRelayAccess;
 impl RelayAccess for SecureRelayAccess {
@@ -522,6 +810,34 @@ fn classify_reply(reply: SignedReply, expected_id: &str) -> DeliveryResult {
         },
     }
 }
+fn classify_v2_reply(reply: SignedReply, expected_id: &str) -> DeliveryResult {
+    if reply.status == 200 {
+        return match serde_json::from_slice::<v2::RelayMessageResponse>(&reply.body) {
+            Ok(response) if response.validate().is_ok() && response.id == expected_id => {
+                DeliveryResult::Sent
+            }
+            _ => DeliveryResult::Retry {
+                code: "invalid_relay_receipt",
+                after: None,
+                uncertain: true,
+            },
+        };
+    }
+    // Error codes and retry policy are identical, but response version must be
+    // validated as v2 before adapting into the unchanged legacy classifier.
+    let parsed = serde_json::from_slice::<v2::RelayErrorResponse>(&reply.body)
+        .ok()
+        .filter(|value| value.validate().is_ok());
+    let body = parsed.map(|error| serde_json::json!({"version":1,"code":error.code,"retryAfter":error.retry_after}))
+        .and_then(|body| serde_json::to_vec(&body).ok()).unwrap_or_default();
+    classify_reply(
+        SignedReply {
+            status: reply.status,
+            body,
+        },
+        expected_id,
+    )
+}
 fn test_result(
     request_id: &str,
     result: Result<DeliveryResult, ClientFailure>,
@@ -672,6 +988,22 @@ async fn send_job_via(
     stopped: &AtomicBool,
     access: &impl RelayAccess,
 ) -> Result<TelegramOutcome, WorkerError> {
+    match job.wire_version {
+        1 => send_v1_job_via(pool, worker, job, stopped, access).await,
+        2 => send_v2_job_via(pool, worker, job, stopped, access).await,
+        _ => Ok(TelegramOutcome::Failed {
+            reason: reason("unsupported_wire_version"),
+        }),
+    }
+}
+
+async fn send_v1_job_via(
+    pool: &PgPool,
+    worker: &str,
+    job: &TelegramJob,
+    stopped: &AtomicBool,
+    access: &impl RelayAccess,
+) -> Result<TelegramOutcome, WorkerError> {
     let now = chrono::Utc::now().timestamp();
     if now > job.expires_at_unix {
         return Ok(retry_outcome(job, "expired", Some(1), now));
@@ -749,6 +1081,126 @@ async fn send_job_via(
     }
     let result = match authenticated.post(&body, message.expires_at).await {
         Ok(reply) => classify_reply(reply, &job.delivery_id),
+        Err(error) => DeliveryResult::Retry {
+            code: error.code,
+            after: None,
+            uncertain: error.uncertain,
+        },
+    };
+    Ok(match result {
+        DeliveryResult::Sent => TelegramOutcome::Sent,
+        DeliveryResult::Failed(code) => TelegramOutcome::Failed {
+            reason: reason(code),
+        },
+        DeliveryResult::Retry { code, after, .. } => {
+            retry_outcome(job, code, after, chrono::Utc::now().timestamp())
+        }
+    })
+}
+
+async fn send_v2_job_via(
+    pool: &PgPool,
+    worker: &str,
+    job: &TelegramJob,
+    stopped: &AtomicBool,
+    access: &impl RelayAccess,
+) -> Result<TelegramOutcome, WorkerError> {
+    let now = chrono::Utc::now().timestamp();
+    if now > job.expires_at_unix {
+        return Ok(retry_outcome(job, "expired", Some(1), now));
+    }
+    if stopped.load(Ordering::SeqCst) || !db::permitted(pool, worker, job).await? {
+        return Ok(disabled("delivery_fenced"));
+    }
+    let key = match access.key() {
+        Ok(key) => key,
+        Err(error) => return Ok(retry_outcome(job, error.code, None, now)),
+    };
+    let session = match access.connect(&job.endpoint_url, &key).await {
+        Ok(session) => session,
+        Err(error) => return Ok(retry_outcome(job, error.code, None, now)),
+    };
+    // Prove exact v2 route/version/capabilities before selecting an unfrozen
+    // photo/text form. Unsupported relays never receive confidential content;
+    // existing v1 work uses the separate unchanged route, not a v2 downgrade.
+    let authenticated = match session.authenticate_v2().await {
+        Ok(value) => value,
+        Err(error) => {
+            db::record_status(pool, job.settings_revision, &failed_status(error.code)).await?;
+            return Ok(retry_outcome(job, error.code, None, now));
+        }
+    };
+    let status = TelegramStatusUpdate {
+        relay_authenticated: true,
+        telegram_ready: Some(authenticated.status.telegram_ready),
+        reason: (!authenticated.status.telegram_ready).then(|| reason("telegram_not_ready")),
+    };
+    db::record_status(pool, job.settings_revision, &status).await?;
+    let (raw_body, diagnostic) = if let Some(body) = &job.request_body {
+        (body.clone(), None)
+    } else {
+        let content = match access.presentation(pool, job).await {
+            Ok(content) => content,
+            Err(error) => {
+                return Ok(TelegramOutcome::Failed {
+                    reason: reason(error.code),
+                });
+            }
+        };
+        let photo_supported = authenticated
+            .status
+            .capabilities
+            .iter()
+            .any(|value| value == "photo_png");
+        match render_v2_message(
+            job,
+            chrono::Utc::now().timestamp(),
+            content,
+            photo_supported,
+        ) {
+            Ok(rendered) => (rendered.body, rendered.diagnostic),
+            Err(error) => {
+                return Ok(TelegramOutcome::Failed {
+                    reason: reason(error.code),
+                });
+            }
+        }
+    };
+    let Some(body) =
+        db::freeze_message_with_diagnostic(pool, worker, job, &raw_body, diagnostic.as_ref())
+            .await?
+    else {
+        return Ok(disabled("delivery_fenced"));
+    };
+    let message = match v2::RelayMessage::parse(&body, chrono::Utc::now().timestamp()) {
+        Ok(message)
+            if message.id == job.delivery_id && message.expires_at == job.expires_at_unix =>
+        {
+            message
+        }
+        _ => {
+            return Ok(TelegramOutcome::Failed {
+                reason: reason("invalid_frozen_message"),
+            });
+        }
+    };
+    if message.attachment.is_some()
+        && !authenticated
+            .status
+            .capabilities
+            .iter()
+            .any(|value| value == "photo_png")
+    {
+        return Ok(retry_outcome(job, "relay_photo_unsupported", None, now));
+    }
+    if stopped.load(Ordering::SeqCst)
+        || !db::permitted(pool, worker, job).await?
+        || !db::renew(pool, worker, job).await?
+    {
+        return Ok(disabled("delivery_fenced"));
+    }
+    let result = match authenticated.post(&body, message.expires_at).await {
+        Ok(reply) => classify_v2_reply(reply, &job.delivery_id),
         Err(error) => DeliveryResult::Retry {
             code: error.code,
             after: None,

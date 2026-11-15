@@ -27,6 +27,57 @@ use std::{
 use tokio::sync::{Mutex, Semaphore};
 
 type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// Wire versions share durable receipt/nonce state, never reinterpret one body.
+/// A request owns its bounded message until the Telegram call completes; no
+/// second payload queue or process-wide image cache is retained by the relay.
+enum DeliveryMessage {
+    V1(RelayMessage),
+    V2(protocol::v2::RelayMessage, Option<Vec<u8>>),
+}
+impl DeliveryMessage {
+    fn rich(message: protocol::v2::RelayMessage) -> Result<Self, protocol::v2::Error> {
+        // Decode/validate before receipt admission and the final TTL check, not
+        // between that check and Telegram egress. The one <=256KiB buffer is
+        // moved into multipart and released on completion/error/cancellation.
+        let png = message
+            .attachment
+            .as_ref()
+            .map(protocol::v2::Attachment::decode_png)
+            .transpose()?;
+        Ok(Self::V2(message, png))
+    }
+    fn id(&self) -> &str {
+        match self {
+            Self::V1(message) => &message.id,
+            Self::V2(message, _) => &message.id,
+        }
+    }
+    fn version(&self) -> u8 {
+        match self {
+            Self::V1(_) => 1,
+            Self::V2(..) => 2,
+        }
+    }
+    fn expires_at(&self) -> i64 {
+        match self {
+            Self::V1(message) => message.expires_at,
+            Self::V2(message, _) => message.expires_at,
+        }
+    }
+    fn validate_expiry(&self, now: i64) -> Result<(), &'static str> {
+        match self {
+            Self::V1(message) => message.validate_expiry(now).map_err(|error| error.code()),
+            Self::V2(message, _) => message.validate_expiry(now).map_err(|error| error.code()),
+        }
+    }
+    async fn send(self, telegram: &Telegram) -> Result<i64, TelegramError> {
+        match self {
+            Self::V1(message) => telegram.send(&message.text).await,
+            Self::V2(message, png) => telegram.send_rich(&message, png).await,
+        }
+    }
+}
 struct Probe {
     cached: Option<(Instant, RelayStatus)>,
 }
@@ -63,6 +114,8 @@ impl App {
         Router::new()
             .route(protocol::MESSAGES_PATH, any(handle))
             .route(protocol::STATUS_PATH, any(handle))
+            .route(protocol::v2::MESSAGES_PATH, any(handle))
+            .route(protocol::v2::STATUS_PATH, any(handle))
             .with_state(self.clone())
     }
     async fn status(&self) -> Result<RelayStatus, RelayError> {
@@ -102,23 +155,25 @@ impl App {
     }
     async fn message(
         &self,
-        message: RelayMessage,
+        message: DeliveryMessage,
         hash: String,
         attempt: PostAttempt,
     ) -> Result<RelayMessageResponse, Failure> {
         let now = (self.clock)();
+        let id = message.id().to_owned();
+        let version = message.version();
         let claim = self
             .store
-            .claim_attempt(message.id.clone(), hash, message.expires_at, now, attempt)
+            .claim_attempt(id.clone(), hash, message.expires_at(), now, attempt)
             .await
             .map_err(Failure::storage)?;
         let epoch = match claim {
-            Claim::Duplicate(id) => {
+            Claim::Duplicate(telegram_id) => {
                 return Ok(RelayMessageResponse {
-                    version: 1,
-                    id: message.id,
+                    version,
+                    id,
                     outcome: RelayOutcome::Duplicate,
-                    telegram_message_id: Some(id),
+                    telegram_message_id: Some(telegram_id),
                 });
             }
             Claim::Conflict => return Err(Failure::new(409, "id_body_conflict", None)),
@@ -145,7 +200,7 @@ impl App {
         let Ok(_channel) = self.channel.try_acquire() else {
             self.store
                 .finish(
-                    message.id.clone(),
+                    id.clone(),
                     epoch,
                     Completion::Retry {
                         code: "channel_busy",
@@ -162,7 +217,7 @@ impl App {
         if let Err(error) = message.validate_expiry((self.clock)()) {
             self.store
                 .finish(
-                    message.id.clone(),
+                    id.clone(),
                     epoch,
                     Completion::Retry {
                         code: "expired",
@@ -173,13 +228,13 @@ impl App {
                 )
                 .await
                 .map_err(Failure::storage)?;
-            return Err(Failure::new(400, error.code(), None));
+            return Err(Failure::new(400, error, None));
         }
-        match self.telegram.send(&message.text).await {
+        match message.send(&self.telegram).await {
             Ok(telegram_id) => {
                 self.store
                     .finish(
-                        message.id.clone(),
+                        id.clone(),
                         epoch,
                         Completion::Sent(telegram_id),
                         (self.clock)(),
@@ -188,8 +243,8 @@ impl App {
                     .map_err(Failure::storage)?;
                 self.actual_send_status(Ok(()));
                 Ok(RelayMessageResponse {
-                    version: 1,
-                    id: message.id,
+                    version,
+                    id,
                     outcome: RelayOutcome::Sent,
                     telegram_message_id: Some(telegram_id),
                 })
@@ -219,7 +274,7 @@ impl App {
                     ),
                 };
                 self.store
-                    .finish(message.id, epoch, completion, (self.clock)())
+                    .finish(id, epoch, completion, (self.clock)())
                     .await
                     .map_err(Failure::storage)?;
                 self.actual_send_status(Err(error));
@@ -263,11 +318,19 @@ fn auth_headers(headers: &HeaderMap) -> Option<RequestAuth> {
 }
 async fn handle(State(app): State<Arc<App>>, request: Request<Body>) -> Response {
     let start = Instant::now();
+    let version = if matches!(
+        request.uri().path(),
+        protocol::v2::STATUS_PATH | protocol::v2::MESSAGES_PATH
+    ) {
+        2
+    } else {
+        1
+    };
     let Some(auth) = auth_headers(request.headers()) else {
-        return unsigned_error(401, "unauthorized");
+        return unsigned_error(version, 401, "unauthorized");
     };
     let Ok(_permit) = app.concurrency.try_acquire() else {
-        return unsigned_error(503, "relay_busy");
+        return unsigned_error(version, 503, "relay_busy");
     };
     let method = request.method().as_str().to_owned();
     let path = request
@@ -278,31 +341,70 @@ async fn handle(State(app): State<Arc<App>>, request: Request<Body>) -> Response
         .to_owned();
     let body = match tokio::time::timeout(
         Duration::from_secs(2),
-        to_bytes(request.into_body(), protocol::MAX_BODY_BYTES),
+        to_bytes(
+            request.into_body(),
+            if version == 2 {
+                protocol::v2::MAX_BODY_BYTES
+            } else {
+                protocol::MAX_BODY_BYTES
+            },
+        ),
     )
     .await
     {
-        Err(_) => return unsigned_error(503, "body_timeout"),
-        Ok(Err(_)) => return unsigned_error(413, "body_too_large"),
+        Err(_) => return unsigned_error(version, 503, "body_timeout"),
+        Ok(Err(_)) => return unsigned_error(version, 413, "body_too_large"),
         Ok(Ok(body)) => body,
     };
-    if protocol::verify_request(&app.key, &method, &path, &auth, &body, (app.clock)()).is_err() {
-        return unsigned_error(401, "unauthorized");
+    let verified = if version == 2 {
+        protocol::v2::verify_request(&app.key, &method, &path, &auth, &body, (app.clock)()).is_ok()
+    } else {
+        protocol::verify_request(&app.key, &method, &path, &auth, &body, (app.clock)()).is_ok()
+    };
+    if !verified {
+        return unsigned_error(version, 401, "unauthorized");
     }
     let response = if app.stopping.load(Ordering::Acquire) {
         signed_error(&app, &auth, Failure::new(503, "relay_stopping", Some(1)))
-    } else if path == protocol::STATUS_PATH {
+    } else if matches!(
+        path.as_str(),
+        protocol::STATUS_PATH | protocol::v2::STATUS_PATH
+    ) {
         match app.status().await {
-            Ok(status) => signed(&app, &auth, 200, &status),
+            Ok(mut status) => {
+                // Cache readiness only; capability/version views are exact per route.
+                // A v1 probe must never advertise v2 support to an old sender.
+                status.version = version;
+                if version == 2 {
+                    status.capabilities = protocol::v2::CAPABILITIES
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect();
+                }
+                signed(&app, &auth, 200, &status)
+            }
             Err(error) => signed_error(&app, &auth, Failure::storage(error)),
         }
     } else {
-        match RelayMessage::parse(&body, (app.clock)()) {
-            Err(error) => signed_error(&app, &auth, Failure::new(400, error.code(), None)),
+        let parsed = if version == 2 {
+            protocol::v2::RelayMessage::parse(&body, (app.clock)())
+                .and_then(DeliveryMessage::rich)
+                .map_err(|error| error.code())
+        } else {
+            RelayMessage::parse(&body, (app.clock)())
+                .map(DeliveryMessage::V1)
+                .map_err(|error| error.code())
+        };
+        // Hash the original authenticated bytes. The wire version, entities and
+        // PNG stay immutable across retries; Store needs no wire schema bump.
+        let hash = protocol::body_sha256(&body);
+        drop(body);
+        match parsed {
+            Err(code) => signed_error(&app, &auth, Failure::new(400, code, None)),
             Ok(message) => match app
                 .message(
                     message,
-                    protocol::body_sha256(&body),
+                    hash,
                     PostAttempt {
                         nonce: auth.nonce.clone(),
                         signed_timestamp: auth.timestamp.parse().expect("verified timestamp"),
@@ -328,18 +430,28 @@ fn signed_error(app: &App, auth: &RequestAuth, error: Failure) -> Response {
         auth,
         error.status,
         &RelayErrorResponse {
-            version: 1,
+            version: if auth.version == "2" { 2 } else { 1 },
             code: error.code.into(),
             retry_after: error.retry,
         },
     )
 }
 fn signed(app: &App, auth: &RequestAuth, status: u16, value: &impl Serialize) -> Response {
+    let version = if auth.version == "2" { 2 } else { 1 };
     let Ok(body) = serde_json::to_vec(value) else {
-        return unsigned_error(500, "internal_error");
+        return unsigned_error(version, 500, "internal_error");
     };
-    let Ok(mac) = protocol::sign_response(&app.key, &auth.nonce, status, &body) else {
-        return unsigned_error(500, "internal_error");
+    // Both wire versions keep the original 32KiB response cap.
+    if body.len() > protocol::MAX_BODY_BYTES {
+        return unsigned_error(version, 500, "internal_error");
+    }
+    let mac = if version == 2 {
+        protocol::v2::sign_response(&app.key, &auth.nonce, status, &body).ok()
+    } else {
+        protocol::sign_response(&app.key, &auth.nonce, status, &body).ok()
+    };
+    let Some(mac) = mac else {
+        return unsigned_error(version, 500, "internal_error");
     };
     let mut response = (
         StatusCode::from_u16(status).expect("static response status"),
@@ -355,11 +467,11 @@ fn signed(app: &App, auth: &RequestAuth, status: u16, value: &impl Serialize) ->
     }
     response
 }
-fn unsigned_error(status: u16, code: &'static str) -> Response {
+fn unsigned_error(version: u8, status: u16, code: &'static str) -> Response {
     (
         StatusCode::from_u16(status).expect("static error status"),
         axum::Json(RelayErrorResponse {
-            version: 1,
+            version,
             code: code.into(),
             retry_after: None,
         }),

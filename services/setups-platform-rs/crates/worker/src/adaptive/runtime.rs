@@ -17,9 +17,13 @@ mod schedule;
 mod batch;
 mod promotion;
 mod text;
+mod caption;
+mod enrichment;
 use profile::{LiveProfile,RecommendationEnvelope};
 pub use store::PgAdaptiveStore;
 pub use text::recommendation_message;
+pub use caption::{AdaptiveTelegramCaption, recommendation_telegram_caption};
+pub use enrichment::AdaptiveExpectancySnapshot;
 
 const HISTORY_PAGE_LIMIT:u32=5000;
 const IO_CONCURRENCY:usize=4;

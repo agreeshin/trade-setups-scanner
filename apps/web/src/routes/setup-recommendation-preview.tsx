@@ -2,7 +2,7 @@ import { useContext, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
-import { formatSetupRecommendation } from "../lib/setup-recommendation";
+import { formatSetupRecommendation, type RecommendationSegment } from "../lib/setup-recommendation";
 import type { SetupRow } from "./platform-controls";
 import { RouteActiveContext } from "./route-active";
 
@@ -21,6 +21,11 @@ const description = (elapsed: boolean) => elapsed ? "Рекомендуемый 
 
 export interface SelectedSetupRecommendation { setup: SetupRow; triggerId: string }
 
+function RecommendationText({ segments }: { segments: readonly RecommendationSegment[] }) {
+  return <>{segments.map((segment, index) => segment.style === "bold" ? <strong key={index}>{segment.text}</strong>
+    : segment.style === "code" ? <code key={index} className="font-mono">{segment.text}</code> : <span key={index}>{segment.text}</span>)}</>;
+}
+
 /** Table-owned selection outlives a refreshed or evicted row, but is released on close. */
 export function SetupRecommendationDialog({ selection, onClose, onRestoreFocus }: { selection: SelectedSetupRecommendation; onClose: () => void; onRestoreFocus: () => void }) {
   const active = useContext(RouteActiveContext);
@@ -30,10 +35,10 @@ export function SetupRecommendationDialog({ selection, onClose, onRestoreFocus }
   const snapshot = selection.setup.recommendation!;
   return <Dialog open={active} onOpenChange={(next) => { if (!next) onClose(); }}>
     <DialogContent className="max-w-xl" onCloseAutoFocus={(event) => { event.preventDefault(); if (active) onRestoreFocus(); }}>
-      <DialogHeader><DialogTitle>Условия сетапа {selection.setup.symbol}</DialogTitle><DialogDescription>{description(result.entryState === "elapsed")}</DialogDescription></DialogHeader>
+      <DialogHeader><DialogTitle>Условия сетапа <code className="font-mono">{selection.setup.symbol}</code></DialogTitle><DialogDescription>{description(result.entryState === "elapsed")}</DialogDescription></DialogHeader>
       <div className="grid min-h-0 gap-3 overflow-y-auto pr-1">
-        <pre className="whitespace-pre-wrap break-words font-sans text-sm">{result.text}</pre>
-        <p className="text-xs text-muted-foreground">Сохранённое исследование #{snapshot.studyId} · поколение #{snapshot.generationId}. Рекомендация не меняется вслед за новым исследованием или переименованием.</p>
+        <pre className="whitespace-pre-wrap break-words font-sans text-sm"><RecommendationText segments={result.segments} /></pre>
+        <p className="text-xs text-muted-foreground">Сохранённое исследование #<code className="font-mono">{snapshot.studyId}</code> · поколение #<code className="font-mono">{snapshot.generationId}</code>. Рекомендация не меняется вслед за новым исследованием или переименованием.</p>
       </div>
     </DialogContent>
   </Dialog>;
@@ -70,7 +75,7 @@ export function SetupRecommendationPreview({ setup, onOpen, dialogOpen }: { setu
     </Button>
     {showTooltip && createPortal(<div ref={tooltip} role="tooltip" id={tooltipId} className="fixed bottom-4 right-4 z-30 grid max-h-96 w-80 max-w-sm gap-2 overflow-y-auto rounded-lg border border-input bg-card p-3 text-card-foreground shadow-card"
       onPointerEnter={() => setHovered(true)} onPointerLeave={(event) => { if (!(event.relatedTarget instanceof Node && trigger.current?.contains(event.relatedTarget))) leaveHover(); }}>
-      <pre className="whitespace-pre-wrap break-words font-sans text-xs">{result.text}</pre>
+      <pre className="whitespace-pre-wrap break-words font-sans text-xs"><RecommendationText segments={result.segments} /></pre>
       <p className="text-xs text-muted-foreground">{description(result.entryState === "elapsed")}</p>
     </div>, document.body)}
   </span>;

@@ -9,6 +9,17 @@ use sqlx::{PgPool,Postgres,Row,Transaction};
 pub const MAX_ATTEMPTS:i32=5;
 pub const LEASE_SECONDS:i64=30;
 pub const MAX_BODY_BYTES:usize=32768;
+pub const MAX_V2_BODY_BYTES:usize=384*1024;
+
+/// The backend PNG accessor returns bytes only. Keep the cached digest check
+/// bounded and owner-scoped without exposing raw checksums or storage errors to
+/// delivery diagnostics. Artifact/renderer identity is checked by the sender.
+pub async fn chart_png_checksum_matches(pool:&PgPool,owner:&str,artifact:i64,version:&str,png:&[u8])->Result<bool,DbError> {
+    if png.len()>crate::expectancy::MAX_PNG_BYTES {return Ok(false);}
+    let hash=format!("{:x}",Sha256::digest(png));
+    Ok(sqlx::query_scalar("select exists(select 1 from study_expectancy_pngs p join study_expectancy_artifacts a on a.id=p.artifact_id where p.artifact_id=$1 and p.rendering_version=$2 and a.owner_id=$3 and p.sha256=$4)")
+        .bind(artifact).bind(version).bind(owner).bind(hash).fetch_one(pool).await?)
+}
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize)]
 #[serde(rename_all="camelCase")]
@@ -27,7 +38,7 @@ impl TelegramReason {
 pub struct TelegramJob {
     pub id:i64,pub setup_id:i64,pub delivery_id:String,pub endpoint_url:String,pub settings_revision:i64,
     pub owner_id:String,pub algorithm_id:String,pub slot_id:Option<i64>,pub generation_id:Option<i64>,
-    pub config_revision:Option<i64>,pub fixed_config:Option<Value>,pub lease_token:i64,
+    pub config_revision:Option<i64>,pub fixed_config:Option<Value>,pub lease_token:i64,pub wire_version:i16,
     pub raw_close_unix:i64,pub expires_at_unix:i64,pub attempts:i32,pub payload:Value,pub request_body:Option<Vec<u8>>,
 }
 #[derive(Debug,Clone)]
@@ -172,7 +183,7 @@ fn job(row:sqlx::postgres::PgRow)->Result<TelegramJob,DbError> {
     Ok(TelegramJob {id:row.try_get("id")?,setup_id:i64::from(row.try_get::<i32,_>("setup_id")?),delivery_id:row.try_get("delivery_id")?,
         endpoint_url:row.try_get("endpoint_url")?,settings_revision:row.try_get("settings_revision")?,owner_id:row.try_get("owner_id")?,algorithm_id:row.try_get("algorithm_id")?,
         slot_id:row.try_get("slot_id")?,generation_id:row.try_get("generation_id")?,config_revision:row.try_get("config_revision")?,fixed_config:row.try_get("fixed_config")?,
-        lease_token:row.try_get("lease_token")?,raw_close_unix:row.try_get("raw_close_unix")?,expires_at_unix:row.try_get("expires_at_unix")?,
+        lease_token:row.try_get("lease_token")?,wire_version:row.try_get("wire_version")?,raw_close_unix:row.try_get("raw_close_unix")?,expires_at_unix:row.try_get("expires_at_unix")?,
         attempts:row.try_get("attempts")?,payload:row.try_get("payload")?,request_body:row.try_get("request_body")?})
 }
 async fn lock_budget(tx:&mut Transaction<'_,Postgres>)->Result<(),DbError> {
@@ -217,23 +228,65 @@ pub async fn renew(pool:&PgPool,worker:&str,job:&TelegramJob)->Result<bool,DbErr
         .bind(job.id).bind(worker).bind(job.lease_token).bind(LEASE_SECONDS).execute(pool).await?.rows_affected()==1)
 }
 pub async fn freeze_message(pool:&PgPool,worker:&str,job:&TelegramJob,raw_body:&[u8])->Result<Option<Vec<u8>>,DbError> {
+    freeze_message_with_diagnostic(pool,worker,job,raw_body,None).await
+}
+
+/// Presentation is selected once, before freezing. A successful text fallback
+/// retains its bounded reason after queue cleanup; retries cannot rewrite it.
+pub async fn freeze_message_with_diagnostic(pool:&PgPool,worker:&str,job:&TelegramJob,raw_body:&[u8],diagnostic:Option<&TelegramReason>)->Result<Option<Vec<u8>>,DbError> {
     valid_worker(worker)?;
     let mut tx=pool.begin().await?;
-    let row=sqlx::query("select request_body from telegram_delivery_outbox where id=$1 and lease_owner=$2 and lease_token=$3 and lease_until>clock_timestamp() and expires_at>=date_trunc('second',clock_timestamp()) for update")
+    let row=sqlx::query("select request_body,wire_version from telegram_delivery_outbox where id=$1 and lease_owner=$2 and lease_token=$3 and lease_until>clock_timestamp() and expires_at>=date_trunc('second',clock_timestamp()) for update")
         .bind(job.id).bind(worker).bind(job.lease_token).fetch_optional(&mut *tx).await?;
     let Some(row)=row else{return Ok(None);};
+    if row.try_get::<i16,_>("wire_version")?!=job.wire_version {return Ok(None);}
     if let Some(body)=row.try_get::<Option<Vec<u8>>,_>("request_body")? {return Ok(Some(body));}
-    if raw_body.len()>MAX_BODY_BYTES {return Err(DbError::Json("Telegram body exceeds 32 KiB".into()));}
+    if let Some(diagnostic)=diagnostic {diagnostic.validate()?;}
+    validate_frozen_body(job,raw_body)?;
+    let hash=format!("{:x}",Sha256::digest(raw_body));
+    sqlx::query("update telegram_delivery_outbox set request_body=$2,request_body_hash=$3,render_diagnostic=$4 where id=$1")
+        .bind(job.id).bind(raw_body).bind(hash).bind(diagnostic.map(|value|json!(value))).execute(&mut *tx).await?;
+    if let Some(diagnostic)=diagnostic {
+        sqlx::query("update live_setups set telegram_delivery_error=$2,telegram_delivery_updated_at=clock_timestamp() where id::bigint=$1")
+            .bind(job.setup_id).bind(json!(diagnostic)).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;Ok(Some(raw_body.to_vec()))
+}
+fn validate_frozen_body(job:&TelegramJob,raw_body:&[u8])->Result<(),DbError> {
+    let limit=match job.wire_version {1=>MAX_BODY_BYTES,2=>MAX_V2_BODY_BYTES,_=>return Err(DbError::Json("unsupported Telegram wire version".into()))};
+    if raw_body.len()>limit {return Err(DbError::Json("Telegram body exceeds version byte limit".into()));}
     let body:Value=serde_json::from_slice(raw_body).map_err(crate::json_error)?;
-    if body.as_object().is_none_or(|object|object.len()!=5||!["version","id","text","expiresAt","attachment"].iter().all(|key|object.contains_key(*key)))
-        ||body["version"]!=1||body["id"]!=job.delivery_id||body["expiresAt"]!=job.expires_at_unix||!body["attachment"].is_null()
-        ||body["text"].as_str().is_none_or(|text|text.is_empty()||text.chars().count()>4096) {
+    let fields:&[&str]=if job.wire_version==1 {&["version","id","text","expiresAt","attachment"]}else{&["version","id","text","entities","expiresAt","attachment"]};
+    let text=body["text"].as_str();
+    if body.as_object().is_none_or(|object|object.len()!=fields.len()||!fields.iter().all(|key|object.contains_key(*key)))
+        ||body["version"]!=i64::from(job.wire_version)||body["id"]!=job.delivery_id||body["expiresAt"]!=job.expires_at_unix
+        ||text.is_none_or(|text|text.is_empty() || if job.wire_version==1 {text.chars().count()>4096}else{text.encode_utf16().count()>if body["attachment"].is_null(){4096}else{1024}})
+        ||(job.wire_version==1&&!body["attachment"].is_null()) {
         return Err(DbError::Json("Telegram body differs from immutable delivery identity/expiry".into()));
     }
-    let hash=format!("{:x}",Sha256::digest(raw_body));
-    sqlx::query("update telegram_delivery_outbox set request_body=$2,request_body_hash=$3 where id=$1")
-        .bind(job.id).bind(raw_body).bind(hash).execute(&mut *tx).await?;
-    tx.commit().await?;Ok(Some(raw_body.to_vec()))
+    if job.wire_version==2 {
+        // The worker's shared v2 protocol validator owns PNG/base64 validation.
+        // Storage separately bounds UTF-16 entities and immutable identity.
+        let text=text.unwrap();
+        let entities=body["entities"].as_array().filter(|items|items.len()<=32)
+            .ok_or_else(||DbError::Json("invalid Telegram entities".into()))?;
+        let mut ranges=Vec::with_capacity(entities.len());
+        for entity in entities {
+            let start=entity["offset"].as_u64().and_then(|value|usize::try_from(value).ok());
+            let length=entity["length"].as_u64().and_then(|value|usize::try_from(value).ok());
+            let (Some(start),Some(length))=(start,length) else{return Err(DbError::Json("invalid Telegram entity range".into()));};
+            let end=start.checked_add(length).filter(|end|*end<=text.encode_utf16().count());
+            let boundary=|at|text.chars().scan(0,|offset,ch|{let current=*offset;*offset+=ch.len_utf16();Some(current)}).any(|offset|offset==at)||at==text.encode_utf16().count();
+            if entity.as_object().is_none_or(|object|object.len()!=3)||!matches!(entity["type"].as_str(),Some("bold"|"code"))
+                ||length==0||end.is_none_or(|end|!boundary(start)||!boundary(end)) {
+                return Err(DbError::Json("invalid Telegram entity range".into()));
+            }
+            ranges.push((start,end.unwrap()));
+        }
+        ranges.sort_unstable();
+        if ranges.windows(2).any(|pair|pair[0].1>pair[1].0) {return Err(DbError::Json("overlapping Telegram entities".into()));}
+    }
+    Ok(())
 }
 pub async fn finish(pool:&PgPool,worker:&str,job:&TelegramJob,outcome:TelegramOutcome)->Result<bool,DbError> {
     valid_worker(worker)?;
@@ -257,9 +310,10 @@ pub async fn finish(pool:&PgPool,worker:&str,job:&TelegramJob,outcome:TelegramOu
         }
     }
     let terminal=if retry.is_some(){"expired"}else{status};
-    let deleted=sqlx::query("delete from telegram_delivery_outbox where id=$1 and lease_owner=$2 and lease_token=$3 and lease_until>clock_timestamp() returning setup_id")
+    let deleted=sqlx::query("delete from telegram_delivery_outbox where id=$1 and lease_owner=$2 and lease_token=$3 and lease_until>clock_timestamp() returning setup_id,render_diagnostic")
         .bind(job.id).bind(worker).bind(job.lease_token).fetch_optional(&mut *tx).await?;
-    if deleted.is_some() {
+    if let Some(row)=&deleted {
+        let error=if terminal=="sent" {row.try_get::<Option<Value>,_>("render_diagnostic")?}else{error};
         sqlx::query("update live_setups set telegram_delivery_status=$2,telegram_delivery_error=$3,telegram_delivery_updated_at=clock_timestamp() where id::bigint=$1")
             .bind(job.setup_id).bind(terminal).bind(error).execute(&mut *tx).await?;
     }
@@ -283,7 +337,7 @@ pub(crate) async fn enqueue(tx:&mut Transaction<'_,Postgres>,source:Enqueue<'_>)
         sqlx::query("update live_setups set telegram_delivery_status='disabled',telegram_delivery_updated_at=clock_timestamp() where id=$1")
             .bind(source.setup_id).execute(&mut **tx).await?;return Ok(());
     }
-    sqlx::query("insert into telegram_delivery_outbox(setup_id,delivery_id,endpoint_url,settings_revision,owner_id,algorithm_id,slot_id,generation_id,config_revision,fixed_config,raw_close_unix,expires_at,payload) select $1,'live:'||instance_id::text||':'||$1::text,$2,$3,$4,$5,$6,$7,$8,$9,$10,to_timestamp($11),$12 from telegram_delivery_budget where id=1")
+    sqlx::query("insert into telegram_delivery_outbox(setup_id,delivery_id,endpoint_url,settings_revision,owner_id,algorithm_id,slot_id,generation_id,config_revision,fixed_config,raw_close_unix,expires_at,payload,wire_version) select $1,'live:'||instance_id::text||':'||$1::text,$2,$3,$4,$5,$6,$7,$8,$9,$10,to_timestamp($11),$12,2 from telegram_delivery_budget where id=1")
         .bind(source.setup_id).bind(config.try_get::<String,_>("endpoint_url")?).bind(config.try_get::<i64,_>("revision")?).bind(source.owner_id).bind(source.algorithm_id)
         .bind(source.slot_id).bind(source.generation_id).bind(source.config_revision).bind(source.fixed_config).bind(source.raw_close_unix)
         .bind(source.expires_at_unix as f64).bind(source.payload).execute(&mut **tx).await?;Ok(())
@@ -292,6 +346,7 @@ pub(crate) async fn enqueue(tx:&mut Transaction<'_,Postgres>,source:Enqueue<'_>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Connection;
     #[test]
     fn public_reason_message_byte_bound_also_fits_web_utf16_budget() {
         for text in ["a".repeat(512),"я".repeat(256),"\u{1d11e}".repeat(128)] {
@@ -302,5 +357,108 @@ mod tests {
             assert!(text.len()>512);
             assert!(TelegramReason::new("bounded",&text).validate().is_err());
         }
+    }
+
+    async fn test_setup(pool:&PgPool,symbol:&str)->i32 {
+        sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,details) values('bybit','linear',$1,'price_volume_spike','1.1.1','{}',to_timestamp(0),to_timestamp(60),'100','{}') returning id")
+            .bind(symbol).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn v2_queue_migration_preserves_legacy_frozen_and_unfrozen_rows_and_reservations() {
+        let Ok(url)=std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("TEST_DATABASE_URL absent; isolated Telegram queue test skipped");return;
+        };
+        let options:sqlx::postgres::PgConnectOptions=url.parse().unwrap();
+        assert!(options.get_database().unwrap_or("").ends_with("_test"));
+        assert!(matches!(options.get_host(),"localhost"|"127.0.0.1"|"::1"));
+        let name=format!("telegram_v2_queue_{}_test",std::process::id());
+        let mut admin=sqlx::PgConnection::connect_with(&options).await.unwrap();
+        sqlx::query(&format!("create database {name}")).execute(&mut admin).await.unwrap();
+        let pool=sqlx::postgres::PgPoolOptions::new().max_connections(4).connect_with(options.database(&name)).await.unwrap();
+        let fixture=pool.clone();
+        let result=tokio::spawn(async move {queue_regression(&fixture).await;}).await;
+        pool.close().await;
+        sqlx::query(&format!("drop database {name} with (force)")).execute(&mut admin).await.unwrap();
+        result.unwrap();
+    }
+
+    async fn queue_regression(pool:&PgPool) {
+        // Deliberately build the previous schema before inserting legacy rows.
+        // This proves the upgrade, not merely the post-upgrade default.
+        let baseline=include_str!("../migrations/0010_baseline.sql").lines()
+            .filter(|line|!line.starts_with('\\')&&!line.starts_with("SET transaction_timeout"))
+            .collect::<Vec<_>>().join("\n");
+        sqlx::raw_sql(&format!("{baseline}\nset search_path=public;")).execute(pool).await.unwrap();
+        for migration in [
+            include_str!("../migrations/0011_run_names.sql"),
+            include_str!("../migrations/0012_optimization_studies.sql"),
+            include_str!("../migrations/0013_continuous_studies.sql"),
+            include_str!("../migrations/0014_adaptive_live_readiness.sql"),
+            include_str!("../migrations/0015_continuous_history_cleanup.sql"),
+            include_str!("../migrations/0016_independent_live_initialization.sql"),
+            include_str!("../migrations/0017_continuous_resume.sql"),
+            include_str!("../migrations/0018_live_readmission.sql"),
+            include_str!("../migrations/0019_telegram_relay.sql"),
+        ] {sqlx::raw_sql(migration).execute(pool).await.unwrap();}
+        assert!(matches!(set_config(pool,0,true,"https://relay.example").await.unwrap(),ConfigUpdate::Updated(_)));
+        let now=Utc::now().timestamp();
+        for (index,frozen) in [(1,false),(2,true)] {
+            let setup=test_setup(pool,&format!("LEGACY{index}")).await;
+            let body=if frozen {Some(serde_json::to_vec(&json!({"version":1,"id":format!("legacy:{index}"),"text":"legacy literal *text*","expiresAt":now+3600,"attachment":null})).unwrap())}else{None};
+            let hash=body.as_ref().map(|bytes|format!("{:x}",Sha256::digest(bytes)));
+            sqlx::query("insert into telegram_delivery_outbox(setup_id,delivery_id,endpoint_url,settings_revision,owner_id,algorithm_id,fixed_config,raw_close_unix,expires_at,payload,request_body,request_body_hash) values($1,$2,'https://relay.example/',1,'admin','price_volume_spike','{}',$3,to_timestamp($4),'{}',$5,$6)")
+                .bind(setup).bind(format!("legacy:{index}")).bind(now).bind((now+3600)as f64).bind(body).bind(hash).execute(pool).await.unwrap();
+        }
+        let before:Vec<Value>=sqlx::query_scalar("select to_jsonb(o) from telegram_delivery_outbox o order by id").fetch_all(pool).await.unwrap();
+        let quota:i64=sqlx::query_scalar("select pending_bytes from telegram_delivery_budget").fetch_one(pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0021_telegram_v2_queue.sql")).execute(pool).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_,Vec<i16>>("select array_agg(wire_version order by id) from telegram_delivery_outbox").fetch_one(pool).await.unwrap(),vec![1,1]);
+        assert_eq!(sqlx::query_scalar::<_,i64>("select pending_bytes from telegram_delivery_budget").fetch_one(pool).await.unwrap(),quota);
+        assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(o)-'wire_version'-'render_diagnostic' from telegram_delivery_outbox o order by id limit 1").fetch_one(pool).await.unwrap(),before[0]);
+        let after:Vec<Value>=sqlx::query_scalar("select to_jsonb(o)-'wire_version'-'render_diagnostic' from telegram_delivery_outbox o order by id").fetch_all(pool).await.unwrap();
+        assert_eq!(after,before,"upgrade must preserve every legacy row field and raw bytea/hash");
+        let old=claim(pool,"queue-fixture",2).await.unwrap();
+        for job in old {
+            assert_eq!(job.wire_version,1);
+            let body=serde_json::to_vec(&json!({"version":1,"id":job.delivery_id,"text":"𝄞".repeat(4096),"expiresAt":job.expires_at_unix,"attachment":null})).unwrap();
+            let frozen=freeze_message(pool,"queue-fixture",&job,&body).await.unwrap().unwrap();
+            let expected=job.request_body.clone().unwrap_or(body);
+            assert_eq!(frozen,expected,"unfrozen legacy renders as v1; frozen bytes remain exact");
+            assert_eq!(freeze_message(pool,"queue-fixture",&job,b"not new JSON").await.unwrap().unwrap(),expected);
+            assert!(sqlx::query("update telegram_delivery_outbox set wire_version=2 where id=$1").bind(job.id).execute(pool).await.is_err());
+            assert!(finish(pool,"queue-fixture",&job,TelegramOutcome::Sent).await.unwrap());
+        }
+        assert_eq!(sqlx::query_scalar::<_,i64>("select pending_jobs+pending_bytes from telegram_delivery_budget").fetch_one(pool).await.unwrap(),0,"legacy reservations release unchanged");
+
+        let setup=test_setup(pool,"NEWV2").await;
+        let payload=json!({});let fixed=json!({});
+        let mut tx=pool.begin().await.unwrap();
+        enqueue(&mut tx,Enqueue {setup_id:setup,owner_id:"admin",algorithm_id:"price_volume_spike",slot_id:None,generation_id:None,config_revision:None,fixed_config:Some(&fixed),raw_close_unix:now,expires_at_unix:now+3600,payload:&payload}).await.unwrap();
+        tx.commit().await.unwrap();
+        let job=claim(pool,"queue-fixture",1).await.unwrap().remove(0);
+        assert_eq!(job.wire_version,2);
+        let reserved:i64=sqlx::query_scalar("select reserved_bytes-octet_length(payload::text) from telegram_delivery_outbox").fetch_one(pool).await.unwrap();
+        assert_eq!(reserved,MAX_V2_BODY_BYTES as i64);
+        for invalid in [
+            serde_json::to_vec(&json!({"version":1,"id":job.delivery_id,"text":"wrong wire","expiresAt":job.expires_at_unix,"attachment":null})).unwrap(),
+            serde_json::to_vec(&json!({"version":2,"id":job.delivery_id,"text":"😀 text","entities":[{"type":"code","offset":1,"length":1}],"expiresAt":job.expires_at_unix,"attachment":null})).unwrap(),
+            vec![b' ';MAX_V2_BODY_BYTES+1],
+        ] {assert!(freeze_message(pool,"queue-fixture",&job,&invalid).await.is_err());}
+        let mut body=serde_json::to_vec(&json!({"version":2,"id":job.delivery_id,"text":"😀 literal *name*","entities":[{"type":"code","offset":3,"length":7}],"expiresAt":job.expires_at_unix,"attachment":null})).unwrap();
+        body.resize(MAX_V2_BODY_BYTES,b' ');
+        let diagnostic=TelegramReason::new("png_unavailable","Chart unavailable; text only.");
+        assert_eq!(freeze_message_with_diagnostic(pool,"queue-fixture",&job,&body,Some(&diagnostic)).await.unwrap().unwrap(),body);
+        assert_eq!(freeze_message_with_diagnostic(pool,"queue-fixture",&job,b"changed",None).await.unwrap().unwrap(),body);
+        assert!(sqlx::query("update telegram_delivery_outbox set request_body='changed'::bytea where id=$1").bind(job.id).execute(pool).await.is_err());
+        assert!(finish(pool,"queue-fixture",&job,TelegramOutcome::Sent).await.unwrap());
+        assert_eq!(sqlx::query_scalar::<_,Value>("select telegram_delivery_error from live_setups where id=$1").bind(setup).fetch_one(pool).await.unwrap(),json!(diagnostic));
+        assert_eq!(sqlx::query_scalar::<_,i64>("select pending_jobs+pending_bytes from telegram_delivery_budget").fetch_one(pool).await.unwrap(),0);
+
+        configure_limits(pool,100,65536).await.unwrap();
+        let setup=test_setup(pool,"FULLV2").await;let mut tx=pool.begin().await.unwrap();
+        enqueue(&mut tx,Enqueue {setup_id:setup,owner_id:"admin",algorithm_id:"price_volume_spike",slot_id:None,generation_id:None,config_revision:None,fixed_config:Some(&fixed),raw_close_unix:now,expires_at_unix:now+3600,payload:&payload}).await.unwrap();tx.commit().await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id=$1").bind(setup).fetch_one(pool).await.unwrap(),"skipped_capacity","reserve the entire v2 body cap before rendering");
+        assert_eq!(sqlx::query_scalar::<_,i64>("select pending_jobs+pending_bytes from telegram_delivery_budget").fetch_one(pool).await.unwrap(),0);
     }
 }

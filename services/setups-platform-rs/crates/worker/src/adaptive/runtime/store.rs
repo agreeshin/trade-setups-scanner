@@ -151,9 +151,18 @@ impl AdaptiveStore for PgAdaptiveStore<'_> {
         {
             return Err(invalid("invalid external algorithm name at setup creation"));
         }
+        let evidence=if setups.iter().any(|setup|setup.recommendation.get("expectancy").is_none()) {
+            Some(super::enrichment::load(self.pool,&captured).await)
+        }else{None};
+        let mut degraded=0usize;
         for setup in setups.iter_mut() {
             setup.recommendation["externalName"] = captured.external_name.clone().into();
+            let invalid=super::enrichment::attach(&captured,instrument,setup,
+                evidence.as_ref().and_then(|captured|captured.artifact.as_ref()),
+                evidence.as_ref().and_then(|captured|captured.artifact_id))?;
+            if invalid || evidence.as_ref().is_some_and(|captured|captured.invalid_evidence) {degraded+=1;}
         }
+        if degraded>0 {super::enrichment::report_degraded(&captured,degraded);}
         let writes: Vec<_> = setups
             .iter()
             .map(|setup| AdaptiveSetupWrite {

@@ -254,6 +254,32 @@ fn adaptive_write(open: i64) -> db::AdaptiveSetupWrite {
 
 #[tokio::test]
 #[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn telegram_explicit_legacy_v1_keeps_original_utf8_body_and_32k_reservation() {
+    isolated(|pool|async move {
+        use setups_db::telegram as tg;
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        tg::set_config(&pool,0,true,"https://relay.example").await.unwrap();
+        let now=chrono::Utc::now().timestamp();
+        let setup=fixed_setup(&pool,now-60).await;
+        tg::configure_limits(&pool,1,65536).await.unwrap();
+        // Omitted version deliberately exercises the legacy default, rather
+        // than upgrading new v2 work or bypassing its immutable-version guard.
+        sqlx::query("insert into telegram_delivery_outbox(setup_id,delivery_id,endpoint_url,settings_revision,owner_id,algorithm_id,fixed_config,raw_close_unix,expires_at,payload) values($1,'legacy:unicode','https://relay.example/',1,'admin',$2,'{}',$3,to_timestamp($4),'{}')")
+            .bind(setup).bind(ALGORITHM).bind(now).bind((now+3600)as f64).execute(&pool).await.unwrap();
+        let job=tg::claim(&pool,"legacy",1).await.unwrap().remove(0);
+        assert_eq!(job.wire_version,1);
+        assert_eq!(sqlx::query_scalar::<_,i64>("select reserved_bytes-octet_length(payload::text) from telegram_delivery_outbox").fetch_one(&pool).await.unwrap(),32768);
+        let body=format!(" {} \n",json!({"version":1,"id":job.delivery_id,"text":"\u{1d11e}".repeat(4096),"expiresAt":job.expires_at_unix,"attachment":null}));
+        assert!(body.len()>16384&&body.len()<32768,"v1 retains scalar-character semantics, not the v2 UTF-16 limit");
+        assert_eq!(tg::freeze_message(&pool,"legacy",&job,body.as_bytes()).await.unwrap().unwrap(),body.as_bytes());
+        assert_eq!(tg::freeze_message(&pool,"legacy",&job,b"different renderer").await.unwrap().unwrap(),body.as_bytes());
+        assert!(tg::finish(&pool,"legacy",&job,tg::TelegramOutcome::Sent).await.unwrap());
+        assert_eq!(sqlx::query_scalar::<_,i64>("select pending_jobs+pending_bytes from telegram_delivery_budget").fetch_one(&pool).await.unwrap(),0);
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
 async fn telegram_fixed_independent_enqueue_raw_bytes_fences_capacity_expiry_and_rollback() {
     isolated(|pool|async move {
         use setups_db::telegram as tg;
@@ -276,11 +302,12 @@ async fn telegram_fixed_independent_enqueue_raw_bytes_fences_capacity_expiry_and
         let before:Value=sqlx::query_scalar("select to_jsonb(o)-'endpoint_url'-'settings_revision' from telegram_delivery_outbox o").fetch_one(&pool).await.unwrap();
         assert!(matches!(tg::set_config(&pool,1,true,"https://other.example").await.unwrap(),tg::ConfigUpdate::Updated(_)));
         assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(o)-'endpoint_url'-'settings_revision' from telegram_delivery_outbox o").fetch_one(&pool).await.unwrap(),before);
-        let job=tg::claim(&pool,"tg",1).await.unwrap().remove(0);assert_eq!(job.setup_id,id);assert_eq!(job.endpoint_url,"https://other.example/");
+        let job=tg::claim(&pool,"tg",1).await.unwrap().remove(0);assert_eq!(job.setup_id,id);assert_eq!(job.endpoint_url,"https://other.example/");assert_eq!(job.wire_version,2);
+        assert_eq!(sqlx::query_scalar::<_,i64>("select reserved_bytes-octet_length(payload::text) from telegram_delivery_outbox where id=$1").bind(job.id).fetch_one(&pool).await.unwrap(),tg::MAX_V2_BODY_BYTES as i64);
         assert!(tg::permitted(&pool,"tg",&job).await.unwrap());assert!(!tg::permitted(&pool,"wrong",&job).await.unwrap());
         assert!(matches!(tg::set_config(&pool,2,true,"https://third.example").await.unwrap(),tg::ConfigUpdate::EndpointBusy));
-        let body=format!(" {} \n",json!({"version":1,"id":job.delivery_id,"text":"\u{1d11e}".repeat(4096),"expiresAt":job.expires_at_unix,"attachment":null}));
-        assert!(body.len()>16384&&body.len()<32768);
+        let body=format!(" {} {}\n",json!({"version":2,"id":job.delivery_id,"text":"\u{1d11e}".repeat(2048),"entities":[],"expiresAt":job.expires_at_unix,"attachment":null})," ".repeat(32768));
+        assert!(body.len()>32768&&body.len()<=tg::MAX_V2_BODY_BYTES);
         let quota:i64=sqlx::query_scalar("select pending_bytes from telegram_delivery_budget").fetch_one(&pool).await.unwrap();
         assert_eq!(tg::freeze_message(&pool,"tg",&job,body.as_bytes()).await.unwrap().unwrap(),body.as_bytes());
         assert_eq!(tg::freeze_message(&pool,"tg",&job,b"changed renderer bytes").await.unwrap().unwrap(),body.as_bytes());
@@ -297,7 +324,12 @@ async fn telegram_fixed_independent_enqueue_raw_bytes_fences_capacity_expiry_and
         assert!(tg::claim(&pool,"tg",1).await.unwrap().is_empty());
         assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id::bigint=$1").bind(id).fetch_one(&pool).await.unwrap(),"failed");
         tg::configure_limits(&pool,1,65536).await.unwrap();
-        db::outbox::commit_fixed_setup(&pool,"bybit","linear","ONE",&raw).await.unwrap().unwrap();
+        let byte_full=db::outbox::commit_fixed_setup(&pool,"bybit","linear","BYTE_FULL",&raw).await.unwrap().unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id::bigint=$1").bind(byte_full).fetch_one(&pool).await.unwrap(),"skipped_capacity","a free job slot cannot bypass the full v2 reservation");
+        assert_eq!(sqlx::query_scalar::<_,i64>("select pending_jobs from telegram_delivery_budget").fetch_one(&pool).await.unwrap(),0);
+        tg::configure_limits(&pool,1,524288).await.unwrap();
+        let one=db::outbox::commit_fixed_setup(&pool,"bybit","linear","ONE",&raw).await.unwrap().unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id::bigint=$1").bind(one).fetch_one(&pool).await.unwrap(),"pending");
         let full=db::outbox::commit_fixed_setup(&pool,"bybit","linear","FULL",&raw).await.unwrap().unwrap();
         assert_eq!(sqlx::query_scalar::<_,String>("select telegram_delivery_status from live_setups where id::bigint=$1").bind(full).fetch_one(&pool).await.unwrap(),"skipped_capacity");
         sqlx::query("update telegram_delivery_outbox set expires_at=clock_timestamp()-interval '1 second'").execute(&pool).await.unwrap();assert!(tg::claim(&pool,"tg",1).await.unwrap().is_empty());

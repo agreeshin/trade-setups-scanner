@@ -1,0 +1,39 @@
+{
+  "input": {
+    "source": {
+      "studyId": "utc-january-parity-study",
+      "derivedSnapshotId": "utc-january-derived-v2",
+      "generationId": "utc-january-parity-generation",
+      "profileId": "utc-january-parity-profile",
+      "provenance": {
+        "algorithmId": "price_volume_spike", "algorithmVersion": "1.1.1", "optimizerVersion": "fixture-only",
+        "seed": 1, "snapshotHash": "frozen-utc-january-parity-input", "capturedAt": "2026-01-12T00:00:00Z",
+        "fromUnix": 1767225600, "toUnix": 1768176000, "observationCutoff": 1768176000
+      },
+      "direction": "short", "tpPct": 2.0, "slPct": 1.0,
+      "analytics": { "clusterEnabled": true, "clusterGapMinutes": 480, "timeShiftMinutes": 3, "priceChangePct": 1.0, "horizonMinutes": 10080 }
+    },
+    "selectedCell": { "rawR": 0.8, "tpCount": 3, "slCount": 2 },
+    "matrixMeanR": 0.21,
+    "daily": {
+      "status": "available",
+      "value": [
+        { "dayStartUnix": 1767225600, "rowCount": 3, "tpCount": 2, "slCount": 1, "meanR": 1.0 },
+        { "dayStartUnix": 1767398400, "rowCount": 1, "tpCount": 0, "slCount": 0, "meanR": null },
+        { "dayStartUnix": 1767484800, "rowCount": 1, "tpCount": 0, "slCount": 1, "meanR": -1.0 },
+        { "dayStartUnix": 1768003200, "rowCount": 1, "tpCount": 1, "slCount": 0, "meanR": 2.0 }
+      ]
+    }
+  },
+  "expected": {
+    "calculationVersion": 2, "timezone": "UTC", "originUnix": 1767225600, "periodDays": 11.0,
+    "dates": ["2026-01-01", "2026-01-03", "2026-01-04", "2026-01-10"],
+    "xUtcDays": [0.0, 2.0, 3.0, 9.0], "dailyMeansR": [1.0, null, -1.0, 2.0],
+    "observedSegmentsX": [[0.0], [3.0, 9.0]],
+    "meanX": 4.0, "meanY": 0.6666666666666666, "slopeRPerDay": 0.16666666666666666,
+    "fittedStartR": 0.0, "fittedEndR": 1.5, "trendDeltaR": 1.5,
+    "rawSignalAt": 1768305600, "rawSignalXUtcDays": 12.5, "forecastR": 2.0833333333333335,
+    "endpointLabels": ["+0.00 R", "+1.50 R"], "selectedRawR": 0.8, "matrixMeanR": 0.21,
+    "tpCount": 3, "slCount": 2, "winRatePct": 60.0
+  }
+}

@@ -76,7 +76,7 @@ pub fn recommendation_message(
     Ok(lines.join("\n"))
 }
 
-fn display_decimal(raw: &str) -> Result<String, WorkerError> {
+pub(super) fn display_decimal(raw: &str) -> Result<String, WorkerError> {
     let parsed = Decimal::parse(raw)?;
     if parsed.int <= 0 {
         return Err(invalid("nonpositive raw price"));
@@ -89,7 +89,7 @@ fn display_decimal(raw: &str) -> Result<String, WorkerError> {
 // Unlike binary float multiplication it preserves the source price and shortest
 // JSON decimal price-change threshold, including scientific notation. Inputs
 // are at most a source Decimal (38 digits) and an f64 (324 decimal places).
-fn price_threshold(
+pub(super) fn price_threshold(
     price: &str,
     pct: f64,
     direction: RecommendationDirection,

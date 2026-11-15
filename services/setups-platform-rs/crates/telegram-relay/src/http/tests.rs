@@ -82,14 +82,27 @@ impl Mock {
 async fn mock_handler(
     State(state): State<Arc<MockState>>,
     Path(method): Path<String>,
-    Json(body): Json<Value>,
+    request: Request<Body>,
 ) -> Response {
+    let content_type = request.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let bytes = to_bytes(request.into_body(), protocol::v2::MAX_BODY_BYTES)
+        .await
+        .unwrap();
+    let body = if method == "sendPhoto" {
+        multipart_fields(&content_type, &bytes)
+    } else {
+        assert!(content_type.starts_with("application/json"));
+        serde_json::from_slice(&bytes).unwrap()
+    };
     {
         let mut calls = state.calls.lock().unwrap();
         assert!(calls.len() < 128);
         calls.push((method.clone(), body));
     }
-    let mode = if method == "sendMessage" {
+    let mode = if matches!(method.as_str(), "sendMessage" | "sendPhoto") {
         state.send_mode.load(Ordering::Relaxed)
     } else {
         state.permission_mode.load(Ordering::Relaxed)
@@ -104,6 +117,57 @@ async fn mock_handler(
         _=>if method=="getChatMember" {Json(json!({"ok":true,"result":{"status":"administrator","can_post_messages":true,"user":{"id":12345}}})).into_response()}
         else{Json(json!({"ok":true,"result":{"message_id":42}})).into_response()},
     }
+}
+// Test-only parser of the actual multipart bytes emitted by reqwest. Captures
+// each part once, including exact binary PNG bytes, not just Content-Type.
+fn multipart_fields(content_type: &str, bytes: &[u8]) -> Value {
+    assert!(content_type.starts_with("multipart/form-data; boundary="));
+    let boundary = content_type.split_once("boundary=").unwrap().1;
+    let marker = format!("\r\n--{boundary}");
+    let mut remaining = bytes
+        .strip_prefix(format!("--{boundary}").as_bytes())
+        .unwrap();
+    let mut fields = serde_json::Map::new();
+    while remaining != b"--\r\n" {
+        remaining = remaining.strip_prefix(b"\r\n").unwrap();
+        let at = remaining
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let headers = std::str::from_utf8(&remaining[..at]).unwrap();
+        let name = headers
+            .split_once("name=\"")
+            .unwrap()
+            .1
+            .split('"')
+            .next()
+            .unwrap();
+        remaining = &remaining[at + 4..];
+        let end = remaining
+            .windows(marker.len())
+            .position(|window| window == marker.as_bytes())
+            .unwrap();
+        let data = &remaining[..end];
+        let value = if name == "photo" {
+            assert!(headers.contains("filename=\"expectancy.png\""));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: image/png")
+            );
+            assert!(data.len() <= protocol::v2::MAX_PNG_BYTES);
+            json!({"bytes": data, "headers": headers})
+        } else {
+            json!(std::str::from_utf8(data).unwrap())
+        };
+        assert!(
+            fields.insert(name.into(), value).is_none(),
+            "duplicate multipart part"
+        );
+        assert!(fields.len() <= 4);
+        remaining = &remaining[end + marker.len()..];
+    }
+    Value::Object(fields)
 }
 struct Fixture {
     app: Arc<App>,
@@ -168,15 +232,15 @@ fn request_nonce(
     key: u8,
     nonce: &str,
 ) -> Request<Body> {
-    let auth = sign_request(
-        &SecretKey::from_bytes([key; 32]),
-        method,
+    let key = SecretKey::from_bytes([key; 32]);
+    let auth = if matches!(
         path,
-        timestamp,
-        nonce,
-        &body,
-    )
-    .unwrap();
+        protocol::v2::MESSAGES_PATH | protocol::v2::STATUS_PATH
+    ) {
+        protocol::v2::sign_request(&key, method, path, timestamp, nonce, &body).unwrap()
+    } else {
+        sign_request(&key, method, path, timestamp, nonce, &body).unwrap()
+    };
     let mut request = Request::builder()
         .method(method)
         .uri(path)
@@ -191,6 +255,10 @@ async fn execute(app: &Arc<App>, request: Request<Body>, authenticated: bool) ->
         .to_str()
         .unwrap()
         .to_owned();
+    let version = request.headers()[protocol::HEADER_VERSION]
+        .to_str()
+        .unwrap()
+        .to_owned();
     let response = app.router().oneshot(request).await.unwrap();
     let status = response.status().as_u16();
     let headers = response.headers().clone();
@@ -201,14 +269,16 @@ async fn execute(app: &Arc<App>, request: Request<Body>, authenticated: bool) ->
             nonce: headers[protocol::HEADER_NONCE].to_str().unwrap().into(),
             signature: headers[protocol::HEADER_SIGNATURE].to_str().unwrap().into(),
         };
-        verify_response(
-            &SecretKey::from_bytes([7; 32]),
-            &nonce,
-            status,
-            &auth,
-            &bytes,
-        )
-        .unwrap();
+        assert_eq!(auth.version, version);
+        assert!(bytes.len() <= protocol::MAX_BODY_BYTES);
+        let key = SecretKey::from_bytes([7; 32]);
+        if version == "2" {
+            protocol::v2::verify_response(&key, &nonce, status, &auth, &bytes).unwrap();
+            assert!(verify_response(&key, &nonce, status, &auth, &bytes).is_err());
+        } else {
+            verify_response(&key, &nonce, status, &auth, &bytes).unwrap();
+            assert!(protocol::v2::verify_response(&key, &nonce, status, &auth, &bytes).is_err());
+        }
     }
     assert!(!String::from_utf8_lossy(&bytes).contains("SECRET-UPSTREAM"));
     assert!(!String::from_utf8_lossy(&bytes).contains("TEST_SENTINEL_TOKEN"));
@@ -717,4 +787,401 @@ async fn cannot_persist_post_protection_fails_before_telegram() {
     assert_eq!(f.mock.calls("sendMessage"), 0);
     assert_eq!(f.app.store.attempt_count().await, 0);
     assert_eq!(f.app.store.stats().await.0, 0);
+}
+
+fn png_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(
+            &mut bytes,
+            protocol::v2::PNG_WIDTH,
+            protocol::v2::PNG_HEIGHT,
+        );
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&vec![
+                25;
+                protocol::v2::PNG_WIDTH as usize
+                    * protocol::v2::PNG_HEIGHT as usize
+                    * 3
+            ])
+            .unwrap();
+    }
+    bytes
+}
+fn rich_message(id: &str, photo: bool) -> Value {
+    let text = "🟢 Условия сделки\nBTC_USDT <b>literal</b> 3.25\nПрогноз МО торговли";
+    let code_start = text.find("BTC_USDT").unwrap();
+    let attachment = photo.then(|| protocol::v2::Attachment::from_png(&png_bytes()).unwrap());
+    serde_json::to_value(protocol::v2::RelayMessage {
+        version: 2,
+        id: id.into(),
+        text: text.into(),
+        entities: vec![
+            protocol::v2::TextEntity {
+                kind: protocol::v2::EntityKind::Bold,
+                offset: 3,
+                length: 14,
+            },
+            protocol::v2::TextEntity {
+                kind: protocol::v2::EntityKind::Code,
+                offset: protocol::v2::utf16_len(&text[..code_start]) as u32,
+                length: 8,
+            },
+        ],
+        expires_at: NOW + 60,
+        attachment,
+    })
+    .unwrap()
+}
+async fn send_v2(f: &Fixture, value: &Value) -> (u16, Value) {
+    execute(
+        &f.app,
+        request(
+            "POST",
+            protocol::v2::MESSAGES_PATH,
+            serde_json::to_vec(value).unwrap(),
+            f.now.load(Ordering::Relaxed),
+            7,
+        ),
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn v2_photo_is_exactly_one_multipart_with_caption_entities_and_original_png() {
+    let f = Fixture::new().await;
+    let value = rich_message("photo", true);
+    let (status, receipt) = send_v2(&f, &value).await;
+    assert_eq!(status, 200);
+    assert_eq!(receipt["version"], 2);
+    assert_eq!(receipt["outcome"], "sent");
+    assert_eq!(receipt["telegramMessageId"], 42);
+    assert_eq!(send_v2(&f, &value).await.1["outcome"], "duplicate");
+    assert_eq!(f.mock.calls("sendPhoto"), 1);
+    assert_eq!(f.mock.calls("sendMessage"), 0);
+    let calls = f.mock.state.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let form = &calls[0].1;
+    let mut names = form
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["caption", "caption_entities", "chat_id", "photo"]);
+    assert_eq!(form["chat_id"], "-10012345");
+    assert_eq!(form["caption"], value["text"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(form["caption_entities"].as_str().unwrap()).unwrap(),
+        value["entities"]
+    );
+    assert_eq!(form["photo"]["bytes"], json!(png_bytes()));
+    assert!(form.get("parse_mode").is_none());
+    assert_eq!(value["entities"][0]["offset"], 3); // emoji occupies two UTF-16 units
+}
+
+#[tokio::test]
+async fn v2_null_attachment_is_one_literal_text_message_with_explicit_entities() {
+    let f = Fixture::new().await;
+    let value = rich_message("rich-text", false);
+    assert_eq!(send_v2(&f, &value).await.0, 200);
+    assert_eq!(f.mock.calls("sendMessage"), 1);
+    assert_eq!(f.mock.calls("sendPhoto"), 0);
+    let calls = f.mock.state.calls.lock().unwrap();
+    let payload = &calls[0].1;
+    assert_eq!(payload["text"], value["text"]);
+    assert_eq!(payload["entities"], value["entities"]);
+    assert_eq!(payload["chat_id"], -10012345i64);
+    assert_eq!(payload["link_preview_options"]["is_disabled"], true);
+    assert!(payload.get("parse_mode").is_none());
+    assert!(payload.get("attachment").is_none());
+}
+
+#[tokio::test]
+async fn versioned_status_views_share_readiness_but_never_leak_v2_capabilities_to_v1() {
+    let f = Fixture::new().await;
+    for (path, version, capabilities) in [
+        (
+            protocol::v2::STATUS_PATH,
+            2,
+            json!(["text", "text_entities", "photo_png"]),
+        ),
+        (protocol::STATUS_PATH, 1, json!(["text"])),
+        (
+            protocol::v2::STATUS_PATH,
+            2,
+            json!(["text", "text_entities", "photo_png"]),
+        ),
+    ] {
+        let (status, value) = execute(&f.app, request("GET", path, vec![], NOW, 7), true).await;
+        assert_eq!(status, 200);
+        assert_eq!(value["version"], version);
+        assert_eq!(value["capabilities"], capabilities);
+        assert_eq!(value["telegramReady"], true);
+    }
+    assert_eq!(f.mock.calls("getChatMember"), 1);
+    assert_eq!(f.mock.calls("sendMessage"), 0);
+    assert_eq!(f.mock.calls("sendPhoto"), 0);
+    f.app.stopping.store(true, Ordering::Release);
+    let (status, error) = execute(
+        &f.app,
+        request("GET", protocol::v2::STATUS_PATH, vec![], NOW, 7),
+        true,
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(error["version"], 2);
+    assert_eq!(error["code"], "relay_stopping");
+}
+
+#[tokio::test]
+async fn v2_route_header_body_versions_and_tampered_png_fail_closed() {
+    let f = Fixture::new().await;
+    let body = serde_json::to_vec(&rich_message("mismatch", true)).unwrap();
+    for (source, destination, bytes) in [
+        (
+            protocol::MESSAGES_PATH,
+            protocol::v2::MESSAGES_PATH,
+            message("cross-route"),
+        ),
+        (
+            protocol::v2::MESSAGES_PATH,
+            protocol::MESSAGES_PATH,
+            body.clone(),
+        ),
+    ] {
+        let mut req = request("POST", source, bytes, NOW, 7);
+        *req.uri_mut() = destination.parse().unwrap();
+        assert_eq!(execute(&f.app, req, false).await.0, 401);
+    }
+    for header in ["1", "3"] {
+        let mut req = request("POST", protocol::v2::MESSAGES_PATH, body.clone(), NOW, 7);
+        req.headers_mut().insert(
+            protocol::HEADER_VERSION,
+            HeaderValue::from_str(header).unwrap(),
+        );
+        assert_eq!(execute(&f.app, req, false).await.0, 401);
+    }
+    let mut req = request("POST", protocol::v2::MESSAGES_PATH, body.clone(), NOW, 7);
+    req.headers_mut().append(
+        protocol::HEADER_SIGNATURE,
+        HeaderValue::from_static("duplicate"),
+    );
+    assert_eq!(execute(&f.app, req, false).await.0, 401);
+    let mut req = request("POST", protocol::v2::MESSAGES_PATH, body, NOW, 7);
+    let mut changed = rich_message("mismatch", true);
+    changed["attachment"]["dataBase64"] = json!("AAAA");
+    *req.body_mut() = Body::from(serde_json::to_vec(&changed).unwrap());
+    assert_eq!(execute(&f.app, req, false).await.0, 401);
+    let mut wrong = rich_message("body-version", false);
+    wrong["version"] = json!(1);
+    let (status, error) = send_v2(&f, &wrong).await;
+    assert_eq!(status, 400);
+    assert_eq!(error["version"], 2);
+    assert_eq!(error["code"], "unsupported_version");
+    let mut wrong: Value = serde_json::from_slice(&message("v1-body-version")).unwrap();
+    wrong["version"] = json!(2);
+    assert_eq!(send(&f, serde_json::to_vec(&wrong).unwrap()).await.0, 400);
+    assert_eq!(f.mock.state.calls.lock().unwrap().len(), 0);
+    assert_eq!(f.app.store.attempt_count().await, 0);
+    assert_eq!(f.app.store.stats().await.0, 0);
+}
+
+#[tokio::test]
+async fn v2_media_entities_caption_bounds_reject_before_store_and_egress() {
+    let f = Fixture::new().await;
+    let base = rich_message("invalid-rich", true);
+    for patch in [
+        json!({"attachment":{"url":"https://invalid.example/must-not-fetch.png"}}),
+        json!({"attachment":{"kind":"png","dataBase64":"iVBORw0KGgo="}}),
+        json!({"attachment":{"kind":"png","dataBase64":"A".repeat(protocol::v2::MAX_PNG_BASE64_BYTES + 4)}}),
+        json!({"text":"x".repeat(1025),"entities":[]}),
+        json!({"entities":[{"type":"code","offset":1,"length":1}]}), // splits emoji
+        json!({"entities":[{"type":"text_link","offset":0,"length":2,"url":"https://invalid.example"}]}),
+        json!({"entities":(0..33).map(|offset|json!({"type":"bold","offset":offset,"length":1})).collect::<Vec<_>>()}),
+        json!({"chat_id":-123}),
+        json!({"expiresAt":NOW-1}),
+    ] {
+        let mut value = base.clone();
+        for (key, value_patch) in patch.as_object().unwrap() {
+            value[key] = value_patch.clone();
+        }
+        assert_eq!(send_v2(&f, &value).await.0, 400);
+    }
+    let mut missing = base.clone();
+    missing.as_object_mut().unwrap().remove("attachment");
+    assert_eq!(send_v2(&f, &missing).await.0, 400);
+    assert_eq!(f.mock.calls("sendPhoto"), 0);
+    assert_eq!(f.mock.calls("sendMessage"), 0);
+    assert_eq!(f.app.store.attempt_count().await, 0);
+    assert_eq!(f.app.store.stats().await.0, 0);
+}
+
+#[tokio::test]
+async fn v2_utf16_text_caption_and_raw_body_limits_are_independent_from_unchanged_v1() {
+    let f = Fixture::new().await;
+    let mut value = rich_message("caption-boundary", true);
+    value["text"] = json!("🟢".repeat(512));
+    value["entities"] = json!([]);
+    assert_eq!(send_v2(&f, &value).await.0, 200); // exactly 1024 UTF-16
+    value["id"] = json!("caption-overflow");
+    value["text"] = json!("🟢".repeat(513));
+    assert_eq!(send_v2(&f, &value).await.0, 400);
+    value["id"] = json!("text-boundary");
+    value["attachment"] = Value::Null;
+    value["text"] = json!("🟢".repeat(2048));
+    assert_eq!(send_v2(&f, &value).await.0, 200); // exactly 4096 UTF-16
+    value["id"] = json!("text-overflow");
+    value["text"] = json!("🟢".repeat(2049));
+    assert_eq!(send_v2(&f, &value).await.0, 400);
+    let mut body = serde_json::to_vec(&rich_message("v2-byte-boundary", false)).unwrap();
+    body.resize(protocol::v2::MAX_BODY_BYTES, b' ');
+    assert_eq!(
+        execute(
+            &f.app,
+            request("POST", protocol::v2::MESSAGES_PATH, body.clone(), NOW, 7),
+            true
+        )
+        .await
+        .0,
+        200
+    );
+    let mut req = request("POST", protocol::v2::MESSAGES_PATH, body.clone(), NOW, 7);
+    body.push(b' ');
+    *req.body_mut() = Body::from(body);
+    assert_eq!(execute(&f.app, req, false).await.0, 413);
+    let mut req = request(
+        "POST",
+        protocol::MESSAGES_PATH,
+        message("v1-still-32k"),
+        NOW,
+        7,
+    );
+    *req.body_mut() = Body::from(vec![b' '; protocol::MAX_BODY_BYTES + 1]);
+    assert_eq!(execute(&f.app, req, false).await.0, 413);
+    assert_eq!(f.mock.calls("sendPhoto"), 1);
+    assert_eq!(f.mock.calls("sendMessage"), 2);
+}
+
+#[tokio::test]
+async fn v2_photo_receipts_survive_restart_and_wire_switch_cannot_republish_id() {
+    let f = Fixture::new().await;
+    let value = rich_message("cross-version-id", true);
+    assert_eq!(send_v2(&f, &value).await.0, 200);
+    assert_eq!(send(&f, message("cross-version-id")).await.0, 409);
+    let store = Store::open(
+        &f.directory.0.join("state.sqlite"),
+        12345,
+        -10012345,
+        f.app.store.limits_for_test(),
+    )
+    .unwrap();
+    let clock = f.now.clone();
+    let restarted = App::new(
+        SecretKey::from_bytes([7; 32]),
+        store,
+        Telegram::for_test(f.mock.origin.clone(), Duration::from_millis(75)),
+        2,
+        Arc::new(move || clock.load(Ordering::Relaxed)),
+    );
+    let (status, receipt) = execute(
+        &restarted,
+        request(
+            "POST",
+            protocol::v2::MESSAGES_PATH,
+            serde_json::to_vec(&value).unwrap(),
+            NOW,
+            7,
+        ),
+        true,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(receipt["outcome"], "duplicate");
+    let db = rusqlite::Connection::open(f.directory.0.join("state.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT version FROM relay_meta", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(f.mock.calls("sendPhoto"), 1);
+    assert_eq!(f.mock.calls("sendMessage"), 0);
+}
+
+#[tokio::test]
+async fn v2_photo_timeout_replay_and_rate_limit_never_change_into_text_fallback() {
+    let f = Fixture::new().await;
+    let value = rich_message("photo-timeout", true);
+    let body = serde_json::to_vec(&value).unwrap();
+    f.mock.state.send_mode.store(3, Ordering::Relaxed);
+    let same = || {
+        request_nonce(
+            "POST",
+            protocol::v2::MESSAGES_PATH,
+            body.clone(),
+            NOW,
+            7,
+            NONCE,
+        )
+    };
+    assert_eq!(execute(&f.app, same(), true).await.0, 503);
+    f.now.store(NOW + 1, Ordering::Relaxed);
+    let (status, error) = execute(&f.app, same(), true).await;
+    assert_eq!(status, 409);
+    assert_eq!(error["code"], "post_replay");
+    f.mock.state.send_mode.store(0, Ordering::Relaxed);
+    assert_eq!(send_v2(&f, &value).await.0, 200);
+    assert_eq!(send_v2(&f, &value).await.1["outcome"], "duplicate");
+    let value = rich_message("photo-rate-limit", true);
+    f.mock.state.send_mode.store(1, Ordering::Relaxed);
+    let (status, error) = send_v2(&f, &value).await;
+    assert_eq!(status, 429);
+    assert_eq!(error["retryAfter"], 7);
+    assert_eq!(send_v2(&f, &value).await.0, 429);
+    assert_eq!(f.mock.calls("sendPhoto"), 3);
+    assert_eq!(f.mock.calls("sendMessage"), 0);
+}
+
+#[tokio::test]
+async fn v2_expiry_recheck_and_store_failure_precede_photo_egress() {
+    let mut f = Fixture::new().await;
+    let value = rich_message("photo-expired-after-claim", true);
+    let mut value = value;
+    value["expiresAt"] = json!(NOW);
+    let counter = Arc::new(AtomicUsize::new(0));
+    Arc::get_mut(&mut f.app).unwrap().clock = Arc::new(move || {
+        if counter.fetch_add(1, Ordering::Relaxed) >= 3 {
+            NOW + 1
+        } else {
+            NOW
+        }
+    });
+    assert_eq!(send_v2(&f, &value).await.1["code"], "expired");
+    assert_eq!(f.mock.calls("sendPhoto"), 0);
+    let f = Fixture::new().await;
+    f.app.store.disable_writes_for_test().await;
+    let (status, error) = send_v2(&f, &rich_message("photo-storage-failure", true)).await;
+    assert_eq!(status, 503);
+    assert_eq!(error["code"], "storage_unavailable");
+    assert_eq!(f.mock.calls("sendPhoto"), 0);
+    assert_eq!(f.app.store.attempt_count().await, 0);
+}
+
+#[test]
+fn caddy_has_only_exact_versioned_routes_with_independent_request_limits() {
+    let config = include_str!("../../../../../../infra/telegram-relay/Caddyfile");
+    assert!(config.contains(
+        "@v1 path /v1/messages /v1/status\n    request_body @v1 {\n        max_size 32KiB"
+    ));
+    assert!(config.contains(
+        "@v2 path /v2/messages /v2/status\n    request_body @v2 {\n        max_size 384KiB"
+    ));
+    assert!(config.contains("@outside not path /v1/messages /v1/status /v2/messages /v2/status"));
+    assert!(!config.contains("/v2/*"));
 }

@@ -25,6 +25,79 @@ impl ContinuousHandle {
     }
 }
 
+#[derive(Default)]
+struct ActiveEnrichmentSummary {attempted:u64,enriched:u64,unavailable:u64,failed:u64,cancelled:bool}
+
+/// One startup pass, outside live commit. Fixed high-water + keyset pages retain
+/// <=16 binding IDs, never raw inputs. Each binding is attempted ONCE per start;
+/// malformed/missing history degrades explicitly, without retry/log storms.
+async fn enrich_active_expectancy(pool:&PgPool,stop:&CancellationToken)->Result<ActiveEnrichmentSummary,setups_db::DbError> {
+    let mut summary=ActiveEnrichmentSummary::default();
+    let upper=tokio::select!{biased;
+        _=stop.cancelled()=>{summary.cancelled=true;return Ok(summary);},
+        result=setups_db::expectancy::active_enrichment_high_water(pool)=>result?,
+    };
+    let mut after=0;
+    loop {
+        let page=tokio::select!{biased;
+            _=stop.cancelled()=>{summary.cancelled=true;return Ok(summary);},
+            result=setups_db::expectancy::active_enrichment_page(pool,after,upper)=>result?,
+        };
+        if page.is_empty() {return Ok(summary);}
+        for binding in page {
+            after=binding.slot_id;
+            let result=tokio::select!{biased;
+                _=stop.cancelled()=>{summary.cancelled=true;return Ok(summary);},
+                result=setups_db::expectancy::enrich_saved_generation(pool,&binding.owner_id,binding.generation_id)=>result,
+            };
+            summary.attempted+=1;
+            match result {Ok(Some(_))=>summary.enriched+=1,Ok(None)=>summary.unavailable+=1,Err(_)=>summary.failed+=1}
+        }
+    }
+}
+
+async fn run_expectancy_renderer(pool:PgPool,stop:CancellationToken) {
+    use setups_analytics::expectancy_chart;
+    match enrich_active_expectancy(&pool,&stop).await {
+        Ok(summary) if summary.attempted>0=>println!("continuous expectancy legacy enrichment: attempted={} enriched={} unavailable={} failed={} cancelled={} code=saved_history_only",summary.attempted,summary.enriched,summary.unavailable,summary.failed,summary.cancelled),
+        Ok(_)=>{},
+        Err(_)=>eprintln!("continuous expectancy legacy enrichment: outcome=degraded code=saved_history_unavailable"),
+    }
+    let worker=format!("expectancy-render-{}-{:016x}",std::process::id(),rand::random::<u64>());
+    let mut degraded=false;
+    while !stop.is_cancelled() {
+        let started=Instant::now();
+        let attempt=async {
+            let Some(job)=setups_db::expectancy::claim_render(&pool,&worker,expectancy_chart::RENDER_VERSION).await? else {return Ok::<_,setups_db::DbError>(false);};
+            let bytes=serde_json::to_vec(&job.artifact.numerical_snapshot).map_err(|error|setups_db::DbError::Json(error.to_string()))?;
+            let artifact=setups_domain::expectancy::ExpectancyArtifact::from_json(&bytes).map_err(|error|setups_db::DbError::Json(error.to_string()))?;
+            // Join the one bounded renderer even on shutdown; never detach a
+            // live CPU handle or retain the research Arc for an optional PNG.
+            let rendered=tokio::task::spawn_blocking(move||expectancy_chart::render_png(&artifact)).await;
+            match rendered {
+                Ok(Ok(png))=>{
+                    setups_db::expectancy::finish_render(&pool,&job,Some(&png),None).await?;
+                    println!("continuous expectancy png: artifact={} outcome=stored bytes={} duration_ms={}",job.artifact.id,png.len(),started.elapsed().as_millis());
+                }
+                Ok(Err(error))=>{
+                    setups_db::expectancy::finish_render(&pool,&job,None,Some(error.code())).await?;
+                    eprintln!("continuous expectancy png: artifact={} outcome=unavailable code={}",job.artifact.id,error.code());
+                }
+                Err(_)=>{
+                    setups_db::expectancy::finish_render(&pool,&job,None,Some("expectancy_renderer_join_failed")).await?;
+                    eprintln!("continuous expectancy png: artifact={} outcome=unavailable code=expectancy_renderer_join_failed",job.artifact.id);
+                }
+            }
+            Ok(true)
+        }.await;
+        match attempt {
+            Ok(_)=>degraded=false,
+            Err(_)=>{if !degraded {eprintln!("continuous expectancy renderer: outcome=degraded code=expectancy_storage_unavailable");}degraded=true;},
+        }
+        tokio::select!{_=stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(if degraded {5}else{1}))=>{}}
+    }
+}
+
 pub async fn start_continuous_runtime(pool:PgPool,market_url:String,market_key:String,config:ContinuousRuntimeConfig)->Result<ContinuousHandle,String> {
     if pool.options().get_max_connections()<2 {return Err("continuous runtime requires at least two shared database connections".into());}
     sqlx::query("select owner_id from continuous_owner_lanes limit 0").execute(&pool).await.map_err(|e|e.to_string())?;
@@ -35,7 +108,11 @@ pub async fn start_continuous_runtime(pool:PgPool,market_url:String,market_key:S
     let stop=CancellationToken::new();
     let notify=Arc::new(Notify::new());
     let available=Arc::new(AtomicBool::new(true));
-    let mut tasks=Vec::with_capacity(config.workers);
+    let mut tasks=Vec::with_capacity(config.workers+1);
+    // Separate single-CPU asset lane, after numeric finalization. It owns no
+    // frozen input, detector state or live-commit transaction; DB claims/retries
+    // and byte budgets survive process restart without retaining a RAM cache.
+    tasks.push(tokio::spawn(run_expectancy_renderer(pool.clone(),stop.clone())));
     for index in 0..config.workers {
         let pool=pool.clone();let url=market_url.clone();let key=market_key.clone();let config=config.clone();
         let stop=stop.clone();let notify=notify.clone();let available=available.clone();
@@ -443,14 +520,21 @@ async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&Continuo
     let stored=persistence.call("load_replay",||db::load_replay(pool,job,config.optimizer.max_working_bytes)).await?;
     let bootstrap=stored.get("bootstrap").filter(|value|value.is_object()).cloned().ok_or_else(||JobError::new("resume_bootstrap_missing","Durable replay has no compact bootstrap proof"))?;
     let persisted:ContinuousReplay=serde_json::from_value(stored).map_err(|e|JobError::new("invalid_persisted_replay",e.to_string()))?;
+    // Select only from the already frozen winner. Capture is post-chain only;
+    // optimizer trials and the original matrix calculation stay unchanged.
+    let expected_selected=core::select_robust_cell(&best.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell).map_err(compute_error)?;
+    let capture=expected_selected.map(|cell|core::ContinuousCaptureCell{tp_pct:cell.tp_pct,sl_pct:cell.sl_pct});
     let cpu_spec=spec.clone();let cpu_input=input.clone();let cpu_candidate=candidate.clone();let limits=config.optimizer.study_limits();
-    let (evaluation,_)=blocking(cancel,None,move|token|core::analyze_continuous(&cpu_spec,&cpu_input,&persisted,&cpu_candidate,&limits,&token)).await?;
-    let evaluation=evaluation.ok_or_else(interrupted)?;
+    let (captured,_)=blocking(cancel,None,move|token|core::analyze_continuous_with_daily(&cpu_spec,&cpu_input,&persisted,&cpu_candidate,&limits,&token,capture)).await?;
+    let captured=captured.ok_or_else(interrupted)?;
+    let evaluation=captured.evaluation;
     if evaluation.evaluation.matrix!=best.matrix || evaluation.evaluation.summary.selected_setup_count!=best.support.selected_setup_count {
         return Err(JobError::new("post_chain_mismatch","Сохранённый replay/аналитика не совпали с frozen исследованием"));
     }
     let recommendation=core::recommend_continuous(&spec,&candidate,&evaluation,&best.provenance,context,job.config["minMeanExpectancy"].as_f64().ok_or_else(||JobError::new("invalid_persisted_config","Нет mean gate"))?).map_err(compute_error)?;
     let selected=core::select_robust_cell(&evaluation.evaluation.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell).map_err(compute_error)?;
+    if selected!=expected_selected {return Err(JobError::new("post_chain_selected_cell_mismatch","Frozen selected pair changed during post-chain analytics"));}
+    let derived=post_chain_expectancy(job,&spec,&best,&evaluation,selected.as_ref(),captured.selected_daily)?;
     let selected=selected.map(|cell|json!(cell));
     let mean=evaluation.evaluation.summary.score;
     let accepted=recommendation.is_some();
@@ -458,10 +542,46 @@ async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&Continuo
     let result=json!({"best":best,"selectedCell":selected,"meanExpectancy":mean,"analytics":evaluation,"recommendation":recommendation,"bootstrap":bootstrap,"setupSetId":format!("batch-{batch}")});
     drop(input);
     let gate=recovery::Gate {result,accepted,mean,selected};
-    if !persistence.call("gate",||recovery::save_gate(pool,job,&identity,&gate)).await? {return Err(interrupted());}
+    if !persistence.call("gate",||recovery::save_gate_with_expectancy(pool,job,&identity,&gate,derived.as_ref().map(|(source,numerical)|(source,numerical)))).await? {return Err(interrupted());}
     check_shutdown(shutdown)?;
     if !persistence.call("finalize",||db::finalize(pool,job,&gate.result,gate.accepted,gate.mean,gate.selected.as_ref())).await? {return Err(interrupted());}
     Ok(())
+}
+
+type DerivedExpectancy=(setups_db::expectancy::ArtifactIdentity,Value);
+
+fn post_chain_expectancy(job:&ChainJob,spec:&StudyRequest,best:&core::StudyBest,evaluation:&core::ContinuousEvaluation,
+    selected:Option<&core::RobustCell>,daily:Option<core::ContinuousSelectedDaily>)->Result<Option<DerivedExpectancy>,JobError> {
+    use setups_domain::{RecommendationProvenance,expectancy::*};
+    let Some(selected)=selected else {
+        if daily.is_some() {return Err(JobError::new("post_chain_capture_mismatch","Unexpected daily capture without a selected cell"));}
+        return Ok(None);
+    };
+    let daily=daily.ok_or_else(||JobError::new("post_chain_capture_missing","Canonical post-chain selected outcomes were not captured"))?;
+    if daily.tp_pct!=selected.tp_pct || daily.sl_pct!=selected.sl_pct {
+        return Err(JobError::new("post_chain_capture_mismatch","Captured outcomes differ from the frozen selected pair"));
+    }
+    let cell=evaluation.evaluation.matrix.iter().find(|cell|cell.tp_pct==selected.tp_pct && cell.sl_pct==selected.sl_pct)
+        .ok_or_else(||JobError::new("post_chain_capture_mismatch","Selected pair is absent from the frozen matrix"))?;
+    let identity=setups_db::expectancy::ArtifactIdentity {owner_id:job.lease.owner_id.clone(),generation_id:job.generation_id,
+        study_id:job.study_id,slot_id:job.slot_id,calculation_version:EXPECTANCY_CALCULATION_VERSION.to_string(),historical_input_hash:None,
+        tp_pct:selected.tp_pct,sl_pct:selected.sl_pct,from_unix:spec.from_unix,to_unix:spec.to_unix,observation_cutoff:job.observation_cutoff,
+        provenance:json!(best.provenance),effective_analytics:json!(best.analytics)};
+    let artifact=build_expectancy_artifact(ExpectancyInput {
+        source:ExpectancySource {study_id:job.study_id.to_string(),derived_snapshot_id:setups_db::expectancy::artifact_key(&identity).map_err(|error|JobError::new("expectancy_identity_invalid",error.to_string()))?,
+            generation_id:Some(job.generation_id.to_string()),profile_id:Some(job.slot_id.to_string()),
+            provenance:RecommendationProvenance {algorithm_id:spec.algorithm_id.clone(),algorithm_version:spec.algorithm_version.clone(),
+                optimizer_version:best.provenance.optimizer_version.clone(),seed:best.provenance.seed,snapshot_hash:best.provenance.snapshot_hash.clone(),
+                captured_at:best.provenance.captured_at.clone(),from_unix:spec.from_unix,to_unix:spec.to_unix,observation_cutoff:job.observation_cutoff},
+            direction:serde_json::from_value(json!(spec.direction)).map_err(|error|JobError::new("expectancy_direction_invalid",error.to_string()))?,
+            tp_pct:selected.tp_pct,sl_pct:selected.sl_pct,analytics:ExpectancyAnalytics {cluster_enabled:best.analytics.cluster_enabled,
+                cluster_gap_minutes:best.analytics.cluster_gap_minutes,time_shift_minutes:best.analytics.time_shift_minutes,
+                price_change_pct:best.analytics.price_change_pct,horizon_minutes:best.analytics.horizon_minutes}},
+        selected_cell:Some(SelectedCellInput {raw_r:Some(selected.raw_r),tp_count:cell.tp_count as u64,sl_count:cell.sl_count as u64}),
+        matrix_mean_r:evaluation.evaluation.summary.score,daily:MetricAvailability::Available {value:daily.points},
+    }).map_err(|error|JobError::new("post_chain_expectancy_invalid",error.to_string()))?;
+    let numerical=setups_db::expectancy::encode_artifact(&artifact).map_err(|error|JobError::new("expectancy_encoding_failed",error.to_string()))?;
+    Ok(Some((identity,numerical)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -682,7 +802,7 @@ mod persistence_tests {
                 assert_eq!(before.get::<chrono::DateTime<chrono::Utc>,_>("research_deadline"),job.research_deadline.unwrap());
                 assert_eq!(before.get::<i32,_>("retry_count"),0,"failure handler cannot charge an uncertain DB transaction");
                 assert_eq!(before.get::<Value,_>("error")["code"],"persistence_unconfirmed");
-                assert_eq!(before.get::<Option<String>,_>("checkpoint_hash").is_some(),operation=="checkpoint");
+                assert_eq!(before.get::<Option<String>,_>("checkpoint_hash").is_some(),operation!="phase");
                 db::release(&pool,&job.lease).await.unwrap();
                 assert!(db::claim_owner(&pool,"backoff").await.unwrap().is_none());
                 sqlx::query("update continuous_processes set next_attempt_at=now()-interval '1 second'").execute(&pool).await.unwrap();
@@ -699,6 +819,12 @@ mod persistence_tests {
             let result=completed.get::<Value,_>("result");assert_eq!(result["best"]["provenance"]["snapshotHash"],input.snapshot_hash);
             assert_eq!(result["best"]["matrix"],result["analytics"]["evaluation"]["matrix"]);
             let study=setups_db::optimization::get(&pool,job.study_id).await.unwrap().unwrap();let outcome:core::StudyOutcome=serde_json::from_value(study.result.unwrap()).unwrap();
+            let sealed=setups_db::expectancy::get_for_generation(&pool,"admin",job.generation_id,&setups_domain::expectancy::EXPECTANCY_CALCULATION_VERSION.to_string()).await.unwrap().expect("actual post-chain must seal numbers before releasing input");
+            let artifact=setups_domain::expectancy::ExpectancyArtifact::from_json(&serde_json::to_vec(&sealed.numerical_snapshot).unwrap()).unwrap();
+            assert_eq!(artifact.source.provenance.snapshot_hash,input.snapshot_hash);
+            assert_eq!(artifact.selected_cell.as_ref().unwrap().raw_r.as_ref().copied(),result["selectedCell"]["rawR"].as_f64());
+            assert!(artifact.daily.as_ref().is_some());
+            assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_expectancy_artifacts").fetch_one(&pool).await.unwrap(),1);
             assert_eq!(outcome.progress.evaluated_candidates,4);assert_eq!(outcome.detector_passes,4,"ACK retries must not reevaluate committed proposals");
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from continuous_generations").fetch_one(&pool).await.unwrap(),1);
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from replay_batches").fetch_one(&pool).await.unwrap(),1);
@@ -716,6 +842,99 @@ mod persistence_tests {
     #[tokio::test]
     #[ignore="requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
     async fn exhausted_checkpoint_ack_retries_defer_then_resume_same_original_input_and_deadline() {fault_after_actual_commit("checkpoint",3).await;}
+    #[tokio::test]
+    #[ignore="requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+    async fn gate_and_expectancy_commit_ack_loss_is_adopted_without_duplicate_artifact() {fault_after_actual_commit("gate",1).await;}
+    #[tokio::test]
+    #[ignore="requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+    async fn exhausted_gate_ack_retries_resume_sealed_gate_without_research_or_input_loss() {fault_after_actual_commit("gate",3).await;}
+    #[tokio::test]
+    #[ignore="requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+    async fn startup_hook_enriches_only_current_legacy_active_profile_without_rewriting_history_or_delivery() {
+        isolated(|pool|async move {
+            use setups_domain::expectancy::*;
+            let (job,input,config)=committed_input(&pool).await;
+            let stop=CancellationToken::new();
+            run_owner(&pool,&job.lease,"http://127.0.0.1:1","unused",&config,&stop,LeaseInstant::now(),&Persistence::default()).await.unwrap();
+            drop(input);
+            // Emulate the pre-extension persisted state, with its exact original
+            // study/post-chain results but no derived artifact or frozen candles.
+            sqlx::query("update continuous_generations set expectancy_artifact_id=null where id=$1").bind(job.generation_id).execute(&pool).await.unwrap();
+            sqlx::query("update replay_batches set expectancy_artifact_id=null where continuous_generation_id=$1").bind(job.generation_id).execute(&pool).await.unwrap();
+            assert_eq!(setups_db::expectancy::collect_unreferenced(&pool,100).await.unwrap(),1);
+            assert_eq!(enrich_active_expectancy(&pool,&stop).await.unwrap().attempted,0,"pending/inactive history is not a startup backfill target");
+            sqlx::query("update continuous_slots set active_generation_id=$2,pending_generation_id=null,pending_status=null,status='active' where id=$1").bind(job.slot_id).bind(job.generation_id).execute(&pool).await.unwrap();
+            let before:(String,String)=sqlx::query_as("select g.result::text,s.result::text from continuous_generations g join optimization_studies s on s.id=g.study_id where g.id=$1").bind(job.generation_id).fetch_one(&pool).await.unwrap();
+            let result:Value=serde_json::from_str(&before.0).unwrap();
+            let old_setup:i32=sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,details,adaptive_slot_id,adaptive_generation_id,recommendation) values('bybit','linear','BTCUSDT','price_volume_spike','1.1.1','{}',to_timestamp($3),to_timestamp($3+60),'100','{}',$1,$2,$4) returning id")
+                .bind(job.slot_id).bind(job.generation_id).bind(job.observation_cutoff as f64).bind(&result["recommendation"]).fetch_one(&pool).await.unwrap();
+            sqlx::query("insert into telegram_delivery_outbox(setup_id,delivery_id,endpoint_url,settings_revision,owner_id,algorithm_id,slot_id,generation_id,config_revision,raw_close_unix,expires_at,payload,request_body,request_body_hash) values($1,'legacy-frozen','https://relay.example/',0,'admin','price_volume_spike',$2,$3,$4,$5,clock_timestamp()+interval '1 hour','{\"legacy\":true}',decode('6c6567616379','hex'),repeat('0',64))")
+                .bind(old_setup).bind(job.slot_id).bind(job.generation_id).bind(job.config_revision).bind(job.observation_cutoff+60).execute(&pool).await.unwrap();
+            let old_setup_text:String=sqlx::query_scalar("select to_jsonb(l)::text from live_setups l where id=$1").bind(old_setup).fetch_one(&pool).await.unwrap();
+            let old_delivery_text:String=sqlx::query_scalar("select to_jsonb(o)::text from telegram_delivery_outbox o where setup_id=$1").bind(old_setup).fetch_one(&pool).await.unwrap();
+            // Actual normal application startup lane, not a manually invoked DB
+            // enrichment API. It must operate without raw input or market IO.
+            let pump=tokio::spawn(run_expectancy_renderer(pool.clone(),stop.clone()));
+            let ready=tokio::time::timeout(Duration::from_secs(20),async {
+                loop {
+                    if let Some(record)=setups_db::expectancy::get_for_generation(&pool,"admin",job.generation_id,&EXPECTANCY_CALCULATION_VERSION.to_string()).await.unwrap() {break record;}
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }).await;
+            stop.cancel();tokio::time::timeout(Duration::from_secs(5),pump).await.unwrap().unwrap();
+            let record=ready.expect("startup must enrich current active legacy binding");
+            let artifact=ExpectancyArtifact::from_json(&serde_json::to_vec(&record.numerical_snapshot).unwrap()).unwrap();
+            let cell=result["analytics"]["evaluation"]["matrix"].as_array().unwrap().iter().find(|cell|cell["tpPct"]==result["selectedCell"]["tpPct"] && cell["slPct"]==result["selectedCell"]["slPct"]).unwrap();
+            let recovered=artifact.selected_cell.as_ref().unwrap();
+            assert_eq!(Some(recovered.tp_count),cell["tpCount"].as_u64());assert_eq!(Some(recovered.sl_count),cell["slCount"].as_u64());
+            assert_eq!(recovered.raw_r.as_ref().copied(),result["selectedCell"]["rawR"].as_f64());
+            assert!(recovered.win_rate_pct.as_ref().is_some());
+            assert!(matches!(artifact.daily,MetricAvailability::Unavailable {reason:ExpectancyUnavailableReason::MissingFrozenOutcomes}));
+            assert!(artifact.trend.is_none());
+            let again=enrich_active_expectancy(&pool,&CancellationToken::new()).await.unwrap();
+            assert_eq!((again.attempted,again.enriched,again.failed),(0,0,0));
+            let cancelled=CancellationToken::new();cancelled.cancel();
+            assert!(enrich_active_expectancy(&pool,&cancelled).await.unwrap().cancelled);
+            assert_eq!(sqlx::query_as::<_,(String,String)>("select g.result::text,s.result::text from continuous_generations g join optimization_studies s on s.id=g.study_id where g.id=$1").bind(job.generation_id).fetch_one(&pool).await.unwrap(),before);
+            assert_eq!(sqlx::query_scalar::<_,String>("select to_jsonb(l)::text from live_setups l where id=$1").bind(old_setup).fetch_one(&pool).await.unwrap(),old_setup_text);
+            assert_eq!(sqlx::query_scalar::<_,String>("select to_jsonb(o)::text from telegram_delivery_outbox o where setup_id=$1").bind(old_setup).fetch_one(&pool).await.unwrap(),old_delivery_text);
+            assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_expectancy_artifacts").fetch_one(&pool).await.unwrap(),1);
+            assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from continuous_frozen_chunks").fetch_one(&pool).await.unwrap(),0);
+        }).await;
+    }
+    #[tokio::test]
+    #[ignore="requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+    async fn renderer_pump_uses_only_sealed_numbers_after_cleanup_then_stops_and_reuses_exact_png() {
+        isolated(|pool|async move {
+            let (job,input,config)=committed_input(&pool).await;
+            let stop=CancellationToken::new();
+            run_owner(&pool,&job.lease,"http://127.0.0.1:1","unused",&config,&stop,LeaseInstant::now(),&Persistence::default()).await.unwrap();
+            assert_eq!(Arc::strong_count(&input),1,"no retained research input owner after chain completion");
+            drop(input);
+            assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from continuous_frozen_chunks").fetch_one(&pool).await.unwrap(),0);
+            let record=setups_db::expectancy::get_for_generation(&pool,"admin",job.generation_id,&setups_domain::expectancy::EXPECTANCY_CALCULATION_VERSION.to_string()).await.unwrap().unwrap();
+            let artifact=setups_domain::expectancy::ExpectancyArtifact::from_json(&serde_json::to_vec(&record.numerical_snapshot).unwrap()).unwrap();
+            let key=artifact.image_key(setups_analytics::expectancy_chart::RENDER_VERSION);
+            let renderer=tokio::spawn(run_expectancy_renderer(pool.clone(),stop.clone()));
+            let ready=tokio::time::timeout(Duration::from_secs(20),async {
+                loop {
+                    if let Some(png)=setups_db::expectancy::load_png_by_image_key(&pool,"admin",&key).await.unwrap() {break png;}
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }).await;
+            // Always stop/join before assertion so a failing test cannot leak
+            // a pump holding the child pool/database or a detached CPU render.
+            stop.cancel();
+            tokio::time::timeout(Duration::from_secs(5),renderer).await.unwrap().unwrap();
+            let png=ready.expect("bounded renderer must populate exact-key cache from persisted numbers");
+            assert_eq!(&png[..8],b"\x89PNG\r\n\x1a\n");
+            assert_eq!(&png[16..20],&900_u32.to_be_bytes());assert_eq!(&png[20..24],&320_u32.to_be_bytes());
+            assert!(png.len()<=setups_db::expectancy::MAX_PNG_BYTES);
+            assert_eq!(setups_db::expectancy::load_png_by_image_key(&pool,"admin",&key).await.unwrap(),Some(png));
+            assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_expectancy_pngs").fetch_one(&pool).await.unwrap(),1);
+            assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_expectancy_render_attempts").fetch_one(&pool).await.unwrap(),0);
+        }).await;
+    }
     #[tokio::test]
     #[ignore="requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
     async fn ancillary_phase_ack_failure_preserves_head_for_real_owner_recovery() {fault_after_actual_commit("phase",3).await;}

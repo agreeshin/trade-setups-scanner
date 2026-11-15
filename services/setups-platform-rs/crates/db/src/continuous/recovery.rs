@@ -73,7 +73,7 @@ pub async fn active_job(pool:&PgPool,lease:&OwnerLease)->Result<Option<ChainJob>
 pub async fn load(pool:&PgPool,job:&ChainJob,identity:&Value)->Result<ChainState,DbError> {
     let mut tx=pool.begin().await?;
     if !scheduler::fenced(&mut tx,job).await? {return Err(DbError::Json("resume fence lost".into()));}
-    let row=sqlx::query("select a.identity,a.snapshot_manifest is not null committed,a.checkpoint,a.checkpoint_hash,a.checkpoint_sequence,s.status study_status,s.result search_result,g.replay_manifest is not null replay_committed,a.gate_result,a.gate_accepted,a.gate_mean,a.gate_selected from continuous_generations g join optimization_studies s on s.id=g.study_id left join continuous_runtime_artifacts a on a.generation_id=g.id where g.id=$1")
+    let row=sqlx::query("select a.identity,a.snapshot_manifest is not null committed,a.checkpoint,a.checkpoint_hash,a.checkpoint_sequence,s.status study_status,s.result search_result,g.replay_manifest is not null replay_committed,a.gate_result,a.gate_accepted,a.gate_mean,a.gate_selected,coalesce(a.gate_expectancy_required,false) expectancy_required,g.expectancy_artifact_id from continuous_generations g join optimization_studies s on s.id=g.study_id left join continuous_runtime_artifacts a on a.generation_id=g.id where g.id=$1")
         .bind(job.generation_id).fetch_one(&mut *tx).await?;
     let stored:Option<Value>=row.try_get("identity")?;
     if stored.as_ref().is_some_and(|stored|stored!=identity) {return Err(DbError::Json("resume_identity_incompatible".into()));}
@@ -86,6 +86,9 @@ pub async fn load(pool:&PgPool,job:&ChainJob,identity:&Value)->Result<ChainState
     let status:String=row.try_get("study_status")?;
     if !matches!(status.as_str(),"running"|"completed") {return Err(DbError::Json("resume_study_not_running_or_completed".into()));}
     let gate:Option<Value>=row.try_get("gate_result")?;
+    if gate.is_some() && row.try_get::<bool,_>("expectancy_required")? && row.try_get::<Option<i64>,_>("expectancy_artifact_id")?.is_none() {
+        return Err(DbError::Json("resume_gate_expectancy_missing".into()));
+    }
     let gate=gate.map(|result|Ok::<_,DbError>(Gate {result,accepted:row.try_get::<Option<bool>,_>("gate_accepted")?.ok_or_else(||DbError::Json("resume_gate_incomplete".into()))?,mean:row.try_get("gate_mean")?,selected:row.try_get("gate_selected")?})).transpose()?;
     let result=ChainState {snapshot_committed:row.try_get::<Option<bool>,_>("committed")?.unwrap_or(false),checkpoint,checkpoint_sequence:row.try_get::<Option<i64>,_>("checkpoint_sequence")?.unwrap_or(0),search_result:if status=="completed" {row.try_get("search_result")?}else{None},replay_committed:row.try_get("replay_committed")?,gate};
     if (result.checkpoint.is_some() || result.search_result.is_some() || result.replay_committed || result.gate.is_some()) && !result.snapshot_committed {return Err(DbError::Json("resume_committed_input_missing".into()));}
@@ -117,17 +120,32 @@ pub async fn save_checkpoint(pool:&PgPool,job:&ChainJob,identity:&Value,bytes:&[
 }
 
 pub async fn save_gate(pool:&PgPool,job:&ChainJob,identity:&Value,gate:&Gate)->Result<bool,DbError> {
+    save_gate_inner(pool,job,identity,gate,None).await
+}
+
+/// New post-chain boundary: numbers and gate commit together. Legacy save_gate
+/// stays compatible with pre-extension gates; never retroactively require input
+/// that an earlier valid gate was allowed to release.
+pub async fn save_gate_with_expectancy(pool:&PgPool,job:&ChainJob,identity:&Value,gate:&Gate,artifact:Option<(&crate::expectancy::ArtifactIdentity,&Value)>)->Result<bool,DbError> {
+    if gate.selected.is_some() && artifact.is_none() {return Err(DbError::Json("post_chain_expectancy_missing".into()));}
+    save_gate_inner(pool,job,identity,gate,artifact).await
+}
+
+async fn save_gate_inner(pool:&PgPool,job:&ChainJob,identity:&Value,gate:&Gate,artifact:Option<(&crate::expectancy::ArtifactIdentity,&Value)>)->Result<bool,DbError> {
     let mut tx=pool.begin().await?;
     if !scheduler::fenced(&mut tx,job).await? {return Ok(false);}
-    let written=sqlx::query("update continuous_runtime_artifacts set gate_result=$3,gate_accepted=$4,gate_mean=$5,gate_selected=$6,updated_at=now() where generation_id=$1 and identity=$2 and snapshot_manifest is not null and gate_result is null")
-        .bind(job.generation_id).bind(identity).bind(&gate.result).bind(gate.accepted).bind(gate.mean).bind(&gate.selected).execute(&mut *tx).await?.rows_affected();
+    let required=artifact.is_some();
+    if let Some((source,numerical))=artifact {crate::expectancy::seal_for_chain_in(&mut tx,job,source,numerical).await?;}
+    let written=sqlx::query("update continuous_runtime_artifacts set gate_result=$3,gate_accepted=$4,gate_mean=$5,gate_selected=$6,gate_expectancy_required=$7,updated_at=now() where generation_id=$1 and identity=$2 and snapshot_manifest is not null and gate_result is null")
+        .bind(job.generation_id).bind(identity).bind(&gate.result).bind(gate.accepted).bind(gate.mean).bind(&gate.selected).bind(required).execute(&mut *tx).await?.rows_affected();
     if written==0 {
-        let matches:bool=sqlx::query_scalar("select exists(select 1 from continuous_runtime_artifacts where generation_id=$1 and identity=$2 and gate_result=$3 and gate_accepted=$4 and gate_mean is not distinct from $5 and gate_selected is not distinct from $6)")
-            .bind(job.generation_id).bind(identity).bind(&gate.result).bind(gate.accepted).bind(gate.mean).bind(&gate.selected).fetch_one(&mut *tx).await?;
+        let matches:bool=sqlx::query_scalar("select exists(select 1 from continuous_runtime_artifacts where generation_id=$1 and identity=$2 and gate_result=$3 and gate_accepted=$4 and gate_mean is not distinct from $5 and gate_selected is not distinct from $6 and gate_expectancy_required=$7)")
+            .bind(job.generation_id).bind(identity).bind(&gate.result).bind(gate.accepted).bind(gate.mean).bind(&gate.selected).bind(required).fetch_one(&mut *tx).await?;
         if !matches {return Err(DbError::Json("resume gate identity/immutable result mismatch".into()));}
     }else{
         acknowledge_boundary(&mut tx,job).await?;
     }
+    if !scheduler::owns(&mut tx,&job.lease).await? {return Ok(false);}
     tx.commit().await?;
     Ok(true)
 }
@@ -142,5 +160,8 @@ pub async fn reclaim_orphans(pool:&PgPool)->Result<u64,DbError> {
     // A terminal transition fences all writers before reclaim; foreign keys own true orphans.
     let count=sqlx::query("delete from continuous_runtime_artifacts a using continuous_generations g where a.generation_id=g.id and g.status<>'running'").execute(&mut *tx).await?.rows_affected();
     tx.commit().await?;
+    // Derived numeric/image artifacts have real generation/replay/live owners,
+    // independent of the disposable runtime rows above. Never evict by age.
+    crate::expectancy::collect_unreferenced(pool,100).await?;
     Ok(count)
 }

@@ -2,8 +2,10 @@ import { afterEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AnalyticsPage } from "./analytics-page";
+import type { TradeRow } from "../lib/analytics-api";
+import { applyInterfaceSettings } from "../lib/datetime-format";
 
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); applyInterfaceSettings({ timezone: "auto" }); });
 
 const setFixture = {
   setId: "run-12", kind: "run", numericId: 12, label: "#12 · Утренний прогон",
@@ -30,6 +32,7 @@ interface StubOptions {
   longBulk?: { tpPct: number; slPct: number; avgMovePct: number | null; riskExpectancy: number | null }[];
   interceptMatrixGrid?: (direction: string) => Promise<Response> | undefined;
   savedSettings?: Record<string, unknown>;
+  tradeRows?: TradeRow[];
 }
 
 function stubFetch(options: StubOptions = {}) {
@@ -47,7 +50,7 @@ function stubFetch(options: StubOptions = {}) {
     if (path.startsWith("/v1/analytics/sets")) return json({ sets: options.sets ?? [setFixture] });
     if (path.startsWith("/v1/analytics/months")) return json({ months: ["2024-01", "2024-02"] });
     if (path.startsWith("/v1/analytics/setups")) {
-      return json({ setups: [setupA, setupB], ...selectionMetrics });
+      return json({ setups: options.tradeRows?.map((row) => row.setup) ?? [setupA, setupB], ...selectionMetrics });
     }
     if (path.startsWith("/v1/analytics/matrix-grid")) {
       const direction = query.get("direction") ?? "short";
@@ -81,6 +84,7 @@ function stubFetch(options: StubOptions = {}) {
       });
     }
     if (path.startsWith("/v1/analytics/trades")) {
+      if (options.tradeRows) return json({ items: options.tradeRows, cachedCount: options.tradeRows.length });
       return json({
         items: [{
           setup: setupA, direction: "short", tpPct: 4, slPct: 4, status: "tp",
@@ -361,3 +365,77 @@ it("shows deposit growth per trade and a full-width daily chart", async () => {
   fireEvent.change(screen.getAllByLabelText("Риск на сделку, %")[0]!, { target: { value: "0" } });
   await screen.findByText("Риск на сделку должен быть числом больше 0 и не больше 100");
 }, 15_000);
+
+function utcTrade(at: string, riskReturn: number | null, index: number): TradeRow {
+  const closeTimeUnix = Date.parse(at) / 1000;
+  return { setup: { ...setupA, symbol: `UTC${index}USDT`, openTimeUnix: closeTimeUnix - 60, closeTimeUnix },
+    direction: "short", tpPct: 4, slPct: 4, status: riskReturn === null ? "unclosed" : riskReturn < 0 ? "sl" : "tp",
+    entryPrice: 100, tpPrice: 96, slPrice: 104, closeTimeUnix: closeTimeUnix + 86400, riskReturn };
+}
+function utcChartOptions(rows: TradeRow[]): StubOptions {
+  return { sets: [{ ...setFixture, fromUnix: Date.parse("2026-01-01T00:00:00Z") / 1000, toUnix: Date.parse("2026-01-12T00:00:00Z") / 1000 }], tradeRows: rows };
+}
+
+it.each(["America/New_York", "Pacific/Auckland"])("renders calendar UTC spacing, null gaps and both fitted labels independently of browser interface zone %s", async (timezone) => {
+  applyInterfaceSettings({ timezone });
+  const rows = [utcTrade("2026-01-01T00:00:00Z", 2, 0), utcTrade("2026-01-01T12:00:00Z", 2, 1), utcTrade("2026-01-01T23:59:00Z", -1, 2),
+    utcTrade("2026-01-03T12:00:00Z", null, 3), utcTrade("2026-01-04T12:00:00Z", -1, 4), utcTrade("2026-01-10T12:00:00Z", 2, 5)]
+    .map((item) => ({ ...item, tpPct: 2, slPct: 1, tpPrice: 98, slPrice: 101 }));
+  const calls = stubFetch(utcChartOptions(rows));
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  expect(calls.some((call) => call.path.startsWith("/v1/analytics/trades") || call.path === "/v1/analytics/setups")).toBe(false);
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByText("Сделок: 6 / 6");
+  const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
+  const circles = [...chart.querySelectorAll("circle")];
+  expect(circles.map((circle) => Number(circle.getAttribute("cx")))).toEqual([64, 288, 736]); // 0, 3, 9 UTC days.
+  expect(circles.map((circle) => circle.querySelector("title")?.textContent)).toEqual([
+    "01.01 UTC: +1.00R, закрыто 3, TP 2, SL 1, из кеша 3/3",
+    "04.01 UTC: -1.00R, закрыто 1, TP 0, SL 1, из кеша 1/1",
+    "10.01 UTC: +2.00R, закрыто 1, TP 1, SL 0, из кеша 1/1",
+  ]);
+  expect(chart.querySelectorAll("polyline")).toHaveLength(1); // The represented null day breaks the first segment.
+  expect(chart.querySelector("polyline")?.getAttribute("points")?.split(" ")).toHaveLength(2);
+  expect(screen.getByLabelText("Начало тренда: +0.00R")).toHaveTextContent("+0.00R");
+  expect(screen.getByLabelText("Конец тренда: +1.50R")).toHaveTextContent("+1.50R");
+  expect(chart.querySelector('line[stroke-dasharray="4 4"] title')).toHaveTextContent("+0.17R/день UTC, за период +1.50R");
+  expect(chart).toHaveTextContent("Дата сигнала (UTC)");
+  expect(circles[0]).toHaveClass("fill-success"); expect(circles[1]).toHaveClass("fill-danger");
+  expect(screen.getByText("Win rate: 60.0%")).toBeInTheDocument();
+  expect(screen.getByText("Матожидание: +0.80R по 5 закрытым")).toBeInTheDocument(); // Trade-weighted, not 2/3 daily mean.
+  expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(1);
+  expect(calls.some((call) => call.path.startsWith("/v1/analytics/trades/"))).toBe(false);
+  expect(calls.some((call) => call.method !== "GET")).toBe(false);
+});
+
+it("renders a single UTC-day point centered without a fabricated trend or endpoint labels", async () => {
+  stubFetch(utcChartOptions([utcTrade("2026-01-04T00:00:00Z", 1, 0)]));
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByText("Сделок: 1 / 1");
+  const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
+  expect(chart.querySelectorAll("circle")).toHaveLength(1); expect(chart.querySelector("circle")).toHaveAttribute("cx", "400");
+  expect(chart.querySelector('line[stroke-dasharray]')).toBeNull();
+  expect(screen.queryByLabelText(/^Начало тренда:/)).not.toBeInTheDocument(); expect(screen.queryByLabelText(/^Конец тренда:/)).not.toBeInTheDocument();
+});
+
+it("shows an explicit no-closed-days state instead of manufacturing zero points", async () => {
+  stubFetch(utcChartOptions([utcTrade("2026-01-04T00:00:00Z", null, 0)]));
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByText("Пока нет дней с закрытыми TP/SL сделками.");
+  expect(screen.queryByRole("img", { name: "Дневное матожидание в рисках" })).not.toBeInTheDocument();
+});
+
+it("keeps both fitted endpoint values in the SVG viewport even when OLS extends outside observed extrema", async () => {
+  stubFetch(utcChartOptions([utcTrade("2026-01-01T12:00:00Z", 0, 0), utcTrade("2026-01-02T12:00:00Z", 1, 1), utcTrade("2026-01-03T12:00:00Z", 1, 2)]));
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByText("Сделок: 3 / 3");
+  const start = screen.getByLabelText("Начало тренда: +0.17R");
+  const end = screen.getByLabelText("Конец тренда: +1.17R");
+  for (const label of [start, end]) {
+    expect(Number(label.getAttribute("y"))).toBeGreaterThan(10); expect(Number(label.getAttribute("y"))).toBeLessThan(224);
+  }
+  expect(start).toHaveAttribute("text-anchor", "start"); expect(end).toHaveAttribute("text-anchor", "end");
+});

@@ -1,5 +1,7 @@
 //! Bounded Telegram relay v1 wire contract. HTTP adapters must reject duplicate auth
 //! headers and bound streamed bodies before buffering; signatures cover raw bytes.
+pub mod v2;
+
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};

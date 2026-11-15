@@ -1,4 +1,5 @@
 pub mod decimal;
+pub mod expectancy;
 pub mod parameter_metadata;
 pub use parameter_metadata::algorithm_fields;
 

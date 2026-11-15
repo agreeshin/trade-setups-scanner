@@ -1,0 +1,38 @@
+{
+  "input": {
+    "source": {
+      "studyId": "utc-parity-study",
+      "derivedSnapshotId": "utc-parity-derived-v2",
+      "generationId": "utc-parity-generation",
+      "profileId": "utc-parity-profile",
+      "provenance": {
+        "algorithmId": "price_volume_spike", "algorithmVersion": "1.1.1", "optimizerVersion": "fixture-only",
+        "seed": 1, "snapshotHash": "frozen-utc-parity-input", "capturedAt": "2026-11-09T12:00:00Z",
+        "fromUnix": 1793534400, "toUnix": 1794225600, "observationCutoff": 1794225600
+      },
+      "direction": "short", "tpPct": 6.0, "slPct": 2.0,
+      "analytics": { "clusterEnabled": true, "clusterGapMinutes": 480, "timeShiftMinutes": 3, "priceChangePct": 1.0, "horizonMinutes": 10080 }
+    },
+    "selectedCell": { "rawR": 1.8444444444444446, "tpCount": 32, "slCount": 13 },
+    "matrixMeanR": 0.21,
+    "daily": {
+      "status": "available",
+      "value": [
+        { "dayStartUnix": 1793491200, "rowCount": 4, "tpCount": 2, "slCount": 2, "meanR": 1.0 },
+        { "dayStartUnix": 1793577600, "rowCount": 3, "tpCount": 0, "slCount": 0, "meanR": null },
+        { "dayStartUnix": 1793664000, "rowCount": 1, "tpCount": 0, "slCount": 1, "meanR": -1.0 },
+        { "dayStartUnix": 1794096000, "rowCount": 40, "tpCount": 30, "slCount": 10, "meanR": 2.0 }
+      ]
+    }
+  },
+  "expected": {
+    "calculationVersion": 2, "timezone": "UTC", "originUnix": 1793491200, "periodDays": 8.0,
+    "dates": ["2026-11-01", "2026-11-02", "2026-11-03", "2026-11-08"],
+    "xUtcDays": [0.0, 1.0, 2.0, 7.0], "dailyMeansR": [1.0, null, -1.0, 2.0],
+    "meanX": 3.0, "meanY": 0.6666666666666666, "slopeRPerDay": 0.23076923076923078,
+    "fittedStartR": -0.02564102564102564, "fittedEndR": 1.5897435897435896, "trendDeltaR": 1.6153846153846154,
+    "rawSignalAt": 1794290400, "rawSignalXUtcDays": 9.25, "forecastR": 2.108974358974359,
+    "endpointLabels": ["-0.03 R", "+1.59 R"], "selectedRawR": 1.8444444444444446, "matrixMeanR": 0.21,
+    "winRatePct": 71.11111111111111
+  }
+}

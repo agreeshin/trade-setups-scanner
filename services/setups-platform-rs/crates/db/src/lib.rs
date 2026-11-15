@@ -10,6 +10,7 @@ pub mod admission;
 pub mod analytics;
 pub mod controls;
 pub mod continuous;
+pub mod expectancy;
 pub mod migrate;
 pub mod optimization;
 pub mod push;
