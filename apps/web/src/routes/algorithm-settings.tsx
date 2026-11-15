@@ -137,9 +137,9 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     </section>
   </form>
     <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
-      <DialogContent id={historyDialogId} tabIndex={-1} className="max-w-5xl" onCloseAutoFocus={(event) => { event.preventDefault(); document.getElementById(historyTriggerId)?.focus(); }}>
+      <DialogContent id={historyDialogId} tabIndex={-1} className="max-w-[96rem]" onCloseAutoFocus={(event) => { event.preventDefault(); document.getElementById(historyTriggerId)?.focus(); }}>
         <DialogHeader><DialogTitle>Все оптимизации · {displayName}</DialogTitle><DialogDescription>Полная история исследований алгоритма. ID открывает сохранённый результат, не закрывая список.</DialogDescription></DialogHeader>
-        <div className="grid min-h-0 min-w-0 gap-4 overflow-y-auto pr-1">
+        <div className="grid min-w-0 gap-4">
           {optimization.error && <Alert variant="destructive" role="alert">{optimization.error}<Button type="button" variant="outline" onClick={optimization.refresh}>Обновить статус оптимизации</Button></Alert>}
           {historyOpen && <OptimizationHistory algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} pageSize={10} active={selectedHistory?.open !== true && selectedDeleteTarget === null} onSelect={selectHistory} onDelete={requestDelete} />}
         </div>

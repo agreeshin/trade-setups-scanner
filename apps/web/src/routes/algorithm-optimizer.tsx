@@ -3,6 +3,7 @@ import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Spinner } from "../components/ui/spinner";
+import { InfoNote } from "../components/ui/info-note";
 import { fetchPlatform } from "../lib/platform-api";
 import { getOptimizationDraft, isActiveStudy, type OptimizationStudyAction } from "../lib/optimization-api";
 import type { CatalogInstrument } from "./instrument-picker";
@@ -78,7 +79,7 @@ function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algori
     draftSave.save(next);
   }
   return <form noValidate onSubmit={(event) => { void submit(event); }} onBlur={saveDraft} className="grid min-w-0 gap-5">
-    <Alert>Исследование изолировано от live, обычных прогонов и кешей. Все выбранные TP×SL-ячейки имеют равный вес; baseline оценивается как trial 0 и входит в бюджет. Открытие и изменение формы ничего не запускают.</Alert>
+    <InfoNote>Исследование изолировано от live, обычных прогонов и кешей. Все выбранные TP×SL-ячейки имеют равный вес; baseline оценивается как trial 0 и входит в бюджет. Открытие и изменение формы ничего не запускают.</InfoNote>
     {!ready && !loadError && <Spinner label="Загрузка historical-списка" />}
     {loadError && <Alert variant="destructive" role="alert">{loadError}<Button type="button" variant="outline" onClick={() => setRevision((value) => value + 1)}>Повторить загрузку</Button></Alert>}
     <OptimizationFields algorithm={algorithm} scope={scope} onScopeChange={change} catalog={catalog} ready={ready} disabled={controller.creating} algorithmDomains={algorithmDomains} onAlgorithmDomainsChange={setAlgorithmDomains} analyticsDomains={analyticsDomains} onAnalyticsDomainsChange={setAnalyticsDomains} />
@@ -111,7 +112,7 @@ export function OptimizationStudyDialog({ id, algorithm, controller, open, onOpe
   return <Dialog open={open} onOpenChange={onOpenChange}>
     <DialogContent className="max-w-4xl" onCloseAutoFocus={(event) => { event.preventDefault(); (document.getElementById(returnFocusId) ?? document.getElementById(fallbackFocusId))?.focus(); }}>
       <DialogHeader><DialogTitle>Исследование #{id} · {algorithmDisplayName(algorithm)}</DialogTitle><DialogDescription>Сохранённое исследование. Просмотр и закрытие окна не меняют серверную работу или настройки.</DialogDescription></DialogHeader>
-      <div className="grid min-h-0 min-w-0 flex-1 gap-4 overflow-y-auto pr-1">
+      <div className="grid min-w-0 gap-4">
         {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
         <StudyDetail detail={detail} algorithm={algorithm} controller={controller} onDelete={onDelete} />
       </div>
@@ -130,7 +131,7 @@ export function AlgorithmOptimizer({ algorithm, controller, open, onOpenChange, 
         <DialogTitle>Оптимизация · {algorithmDisplayName(algorithm)}</DialogTitle>
         <DialogDescription>Серверное исследование Plan A. Закрытие окна не останавливает работу; для остановки нужна отдельная команда.</DialogDescription>
       </DialogHeader>
-      <div className="grid min-h-0 min-w-0 flex-1 gap-4 overflow-y-auto pr-1">
+      <div className="grid min-w-0 gap-4">
         {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
         {!controller.ready && <div className="flex flex-wrap items-center gap-2 text-sm"><span>Проверяем сохранённые исследования. Новый запуск пока недоступен.</span><Button type="button" variant="outline" onClick={controller.refresh}>Обновить статус</Button></div>}
         {controller.active && controller.active.spec.algorithmId !== algorithm.id && <Alert variant="warning">Исследование #{controller.active.id} для {controller.active.spec.algorithmId} уже выполняется. В платформе допускается только одно активное исследование.</Alert>}

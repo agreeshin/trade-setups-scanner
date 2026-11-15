@@ -31,7 +31,7 @@ export function ReplayPreflight({ preview }: { preview: PreflightResponse }) {
           <DialogTitle>Проверенные наборы свечей</DialogTitle>
           <DialogDescription>Результаты предварительной проверки по каждому инструменту. Это снимок на момент проверки; кеш и покрытие могли уже измениться.</DialogDescription>
         </DialogHeader>
-        <div className="grid min-h-0 flex-1 gap-3 overflow-y-auto pr-1">
+        <div className="grid gap-3">
           {preview.results.map((item) => <article key={`${item.exchange}/${item.category}/${item.symbol}`} className="grid gap-2 rounded-md border border-input/80 bg-background/40 p-3 text-sm">
             <h3 className="font-semibold">{item.exchange} / {item.category} / {item.symbol}</h3>
             {item.status === "cached" ? <>

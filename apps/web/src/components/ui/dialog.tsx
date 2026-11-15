@@ -9,19 +9,16 @@ export const DialogTrigger = DialogPrimitive.Trigger;
 export const DialogClose = DialogPrimitive.Close;
 
 export function DialogContent({ className, children, ...props }: DialogContentProps) {
-  React.useEffect(() => () => {
-    document.body.removeAttribute("data-scroll-locked");
-    document.body.style.removeProperty("pointer-events");
-    document.body.style.removeProperty("overflow");
-    document.body.style.removeProperty("padding-right");
-    document.body.style.removeProperty("margin-right");
-  }, []);
   return <DialogPrimitive.Portal>
-    <DialogPrimitive.Overlay data-slot="dialog-overlay" className="fixed inset-0 z-40 bg-black/40 backdrop-blur-[1.5px]" />
-    <DialogPrimitive.Content data-slot="dialog-content" className={cn("fixed left-1/2 top-1/2 z-50 flex max-h-[85dvh] w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 flex-col gap-4 overflow-hidden rounded-xl border border-input/60 bg-card p-5 text-sm shadow-card sm:p-6", className)} {...props}>
+    {/* Each complete layer shares one stacking context; a later overlay blurs earlier dialogs too. */}
+    <DialogPrimitive.Overlay data-slot="dialog-overlay" className="fixed inset-0 z-50 overflow-y-auto bg-black/40 backdrop-blur-[1.5px] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div data-slot="dialog-viewport" className="flex min-h-full items-center justify-center p-4 sm:p-6">
+    <DialogPrimitive.Content data-slot="dialog-content" className={cn("relative flex w-full min-w-0 max-w-lg shrink-0 flex-col gap-4 rounded-xl border border-input/60 bg-card p-5 text-sm shadow-card sm:p-6", className)} {...props}>
       {children}
       <DialogPrimitive.Close aria-label="Закрыть" className="absolute right-3 top-3 inline-flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">✕</DialogPrimitive.Close>
     </DialogPrimitive.Content>
+    </div>
+    </DialogPrimitive.Overlay>
   </DialogPrimitive.Portal>;
 }
 

@@ -244,7 +244,7 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="max-w-4xl">
         <DialogHeader><DialogTitle>Непрерывное исследование · {algorithmDisplayName(algorithm)}</DialogTitle><DialogDescription>Метаданные и домены как в ручной оптимизации. Даты и зрелость первого сетапа фиксирует сервер.</DialogDescription></DialogHeader>
-        <div className="grid min-h-0 min-w-0 gap-4 overflow-y-auto pr-1">{open && <ContinuousForm algorithm={algorithm} controller={controller} onSaved={() => setOpen(false)} />}</div>
+        <div className="grid min-w-0 gap-4">{open && <ContinuousForm algorithm={algorithm} controller={controller} onSaved={() => setOpen(false)} />}</div>
       </DialogContent>
     </Dialog>
   </section>;

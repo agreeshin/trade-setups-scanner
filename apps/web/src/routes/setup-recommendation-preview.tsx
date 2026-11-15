@@ -36,7 +36,7 @@ export function SetupRecommendationDialog({ selection, onClose, onRestoreFocus }
   return <Dialog open={active} onOpenChange={(next) => { if (!next) onClose(); }}>
     <DialogContent className="max-w-xl" onCloseAutoFocus={(event) => { event.preventDefault(); if (active) onRestoreFocus(); }}>
       <DialogHeader><DialogTitle>Условия сетапа <code className="font-mono">{selection.setup.symbol}</code></DialogTitle><DialogDescription>{description(result.entryState === "elapsed")}</DialogDescription></DialogHeader>
-      <div className="grid min-h-0 gap-3 overflow-y-auto pr-1">
+      <div className="grid gap-3">
         <pre className="whitespace-pre-wrap break-words font-sans text-sm"><RecommendationText segments={result.segments} /></pre>
         <p className="text-xs text-muted-foreground">Сохранённое исследование #<code className="font-mono">{snapshot.studyId}</code> · поколение #<code className="font-mono">{snapshot.generationId}</code>. Рекомендация не меняется вслед за новым исследованием или переименованием.</p>
       </div>
