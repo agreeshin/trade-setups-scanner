@@ -24,7 +24,8 @@ it("links a mobile-first/right-desktop sidebar to retained, accessible panels", 
   expect(document.getElementById(first.getAttribute("aria-controls")!)).toBe(screen.getByRole("tabpanel", { name: "Первый" }));
   const layout = container.querySelector('[data-slot="page-sidebar-layout"]')!;
   expect(layout.firstElementChild).toHaveAttribute("data-slot", "page-sidebar");
-  expect(layout.firstElementChild).toHaveClass("md:col-start-2");
+  expect(layout.firstElementChild).toHaveClass("md:fixed", "md:right-0", "md:inset-y-0", "rounded-none", "md:bg-card");
+  expect(layout).not.toHaveClass("md:grid-cols-[minmax(0,1fr)_14rem]");
   await userEvent.click(screen.getByRole("tab", { name: "Второй" }));
   expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
   expect(draft).not.toBeVisible();

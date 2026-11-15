@@ -1,4 +1,4 @@
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useLayoutEffect, useRef, type ReactNode } from "react";
 import { ThemeSelect } from "./theme-select";
 
 export function AppSurface({ children }: { children: ReactNode }) {
@@ -18,8 +18,21 @@ export function SessionSlot() {
 }
 
 export function AppFrame({ navigation, status, children }: { navigation: ReactNode; status: ReactNode; children: ReactNode }) {
-  return <div className="flex flex-col">
-    <header className="sticky top-0 z-20 border-b border-input/60 bg-background">
+  const frame = useRef<HTMLDivElement>(null);
+  const header = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    const update = () => {
+      const height = header.current?.getBoundingClientRect().height;
+      if (height) frame.current?.style.setProperty("--app-header-height", `${height}px`);
+    };
+    update();
+    if (typeof ResizeObserver === "undefined" || !header.current) return;
+    const observer = new ResizeObserver(update);
+    observer.observe(header.current);
+    return () => observer.disconnect();
+  }, []);
+  return <div ref={frame} data-slot="app-frame" className="flex flex-col">
+    <header ref={header} className="sticky top-0 z-20 border-b border-input/60 bg-background">
       <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5 sm:px-6">
         <span className="flex items-center gap-2.5 font-semibold tracking-tight">
           <span aria-hidden="true" className="size-3.5 rounded-full border-2 border-primary" />
@@ -33,7 +46,7 @@ export function AppFrame({ navigation, status, children }: { navigation: ReactNo
         </div>
       </div>
     </header>
-    <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6 sm:py-8">
+    <main data-slot="app-main" className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6 sm:py-8">
       <div data-slot="page-card" className="rounded-xl border border-input/60 bg-card p-5 sm:p-8">{children}</div>
     </main>
   </div>;

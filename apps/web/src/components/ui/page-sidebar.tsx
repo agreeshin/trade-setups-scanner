@@ -19,9 +19,9 @@ export function PageSidebar<T extends string>({ label, items, value, onValueChan
     setVisitState(acceptedVisitState);
   }
   return <SidebarContext.Provider value={{ id, selected: value, visited: acceptedVisitState.visited }}>
-    <div data-slot="page-sidebar-layout" className={items.length ? "grid min-w-0 gap-6 md:grid-cols-[minmax(0,1fr)_14rem]" : "min-w-0"}>
-      {items.length > 0 && <aside data-slot="page-sidebar" className="min-w-0 border-b border-input/60 pb-4 md:col-start-2 md:row-start-1 md:border-b-0 md:border-l md:pb-0 md:pl-5">
-        <div role="tablist" aria-label={label} aria-orientation="vertical" className="grid gap-1 md:sticky md:top-24">
+    <div data-slot="page-sidebar-layout" className={items.length ? "grid min-w-0 gap-6" : "min-w-0"}>
+      {items.length > 0 && <aside data-slot="page-sidebar" className="min-w-0 rounded-none border-b border-input/60 pb-4 md:fixed md:inset-y-0 md:right-0 md:z-10 md:w-56 md:overflow-y-auto md:border-b-0 md:border-l md:bg-card md:px-4 md:pb-6 md:pt-[calc(var(--app-header-height,5rem)+1rem)]">
+        <div role="tablist" aria-label={label} aria-orientation="vertical" className="grid gap-1">
           {items.map((item, index) => <Button key={item.id} type="button" variant="navigation" role="tab"
             id={`${id}-tab-${item.id}`} aria-controls={`${id}-panel-${item.id}`} aria-selected={value === item.id}
             aria-label={item.label} aria-describedby={item.status ? `${id}-status-${item.id}` : undefined}
@@ -41,7 +41,7 @@ export function PageSidebar<T extends string>({ label, items, value, onValueChan
           </Button>)}
         </div>
       </aside>}
-      <div data-slot="page-sidebar-content" className="grid min-w-0 content-start gap-6 md:col-start-1 md:row-start-1">{children}</div>
+      <div data-slot="page-sidebar-content" className="grid min-w-0 content-start gap-6">{children}</div>
     </div>
   </SidebarContext.Provider>;
 }
