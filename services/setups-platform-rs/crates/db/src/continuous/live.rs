@@ -113,6 +113,9 @@ pub struct WarmupLease {
     pub initialization: LiveInitialization,
     pub attempt: i32,
     pub attempt_deadline_unix: i64,
+    /// Conservative monotonic expiry confirmed by the claim transaction. Not a
+    /// new TTL from supervisor startup (which can be delayed by the data plane).
+    pub lease_valid_until: std::time::Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -185,14 +188,30 @@ pub enum WarmupRenewal {Renewed,Rejected}
 /// NOT queue behind the data plane's owner/process/slot locks. The only write
 /// lock is the fenced global lane, ordered before any generation mutation.
 pub async fn renew_pending_warmup(pool:&PgPool,fence:&WarmupLease)->Result<WarmupRenewal,DbError> {
+    Ok(if renew_pending_warmup_until(pool,fence).await?.is_some() {WarmupRenewal::Renewed}else{WarmupRenewal::Rejected})
+}
+
+/// Only a confirmed COMMIT earns lease credit. Anchor the server's remaining
+/// time BEFORE I/O, conservatively charging acquisition/query/commit latency;
+/// a delayed response must never manufacture a fresh 30s lease on receipt.
+/// The UPDATE locks only the lane row; all generation/process/slot/settings
+/// predicates are ordinary MVCC reads, NOT their report/promotion lock paths.
+pub async fn renew_pending_warmup_until(pool:&PgPool,fence:&WarmupLease)->Result<Option<std::time::Instant>,DbError> {
+    let started=std::time::Instant::now();
     let mut tx=pool.begin().await?;
-    control_timeouts(&mut tx).await?;
-    let renewed=sqlx::query("update adaptive_live_warmup_lane w set lease_until=least(clock_timestamp()+$5::bigint*interval '1 second',g.live_init_deadline) from continuous_generations g,continuous_slots s,continuous_processes p where w.id=1 and w.slot_id=$1 and w.generation_id=$2 and w.lease_owner=$3 and w.lease_token=$4 and w.lease_until>clock_timestamp() and g.id=w.generation_id and g.live_init_deadline>clock_timestamp() and g.live_init_status='running' and g.live_init_attempts=$6 and g.status='completed' and g.accepted and s.id=w.slot_id and s.pending_generation_id=g.id and s.enabled and p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id and p.desired_running and p.config_revision=g.config_revision and p.config_revision=$7 and p.owner_id=$8 and p.algorithm_id=$9 and p.config->'adaptiveEnabled'='true'::jsonb and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb)")
+    sqlx::query("select set_config('lock_timeout','500ms',true),set_config('statement_timeout','750ms',true)")
+        .execute(&mut *tx).await?;
+    // Lock ONLY the lane before testing wall-clock predicates. PostgreSQL may
+    // evaluate UPDATE's WHERE before waiting on an unchanged locked tuple;
+    // without this step a lease expiring during that wait could be resurrected.
+    sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update")
+        .execute(&mut *tx).await?;
+    let remaining:Option<i64>=sqlx::query_scalar("update adaptive_live_warmup_lane w set lease_until=least(clock_timestamp()+$5::bigint*interval '1 second',g.live_init_deadline) from continuous_generations g,continuous_slots s,continuous_processes p where w.id=1 and w.slot_id=$1 and w.generation_id=$2 and w.lease_owner=$3 and w.lease_token=$4 and w.lease_until>clock_timestamp() and g.id=w.generation_id and g.live_init_deadline>clock_timestamp() and g.live_init_status='running' and g.live_init_attempts=$6 and g.status='completed' and g.accepted and s.id=w.slot_id and s.pending_generation_id=g.id and s.enabled and p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id and p.desired_running and p.config_revision=g.config_revision and p.config_revision=$7 and p.owner_id=$8 and p.algorithm_id=$9 and p.config->'adaptiveEnabled'='true'::jsonb and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb) returning floor(extract(epoch from (w.lease_until-clock_timestamp()))*1000)::bigint")
         .bind(fence.slot_id).bind(fence.generation_id).bind(&fence.worker).bind(fence.token).bind(WARMUP_LEASE_SECONDS)
         .bind(fence.attempt).bind(fence.config_revision).bind(&fence.owner_id).bind(&fence.algorithm_id)
-        .execute(&mut *tx).await?.rows_affected()==1;
+        .fetch_optional(&mut *tx).await?;
     tx.commit().await?;
-    Ok(if renewed {WarmupRenewal::Renewed}else{WarmupRenewal::Rejected})
+    Ok(remaining.map(|ms|started+std::time::Duration::from_millis(ms.max(0) as u64)))
 }
 async fn control_timeouts(tx:&mut Transaction<'_,Postgres>)->Result<(),DbError> {
     sqlx::query("select set_config('lock_timeout','1000',true),set_config('statement_timeout','2000',true)")
@@ -245,7 +264,7 @@ pub async fn claim_pending_warmup_with_budget(pool: &PgPool, pending: &PendingAd
     let initialization = p.live_initialization.clone().map(Ok).unwrap_or_else(|| initialization_at(p,anchor_close_unix))?;
     let mut fence = WarmupLease {owner_id:p.owner_id.clone(),algorithm_id:p.algorithm_id.clone(),slot_id:p.slot_id,
         generation_id:p.generation_id,config_revision:p.config_revision,worker:worker.into(),token:0,
-        initialization,attempt:0,attempt_deadline_unix:0};
+        initialization,attempt:0,attempt_deadline_unix:0,lease_valid_until:std::time::Instant::now()};
     let mut tx = pool.begin().await?;
     if !lock_pending(&mut tx,&fence).await? { return Ok(None); }
     // Process -> slot -> global lane -> generation: no long reads under locks.
@@ -253,6 +272,7 @@ pub async fn claim_pending_warmup_with_budget(pool: &PgPool, pending: &PendingAd
     let eligible: bool = sqlx::query_scalar("select exists(select 1 from continuous_generations g where id=$1 and status='completed' and accepted=true and live_init_attempts<live_init_attempt_limit and live_init_status is distinct from 'exhausted' and live_init_status is distinct from 'superseded' and (live_init_next_attempt_at is null or live_init_next_attempt_at<=clock_timestamp()) and not exists(select 1 from continuous_generations newer where newer.owner_id=g.owner_id and newer.algorithm_id=g.algorithm_id and newer.slot_id=g.slot_id and newer.config_revision=g.config_revision and newer.status='completed' and newer.id>g.id))")
         .bind(p.generation_id).fetch_one(&mut *tx).await?;
     if !eligible { return Ok(None); }
+    fence.lease_valid_until=std::time::Instant::now()+std::time::Duration::from_secs(WARMUP_LEASE_SECONDS as u64);
     let token: Option<i64> = sqlx::query_scalar("update adaptive_live_warmup_lane set slot_id=$1,generation_id=$2,lease_owner=$3,lease_token=lease_token+1,lease_until=clock_timestamp()+$4::bigint*interval '1 second' where id=1 and (lease_owner is null or lease_until<=clock_timestamp()) returning lease_token")
         .bind(p.slot_id).bind(p.generation_id).bind(worker).bind(WARMUP_LEASE_SECONDS).fetch_optional(&mut *tx).await?;
     let Some(token) = token else { return Ok(None); };

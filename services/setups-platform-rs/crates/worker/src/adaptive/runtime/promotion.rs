@@ -128,7 +128,8 @@ mod tests {
         let lease=live::WarmupLease {owner_id:"admin".into(),algorithm_id:"price_volume_spike".into(),slot_id:slot,
             generation_id:generations[1],config_revision:1,worker:"fixture".into(),token:42,
             initialization:live::LiveInitialization {version:1,anchor_close_unix:180,detector_from_open_unix:0,emit_from_close_unix:240},
-            attempt:1,attempt_deadline_unix:chrono::Utc::now().timestamp()+3600};
+            attempt:1,attempt_deadline_unix:chrono::Utc::now().timestamp()+3600,
+            lease_valid_until:Instant::now()+Duration::from_secs(30)};
         sqlx::query("update continuous_slots set active_generation_id=$2,pending_generation_id=$3,pending_status='ready',readiness_frontier=180 where id=$1")
             .bind(slot).bind(generations[0]).bind(generations[1]).execute(&pool).await.unwrap();
         sqlx::query("update adaptive_live_warmup_lane set slot_id=$1,generation_id=$2,lease_owner='fixture',lease_token=42,lease_until=now()+interval '30 seconds' where id=1")

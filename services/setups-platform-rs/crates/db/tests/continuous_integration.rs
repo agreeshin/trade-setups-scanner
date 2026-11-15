@@ -1091,18 +1091,71 @@ async fn independent_heartbeat_survives_slow_tick_owner_row_locks_and_saturated_
         sqlx::query("select id from continuous_slots where id=$1 for update").bind(old.slot_id).execute(&mut *held).await.unwrap();
         let a=pool.acquire().await.unwrap();let b=pool.acquire().await.unwrap();let c=pool.acquire().await.unwrap();
         let beating=async {
-            for _ in 0..6 {
+            for _ in 0..30 {
                 assert_eq!(tokio::time::timeout(Duration::from_millis(300),renew_pending_warmup(&control,&fence)).await.unwrap().unwrap(),WarmupRenewal::Renewed);
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         };
-        tokio::join!(beating,tokio::time::sleep(Duration::from_millis(1100)));
+        tokio::join!(beating,tokio::time::sleep(Duration::from_secs(6)));
         drop((a,b,c));held.rollback().await.unwrap();
         assert_eq!(recover_pending_warmups(&pool,OWNER).await.unwrap(),0,"renewed slow successful tick must not reap itself");
         assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(live_init_deadline) from continuous_generations where id=$1")
             .bind(fence.generation_id).fetch_one(&pool).await.unwrap(),deadline,"heartbeats never extend the fixed attempt deadline");
         assert_eq!(db::active_adaptive_slots(&pool,OWNER).await.unwrap()[0].generation_id,old.generation_id);
+        assert_eq!(sqlx::query_scalar::<_,i32>("select live_init_attempts from continuous_generations where id=$1")
+            .bind(fence.generation_id).fetch_one(&pool).await.unwrap(),1,"held data-plane locks must not consume another attempt");
         assert!(release_pending_warmup(&pool,&fence).await.unwrap());control.close().await;
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn heartbeat_rechecks_expiry_after_lane_lock_wait_without_resurrecting_the_claim() {
+    use db::live::*;
+    isolated(|pool|async move {
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        let old=accepted(&pool).await;let pending=pending_fixture(&pool,&old).await;
+        let fence=claim_pending_warmup_at(&pool,&pending,"expiry-during-renewal",CUTOFF).await.unwrap().unwrap();
+        sqlx::query("update adaptive_live_warmup_lane set lease_until=clock_timestamp()+interval '200 milliseconds'")
+            .execute(&pool).await.unwrap();
+        let mut held=pool.begin().await.unwrap();
+        sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update").execute(&mut *held).await.unwrap();
+        let (renewal,())=tokio::join!(renew_pending_warmup_until(&pool,&fence),async {
+            tokio::time::sleep(Duration::from_millis(300)).await;held.rollback().await.unwrap();
+        });
+        assert!(renewal.unwrap().is_none(),"expiry must be checked AFTER acquiring the lane row lock");
+        assert_eq!(recover_pending_warmups(&pool,OWNER).await.unwrap(),1);
+        assert_eq!(db::active_adaptive_slots(&pool,OWNER).await.unwrap()[0].generation_id,old.generation_id);
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn heartbeat_statement_cancels_are_short_retryable_and_do_not_spend_attempts_or_extend_credit() {
+    use db::live::*;
+    isolated(|pool|async move {
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        let old=accepted(&pool).await;let pending=pending_fixture(&pool,&old).await;
+        let fence=claim_pending_warmup_at(&pool,&pending,"statement-cancel-storm",CUTOFF).await.unwrap().unwrap();
+        let before:Value=sqlx::query_scalar("select to_jsonb(lease_until) from adaptive_live_warmup_lane").fetch_one(&pool).await.unwrap();
+        sqlx::raw_sql("create function slow_warmup_renewal() returns trigger language plpgsql as $$begin perform pg_sleep(2); return new; end$$; create trigger slow_warmup_renewal before update of lease_until on adaptive_live_warmup_lane for each row execute function slow_warmup_renewal();")
+            .execute(&pool).await.unwrap();
+        for _ in 0..3 {
+            let started=std::time::Instant::now();
+            let error=renew_pending_warmup_until(&pool,&fence).await.unwrap_err();
+            assert_eq!(setups_db::diagnostics::db_error_code(&error),"statement_timeout_or_cancel");
+            assert!(started.elapsed()<Duration::from_millis(1500),"heartbeat statement timeout must be sub-second, below the 3s I/O budget");
+        }
+        assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(lease_until) from adaptive_live_warmup_lane").fetch_one(&pool).await.unwrap(),before);
+        sqlx::query("drop trigger slow_warmup_renewal on adaptive_live_warmup_lane").execute(&pool).await.unwrap();
+        let started=std::time::Instant::now();
+        let until=renew_pending_warmup_until(&pool,&fence).await.unwrap().unwrap();
+        assert!(until<=started+Duration::from_secs(30),"latency cannot manufacture extra lease credit");
+        assert!(until>std::time::Instant::now()+Duration::from_secs(25));
+        assert_eq!(sqlx::query_scalar::<_,i32>("select live_init_attempts from continuous_generations where id=$1").bind(fence.generation_id).fetch_one(&pool).await.unwrap(),1);
+        assert_eq!(recover_pending_warmups(&pool,OWNER).await.unwrap(),0);
+        assert_eq!(db::active_adaptive_slots(&pool,OWNER).await.unwrap()[0].generation_id,old.generation_id);
+        assert!(release_pending_warmup(&pool,&fence).await.unwrap());
     }).await;
 }
 

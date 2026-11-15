@@ -850,7 +850,8 @@ mod tests {
         let candidate_key=candidate.key();let incumbent_key=f.spec.key();
         let lease=live::WarmupLease {owner_id:f.spec.fence.owner_id.clone(),algorithm_id:f.spec.fence.algorithm_id.clone(),slot_id:1,
             generation_id:2,config_revision:1,worker:"owned-drain".into(),token:1,attempt:1,attempt_deadline_unix:chrono::Utc::now().timestamp()+21600,
-            initialization:live::LiveInitialization {version:1,anchor_close_unix:f.frontier,detector_from_open_unix:0,emit_from_close_unix:f.frontier+60}};
+            initialization:live::LiveInitialization {version:1,anchor_close_unix:f.frontier,detector_from_open_unix:0,emit_from_close_unix:f.frontier+60},
+            lease_valid_until:Instant::now()+Duration::from_secs(30)};
         let profile=ActiveAdaptiveSlot {owner_id:lease.owner_id.clone(),algorithm_id:lease.algorithm_id.clone(),slot_id:1,generation_id:2,study_id:2,
             config_revision:1,min_setups_per_day:0.0,spec:json!({}),result:json!({}),params:json!({}),analytics:json!({}),selected_cell:json!({}),
             mean_expectancy:0.21,direction:"short".into(),external_name:"fixture".into(),live_initialization:Some(lease.initialization.clone()),live_readiness:Vec::new()};
