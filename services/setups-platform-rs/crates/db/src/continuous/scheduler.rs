@@ -207,7 +207,7 @@ pub async fn prepare_next(pool: &PgPool, lease: &OwnerLease) -> Result<Option<Ch
     sqlx::query("update continuous_generations set study_id=$2 where id=$1").bind(generation_id).bind(study_id).execute(&mut *tx).await?;
     sqlx::query("update continuous_processes set status='running',active_generation_id=$3,active_study_id=$4,phase='acquiring',error=null,updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(&lease.owner_id).bind(&algorithm).bind(generation_id).bind(study_id).execute(&mut *tx).await?;
-    sqlx::query("update continuous_slots set status='acquiring',study_id=$2,updated_at=now() where id=$1").bind(slot_id).bind(study_id).execute(&mut *tx).await?;
+    sqlx::query("update continuous_slots set status='acquiring',updated_at=now() where id=$1").bind(slot_id).execute(&mut *tx).await?;
     sqlx::query("update continuous_owner_lanes set last_algorithm_id=$2 where owner_id=$1").bind(&lease.owner_id).bind(&algorithm).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(Some(ChainJob{lease:lease.clone(),algorithm_id:algorithm,generation_id,slot_id,study_id,config_revision:revision,observation_cutoff:cutoff,config,spec,execution_started_at:start,research_deadline:Some(deadline)}))
@@ -327,12 +327,34 @@ pub async fn load_replay(pool: &PgPool, job: &ChainJob, max_bytes: usize) -> Res
 }
 
 pub async fn finalize(pool: &PgPool, job: &ChainJob, result: &Value, accepted: bool, mean: Option<f64>, selected: Option<&Value>) -> Result<bool,DbError> {
+    let started=std::time::Instant::now();
+    crate::diagnostics::emit(crate::diagnostics::Level::Info,"continuous_finalization_started",finalization_diagnostics(job,accepted,started));
+    let outcome=finalize_inner(pool,job,result,accepted,mean,selected).await;
+    if !matches!(outcome,Ok(true)) {
+        let mut fields=finalization_diagnostics(job,accepted,started);
+        fields["outcome"]=if outcome.is_err(){"error"}else{"rejected_fence"}.into();
+        if let Err(error)=&outcome {fields["error_code"]=crate::diagnostics::db_error_code(error).into();}
+        crate::diagnostics::emit(if outcome.is_err(){crate::diagnostics::Level::Error}else{crate::diagnostics::Level::Warn},"continuous_finalization_finished",fields);
+    }
+    outcome
+}
+fn finalization_diagnostics(job:&ChainJob,accepted:bool,started:std::time::Instant)->Value {
+    json!({"runtime_instance":job.lease.worker,"slot_id":job.slot_id,"generation_id":job.generation_id,
+        "study_id":job.study_id,"algorithm_id":job.algorithm_id,"config_revision":job.config_revision,
+        "lease_token":job.lease.token,"accepted":accepted,"stage":"finalization","duration_ms":started.elapsed().as_millis() as u64})
+}
+async fn finalize_inner(pool: &PgPool, job: &ChainJob, result: &Value, accepted: bool, mean: Option<f64>, selected: Option<&Value>) -> Result<bool,DbError> {
+    let started=std::time::Instant::now();
     let mut tx=pool.begin().await?;
     // A lost response may retry finalization, including after a newer owner won.
     // An exact already-completed result acknowledges success without any writes.
     let completed:bool=sqlx::query_scalar("select exists(select 1 from continuous_generations where id=$1 and owner_id=$2 and config_revision=$3 and status='completed' and result=$4 and accepted=$5)")
         .bind(job.generation_id).bind(&job.lease.owner_id).bind(job.config_revision).bind(result).bind(accepted).fetch_one(&mut *tx).await?;
-    if completed {return Ok(true);}
+    if completed {
+        let mut fields=finalization_diagnostics(job,accepted,started);fields["outcome"]="already_completed".into();
+        crate::diagnostics::emit(crate::diagnostics::Level::Debug,"continuous_finalization_finished",fields);
+        return Ok(true);
+    }
     if !fenced(&mut tx,job).await? { return Ok(false); }
     // Process -> slot, like scan commit and promotion. No market/CPU work here.
     sqlx::query("select owner_id from continuous_processes where owner_id=$1 and algorithm_id=$2 for update")
@@ -364,6 +386,8 @@ pub async fn finalize(pool: &PgPool, job: &ChainJob, result: &Value, accepted: b
     sqlx::query("delete from continuous_runtime_artifacts where generation_id=$1").bind(job.generation_id).execute(&mut *tx).await?;
     if !owns(&mut tx,&job.lease).await? {return Ok(false);}
     tx.commit().await?;
+    let mut fields=finalization_diagnostics(job,accepted,started);fields["outcome"]="finalized".into();
+    crate::diagnostics::emit(crate::diagnostics::Level::Info,"continuous_finalization_finished",fields);
     Ok(true)
 }
 

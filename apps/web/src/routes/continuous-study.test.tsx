@@ -83,7 +83,8 @@ function profileController(patch: Partial<ContinuousSlot> = {}, processPatch: Pa
   const controller: ContinuousController = {
     process: { ownerId: "admin", algorithmId: "future", status: "running", configRevision: 1,
       config: { lookbackDays: 30, minSetupsPerDay: [4], minMeanExpectancy: 0.15, adaptiveEnabled: true, study: spec }, activeStudyId: null, phase: "queued", error: null,
-      slots: [{ id: 1, minSetupsPerDay: 4, status: "warming", activeGenerationId: 7, studyId: 42, meanExpectancy: 0.21,
+      slots: [{ id: 1, minSetupsPerDay: 4, status: "warming", activeGenerationId: 7, studyId: 42,
+        runningStudyId: null, finalizedGenerationId: 8, activeStudyId: 41, pendingStudyId: null, meanExpectancy: 0.21,
         selectedCell: { tpPct: 14, slPct: 4, rawR: 0.32, meanR: 0.21, robustScore: 0.01 }, updatedAt: "2026-11-12T12:00:00Z", ...patch }], ...processPatch },
     available: true, loading: false, error: null, busy: null, revision: 0,
     refresh: vi.fn(), save: vi.fn(() => Promise.resolve(true)), start: vi.fn(() => Promise.resolve(true)), stop: vi.fn(() => Promise.resolve(true)),
@@ -200,7 +201,7 @@ it("updates readiness as waiting instruments join the same generation without in
   expect(requests).toHaveLength(0);
 });
 it("labels configured profiles separately from research history and marks cleared results without deleting the slot", () => {
-  render(profileView({ status: "stopped", activeGenerationId: null, activeStatus: "inactive", studyId: null, meanExpectancy: null, selectedCell: null,
+  render(profileView({ status: "stopped", activeGenerationId: null, activeStatus: "inactive", studyId: null, finalizedGenerationId: null, meanExpectancy: null, selectedCell: null,
     pendingGenerationId: null, pendingStatus: null, readinessFrontier: null, pendingError: null, liveWatermark: null }));
   expect(screen.getByRole("heading", { name: "Настроенные адаптивные профили" })).toBeInTheDocument();
   const table = within(screen.getByRole("table", { name: "Настроенные адаптивные профили · Мой алгоритм" }));
@@ -209,6 +210,40 @@ it("labels configured profiles separately from research history and marks cleare
   expect(table.getByRole("columnheader", { name: "Изменение состояния профиля" })).toBeInTheDocument();
   expect(screen.getByText(/не дата исследования/)).toBeInTheDocument();
   expect(requests).toHaveLength(0);
+});
+it("keeps finalized and incumbent provenance while new research starts, completes only its search, and fails downstream", () => {
+  const saved = { finalizedGenerationId: 8, studyId: 42, activeStudyId: 41, activeStatus: "active" as const,
+    pendingGenerationId: 8, pendingStudyId: 42, pendingStatus: "warming" };
+  const view = render(profileView({ ...saved, runningStudyId: 43, status: "acquiring" }));
+  const research = () => within(screen.getByRole("cell", { name: /Сохранённое исследование #42/ }));
+  const unchanged = () => {
+    expect(research().getByText("Сохранённое исследование #42")).toBeInTheDocument();
+    expect(research().getByText("Полностью завершённое поколение #8")).toBeInTheDocument();
+    expect(screen.queryByText("Сохранённое исследование #43")).not.toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: /Действующее поколение #7/ })).toHaveTextContent("Источник метрик и рекомендации: исследование #41 · поколение #7");
+    expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Исследование кандидата #42");
+    expect(screen.getByText("SHORT · TP 14% / SL 4% · 0.32 R")).toBeInTheDocument();
+  };
+  expect(research().getByText("Идёт исследование #43")).toBeInTheDocument(); unchanged();
+  view.rerender(profileView({ ...saved, runningStudyId: 43, status: "analytics" }));
+  expect(research().getByText("Идёт исследование #43")).toBeInTheDocument(); unchanged();
+  view.rerender(profileView({ ...saved, runningStudyId: null, status: "error" }));
+  expect(screen.queryByText("Идёт исследование #43")).not.toBeInTheDocument(); unchanged();
+  expect(requests).toHaveLength(0);
+});
+it("does not call an unfinalized first research or an ambiguous legacy binding a saved result", () => {
+  const view = render(profileView({ runningStudyId: 26, finalizedGenerationId: null, studyId: null,
+    activeGenerationId: null, activeStudyId: null, pendingGenerationId: null, pendingStatus: null,
+    meanExpectancy: null, selectedCell: null, status: "acquiring" }));
+  expect(screen.getByText("Идёт исследование #26")).toBeInTheDocument();
+  expect(screen.queryByText("Сохранённое исследование #26")).not.toBeInTheDocument();
+  const legacy = profileController({ studyId: 26 });
+  if (!legacy.process?.slots[0]) throw new Error("Expected legacy slot");
+  delete legacy.process.slots[0].finalizedGenerationId;
+  delete legacy.process.slots[0].runningStudyId;
+  view.rerender(<ContinuousResearch algorithm={algorithm} controller={legacy} />);
+  expect(screen.getByText("Происхождение сохранённого результата неизвестно (старый API)")).toBeInTheDocument();
+  expect(screen.queryByText("Сохранённое исследование #26")).not.toBeInTheDocument();
 });
 it("separates successful research, incumbent live and the warming candidate without relabelling its study as the incumbent", () => {
   render(profileView({ activeStatus: "active", pendingGenerationId: 8, pendingStatus: "warming", readinessFrontier: null, pendingError: null, liveWatermark: closedBoundary }));

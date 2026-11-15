@@ -43,10 +43,12 @@ pub(super) struct PgPromotion<'a> {
     pub initial:&'a[live::InitialAdaptiveCheckpoint],
     pub waiting:&'a[live::WaitingInstrument],
     pub retired:&'a[live::WaitingInstrument],
+    pub supervision:Option<&'a supervision::Permit>,
 }
 impl PromotionStore for PgPromotion<'_> {
     async fn attempt(&self)->Result<bool,WorkerError> {
-        Ok(live::promote_pending_with_dispositions(self.pool,self.lease,self.predecessor,self.expected,self.frontier,self.initial,self.waiting,self.retired).await?)
+        Ok(live::promote_pending_with_dispositions_guarded(self.pool,self.lease,self.predecessor,self.expected,self.frontier,self.initial,self.waiting,self.retired,
+            ||self.supervision.is_none_or(supervision::Permit::current)).await?)
     }
     async fn reread(&self)->Result<Durable,WorkerError> {
         let mut tx=self.pool.begin().await?;
@@ -139,7 +141,7 @@ mod tests {
             live::CheckpointExpectation {instrument_key:"test/linear/WAITUSDT".into(),checkpoint:None}];
         let initial=vec![live::InitialAdaptiveCheckpoint {instrument_key:key.into(),state:state(generations[1])}];
         let waiting=vec![live::WaitingInstrument {instrument_key:"test/linear/WAITUSDT".into(),reason:"insufficient_history".into()}];
-        let pg=PgPromotion {pool:&pool,lease:&lease,predecessor:Some(generations[0]),expected:&expected,frontier:180,initial:&initial,waiting:&waiting,retired:&[]};
+        let pg=PgPromotion {pool:&pool,lease:&lease,predecessor:Some(generations[0]),expected:&expected,frontier:180,initial:&initial,waiting:&waiting,retired:&[],supervision:None};
         assert_eq!(pg.reread().await.unwrap(),Durable::Predecessor);
         struct LostReply<'a>(PgPromotion<'a>,AtomicUsize);
         impl PromotionStore for LostReply<'_> {

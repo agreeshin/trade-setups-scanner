@@ -37,6 +37,8 @@ pub enum WorkerError {
     Source(String),
     PageLimitExceeded(usize),
     Json(String),
+    WarmupFailure {cause:Box<WorkerError>,report:adaptive::WarmupFailureReportOutcome},
+    WarmupControl(adaptive::WarmupControlOutcome),
 }
 
 impl fmt::Display for WorkerError {
@@ -49,11 +51,17 @@ impl fmt::Display for WorkerError {
                 write!(f, "replay source exceeded page limit: {size}")
             }
             WorkerError::Json(message) => write!(f, "json error: {message}"),
+            WorkerError::WarmupFailure {cause,report} => write!(f,"{cause}; warmup failure report: {report:?}"),
+            WorkerError::WarmupControl(outcome)=>write!(f,"warmup supervision lost: {outcome:?}"),
         }
     }
 }
 
-impl std::error::Error for WorkerError {}
+impl std::error::Error for WorkerError {
+    fn source(&self)->Option<&(dyn std::error::Error+'static)> {
+        match self {Self::WarmupFailure {cause,..}=>Some(cause.as_ref()),Self::Db(error)=>Some(error),_=>None}
+    }
+}
 
 impl From<DbError> for WorkerError {
     fn from(error: DbError) -> Self {

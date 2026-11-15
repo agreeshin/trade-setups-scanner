@@ -19,6 +19,9 @@ mod promotion;
 mod text;
 mod caption;
 mod enrichment;
+mod diagnostics;
+mod supervision;
+use setups_db::diagnostics::{self as lifecycle,Level};
 use profile::{LiveProfile,RecommendationEnvelope};
 pub use store::PgAdaptiveStore;
 pub use text::recommendation_message;
@@ -68,6 +71,7 @@ fn preparation_source_ready<'a>(state:&AdaptiveRuntime,plans:impl Iterator<Item=
 struct Warmup {
     pending:live::PendingAdaptiveSlot,
     lease:live::WarmupLease,
+    supervisor:supervision::Supervisor,
     plans:Vec<SymbolPlan>,
     candidate_key:String,
     cohort:BTreeSet<String>,
@@ -85,11 +89,12 @@ pub struct AdaptiveLiveRuntime {
     join_cursor:usize,
     peak_staging_epochs:usize,
     preparation:crate::preparation::Preparation,
+    diagnostic_summary_at:Instant,
 }
 impl AdaptiveLiveRuntime {
     pub fn new(limits:AdaptiveRuntimeLimits)->Self {
         Self {state:AdaptiveRuntime::new(limits),warmup:None,
-            worker:format!("adaptive-live-{}",std::process::id()),next_pending:0,cold_schedule:schedule::ColdSchedule::default(),join_cursor:0,peak_staging_epochs:0,preparation:Default::default()}
+            worker:format!("adaptive-live-{}-{:016x}",std::process::id(),rand::random::<u64>()),next_pending:0,cold_schedule:schedule::ColdSchedule::default(),join_cursor:0,peak_staging_epochs:0,preparation:Default::default(),diagnostic_summary_at:Instant::now()}
     }
     pub fn peak_staging_epochs(&self)->usize {self.peak_staging_epochs}
     pub fn retained_history_epochs(&self)->usize {self.state.retained_history_epochs()}
@@ -120,7 +125,7 @@ impl AdaptiveLiveRuntime {
         }
         Ok(plans.into_values().collect())
     }
-    async fn build_warmup_plans(&self,pool:&PgPool,candidate:&live::PendingAdaptiveSlot,active:&[SymbolPlan],slots:&[Arc<ActiveAdaptiveSlot>],catalog:&[CatalogInstrument])->Result<(Vec<SymbolPlan>,String),WorkerError> {
+    async fn build_warmup_plans(&self,pool:&PgPool,candidate:&live::PendingAdaptiveSlot,active:&[SymbolPlan],slots:&[Arc<ActiveAdaptiveSlot>],catalog:&[CatalogInstrument],permit:&supervision::Permit)->Result<(Vec<SymbolPlan>,String),WorkerError> {
         let profile=LiveProfile::parse(&candidate.profile)?;
         let candidate_key=profile.fence_key();
         let incumbent=slots.iter().find(|slot|slot.slot_id==candidate.profile.slot_id).cloned();
@@ -129,6 +134,7 @@ impl AdaptiveLiveRuntime {
         if let Some(old)=&old {scope.extend(old.instruments.iter().cloned());}
         let mut plans=Vec::new();
         for scoped in scope {
+            permit.check()?;
             let matches:Vec<_>=catalog.iter().filter(|item|item.exchange==scoped.exchange && item.category==scoped.category && item.symbol==scoped.symbol).collect();
             if matches.len()>1 {return Err(invalid("ambiguous pending source catalog identity"));}
             let item=matches.first().copied();
@@ -178,7 +184,8 @@ impl AdaptiveLiveRuntime {
         if let Some(warmup)=&self.warmup {
             let current=warmup.cohort==cohort && pending.iter().any(|p|p.profile.slot_id==warmup.lease.slot_id && p.profile.generation_id==warmup.lease.generation_id
                 && p.profile.config_revision==warmup.lease.config_revision);
-            if current && live::report_warmup(pool,&warmup.lease,"warming",None,None).await? {
+            warmup.supervisor.permit().check()?;
+            if current {
                 // A waiting sibling may have joined while this candidate was
                 // warming. Refresh only durable control fields, NEVER origins
                 // or reconstructed scalar state from the candidate's recipe.
@@ -203,38 +210,82 @@ impl AdaptiveLiveRuntime {
                 return Ok(());
             }
             live::release_pending_warmup(pool,&warmup.lease).await?;
-            self.discard_warmup();
+            self.discard_warmup().await?;
         }
         if pending.is_empty() {return Ok(());}
         for offset in 0..pending.len() {
             let index=(self.next_pending+offset)%pending.len();
             let mut candidate=pending[index].clone();
             let Some(lease)=live::claim_pending_warmup_at(pool,&candidate,&self.worker,target).await? else {continue;};
+            let mut supervisor=match supervision::Supervisor::start(pool,&lease) {
+                Ok(supervisor)=>supervisor,
+                Err(error)=>{
+                    let report=live::report_warmup_failure(pool,&lease,&json!({"code":"warmup_supervisor_start_failed"}),true).await;
+                    let (error,fields)=diagnostics::failure_report(error,&report,live::warmup_diagnostic_fields(&lease));
+                    lifecycle::emit(Level::Error,"adaptive_warmup_failure_report",fields);return Err(error);
+                },
+            };
             // The claim, not the pre-claim pending DTO, owns the stable anchor.
             candidate.profile.live_initialization=Some(lease.initialization.clone());
             self.next_pending=(index+1)%pending.len();
-            let build=self.build_warmup_plans(pool,&candidate,active,slots,catalog).await;
+            let build=self.build_warmup_plans(pool,&candidate,active,slots,catalog,supervisor.permit()).await.and_then(|built| {
+                supervisor.permit().check()?;Ok(built)
+            });
             match build {
                 Ok((plans,candidate_key))=>{
                     let waiting=plans.iter().filter(|p|p.specs.iter().any(|s|s.key()==candidate_key) && !p.specs.iter().any(|s|s.publish_enabled))
                         .map(|p|(instrument_key(&p.instrument),if p.catalog_id==0 {"unavailable_catalog".into()}else{"not_listed".into()})).collect();
                     let retired=plans.iter().filter(|p|!p.specs.iter().any(|s|s.key()==candidate_key) && !p.specs.iter().any(|s|s.publish_enabled))
                         .map(|p|(instrument_key(&p.instrument),if p.catalog_id==0 {"unavailable_catalog".into()}else{"not_listed".into()})).collect();
-                    self.warmup=Some(Warmup {pending:candidate,lease,plans,candidate_key,cohort:cohort.clone(),barrier_attempts:0,waiting,retired});
+                    self.warmup=Some(Warmup {pending:candidate,lease,supervisor,plans,candidate_key,cohort:cohort.clone(),barrier_attempts:0,waiting,retired});
                 },
-                Err(error)=>{live::report_warmup_failure(pool,&lease,&json!({"code":"invalid_live_candidate","message":error.to_string().chars().take(240).collect::<String>()}),false).await?;}
+                Err(error)=>{
+                    if let Err(cleanup)=supervisor.stop().await {
+                        lifecycle::emit(Level::Error,"live_supervision_join_failed",json!({"runtime_instance":self.worker,"error_code":diagnostics::error_code(&cleanup)}));
+                    }
+                    let retryable=matches!(error,WorkerError::WarmupControl(_));
+                    let report=live::report_warmup_failure(pool,&lease,&json!({"code":if retryable {"warmup_supervision_lost"}else{"invalid_live_candidate"},"message":error.to_string().chars().take(240).collect::<String>()}),retryable).await;
+                    let (error,fields)=diagnostics::failure_report(error,&report,live::warmup_diagnostic_fields(&lease));
+                    lifecycle::emit(Level::Error,"adaptive_warmup_failure_report",fields);return Err(error);
+                }
             }
             break;
         }
         Ok(())
     }
-    fn discard_warmup(&mut self) {
-        if let Some(warmup)=self.warmup.take() {
+    fn check_supervision(&self)->Result<(),WorkerError> {
+        self.warmup.as_ref().map_or(Ok(()),|w|w.supervisor.permit().check())
+    }
+    fn candidate_cursor(&self,plan:&SymbolPlan)->Option<i64> {
+        let w=self.warmup.as_ref()?;
+        if !plan.specs.iter().any(|s|s.key()==w.candidate_key) {return None;}
+        self.state.checkpoint_for(&plan.epoch,&w.candidate_key).map(|checkpoint|checkpoint.next_open_unix)
+    }
+    fn candidate_progress(&self,plan:&SymbolPlan,previous:Option<i64>) {
+        if let Some(w)=&self.warmup && let (Some(previous),Some(next))=(previous,self.candidate_cursor(plan))
+            && next>previous {w.supervisor.permit().progress();}
+    }
+    async fn discard_warmup(&mut self)->Result<(),WorkerError> {
+        if let Some(mut warmup)=self.warmup.take() {
+            let stopped=warmup.supervisor.stop().await;
             for plan in warmup.plans {
                 if plan.epoch==AdaptiveRuntime::epoch_key(&plan.instrument,None) {self.state.remove_profile(&plan.epoch,&warmup.candidate_key);}
                 else {self.state.invalidate(&plan.epoch,None);}
             }
+            stopped?;
         }
+        Ok(())
+    }
+    /// The caller has drained its tick/read/commit futures. This only releases
+    /// the pending claim; incumbent checkpoints/generation and delivery survive.
+    pub async fn shutdown_warmup(&mut self,pool:&PgPool)->Result<bool,WorkerError> {
+        let Some(warmup)=self.warmup.as_mut() else {return Ok(false);};
+        warmup.supervisor.stop().await?;
+        let released=live::release_pending_warmup(pool,&warmup.lease).await?;
+        let mut fields=live::warmup_diagnostic_fields(&warmup.lease);
+        fields["release_outcome"]=if released {"released_and_refunded"}else{"expired_or_fenced_not_refunded"}.into();
+        lifecycle::emit(Level::Info,"adaptive_shutdown_claim_finished",fields);
+        self.discard_warmup().await?;Ok(released)
     }
     fn cold_plans(&self,active:&[SymbolPlan],target:i64,completed:&BTreeSet<String>)->Vec<SymbolPlan> {
         let mut cold:BTreeMap<String,SymbolPlan>=active.iter().filter(|p|!self.state.is_current(&p.epoch,target-1800) && !completed.contains(&p.epoch))
@@ -302,11 +353,13 @@ impl AdaptiveLiveRuntime {
         Ok(())
     }
     async fn adopt_ready_staging(&mut self,pool:&PgPool,frontier:i64)->Result<(),WorkerError> {
+        self.check_supervision()?;
         let Some(warmup)=&self.warmup else {return Ok(());};
         let candidate=warmup.candidate_key.clone();
         let ready:Vec<_>=warmup.plans.iter().filter(|p|p.epoch!=AdaptiveRuntime::epoch_key(&p.instrument,None)
             && self.state.is_current(&p.epoch,frontier)).cloned().collect();
         for plan in ready {
+            self.check_supervision()?;
             let mut expected=BTreeMap::new();let mut caught_up=true;
             for spec in plan.specs.iter().filter(|spec|spec.key()!=candidate) {
                 let staged=self.state.checkpoint_for(&plan.epoch,&spec.key()).ok_or_else(||invalid("staged incumbent checkpoint missing"))?;
@@ -326,10 +379,11 @@ impl AdaptiveLiveRuntime {
                 expected.insert(spec.key(),staged);
             }
             if !caught_up {continue;}
+            self.check_supervision()?;
             let production=AdaptiveRuntime::epoch_key(&plan.instrument,None);
             if !self.state.adopt_staging(&plan.epoch,&production,&candidate,&expected)? {
                 if let Some(warmup)=&self.warmup {live::release_pending_warmup(pool,&warmup.lease).await?;}
-                self.discard_warmup();break;
+                self.discard_warmup().await?;break;
             }
             if let Some(warmup)=&mut self.warmup
                 && let Some(staged)=warmup.plans.iter_mut().find(|p|p.epoch==plan.epoch) {
@@ -345,26 +399,47 @@ impl AdaptiveLiveRuntime {
     /// Explicit observation clock for deterministic guarded-tick integration.
     /// The production loop always uses tick(), which supplies the actual UTC clock.
     pub async fn tick_at(&mut self,pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool,observation_unix:i64)->Result<(),WorkerError> {
-        let result=self.tick_observed(pool,client,stopped,observation_unix).await;
-        if let Err(error)=&result && let Some(warmup)=&self.warmup {
-            let report=json!({"code":"adaptive_warmup_failed","message":error.to_string().chars().take(240).collect::<String>()});
-            if let Err(report_error)=live::report_warmup_failure(pool,&warmup.lease,&report,true).await {
-                eprintln!("[adaptive-live] warmup error report failed: {}",report_error.to_string().chars().take(200).collect::<String>());
-            }
-            self.discard_warmup();
-        }
-        result
-    }
-    async fn tick_observed(&mut self,pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool,observation_unix:i64)->Result<(),WorkerError> {
-        if stopped.load(Ordering::SeqCst) || settings_get(pool,"live").await?.unwrap_or(json!({}))["enabled"]!=true {
-            self.state.clear();self.warmup=None;self.preparation.clear();return Ok(());
-        }
-        live::recover_pending_warmups(pool,continuous::ADMIN_OWNER).await?;
+        let mut trace=diagnostics::TickTrace::new(&self.worker);
+        let result=self.tick_observed(pool,client,stopped,observation_unix,&mut trace).await;
         let target=observation_unix.div_euclid(60)*60;
+        let level=if result.is_err() {Level::Error}
+            else if trace.started.elapsed()>=Duration::from_secs(5) || self.diagnostic_summary_at.elapsed()>=Duration::from_secs(30) {Level::Info}
+            else {Level::Debug};
+        trace.finish(self,target,level,result.as_ref().err());
+        if level!=Level::Debug {self.diagnostic_summary_at=Instant::now();}
+        let Err(error)=result else {return Ok(());};
+        if let Some(warmup)=&self.warmup {
+            let report=json!({"code":"adaptive_warmup_failed","message":error.to_string().chars().take(240).collect::<String>()});
+            let reported=live::report_warmup_failure(pool,&warmup.lease,&report,true).await;
+            let (error,fields)=diagnostics::failure_report(error,&reported,trace.fields(self,target));
+            lifecycle::emit(Level::Error,"adaptive_warmup_failure_report",fields);
+            if let Err(cleanup)=self.discard_warmup().await {
+                lifecycle::emit(Level::Error,"live_supervision_join_failed",json!({"runtime_instance":self.worker,"error_code":diagnostics::error_code(&cleanup)}));
+            }
+            return Err(error);
+        }
+        Err(error)
+    }
+    async fn tick_observed(&mut self,pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool,observation_unix:i64,trace:&mut diagnostics::TickTrace)->Result<(),WorkerError> {
+        if stopped.load(Ordering::SeqCst) {return Ok(());}
+        self.check_supervision()?;
+        if settings_get(pool,"live").await?.unwrap_or(json!({}))["enabled"]!=true {
+            self.shutdown_warmup(pool).await?;
+            self.state.clear();self.preparation.clear();return Ok(());
+        }
+        trace.enter("recovery");
+        // The independent supervisor owns our claim. Never reap it ahead of
+        // renewal or queue its control plane behind research's owner lock.
+        if self.warmup.is_none() {live::recover_pending_warmups(pool,continuous::ADMIN_OWNER).await?;}
+        let target=observation_unix.div_euclid(60)*60;
+        trace.enter("projection");
         let slots:Vec<_>=continuous::active_adaptive_slots(pool,continuous::ADMIN_OWNER).await?.into_iter().map(Arc::new).collect();
         let pending=live::pending_adaptive_slots(pool,continuous::ADMIN_OWNER).await?;
-        if slots.is_empty() && pending.is_empty() {self.state.clear();self.warmup=None;self.preparation.clear();return Ok(());}
+        if slots.is_empty() && pending.is_empty() {self.discard_warmup().await?;self.state.clear();self.preparation.clear();return Ok(());}
+        trace.enter("catalog");
         let catalog=client.instruments().await.map_err(|e|invalid(&e.to_string()))?;
+        trace.enter("plan_refresh");
+        self.check_supervision()?;
         let active=self.active_plans(pool,&slots,&catalog).await?;
         self.refresh_warmup(pool,pending,&catalog,&active,&slots,target).await?;
         let mut wanted:BTreeMap<String,BTreeSet<String>>=BTreeMap::new();
@@ -387,6 +462,7 @@ impl AdaptiveLiveRuntime {
         }
         let mut hot=active.clone();
         if let Some(warmup)=&self.warmup {hot.extend(warmup.plans.iter().filter(|p|!warmup.waiting.contains_key(&instrument_key(&p.instrument)) && self.state.is_current(&p.epoch,target-1800)).cloned());}
+        trace.enter("hot_tail");
         self.hot_tail(pool,client,&hot,target,stopped).await?;
         for id in preparation_requirements.keys() {
             if preparation_source_ready(&self.state,active.iter().chain(self.warmup.iter().flat_map(|warmup|warmup.plans.iter())),*id,target) {
@@ -398,20 +474,25 @@ impl AdaptiveLiveRuntime {
         self.adopt_ready_staging(pool,target).await?;
         // Active hot work wins; at most four duplicate staging rings exist.
         // A completed empty observation is retried next tick, not in a loop.
+        trace.enter("cold_history");
         let mut completed=BTreeSet::new();
         let mut cold=self.cold_plans(&active,target,&completed);
         let started=Instant::now();
         let mut pages=0;
         while !cold.is_empty() && pages<self.state.limits.warmup_pages_per_turn && started.elapsed()<WARMUP_TIME_SLICE && !stopped.load(Ordering::SeqCst) {
+            self.check_supervision()?;
             let count=IO_CONCURRENCY.min(self.state.limits.warmup_pages_per_turn-pages).min(cold.len());
             let mut reads=tokio::task::JoinSet::new();
+            let mut first_error=None;
             for index in self.cold_schedule.select(&cold,count) {
+                if let Err(error)=self.check_supervision() {first_error=Some(error);break;}
                 let mut plan=cold[index].clone();
                 if !self.state.has_epoch(&plan.epoch) {
                     for spec in plan.specs.iter_mut().filter(|spec|!spec.pending) {
                         spec.checkpoint=store::load_checkpoint(pool,spec.fence.slot_id,&plan.instrument).await?;
                     }
                 }
+                if let Err(error)=self.check_supervision() {first_error=Some(error);break;}
                 self.state.install(&plan.epoch,&plan.specs)?;
                 let resident=self.warmup.as_ref().map_or(0,|w|w.plans.iter().filter(|p|p.epoch!=AdaptiveRuntime::epoch_key(&p.instrument,None) && self.state.has_epoch(&p.epoch)).count());
                 self.peak_staging_epochs=self.peak_staging_epochs.max(resident);
@@ -424,9 +505,9 @@ impl AdaptiveLiveRuntime {
                     (plan,result)
                 });
             }
-            let mut first_error=None;
             while let Some(result)=reads.join_next().await {
                 let (plan,response)=result.map_err(|e|invalid(&e.to_string()))?;
+                if let Err(error)=self.check_supervision() {first_error.get_or_insert(error);continue;}
                 let page=match response {
                     Ok(page)=>page,
                     Err(failure)=>{
@@ -439,8 +520,11 @@ impl AdaptiveLiveRuntime {
                     }
                 };
                 let source_empty=page.missing_source;
+                trace.pages+=1;trace.bars+=page.bars.len();
                 self.state.acknowledge_source(&plan.epoch,page.token)?;
-                if let Err(error)=process_page(&mut self.state,pool,&plan,&page.bars,target,page.complete).await {
+                let progress=self.warmup.as_ref().filter(|w|plan.specs.iter().any(|s|s.key()==w.candidate_key))
+                    .map(|w|(w.supervisor.permit(),w.candidate_key.as_str()));
+                if let Err(error)=process_page(&mut self.state,pool,&plan,&page.bars,target,page.complete,progress).await {
                     first_error.get_or_insert(error);continue;
                 }
                 if plan.specs.iter().any(|spec|spec.publish_enabled) {
@@ -465,7 +549,10 @@ impl AdaptiveLiveRuntime {
             cold=self.cold_plans(&active,target,&completed);
             tokio::task::yield_now().await;
         }
+        trace.enter("waiting_join");
+        self.check_supervision()?;
         self.join_ready_waiting(pool,&active,target).await?;
+        trace.enter("promotion");
         self.try_promote(pool,&slots,&catalog,target,stopped).await?;
         self.preparation.poll(client,stopped.load(Ordering::SeqCst));
         Ok(())
@@ -500,6 +587,7 @@ impl AdaptiveLiveRuntime {
         let mut batches=batches.into_iter();let mut first_error=None;
         loop {
             if stopped.load(Ordering::SeqCst) {break;}
+            if let Err(error)=self.check_supervision() {first_error.get_or_insert(error);break;}
             let mut reads=tokio::task::JoinSet::new();
             for batch in batches.by_ref().take(IO_CONCURRENCY) {
                 let ids:Vec<_>=batch.iter().map(|plan|plan.catalog_id).collect();
@@ -516,6 +604,7 @@ impl AdaptiveLiveRuntime {
             if reads.is_empty() {break;}
             while let Some(response)=reads.join_next().await {
                 let (batch,guards,response)=response.map_err(|e|invalid(&e.to_string()))?;
+                if let Err(error)=self.check_supervision() {first_error.get_or_insert(error);continue;}
                 let response=match response {
                     Ok(response)=>response,
                     Err(error)=>{
@@ -526,6 +615,7 @@ impl AdaptiveLiveRuntime {
                     }
                 };
                 let batch_store=batch::PgBatchStore {pool};
+                let previous:BTreeMap<_,_>=batch.iter().map(|p|(p.epoch.clone(),self.candidate_cursor(p))).collect();
                 let mut window=batch::Window::new(&mut self.state,&batch_store);
                 let mut response_failed=false;
                 for item in response.instruments {
@@ -554,6 +644,7 @@ impl AdaptiveLiveRuntime {
                     drop(window);
                 } else {
                     if let Err(error)=window.finish().await {first_error.get_or_insert(error);}
+                    for plan in &batch {self.candidate_progress(plan,previous[&plan.epoch]);}
                     for plan in &batch {self.park_waiting(plan,target);}
                 }
             }
@@ -561,7 +652,9 @@ impl AdaptiveLiveRuntime {
         first_error.map_or(Ok(()),Err)
     }
     async fn try_promote(&mut self,pool:&PgPool,_active:&[Arc<ActiveAdaptiveSlot>],_catalog:&[CatalogInstrument],frontier:i64,stopped:&AtomicBool)->Result<(),WorkerError> {
+        self.check_supervision()?;
         let Some(warmup)=self.warmup.as_ref() else {return Ok(());};
+        let promotion_started=Instant::now();
         if stopped.load(Ordering::SeqCst) {return Ok(());}
         for plan in &warmup.plans {
             if !plan.specs.iter().any(|s|s.publish_enabled) {continue;}
@@ -590,12 +683,25 @@ impl AdaptiveLiveRuntime {
         if initial.is_empty() {return Ok(());}
         let waiting:Vec<_>=warmup.waiting.iter().map(|(key,reason)|live::WaitingInstrument {instrument_key:key.clone(),reason:reason.clone()}).collect();
         let retired:Vec<_>=warmup.retired.iter().map(|(key,reason)|live::WaitingInstrument {instrument_key:key.clone(),reason:reason.clone()}).collect();
-        if !live::report_warmup(pool,&warmup.lease,"ready",Some(frontier),None).await? {self.discard_warmup();return Ok(());}
+        warmup.supervisor.permit().check()?;
+        if !live::report_warmup(pool,&warmup.lease,"ready",Some(frontier),None).await? {
+            return Err(WorkerError::WarmupControl(WarmupControlOutcome::RenewalRejected));
+        }
         let result=promotion::persist(&promotion::PgPromotion {pool,lease:&warmup.lease,
-            predecessor:warmup.pending.expected_active_generation_id,expected:&expected,frontier,initial:&initial,waiting:&waiting,retired:&retired}).await;
+            predecessor:warmup.pending.expected_active_generation_id,expected:&expected,frontier,initial:&initial,waiting:&waiting,retired:&retired,
+            supervision:Some(warmup.supervisor.permit())}).await;
+        let mut fields=live::warmup_diagnostic_fields(&warmup.lease);
+        fields["study_id"]=warmup.pending.profile.study_id.into();
+        fields["frontier"]=frontier.into();fields["ready_instruments"]=initial.len().into();fields["waiting_instruments"]=waiting.len().into();
+        fields["duration_ms"]=(promotion_started.elapsed().as_millis() as u64).into();
+        fields["outcome"]=match &result {Ok(promotion::Outcome::Adopt)=>"adopted",Ok(promotion::Outcome::Rebuild)=>"rebuild",
+            Ok(promotion::Outcome::Lost)=>"lost",Ok(promotion::Outcome::Retry)=>"retry",Err(_)=>"error"}.into();
+        if let Err(error)=&result {fields["error_code"]=diagnostics::error_code(error).into();}
+        lifecycle::emit(if result.is_err(){Level::Error}else if matches!(&result,Ok(promotion::Outcome::Retry)){Level::Debug}else{Level::Info},"adaptive_promotion_finished",fields);
+        if !matches!(&result,Ok(promotion::Outcome::Adopt|promotion::Outcome::Rebuild)) {self.check_supervision()?;}
         match result {
             Ok(promotion::Outcome::Adopt)=>{
-                let warmup=self.warmup.take().unwrap();
+                let mut warmup=self.warmup.take().unwrap();warmup.supervisor.stop().await?;
                 for plan in &warmup.plans {
                     if initial.iter().any(|entry|entry.instrument_key==instrument_key(&plan.instrument)) {self.state.activate(&plan.epoch,&warmup.candidate_key,frontier)?;}
                     for spec in plan.specs.iter().filter(|spec|spec.fence.slot_id==warmup.lease.slot_id && spec.key()!=warmup.candidate_key) {
@@ -604,21 +710,22 @@ impl AdaptiveLiveRuntime {
                 }
             },
             Ok(promotion::Outcome::Rebuild)=>{
-                let warmup=self.warmup.take().unwrap();
+                let mut warmup=self.warmup.take().unwrap();warmup.supervisor.stop().await?;
                 for plan in &warmup.plans {self.state.invalidate(&plan.epoch,None);}
             },
-            Ok(promotion::Outcome::Lost)=>self.discard_warmup(),
+            Ok(promotion::Outcome::Lost)=>self.discard_warmup().await?,
             Ok(promotion::Outcome::Retry)=>{
                 let warmup=self.warmup.as_mut().unwrap();warmup.barrier_attempts+=1;
                 if warmup.barrier_attempts>=3 {
+                    lifecycle::emit(Level::Info,"adaptive_promotion_yielded",live::warmup_diagnostic_fields(&warmup.lease));
                     live::release_pending_warmup(pool,&warmup.lease).await?;
-                    self.discard_warmup();
+                    self.discard_warmup().await?;
                 }
             },
             Err(error)=>{
-                // Do not leave a possibly committed candidate missing from a
-                // nonempty production ring. Reconstruct from durable fences.
-                if let Some(warmup)=&self.warmup {for plan in &warmup.plans {self.state.invalidate(&plan.epoch,None);}}
+                // tick_at drains/discards only candidate staging. Preserve the
+                // incumbent's canonical state; if COMMIT was actually applied,
+                // next tick's authoritative generation projection reconciles it.
                 return Err(error);
             },
         }
@@ -638,10 +745,14 @@ fn validate_history_page(bars:&[DetectorBar],from:i64,to:i64,next:Option<i64>)->
     Ok(())
 }
 
-async fn process_page(state:&mut AdaptiveRuntime,pool:&PgPool,plan:&SymbolPlan,bars:&[DetectorBar],target:i64,complete:bool)->Result<(),WorkerError> {
+async fn process_page(state:&mut AdaptiveRuntime,pool:&PgPool,plan:&SymbolPlan,bars:&[DetectorBar],target:i64,complete:bool,progress:Option<(&supervision::Permit,&str)>)->Result<(),WorkerError> {
     if bars.is_empty() {process_chunk(state,pool,plan,&[],target,complete).await?;}
     for (index,chunk) in bars.chunks(ADAPTIVE_PAGE_LIMIT).enumerate() {
+        if let Some((permit,_))=progress {permit.check()?;}
+        let previous=progress.and_then(|(_,key)|state.checkpoint_for(&plan.epoch,key));
         process_chunk(state,pool,plan,chunk,target,complete && (index+1)*ADAPTIVE_PAGE_LIMIT>=bars.len()).await?;
+        if let Some((permit,key))=progress && let (Some(before),Some(after))=(previous,state.checkpoint_for(&plan.epoch,key))
+            && after.next_open_unix>before.next_open_unix {permit.progress();}
     }
     Ok(())
 }
@@ -698,18 +809,31 @@ pub(crate) async fn adaptive_live_loop(pool:PgPool,market_url:String,market_key:
     let scan=async move {
         let client=MarketDataClient::new(market_url,market_key);
         let mut owner=AdaptiveLiveRuntime::new(AdaptiveRuntimeLimits::default());
+        lifecycle::emit(Level::Info,"adaptive_runtime_started",json!({"runtime_instance":owner.worker}));
         while !scan_stopped.load(Ordering::SeqCst) {
             if let Err(error)=owner.tick(&scan_pool,&client,&scan_stopped).await {
                 if let Some(warmup)=&owner.warmup {
                     let report=json!({"code":"adaptive_warmup_failed","message":error.to_string().chars().take(240).collect::<String>()});
                     let _=live::report_warmup(&scan_pool,&warmup.lease,"error",None,Some(&report)).await;
-                    owner.discard_warmup();
+                    if let Err(error)=owner.discard_warmup().await {lifecycle::emit(Level::Error,"live_supervision_join_failed",json!({"error_code":diagnostics::error_code(&error)}));}
                 }
-                eprintln!("[adaptive-live] tick failed: {}",error.to_string().chars().take(240).collect::<String>());
+                lifecycle::emit(Level::Error,"adaptive_tick_error",json!({"runtime_instance":owner.worker,"error_code":diagnostics::error_code(&error)}));
             }
             tokio::select! {_=scan_notify.notified()=>{},_=tokio::time::sleep(Duration::from_secs(2))=>{}}
         }
-        owner.state.clear();
+        let shutdown_started=Instant::now();
+        let mut fields=owner.warmup.as_ref().map_or_else(||json!({"runtime_instance":owner.worker}),|w|live::warmup_diagnostic_fields(&w.lease));
+        fields["warmup_in_progress"]=owner.warmup.is_some().into();
+        fields["history_bytes_before"]=owner.retained_history_bytes().into();fields["profile_bytes_before"]=owner.retained_profile_bytes().into();
+        lifecycle::emit(Level::Info,"adaptive_shutdown_started",fields.clone());
+        let release=owner.shutdown_warmup(&scan_pool).await;
+        fields["lease_disposition"]=match &release {Ok(true)=>"released_and_refunded",Ok(false)=>"no_current_claim",Err(_)=>"release_error_not_refunded"}.into();
+        if let Err(error)=&release {fields["error_code"]=diagnostics::error_code(error).into();}
+        owner.state.clear();drop(owner);
+        fields["duration_ms"]=(shutdown_started.elapsed().as_millis() as u64).into();
+        fields["outcome"]=if release.is_ok(){"drained"}else{"release_error"}.into();
+        fields["history_bytes"]=0.into();fields["profile_bytes"]=0.into();
+        lifecycle::emit(if release.is_ok(){Level::Info}else{Level::Error},"adaptive_shutdown_finished",fields);
     };
     tokio::join!(scan,delivery::run(pool,stopped,notify));
 }
@@ -718,6 +842,56 @@ pub(crate) async fn adaptive_live_loop(pool:PgPool,market_url:String,market_key:
 mod tests {
     use super::*;
     use crate::adaptive::state::tests::{fixture,feed};
+    #[tokio::test]
+    async fn supervision_loss_drains_owned_reads_stops_admission_and_preserves_incumbent_ram() {
+        use axum::{Json,Router,routing::post};
+        use std::sync::atomic::AtomicUsize;
+        let f=fixture();let mut candidate=f.spec.clone();candidate.fence.generation_id=2;candidate.pending=true;
+        let candidate_key=candidate.key();let incumbent_key=f.spec.key();
+        let lease=live::WarmupLease {owner_id:f.spec.fence.owner_id.clone(),algorithm_id:f.spec.fence.algorithm_id.clone(),slot_id:1,
+            generation_id:2,config_revision:1,worker:"owned-drain".into(),token:1,attempt:1,attempt_deadline_unix:chrono::Utc::now().timestamp()+21600,
+            initialization:live::LiveInitialization {version:1,anchor_close_unix:f.frontier,detector_from_open_unix:0,emit_from_close_unix:f.frontier+60}};
+        let profile=ActiveAdaptiveSlot {owner_id:lease.owner_id.clone(),algorithm_id:lease.algorithm_id.clone(),slot_id:1,generation_id:2,study_id:2,
+            config_revision:1,min_setups_per_day:0.0,spec:json!({}),result:json!({}),params:json!({}),analytics:json!({}),selected_cell:json!({}),
+            mean_expectancy:0.21,direction:"short".into(),external_name:"fixture".into(),live_initialization:Some(lease.initialization.clone()),live_readiness:Vec::new()};
+        let plan=SymbolPlan {epoch:f.epoch.clone(),instrument:f.instrument.clone(),catalog_id:1,specs:vec![f.spec.clone(),candidate],slots:BTreeMap::new()};
+        let mut owner=AdaptiveLiveRuntime::new(f.runtime.limits.clone());
+        owner.state.install(&f.epoch,&plan.specs).unwrap();feed(&mut owner.state,&f.epoch,&f.instrument,&f.bars,f.frontier).unwrap();
+        let checkpoint=owner.state.checkpoint_for(&f.epoch,&incumbent_key).unwrap();let history_bytes=owner.retained_history_bytes();
+        let supervisor=supervision::Supervisor::fixture(&lease);let permit=supervisor.permit().clone();
+        owner.warmup=Some(Warmup {pending:live::PendingAdaptiveSlot {profile,expected_active_generation_id:Some(1),warmup_status:"warming".into(),readiness_frontier:None},lease,supervisor,
+            plans:vec![plan.clone()],candidate_key:candidate_key.clone(),cohort:BTreeSet::new(),barrier_attempts:0,waiting:BTreeMap::new(),retired:BTreeMap::new()});
+        let entered=Arc::new(AtomicUsize::new(0));let observed=entered.clone();let gate=Arc::new(tokio::sync::Semaphore::new(0));let blocked=gate.clone();
+        let app=Router::new().route("/v1/candles/tail-batch",post(move || {
+            let entered=observed.clone();let gate=blocked.clone();async move {
+                entered.fetch_add(1,Ordering::SeqCst);gate.acquire().await.unwrap().forget();Json(json!({}))
+            }
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let url=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap();});
+        let pool=sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://test:test@127.0.0.1:1/unreachable_test").unwrap();
+        let batches=vec![vec![plan];IO_CONCURRENCY+1];let target=f.frontier;
+        let work=tokio::spawn(async move {
+            let outcome=owner.hot_tail_snapshots(&pool,&MarketDataClient::new(url,"fixture"),batches,target,&AtomicBool::new(false)).await;(owner,outcome)
+        });
+        tokio::time::timeout(Duration::from_secs(2),async {while entered.load(Ordering::SeqCst)<IO_CONCURRENCY {tokio::time::sleep(Duration::from_millis(1)).await;}}).await.unwrap();
+        permit.lose(WarmupControlOutcome::RenewalRejected);
+        gate.add_permits(IO_CONCURRENCY-1);tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!work.is_finished(),"loss must drain every already-owned request, not abort its remaining sibling");
+        gate.add_permits(1);let (mut owner,outcome)=tokio::time::timeout(Duration::from_secs(2),work).await.unwrap().unwrap();
+        assert!(matches!(outcome,Err(WorkerError::WarmupControl(WarmupControlOutcome::RenewalRejected))));
+        assert_eq!(entered.load(Ordering::SeqCst),IO_CONCURRENCY,"no next-wave admission after supervision loss");
+        owner.discard_warmup().await.unwrap();assert!(owner.warmup.is_none());
+        assert_eq!(owner.retained_history_bytes(),history_bytes);
+        assert_eq!(owner.state.checkpoint_for(&f.epoch,&incumbent_key),Some(checkpoint));
+        assert!(owner.state.checkpoint_for(&f.epoch,&candidate_key).is_none());
+        let mut next=f.bars.last().unwrap().clone();next.open_time_unix=f.frontier;next.quote_turnover="100".into();
+        feed(&mut owner.state,&f.epoch,&f.instrument,std::slice::from_ref(&next),f.frontier+60).unwrap();
+        let mut reference=fixture();reference.runtime.install(&reference.epoch,std::slice::from_ref(&reference.spec)).unwrap();
+        let mut bars=f.bars;bars.push(next);feed(&mut reference.runtime,&reference.epoch,&reference.instrument,&bars,f.frontier+60).unwrap();
+        assert_eq!(owner.state.checkpoint_for(&f.epoch,&incumbent_key),reference.runtime.checkpoint_for(&reference.epoch,&incumbent_key),"incumbent continues the original detector/cluster, not a reset profile");
+        server.abort();let _=server.await;
+    }
     #[test]
     fn cold_preparation_uses_frozen_scope_bounds_not_restart_observation_clock() {
         let f=fixture();let mut sibling=f.spec.clone();sibling.from_open=60;sibling.warmup_through+=60;

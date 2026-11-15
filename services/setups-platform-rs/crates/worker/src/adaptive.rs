@@ -19,6 +19,16 @@ pub use runtime::{AdaptiveLiveBootstrap, AdaptiveLiveRuntime, PgAdaptiveStore, a
 pub use runtime::{AdaptiveTelegramCaption, recommendation_telegram_caption};
 pub use runtime::AdaptiveExpectancySnapshot;
 
+/// Reporting a technical failure can itself lose its fence. Keep that outcome
+/// typed and visible without replacing the original worker error/cause.
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Serialize)]
+#[serde(rename_all="snake_case")]
+pub enum WarmupFailureReportOutcome {Persisted,RejectedStaleOrFenced,DatabaseError}
+
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Serialize)]
+#[serde(rename_all="snake_case")]
+pub enum WarmupControlOutcome {RenewalRejected,RenewalUnavailable,ProgressBudgetExpired,SupervisorStopped}
+
 pub const ADAPTIVE_PAGE_LIMIT: usize = 256;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024;
 

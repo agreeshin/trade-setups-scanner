@@ -34,6 +34,12 @@ pub struct ContinuousSlot {
     pub pending_attempts: i32,
     pub pending_next_attempt_at: Option<DateTime<Utc>>,
     pub pending_attempt_deadline: Option<DateTime<Utc>>,
+    /// Research ownership is separate from finalized-result and live provenance.
+    pub running_study_id: Option<i64>,
+    pub finalized_generation_id: Option<i64>,
+    pub active_study_id: Option<i64>,
+    pub pending_study_id: Option<i64>,
+    /// Last fully finalized continuous result, never merely a completed search.
     pub study_id: Option<i64>,
     pub mean_expectancy: Option<f64>,
     pub selected_cell: Option<Value>,
@@ -70,7 +76,23 @@ pub async fn get(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Option<C
         .bind(owner).bind(algorithm).fetch_optional(&mut *tx).await?;
     let Some(row) = row else { return Ok(None); };
     let mut result = process(&row)?;
-    let slots = sqlx::query("select s.*,s.min_setups_per_day::double precision as frequency,a.spec active_spec,a.live_initialization,coalesce(a.live_readiness,'[]'::jsonb) live_readiness,n.live_initialization pending_initialization,coalesce(n.live_init_attempts,0) pending_attempts,n.live_init_next_attempt_at pending_next_attempt_at,n.live_init_deadline pending_attempt_deadline from continuous_slots s left join continuous_generations a on a.id=s.active_generation_id left join continuous_generations n on n.id=s.pending_generation_id where s.owner_id=$1 and s.algorithm_id=$2 and s.enabled order by s.id")
+    // Repair legacy display bindings at read time: prepare_next used to replace
+    // s.study_id before post-chain/gate completed. Never trust that cached field.
+    let slots = sqlx::query(r#"select s.*,s.min_setups_per_day::double precision as frequency,
+        a.spec active_spec,a.live_initialization,coalesce(a.live_readiness,'[]'::jsonb) live_readiness,
+        a.study_id active_study_id,n.study_id pending_study_id,r.study_id running_study_id,
+        f.id finalized_generation_id,f.study_id finalized_study_id,
+        n.live_initialization pending_initialization,coalesce(n.live_init_attempts,0) pending_attempts,
+        n.live_init_next_attempt_at pending_next_attempt_at,n.live_init_deadline pending_attempt_deadline
+        from continuous_slots s
+        join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id
+        left join continuous_generations a on a.id=s.active_generation_id
+        left join continuous_generations n on n.id=s.pending_generation_id
+        left join continuous_generations r on r.id=p.active_generation_id and r.slot_id=s.id and r.status='running'
+        left join lateral (select g.id,g.study_id from continuous_generations g
+            where g.owner_id=s.owner_id and g.algorithm_id=s.algorithm_id and g.slot_id=s.id
+                and g.status='completed' order by g.id desc limit 1) f on true
+        where s.owner_id=$1 and s.algorithm_id=$2 and s.enabled order by s.id"#)
         .bind(owner).bind(algorithm).fetch_all(&mut *tx).await?;
     result.slots = slots.into_iter().map(|row| Ok(ContinuousSlot {
         id: row.try_get("id")?, min_setups_per_day: row.try_get("frequency")?,
@@ -85,7 +107,10 @@ pub async fn get(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Option<C
         pending_attempts:row.try_get("pending_attempts")?,
         pending_next_attempt_at:row.try_get("pending_next_attempt_at")?,
         pending_attempt_deadline:row.try_get("pending_attempt_deadline")?,
-        study_id: row.try_get("study_id")?, mean_expectancy: row.try_get("mean_expectancy")?,
+        running_study_id: row.try_get("running_study_id")?,
+        finalized_generation_id: row.try_get("finalized_generation_id")?,
+        active_study_id: row.try_get("active_study_id")?, pending_study_id: row.try_get("pending_study_id")?,
+        study_id: row.try_get("finalized_study_id")?, mean_expectancy: row.try_get("mean_expectancy")?,
         selected_cell: row.try_get("selected_cell")?, updated_at: row.try_get("updated_at")?,
     })).collect::<Result<_,DbError>>()?;
     tx.commit().await?;

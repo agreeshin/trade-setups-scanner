@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
+use crate::diagnostics::{self,Level};
 
 pub const WARMUP_LEASE_SECONDS: i64 = 30;
 pub const MAX_PROMOTION_INSTRUMENTS: usize = 1000;
@@ -177,6 +178,51 @@ async fn lease_current(tx: &mut Transaction<'_, Postgres>, fence: &WarmupLease) 
         .bind(fence.slot_id).bind(fence.generation_id).bind(&fence.worker).bind(fence.token).fetch_one(&mut **tx).await?)
 }
 
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub enum WarmupRenewal {Renewed,Rejected}
+
+/// A separate control connection owns this bounded transaction. MVCC reads do
+/// NOT queue behind the data plane's owner/process/slot locks. The only write
+/// lock is the fenced global lane, ordered before any generation mutation.
+pub async fn renew_pending_warmup(pool:&PgPool,fence:&WarmupLease)->Result<WarmupRenewal,DbError> {
+    let mut tx=pool.begin().await?;
+    control_timeouts(&mut tx).await?;
+    let renewed=sqlx::query("update adaptive_live_warmup_lane w set lease_until=least(clock_timestamp()+$5::bigint*interval '1 second',g.live_init_deadline) from continuous_generations g,continuous_slots s,continuous_processes p where w.id=1 and w.slot_id=$1 and w.generation_id=$2 and w.lease_owner=$3 and w.lease_token=$4 and w.lease_until>clock_timestamp() and g.id=w.generation_id and g.live_init_deadline>clock_timestamp() and g.live_init_status='running' and g.live_init_attempts=$6 and g.status='completed' and g.accepted and s.id=w.slot_id and s.pending_generation_id=g.id and s.enabled and p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id and p.desired_running and p.config_revision=g.config_revision and p.config_revision=$7 and p.owner_id=$8 and p.algorithm_id=$9 and p.config->'adaptiveEnabled'='true'::jsonb and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb)")
+        .bind(fence.slot_id).bind(fence.generation_id).bind(&fence.worker).bind(fence.token).bind(WARMUP_LEASE_SECONDS)
+        .bind(fence.attempt).bind(fence.config_revision).bind(&fence.owner_id).bind(&fence.algorithm_id)
+        .execute(&mut *tx).await?.rows_affected()==1;
+    tx.commit().await?;
+    Ok(if renewed {WarmupRenewal::Renewed}else{WarmupRenewal::Rejected})
+}
+async fn control_timeouts(tx:&mut Transaction<'_,Postgres>)->Result<(),DbError> {
+    sqlx::query("select set_config('lock_timeout','1000',true),set_config('statement_timeout','2000',true)")
+        .execute(&mut **tx).await?;Ok(())
+}
+async fn pending_control_current(tx:&mut Transaction<'_,Postgres>,fence:&WarmupLease)->Result<bool,DbError> {
+    Ok(sqlx::query_scalar("select exists(select 1 from continuous_slots s join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id join continuous_generations g on g.id=s.pending_generation_id where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3 and s.pending_generation_id=$4 and s.enabled and p.desired_running and p.config_revision=$5 and g.config_revision=$5 and p.config->'adaptiveEnabled'='true'::jsonb and g.live_init_status='running' and g.live_init_attempts=$6)")
+        .bind(fence.slot_id).bind(&fence.owner_id).bind(&fence.algorithm_id).bind(fence.generation_id)
+        .bind(fence.config_revision).bind(fence.attempt).fetch_one(&mut **tx).await?)
+}
+
+/// Capture control-plane facts BEFORE a terminal transition clears them. Never
+/// include scientific inputs/results or an error's potentially raw SQL/body.
+async fn attempt_diagnostics(tx:&mut Transaction<'_,Postgres>,generation:i64,slot:i64)->Result<Value,DbError> {
+    Ok(sqlx::query_scalar("select jsonb_build_object('slot_id',$2::bigint,'generation_id',g.id,'study_id',g.study_id,'algorithm_id',g.algorithm_id,'config_revision',g.config_revision,'runtime_instance',w.lease_owner,'lease_token',w.lease_token,'lane_generation_id',w.generation_id,'attempt',g.live_init_attempts,'attempt_limit',g.live_init_attempt_limit,'deadline_unix',extract(epoch from g.live_init_deadline)::bigint,'deadline_remaining_ms',(extract(epoch from (g.live_init_deadline-clock_timestamp()))*1000)::bigint,'lease_remaining_ms',case when w.generation_id=g.id then (extract(epoch from (w.lease_until-clock_timestamp()))*1000)::bigint end) from continuous_generations g left join adaptive_live_warmup_lane w on w.id=1 where g.id=$1")
+        .bind(generation).bind(slot).fetch_one(&mut **tx).await?)
+}
+pub fn warmup_diagnostic_fields(fence:&WarmupLease)->Value {
+    json!({"runtime_instance":fence.worker,"slot_id":fence.slot_id,"generation_id":fence.generation_id,
+        "algorithm_id":fence.algorithm_id,"config_revision":fence.config_revision,"lease_token":fence.token,
+        "attempt":fence.attempt,"deadline_unix":fence.attempt_deadline_unix,
+        "deadline_remaining_ms":fence.attempt_deadline_unix.saturating_sub(chrono::Utc::now().timestamp()).saturating_mul(1000)})
+}
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Serialize)]
+#[serde(rename_all="snake_case")]
+enum AbandonReason {Deadline,Lease,#[serde(rename="lane-missing")] LaneMissing}
+fn abandon_reason(deadline_expired:bool,lane_present:bool)->AbandonReason {
+    if deadline_expired {AbandonReason::Deadline} else if lane_present {AbandonReason::Lease} else {AbandonReason::LaneMissing}
+}
+
 pub async fn claim_pending_warmup(pool: &PgPool, pending: &PendingAdaptiveSlot, worker: &str) -> Result<Option<WarmupLease>, DbError> {
     let anchor: i64 = sqlx::query_scalar("select floor(extract(epoch from clock_timestamp())/60)::bigint*60")
         .fetch_one(pool).await?;
@@ -189,6 +235,7 @@ pub async fn claim_pending_warmup_at(pool: &PgPool, pending: &PendingAdaptiveSlo
 
 /// Explicit 1 minute..24 hour wall budget, independent of renewable lease TTL.
 pub async fn claim_pending_warmup_with_budget(pool: &PgPool, pending: &PendingAdaptiveSlot, worker: &str, anchor_close_unix: i64, attempt_seconds: i64) -> Result<Option<WarmupLease>, DbError> {
+    let started=std::time::Instant::now();
     valid_worker(worker)?;
     if anchor_close_unix < 0 || anchor_close_unix % 60 != 0 || !(60..=86400).contains(&attempt_seconds) {
         return Err(DbError::Json("invalid live initialization anchor/attempt budget".into()));
@@ -218,11 +265,26 @@ pub async fn claim_pending_warmup_with_budget(pool: &PgPool, pending: &PendingAd
     // Keep last error visible during retries instead of erasing a diagnostic.
     sqlx::query("update continuous_slots set pending_status='warming',readiness_frontier=null,updated_at=now() where id=$1")
         .bind(p.slot_id).execute(&mut *tx).await?;
+    let mut diagnostic=attempt_diagnostics(&mut tx,p.generation_id,p.slot_id).await?;
     tx.commit().await?;
+    diagnostic["duration_ms"]=(started.elapsed().as_millis() as u64).into();diagnostic["stage"]="claim".into();
+    diagnostics::emit(Level::Info,"live_initialization_claimed",diagnostic);
     Ok(Some(fence))
 }
 
 pub async fn report_warmup(pool: &PgPool, fence: &WarmupLease, status: &str, readiness_frontier: Option<i64>, error: Option<&Value>) -> Result<bool, DbError> {
+    let started=std::time::Instant::now();
+    let result=report_warmup_inner(pool,fence,status,readiness_frontier,error).await;
+    if !matches!(result,Ok(true)) {
+        let mut fields=warmup_diagnostic_fields(fence);
+        fields["stage"]=status.into();fields["duration_ms"]=(started.elapsed().as_millis() as u64).into();
+        fields["outcome"]=if result.is_err() {"error"}else{"rejected_stale_or_fenced"}.into();
+        if let Err(error)=&result {fields["error_code"]=diagnostics::db_error_code(error).into();}
+        diagnostics::emit(if result.is_err(){Level::Error}else{Level::Warn},"live_initialization_report_rejected",fields);
+    }
+    result
+}
+async fn report_warmup_inner(pool: &PgPool, fence: &WarmupLease, status: &str, readiness_frontier: Option<i64>, error: Option<&Value>) -> Result<bool, DbError> {
     if !matches!(status,"warming"|"ready"|"error") || (status=="ready" && readiness_frontier.is_none())
         || readiness_frontier.is_some_and(|v| v<0 || v%60!=0)
         || error.is_some_and(|v| !v.is_object() || v.to_string().len()>4096) {
@@ -232,6 +294,7 @@ pub async fn report_warmup(pool: &PgPool, fence: &WarmupLease, status: &str, rea
         return report_warmup_failure(pool,fence,error.unwrap_or(&json!({"code":"adaptive_warmup_failed"})),true).await;
     }
     let mut tx = pool.begin().await?;
+    control_timeouts(&mut tx).await?;
     if !lock_pending(&mut tx,fence).await? { return Ok(false); }
     sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update").execute(&mut *tx).await?;
     if !lease_current(&mut tx,fence).await? { return Ok(false); }
@@ -243,39 +306,56 @@ pub async fn report_warmup(pool: &PgPool, fence: &WarmupLease, status: &str, rea
     Ok(true)
 }
 
-async fn finish_failed_attempt(tx: &mut Transaction<'_,Postgres>, generation: i64, slot: i64, error: &Value, retryable: bool) -> Result<(),DbError> {
+async fn finish_failed_attempt(tx: &mut Transaction<'_,Postgres>, generation: i64, slot: i64, error: &Value, retryable: bool) -> Result<Value,DbError> {
+    let mut diagnostic=attempt_diagnostics(tx,generation,slot).await?;
     let exhausted:bool=sqlx::query_scalar("update continuous_generations set live_init_status=case when not $3 or live_init_attempts>=live_init_attempt_limit then 'exhausted' else 'retry' end,live_init_error=$2,live_init_deadline=null,live_init_next_attempt_at=clock_timestamp()+(case when live_init_attempts<=1 then 5 else 30 end)*interval '1 second' where id=$1 returning live_init_status='exhausted'")
         .bind(generation).bind(error).bind(retryable).fetch_one(&mut **tx).await?;
     sqlx::query("update continuous_slots set pending_generation_id=case when $3 then null else pending_generation_id end,pending_status='error',pending_error=$4,readiness_frontier=null,status=case when active_generation_id is not null then 'active' else 'error' end,updated_at=now() where id=$1 and pending_generation_id=$2")
         .bind(slot).bind(generation).bind(exhausted).bind(error).execute(&mut **tx).await?;
     sqlx::query("update adaptive_live_warmup_lane set slot_id=null,generation_id=null,lease_owner=null,lease_until=null,lease_token=lease_token+1 where id=1 and generation_id=$1")
         .bind(generation).execute(&mut **tx).await?;
-    Ok(())
+    diagnostic["outcome"]=if exhausted {"exhausted"}else{"retry"}.into();
+    diagnostic["error_code"]=error.get("code").cloned().unwrap_or(Value::Null);
+    diagnostic["reason"]=error.get("reason").cloned().unwrap_or(Value::Null);
+    Ok(diagnostic)
 }
 
 /// Caller has drained this attempt's CPU/I/O before releasing the global lane.
 pub async fn report_warmup_failure(pool:&PgPool,fence:&WarmupLease,error:&Value,retryable:bool)->Result<bool,DbError> {
+    let started=std::time::Instant::now();
     if !error.is_object() || error.to_string().len()>4096 {return Err(DbError::Json("invalid bounded live initialization failure".into()));}
     let mut tx=pool.begin().await?;
+    control_timeouts(&mut tx).await?;
     if !lock_pending(&mut tx,fence).await? {return Ok(false);}
     sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update").execute(&mut *tx).await?;
     if !lease_current(&mut tx,fence).await? {return Ok(false);}
-    finish_failed_attempt(&mut tx,fence.generation_id,fence.slot_id,error,retryable).await?;
+    let mut diagnostic=finish_failed_attempt(&mut tx,fence.generation_id,fence.slot_id,error,retryable).await?;
     tx.commit().await?;
+    diagnostic["duration_ms"]=(started.elapsed().as_millis() as u64).into();diagnostic["stage"]="failure".into();
+    diagnostics::emit(Level::Warn,"live_initialization_failed",diagnostic);
     Ok(true)
 }
 
 /// Expected cohort/CAS changes may yield without classifying the candidate as bad.
 pub async fn release_pending_warmup(pool:&PgPool,fence:&WarmupLease)->Result<bool,DbError> {
     let mut tx=pool.begin().await?;
-    if !lock_pending(&mut tx,fence).await? {return Ok(false);}
+    control_timeouts(&mut tx).await?;
+    // A neutral release changes only this claim's counter and lane. Do not
+    // queue behind research's owner lock or mutate incumbent pointers/cursors.
     sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update").execute(&mut *tx).await?;
-    if !lease_current(&mut tx,fence).await? {return Ok(false);}
+    // Acquire every potentially contended write lock BEFORE checking expiry;
+    // a claim that expires while waiting for its generation is not refundable.
+    sqlx::query("select id from continuous_generations where id=$1 for update").bind(fence.generation_id).execute(&mut *tx).await?;
+    if !lease_current(&mut tx,fence).await? || !pending_control_current(&mut tx,fence).await? {return Ok(false);}
+    let mut diagnostic=attempt_diagnostics(&mut tx,fence.generation_id,fence.slot_id).await?;
     sqlx::query("update continuous_generations set live_init_attempts=greatest(live_init_attempts-1,0),live_init_status='retry',live_init_deadline=null,live_init_next_attempt_at=clock_timestamp() where id=$1")
         .bind(fence.generation_id).execute(&mut *tx).await?;
     sqlx::query("update adaptive_live_warmup_lane set slot_id=null,generation_id=null,lease_owner=null,lease_until=null,lease_token=lease_token+1 where id=1")
         .execute(&mut *tx).await?;
-    tx.commit().await?;Ok(true)
+    tx.commit().await?;
+    diagnostic["outcome"]="neutral_yield".into();diagnostic["attempt_refunded"]=true.into();
+    diagnostics::emit(Level::Info,"live_initialization_yielded",diagnostic);
+    Ok(true)
 }
 
 /// Recovers abandoned claims, including the last allowed attempt. Read APIs stay pure.
@@ -286,17 +366,27 @@ pub async fn recover_pending_warmups(pool:&PgPool,owner:&str)->Result<u64,DbErro
     let rows=sqlx::query("select s.id slot_id,g.id generation_id from continuous_slots s join continuous_generations g on g.id=s.pending_generation_id where s.owner_id=$1 and g.live_init_status='running' order by s.id for update of s")
         .bind(owner).fetch_all(&mut *tx).await?;
     sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update").execute(&mut *tx).await?;
-    let mut count=0;
+    let mut count=0u64;
+    // At most the admitted pending slot count; scoped to this transaction only.
+    let mut recovered=Vec::new();
     for row in rows {
         let generation:i64=row.try_get("generation_id")?;
         let expired:bool=sqlx::query_scalar("select exists(select 1 from continuous_generations g where g.id=$1 and (g.live_init_deadline<=clock_timestamp() or not exists(select 1 from adaptive_live_warmup_lane w where w.generation_id=g.id and w.lease_owner is not null and w.lease_until>clock_timestamp())))")
             .bind(generation).fetch_one(&mut *tx).await?;
         if expired {
-            finish_failed_attempt(&mut tx,generation,row.try_get("slot_id")?,&json!({"code":"live_initialization_abandoned","message":"Initialization lease or fixed attempt budget expired"}),true).await?;
+            let facts=sqlx::query("select g.live_init_deadline<=clock_timestamp() deadline_expired,exists(select 1 from adaptive_live_warmup_lane w where w.generation_id=g.id and w.lease_owner is not null and w.lease_until is not null) lane_present from continuous_generations g where g.id=$1")
+                .bind(generation).fetch_one(&mut *tx).await?;
+            let reason=abandon_reason(facts.try_get::<Option<bool>,_>("deadline_expired")?.unwrap_or(false),facts.try_get("lane_present")?);
+            let diagnostic=finish_failed_attempt(&mut tx,generation,row.try_get("slot_id")?,&json!({"code":"live_initialization_abandoned","message":"Initialization lease or fixed attempt budget expired","reason":reason}),true).await?;
+            if recovered.len()<256 {recovered.push(diagnostic);}
             count+=1;
         }
     }
-    tx.commit().await?;Ok(count)
+    tx.commit().await?;
+    let omitted=count.saturating_sub(recovered.len() as u64);
+    for mut diagnostic in recovered {diagnostic["stage"]="recovery".into();diagnostics::emit(Level::Warn,"live_initialization_recovered",diagnostic);}
+    if omitted>0 {diagnostics::emit(Level::Warn,"live_initialization_recovery_summary",json!({"recovered":count,"diagnostic_records_omitted":omitted}));}
+    Ok(count)
 }
 
 fn validate_promotion(expected: &[CheckpointExpectation], frontier: i64, initial: &[InitialAdaptiveCheckpoint], generation: i64, waiting: &[WaitingInstrument], retired_unavailable:&[WaitingInstrument]) -> Result<(),DbError> {
@@ -353,6 +443,14 @@ pub async fn promote_pending_with_waiting(pool: &PgPool, fence: &WarmupLease, ex
 /// never count them as candidate readiness or invent cursor progress for them.
 #[allow(clippy::too_many_arguments)]
 pub async fn promote_pending_with_dispositions(pool: &PgPool, fence: &WarmupLease, expected_active_generation_id: Option<i64>, expected_checkpoints: &[CheckpointExpectation], readiness_frontier: i64, initial_new_checkpoints: &[InitialAdaptiveCheckpoint], waiting: &[WaitingInstrument], retired_unavailable:&[WaitingInstrument]) -> Result<bool, DbError> {
+    promote_pending_with_dispositions_guarded(pool,fence,expected_active_generation_id,expected_checkpoints,readiness_frontier,initial_new_checkpoints,waiting,retired_unavailable,||true).await
+}
+
+/// The synchronous final gate also fences a locally lost progress/supervision
+/// permit while an already-admitted CAS was waiting on database locks.
+#[allow(clippy::too_many_arguments)]
+pub async fn promote_pending_with_dispositions_guarded(pool: &PgPool, fence: &WarmupLease, expected_active_generation_id: Option<i64>, expected_checkpoints: &[CheckpointExpectation], readiness_frontier: i64, initial_new_checkpoints: &[InitialAdaptiveCheckpoint], waiting: &[WaitingInstrument], retired_unavailable:&[WaitingInstrument], can_commit:impl Fn()->bool) -> Result<bool, DbError> {
+    if !can_commit() {return Ok(false);}
     if initial_new_checkpoints.is_empty() {return Ok(false);}
     validate_promotion(expected_checkpoints,readiness_frontier,initial_new_checkpoints,fence.generation_id,waiting,retired_unavailable)?;
     let mut tx = pool.begin().await?;
@@ -399,12 +497,13 @@ pub async fn promote_pending_with_dispositions(pool: &PgPool, fence: &WarmupLeas
     }).collect();
     sqlx::query("update continuous_generations set live_readiness=$2,live_init_status='active',live_init_next_attempt_at=null,live_init_error=null where id=$1")
         .bind(fence.generation_id).bind(json!(readiness)).execute(&mut *tx).await?;
-    sqlx::query("update continuous_slots s set active_generation_id=s.pending_generation_id,pending_generation_id=null,pending_status=null,pending_error=null,readiness_frontier=null,live_watermark=$2,status='active',study_id=g.study_id,mean_expectancy=(g.result->>'meanExpectancy')::double precision,selected_cell=g.result->'selectedCell',updated_at=now() from continuous_generations g where s.id=$1 and g.id=s.pending_generation_id")
+    sqlx::query("update continuous_slots s set active_generation_id=s.pending_generation_id,pending_generation_id=null,pending_status=null,pending_error=null,readiness_frontier=null,live_watermark=$2,status='active',mean_expectancy=(g.result->>'meanExpectancy')::double precision,selected_cell=g.result->'selectedCell',updated_at=now() from continuous_generations g where s.id=$1 and g.id=s.pending_generation_id")
         .bind(fence.slot_id).bind(readiness_frontier).execute(&mut *tx).await?;
-    if !lease_current(&mut tx,fence).await? {return Ok(false);}
+    if !lease_current(&mut tx,fence).await? || !can_commit() {return Ok(false);}
     sqlx::query("update continuous_generations set live_init_deadline=null where id=$1")
         .bind(fence.generation_id).execute(&mut *tx).await?;
     sqlx::query("update adaptive_live_warmup_lane set slot_id=null,generation_id=null,lease_owner=null,lease_until=null where id=1").execute(&mut *tx).await?;
+    if !can_commit() {return Ok(false);}
     tx.commit().await?;
     Ok(true)
 }
@@ -501,6 +600,14 @@ pub(super) async fn supersede_pending(tx:&mut Transaction<'_,Postgres>,slot:i64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abandonment_reasons_distinguish_fixed_deadline_expired_lease_and_missing_lane() {
+        assert_eq!(serde_json::to_value(abandon_reason(true,true)).unwrap(),"deadline");
+        assert_eq!(serde_json::to_value(abandon_reason(false,true)).unwrap(),"lease");
+        assert_eq!(serde_json::to_value(abandon_reason(false,false)).unwrap(),"lane-missing");
+        assert_eq!(abandon_reason(true,false),AbandonReason::Deadline);
+    }
 
     #[test]
     fn public_readiness_summary_counts_entire_declared_scope_and_bounds_reasons() {

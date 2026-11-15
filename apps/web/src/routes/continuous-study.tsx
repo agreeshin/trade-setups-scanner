@@ -57,6 +57,7 @@ function SlotIncumbent({ slot }: { slot: ContinuousSlot }) {
   if (slot.activeGenerationId === null) return <div className="grid gap-1 text-xs"><span className="text-sm">Нет действующего поколения</span><span>Адаптивные сигналы этого профиля не формируются.</span><SlotReadiness slot={slot} /></div>;
   return <div className="grid gap-1 text-xs">
     <span className="text-sm">{slot.activeStatus === "active" ? "Действующее" : "Принятое"} поколение #{slot.activeGenerationId}</span>
+    <span>{slot.activeStudyId == null ? "Исследование действующего поколения неизвестно" : `Источник метрик и рекомендации: исследование #${slot.activeStudyId} · поколение #${slot.activeGenerationId}`}</span>
     <Badge>{slot.activeStatus === "active" ? "Активно" : slot.activeStatus === "inactive" ? "Неактивно" : "Состояние live неизвестно (старый API)"}</Badge>
     <span>Принятое поколение сохранено</span>
     <SlotReadiness slot={slot} />
@@ -82,6 +83,7 @@ function SlotPending({ slot }: { slot: ContinuousSlot }) {
   const error = pendingErrorMessage(slot.pendingError) ?? (slot.pendingStatus === "error" ? "Описание ошибки не передано." : null);
   return <div className="grid gap-1 text-xs">
     {slot.pendingGenerationId != null && <span className="text-sm">Кандидат #{slot.pendingGenerationId}</span>}
+    {slot.pendingStudyId != null && <span>Исследование кандидата #{slot.pendingStudyId}</span>}
     {absent ? <span>Нет кандидата на замену</span> : <Badge variant={slot.pendingStatus === "error" ? "danger" : "neutral"}>{legacy ? "Статус инициализации live неизвестен (старый API)" : slot.pendingStatus ? pendingStatuses[slot.pendingStatus] ?? `Состояние кандидата: ${slot.pendingStatus.slice(0, 120)}` : "Статус инициализации live неизвестен"}</Badge>}
     {!legacy && !absent && <span>{slot.readinessFrontier === undefined ? "Граница готовности неизвестна" : slot.readinessFrontier === null ? "Граница готовности ещё не подтверждена" : `Граница готовности (закрытие минуты): ${closedTime(slot.readinessFrontier)}`}</span>}
     {error && <p role="alert" className="text-destructive">Ошибка кандидата: {error}</p>}
@@ -92,6 +94,17 @@ function hasNoProfileResults(slot: ContinuousSlot): boolean {
   return slot.studyId === null && slot.activeGenerationId === null && slot.pendingGenerationId == null
     && slot.meanExpectancy === null && slot.selectedCell === null && slot.pendingStatus == null
     && slot.pendingError == null && slot.readinessFrontier == null && slot.liveWatermark == null;
+}
+
+function SlotResearch({ slot }: { slot: ContinuousSlot }) {
+  return <div className="grid gap-1 text-xs">
+    <Badge>{slotStatuses[slot.status] ?? phases[slot.status] ?? slot.status}</Badge>
+    {slot.runningStudyId != null && <span>Идёт исследование #{slot.runningStudyId}</span>}
+    <span>{slot.finalizedGenerationId === undefined ? "Происхождение сохранённого результата неизвестно (старый API)"
+      : slot.studyId === null ? hasNoProfileResults(slot) ? "Результатов нет" : "Полностью завершённых исследований нет"
+      : `Сохранённое исследование #${slot.studyId}`}</span>
+    {slot.finalizedGenerationId != null && <span>Полностью завершённое поколение #{slot.finalizedGenerationId}</span>}
+  </div>;
 }
 
 
@@ -203,13 +216,13 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
     {process && <>
       <p className="text-sm">Ревизия конфигурации: {process.configRevision}{process.activeStudyId !== null ? ` · Исследование #${process.activeStudyId}` : ""}{process.phase ? ` · ${phases[process.phase] ?? process.phase}` : ""}</p>
       {process.error && <Alert variant="destructive">{process.error.code}: {process.error.message}. Технический сбой не означает непрохождение допуска; прежний принятый профиль может сохраняться.</Alert>}
-      <p className="text-xs text-muted-foreground">Исследование принято — это готовность рекомендаций, а не live. Кандидат независимо инициализируется по текущим закрытым свечам, без повторной проверки исторического результата. Сохранённое исследование может относиться к кандидату; при сохранённом принятом поколении среднее и рекомендация относятся к нему. Новые рекомендации поступят после следующего полного исследования слота. Новое поколение действует после watermark закрытой минуты.</p>
+      <p className="text-xs text-muted-foreground">Исследование принято — это готовность рекомендаций, а не live. Кандидат независимо инициализируется по текущим закрытым свечам, без повторной проверки исторического результата. Сохранённое исследование относится к последнему полностью завершённому поколению после replay, аналитики и gate; идущее исследование показано отдельно. При сохранённом принятом поколении среднее и рекомендация относятся к его собственному исследованию. Новые рекомендации поступят после следующего полного исследования слота. Новое поколение действует после watermark закрытой минуты.</p>
       <p className="text-xs text-muted-foreground">Это настроенные пороги, а не история исследований. Очистка сохраняет их настройки. Дата ниже — изменение состояния профиля, включая сброс при очистке, а не дата исследования.</p>
       <div className="overflow-x-auto"><Table aria-label={`Настроенные адаптивные профили · ${algorithmDisplayName(algorithm)}`}>
         <TableHeader><TableRow>{["Минимум сетапов в день", "Исследование / допуск", "Принятое поколение / live", "Кандидат / инициализация live", "Среднее матрицы", "Рекомендация", "Изменение состояния профиля"].map((title) => <TableHead key={title}>{title}</TableHead>)}</TableRow></TableHeader>
         <TableBody>{process.slots.map((slot) => <TableRow key={slot.id}>
           <TableCell>{slot.minSetupsPerDay === 0 ? "0 · без частотного допуска" : slot.minSetupsPerDay}</TableCell>
-          <TableCell><div className="grid gap-1"><Badge>{slotStatuses[slot.status] ?? slot.status}</Badge><span className="text-xs">{hasNoProfileResults(slot) ? "Результатов нет" : slot.studyId === null ? "Сохранённое исследование не указано" : `Сохранённое исследование #${slot.studyId}`}</span></div></TableCell>
+          <TableCell><SlotResearch slot={slot} /></TableCell>
           <TableCell><SlotIncumbent slot={slot} /></TableCell>
           <TableCell><SlotPending slot={slot} /></TableCell>
           <TableCell>{slot.meanExpectancy === null ? "—" : `${slot.meanExpectancy.toFixed(2)} R`}</TableCell>

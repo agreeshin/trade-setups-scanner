@@ -55,6 +55,11 @@ const incumbentSlot = { id: 5, minSetupsPerDay: 4, status: "warming", activeGene
   selectedCell: { tpPct: 14, slPct: 4, rawR: 0.32, meanR: 0.21, robustScore: 0.01 }, updatedAt: "2026-11-12T12:00:00Z" };
 const readinessSummary = { generationId: 7, totalInstruments: 822, readyInstruments: 815, waitingInstruments: 7,
   waitingReasons: [{ reason: "insufficient_history", count: 5 }, { reason: "waiting_tail", count: 2 }], otherWaitingInstruments: 0 };
+it("preserves separate running, finalized, pending and incumbent study provenance", async () => {
+  const slot = { ...incumbentSlot, runningStudyId: 43, finalizedGenerationId: 8, pendingGenerationId: 8, pendingStudyId: 42, activeStudyId: 41 };
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ...process, slots: [slot] })))));
+  expect((await getContinuousStudy("future", new AbortController().signal)).slots[0]).toEqual(slot);
+});
 it.each([readinessSummary, null])("accepts the optional active-generation readiness summary without changing its scope: %j", async (liveReadinessSummary) => {
   const configured = { ...process, slots: [{ ...incumbentSlot, liveReadinessSummary }] };
   vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(configured)))));
@@ -98,6 +103,7 @@ it("accepts explicit inactive/null fields and leaves legacy readiness absent rat
 });
 it.each([
   { activeStatus: "warming" }, { activeStatus: null }, { pendingGenerationId: 0 }, { pendingGenerationId: -1 }, { pendingGenerationId: "8" }, { pendingGenerationId: 1.5 },
+  { runningStudyId: 0 }, { finalizedGenerationId: "8" }, { activeStudyId: -1 }, { pendingStudyId: 1.5 },
   { pendingStatus: 7 }, { readinessFrontier: -60 }, { readinessFrontier: closedBoundary + 1 }, { readinessFrontier: "1794484800" },
   { liveWatermark: -60 }, { liveWatermark: closedBoundary + 0.5 }, { liveWatermark: Number.MAX_SAFE_INTEGER + 1 }, { liveWatermark: "0" },
 ])("rejects malformed rollout fields %j", async (patch) => {

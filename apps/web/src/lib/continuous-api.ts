@@ -48,6 +48,12 @@ export interface ContinuousSlot {
   liveWatermark?: number | null;
   /** Active-generation initialization coverage; absence is unknown, never all-ready. */
   liveReadinessSummary?: LiveReadinessSummary | null;
+  /** Optional for old-API detection; null means no corresponding generation. */
+  runningStudyId?: number | null;
+  finalizedGenerationId?: number | null;
+  activeStudyId?: number | null;
+  pendingStudyId?: number | null;
+  /** Last fully finalized continuous result, not search-stage completion. */
   studyId: number | null;
   meanExpectancy: number | null;
   selectedCell: RecommendedCell | null;
@@ -112,6 +118,7 @@ function isProcess(value: unknown): value is ContinuousProcess {
       && Number.isSafeInteger(slot.id) && slot.id > 0 && typeof slot.status === "string" && Number.isFinite(slot.minSetupsPerDay) && nullableId(slot.activeGenerationId) && nullableId(slot.studyId)
       && (slot.activeStatus === undefined || slot.activeStatus === "active" || slot.activeStatus === "inactive")
       && (slot.pendingGenerationId === undefined || nullableId(slot.pendingGenerationId))
+      && [slot.runningStudyId, slot.finalizedGenerationId, slot.activeStudyId, slot.pendingStudyId].every((id) => id === undefined || nullableId(id))
       && (slot.pendingStatus === undefined || slot.pendingStatus === null || typeof slot.pendingStatus === "string")
       && optionalClosedBoundary(slot.readinessFrontier) && optionalClosedBoundary(slot.liveWatermark)
       && (slot.liveReadinessSummary == null || isLiveReadinessSummary(slot.liveReadinessSummary))

@@ -180,9 +180,14 @@ pub struct LiveHandle {
 
 impl LiveHandle {
     pub async fn stop(self) {
+        let started=std::time::Instant::now();
+        setups_db::diagnostics::emit(setups_db::diagnostics::Level::Info,"live_shutdown_requested",json!({"stage":"drain_and_join"}));
         self.stopped.store(true, Ordering::SeqCst);
         self.notify.notify_waiters();
-        let _ = self.task.await;
+        let result=self.task.await;
+        setups_db::diagnostics::emit(if result.is_err(){setups_db::diagnostics::Level::Error}else{setups_db::diagnostics::Level::Info},
+            "live_shutdown_joined",json!({"duration_ms":started.elapsed().as_millis() as u64,
+                "outcome":match result {Ok(())=>"joined",Err(error) if error.is_cancelled()=>"cancelled",Err(_)=>"task_panicked"}}));
     }
 }
 
