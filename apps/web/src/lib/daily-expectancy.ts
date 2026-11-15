@@ -12,19 +12,10 @@ export interface DailyExpectancyPoint {
   cachedCount: number;
 }
 export interface DailyExpectancyCoordinate extends DailyExpectancyPoint { x: number }
-export interface DailyExpectancyTrend {
-  slopePerDay: number;
-  meanX: number;
-  meanY: number;
-  start: { x: number; riskExpectancy: number };
-  end: { x: number; riskExpectancy: number };
-  totalChange: number;
-}
 export interface DailyExpectancyModel {
   originUnix: number;
   points: DailyExpectancyCoordinate[];
   segments: DailyExpectancyCoordinate[][];
-  trend: DailyExpectancyTrend | null;
 }
 
 /** One UTC day per represented signal date; no missing-day zero fill or browser timezone. */
@@ -56,12 +47,11 @@ export function utcDayStart(unix: number): number {
   return Math.floor(unix / SECONDS_PER_DAY) * SECONDS_PER_DAY;
 }
 
-/** Historical model only. The caller fixes the displayed period's origin; no live forecasting. */
+/** Calendar geometry only. Fitting/SE belong to the shared Rust analytics solver. */
 export function buildDailyExpectancyModel(items: readonly DailyExpectancyPoint[], periodStartUnix: number): DailyExpectancyModel {
   const originUnix = utcDayStart(periodStartUnix);
   const points = items.map((item) => ({ ...item, x: (item.dayStartUnix - originUnix) / SECONDS_PER_DAY }));
   const segments: DailyExpectancyCoordinate[][] = [];
-  const finite: { x: number; value: number }[] = [];
   let segment: DailyExpectancyCoordinate[] = [];
   let previousDay = -Infinity;
   for (const point of points) {
@@ -72,29 +62,8 @@ export function buildDailyExpectancyModel(items: readonly DailyExpectancyPoint[]
       segment = [];
     } else {
       segment.push(point);
-      finite.push({ x: point.x, value: point.riskExpectancy });
     }
   }
   if (segment.length > 0) segments.push(segment);
-  let trend: DailyExpectancyTrend | null = null;
-  if (finite.length > 1) {
-    const meanX = finite.reduce((sum, point) => sum + point.x, 0) / finite.length;
-    const meanY = finite.reduce((sum, point) => sum + point.value, 0) / finite.length;
-    let covariance = 0;
-    let variance = 0;
-    for (const point of finite) {
-      covariance += (point.x - meanX) * (point.value - meanY);
-      variance += (point.x - meanX) ** 2;
-    }
-    if (variance > 0) {
-      const slopePerDay = covariance / variance;
-      const fittedAt = (x: number) => meanY + slopePerDay * (x - meanX);
-      const first = finite[0]!;
-      const last = finite[finite.length - 1]!;
-      const start = { x: first.x, riskExpectancy: fittedAt(first.x) };
-      const end = { x: last.x, riskExpectancy: fittedAt(last.x) };
-      trend = { slopePerDay, meanX, meanY, start, end, totalChange: end.riskExpectancy - start.riskExpectancy };
-    }
-  }
-  return { originUnix, points, segments, trend };
+  return { originUnix, points, segments };
 }

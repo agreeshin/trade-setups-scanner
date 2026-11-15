@@ -1,4 +1,5 @@
 import { apiFetch } from "./platform-api";
+import type { TrendBendDays, TrendMode } from "./analytics-api";
 
 export type AnalyticsSectionKey = "short-matrix" | "short-trades" | "long-matrix" | "long-trades";
 
@@ -9,6 +10,8 @@ export interface AnalyticsUserSettings {
   maturity: number;
   clusterGapInput: string;
   autoCalc: boolean;
+  trendBendDays: TrendBendDays;
+  trendMode: TrendMode;
   sections: Partial<Record<AnalyticsSectionKey, Record<string, unknown>>>;
 }
 
@@ -25,6 +28,8 @@ export async function fetchAnalyticsSettings(): Promise<AnalyticsUserSettings | 
     maturity: typeof partial.maturity === "number" && Number.isFinite(partial.maturity) ? partial.maturity : 0.5,
     clusterGapInput: typeof partial.clusterGapInput === "string" && partial.clusterGapInput !== "" ? partial.clusterGapInput : "8",
     autoCalc: partial.autoCalc === true,
+    trendBendDays: partial.trendBendDays === "7" || partial.trendBendDays === "14" || partial.trendBendDays === "30" ? partial.trendBendDays : "linear",
+    trendMode: partial.trendMode === "forecast" ? "forecast" : "mean",
     sections: partial.sections !== null && typeof partial.sections === "object" ? partial.sections : {},
   };
 }

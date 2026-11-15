@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AnalyticsPage } from "./analytics-page";
-import type { TradeRow } from "../lib/analytics-api";
+import type { MatrixCellRef, TradeRow, TrendInput, TrendSummary } from "../lib/analytics-api";
 import { applyInterfaceSettings } from "../lib/datetime-format";
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); applyInterfaceSettings({ timezone: "auto" }); });
@@ -28,11 +28,28 @@ function matrixCell(tpPct: number, slPct: number, risk: number | null) {
 
 interface StubOptions {
   sets?: typeof setFixture[];
-  shortBulk?: { tpPct: number; slPct: number; avgMovePct: number | null; riskExpectancy: number | null }[];
-  longBulk?: { tpPct: number; slPct: number; avgMovePct: number | null; riskExpectancy: number | null }[];
+  shortBulk?: MatrixCellRef[];
+  longBulk?: MatrixCellRef[];
   interceptMatrixGrid?: (direction: string) => Promise<Response> | undefined;
   savedSettings?: Record<string, unknown>;
   tradeRows?: TradeRow[];
+  trend?: TrendSummary | null;
+  trendError?: boolean;
+  interceptTrend?: (signal: AbortSignal | undefined) => Promise<Response>;
+}
+
+// Transport fixture only; spline/SE arithmetic is tested in Rust. This weighted
+// line supplies known values for the legacy calendar/viewport rendering cases.
+function fixtureTrend(points: TrendInput[]): TrendSummary | null {
+  const finite = points.filter((p): p is TrendInput & { value: number } => p.value !== null && p.weight > 0);
+  if (finite.length < 2) return null;
+  const weight = finite.reduce((sum, p) => sum + p.weight, 0);
+  const meanX = finite.reduce((sum, p) => sum + p.day * p.weight, 0) / weight;
+  const meanY = finite.reduce((sum, p) => sum + p.value * p.weight, 0) / weight;
+  const slope = finite.reduce((sum, p) => sum + p.weight * (p.day - meanX) * (p.value - meanY), 0) / finite.reduce((sum, p) => sum + p.weight * (p.day - meanX) ** 2, 0);
+  const start = { day: finite[0]!.day, value: meanY + slope * (finite[0]!.day - meanX), se: finite.length > 2 ? 0.2 : null };
+  const end = { day: finite[finite.length - 1]!.day, value: meanY + slope * (finite[finite.length - 1]!.day - meanX), se: start.se };
+  return { method: "linear", start, end, endpointSe: end.se, curve: [start, end] };
 }
 
 function stubFetch(options: StubOptions = {}) {
@@ -43,6 +60,12 @@ function stubFetch(options: StubOptions = {}) {
     const method = init?.method ?? "GET";
     calls.push({ method, path: path.split("?")[0]!, search: path.split("?")[1] ?? "", ...(typeof init?.body === "string" ? { body: init.body } : {}) });
     const json = (body: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(body), { status }));
+    if (path === "/v1/analytics/trend") {
+      if (options.interceptTrend) return options.interceptTrend(init?.signal ?? undefined);
+      if (options.trendError) return json({ error: "trend unavailable" }, 503);
+      const request = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as { points: TrendInput[] };
+      return json({ trend: options.trend === undefined ? fixtureTrend(request.points) : options.trend });
+    }
     if (path.startsWith("/v1/settings/web-analytics")) {
       if (method === "PUT") return json({ settings: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : {} });
       return json({ settings: options.savedSettings ?? {} });
@@ -394,11 +417,10 @@ it.each(["America/New_York", "Pacific/Auckland"])("renders calendar UTC spacing,
     "04.01 UTC: -1.00R, закрыто 1, TP 0, SL 1, из кеша 1/1",
     "10.01 UTC: +2.00R, закрыто 1, TP 1, SL 0, из кеша 1/1",
   ]);
-  expect(chart.querySelectorAll("polyline")).toHaveLength(1); // The represented null day breaks the first segment.
-  expect(chart.querySelector("polyline")?.getAttribute("points")?.split(" ")).toHaveLength(2);
-  expect(screen.getByLabelText("Начало тренда: +0.00R")).toHaveTextContent("+0.00R");
-  expect(screen.getByLabelText("Конец тренда: +1.50R")).toHaveTextContent("+1.50R");
-  expect(chart.querySelector('line[stroke-dasharray="4 4"] title')).toHaveTextContent("+0.17R/день UTC, за период +1.50R");
+  expect(chart.querySelector('polyline:not([data-testid])')?.getAttribute("points")?.split(" ")).toHaveLength(2); // Null day breaks the observed series, not the fitted curve.
+  expect(await screen.findByLabelText("Начало тренда: +0.59R")).toHaveTextContent("+0.59R");
+  expect(screen.getByLabelText("Конец тренда: +1.38R")).toHaveTextContent("+1.38R");
+  expect(chart.querySelector('[data-testid="trend-curve"] title')).toHaveTextContent("Взвешенная прямая: изменение +0.79R");
   expect(chart).toHaveTextContent("Дата сетапа (UTC)");
   expect(chart).not.toHaveTextContent("Дата сигнала");
   expect(screen.getByRole("heading", { name: /^Дневное матожидание в рисках/ })).toHaveTextContent("Среднее МО: +0.80R");
@@ -412,7 +434,9 @@ it.each(["America/New_York", "Pacific/Auckland"])("renders calendar UTC spacing,
   expect(screen.getByText("Матожидание: +0.80R по 5 закрытым")).toBeInTheDocument(); // Trade-weighted, not 2/3 daily mean.
   expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(1);
   expect(calls.some((call) => call.path.startsWith("/v1/analytics/trades/"))).toBe(false);
-  expect(calls.some((call) => call.method !== "GET")).toBe(false);
+  expect(calls.filter((call) => call.method !== "GET").map((call) => call.path)).toEqual(["/v1/analytics/trend"]);
+  const trendRequest = JSON.parse(calls.find((call) => call.path === "/v1/analytics/trend")!.body!) as { points: TrendInput[] };
+  expect(trendRequest.points.map((p) => p.weight)).toEqual([3, 1, 1, 1]);
 });
 
 it.each([
@@ -454,10 +478,77 @@ it("keeps both fitted endpoint values in the SVG viewport even when OLS extends 
   render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
   await screen.findByText("Сделок: 3 / 3");
-  const start = screen.getByLabelText("Начало тренда: +0.17R");
+  const start = await screen.findByLabelText("Начало тренда: +0.17R");
   const end = screen.getByLabelText("Конец тренда: +1.17R");
   for (const label of [start, end]) {
     expect(Number(label.getAttribute("y"))).toBeGreaterThan(10); expect(Number(label.getAttribute("y"))).toBeLessThan(224);
   }
   expect(start).toHaveAttribute("text-anchor", "start"); expect(end).toHaveAttribute("text-anchor", "end");
+});
+
+it("restores trend controls, sends forecast cache dimensions and exposes matrix uncertainty", async () => {
+  const calls = stubFetch({ savedSettings: { trendBendDays: "14", trendMode: "forecast" }, shortBulk: [{ ...matrixCell(4, 4, 0.42), endpointSe: 0.15 }] });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  expect(screen.getByLabelText("Перегиб на N дней")).toHaveValue("14");
+  expect(screen.getByRole("button", { name: "Прогноз по тренду" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("heading", { name: "Прогноз матожидания по тренду" })).toBeInTheDocument();
+  expect(calls.some((call) => call.path === "/v1/analytics/matrix-grid")).toBe(false);
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  const cell = await screen.findByText("0.42");
+  expect(cell).toHaveAttribute("title", expect.stringContaining("SE 0.150 R · 95% ±0.294 R"));
+  const query = new URLSearchParams(calls.find((call) => call.path === "/v1/analytics/matrix-grid")!.search);
+  expect(query.get("trendMode")).toBe("forecast"); expect(query.get("trendBendDays")).toBe("14");
+  // A changed forecast identity cannot relabel already-computed cells.
+  fireEvent.change(screen.getByLabelText("Перегиб на N дней"), { target: { value: "7" } });
+  expect(screen.queryByText("0.42")).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Среднее" }));
+  expect(screen.getByRole("button", { name: "Среднее" })).toHaveAttribute("aria-pressed", "true");
+  await waitFor(() => expect(calls.some((call) => call.method === "PUT")).toBe(true), { timeout: 3000 });
+  const saved = JSON.parse(calls.findLast((call) => call.method === "PUT")!.body!) as Record<string, unknown>;
+  expect(saved).toMatchObject({ trendMode: "mean", trendBendDays: "7" });
+});
+
+it("draws the server P-spline and translucent CI within data bounds without changing the trade mean", async () => {
+  const day = Date.parse("2026-01-01T00:00:00Z") / 86400000;
+  const curve = [
+    { day, value: -0.5, se: 0.1 }, { day: day + 1, value: 0.5, se: 0.3 },
+    { day: day + 2, value: -0.25, se: 0.5 }, { day: day + 3, value: 0.75, se: 0.7 },
+  ];
+  const calls = stubFetch({ ...utcChartOptions([0, 1, 2, 3].map((i) => utcTrade(`2026-01-0${i + 1}T12:00:00Z`, i % 2 === 0 ? -1 : 1, i))),
+    savedSettings: { trendBendDays: "7" }, trend: { method: "p_spline", start: curve[0]!, end: curve[3]!, endpointSe: 0.7, curve } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  const line = await screen.findByTestId("trend-curve");
+  expect(line.querySelector("title")).toHaveTextContent("P-spline");
+  const vertices = line.getAttribute("points")!.split(" ").map((p) => p.split(",").map(Number));
+  expect(vertices).toHaveLength(4); expect(vertices[0]![0]).toBe(64); expect(vertices[3]![0]).toBe(736);
+  const band = screen.getByTestId("trend-ci-band");
+  expect(band).toHaveClass("fill-warning/15");
+  const bandVertices = band.getAttribute("points")!.split(" ").map((p) => p.split(",").map(Number));
+  expect(bandVertices).toHaveLength(8);
+  expect(bandVertices.every(([x, y]) => x! >= 64 && x! <= 736 && y! >= 24 && y! <= 224)).toBe(true);
+  expect(screen.getByLabelText("Конец тренда: +0.75R")).toBeInTheDocument();
+  expect(screen.getByLabelText("Среднее МО за период")).toHaveTextContent("+0.00R");
+  const request = JSON.parse(calls.find((call) => call.path === "/v1/analytics/trend")!.body!) as { trendBendDays: string };
+  expect(request.trendBendDays).toBe("7");
+});
+
+it("reports curve failures and aborts owned curve work on replacement and unmount", async () => {
+  const pending: AbortSignal[] = [];
+  let attempts = 0;
+  stubFetch({ ...utcChartOptions([utcTrade("2026-01-01T12:00:00Z", -1, 0), utcTrade("2026-01-02T12:00:00Z", 1, 1)]), interceptTrend: (signal) => {
+    attempts += 1;
+    if (attempts === 1) return Promise.resolve(new Response("unavailable", { status: 503 }));
+    pending.push(signal!); return new Promise<Response>(() => undefined);
+  } });
+  const view = render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  expect(await screen.findByText(/Не удалось рассчитать тренд: HTTP 503/)).toBeInTheDocument();
+  expect(screen.queryByTestId("trend-curve")).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Перегиб на N дней"), { target: { value: "7" } });
+  await waitFor(() => expect(pending).toHaveLength(1));
+  fireEvent.change(screen.getByLabelText("Перегиб на N дней"), { target: { value: "14" } });
+  expect(pending[0]!.aborted).toBe(true);
+  await waitFor(() => expect(pending).toHaveLength(2));
+  view.unmount(); expect(pending[1]!.aborted).toBe(true);
 });

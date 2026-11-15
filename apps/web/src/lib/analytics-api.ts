@@ -1,5 +1,27 @@
 import { apiFetch } from "./platform-api";
 
+export type TrendBendDays = "7" | "14" | "30" | "linear";
+export type TrendMode = "mean" | "forecast";
+export interface TrendPoint { day: number; value: number; se: number | null }
+export interface TrendSummary {
+  method: "linear" | "p_spline";
+  start: TrendPoint;
+  end: TrendPoint;
+  endpointSe: number | null;
+  curve: TrendPoint[];
+}
+export interface TrendInput { day: number; value: number | null; weight: number }
+
+/** Same Rust solver as forecast matrices. Abort on changed data/unmount. */
+export async function fetchDailyTrend(points: TrendInput[], trendBendDays: TrendBendDays, signal: AbortSignal): Promise<TrendSummary | null> {
+  const response = await apiFetch("/v1/analytics/trend", {
+    method: "POST", signal, headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ points, trendBendDays }),
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 120)}`);
+  return ((await response.json()) as { trend: TrendSummary | null }).trend;
+}
+
 export interface AnalyticsSet {
   setId: string;
   kind: "batch" | "run";
@@ -35,6 +57,8 @@ export interface SelectionMetrics {
 }
 
 export interface MatrixCellPayload {
+  endpointSe?: number | null;
+  meanRiskExpectancy?: number | null;
   tpPct: number;
   slPct: number;
   direction: "short" | "long";
@@ -77,6 +101,8 @@ export interface TradeRow {
 }
 
 export interface MatrixCellRef {
+  endpointSe?: number | null;
+  meanRiskExpectancy?: number | null;
   tpPct: number;
   slPct: number;
   avgMovePct: number | null;
@@ -84,6 +110,8 @@ export interface MatrixCellRef {
 }
 
 export interface AnalyticsQueryParams {
+  trendBendDays?: TrendBendDays;
+  trendMode?: TrendMode;
   set: string;
   direction?: "short" | "long";
   month?: string;
@@ -100,6 +128,8 @@ export interface AnalyticsQueryParams {
 
 function toQuery(params: AnalyticsQueryParams): URLSearchParams {
   const search = new URLSearchParams({ set: params.set });
+  if (params.trendBendDays !== undefined) search.set("trendBendDays", params.trendBendDays);
+  if (params.trendMode !== undefined) search.set("trendMode", params.trendMode);
   if (params.direction !== undefined) search.set("direction", params.direction);
   if (params.month !== undefined) search.set("month", params.month);
   if (params.setupMaturity !== undefined) search.set("setupMaturity", String(params.setupMaturity));

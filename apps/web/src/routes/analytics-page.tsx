@@ -23,6 +23,10 @@ import {
   fetchAnalyticsSetups,
   fetchTradeRow,
   fetchTradeRows,
+  fetchDailyTrend,
+  type TrendBendDays,
+  type TrendMode,
+  type TrendSummary,
   type AnalyticsSet,
   type MatrixCellRef,
   type SelectionMetrics,
@@ -78,6 +82,8 @@ function matrixCellTextStep(value: number, min: number, max: number): number {
 }
 
 interface MatrixSectionProps {
+  trendBendDays: TrendBendDays;
+  trendMode: TrendMode;
   setId: string;
   description: string;
   direction: "short" | "long";
@@ -99,7 +105,7 @@ interface MatrixSectionProps {
 function MatrixSection({
   setId, description, direction, tpLevels, slLevels, enablePriceChange,
   gradientMinDefault, gradientMaxDefault, clusterize, maturity, clusterGapHours, setBounds,
-  initial, reportState, onCommit, runToken,
+  initial, reportState, onCommit, runToken, trendBendDays, trendMode,
 }: MatrixSectionProps) {
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(() => normalizeTimeRange(initial?.timeRange));
   const [timeShiftInput, setTimeShiftInput] = useState(() => savedString(initial?.timeShiftInput, "0"));
@@ -110,6 +116,7 @@ function MatrixSection({
   const [gradientMin, setGradientMin] = useState(() => savedNumber(initial?.gradientMin, gradientMinDefault));
   const [gradientMax, setGradientMax] = useState(() => savedNumber(initial?.gradientMax, gradientMaxDefault));
   const [cells, setCells] = useState<Map<string, MatrixCellRef>>(new Map());
+  const [resultTrend, setResultTrend] = useState<{ mode: TrendMode; bend: TrendBendDays } | null>(null);
   const [metrics, setMetrics] = useState<SelectionMetrics | null>(null);
   const [running, setRunning] = useState(false);
   const [pendingCell, setPendingCell] = useState<string | null>(null);
@@ -139,6 +146,8 @@ function MatrixSection({
     const baseParams = {
       set: setId,
       direction,
+      trendBendDays,
+      trendMode,
       ...timeRangeParams(timeRange),
       ...(clusterize ? {
         setupMaturity: maturity,
@@ -153,6 +162,7 @@ function MatrixSection({
       if (stale()) return;
       const nextCells = new Map(grid.items.map((item) => [`${item.tpPct}:${item.slPct}`, item]));
       setCells(nextCells);
+      setResultTrend({ mode: trendMode, bend: trendBendDays });
       setMetrics(grid);
       setProgress({ done: nextCells.size, total: totalCells });
     } catch (cause) {
@@ -163,7 +173,7 @@ function MatrixSection({
         setPendingCell(null);
       }
     }
-  }, [setId, direction, timeRange, clusterize, maturity, clusterGapHours, tpLevels, slLevels, totalCells]);
+  }, [setId, direction, timeRange, clusterize, maturity, clusterGapHours, tpLevels, slLevels, totalCells, trendBendDays, trendMode]);
 
   const appliedShift = Math.max(0, Math.round(parseNumberInput(timeShiftInput) ?? 0));
   const appliedPriceChange = enablePriceChange && considerPriceChange ? (parseNumberInput(priceChangeInput) ?? 0) : null;
@@ -182,7 +192,7 @@ function MatrixSection({
 
   return <section className="grid min-w-0 gap-4">
       <div className="grid gap-1">
-        <h2 className="text-lg font-semibold">Среднее матожидание сетапов</h2>
+        <h2 className="text-lg font-semibold">{trendMode === "forecast" ? "Прогноз матожидания по тренду" : "Среднее матожидание сетапов"}</h2>
         <InfoNote>{description}</InfoNote>
       </div>
       <div className="flex flex-wrap items-end gap-3">
@@ -263,7 +273,7 @@ function MatrixSection({
               <TableRow key={tp}>
                 <TableHead numeric>{tp}%</TableHead>
                 {slLevels.map((sl) => {
-                  const cell = cells.get(`${tp}:${sl}`);
+                  const cell = resultTrend?.mode === trendMode && (trendMode === "mean" || resultTrend.bend === trendBendDays) ? cells.get(`${tp}:${sl}`) : undefined;
                   if (cell === undefined) {
                     if (running && pendingCell === `${tp}:${sl}`) {
                       return <TableCell key={sl} numeric className="text-muted-foreground"><Spinner label="Расчёт ячейки" /></TableCell>;
@@ -277,7 +287,7 @@ function MatrixSection({
                     key={sl}
                     numeric
                     className={`tabular-nums font-bold analytics-cell-text-${matrixCellTextStep(cell.riskExpectancy, gradientMin, gradientMax)}`}
-                    title={`avg ${cell.avgMovePct?.toFixed(2) ?? "—"}% · R ${cell.riskExpectancy.toFixed(3)}`}
+                    title={`avg ${cell.avgMovePct?.toFixed(2) ?? "—"}% · R ${cell.riskExpectancy.toFixed(3)}${trendMode === "forecast" ? ` · SE ${cell.endpointSe?.toFixed(3) ?? "—"} R · 95% ±${cell.endpointSe != null ? (1.96 * cell.endpointSe).toFixed(3) : "—"} R` : ""}`}
                   >
                     {cell.riskExpectancy.toFixed(2)}
                   </TableCell>;
@@ -287,7 +297,7 @@ function MatrixSection({
           </TableBody>
         </Table>
       </div>
-       <InfoNote>Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок. Спорная свеча считается Stop Loss. Цвет жирных значений интерполируется от красного к зелёному между порогами ползунков.</InfoNote>
+       <InfoNote>{trendMode === "forecast" ? "Ячейка — сглаженный уровень МО на последней дате с закрытыми сделками, без экстраполяции. «—» — недостаточно пригодных дней. Подсказка содержит SE и 95% неопределённость уровня, не будущей сделки." : "Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок."} Спорная свеча считается Stop Loss. Цвет жирных значений интерполируется от красного к зелёному между порогами ползунков.</InfoNote>
   </section>;
 }
 
@@ -407,19 +417,35 @@ function dayLabel(day: string): string {
   return `${dayNumber}.${month}`;
 }
 
-/** Daily UTC expectancy with actual calendar spacing and equal-weight daily OLS. */
-function DailyExpectancyChart({ items, originUnix, meanRisk }: { items: DailyExpectancyPoint[]; originUnix: number; meanRisk: number | null }) {
+/** Daily UTC geometry with the shared weighted Rust curve and uncertainty. */
+function DailyExpectancyChart({ items, originUnix, meanRisk, trendBendDays }: { items: DailyExpectancyPoint[]; originUnix: number; meanRisk: number | null; trendBendDays: TrendBendDays }) {
+  const [result, setResult] = useState<{ items: DailyExpectancyPoint[]; bend: TrendBendDays; trend: TrendSummary | null; error: string | null } | null>(null);
+  useEffect(() => {
+    if (items.filter((item) => item.riskExpectancy !== null && item.computedCount > 0).length < 2) return;
+    const controller = new AbortController();
+    // Coalesce progress flushes, retaining at most one request/result per chart.
+    const timer = window.setTimeout(() => {
+      void fetchDailyTrend(items.map((item) => ({ day: item.dayStartUnix / 86400, value: item.riskExpectancy, weight: item.computedCount })), trendBendDays, controller.signal)
+        .then((trend) => { if (!controller.signal.aborted) setResult({ items, bend: trendBendDays, trend, error: null }); })
+        .catch((error: unknown) => { if (!controller.signal.aborted) setResult({ items, bend: trendBendDays, trend: null, error: error instanceof Error ? error.message : "ошибка расчёта" }); });
+    }, 250);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [items, trendBendDays]);
+  const current = result?.items === items && result.bend === trendBendDays ? result : null;
+  const trend = current?.trend ?? null;
   if (items.length === 0) {
     return <p className="text-xs text-muted-foreground">График появится после расчёта первых строк.</p>;
   }
   const model = buildDailyExpectancyModel(items, originUnix);
-  const trend = model.trend;
   const values = items.map((item) => item.riskExpectancy).filter((value): value is number => value !== null && Number.isFinite(value));
   if (values.length === 0) {
     return <p className="text-xs text-muted-foreground">Пока нет дней с закрытыми TP/SL сделками.</p>;
   }
   // Fitted endpoints may exceed observed extrema; keep the trend and both labels visible.
-  if (trend) values.push(trend.start.riskExpectancy, trend.end.riskExpectancy);
+  if (trend) for (const point of trend.curve) {
+    values.push(point.value);
+    if (point.se !== null) values.push(point.value - 1.96 * point.se, point.value + 1.96 * point.se);
+  }
   const width = 760;
   const height = 280;
   const left = 64;
@@ -437,6 +463,7 @@ function DailyExpectancyChart({ items, originUnix, meanRisk }: { items: DailyExp
   const firstX = model.points[0]!.x;
   const xRange = model.points[model.points.length - 1]!.x - firstX;
   const xForDay = (x: number) => left + (xRange === 0 ? plotWidth / 2 : ((x - firstX) / xRange) * plotWidth);
+  const xForTrend = (day: number) => xForDay(day - model.originUnix / 86400);
   const yForValue = (value: number) => top + ((yMax - value) / yRange) * plotHeight;
   const zeroY = yMin <= 0 && yMax >= 0 ? yForValue(0) : null;
   const labelStep = Math.max(1, Math.ceil(items.length / 8));
@@ -446,6 +473,7 @@ function DailyExpectancyChart({ items, originUnix, meanRisk }: { items: DailyExp
   return (
     <div className="grid gap-2">
     <h3 className="text-sm font-medium">Дневное матожидание в рисках · Среднее МО: <span aria-label="Среднее МО за период" className={meanRisk !== null && meanRisk > 0 ? "text-success" : meanRisk !== null && meanRisk < 0 ? "text-danger" : "text-muted-foreground"}>{meanRisk === null ? "—" : fittedLabel(meanRisk)}</span></h3>
+    {current?.error && <p role="status" className="text-xs text-danger">Не удалось рассчитать тренд: {current.error}</p>}
     <svg className="w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание в рисках">
       <desc>Среднее закрытых сделок по UTC-дням сигнала. Расстояния по оси X соответствуют календарным суткам; дни без закрытых сделок не равны нулю.</desc>
       <line className="stroke-muted-foreground/40" x1={left} y1={top} x2={left} y2={height - bottom} />
@@ -463,12 +491,16 @@ function DailyExpectancyChart({ items, originUnix, meanRisk }: { items: DailyExp
       {model.segments.map((segment, index) => segment.length > 1
         ? <polyline key={index} className="fill-none stroke-primary stroke-2" points={segment.map((point) => `${xForDay(point.x)},${yForValue(point.riskExpectancy!)}`).join(" ")} /> : null)}
       {trend !== null ? <>
-        <line className="stroke-warning" strokeWidth={2} strokeDasharray="4 4"
-          x1={xForDay(trend.start.x)} y1={yForValue(trend.start.riskExpectancy)} x2={xForDay(trend.end.x)} y2={yForValue(trend.end.riskExpectancy)}>
-          <title>{`Тренд дневного матожидания: ${formatRisk(trend.slopePerDay)}/день UTC, за период ${formatRisk(trend.totalChange)}`}</title>
-        </line>
-        <text className="fill-warning font-mono text-[10px]" x={xForDay(trend.start.x)} y={yForValue(trend.start.riskExpectancy) - 10} textAnchor="start" aria-label={`Начало тренда: ${fittedLabel(trend.start.riskExpectancy)}`}>{fittedLabel(trend.start.riskExpectancy)}</text>
-        <text className="fill-warning font-mono text-[10px]" x={xForDay(trend.end.x)} y={yForValue(trend.end.riskExpectancy) - 10} textAnchor="end" aria-label={`Конец тренда: ${fittedLabel(trend.end.riskExpectancy)}`}>{fittedLabel(trend.end.riskExpectancy)}</text>
+        {trend.curve.every((point) => point.se !== null) && <polygon data-testid="trend-ci-band" className="fill-warning/15" points={[
+          ...trend.curve.map((point) => `${xForTrend(point.day)},${yForValue(point.value + 1.96 * point.se!)}`),
+          ...[...trend.curve].reverse().map((point) => `${xForTrend(point.day)},${yForValue(point.value - 1.96 * point.se!)}`),
+        ].join(" ")}><title>95% неопределённость сглаженного уровня: ±1.96 SE, не прогноз отдельной сделки</title></polygon>}
+        <polyline data-testid="trend-curve" className="fill-none stroke-warning" strokeWidth={2} strokeDasharray="4 4"
+          points={trend.curve.map((point) => `${xForTrend(point.day)},${yForValue(point.value)}`).join(" ")}>
+          <title>{`${trend.method === "p_spline" ? "P-spline" : "Взвешенная прямая"}: изменение ${formatRisk(trend.end.value - trend.start.value)}, текущий уровень ${formatRisk(trend.end.value)}, SE ${trend.endpointSe?.toFixed(3) ?? "—"} R. Без экстраполяции.`}</title>
+        </polyline>
+        <text className="fill-warning font-mono text-[10px]" x={xForTrend(trend.start.day)} y={yForValue(trend.start.value) - 10} textAnchor="start" aria-label={`Начало тренда: ${fittedLabel(trend.start.value)}`}>{fittedLabel(trend.start.value)}</text>
+        <text className="fill-warning font-mono text-[10px]" x={xForTrend(trend.end.day)} y={yForValue(trend.end.value) - 10} textAnchor="end" aria-label={`Конец тренда: ${fittedLabel(trend.end.value)}`}>{fittedLabel(trend.end.value)}</text>
       </> : null}
       {model.points.map((item, index) => {
         const x = xForDay(item.x);
@@ -491,6 +523,7 @@ function DailyExpectancyChart({ items, originUnix, meanRisk }: { items: DailyExp
 }
 
 interface TradesSectionProps {
+  trendBendDays: TrendBendDays;
   setId: string;
   description: string;
   direction: "short" | "long";
@@ -504,7 +537,7 @@ interface TradesSectionProps {
   onCommit?: (() => void) | undefined;
 }
 
-function TradesSection({ setId, description, direction, enablePriceChange, clusterize, maturity, clusterGapHours, setBounds, initial, reportState, onCommit }: TradesSectionProps) {
+function TradesSection({ setId, description, direction, enablePriceChange, clusterize, maturity, clusterGapHours, setBounds, initial, reportState, onCommit, trendBendDays }: TradesSectionProps) {
   const [tpInput, setTpInput] = useState(() => savedString(initial?.tpInput, "4"));
   const [slInput, setSlInput] = useState(() => savedString(initial?.slInput, "4"));
   const [timeShiftInput, setTimeShiftInput] = useState(() => savedString(initial?.timeShiftInput, "0"));
@@ -589,12 +622,14 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
   }, [params]);
 
   const effectiveDays = timeRangeBounds(timeRange, setBounds);
+  const effectiveFromDay = effectiveDays?.from;
+  const effectiveToDay = effectiveDays?.to;
   const visibleRows = useMemo(() => {
-    if (effectiveDays === null) return rows;
-    const from = Math.floor(new Date(`${effectiveDays.from}T00:00:00Z`).getTime() / 1000);
-    const to = Math.floor(new Date(`${effectiveDays.to}T23:59:59Z`).getTime() / 1000);
+    if (effectiveFromDay === undefined || effectiveToDay === undefined) return rows;
+    const from = Math.floor(new Date(`${effectiveFromDay}T00:00:00Z`).getTime() / 1000);
+    const to = Math.floor(new Date(`${effectiveToDay}T23:59:59Z`).getTime() / 1000);
     return rows.filter((row) => row.setup.closeTimeUnix >= from && row.setup.closeTimeUnix <= to);
-  }, [rows, effectiveDays]);
+  }, [rows, effectiveFromDay, effectiveToDay]);
 
   const deposit = useMemo(() => {
     const riskPct = parseNumberInput(riskPctInput);
@@ -667,7 +702,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
         {summary.avgRisk !== null && <Badge>Матожидание: {formatRisk(summary.avgRisk)} по {summary.closed} закрытым</Badge>}
         {filteredCount > 0 && <Badge variant="warning">Отфильтровано смещением цены: {filteredCount}</Badge>}
       </div>
-      {rows.length > 0 && <DailyExpectancyChart items={dailyPoints} originUnix={chartOriginUnix} meanRisk={summary.avgRisk} />}
+      {rows.length > 0 && <DailyExpectancyChart items={dailyPoints} originUnix={chartOriginUnix} meanRisk={summary.avgRisk} trendBendDays={trendBendDays} />}
       {rows.length === 0 && !running && !error && <EmptyState title="Нет рассчитанных сделок" description="Выберите параметры и нажмите «Рассчитать». Сначала загружаются кешированные строки, затем досчитываются остальные." />}
       {rows.length > 0 && (
         <div className="overflow-x-auto">
@@ -798,6 +833,8 @@ export function AnalyticsPage() {
   const [maturityDraft, setMaturityDraft] = useState(0.5);
   const [maturity, setMaturity] = useState(0.5);
   const [autoCalc, setAutoCalc] = useState(false);
+  const [trendBendDays, setTrendBendDays] = useState<TrendBendDays>("linear");
+  const [trendMode, setTrendMode] = useState<TrendMode>("mean");
   const [runToken, setRunToken] = useState(0);
   const sectionsRef = useRef<Partial<Record<AnalyticsSectionKey, Record<string, unknown>>>>({});
 
@@ -826,6 +863,8 @@ export function AnalyticsPage() {
         setMaturity(settings.maturity);
         setClusterGapInput(settings.clusterGapInput);
         setAutoCalc(settings.autoCalc);
+        setTrendBendDays(settings.trendBendDays);
+        setTrendMode(settings.trendMode);
       }
       setSavedSettings(settings);
       setSettingsState("ready");
@@ -845,8 +884,10 @@ export function AnalyticsPage() {
     maturity,
     clusterGapInput,
     autoCalc,
+    trendBendDays,
+    trendMode,
     sections: { ...sectionsRef.current },
-  }), [setId, clusterize, maturity, clusterGapInput, autoCalc]);
+  }), [setId, clusterize, maturity, clusterGapInput, autoCalc, trendBendDays, trendMode]);
   const collectRef = useRef(collectSettings);
   useEffect(() => { collectRef.current = collectSettings; }, [collectSettings]);
 
@@ -949,6 +990,22 @@ export function AnalyticsPage() {
           </div>
           <InfoNote>Настройки кластеризации действуют одновременно на все разделы SHORT и LONG. 0 — первый сетап кластера, 1 — последний, 0.5 — середина; соседние сигналы одной монеты с разрывом до {(appliedClusterGapHours ?? 8).toString()} часов образуют кластер. При выключенной галочке кластеризация не выполняется — в расчёт входят все сетапы.</InfoNote>
         </div>
+        <Separator />
+        <div className="grid gap-3">
+          <h3 className="text-sm font-semibold text-muted-foreground">Тренд матожидания</h3>
+          <div className="flex flex-wrap items-end gap-3">
+            <Field label="Перегиб на N дней" className="w-48">
+              {(control) => <Select {...control} value={trendBendDays} onChange={(event) => { setTrendBendDays(event.target.value as TrendBendDays); onSettingsCommit(); }}>
+                <option value="7">7 дней</option><option value="14">14 дней</option><option value="30">30 дней</option><option value="linear">∞ — прямая</option>
+              </Select>}
+            </Field>
+            <div role="group" aria-label="Значения матрицы" className="flex flex-wrap gap-1">
+              <Button variant={trendMode === "mean" ? "default" : "outline"} aria-pressed={trendMode === "mean"} onClick={() => { setTrendMode("mean"); onSettingsCommit(); }}>Среднее</Button>
+              <Button variant={trendMode === "forecast" ? "default" : "outline"} aria-pressed={trendMode === "forecast"} onClick={() => { setTrendMode("forecast"); onSettingsCommit(); }}>Прогноз по тренду</Button>
+            </div>
+          </div>
+          <InfoNote>Вес дня — число сетапов. «Перегиб» задаёт расстояние между узлами кубического P-spline, ∞ — взвешенная прямая. Прогноз — сглаженный уровень на последней дате с данными, без экстраполяции. Полоса графика — 95% неопределённость уровня (±1.96 SE), не доходности будущей сделки.</InfoNote>
+        </div>
         {saveStatus === "error" && <p role="status" className="text-xs text-danger">Не удалось сохранить настройки</p>}
     </section>
     {(setsState === "loading" || settingsState === "loading") && <Spinner label="Загрузка наборов…" />}
@@ -959,6 +1016,8 @@ export function AnalyticsPage() {
     {settingsState === "ready" && (<>
     <PageSidebarPanel value="short">
       <MatrixSection
+        trendBendDays={trendBendDays}
+        trendMode={trendMode}
         setId={setId}
         description="SHORT: TP×SL по сетапам, выбранным из кластеров по зрелости. Период ограничивает исходные сигналы до кластеризации; горизонт сделки концом периода не обрезается."
         direction="short"
@@ -978,6 +1037,7 @@ export function AnalyticsPage() {
       />
       <Separator />
       <TradesSection
+        trendBendDays={trendBendDays}
         setId={setId}
         description="SHORT: построчные сделки — вход по close свечи через time-shift, закрытие по TP или SL за 7 дней. Сначала показываются кешированные строки, недостающие досчитываются."
         direction="short"
@@ -993,6 +1053,8 @@ export function AnalyticsPage() {
     </PageSidebarPanel>
     <PageSidebarPanel value="long">
       <MatrixSection
+        trendBendDays={trendBendDays}
+        trendMode={trendMode}
         setId={setId}
         description="LONG: TP×SL по сетапам набора с общими настройками кластеризации и периода. Гейт смещения цены зеркален: LONG заходит только при падении цены на заданный процент."
         direction="long"
@@ -1012,6 +1074,7 @@ export function AnalyticsPage() {
       />
       <Separator />
       <TradesSection
+        trendBendDays={trendBendDays}
         setId={setId}
         description="LONG: построчные закрытия по уровням TP/SL с ценой входа, временем касания и результатом в рисках."
         direction="long"
