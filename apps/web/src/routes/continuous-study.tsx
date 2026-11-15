@@ -6,6 +6,7 @@ import { Checkbox } from "../components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
+import { InfoNote } from "../components/ui/info-note";
 import { Spinner } from "../components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { effectiveTimezone, formatIsoDateTime, formatUnix } from "../lib/datetime-format";
@@ -116,7 +117,7 @@ export function AdaptiveLive({ controller }: { controller: ContinuousController 
   const accepted = controller.process?.slots.filter((slot) => slot.activeGenerationId !== null).length ?? 0;
   return <div className="grid gap-3">
     <label className="flex items-center gap-2 text-sm"><Checkbox checked={enabled} disabled={!controller.available || controller.busy !== null} onCheckedChange={(checked) => { setDraft(checked === true); setSaved(false); }} />Разрешить адаптивное live-сканирование</label>
-    <p className="text-sm text-muted-foreground">Отдельное разрешение; исследование не включает live автоматически. Постоянные параметры не меняются. Готовность данных и общий выключатель live проверяются отдельно.</p>
+    <InfoNote>Отдельное разрешение; исследование не включает live автоматически. Постоянные параметры не меняются. Готовность данных и общий выключатель live проверяются отдельно.</InfoNote>
     <p role="status" className="text-sm">{!controller.available ? "Состояние адаптивного live не подтверждено." : !savedPermission ? "Адаптивный live не разрешён." : accepted === 0 ? "Адаптивный live разрешён · действующих профилей нет, ожидается инициализация." : `Адаптивный live разрешён · принято профилей: ${accepted}.`}</p>
     <div><Button type="button" variant="outline" disabled={!controller.available || !controller.process?.config || controller.busy !== null || enabled === savedPermission} onClick={() => {
       const config = controller.process?.config;
@@ -186,7 +187,7 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
     draftSave.save(next);
   }
   return <form noValidate onSubmit={(event) => { void submit(event); }} onBlur={saveDraft} className="grid min-w-0 gap-5">
-    <Alert>Сохранение не запускает исследование и не включает live. Сервер фиксирует последние N суток при фактическом старте, без lag; вся цепочка использует один период и снимок. Включённая кластеризация выбирает только первый сетап.</Alert>
+    <InfoNote>Сохранение не запускает исследование и не включает live. Сервер фиксирует последние N суток при фактическом старте, без lag; вся цепочка использует один период и снимок. Включённая кластеризация выбирает только первый сетап.</InfoNote>
     {locked && <Alert>Параметры исследования доступны для чтения. Чтобы изменить период, пороги или домены, остановите процесс и дождитесь drain. Разрешение adaptive live сохраняется отдельно.</Alert>}
     <fieldset disabled={locked || controller.busy !== null} className="grid gap-3 sm:grid-cols-2">
       <legend className="mb-2 font-semibold">Период и отдельные пороговые профили</legend>
@@ -216,8 +217,7 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
     {process && <>
       <p className="text-sm">Ревизия конфигурации: {process.configRevision}{process.activeStudyId !== null ? ` · Исследование #${process.activeStudyId}` : ""}{process.phase ? ` · ${phases[process.phase] ?? process.phase}` : ""}</p>
       {process.error && <Alert variant="destructive">{process.error.code}: {process.error.message}. Технический сбой не означает непрохождение допуска; прежний принятый профиль может сохраняться.</Alert>}
-      <p className="text-xs text-muted-foreground">Исследование принято — это готовность рекомендаций, а не live. Кандидат независимо инициализируется по текущим закрытым свечам, без повторной проверки исторического результата. Сохранённое исследование относится к последнему полностью завершённому поколению после replay, аналитики и gate; идущее исследование показано отдельно. При сохранённом принятом поколении среднее и рекомендация относятся к его собственному исследованию. Новые рекомендации поступят после следующего полного исследования слота. Новое поколение действует после watermark закрытой минуты.</p>
-      <p className="text-xs text-muted-foreground">Это настроенные пороги, а не история исследований. Очистка сохраняет их настройки. Дата ниже — изменение состояния профиля, включая сброс при очистке, а не дата исследования.</p>
+      <InfoNote label="О настроенных адаптивных профилях"><span className="grid gap-2"><span>Исследование принято — это готовность рекомендаций, а не live. Кандидат независимо инициализируется по текущим закрытым свечам, без повторной проверки исторического результата. Сохранённое исследование относится к последнему полностью завершённому поколению после replay, аналитики и gate; идущее исследование показано отдельно. При сохранённом принятом поколении среднее и рекомендация относятся к его собственному исследованию. Новые рекомендации поступят после следующего полного исследования слота. Новое поколение действует после watermark закрытой минуты.</span><span>Это настроенные пороги, а не история исследований. Очистка сохраняет их настройки. Дата ниже — изменение состояния профиля, включая сброс при очистке, а не дата исследования.</span></span></InfoNote>
       <div className="overflow-x-auto"><Table aria-label={`Настроенные адаптивные профили · ${algorithmDisplayName(algorithm)}`}>
         <TableHeader><TableRow>{["Минимум сетапов в день", "Исследование / допуск", "Принятое поколение / live", "Кандидат / инициализация live", "Среднее матрицы", "Рекомендация", "Изменение состояния профиля"].map((title) => <TableHead key={title}>{title}</TableHead>)}</TableRow></TableHeader>
         <TableBody>{process.slots.map((slot) => <TableRow key={slot.id}>
@@ -240,8 +240,7 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
       {recoveryExhausted && <Button type="button" variant="outline" disabled={!controller.available || controller.busy !== null} onClick={() => { void controller.start(); }}>Повторить восстановление исследования</Button>}
     </div>
     {recoveryExhausted && <p className="text-xs text-muted-foreground">Повтор восстановления сохраняет тот же ID исследования, сохранённый вход и исходный абсолютный дедлайн, без нового окна. Эта явная команда Start сбрасывает бюджет попыток; возобновление допуска обслуживания его не сбрасывает.</p>}
-    <p className="text-xs text-muted-foreground">Остановка общая для алгоритма: деактивирует его адаптивные профили. После drain очищаются только незавершённые дочерние данные; завершённая история и постоянный live сохраняются.</p>
-    <p className="text-xs text-muted-foreground">R рассчитан только по наблюдавшимся закрытым TP/SL-сделкам. Правый край последних N суток может быть незрелым: будущие входы, незакрытые сделки и пропуски не подменяются нулевой доходностью или SL. Частота eligible-входов и доходность — разные показатели.</p>
+    <InfoNote label="Об остановке и расчёте доходности"><span className="grid gap-2"><span>Остановка общая для алгоритма: деактивирует его адаптивные профили. После drain очищаются только незавершённые дочерние данные; завершённая история и постоянный live сохраняются.</span><span>R рассчитан только по наблюдавшимся закрытым TP/SL-сделкам. Правый край последних N суток может быть незрелым: будущие входы, незакрытые сделки и пропуски не подменяются нулевой доходностью или SL. Частота eligible-входов и доходность — разные показатели.</span></span></InfoNote>
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="max-w-4xl">
         <DialogHeader><DialogTitle>Непрерывное исследование · {algorithmDisplayName(algorithm)}</DialogTitle><DialogDescription>Метаданные и домены как в ручной оптимизации. Даты и зрелость первого сетапа фиксирует сервер.</DialogDescription></DialogHeader>

@@ -167,7 +167,7 @@ export function TelegramRelaySettingsSection({ active }: { active: boolean }) {
 
   return <section aria-labelledby="telegram-relay-heading" className="grid gap-3">
     <SectionHeader id="telegram-relay-heading" title="Telegram relay" />
-    <p className="text-sm text-muted-foreground">Удалённый relay отправляет текст в закрытый Telegram-канал. Токен бота и chat ID остаются только на relay; общий ключ подписи настраивается администратором в приватных файлах, не в браузере.</p>
+    <InfoNote>Удалённый relay отправляет текст в закрытый Telegram-канал. Токен бота и chat ID остаются только на relay; общий ключ подписи настраивается администратором в приватных файлах, не в браузере.</InfoNote>
     <form onSubmit={save} className="grid gap-3" aria-label="Настройки Telegram relay">
       <label className="flex items-center gap-2 text-sm"><Checkbox disabled={!draft || busy !== null} checked={draft?.enabled ?? false} onCheckedChange={(checked) => update({ enabled: checked === true })} />Включить Telegram</label>
       <Field label="HTTPS-адрес Telegram relay" error={inputError} hint="Рекомендуется домен. Допустим публичный IP с действительным TLS-сертификатом для этого IP. Только HTTPS origin без пути и параметров; публичность адреса и сертификат проверяет сервер.">
@@ -203,7 +203,7 @@ export function TelegramRelaySettingsSection({ active }: { active: boolean }) {
     {readError && <Alert variant="destructive" role="alert">{readError}</Alert>}
     {commandError && <Alert variant="destructive" role="alert">{commandError}</Alert>}
     {message && <Alert variant="success" role="status">{message}</Alert>}
-    <p className="text-xs text-muted-foreground">Статус relay и права Telegram-канала — разные проверки. Проверка и один фиксированный тест выполняются только по нажатию. Чтение статуса ничего не отправляет.</p>
-    <p className="text-xs text-muted-foreground">Смена адреса не требует перезапуска сервисов. Доставляются только новые live-сетапы в пределах прежнего возраста уведомлений (по умолчанию 60 секунд от закрытия сигнальной минуты); история и replay не рассылаются, срок не продлевается.</p>
+    <InfoNote label="О проверке и доставке Telegram"><span className="grid gap-2"><span>Статус relay и права Telegram-канала — разные проверки. Проверка и один фиксированный тест выполняются только по нажатию. Чтение статуса ничего не отправляет.</span><span>Смена адреса не требует перезапуска сервисов. Доставляются только новые live-сетапы в пределах прежнего возраста уведомлений (по умолчанию 60 секунд от закрытия сигнальной минуты); история и replay не рассылаются, срок не продлевается.</span></span></InfoNote>
   </section>;
 }
+import { InfoNote } from "../components/ui/info-note";

@@ -43,7 +43,11 @@ it("shows only counts and drain/resume admission controls, allows resume while d
   render(<ContinuousMaintenance active />); await tick();
   expect(screen.getByText("Незавершённых цепочек: 1")).toBeInTheDocument();
   expect(screen.getByText("Цепочек с сохранённым снимком: 1")).toBeInTheDocument();
-  expect(screen.getByText(/не гарантия совместимости будущей версии/)).toBeInTheDocument();
+  expect(screen.queryByText(/не гарантия совместимости будущей версии/)).not.toBeInTheDocument();
+  fireEvent.mouseEnter(screen.getByRole("button", { name: "О снимках и возобновлении допуска" }));
+  expect(screen.getByRole("tooltip")).toHaveTextContent("не гарантия совместимости будущей версии");
+  fireEvent.keyDown(document, { key: "Escape" });
+  fireEvent.mouseEnter(screen.getByRole("button", { name: "Об обслуживании непрерывных исследований" }));
   expect(screen.getByText(/Это не Stop/)).toHaveTextContent("действующие адаптивные профили не отключаются");
   expect(resumeButton()).toBeDisabled();
   fireEvent.click(drainButton()); fireEvent.click(drainButton()); await tick();

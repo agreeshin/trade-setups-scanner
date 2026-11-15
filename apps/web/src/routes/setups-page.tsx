@@ -104,7 +104,7 @@ export function SetupsPage() {
           <Button asChild variant="outline"><a href={`${PLATFORM_URL}/v1/export/setups.csv`}>Экспорт CSV (без фильтра)</a></Button>
         </div>
         <p className="w-full text-xs text-muted-foreground" aria-live="polite">{query.mode === "live" ? "Live-лента · обновление каждые 3 с в активной видимой вкладке." : query.mode === "history" ? "Исторический снимок · автообновление приостановлено." : "Обновление ленты приостановлено."}</p>
-        <p className="w-full text-xs text-muted-foreground">CSV содержит всю сохранённую live-ленту на начало выгрузки, без фильтра экрана и лимита строк. Статус и отмена доступны в загрузках браузера.</p>
+        <InfoNote label="О выгрузке CSV">CSV содержит всю сохранённую live-ленту на начало выгрузки, без фильтра экрана и лимита строк. Статус и отмена доступны в загрузках браузера.</InfoNote>
       </CardContent>
     </Card>
     {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
@@ -128,3 +128,4 @@ export function SetupsPage() {
     </>}
   </section>;
 }
+import { InfoNote } from "../components/ui/info-note";

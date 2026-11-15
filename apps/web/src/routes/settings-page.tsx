@@ -6,6 +6,7 @@ import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { PageHeader, SectionHeader } from "../components/ui/page-header";
 import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
+import { InfoNote } from "../components/ui/info-note";
 import { Select } from "../components/ui/select";
 import { Separator } from "../components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
@@ -99,7 +100,7 @@ function CacheSettings() {
       {state.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка…</p>}
       {state.kind === "unreachable" && <Alert variant="destructive" role="alert">Кеш недоступен ({state.detail})</Alert>}
       {state.kind === "ready" && <p>Записей: {state.data.entries} · Размер таблицы: {(state.data.bytes / 1024 / 1024).toFixed(2)} МиБ</p>}
-      <p className="text-sm text-muted-foreground">Очистка удаляет только кеш расчётов. Сохранённые запуски и рыночная история остаются; повторный расчёт может занять больше времени.</p>
+      <InfoNote>Очистка удаляет только кеш расчётов. Сохранённые запуски и рыночная история остаются; повторный расчёт может занять больше времени.</InfoNote>
       <label className="flex items-center gap-2 text-sm"><Checkbox checked={confirm} onCheckedChange={(checked) => setConfirm(checked === true)} />Подтверждаю очистку всего кеша</label>
       <div><Button variant="outline" disabled={busy || !confirm || state.kind !== "ready"} onClick={() => { void clear(); }}>Очистить кеш</Button></div>
       {message && <Alert variant="success" role="status">{message}</Alert>}
@@ -142,7 +143,7 @@ function InterfaceSettingsSection() {
   return <section className="grid gap-3" aria-labelledby="interface-heading">
     <SectionHeader id="interface-heading" title="Интерфейс" />
     <div className="grid gap-3">
-      <p className="text-sm text-muted-foreground">Формат применяется ко всем датам и времени в приложении и сохраняется для всех ваших устройств. Нативные селекторы дат следуют локали браузера.</p>
+      <InfoNote>Формат применяется ко всем датам, включая поля выбора даты, и времени в приложении и сохраняется для всех ваших устройств.</InfoNote>
       <Field label="Порядок даты">
         {(control) => <Select {...control} value={settings.dateOrder} onChange={(event) => update({ dateOrder: event.target.value as DateOrder })}>
           <option value="dmy">День · месяц · год</option>
@@ -221,12 +222,11 @@ export function SettingsPage() {
       <form className="grid gap-3" onSubmit={(event) => { void save(event); }} aria-labelledby="notifications-heading">
         <SectionHeader id="notifications-heading" title="Уведомления" />
         <div className="grid gap-3">
-          <p className="text-sm text-muted-foreground">Настройка возраста задаёт порог свежести; Telegram relay и подписка Web Push включаются отдельно ниже и только по вашему действию.</p>
-          <p className="text-sm text-muted-foreground">Web Push недоступен по обычному HTTP: требуется HTTPS (исключение — localhost). Сохранение порога не запрашивает разрешение на уведомления.</p>
+          <InfoNote label="О доставке уведомлений"><span className="grid gap-2"><span>Настройка возраста задаёт порог свежести; Telegram relay и подписка Web Push включаются отдельно ниже и только по вашему действию.</span><span>Web Push недоступен по обычному HTTP: требуется HTTPS (исключение — localhost). Сохранение порога не запрашивает разрешение на уведомления.</span></span></InfoNote>
           <Field label="Максимальный возраст уведомления (секунд)">
             {(control) => <Input type="number" min="1" step="1" required disabled={!ready} value={maxAge} onChange={(event) => { setMaxAge(event.target.value); setMessage(null); }} {...control} />}
           </Field>
-          <p className="text-xs text-muted-foreground">Просроченные сетапы остаются в ленте, но не рассылаются как свежие.</p>
+          <InfoNote>Просроченные сетапы остаются в ленте, но не рассылаются как свежие.</InfoNote>
           {error && <Alert variant="destructive" role="alert">{error}</Alert>}
           {message && <Alert variant="success" role="status">{message}</Alert>}
           <div><Button type="submit" disabled={saving || !ready}>{saving ? "Сохранение…" : "Сохранить уведомления"}</Button></div>

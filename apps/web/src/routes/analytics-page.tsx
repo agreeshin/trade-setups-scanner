@@ -8,6 +8,7 @@ import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { PageHeader } from "../components/ui/page-header";
 import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
+import { InfoNote } from "../components/ui/info-note";
 import { Select } from "../components/ui/select";
 import { Separator } from "../components/ui/separator";
 import { Spinner } from "../components/ui/spinner";
@@ -182,7 +183,7 @@ function MatrixSection({
   return <section className="grid min-w-0 gap-4">
       <div className="grid gap-1">
         <h2 className="text-lg font-semibold">Среднее матожидание сетапов</h2>
-        <p className="text-xs text-muted-foreground">{description}</p>
+        <InfoNote>{description}</InfoNote>
       </div>
       <div className="flex flex-wrap items-end gap-3">
         <TimeRangeControls setId={setId} setBounds={setBounds} value={timeRange} onChange={setTimeRange} onCommit={onCommit} />
@@ -286,7 +287,7 @@ function MatrixSection({
           </TableBody>
         </Table>
       </div>
-      <p className="text-xs text-muted-foreground">Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок. Спорная свеча считается Stop Loss. Цвет жирных значений интерполируется от красного к зелёному между порогами ползунков.</p>
+       <InfoNote>Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок. Спорная свеча считается Stop Loss. Цвет жирных значений интерполируется от красного к зелёному между порогами ползунков.</InfoNote>
   </section>;
 }
 
@@ -627,7 +628,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
   return <section className="grid min-w-0 gap-4">
       <div className="grid gap-1">
         <h2 className="text-lg font-semibold">Матожидание по сетапам</h2>
-        <p className="text-xs text-muted-foreground">{description}</p>
+        <InfoNote>{description}</InfoNote>
       </div>
       <div className="flex flex-wrap items-end gap-3">
         <Field label="TP, %" className="w-28">
@@ -747,7 +748,7 @@ function AnalyticsCacheCard() {
   return <section className="grid min-w-0 gap-4">
       <div className="grid gap-1">
         <h2 className="text-lg font-semibold">Кеш аналитики</h2>
-        <p className="text-xs text-muted-foreground">Кеш результатов хранится в БД платформы рядом с сетапами. Догрузка истории не сбрасывает его автоматически; очистка удаляет только кеш аналитики, не трогая запуски, сетапы и рыночные данные.</p>
+        <InfoNote>Кеш результатов хранится в БД платформы рядом с сетапами. Догрузка истории не сбрасывает его автоматически; очистка удаляет только кеш аналитики, не трогая запуски, сетапы и рыночные данные.</InfoNote>
       </div>
       {state === "loading" && <Spinner label="Загрузка сводки…" />}
       {state === "error" && <Alert variant="destructive" role="alert">Сводка кеша недоступна</Alert>}
@@ -946,7 +947,7 @@ export function AnalyticsPage() {
               {(control) => <Input {...control} inputMode="decimal" disabled={!clusterize} value={clusterGapInput} onBlur={() => onSettingsCommit()} onChange={(event) => setClusterGapInput(event.target.value)} />}
             </Field>
           </div>
-          <p className="text-xs text-muted-foreground">Настройки кластеризации действуют одновременно на все разделы SHORT и LONG. 0 — первый сетап кластера, 1 — последний, 0.5 — середина; соседние сигналы одной монеты с разрывом до {(appliedClusterGapHours ?? 8).toString()} часов образуют кластер. При выключенной галочке кластеризация не выполняется — в расчёт входят все сетапы.</p>
+          <InfoNote>Настройки кластеризации действуют одновременно на все разделы SHORT и LONG. 0 — первый сетап кластера, 1 — последний, 0.5 — середина; соседние сигналы одной монеты с разрывом до {(appliedClusterGapHours ?? 8).toString()} часов образуют кластер. При выключенной галочке кластеризация не выполняется — в расчёт входят все сетапы.</InfoNote>
         </div>
         {saveStatus === "error" && <p role="status" className="text-xs text-danger">Не удалось сохранить настройки</p>}
     </section>

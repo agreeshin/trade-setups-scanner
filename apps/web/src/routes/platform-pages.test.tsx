@@ -331,7 +331,9 @@ describe("platform screens", () => {
     const relay = await screen.findByRole("textbox", { name: "HTTPS-адрес Telegram relay" });
     await waitFor(() => expect(relay).toBeEnabled());
     fireEvent.change(relay, { target: { value: "https://relay.example/" } });
-    expect(screen.getByText(/Web Push недоступен по обычному HTTP/)).toHaveTextContent("localhost");
+    await userEvent.hover(screen.getByRole("button", { name: "О доставке уведомлений" }));
+    expect(screen.getByRole("tooltip")).toHaveTextContent("Web Push недоступен по обычному HTTP");
+    expect(screen.getByRole("tooltip")).toHaveTextContent("localhost");
     await userEvent.click(screen.getByRole("tab", { name: "Обслуживание" }));
     expect(screen.getByRole("heading", { name: "Обслуживание непрерывных исследований" })).toBeVisible();
     expect(await screen.findByText("Допуск новых непрерывных цепочек открыт")).toBeVisible();

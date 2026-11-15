@@ -29,7 +29,7 @@ describe("Web Push settings", () => {
     vi.stubGlobal("isSecureContext", false);
     render(<PushSettings />);
     expect(screen.getByRole("status")).toHaveTextContent("На HTTP-адресе сервера подключение заблокировано");
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Подключить уведомления|Отключить уведомления|Обновить подключение/ })).not.toBeInTheDocument();
   });
 
   it("never prompts on mount, subscribes only on click, persists and deletes server subscription", async () => {

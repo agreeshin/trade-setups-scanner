@@ -1,5 +1,6 @@
 import { useId, type ReactNode } from "react";
 import { cn } from "../../lib/utils";
+import { InfoNote } from "./info-note";
 
 export interface FieldControlProps {
   id: string;
@@ -22,9 +23,9 @@ export function Field({ label, children, hint, error, className }: FieldProps) {
   const describedBy = [hint ? hintId : null, error ? errorId : null].filter(Boolean).join(" ") || undefined;
   return (
     <div data-slot="field" className={cn("grid gap-1.5 text-sm", className)}>
-      <label htmlFor={controlId} className="font-medium leading-none">{label}</label>
+      <div className="flex items-center gap-1"><label htmlFor={controlId} className="font-medium leading-none">{label}</label>{hint && <InfoNote label={typeof label === "string" ? `Пояснение: ${label}` : "Пояснение к полю"}>{hint}</InfoNote>}</div>
       {children({ id: controlId, "aria-describedby": describedBy, "aria-invalid": error ? true : undefined })}
-      {hint ? <p id={hintId} className="text-xs text-muted-foreground">{hint}</p> : null}
+      {hint ? <span id={hintId} className="sr-only">{hint}</span> : null}
       {error ? <p id={errorId} role="alert" className="text-xs text-danger">{error}</p> : null}
     </div>
   );

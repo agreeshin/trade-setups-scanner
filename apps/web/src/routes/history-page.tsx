@@ -9,6 +9,7 @@ import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { PageHeader, SectionHeader } from "../components/ui/page-header";
 import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
+import { InfoNote } from "../components/ui/info-note";
 import { Select } from "../components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
@@ -224,7 +225,7 @@ export function HistoryPage() {
 
     <PageSidebarPanel value="upload" lazy><section className="grid gap-3" aria-labelledby="upload-heading">
       <SectionHeader id="upload-heading" title="Загрузить историю" />
-      <p className="text-xs text-muted-foreground">Выберите инструменты вручную, импортом CSV без заголовка или текущим листингом Bybit, при необходимости отредактируйте список и подтвердите загрузку для выбранных дат. Создаётся отдельное задание на каждый инструмент.</p>
+      <InfoNote>Выберите инструменты вручную, импортом CSV без заголовка или текущим листингом Bybit, при необходимости отредактируйте список и подтвердите загрузку для выбранных дат. Создаётся отдельное задание на каждый инструмент.</InfoNote>
       <div className="flex flex-wrap gap-2">
         <Button type="button" variant="outline" disabled={busy} onClick={() => { void importListing(); }}>Импортировать текущий листинг Bybit (линейные USDT perpetual)</Button>
         <Button type="button" variant="outline" disabled={busy || symbols.trim().length === 0} onClick={() => { setSymbols(""); setMessage(null); }}>Очистить выбор</Button>
@@ -256,7 +257,7 @@ export function HistoryPage() {
       <SectionHeader id="collection-heading" title="Текущий сбор свечей" />
       <CoverageOverview revision={revision} />
       <div className="grid gap-3">
-        <p className="text-sm text-muted-foreground">Массовое управление сбором: выберите инструменты чек-боксами, «Все из БД» выбирает весь каталог, импорт листинга Bybit обновляет каталог биржи и добавляет её символы в выбор. Лимита на количество нет.</p>
+        <InfoNote>Массовое управление сбором: выберите инструменты чек-боксами, «Все из БД» выбирает весь каталог, импорт листинга Bybit обновляет каталог биржи и добавляет её символы в выбор. Лимита на количество нет.</InfoNote>
         <div><Button type="button" variant="outline" disabled={busy} onClick={() => { void importListingToCollection(); }}>Импортировать листинг для сбора</Button></div>
         <InstrumentPicker catalog={instruments} symbols={collectionSymbols} onChange={(value) => { setCollectionSymbols(value); setMessage(null); }} disabled={busy || catalog.kind !== "ready"} limit={null} />
         <div className="flex flex-wrap gap-2">
@@ -297,7 +298,7 @@ export function HistoryPage() {
     </section></PageSidebarPanel>
 
     <PageSidebarPanel value="jobs" lazy><section className="grid gap-3" aria-labelledby="backfill-heading">
-      <SectionHeader id="backfill-heading" title="Задания загрузки" /><p className="text-xs text-muted-foreground">Обновление каждые 3 секунды в видимой вкладке. Прогресс отражает checkpoint диапазона, не полноту свечей.</p>
+      <SectionHeader id="backfill-heading" title="Задания загрузки" /><InfoNote>Обновление каждые 3 секунды в видимой вкладке. Прогресс отражает checkpoint диапазона, не полноту свечей.</InfoNote>
       {counts !== null && <p className="text-sm text-muted-foreground">Активных: {activeJobs}. Завершено успешно: {counts.done}. С ошибкой: {counts.failed}. Отменено: {counts.cancelled}.</p>}
       {jobs.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка заданий…</p>}{jobs.kind === "unreachable" && <Alert variant="destructive" role="alert">Задания недоступны ({jobs.detail})</Alert>}
       {jobs.kind === "ready" && <div className="overflow-x-auto"><Table>

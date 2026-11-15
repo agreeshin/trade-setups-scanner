@@ -6,6 +6,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
+import { InfoNote } from "../components/ui/info-note";
 import { Separator } from "../components/ui/separator";
 import { fetchPlatform, type PlatformState } from "../lib/platform-api";
 import type { OptimizationStudyAction } from "../lib/optimization-api";
@@ -99,7 +100,7 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
   }
   return <><form onSubmit={(event) => { void save(event); }} className="grid min-w-0 gap-4">
     <h3 className="text-lg font-semibold">{displayName} · {algorithm.version}</h3>
-    <p className="text-sm text-muted-foreground">{algorithm.description}</p>
+    <InfoNote label="Описание алгоритма">{algorithm.description}</InfoNote>
     <Field label="Внешнее название алгоритма" hint="До 120 символов. Отдельная пользовательская подпись; служебное имя, ID, версия и старые сетапы не меняются.">{(control) => <Input {...control} maxLength={240} value={externalName} onChange={(event) => { setExternalName(event.target.value); setNameSaved(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); if (!nameBusy) void saveName(); } }} />}</Field>
     <div><Button type="button" variant="outline" disabled={nameBusy} onClick={() => { void saveName(); }}>{nameBusy ? "Сохранение названия…" : "Сохранить название"}</Button></div>
     {nameError && <Alert variant="destructive" role="alert">{nameError}</Alert>}
@@ -113,7 +114,7 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
         {(control) => <Input type="number" required min={field.min} max={field.max} step={field.type === "integer" ? "1" : "any"} value={params[field.key] ?? ""} onChange={(event) => { setParams({ ...params, [field.key]: event.target.value }); setSaved(false); }} {...control} />}
       </Field>)}
     </fieldset>)}
-    <p className="text-xs text-muted-foreground">Порог цены задаётся в процентах — рост или падение, зависит от алгоритма; окно в минутах. Множитель объёма 3 означает 3× (300% базового объёма). Изменения общие для live и новых исторических запусков; завершённые запуски сохраняют свой снимок параметров.</p>
+    <InfoNote>Порог цены задаётся в процентах — рост или падение, зависит от алгоритма; окно в минутах. Множитель объёма 3 означает 3× (300% базового объёма). Изменения общие для live и новых исторических запусков; завершённые запуски сохраняют свой снимок параметров.</InfoNote>
     {error && <Alert variant="destructive" role="alert">{error}</Alert>}
     {saved && <Alert variant="success" role="status">Настройки алгоритма сохранены.</Alert>}
     <div><Button disabled={busy} type="submit">{busy ? "Сохранение…" : "Сохранить алгоритм"}</Button></div>

@@ -43,7 +43,7 @@ export function OptimizationFields({ algorithm, scope, onScopeChange, catalog, r
   ];
   return <fieldset disabled={disabled} className="grid min-w-0 gap-4">
     <legend className="mb-2 font-semibold">Фиксированный scope</legend>
-    {!continuous && <p className="text-xs text-muted-foreground">Часовой пояс ввода: {Intl.DateTimeFormat().resolvedOptions().timeZone} (часовой пояс браузера). Период по времени закрытия сигнала [начало, конец), границы кратны минуте. Горизонт сделки не обрезается концом периода.</p>}
+    {!continuous && <InfoNote>Часовой пояс ввода: {Intl.DateTimeFormat().resolvedOptions().timeZone} (часовой пояс браузера). Период по времени закрытия сигнала [начало, конец), границы кратны минуте. Горизонт сделки не обрезается концом периода.</InfoNote>}
     <div className="grid gap-3 sm:grid-cols-2">
       {!continuous && <>
         <Field label="Начало периода сигналов">{(control) => <Input {...control} type="datetime-local" step={60} value={scope.from} onChange={(event) => onScopeChange({ from: event.target.value })} />}</Field>
@@ -57,12 +57,13 @@ export function OptimizationFields({ algorithm, scope, onScopeChange, catalog, r
       <Field label="Уровни SL, %" hint="Независимая ось: 0 < SL ≤ 100, не более 64 уровней.">{(control) => <Input {...control} maxLength={8192} value={scope.slLevels} onChange={(event) => onScopeChange({ slLevels: event.target.value })} />}</Field>
       {numericFields.filter((field) => !continuous || field.key !== "minSetupsPerDay").map((field) => <Field key={field.key} label={field.label} hint={continuous && field.key === "setupMaturity" ? "Только первый сетап кластера. При выключенной кластеризации не применяется." : field.hint}>{(control) => <Input {...control} type="number" min={field.min} max={field.max} step={field.step ?? 1} disabled={continuous && field.key === "setupMaturity"} value={continuous && field.key === "setupMaturity" ? "0" : scope[field.key]} onChange={(event) => onScopeChange({ [field.key]: event.target.value })} />}</Field>)}
     </div>
-    <p className="text-xs text-muted-foreground">Выбрано ячеек TP×SL: {scope.tpLevels.split(",").filter((item) => item.trim()).length} × {scope.slLevels.split(",").filter((item) => item.trim()).length}. Зрелость не подбирается; без кластеризации не применяется. Гейт null отличается от порога 0.</p>
+    <InfoNote>Выбрано ячеек TP×SL: {scope.tpLevels.split(",").filter((item) => item.trim()).length} × {scope.slLevels.split(",").filter((item) => item.trim()).length}. Зрелость не подбирается; без кластеризации не применяется. Гейт null отличается от порога 0.</InfoNote>
     <h3 className="font-semibold">Параметры алгоритма · {algorithm.version}</h3>
-    <p className="text-xs text-muted-foreground">Baseline скопирован из сохранённой конфигурации, а не из несохранённых правок карточки. Изменения здесь относятся только к исследованию. Составные ограничения проверяет сервер.</p>
+    <InfoNote>Baseline скопирован из сохранённой конфигурации, а не из несохранённых правок карточки. Изменения здесь относятся только к исследованию. Составные ограничения проверяет сервер.</InfoNote>
     <DomainControls fields={algorithm.fields} value={algorithmDomains} onChange={onAlgorithmDomainsChange} />
     {Object.entries(algorithm.params).filter(([key]) => !algorithm.fields.some((field) => field.key === key)).map(([key, value]) => <p key={key} className="text-sm">{key}: {value} (фиксирован)</p>)}
     <h3 className="font-semibold">Параметры аналитики</h3>
     <DomainControls fields={ANALYTICS_SEARCH_FIELDS} value={analyticsDomains} onChange={onAnalyticsDomainsChange} />
   </fieldset>;
 }
+import { InfoNote } from "../components/ui/info-note";

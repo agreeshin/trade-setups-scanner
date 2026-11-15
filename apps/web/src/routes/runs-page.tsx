@@ -111,7 +111,7 @@ function RunResults({ id, isBatch, revision }: { id: number; isBatch: boolean; r
   return <section className="mt-8" aria-labelledby="run-results-heading">
     <Card className="grid gap-3">
       <SectionHeader id="run-results-heading" title={`Результаты запуска #${id}`} actions={<Button variant="outline" size="sm" disabled={downloading} onClick={() => { void exportCsv(); }}>{downloading ? "Подготовка CSV…" : "Скачать CSV запуска"}</Button>} />
-      <p className="text-xs text-muted-foreground">CSV содержит все результаты запуска, не только текущую страницу. Большой файл потребует времени и памяти браузера.</p>
+      <InfoNote>CSV содержит все результаты запуска, не только текущую страницу. Большой файл потребует времени и памяти браузера.</InfoNote>
       {error && <Alert variant="destructive" role="alert">{error}</Alert>}
       <RunResultPage key={offset} id={id} isBatch={isBatch} offset={offset} revision={revision} onPage={setOffset} qualityPanel={qualityPanel} onQualityPanel={setQualityPanel} />
     </Card>
@@ -341,10 +341,10 @@ export function RunsPage() {
           <Field label="Начало">{(control) => <Input type="datetime-local" required disabled={!ready || busy} value={form.from} onChange={(event) => changeForm({ ...form, from: utcMidnightOnDateChange(form.from, event.target.value) })} {...control} />}</Field>
           <Field label="Конец">{(control) => <Input type="datetime-local" required disabled={!ready || busy} value={form.to} onChange={(event) => changeForm({ ...form, to: utcMidnightOnDateChange(form.to, event.target.value) })} {...control} />}</Field>
         </div>
-        <p className="text-xs text-muted-foreground">Локальное время: {localTimezoneLabel()}. В API передаются Unix-секунды.</p>
+        <InfoNote>Локальное время: {localTimezoneLabel()}. В API передаются Unix-секунды.</InfoNote>
         {error && <Alert variant="destructive" role="alert">{error}</Alert>}
         {message && <Alert variant="success" role="status">{message}</Alert>}
-        <p className="text-xs text-muted-foreground">Расчёт выполняется в фоне. Список обновляется каждые 3 секунды в видимой вкладке. Закрытие страницы не отменяет расчёт; используйте кнопку отмены.</p>
+        <InfoNote>Расчёт выполняется в фоне. Список обновляется каждые 3 секунды в видимой вкладке. Закрытие страницы не отменяет расчёт; используйте кнопку отмены.</InfoNote>
         <div className="flex flex-wrap gap-2"><Button type="submit" disabled={busy || checking || !ready || algorithms.kind !== "ready"}>{checking ? "Проверка…" : "Проверить данные"}</Button><Button type="button" variant="outline" disabled={busy || checking || !ready} onClick={() => { void saveForm(); }}>Сохранить форму</Button></div>
         {preview && <><ReplayPreflight preview={preview} /><Button type="button" disabled={busy || !preview.canRun} onClick={() => { void launch(); }}>Запустить проверенный расчёт</Button></>}
       </Card>
@@ -397,3 +397,4 @@ export function RunsPage() {
       )}
   </section>;
 }
+import { InfoNote } from "../components/ui/info-note";

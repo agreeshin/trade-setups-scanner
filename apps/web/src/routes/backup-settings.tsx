@@ -38,16 +38,17 @@ export function BackupSettings() {
   return <section className="grid gap-3" aria-labelledby="backup-heading">
     <SectionHeader id="backup-heading" title="Резервные копии и восстановление" />
     <div className="grid gap-3">
-      <p className="text-sm text-muted-foreground">Копии двух БД независимы. Platform backup содержит чувствительные Web Push endpoints и хранится защищённо.</p>
+      <InfoNote>Копии двух БД независимы. Platform backup содержит чувствительные Web Push endpoints и хранится защищённо.</InfoNote>
       <div className="flex flex-wrap gap-2"><Button asChild variant="outline"><a href="/v1/admin/backup" download>Скачать platform DB</a></Button><Button asChild variant="outline"><a href="/v1/admin/market-backup" download>Скачать market-data DB</a></Button></div>
       <form className="grid gap-4 border-t border-input pt-4" onSubmit={(event) => { void stage(event); }}>
         <Field label="Область">{(control) => <Select value={scope} onChange={(event) => { setScope(event.target.value as Scope); setConfirmation(""); }} {...control}><option value="platform">Platform DB</option><option value="market-data">Market-data DB</option></Select>}</Field>
         <Field label="Файл backup">{(control) => <Input type="file" accept=".tsb,application/octet-stream" onChange={(event) => setFile(event.target.files?.[0] ?? null)} {...control} />}</Field>
         <Field label={<>Введите <code className="text-xs">{expected}</code></>}>{(control) => <Input value={confirmation} autoComplete="off" onChange={(event) => setConfirmation(event.target.value)} {...control} />}</Field>
-        <p className="text-xs text-muted-foreground">Upload проверяет scope, checksum, совместимость и место. Автоматического restart нет.</p>
+        <InfoNote>Upload проверяет scope, checksum, совместимость и место. Автоматического restart нет.</InfoNote>
         {message && <Alert variant="info" role="status">{message}</Alert>}
         <div><Button type="submit" disabled={busy || !file || confirmation !== expected}>{busy ? "Проверка…" : "Проверить и подготовить restore"}</Button></div>
       </form>
     </div>
   </section>;
 }
+import { InfoNote } from "../components/ui/info-note";

@@ -208,7 +208,9 @@ it("labels configured profiles separately from research history and marks cleare
   expect(table.getAllByRole("row")).toHaveLength(2);
   expect(table.getByText("Результатов нет")).toBeInTheDocument();
   expect(table.getByRole("columnheader", { name: "Изменение состояния профиля" })).toBeInTheDocument();
-  expect(screen.getByText(/не дата исследования/)).toBeInTheDocument();
+  expect(screen.queryByText(/не дата исследования/)).not.toBeInTheDocument();
+  fireEvent.mouseEnter(screen.getByRole("button", { name: "О настроенных адаптивных профилях" }));
+  expect(screen.getByRole("tooltip")).toHaveTextContent("не дата исследования");
   expect(requests).toHaveLength(0);
 });
 it("keeps finalized and incumbent provenance while new research starts, completes only its search, and fails downstream", () => {
@@ -255,7 +257,8 @@ it("separates successful research, incumbent live and the warming candidate with
   expect(incumbent).not.toHaveTextContent("#8"); expect(incumbent).not.toHaveTextContent("#42");
   expect(candidate).toHaveTextContent("Инициализация live по текущим данным");
   expect(candidate).not.toHaveTextContent("Готов к переключению");
-  expect(screen.getByText(/Кандидат независимо инициализируется по текущим закрытым свечам/)).toHaveTextContent("без повторной проверки исторического результата");
+  fireEvent.mouseEnter(screen.getByRole("button", { name: "О настроенных адаптивных профилях" }));
+  expect(screen.getByRole("tooltip")).toHaveTextContent("без повторной проверки исторического результата");
   expect(screen.queryByText("Адаптивные сигналы этого профиля не формируются.")).not.toBeInTheDocument();
   expect(table.getByText("SHORT · TP 14% / SL 4% · 0.32 R")).toBeInTheDocument();
   expect(requests).toHaveLength(0);
