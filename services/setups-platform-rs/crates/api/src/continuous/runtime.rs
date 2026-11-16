@@ -71,9 +71,17 @@ async fn run_expectancy_renderer(pool:PgPool,stop:CancellationToken) {
             let Some(job)=setups_db::expectancy::claim_render(&pool,&worker,expectancy_chart::RENDER_VERSION).await? else {return Ok::<_,setups_db::DbError>(false);};
             let bytes=serde_json::to_vec(&job.artifact.numerical_snapshot).map_err(|error|setups_db::DbError::Json(error.to_string()))?;
             let artifact=setups_domain::expectancy::ExpectancyArtifact::from_json(&bytes).map_err(|error|setups_db::DbError::Json(error.to_string()))?;
+            let study=match serde_json::from_value::<expectancy_chart::StudyTrend>(job.study_trend.clone()) {
+                Ok(study)=>study,
+                Err(_)=>{
+                    setups_db::expectancy::finish_render(&pool,&job,None,Some("expectancy_study_trend_invalid")).await?;
+                    eprintln!("continuous expectancy png: artifact={} outcome=unavailable code=expectancy_study_trend_invalid",job.artifact.id);
+                    return Ok(true);
+                },
+            };
             // Join the one bounded renderer even on shutdown; never detach a
             // live CPU handle or retain the research Arc for an optional PNG.
-            let rendered=tokio::task::spawn_blocking(move||expectancy_chart::render_png(&artifact)).await;
+            let rendered=tokio::task::spawn_blocking(move||expectancy_chart::render_png_with_trend(&artifact,study)).await;
             match rendered {
                 Ok(Ok(png))=>{
                     setups_db::expectancy::finish_render(&pool,&job,Some(&png),None).await?;
@@ -926,6 +934,9 @@ mod persistence_tests {
             let record=setups_db::expectancy::get_for_generation(&pool,"admin",job.generation_id,&setups_domain::expectancy::EXPECTANCY_CALCULATION_VERSION.to_string()).await.unwrap().unwrap();
             let artifact=setups_domain::expectancy::ExpectancyArtifact::from_json(&serde_json::to_vec(&record.numerical_snapshot).unwrap()).unwrap();
             let key=artifact.image_key(setups_analytics::expectancy_chart::RENDER_VERSION);
+            let saved_study=serde_json::from_value::<setups_analytics::expectancy_chart::StudyTrend>(job.spec.clone()).unwrap();
+            let expected_png=setups_analytics::expectancy_chart::render_png_with_trend(&artifact,saved_study).unwrap();
+            let sealed_before=serde_json::to_vec(&record.numerical_snapshot).unwrap();
             let renderer=tokio::spawn(run_expectancy_renderer(pool.clone(),stop.clone()));
             let ready=tokio::time::timeout(Duration::from_secs(20),async {
                 loop {
@@ -941,7 +952,15 @@ mod persistence_tests {
             assert_eq!(&png[..8],b"\x89PNG\r\n\x1a\n");
             assert_eq!(&png[16..20],&900_u32.to_be_bytes());assert_eq!(&png[20..24],&320_u32.to_be_bytes());
             assert!(png.len()<=setups_db::expectancy::MAX_PNG_BYTES);
+            assert_eq!(png,expected_png,"startup renders sealed numbers using their original study options");
+            assert_eq!(setups_db::expectancy::load_png_by_image_key(&pool,"admin",&key).await.unwrap(),Some(png.clone()));
+            let second_stop=CancellationToken::new();
+            let second=tokio::spawn(run_expectancy_renderer(pool.clone(),second_stop.clone()));
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            second_stop.cancel();tokio::time::timeout(Duration::from_secs(5),second).await.unwrap().unwrap();
             assert_eq!(setups_db::expectancy::load_png_by_image_key(&pool,"admin",&key).await.unwrap(),Some(png));
+            let sealed_after=setups_db::expectancy::get(&pool,"admin",record.id).await.unwrap().unwrap();
+            assert_eq!(serde_json::to_vec(&sealed_after.numerical_snapshot).unwrap(),sealed_before);
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_expectancy_pngs").fetch_one(&pool).await.unwrap(),1);
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_expectancy_render_attempts").fetch_one(&pool).await.unwrap(),0);
         }).await;

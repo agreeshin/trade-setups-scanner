@@ -649,6 +649,9 @@ pub async fn load_png_by_image_key(
 
 pub struct RenderJob {
     pub artifact: Artifact,
+    /// Three fields from the artifact's original generation spec, not current
+    /// research/profile settings. Orphan/legacy specs project an empty object.
+    pub study_trend: Value,
     pub render_version: u32,
     worker: String,
     token: i64,
@@ -669,11 +672,12 @@ pub async fn claim_render(
         .bind(STORAGE_LOCK)
         .execute(&mut *tx)
         .await?;
-    let row=sqlx::query("select a.id,a.artifact_key,a.identity,a.numerical_snapshot from study_expectancy_artifacts a left join study_expectancy_render_attempts r on r.artifact_id=a.id and r.render_version=$1 left join continuous_generations g on g.id=a.source_generation_id and g.owner_id=a.owner_id where (g.id is null or g.status='completed') and a.numerical_snapshot#>>'{daily,status}'='available' and jsonb_array_length(a.numerical_snapshot#>'{daily,value}')>0 and not exists(select 1 from study_expectancy_pngs p where p.artifact_id=a.id and p.rendering_version=$2) and (r.artifact_id is null or (r.attempts<3 and (r.lease_until is null or r.lease_until<=clock_timestamp()) and r.next_attempt_at<=clock_timestamp())) order by a.id limit 1")
+    let row=sqlx::query("select a.id,a.artifact_key,a.identity,a.numerical_snapshot,jsonb_strip_nulls(jsonb_build_object('trendMode',g.spec->'trendMode','trendBendDays',g.spec->'trendBendDays','trendBlendLambda',g.spec->'trendBlendLambda')) study_trend from study_expectancy_artifacts a left join study_expectancy_render_attempts r on r.artifact_id=a.id and r.render_version=$1 left join continuous_generations g on g.id=a.source_generation_id and g.owner_id=a.owner_id where (g.id is null or g.status='completed') and a.numerical_snapshot#>>'{daily,status}'='available' and jsonb_array_length(a.numerical_snapshot#>'{daily,value}')>0 and not exists(select 1 from study_expectancy_pngs p where p.artifact_id=a.id and p.rendering_version=$2) and (r.artifact_id is null or (r.attempts<3 and (r.lease_until is null or r.lease_until<=clock_timestamp()) and r.next_attempt_at<=clock_timestamp())) order by a.id limit 1")
         .bind(version as i32).bind(version.to_string()).fetch_optional(&mut *tx).await?;
     let Some(row) = row else {
         return Ok(None);
     };
+    let study_trend = row.try_get("study_trend")?;
     let artifact = decode(row)?;
     let count: i64 = sqlx::query_scalar("select count(*) from study_expectancy_render_attempts")
         .fetch_one(&mut *tx)
@@ -688,6 +692,7 @@ pub async fn claim_render(
     tx.commit().await?;
     Ok(Some(RenderJob {
         artifact,
+        study_trend,
         render_version: version,
         worker: worker.into(),
         token,

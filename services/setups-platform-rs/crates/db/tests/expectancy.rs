@@ -63,8 +63,13 @@ where
 }
 
 async fn chain(pool: &PgPool) -> (scheduler::ChainJob, db::ArtifactIdentity, Value) {
-    let config = json!({"adaptiveEnabled":true,"lookbackDays":3,"minSetupsPerDay":[0],"minMeanExpectancy":0.15,
+    chain_with_trend(pool, &json!({})).await
+}
+
+async fn chain_with_trend(pool: &PgPool, trend: &Value) -> (scheduler::ChainJob, db::ArtifactIdentity, Value) {
+    let mut config = json!({"adaptiveEnabled":true,"lookbackDays":3,"minSetupsPerDay":[0],"minMeanExpectancy":0.15,
         "study":{"algorithmId":"price_volume_spike","algorithmVersion":"1.1.1","direction":"short","horizonMinutes":60,"maxSeconds":3600,"maxTrials":8,"seed":42}});
+    config["study"].as_object_mut().unwrap().extend(trend.as_object().unwrap().clone());
     continuous::configure(pool, "admin", "price_volume_spike", &config, &[0.0])
         .await
         .unwrap();
@@ -324,6 +329,7 @@ async fn png_exact_key_claim_recovery_retry_limit_and_live_history_reference_are
         let key=canonical.image_key(1);
         assert!(db::load_png_by_image_key(&pool,"admin",&key).await.unwrap().is_none());
         let first=db::claim_render(&pool,"renderer-one",1).await.unwrap().unwrap();
+        assert_eq!(first.study_trend,json!({}),"missing legacy study fields reach the renderer as defaults");
         assert!(db::claim_render(&pool,"competing-renderer",1).await.unwrap().is_none());
         // Process restart: reclaim the expired attempt with the same immutable input.
         sqlx::query("update study_expectancy_render_attempts set lease_until=clock_timestamp()-interval '1 second'").execute(&pool).await.unwrap();
@@ -374,6 +380,36 @@ async fn png_exact_key_claim_recovery_retry_limit_and_live_history_reference_are
         assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_expectancy_pngs").fetch_one(&pool).await.unwrap(),0);
         assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_expectancy_render_attempts").fetch_one(&pool).await.unwrap(),0);
     }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn render_claim_uses_original_study_trend_not_current_research_config() {
+    for trend in [
+        json!({"trendMode":"mean","trendBendDays":"30"}),
+        json!({"trendMode":"forecast","trendBendDays":"7"}),
+        json!({"trendMode":"blend","trendBendDays":"14","trendBlendLambda":0.6}),
+    ] {
+        isolated(move |pool| async move {
+            let (job, identity, original) = chain_with_trend(&pool, &trend).await;
+            let numerical = artifact(&identity, false);
+            let id = db::seal_for_chain(&pool, &job, &identity, &numerical).await.unwrap().unwrap();
+            finish(&pool, &job, &original).await;
+            sqlx::query("update continuous_processes set config=jsonb_set(config,'{study}', $1)")
+                .bind(json!({"trendMode":"blend","trendBendDays":"linear","trendBlendLambda":0.95}))
+                .execute(&pool).await.unwrap();
+            let claim = db::claim_render(&pool, "original-study-renderer", 1).await.unwrap().unwrap();
+            assert_eq!(claim.study_trend, trend);
+            assert_eq!(claim.artifact.id, id);
+            assert_eq!(claim.artifact.numerical_snapshot, numerical);
+            assert!(claim.study_trend.as_object().unwrap().len() <= 3);
+            let png = png_fixture();
+            db::finish_render(&pool, &claim, Some(&png), None).await.unwrap();
+            assert!(db::claim_render(&pool, "reuse-cached", 1).await.unwrap().is_none());
+            assert_eq!(sqlx::query_scalar::<_,Value>("select numerical_snapshot from study_expectancy_artifacts where id=$1")
+                .bind(id).fetch_one(&pool).await.unwrap(), numerical);
+        }).await;
+    }
 }
 
 #[test]

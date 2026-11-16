@@ -1,6 +1,8 @@
 //! Deterministic historical expectancy PNG from one sealed numeric artifact.
 //!
-//! No candles, outcome evaluation, regression fitting, clock, network or cache.
+//! No candles, outcome evaluation, clock, network or cache. A bounded display
+//! fit uses sealed daily points and the original study's immutable trend spec;
+//! it never replaces the artifact's saved numerical OLS or recommendation.
 //! SVG paths/text are rasterized by resvg/tiny-skia with only a bundled font.
 //! A call owns one 900x320 RGBA pixmap (1,152,000 bytes), a bounded SVG/series,
 //! the renderer's temporary paths/font data, and a <=256-KiB encoded result.
@@ -8,7 +10,10 @@
 //! asynchronous scheduling and the immutable per-artifact image cache.
 use resvg::{tiny_skia, usvg};
 use setups_domain::expectancy::{
-    ExpectancyArtifact, ExpectancyError, ExpectancyUnavailableReason, UtcDailyPoint, UtcLinearTrend,
+    ExpectancyArtifact, ExpectancyError, ExpectancyUnavailableReason, UtcDailyPoint,
+};
+use setups_domain::trend::{
+    TrendBendDays, TrendBlendLambda, TrendError, TrendInput, TrendMode, fit_weighted_trend,
 };
 use std::{fmt, fmt::Write as _, io};
 
@@ -38,9 +43,20 @@ const TOP: f64 = 66.0;
 const BOTTOM: f64 = 258.0;
 const LABEL_WIDTH: f64 = 112.0;
 
+/// Only the three immutable study fields needed by this render. Missing legacy
+/// fields use study defaults; invalid present values fail rather than guessing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct StudyTrend {
+    pub trend_mode: TrendMode,
+    pub trend_bend_days: TrendBendDays,
+    pub trend_blend_lambda: TrendBlendLambda,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderError {
     InvalidArtifact(ExpectancyError),
+    InvalidTrend(TrendError),
     SeriesUnavailable(ExpectancyUnavailableReason),
     NoFiniteDays,
     InvalidGeometry,
@@ -55,6 +71,7 @@ impl RenderError {
     pub const fn code(self) -> &'static str {
         match self {
             Self::InvalidArtifact(_) => "invalid_expectancy_artifact",
+            Self::InvalidTrend(_) => "expectancy_chart_invalid_trend",
             Self::SeriesUnavailable(_) => "expectancy_series_unavailable",
             Self::NoFiniteDays => "expectancy_no_finite_days",
             Self::InvalidGeometry => "expectancy_chart_invalid_geometry",
@@ -76,6 +93,7 @@ impl std::error::Error for RenderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidArtifact(error) => Some(error),
+            Self::InvalidTrend(error) => Some(error),
             _ => None,
         }
     }
@@ -92,12 +110,19 @@ pub fn image_key(artifact: &ExpectancyArtifact) -> ExpectancyImageKey {
     artifact.image_key(RENDER_VERSION)
 }
 
-/// Render from stored UTC points and stored fitted endpoints. Domain validation
-/// verifies the sealed artifact; this module never computes a replacement fit.
+/// Render with the legacy study defaults. Production supplies the saved study
+/// fields explicitly through render_png_with_trend, never mutable UI settings.
 /// Empty/unavailable/all-null series are explicit errors for text-only fallback.
 /// A single finite point is rendered without fabricating a trend.
 pub fn render_png(artifact: &ExpectancyArtifact) -> Result<Vec<u8>, RenderError> {
-    let svg = render_svg(artifact)?;
+    render_png_with_trend(artifact, StudyTrend::default())
+}
+
+pub fn render_png_with_trend(
+    artifact: &ExpectancyArtifact,
+    study: StudyTrend,
+) -> Result<Vec<u8>, RenderError> {
+    let svg = render_svg_with_trend(artifact, study)?;
     let mut options = usvg::Options {
         font_family: FONT_FAMILY.into(),
         ..Default::default()
@@ -142,10 +167,10 @@ struct Geometry {
 impl Geometry {
     fn from_points(
         points: &[UtcDailyPoint],
-        trend: Option<UtcLinearTrend>,
+        trend: Option<&DisplayTrend>,
     ) -> Result<Self, RenderError> {
         let mut minimum = 0.0_f64;
-        let mut maximum = 0.0_f64;
+        let mut maximum = 1.0_f64;
         let mut finite = false;
         for point in points {
             if let Some(value) = point.mean_r {
@@ -157,17 +182,15 @@ impl Geometry {
         if !finite {
             return Err(RenderError::NoFiniteDays);
         }
-        // Match the web plot: fitted endpoints may exceed observed extrema.
+        // Include the displayed curve (including spline overshoot), but never
+        // uncertainty bands or decorative padding in the labelled bounds.
         if let Some(trend) = trend {
-            minimum = minimum.min(trend.fitted_start_r).min(trend.fitted_end_r);
-            maximum = maximum.max(trend.fitted_start_r).max(trend.fitted_end_r);
+            for &(_, value) in &trend.points {
+                minimum = minimum.min(value);
+                maximum = maximum.max(value);
+            }
         }
-        let padding = ((maximum - minimum) * 0.08).max(0.1);
-        let (y_min, y_max) = if minimum == maximum {
-            (minimum - 0.5, maximum + 0.5)
-        } else {
-            (minimum - padding, maximum + padding)
-        };
+        let (y_min, y_max) = (minimum, maximum);
         let first_x = points.first().ok_or(RenderError::NoFiniteDays)?.x_utc_days;
         let x_span = points.last().ok_or(RenderError::NoFiniteDays)?.x_utc_days - first_x;
         if !y_min.is_finite()
@@ -194,6 +217,67 @@ impl Geometry {
     fn y(self, value: f64) -> f64 {
         TOP + (self.y_max - value) / (self.y_max - self.y_min) * (BOTTOM - TOP)
     }
+}
+
+/// <=257 sampled points owned by one render and released with its SVG. No
+/// confidence interval is retained or drawn, for straight or curved fits.
+#[derive(Debug, PartialEq)]
+struct DisplayTrend {
+    method: &'static str,
+    points: Vec<(f64, f64)>,
+}
+
+fn display_trend(
+    points: &[UtcDailyPoint],
+    mean: f64,
+    study: StudyTrend,
+) -> Result<Option<DisplayTrend>, RenderError> {
+    let mut finite = points.iter().filter(|point| point.mean_r.is_some());
+    let Some(first) = finite.next() else {
+        return Ok(None);
+    };
+    let Some(last) = finite.next_back() else {
+        return Ok(None);
+    };
+    if study.trend_mode == TrendMode::Mean {
+        return Ok(Some(DisplayTrend {
+            method: "mean",
+            points: vec![(first.x_utc_days, mean), (last.x_utc_days, mean)],
+        }));
+    }
+    let input: Vec<_> = points
+        .iter()
+        .map(|point| {
+            let weight = u32::try_from(point.row_count)
+                .map_err(|_| RenderError::InvalidTrend(TrendError::InvalidDayOrValue))?;
+            Ok(TrendInput {
+                day: point.x_utc_days,
+                value: point.mean_r,
+                weight,
+            })
+        })
+        .collect::<Result<_, RenderError>>()?;
+    let Some(fit) =
+        fit_weighted_trend(&input, study.trend_bend_days).map_err(RenderError::InvalidTrend)?
+    else {
+        return Ok(None);
+    };
+    let summary = fit.summary();
+    Ok(Some(DisplayTrend {
+        method: summary.method,
+        points: summary
+            .curve
+            .iter()
+            .map(|point| {
+                let value = if study.trend_mode == TrendMode::Blend {
+                    study.trend_blend_lambda.combine(mean, point.value)
+                } else {
+                    point.value
+                };
+                (point.day, value)
+            })
+            .collect(),
+    }))
 }
 
 fn risk_label(value: f64) -> String {
@@ -231,7 +315,27 @@ fn period_mean_r(artifact: &ExpectancyArtifact, points: &[UtcDailyPoint]) -> f64
         .sum()
 }
 
+fn period_win_rate_pct(points: &[UtcDailyPoint]) -> Option<f64> {
+    // Domain validation bounds total TP and SL individually to u64; u128 also
+    // safely adds both totals. Unclosed/null rows never enter this denominator.
+    let (tp, sl) = points.iter().fold((0_u128, 0_u128), |(tp, sl), point| {
+        (
+            tp + u128::from(point.tp_count),
+            sl + u128::from(point.sl_count),
+        )
+    });
+    (tp + sl > 0).then(|| 100.0 * tp as f64 / (tp + sl) as f64)
+}
+
+#[cfg(test)]
 fn render_svg(artifact: &ExpectancyArtifact) -> Result<String, RenderError> {
+    render_svg_with_trend(artifact, StudyTrend::default())
+}
+
+fn render_svg_with_trend(
+    artifact: &ExpectancyArtifact,
+    study: StudyTrend,
+) -> Result<String, RenderError> {
     artifact.validate().map_err(RenderError::InvalidArtifact)?;
     let points = artifact.daily.as_ref().ok_or_else(|| {
         let setups_domain::expectancy::MetricAvailability::Unavailable { reason } = &artifact.daily
@@ -240,8 +344,11 @@ fn render_svg(artifact: &ExpectancyArtifact) -> Result<String, RenderError> {
         };
         RenderError::SeriesUnavailable(*reason)
     })?;
-    let geometry = Geometry::from_points(points, artifact.trend)?;
+    // Geometry rejects all-null/empty series before presentation aggregates.
+    Geometry::from_points(points, None)?;
     let mean = period_mean_r(artifact, points);
+    let trend = display_trend(points, mean, study)?;
+    let geometry = Geometry::from_points(points, trend.as_ref())?;
     let title_color = if mean > 0.0 {
         POSITIVE
     } else if mean < 0.0 {
@@ -250,38 +357,40 @@ fn render_svg(artifact: &ExpectancyArtifact) -> Result<String, RenderError> {
         FOREGROUND
     };
     let mean_label = risk_label(mean);
+    let win_rate = period_win_rate_pct(points)
+        .map_or_else(|| "недоступно".into(), |rate| format!("{rate:.1}%"));
     let mut svg = BoundedSvg(String::with_capacity(
         (points.len() * 128 + 8192).min(MAX_SVG_BYTES),
     ));
     write!(
         svg,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="320" viewBox="0 0 900 320" font-family="{FONT_FAMILY}"><rect width="900" height="320" fill="{BACKGROUND}"/><text id="title" x="450" y="28" text-anchor="middle" font-size="18" fill="{title_color}">{TITLE} · Среднее МО: {mean_label}</text>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="320" viewBox="0 0 900 320" font-family="{FONT_FAMILY}"><rect width="900" height="320" fill="{BACKGROUND}"/><text id="title" x="450" y="28" text-anchor="middle" font-size="18" fill="{title_color}">{TITLE} · Среднее МО: {mean_label} · Win rate: {win_rate}</text>"#
     )?;
     write!(
         svg,
         r#"<g fill="none" stroke="{AXIS}" stroke-width="1" stroke-opacity="0.4"><path d="M {LEFT} {TOP} V {BOTTOM} H {RIGHT}"/></g><text x="42" y="56" text-anchor="middle" font-size="12" fill="{AXIS}">R</text>"#
     )?;
     let zero = geometry.y(0.0);
-    for value in [
-        geometry.y_min,
-        (geometry.y_min / 2.0 + geometry.y_max / 2.0),
-        geometry.y_max,
+    for (id, value) in [
+        ("axis-min", geometry.y_min),
+        ("axis-mid", geometry.y_min / 2.0 + geometry.y_max / 2.0),
+        ("axis-max", geometry.y_max),
     ] {
         let y = geometry.y(value);
-        if (y - zero).abs() < 14.0 {
+        if value == 0.0 || (id == "axis-mid" && (y - zero).abs() < 14.0) {
             continue; // Reserve the explicit zero label; avoid overlapping ticks.
         }
         write!(
             svg,
-            r#"<line x1="{LEFT}" y1="{y:.3}" x2="{RIGHT}" y2="{y:.3}" stroke="{AXIS}" stroke-opacity="0.18"/><text x="70" y="{:.3}" text-anchor="end" font-size="11" fill="{AXIS}">{}</text>"#,
+            r#"<line x1="{LEFT}" y1="{y:.3}" x2="{RIGHT}" y2="{y:.3}" stroke="{AXIS}" stroke-opacity="0.18"/><text id="{id}" x="70" y="{:.3}" text-anchor="end" font-size="11" fill="{AXIS}">{}</text>"#,
             y + 4.0,
             risk_label(value)
         )?;
     }
     write!(
         svg,
-        r#"<line id="zero" x1="{LEFT}" y1="{zero:.3}" x2="{RIGHT}" y2="{zero:.3}" stroke="{AXIS}" stroke-opacity="0.55"/><text id="zero-label" x="70" y="{:.3}" text-anchor="end" font-size="11" fill="{AXIS}">0 R</text>"#,
-        zero + 4.0,
+        r#"<line id="zero" x1="{LEFT}" y1="{zero:.3}" x2="{RIGHT}" y2="{zero:.3}" stroke="{AXIS}" stroke-opacity="0.55"/><text id="zero-label" x="70" y="{:.3}" text-anchor="end" font-size="11" fill="{AXIS}">0</text>"#,
+        zero + if zero - TOP < 14.0 { 18.0 } else { 4.0 },
     )?;
 
     // A null represented day ends a segment. Missing calendar dates are NOT
@@ -308,15 +417,16 @@ fn render_svg(artifact: &ExpectancyArtifact) -> Result<String, RenderError> {
             segment_start = end + 1;
         }
     }
-    if let Some(trend) = artifact.trend {
+    if let Some(trend) = &trend {
         write!(
             svg,
-            r#"<line id="trend" x1="{:.3}" y1="{:.3}" x2="{:.3}" y2="{:.3}" stroke="{TREND}" stroke-width="2" stroke-dasharray="4 4"/>"#,
-            geometry.x(trend.first_x),
-            geometry.y(trend.fitted_start_r),
-            geometry.x(trend.last_x),
-            geometry.y(trend.fitted_end_r)
+            r#"<polyline id="trend" data-method="{}" fill="none" stroke="{TREND}" stroke-width="2" stroke-dasharray="4 4" stroke-linejoin="round" points=""#,
+            trend.method,
         )?;
+        for &(day, value) in &trend.points {
+            write!(svg, "{:.3},{:.3} ", geometry.x(day), geometry.y(value))?;
+        }
+        write!(svg, "\"/>")?;
     }
     for point in points {
         if let Some(value) = point.mean_r {
@@ -329,24 +439,25 @@ fn render_svg(artifact: &ExpectancyArtifact) -> Result<String, RenderError> {
             )?;
         }
     }
-    if let Some(trend) = artifact.trend {
-        let close = geometry.x(trend.last_x) - geometry.x(trend.first_x) < 2.0 * LABEL_WIDTH;
+    if let Some(trend) = &trend {
+        let &(first_x, start_r) = trend.points.first().expect("two finite dates");
+        let &(last_x, end_r) = trend.points.last().expect("two finite dates");
+        let close = geometry.x(last_x) - geometry.x(first_x) < 2.0 * LABEL_WIDTH;
         trend_label(
             &mut svg,
             "trend-start",
-            geometry.x(trend.first_x).clamp(LEFT, RIGHT - LABEL_WIDTH),
-            (geometry.y(trend.fitted_start_r) - 12.0).clamp(48.0, BOTTOM - 6.0),
+            geometry.x(first_x).clamp(LEFT, RIGHT - LABEL_WIDTH),
+            (geometry.y(start_r) - 12.0).clamp(48.0, BOTTOM - 6.0),
             "start",
-            trend.fitted_start_r,
+            start_r,
         )?;
         trend_label(
             &mut svg,
             "trend-end",
-            geometry.x(trend.last_x).clamp(LEFT + LABEL_WIDTH, RIGHT),
-            (geometry.y(trend.fitted_end_r) + if close { 20.0 } else { -12.0 })
-                .clamp(48.0, BOTTOM - 6.0),
+            geometry.x(last_x).clamp(LEFT + LABEL_WIDTH, RIGHT),
+            (geometry.y(end_r) + if close { 20.0 } else { -12.0 }).clamp(48.0, BOTTOM - 6.0),
             "end",
-            trend.fitted_end_r,
+            end_r,
         )?;
     } else {
         write!(
@@ -520,8 +631,274 @@ mod tests {
             .count()
     }
 
+    fn curved_fixture() -> ExpectancyArtifact {
+        let mut input = input();
+        input.selected_cell = None;
+        input.source.tp_pct = 4.0;
+        input.source.provenance.to_unix = ORIGIN + 43 * 86400;
+        input.source.provenance.observation_cutoff = input.source.provenance.to_unix;
+        input.daily = MetricAvailability::Available {
+            value: (0..43)
+                .map(|day| {
+                    let tp = if day < 14 {
+                        1 + day / 2
+                    } else if day < 28 {
+                        8 - (day - 14) / 2
+                    } else {
+                        1 + (day - 28) / 2
+                    };
+                    let (tp_count, sl_count) = if day == 10 || day == 28 {
+                        (0, 0)
+                    } else {
+                        (tp as u64, (10 - tp) as u64)
+                    };
+                    UtcDailyInput {
+                        day_start_unix: ORIGIN + day * 86400,
+                        row_count: 10 + day as u64 % 4,
+                        tp_count,
+                        sl_count,
+                        mean_r: (tp_count + sl_count > 0)
+                            .then(|| (tp_count as f64 * 4.0 - sl_count as f64) / 10.0),
+                    }
+                })
+                .collect(),
+        };
+        build_expectancy_artifact(input).unwrap()
+    }
+
     #[test]
-    fn utc_golden_uses_calendar_spacing_null_breaks_and_saved_fit_labels() {
+    fn title_win_rate_aggregates_closed_counts_not_daily_percentages_or_unclosed_rows() {
+        let mut artifact = with_outcomes(2.0, 1.0, &[(0, 1, 0), (3, 0, 9), (9, 0, 0)]);
+        let MetricAvailability::Available { value: points } = &mut artifact.daily else {
+            unreachable!()
+        };
+        points[0].row_count += 100;
+        points[2].row_count += 100;
+        artifact.validate().unwrap();
+        assert_eq!(
+            period_win_rate_pct(artifact.daily.as_ref().unwrap()),
+            Some(10.0)
+        );
+        let svg = render_svg(&artifact).unwrap();
+        assert!(svg.contains("Среднее МО: -0.70 R · Win rate: 10.0%</text>"));
+        assert!(svg.contains(&format!("fill=\"{NEGATIVE}\">{TITLE}")));
+        assert_eq!(period_win_rate_pct(&[]), None);
+        let null = with_outcomes(2.0, 1.0, &[(0, 0, 0)]);
+        assert_eq!(period_win_rate_pct(null.daily.as_ref().unwrap()), None);
+        assert_eq!(render_png(&null), Err(RenderError::NoFiniteDays));
+    }
+
+    #[test]
+    fn study_modes_share_matrix_solver_weights_bends_and_blend_formula() {
+        use setups_domain::trend::TrendDesign;
+        let artifact = curved_fixture();
+        let sealed = artifact.to_json().unwrap();
+        let points = artifact.daily.as_ref().unwrap();
+        let mean = period_mean_r(&artifact, points);
+        let mean_line = display_trend(points, mean, StudyTrend::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(mean_line.method, "mean");
+        assert!(mean_line.points.iter().all(|(_, value)| *value == mean));
+        let input: Vec<_> = points
+            .iter()
+            .map(|point| TrendInput {
+                day: point.x_utc_days,
+                value: point.mean_r,
+                weight: point.row_count as u32,
+            })
+            .collect();
+        let mut endpoints = Vec::new();
+        for bend in [
+            TrendBendDays::Linear,
+            TrendBendDays::Seven,
+            TrendBendDays::Fourteen,
+            TrendBendDays::Thirty,
+        ] {
+            let study = StudyTrend {
+                trend_mode: TrendMode::Forecast,
+                trend_bend_days: bend,
+                ..StudyTrend::default()
+            };
+            let forecast = display_trend(points, mean, study).unwrap().unwrap();
+            let matrix = TrendDesign::new(0.0, 42.0, bend)
+                .unwrap()
+                .endpoint(&input)
+                .unwrap()
+                .unwrap();
+            assert_eq!(forecast.points.last().unwrap().1, matrix);
+            assert_eq!(
+                forecast.method,
+                if bend == TrendBendDays::Linear {
+                    "linear"
+                } else {
+                    "p_spline"
+                }
+            );
+            assert!(forecast.points.len() <= 257);
+            assert_eq!(forecast.points.first().unwrap().0, 0.0);
+            assert_eq!(forecast.points.last().unwrap().0, 42.0);
+            endpoints.push(matrix);
+            for lambda in [
+                TrendBlendLambda::default(),
+                TrendBlendLambda::try_from(0.6).unwrap(),
+            ] {
+                let blend = display_trend(
+                    points,
+                    mean,
+                    StudyTrend {
+                        trend_mode: TrendMode::Blend,
+                        trend_blend_lambda: lambda,
+                        ..study
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(blend.points.len(), forecast.points.len());
+                for (&(day, value), &(forecast_day, forecast_value)) in
+                    blend.points.iter().zip(&forecast.points)
+                {
+                    assert_eq!(day, forecast_day);
+                    assert_eq!(value, lambda.combine(mean, forecast_value));
+                }
+            }
+        }
+        assert!(
+            endpoints
+                .windows(2)
+                .all(|pair| (pair[0] - pair[1]).abs() > 1e-6)
+        );
+        assert_eq!(
+            artifact.to_json().unwrap(),
+            sealed,
+            "display fit never reseals scientific numbers"
+        );
+    }
+
+    #[test]
+    fn curves_are_open_unfilled_lines_with_no_confidence_band() {
+        let artifact = curved_fixture();
+        for mode in [TrendMode::Forecast, TrendMode::Blend] {
+            let study = StudyTrend {
+                trend_mode: mode,
+                trend_bend_days: TrendBendDays::Seven,
+                ..StudyTrend::default()
+            };
+            let svg = render_svg_with_trend(&artifact, study).unwrap();
+            let start = svg.find("<polyline id=\"trend\"").unwrap();
+            let line = &svg[start..start + svg[start..].find("/>").unwrap()];
+            assert!(line.contains("data-method=\"p_spline\""));
+            assert!(line.contains("fill=\"none\""));
+            assert!(line.contains(&format!("stroke=\"{TREND}\"")));
+            assert!(!line.contains(" Z") && !line.contains(" z"));
+            assert!(
+                !svg.contains("<polygon")
+                    && !svg.contains("confidence")
+                    && !svg.contains("fill-opacity")
+            );
+            assert!(!svg.contains(&format!("fill=\"{TREND}\" stroke-opacity")));
+            assert_eq!(svg.matches("id=\"trend-start\"").count(), 1);
+            assert_eq!(svg.matches("id=\"trend-end\"").count(), 1);
+            let png = render_png_with_trend(&artifact, study).unwrap();
+            setups_relay_protocol::v2::validate_png(&png).unwrap();
+            assert_eq!(png, render_png_with_trend(&artifact, study).unwrap());
+        }
+    }
+
+    #[test]
+    fn axis_bounds_are_exact_display_extrema_clamped_to_zero_and_one() {
+        for (artifact, minimum, maximum) in [
+            (with_outcomes(0.2, 1.0, &[(0, 1, 0), (2, 1, 0)]), 0.0, 1.0),
+            (with_outcomes(4.0, 1.0, &[(0, 1, 0), (2, 1, 1)]), 0.0, 4.0),
+            (with_outcomes(2.0, 1.0, &[(0, 0, 1), (2, 0, 1)]), -1.0, 1.0),
+            (with_outcomes(1.0, 1.0, &[(0, 1, 1), (2, 1, 1)]), 0.0, 1.0),
+            (with_outcomes(4.0, 1.0, &[(0, 0, 1), (2, 1, 0)]), -1.0, 4.0),
+        ] {
+            let geometry = Geometry::from_points(artifact.daily.as_ref().unwrap(), None).unwrap();
+            assert_eq!((geometry.y_min, geometry.y_max), (minimum, maximum));
+            assert_eq!((geometry.y(maximum), geometry.y(minimum)), (TOP, BOTTOM));
+            let svg = render_svg(&artifact).unwrap();
+            assert!(svg.contains(&format!("id=\"axis-max\" x=\"70\" y=\"70.000\" text-anchor=\"end\" font-size=\"11\" fill=\"{AXIS}\">{}</text>", risk_label(maximum))));
+            assert_eq!(svg.matches(">0</text>").count(), 1);
+            if minimum < 0.0 {
+                assert!(svg.contains(&format!("id=\"axis-min\" x=\"70\" y=\"262.000\" text-anchor=\"end\" font-size=\"11\" fill=\"{AXIS}\">{}</text>", risk_label(minimum))));
+            }
+        }
+        // Internal curve extrema, not just endpoints, participate in the scale.
+        let artifact = fixture();
+        let curve = DisplayTrend {
+            method: "p_spline",
+            points: vec![(0.0, 0.2), (4.0, 8.0), (6.0, -3.0), (9.0, 0.5)],
+        };
+        let geometry =
+            Geometry::from_points(artifact.daily.as_ref().unwrap(), Some(&curve)).unwrap();
+        assert_eq!((geometry.y_min, geometry.y_max), (-3.0, 8.0));
+    }
+
+    #[test]
+    fn saved_study_defaults_and_invalid_options_are_explicit_and_short_fits_fall_back() {
+        let defaults: StudyTrend = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(defaults, StudyTrend::default());
+        assert_eq!(defaults.trend_blend_lambda.fraction(), 0.7);
+        for value in [
+            serde_json::json!({"trendMode":"unknown"}),
+            serde_json::json!({"trendBendDays":"8"}),
+            serde_json::json!({"trendBlendLambda":0.705}),
+            serde_json::json!({"trendBlendLambda":1}),
+        ] {
+            assert!(serde_json::from_value::<StudyTrend>(value).is_err());
+        }
+        let short = fixture();
+        let points = short.daily.as_ref().unwrap();
+        let curve = display_trend(
+            points,
+            0.8,
+            StudyTrend {
+                trend_mode: TrendMode::Forecast,
+                trend_bend_days: TrendBendDays::Seven,
+                ..defaults
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            curve.method, "linear",
+            "three finite days cannot invent a spline"
+        );
+        let single = with_outcomes(2.0, 1.0, &[(0, 1, 0)]);
+        for mode in [TrendMode::Mean, TrendMode::Forecast, TrendMode::Blend] {
+            let svg = render_svg_with_trend(
+                &single,
+                StudyTrend {
+                    trend_mode: mode,
+                    ..defaults
+                },
+            )
+            .unwrap();
+            assert!(!svg.contains("id=\"trend\""));
+            assert!(svg.contains("id=\"no-trend\""));
+        }
+        let mut oversized = fixture();
+        let MetricAvailability::Available { value: points } = &mut oversized.daily else {
+            unreachable!()
+        };
+        points[0].row_count = u64::from(u32::MAX) + 1;
+        oversized.validate().unwrap();
+        assert_eq!(
+            render_png_with_trend(
+                &oversized,
+                StudyTrend {
+                    trend_mode: TrendMode::Forecast,
+                    ..defaults
+                }
+            ),
+            Err(RenderError::InvalidTrend(TrendError::InvalidDayOrValue)),
+            "do not truncate oversized setup weights"
+        );
+    }
+
+    #[test]
+    fn utc_golden_uses_calendar_spacing_null_breaks_and_keeps_sealed_ols_unchanged() {
         let artifact = fixture();
         assert_eq!(artifact.origin_unix, ORIGIN);
         let cell = artifact.selected_cell.as_ref().unwrap();
@@ -531,14 +908,15 @@ mod tests {
         let trend = artifact.trend.unwrap();
         assert!((trend.slope_r_per_day - 1.0 / 6.0).abs() < 1e-12);
         let points = artifact.daily.as_ref().unwrap();
-        let geometry = Geometry::from_points(points, Some(trend)).unwrap();
+        let geometry = Geometry::from_points(points, None).unwrap();
         assert!((geometry.x(3.0) - LEFT - (RIGHT - LEFT) / 3.0).abs() < 1e-10);
         let svg = render_svg(&artifact).unwrap();
         assert_eq!(svg.matches("class=\"daily-point\"").count(), 3);
         assert_eq!(svg.matches("class=\"daily-segment\"").count(), 1);
-        assert!(svg.contains("+0.00 R</text>"));
-        assert!(svg.contains("+1.50 R</text>"));
-        assert!(svg.contains(&format!("{TITLE} · Среднее МО: +0.80 R</text>")));
+        assert_eq!(svg.matches(">+0.80 R</text>").count(), 2);
+        assert!(svg.contains(&format!(
+            "{TITLE} · Среднее МО: +0.80 R · Win rate: 60.0%</text>"
+        )));
         assert!(svg.contains("Дата сетапа (UTC)"));
         assert!(!svg.contains("Дата сигнала"));
         assert!(svg.contains("03.01</text>")); // represented null day remains on the date axis
@@ -592,7 +970,7 @@ mod tests {
         assert!(
             render_svg(&weighted)
                 .unwrap()
-                .contains("Среднее МО: +0.80 R</text>")
+                .contains("Среднее МО: +0.80 R · Win rate: 60.0%</text>")
         );
         for (artifact, color, rgb, label) in [
             (
@@ -622,15 +1000,14 @@ mod tests {
         ] {
             let svg = render_svg(&artifact).unwrap();
             assert!(svg.contains(&format!(
-                "fill=\"{color}\">{TITLE} · Среднее МО: {label}</text>"
+                "fill=\"{color}\">{TITLE} · Среднее МО: {label} · Win rate:"
             )));
-            let geometry =
-                Geometry::from_points(artifact.daily.as_ref().unwrap(), artifact.trend).unwrap();
+            let geometry = Geometry::from_points(artifact.daily.as_ref().unwrap(), None).unwrap();
             assert!(svg.contains(&format!(
                 "id=\"zero-label\" x=\"70\" y=\"{:.3}\"",
                 geometry.y(0.0) + 4.0
             )));
-            assert_eq!(svg.matches(">0 R</text>").count(), 1);
+            assert_eq!(svg.matches(">0</text>").count(), 1);
             let (_, pixels) = decoded(&render_png(&artifact).unwrap());
             assert!(count_color(&pixels, rgb, (100, 5, 800, 35)) > 100);
         }
@@ -639,20 +1016,26 @@ mod tests {
     #[test]
     fn outlier_fit_is_included_in_scale_and_both_endpoint_labels_are_visible() {
         let artifact = with_outcomes(10.0, 1.0, &[(0, 1, 10), (1, 1, 0), (2, 1, 0)]);
-        let trend = artifact.trend.unwrap();
-        assert!(trend.fitted_end_r > 10.0);
-        let geometry =
-            Geometry::from_points(artifact.daily.as_ref().unwrap(), Some(trend)).unwrap();
-        assert!(geometry.y_max > trend.fitted_end_r);
-        let svg = render_svg(&artifact).unwrap();
+        let study = StudyTrend {
+            trend_mode: TrendMode::Forecast,
+            ..StudyTrend::default()
+        };
+        let points = artifact.daily.as_ref().unwrap();
+        let trend = display_trend(points, period_mean_r(&artifact, points), study)
+            .unwrap()
+            .unwrap();
+        let start_r = trend.points.first().unwrap().1;
+        let end_r = trend.points.last().unwrap().1;
+        assert!(end_r > 10.0);
+        let geometry = Geometry::from_points(points, Some(&trend)).unwrap();
+        assert_eq!(geometry.y_max, end_r);
+        let svg = render_svg_with_trend(&artifact, study).unwrap();
         assert!(svg.contains("id=\"trend-start\"") && svg.contains("id=\"trend-end\""));
-        assert!(svg.contains("+1.67 R</text>") && svg.contains("+11.67 R</text>"));
-        let bytes = render_png(&artifact).unwrap();
+        assert!(svg.contains(&format!("{}</text>", risk_label(start_r))));
+        assert!(svg.contains(&format!("{}</text>", risk_label(end_r))));
+        let bytes = render_png_with_trend(&artifact, study).unwrap();
         let (_, pixels) = decoded(&bytes);
-        for (x, value) in [
-            (LEFT, trend.fitted_start_r),
-            (RIGHT - LABEL_WIDTH, trend.fitted_end_r),
-        ] {
+        for (x, value) in [(LEFT, start_r), (RIGHT - LABEL_WIDTH, end_r)] {
             let baseline = (geometry.y(value) - 12.0).clamp(48.0, BOTTOM - 6.0);
             assert!(
                 count_color(
@@ -764,10 +1147,24 @@ mod tests {
                 .collect(),
         };
         let artifact = build_expectancy_artifact(input).unwrap();
-        assert!(render_svg(&artifact).unwrap().len() <= MAX_SVG_BYTES);
-        let bytes = render_png(&artifact).unwrap();
-        assert!(bytes.len() <= MAX_PNG_BYTES);
-        setups_relay_protocol::v2::validate_png(&bytes).unwrap();
+        for study in [
+            StudyTrend::default(),
+            StudyTrend {
+                trend_mode: TrendMode::Forecast,
+                trend_bend_days: TrendBendDays::Seven,
+                ..StudyTrend::default()
+            },
+            StudyTrend {
+                trend_mode: TrendMode::Blend,
+                trend_bend_days: TrendBendDays::Thirty,
+                ..StudyTrend::default()
+            },
+        ] {
+            assert!(render_svg_with_trend(&artifact, study).unwrap().len() <= MAX_SVG_BYTES);
+            let bytes = render_png_with_trend(&artifact, study).unwrap();
+            assert!(bytes.len() <= MAX_PNG_BYTES);
+            setups_relay_protocol::v2::validate_png(&bytes).unwrap();
+        }
     }
 
     #[test]
