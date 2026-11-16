@@ -712,6 +712,7 @@ mod tests {
                 cluster_enabled: source.analytics.cluster_enabled,
                 cluster_gap_minutes: source.analytics.cluster_gap_minutes,
                 provenance: source.provenance.clone(),
+                search_forecast: None,
             },
             study_id: 42,
             generation_id: 3,

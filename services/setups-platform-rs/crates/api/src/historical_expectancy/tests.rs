@@ -13,6 +13,7 @@ fn legacy_unaligned_period_preserves_continuous_bounds_and_original_cutoff() {
         from_unix:1793168289,to_unix:1794637089,direction:setups_analytics::TradeDirection::Short,
         setup_maturity:0.0,tp_levels:vec![16.0],sl_levels:vec![4.0],horizon_minutes:10080,
         min_closed_per_cell:1,min_setups_per_day:0.0,max_trials:8,max_seconds:30,seed:168,
+        trend_mode:core::TrendMode::Mean,trend_bend_days:core::TrendBendDays::Linear,
     };
     let context=core::ContinuousContext {observation_cutoff:1794637080};
     assert!(core::required_input_bounds(&spec).is_err(),"manual validation is not the continuous contract");

@@ -1,4 +1,4 @@
-//! Manual analytics only; immutable research/recommendation OLS is unchanged.
+//! Weighted analytics and opt-in study objectives; legacy recommendation OLS is unchanged.
 //! One fit owns O(days + coefficients) memory (< 1 MiB at the admitted bounds).
 //! No cache, clock, I/O or extrapolation. Weights are setup counts, not returns.
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ pub enum TrendBendDays {
     Linear,
 }
 impl TrendBendDays {
+    pub fn is_linear(&self) -> bool { *self == Self::Linear }
     pub fn key(self) -> &'static str {
         match self {
             Self::Seven => "7",
@@ -44,6 +45,9 @@ pub enum TrendMode {
     #[default]
     Mean,
     Forecast,
+}
+impl TrendMode {
+    pub fn is_mean(&self) -> bool { *self == Self::Mean }
 }
 /// Mean keys/payloads deliberately remain byte-compatible with pre-trend caches.
 pub fn trend_matrix_scope(scope: &str, mode: TrendMode, bend: TrendBendDays) -> String {
@@ -182,6 +186,63 @@ fn dot_at(coefficients: &[f64], offset: usize, b: &[f64; BAND]) -> f64 {
         .map(|(j, value)| value * coefficients[offset + j])
         .sum()
 }
+
+/// One evaluation/group owns this immutable calendar design. All cells sharing
+/// finite endpoints reuse knots, basis and penalty; no weights or outcomes live
+/// here. Null leading/trailing days require a different design, not extrapolation.
+pub struct TrendDesign {
+    first: f64,
+    last: f64,
+    bend: TrendBendDays,
+    knots: Vec<f64>,
+    rows: Vec<(usize, [f64; BAND])>,
+    penalty: Vec<(usize, usize, f64)>,
+}
+impl TrendDesign {
+    pub fn new(first: f64, last: f64, bend: TrendBendDays) -> Result<Self, TrendError> {
+        if !first.is_finite() || !last.is_finite() || first.fract() != 0.0
+            || last.fract() != 0.0 || first.abs() > 100_000_000.0
+            || last.abs() > 100_000_000.0 || last <= first {
+            return Err(TrendError::InvalidDayOrValue);
+        }
+        if last - first > 3660.0 { return Err(TrendError::PeriodTooLong); }
+        let mut design = Self { first, last, bend, knots: Vec::new(), rows: Vec::new(), penalty: Vec::new() };
+        if let Some(spacing) = bend.spacing() {
+            design.knots = vec![first; BAND];
+            let mut knot = first + spacing;
+            while knot < last { design.knots.push(knot); knot += spacing; }
+            design.knots.extend([last; BAND]);
+            design.rows = (0..=(last - first) as usize)
+                .map(|day| basis(&design.knots, first + day as f64)).collect();
+            let n = design.knots.len() - BAND;
+            for i in 0..n - 2 {
+                let d = [1.0, -2.0, 1.0];
+                for j in 0..3 { for k in 0..=j {
+                    // Preserve the original order of floating-point additions.
+                    design.penalty.push((i + j, i + k, LAMBDA * d[j] * d[k]));
+                }}
+            }
+        }
+        Ok(design)
+    }
+    pub fn working_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.knots.capacity() * std::mem::size_of::<f64>()
+            + self.rows.capacity() * std::mem::size_of::<(usize, [f64; BAND])>()
+            + self.penalty.capacity() * std::mem::size_of::<(usize, usize, f64)>()
+    }
+    /// Endpoint-only solve: the same coefficients/fallback as Analytics without
+    /// O(days × coefficients) effective-df/CI work or sampled curves per cell.
+    pub fn endpoint(&self, input: &[TrendInput]) -> Result<Option<f64>, TrendError> {
+        Ok(fit_weighted_trend_inner(input, self.bend, Some(self), false)?
+            .map(|fit| match &fit.model {
+                Model::Linear { mean_x, mean_y, slope, .. } => mean_y + slope * (fit.last - mean_x),
+                Model::Spline { knots, coefficients, .. } => {
+                    let (offset, b) = basis(knots, fit.last);
+                    dot_at(coefficients, offset, &b)
+                }
+            }))
+    }
+}
 enum Model {
     Linear {
         mean_x: f64,
@@ -279,6 +340,15 @@ pub fn fit_weighted_trend(
     input: &[TrendInput],
     bend: TrendBendDays,
 ) -> Result<Option<WeightedTrend>, TrendError> {
+    fit_weighted_trend_inner(input, bend, None, true)
+}
+
+fn fit_weighted_trend_inner(
+    input: &[TrendInput],
+    bend: TrendBendDays,
+    prepared: Option<&TrendDesign>,
+    uncertainty: bool,
+) -> Result<Option<WeightedTrend>, TrendError> {
     if input.len() > MAX_TREND_DAYS {
         return Err(TrendError::TooManyDays);
     }
@@ -318,6 +388,9 @@ pub fn fit_weighted_trend(
     }
     let first = points[0].0;
     let last = points[points.len() - 1].0;
+    if prepared.is_some_and(|design| design.first != first || design.last != last || design.bend != bend) {
+        return Err(TrendError::InvalidDayOrValue);
+    }
     let mean_x = points.iter().map(|p| p.0 * p.2).sum::<f64>() / count;
     let mean_y = points.iter().map(|p| p.1 * p.2).sum::<f64>() / count;
     let xx = points
@@ -350,20 +423,19 @@ pub fn fit_weighted_trend(
     if !xx.is_finite() || xx <= 0.0 || !slope.is_finite() {
         return Err(TrendError::NumericalFailure);
     }
-    let Some(spacing) = bend.spacing().filter(|_| points.len() >= 4) else {
+    let Some(_) = bend.spacing().filter(|_| points.len() >= 4) else {
         return Ok(Some(linear()));
     };
-    let mut knots = vec![first; BAND];
-    let mut knot = first + spacing;
-    while knot < last {
-        knots.push(knot);
-        knot += spacing;
-    }
-    knots.extend([last; BAND]);
+    let owned;
+    let design = match prepared {
+        Some(design) => design,
+        None => { owned = TrendDesign::new(first, last, bend)?; &owned }
+    };
+    let knots = design.knots.clone();
     let n = knots.len() - BAND;
     let mut gram = Banded(vec![[0.0; BAND]; n]);
     let mut rhs = vec![0.0; n];
-    let rows: Vec<_> = points.iter().map(|p| basis(&knots, p.0)).collect();
+    let rows: Vec<_> = points.iter().map(|p| design.rows[(p.0 - first) as usize]).collect();
     for ((_, y, w), (offset, b)) in points.iter().zip(&rows) {
         for j in 0..BAND {
             rhs[offset + j] += w * b[j] * y;
@@ -373,13 +445,8 @@ pub fn fit_weighted_trend(
         }
     }
     let mut penalized = gram.clone();
-    for i in 0..n - 2 {
-        let d = [1.0, -2.0, 1.0];
-        for j in 0..3 {
-            for k in 0..=j {
-                penalized.add(i + j, i + k, LAMBDA * d[j] * d[k]);
-            }
-        }
+    for &(i, j, value) in &design.penalty {
+        penalized.add(i, j, value);
     }
     let Some(factor) = penalized.cholesky() else {
         return Ok(Some(linear()));
@@ -390,7 +457,7 @@ pub fn fit_weighted_trend(
     }
     let mut sse = 0.0;
     let mut edf = 0.0;
-    for ((_, y, w), (offset, b)) in points.iter().zip(&rows) {
+    for ((_, y, w), (offset, b)) in points.iter().zip(&rows).take(if uncertainty { points.len() } else { 0 }) {
         sse += w * (y - dot_at(&coefficients, *offset, b)).powi(2);
         let mut unit = vec![0.0; n];
         unit[*offset..offset + BAND].copy_from_slice(b);
@@ -420,6 +487,37 @@ mod tests {
                 weight: 1,
             })
             .collect()
+    }
+    #[test]
+    fn shared_design_endpoints_match_analytics_bits_with_weights_nulls_and_fallbacks() {
+        for bend in [TrendBendDays::Seven, TrendBendDays::Fourteen, TrendBendDays::Thirty, TrendBendDays::Linear] {
+            for count in [2, 3, 4, 31, 91] {
+                let mut points = series(count, |x| (x / 6.0).sin() + x / 90.0);
+                for (i, point) in points.iter_mut().enumerate() {
+                    point.day += 20_000.0;
+                    point.weight = (i % 7 + 1) as u32;
+                    if i > 0 && i + 1 < count && i % 3 == 0 { point.value = None; }
+                }
+                let design = TrendDesign::new(points[0].day, points[count - 1].day, bend).unwrap();
+                assert!(design.working_bytes() < 1024 * 1024);
+                let endpoint = design.endpoint(&points).unwrap().unwrap();
+                let analytics = fit_weighted_trend(&points, bend).unwrap().unwrap().endpoint().value;
+                assert_eq!(endpoint.to_bits(), analytics.to_bits(), "{bend:?}, {count}");
+                assert_eq!(design.endpoint(&points).unwrap(), Some(endpoint));
+            }
+        }
+    }
+    #[test]
+    fn prepared_design_rejects_different_finite_bounds_instead_of_extrapolating() {
+        let design = TrendDesign::new(0.0, 30.0, TrendBendDays::Seven).unwrap();
+        let mut points = series(31, |x| x);
+        points[30].value = None;
+        assert_eq!(design.endpoint(&points), Err(TrendError::InvalidDayOrValue));
+        let own = TrendDesign::new(0.0, 29.0, TrendBendDays::Seven).unwrap();
+        let analytics = fit_weighted_trend(&points, TrendBendDays::Seven).unwrap().unwrap();
+        assert_eq!(analytics.endpoint().day, 29.0);
+        assert_eq!(own.endpoint(&points).unwrap(), Some(analytics.endpoint().value));
+        assert!(TrendDesign::new(0.0, 3661.0, TrendBendDays::Seven).is_err());
     }
     #[test]
     fn linear_equal_weights_match_existing_ols_and_infinity_is_weighted() {

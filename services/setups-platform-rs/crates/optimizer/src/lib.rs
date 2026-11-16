@@ -17,6 +17,8 @@ pub use checkpoint::{
 };
 pub use continuous::*;
 pub use evaluation::{canonical_candidate_key, evaluate_candidate, score_matrix, snapshot_bytes};
+mod trend;
+pub use trend::score_period_mean;
 pub use input_codec::{
     FrozenInputCodecLimits, FrozenInputDigest, read_frozen_input, write_frozen_input,
 };

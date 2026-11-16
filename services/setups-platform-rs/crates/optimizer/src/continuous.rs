@@ -1,8 +1,9 @@
 //! Additive causal kernels. The caller owns one immutable StudyInput through
 //! search, service replay persistence, then analytics. No IO or shared cache.
 use crate::evaluation::{
-    Control, InputStats, accumulate_setup, empty_matrix, limit, numerical_budget, validate_input,
+    Control, InputStats, accumulate_setup_with_daily, empty_matrix, limit, numerical_budget, validate_input,
 };
+use crate::trend::DailyMatrix;
 use crate::frequency::FrequencyGate;
 use crate::validation::{invalid, parse_params, validate_analytics, validate_request_mode};
 use crate::*;
@@ -315,6 +316,10 @@ pub struct RobustCell {
     pub raw_r: f64,
     pub mean_r: f64,
     pub robust_score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast_r: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast_matrix_r: Option<f64>,
 }
 
 pub fn validate_continuous_request(
@@ -664,6 +669,7 @@ pub fn materialize_continuous(
 // fabricate an outcome over an earlier missing minute that could have hit SL.
 // TODO: fuse this cancellable evidence walk into the shared first-hit scan if
 // production profiling shows the extra horizon pass dominates trial cost.
+#[allow(clippy::too_many_arguments)]
 fn accumulate_observed(
     spec: &StudyRequest,
     analytics: &AnalyticsParams,
@@ -672,6 +678,7 @@ fn accumulate_observed(
     context: ContinuousContext,
     evaluation: &mut ContinuousEvaluation,
     control: &Control<'_>,
+    daily: Option<&mut DailyMatrix>,
 ) -> bool {
     let entry_open = setup.open_time_unix + analytics.time_shift_minutes * 60;
     let mut end_index = data.candles.len();
@@ -712,7 +719,7 @@ fn accumulate_observed(
         .iter()
         .map(|cell| cell.unclosed_count)
         .collect();
-    if !accumulate_setup(
+    if !accumulate_setup_with_daily(
         spec,
         analytics,
         &data.candles[..end_index],
@@ -720,6 +727,7 @@ fn accumulate_observed(
         &mut evaluation.evaluation.matrix,
         &mut evaluation.evaluation.summary.selected_setup_count,
         control,
+        daily,
     ) {
         return false;
     }
@@ -760,7 +768,8 @@ pub(crate) fn analyze_inner(
     limits: &StudyLimits,
     control: &Control<'_>,
 ) -> Result<Option<ContinuousEvaluation>, StudyError> {
-    // Search/trials and existing callers never enable or allocate daily capture.
+    // Mean search paths never allocate daily capture; forecast trials own their
+    // bounded all-cell buckets independently of final selected-pair reporting.
     Ok(analyze_inner_with_daily(spec, input, replay, candidate, limits, control, None)?
         .map(|result| result.evaluation))
 }
@@ -779,7 +788,8 @@ fn analyze_inner_with_daily(
     }
     validate_analytics(&candidate.analytics)?;
     let working_base = replay_bytes(replay)
-        .saturating_add(spec.tp_levels.len() * spec.sl_levels.len() * 256);
+        .saturating_add(spec.tp_levels.len() * spec.sl_levels.len() * 256)
+        .saturating_add(DailyMatrix::working_bytes(spec)?);
     let mut capture = capture
         .map(|pair| SelectedDailyCapture::new(spec, pair, working_base, limits))
         .transpose()?;
@@ -788,6 +798,7 @@ fn analyze_inner_with_daily(
         working_base.saturating_add(capture.as_ref().map_or(0, SelectedDailyCapture::working_bytes)),
         limits.max_working_bytes,
     )?;
+    let mut daily = if spec.trend_mode == TrendMode::Forecast { Some(DailyMatrix::new(spec, limits)?) } else { None };
     let frequency = FrequencyGate::new(spec)?;
     let matrix = empty_matrix(spec);
     let diagnostics = matrix
@@ -851,7 +862,7 @@ fn analyze_inner_with_daily(
             };
             let before = capture.as_ref().map(|capture| {
                 let cell = &result.evaluation.matrix[capture.cell_index];
-                (cell.tp_count, cell.sl_count)
+                (cell.tp_count, cell.sl_count, cell.price_change_filtered_count)
             });
             if !accumulate_observed(
                 spec,
@@ -861,12 +872,16 @@ fn analyze_inner_with_daily(
                 replay.context,
                 &mut result,
                 control,
+                daily.as_mut(),
             ) {
                 return Ok(None);
             }
             if let Some(capture) = &mut capture {
-                capture.record(setup.close_time_unix, before.expect("capture took counters"),
-                    &result.evaluation.matrix[capture.cell_index])?;
+                let before = before.expect("capture took counters");
+                let after = &result.evaluation.matrix[capture.cell_index];
+                if spec.trend_mode.is_mean() || after.price_change_filtered_count == before.2 {
+                    capture.record(setup.close_time_unix, (before.0, before.1), after)?;
+                }
             }
         }
     }
@@ -894,6 +909,8 @@ fn analyze_inner_with_daily(
             cell.risk_expectancy = Some(avg / cell.sl_pct);
         }
     }
+    if let Some(daily) = daily
+        && !daily.apply(spec, &mut result.evaluation.matrix, control)? { return Ok(None); }
     let summary = &mut result.evaluation.summary;
     let selected = summary.selected_setup_count;
     summary.avg_setups_per_day = Some(frequency.average(selected));
@@ -1153,9 +1170,14 @@ pub fn select_robust_cell(
             return Err(StudyError::InvalidInput("duplicate matrix cell".into()));
         }
     }
-    let Some(mean_r) = score_matrix(matrix, min_closed_per_cell) else {
+    let Some(metric_r) = score_matrix(matrix, min_closed_per_cell) else {
         return Ok(None);
     };
+    let mean_r = score_period_mean(matrix, min_closed_per_cell).expect("scorable matrix has period means");
+    if matrix.iter().any(|cell| cell.mean_risk_expectancy.is_some())
+        && matrix.iter().any(|cell| cell.mean_risk_expectancy.is_none()) {
+        return Err(StudyError::InvalidInput("mixed mean/forecast matrix".into()));
+    }
     let mut best: Option<RobustCell> = None;
     for (i, &tp_pct) in tp.iter().enumerate() {
         for (j, &sl_pct) in sl.iter().enumerate() {
@@ -1176,20 +1198,22 @@ pub fn select_robust_cell(
             } else {
                 neighbors[neighbors.len() / 2 - 1] / 2.0 + neighbors[neighbors.len() / 2] / 2.0
             };
-            let raw_r = ordered[i * sl.len() + j]
-                .expect("complete matrix")
+            let selected = ordered[i * sl.len() + j].expect("complete matrix");
+            let metric_cell_r = selected
                 .risk_expectancy
                 .expect("validated R");
             let next = RobustCell {
                 tp_pct,
                 sl_pct,
-                raw_r,
+                raw_r: selected.mean_risk_expectancy.unwrap_or(metric_cell_r),
                 mean_r,
-                robust_score: raw_r.min(median),
+                robust_score: metric_cell_r.min(median),
+                forecast_r: selected.mean_risk_expectancy.map(|_| metric_cell_r),
+                forecast_matrix_r: selected.mean_risk_expectancy.map(|_| metric_r),
             };
             if best.is_none_or(|old| {
                 next.robust_score > old.robust_score
-                    || (next.robust_score == old.robust_score && next.raw_r > old.raw_r)
+                    || (next.robust_score == old.robust_score && next.forecast_r.unwrap_or(next.raw_r) > old.forecast_r.unwrap_or(old.raw_r))
             }) {
                 best = Some(next);
             }
@@ -1223,7 +1247,8 @@ pub fn recommend_continuous(
     else {
         return Ok(None);
     };
-    if cell.mean_r < minimum_mean_r {
+    let metric_r = cell.forecast_matrix_r.unwrap_or(cell.mean_r);
+    if metric_r < minimum_mean_r || (spec.trend_mode == TrendMode::Forecast && metric_r <= 0.0) {
         return Ok(None);
     }
     Ok(Some(AdaptiveRecommendationSnapshot {
@@ -1236,6 +1261,9 @@ pub fn recommend_continuous(
         raw_r: cell.raw_r,
         mean_r: cell.mean_r,
         robust_score: cell.robust_score,
+        search_forecast: cell.forecast_r.zip(cell.forecast_matrix_r).map(|(cell_r, matrix_r)| setups_domain::SearchForecast {
+            bend_days: spec.trend_bend_days, cell_r, matrix_r,
+        }),
         time_shift_minutes: candidate.analytics.time_shift_minutes,
         price_change_pct: candidate.analytics.price_change_pct,
         cluster_enabled: candidate.analytics.cluster_enabled,

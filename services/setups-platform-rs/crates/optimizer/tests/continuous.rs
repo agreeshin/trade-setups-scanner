@@ -45,6 +45,8 @@ fn request() -> StudyRequest {
         max_trials: 8,
         max_seconds: 30,
         seed: 42,
+        trend_mode: TrendMode::Mean,
+        trend_bend_days: TrendBendDays::Linear,
     }
 }
 fn candidate(spec: &StudyRequest) -> StudyCandidate {
@@ -754,6 +756,7 @@ fn cell(tp: f64, sl: f64, risk: f64) -> MatrixCell {
         unclosed_count: 0,
         no_data_count: 0,
         price_change_filtered_count: 0,
+        mean_risk_expectancy: None,
     }
 }
 
@@ -893,6 +896,35 @@ fn recommendation_gate_is_unrounded_whole_mean_and_payload_keeps_direction_and_r
         .unwrap()
         .is_none()
     );
+}
+
+#[test]
+fn forecast_gate_uses_chosen_metric_not_source_mean_and_keeps_period_provenance() {
+    let (mut spec, data, raw) = observed_fixture();
+    let mut result = analyze_continuous(&spec, &data, &raw, &candidate(&spec), &StudyLimits::default(), &CancelToken::new()).unwrap().unwrap();
+    spec.trend_mode = TrendMode::Forecast;
+    spec.trend_bend_days = TrendBendDays::Seven;
+    for (forecast, period_mean, threshold, accepted) in [
+        (0.1499999999, 2.0, 0.15, false), (0.15, -0.4, 0.15, true),
+        (-0.1, 2.0, -1.0, false), (0.0, 2.0, 0.0, false), (0.01, -0.5, -1.0, true),
+    ] {
+        let mut value = cell(4.0, 4.0, forecast);
+        value.mean_risk_expectancy = Some(period_mean);
+        result.evaluation.matrix = vec![value];
+        let recommendation = recommend_continuous(&spec, &candidate(&spec), &result, &raw.provenance, raw.context, threshold).unwrap();
+        assert_eq!(recommendation.is_some(), accepted);
+        if let Some(recommendation) = recommendation {
+            assert_eq!(recommendation.raw_r, period_mean);
+            assert_eq!(recommendation.mean_r, period_mean);
+            let metric = recommendation.search_forecast.unwrap();
+            assert_eq!(metric.cell_r, forecast);
+            assert_eq!(metric.matrix_r, forecast);
+            assert_eq!(metric.bend_days, TrendBendDays::Seven);
+        }
+    }
+    spec.trend_mode = TrendMode::Mean;
+    result.evaluation.matrix = vec![cell(4.0, 4.0, -0.1)];
+    assert!(recommend_continuous(&spec, &candidate(&spec), &result, &raw.provenance, raw.context, -1.0).unwrap().unwrap().search_forecast.is_none());
 }
 
 #[test]

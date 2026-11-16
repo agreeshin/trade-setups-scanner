@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use setups_analytics::{OhlcCandle, TradeDirection};
 use setups_domain::DetectorBar;
+pub use setups_domain::trend::{TrendBendDays, TrendMode};
 use std::collections::BTreeMap;
 
 pub type ParamMap = BTreeMap<String, Value>;
@@ -58,6 +59,10 @@ pub struct StudyRequest {
     #[serde(default = "default_seconds")]
     pub max_seconds: u64,
     pub seed: u64,
+    #[serde(default, skip_serializing_if = "TrendMode::is_mean")]
+    pub trend_mode: TrendMode,
+    #[serde(default, skip_serializing_if = "TrendBendDays::is_linear")]
+    pub trend_bend_days: TrendBendDays,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -248,6 +253,9 @@ pub struct EffectiveAnalytics {
 #[serde(rename_all = "camelCase")]
 pub struct StudyBest {
     pub score: f64,
+    /// Original equal-cell period mean, separately recorded for forecast wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_score: Option<f64>,
     pub partial: bool,
     pub params: ParamMap,
     pub analytics: EffectiveAnalytics,
@@ -256,6 +264,10 @@ pub struct StudyBest {
     pub conclusions: Vec<String>,
     pub support: TrialSummary,
     pub trial_index: usize,
+    #[serde(default, skip_serializing_if = "TrendMode::is_mean")]
+    pub trend_mode: TrendMode,
+    #[serde(default, skip_serializing_if = "TrendBendDays::is_linear")]
+    pub trend_bend_days: TrendBendDays,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -280,6 +292,10 @@ pub struct MatrixCell {
     pub unclosed_count: usize,
     pub no_data_count: usize,
     pub price_change_filtered_count: usize,
+    /// Present only for forecast objectives. riskExpectancy is then the fitted
+    /// endpoint; this field retains the original period mean without rounding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_risk_expectancy: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

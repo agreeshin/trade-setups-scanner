@@ -502,6 +502,7 @@ fn make_best(
 ) -> StudyBest {
     StudyBest {
         score: evaluation.summary.score.expect("scorable evaluation"),
+        mean_score: (!spec.trend_mode.is_mean()).then(|| score_period_mean(&evaluation.matrix, spec.min_closed_per_cell)).flatten(),
         partial: true,
         params: candidate.params.clone(),
         analytics: EffectiveAnalytics {
@@ -521,6 +522,8 @@ fn make_best(
         matrix: evaluation.matrix,
         support: evaluation.summary,
         trial_index: trial,
+        trend_mode: spec.trend_mode,
+        trend_bend_days: if spec.trend_mode.is_mean() { TrendBendDays::Linear } else { spec.trend_bend_days },
         provenance: Provenance {
             optimizer_version: if continuous {
                 CONTINUOUS_OPTIMIZER_VERSION
@@ -1298,6 +1301,9 @@ fn decode_checkpoint(
     if let Some(best) = &state.best {
         let provenance = &best.provenance;
         if !best.score.is_finite()
+            || best.trend_mode != spec.trend_mode
+            || (!spec.trend_mode.is_mean() && best.trend_bend_days != spec.trend_bend_days)
+            || best.mean_score != (!spec.trend_mode.is_mean()).then(|| score_period_mean(&best.matrix, spec.min_closed_per_cell)).flatten()
             || best.trial_index >= state.submitted
             || !finite_summary(&best.support)
             || best.support.score != Some(best.score)
@@ -1320,6 +1326,8 @@ fn decode_checkpoint(
                     || !cell.sl_pct.is_finite()
                     || cell.risk_expectancy.is_some_and(|v| !v.is_finite())
                     || cell.avg_move_pct.is_some_and(|v| !v.is_finite())
+                    || cell.mean_risk_expectancy.is_some_and(|v| !v.is_finite())
+                    || (spec.trend_mode.is_mean() == cell.mean_risk_expectancy.is_some())
             })
             || score_matrix(&best.matrix, spec.min_closed_per_cell) != Some(best.score)
         {

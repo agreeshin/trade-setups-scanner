@@ -495,6 +495,14 @@ mod tests {
                 },
             )
             .unwrap();
+            // Permit intentionally floors its scalar horizon to milliseconds.
+            // Check that this is conservative by less than 1ms, then compare
+            // loss against that actual horizon, not the unquantized Instant.
+            let permit = owner.permit();
+            let safe_horizon = permit.0.started
+                + Duration::from_millis(permit.0.safe_until_ms.load(Ordering::Acquire));
+            assert!(safe_horizon <= horizon);
+            assert!(horizon.duration_since(safe_horizon) < Duration::from_millis(1));
             tokio::time::sleep(Duration::from_millis(160)).await;
             assert!(Instant::now() < horizon);
             owner.permit().check().unwrap();
@@ -507,7 +515,7 @@ mod tests {
             .await
             .unwrap();
             assert!(
-                Instant::now() >= horizon,
+                Instant::now() >= safe_horizon,
                 "one failed renewal must not spend a still-maintainable lease"
             );
             assert!(

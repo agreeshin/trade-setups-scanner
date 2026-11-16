@@ -448,6 +448,38 @@ async fn stop(
 mod tests {
     use super::ContinuousRuntimeConfig;
 
+    #[test]
+    fn trend_settings_are_additive_strict_and_preserve_legacy_mean_config() {
+        use serde_json::json;
+        let legacy = json!({"lookbackDays":30,"minSetupsPerDay":[0],"adaptiveEnabled":false,"study":{
+            "algorithmId":"price_volume_spike","algorithmVersion":"1.1.1",
+            "algorithmParams":setups_domain::SpikeParams::default(),
+            "analyticsParams":setups_optimizer::AnalyticsParams::default(),
+            "instruments":[{"exchange":"bybit","category":"linear","symbol":"BTCUSDT"}],
+            "direction":"short","seed":42
+        }});
+        let normalize = |value| super::normalize_config(serde_json::from_value(value).unwrap(), "price_volume_spike", &crate::config::OptimizationConfig::default());
+        let old = normalize(legacy.clone()).unwrap();
+        assert!(old.study.get("trendMode").is_none());
+        assert!(old.study.get("trendBendDays").is_none());
+        let mut explicit = legacy.clone();
+        explicit["study"]["trendMode"] = json!("mean");
+        explicit["study"]["trendBendDays"] = json!("linear");
+        assert_eq!(normalize(explicit).unwrap(), old);
+        for bend in ["7","14","30","linear"] {
+            let mut request=legacy.clone();
+            request["study"]["trendMode"]=json!("forecast");
+            request["study"]["trendBendDays"]=json!(bend);
+            let normalized=normalize(request).unwrap();
+            assert_eq!(normalized.study["trendMode"],"forecast");
+            assert_eq!(normalized.study.get("trendBendDays").and_then(|v|v.as_str()).unwrap_or("linear"),bend);
+        }
+        for (field,value) in [("trendMode","median"),("trendBendDays","8")] {
+            let mut request=legacy.clone();request["study"][field]=json!(value);
+            assert!(normalize(request).is_err());
+        }
+    }
+
     fn config(values: &[(&str, &str)]) -> Result<ContinuousRuntimeConfig, String> {
         ContinuousRuntimeConfig::from_lookup(&mut |key| {
             values

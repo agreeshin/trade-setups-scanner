@@ -1,4 +1,5 @@
 use crate::frequency::FrequencyGate;
+use crate::trend::DailyMatrix;
 use crate::validation::{decimal, invalid, normalized_decimal, parse_params, validate_analytics};
 use crate::*;
 use serde_json::Value;
@@ -308,6 +309,7 @@ pub(crate) fn empty_matrix(spec: &StudyRequest) -> Vec<MatrixCell> {
                 unclosed_count: 0,
                 no_data_count: 0,
                 price_change_filtered_count: 0,
+                mean_risk_expectancy: None,
             })
         })
         .collect()
@@ -358,6 +360,7 @@ fn selected_indexes(
     Some(selected)
 }
 
+#[cfg(test)]
 pub(crate) fn accumulate_setup(
     spec: &StudyRequest,
     analytics: &AnalyticsParams,
@@ -367,10 +370,25 @@ pub(crate) fn accumulate_setup(
     selected_count: &mut usize,
     control: &Control<'_>,
 ) -> bool {
+    accumulate_setup_with_daily(spec, analytics, candles, setup, matrix, selected_count, control, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accumulate_setup_with_daily(
+    spec: &StudyRequest,
+    analytics: &AnalyticsParams,
+    candles: &[setups_analytics::OhlcCandle],
+    setup: &AnalyticsSetup,
+    matrix: &mut [MatrixCell],
+    selected_count: &mut usize,
+    control: &Control<'_>,
+    mut daily: Option<&mut DailyMatrix>,
+) -> bool {
     let Some(entry) = find_candle_by_open_time(
         candles,
         setup.open_time_unix + analytics.time_shift_minutes * 60,
     ) else {
+        if let Some(daily) = &mut daily { daily.record_setup(setup.close_time_unix); }
         for cell in matrix {
             cell.no_data_count += 1;
         }
@@ -385,6 +403,7 @@ pub(crate) fn accumulate_setup(
             return true;
         }
     }
+    let day = daily.as_mut().map(|daily| daily.record_setup(setup.close_time_unix));
     // The frequency population is the very same full-candidate population
     // admitted to TP/SL evaluation. Missing/filtered entries cannot open a
     // trade; every eligible entry counts regardless of its later outcome.
@@ -456,10 +475,18 @@ pub(crate) fn accumulate_setup(
             let cell = &mut matrix[tp_index * sl_first.len() + sl_index];
             match (tp, sl) {
                 (None, None) => cell.unclosed_count += 1,
-                (Some(_), None) => cell.tp_count += 1,
-                (None, Some(_)) => cell.sl_count += 1,
-                (Some(tp), Some(sl)) if tp < sl => cell.tp_count += 1,
-                (Some(_), Some(_)) => cell.sl_count += 1,
+                (Some(_), None) => {
+                    cell.tp_count += 1;
+                    if let Some(daily) = &mut daily { daily.record_outcome(tp_index * sl_first.len() + sl_index, day.unwrap(), cell.tp_pct / cell.sl_pct); }
+                }
+                (Some(tp), Some(sl)) if tp < sl => {
+                    cell.tp_count += 1;
+                    if let Some(daily) = &mut daily { daily.record_outcome(tp_index * sl_first.len() + sl_index, day.unwrap(), cell.tp_pct / cell.sl_pct); }
+                }
+                _ => {
+                    cell.sl_count += 1;
+                    if let Some(daily) = &mut daily { daily.record_outcome(tp_index * sl_first.len() + sl_index, day.unwrap(), -1.0); }
+                }
             }
         }
     }
@@ -515,6 +542,7 @@ pub(crate) fn evaluate_group(
         spec.tp_levels.len() * spec.sl_levels.len() * size_of::<MatrixCell>() * candidates.len();
     let base_bytes = detector_bytes
         .saturating_add(matrix_bytes)
+        .saturating_add(DailyMatrix::working_bytes(spec)?.saturating_mul(candidates.len()))
         .saturating_add(16 * 1024);
     limit(
         "candidate_working_bytes",
@@ -525,6 +553,9 @@ pub(crate) fn evaluate_group(
     let warmup_from = from_open - required as i64 * 60;
     let to_open = spec.to_unix - 60;
     let mut matrices: Vec<_> = candidates.iter().map(|_| empty_matrix(spec)).collect();
+    let mut dailies = if spec.trend_mode == TrendMode::Forecast {
+        candidates.iter().map(|_| DailyMatrix::new(spec, limits)).collect::<Result<Vec<_>, _>>()?
+    } else { Vec::new() };
     let mut summary = TrialSummary {
         score: None,
         setup_count: 0,
@@ -613,7 +644,7 @@ pub(crate) fn evaluate_group(
             };
             for index in indexes {
                 if control.stopped()
-                    || !accumulate_setup(
+                    || !accumulate_setup_with_daily(
                         spec,
                         &candidate.analytics,
                         &data.candles,
@@ -621,6 +652,7 @@ pub(crate) fn evaluate_group(
                         &mut matrices[candidate_index],
                         &mut selected_counts[candidate_index],
                         control,
+                        dailies.get_mut(candidate_index),
                     )
                 {
                     return Ok(interrupted());
@@ -658,6 +690,11 @@ pub(crate) fn evaluate_group(
                 cell.avg_move_pct = Some(avg);
                 cell.risk_expectancy = Some(avg / cell.sl_pct);
             }
+        }
+        if let Some(daily) = dailies.get(candidate_index)
+            && !daily.apply(spec, &mut matrix, control)? {
+            evaluations.extend((evaluations.len()..candidates.len()).map(|_| None));
+            return Ok(evaluations);
         }
         let mut summary = summary.clone();
         summary.selected_setup_count = selected_counts[candidate_index];

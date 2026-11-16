@@ -42,6 +42,8 @@ pub struct ContinuousSlot {
     /// Last fully finalized continuous result, never merely a completed search.
     pub study_id: Option<i64>,
     pub mean_expectancy: Option<f64>,
+    /// Objective of the saved matrix, never the currently editable process config.
+    pub trend_mode: Option<setups_domain::trend::TrendMode>,
     pub selected_cell: Option<Value>,
     pub updated_at: DateTime<Utc>,
 }
@@ -69,6 +71,19 @@ fn process(row: &PgRow) -> Result<ContinuousProcess, DbError> {
     })
 }
 
+fn saved_trend_mode(spec: Option<&Value>) -> Option<setups_domain::trend::TrendMode> {
+    use setups_domain::trend::TrendMode;
+    match spec?.as_object()?.get("trendMode") {
+        // Before N6 this persisted study path could only optimize period means.
+        None => Some(TrendMode::Mean),
+        Some(value) => match value.as_str() {
+            Some("mean") => Some(TrendMode::Mean),
+            Some("forecast") => Some(TrendMode::Forecast),
+            _ => None,
+        },
+    }
+}
+
 pub async fn get(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Option<ContinuousProcess>, DbError> {
     let mut tx = pool.begin().await?;
     sqlx::query("set transaction isolation level repeatable read, read only").execute(&mut *tx).await?;
@@ -79,7 +94,8 @@ pub async fn get(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Option<C
     // Repair legacy display bindings at read time: prepare_next used to replace
     // s.study_id before post-chain/gate completed. Never trust that cached field.
     let slots = sqlx::query(r#"select s.*,s.min_setups_per_day::double precision as frequency,
-        a.spec active_spec,a.live_initialization,coalesce(a.live_readiness,'[]'::jsonb) live_readiness,
+        a.spec active_spec,coalesce(a.spec,m.spec) metric_spec,
+        a.live_initialization,coalesce(a.live_readiness,'[]'::jsonb) live_readiness,
         a.study_id active_study_id,n.study_id pending_study_id,r.study_id running_study_id,
         f.id finalized_generation_id,f.study_id finalized_study_id,
         n.live_initialization pending_initialization,coalesce(n.live_init_attempts,0) pending_attempts,
@@ -92,6 +108,11 @@ pub async fn get(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Option<C
         left join lateral (select g.id,g.study_id from continuous_generations g
             where g.owner_id=s.owner_id and g.algorithm_id=s.algorithm_id and g.slot_id=s.id
                 and g.status='completed' order by g.id desc limit 1) f on true
+        left join lateral (select g.spec from continuous_generations g
+            where g.owner_id=s.owner_id and g.algorithm_id=s.algorithm_id and g.slot_id=s.id
+                and g.status='completed' and g.result->'meanExpectancy'=to_jsonb(s.mean_expectancy)
+                and g.result->'selectedCell' is not distinct from s.selected_cell
+            order by g.id desc limit 1) m on true
         where s.owner_id=$1 and s.algorithm_id=$2 and s.enabled order by s.id"#)
         .bind(owner).bind(algorithm).fetch_all(&mut *tx).await?;
     result.slots = slots.into_iter().map(|row| Ok(ContinuousSlot {
@@ -111,6 +132,9 @@ pub async fn get(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Option<C
         finalized_generation_id: row.try_get("finalized_generation_id")?,
         active_study_id: row.try_get("active_study_id")?, pending_study_id: row.try_get("pending_study_id")?,
         study_id: row.try_get("finalized_study_id")?, mean_expectancy: row.try_get("mean_expectancy")?,
+        trend_mode: if row.try_get::<Option<f64>,_>("mean_expectancy")?.is_some() {
+            saved_trend_mode(row.try_get::<Option<Value>,_>("metric_spec")?.as_ref())
+        } else { None },
         selected_cell: row.try_get("selected_cell")?, updated_at: row.try_get("updated_at")?,
     })).collect::<Result<_,DbError>>()?;
     tx.commit().await?;
@@ -678,6 +702,17 @@ pub async fn is_service_batch(pool:&PgPool,id:i64)->Result<bool,DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_matrix_mode_defaults_only_proven_legacy_specs() {
+        use setups_domain::trend::TrendMode;
+        assert_eq!(saved_trend_mode(Some(&json!({"trendMode":"mean"}))), Some(TrendMode::Mean));
+        assert_eq!(saved_trend_mode(Some(&json!({"trendMode":"forecast"}))), Some(TrendMode::Forecast));
+        assert_eq!(saved_trend_mode(Some(&json!({"algorithmId":"legacy"}))), Some(TrendMode::Mean));
+        for unknown in [None, Some(json!(null)), Some(json!({"trendMode":null})), Some(json!({"trendMode":"unknown"}))] {
+            assert_eq!(saved_trend_mode(unknown.as_ref()), None);
+        }
+    }
 
     #[test]
     fn adaptive_batch_preflight_bounds_keys_items_and_exact_serialized_bytes() {

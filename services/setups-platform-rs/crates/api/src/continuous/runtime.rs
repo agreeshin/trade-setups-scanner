@@ -536,7 +536,7 @@ async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&Continuo
     if selected!=expected_selected {return Err(JobError::new("post_chain_selected_cell_mismatch","Frozen selected pair changed during post-chain analytics"));}
     let derived=post_chain_expectancy(job,&spec,&best,&evaluation,selected.as_ref(),captured.selected_daily)?;
     let selected=selected.map(|cell|json!(cell));
-    let mean=evaluation.evaluation.summary.score;
+    let mean=core::score_period_mean(&evaluation.evaluation.matrix,spec.min_closed_per_cell);
     let accepted=recommendation.is_some();
     let batch=persistence.call("batch_id",||async {sqlx::query_scalar::<_,i32>("select replay_batch_id from continuous_generations where id=$1").bind(job.generation_id).fetch_one(pool).await.map_err(Into::into)}).await?;
     let result=json!({"best":best,"selectedCell":selected,"meanExpectancy":mean,"analytics":evaluation,"recommendation":recommendation,"bootstrap":bootstrap,"setupSetId":format!("batch-{batch}")});
@@ -558,6 +558,17 @@ fn post_chain_expectancy(job:&ChainJob,spec:&StudyRequest,best:&core::StudyBest,
         return Ok(None);
     };
     let daily=daily.ok_or_else(||JobError::new("post_chain_capture_missing","Canonical post-chain selected outcomes were not captured"))?;
+    if spec.trend_mode==core::TrendMode::Forecast {
+        let points:Vec<_>=daily.points.iter().map(|point|Ok(setups_domain::trend::TrendInput {
+            day:point.day_start_unix.div_euclid(86400) as f64,value:point.mean_r,
+            weight:u32::try_from(point.row_count).map_err(|_|JobError::new("post_chain_forecast_invalid","Daily weight exceeds the forecast counter bound"))?,
+        })).collect::<Result<_,JobError>>()?;
+        let fit=setups_domain::trend::fit_weighted_trend(&points,spec.trend_bend_days)
+            .map_err(|error|JobError::new("post_chain_forecast_invalid",error.to_string()))?;
+        if fit.map(|fit|fit.endpoint().value)!=selected.forecast_r {
+            return Err(JobError::new("post_chain_forecast_mismatch","Captured daily series differs from the optimizing forecast"));
+        }
+    }
     if daily.tp_pct!=selected.tp_pct || daily.sl_pct!=selected.sl_pct {
         return Err(JobError::new("post_chain_capture_mismatch","Captured outcomes differ from the frozen selected pair"));
     }
@@ -578,7 +589,7 @@ fn post_chain_expectancy(job:&ChainJob,spec:&StudyRequest,best:&core::StudyBest,
                 cluster_gap_minutes:best.analytics.cluster_gap_minutes,time_shift_minutes:best.analytics.time_shift_minutes,
                 price_change_pct:best.analytics.price_change_pct,horizon_minutes:best.analytics.horizon_minutes}},
         selected_cell:Some(SelectedCellInput {raw_r:Some(selected.raw_r),tp_count:cell.tp_count as u64,sl_count:cell.sl_count as u64}),
-        matrix_mean_r:evaluation.evaluation.summary.score,daily:MetricAvailability::Available {value:daily.points},
+        matrix_mean_r:core::score_period_mean(&evaluation.evaluation.matrix,spec.min_closed_per_cell),daily:MetricAvailability::Available {value:daily.points},
     }).map_err(|error|JobError::new("post_chain_expectancy_invalid",error.to_string()))?;
     let numerical=setups_db::expectancy::encode_artifact(&artifact).map_err(|error|JobError::new("expectancy_encoding_failed",error.to_string()))?;
     Ok(Some((identity,numerical)))

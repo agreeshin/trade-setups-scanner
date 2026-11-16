@@ -1016,6 +1016,52 @@ async fn adaptive_batch_late_validation_outbox_failure_and_statement_timeout_rol
 
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn saved_matrix_payload_projects_own_mode_for_mean_forecast_and_legacy() {
+    isolated(|pool| async move {
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        let slot = configured(&pool, OWNER, ALGORITHM).await;
+        for (index, mode) in [Some("mean"), Some("forecast"), None].into_iter().enumerate() {
+            let id = generation(&pool, OWNER, ALGORITHM, slot, "completed").await;
+            let mut saved_spec = spec(ALGORITHM);
+            if let Some(mode) = mode { saved_spec["trendMode"] = json!(mode); }
+            let selected = json!({"tpPct":14,"slPct":4,"rawR":0.32,"fixture":index});
+            let result = json!({"meanExpectancy":0.21,"selectedCell":selected});
+            sqlx::query("update continuous_generations set spec=$2,result=$3 where id=$1")
+                .bind(id).bind(saved_spec).bind(result).execute(&pool).await.unwrap();
+            sqlx::query("update continuous_slots set active_generation_id=$2,mean_expectancy=0.21,selected_cell=$3 where id=$1")
+                .bind(slot).bind(id).bind(&selected).execute(&pool).await.unwrap();
+            // A newly configured mode and a newer completed generation must not
+            // relabel the matrix still belonging to the incumbent.
+            let opposite = if mode == Some("forecast") { "mean" } else { "forecast" };
+            sqlx::query("update continuous_processes set config=jsonb_set(config,'{study,trendMode}',$3) where owner_id=$1 and algorithm_id=$2")
+                .bind(OWNER).bind(ALGORITHM).bind(json!(opposite)).execute(&pool).await.unwrap();
+            let newer = generation(&pool, OWNER, ALGORITHM, slot, "completed").await;
+            let mut newer_spec = spec(ALGORITHM); newer_spec["trendMode"] = json!(opposite);
+            sqlx::query("update continuous_generations set spec=$2,result=$3 where id=$1")
+                .bind(newer).bind(newer_spec).bind(json!({"meanExpectancy":0.99,"selectedCell":selected}))
+                .execute(&pool).await.unwrap();
+            let expected = mode.unwrap_or("mean");
+            let detail = serde_json::to_value(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap()).unwrap();
+            assert_eq!(detail["slots"][0]["trendMode"], expected);
+            assert_eq!(detail["slots"][0]["meanExpectancy"], 0.21);
+            let list = serde_json::to_value(db::list(&pool, OWNER, Some(ALGORITHM)).await.unwrap()).unwrap();
+            assert_eq!(list[0]["slots"][0]["trendMode"], expected);
+            // Stopping/reconfiguration may clear live ownership while retaining
+            // the saved mean: recover only from its matching frozen result.
+            sqlx::query("update continuous_slots set active_generation_id=null where id=$1")
+                .bind(slot).execute(&pool).await.unwrap();
+            let saved = serde_json::to_value(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap()).unwrap();
+            assert_eq!(saved["slots"][0]["trendMode"], expected);
+        }
+        sqlx::query("update continuous_slots set mean_expectancy=9.99 where id=$1")
+            .bind(slot).execute(&pool).await.unwrap();
+        let unknown = serde_json::to_value(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap()).unwrap();
+        assert!(unknown["slots"][0]["trendMode"].is_null(), "no proven persisted source means unknown, not a guessed default");
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn new_research_search_completion_and_failure_preserve_finalized_profile_provenance() {
     isolated(|pool| async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();

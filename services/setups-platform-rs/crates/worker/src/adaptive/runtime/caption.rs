@@ -266,6 +266,15 @@ fn format_caption(
     }
     out.plain("\nВ среднем для других уровней TP и SL: ")?;
     out.code(&signed_r(snapshot.mean_r)?)?;
+    if let Some(forecast) = snapshot.search_forecast {
+        out.plain("\nВыбор по прогнозу тренда (")?;
+        out.plain(if forecast.bend_days.is_linear() { "прямая" } else { forecast.bend_days.key() })?;
+        if !forecast.bend_days.is_linear() { out.plain(" д.")?; }
+        out.plain("): ")?;
+        out.code(&signed_r(forecast.cell_r)?)?;
+        out.plain("; score матрицы: ")?;
+        out.code(&signed_r(forecast.matrix_r)?)?;
+    }
     out.plain("\n\nАлгоритм: ")?;
     out.label(&envelope.external_name)?;
     out.finish()
@@ -310,6 +319,22 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn forecast_search_label_is_additive_and_does_not_relabel_saved_period_means() {
+        let (instrument, raw, mut value) = fixture();
+        value["searchForecast"] = json!({"bendDays":"7","cellR":0.61,"matrixR":0.45});
+        let before = value.clone();
+        let caption = recommendation_telegram_caption(&instrument, &raw, &value).unwrap();
+        assert_eq!(value, before);
+        assert!(caption.text.contains("Среднее МО за последние 1 суток: +0.32 R"));
+        assert!(caption.text.contains("В среднем для других уровней TP и SL: +0.21 R"));
+        assert!(caption.text.contains("Выбор по прогнозу тренда (7 д.): +0.61 R; score матрицы: +0.45 R"));
+        assert!(caption.fits_photo_caption());
+        v2::validate_entities(&caption.text, &caption.entities).unwrap();
+        value["searchForecast"]["bendDays"] = json!("linear");
+        assert!(recommendation_telegram_caption(&instrument, &raw, &value).unwrap().text.contains("Выбор по прогнозу тренда (прямая)"));
     }
 
     #[test]

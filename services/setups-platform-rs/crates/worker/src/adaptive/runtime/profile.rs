@@ -52,6 +52,15 @@ impl LiveProfile {
             || slot.external_name.len()>480 || slot.external_name.chars().any(char::is_control)
             || expected.is_empty() || expected.len()!=spec.instruments.len() || expected.len()>1000
         {return Err(invalid("accepted recipe identity or values mismatch"));}
+        match (spec.trend_mode, snapshot.search_forecast) {
+            (setups_optimizer::TrendMode::Mean, None) => {},
+            (setups_optimizer::TrendMode::Forecast, Some(forecast))
+                if forecast.bend_days==spec.trend_bend_days && forecast.cell_r.is_finite()
+                    && forecast.matrix_r.is_finite() && forecast.matrix_r>0.0
+                    && slot.selected_cell["forecastR"].as_f64()==Some(forecast.cell_r)
+                    && slot.selected_cell["forecastMatrixR"].as_f64()==Some(forecast.matrix_r) => {},
+            _ => return Err(invalid("accepted search metric identity mismatch")),
+        }
         if let Some(init)=&slot.live_initialization
             && (init.version!=1 || init.detector_from_open_unix<0 || init.detector_from_open_unix%60!=0
                 || init.anchor_close_unix%60!=0 || init.anchor_close_unix<init.detector_from_open_unix

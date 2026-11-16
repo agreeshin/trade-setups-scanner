@@ -52,6 +52,17 @@ pub struct AdaptiveRecommendationSnapshot {
     pub cluster_enabled: bool,
     pub cluster_gap_minutes: Option<i64>,
     pub provenance: RecommendationProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_forecast: Option<SearchForecast>,
+}
+
+/// Additive optimizing metric. rawR/meanR above always remain period means.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchForecast {
+    pub bend_days: trend::TrendBendDays,
+    pub cell_r: f64,
+    pub matrix_r: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
