@@ -72,6 +72,24 @@ fn invalid(message: &str) -> DbError {
     DbError::Json(format!("study_expectancy_{message}"))
 }
 
+/// Artifacts retain period means even when search optimizes forecast/blend.
+/// Only legacy/mean objectives are equivalent when the additive mean is absent;
+/// an explicit null/invalid mean must not silently fall back to the objective.
+fn period_mean(
+    value: &Value,
+    mean_field: &str,
+    objective_field: &str,
+    trend_mode: Option<&Value>,
+) -> Option<f64> {
+    match value.get(mean_field) {
+        Some(mean) => mean.as_f64(),
+        None if trend_mode.is_none_or(|mode| mode.as_str() == Some("mean")) => {
+            value[objective_field].as_f64()
+        }
+        None => None,
+    }
+}
+
 fn bounded_object(value: &Value, maximum: usize) -> Result<(), DbError> {
     if !value.is_object() || serde_json::to_vec(value).map_err(crate::json_error)?.len() > maximum {
         return Err(invalid("payload_resource_limit"));
@@ -261,6 +279,7 @@ pub async fn enrich_saved_generation(
         return Err(invalid("selected_cell_ambiguous"));
     }
     let best = &saved.result["best"];
+    let trend_mode = best.get("trendMode").or_else(|| saved.spec.get("trendMode"));
     let analytics = &best["analytics"];
     let from_unix = saved.spec["fromUnix"]
         .as_i64()
@@ -298,7 +317,7 @@ pub async fn enrich_saved_generation(
     let artifact = build_expectancy_artifact(ExpectancyInput {
         source,
         selected_cell: Some(SelectedCellInput {
-            raw_r: cell["riskExpectancy"].as_f64(),
+            raw_r: period_mean(cell, "meanRiskExpectancy", "riskExpectancy", trend_mode),
             tp_count: cell["tpCount"]
                 .as_u64()
                 .ok_or_else(|| invalid("selected_counts_invalid"))?,
@@ -418,10 +437,13 @@ async fn validate_source_in(
         .selected_cell
         .as_ref()
         .ok_or_else(|| invalid("selected_metrics_missing"))?;
+    let trend_mode = search["best"].get("trendMode").or_else(|| spec.get("trendMode"));
     if Some(metrics.tp_count) != original_cell["tpCount"].as_u64()
         || Some(metrics.sl_count) != original_cell["slCount"].as_u64()
-        || metrics.raw_r.as_ref().copied() != original_cell["riskExpectancy"].as_f64()
-        || artifact.matrix_mean_r.as_ref().copied() != search["best"]["score"].as_f64()
+        || metrics.raw_r.as_ref().copied()
+            != period_mean(original_cell, "meanRiskExpectancy", "riskExpectancy", trend_mode)
+        || artifact.matrix_mean_r.as_ref().copied()
+            != period_mean(&search["best"], "meanScore", "score", trend_mode)
         || serde_json::to_value(&artifact.source.provenance.algorithm_id)
             .map_err(crate::json_error)?
             != spec["algorithmId"]
@@ -741,4 +763,36 @@ pub async fn collect_unreferenced(pool: &PgPool, limit: u32) -> Result<u64, DbEr
         .bind(i64::from(limit.min(100))).execute(&mut *tx).await?.rows_affected();
     tx.commit().await?;
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn period_mean_prefers_saved_mean_and_only_legacy_mean_can_fall_back() {
+        for (mean_field, objective_field) in [
+            ("meanRiskExpectancy", "riskExpectancy"),
+            ("meanScore", "score"),
+        ] {
+            for mode in [None, Some(json!("mean")), Some(json!("forecast")), Some(json!("blend"))] {
+                let mut value = json!({});
+                value[objective_field] = json!(1.7);
+                value[mean_field] = json!(-0.25);
+                assert_eq!(period_mean(&value, mean_field, objective_field, mode.as_ref()), Some(-0.25));
+                for invalid in [Value::Null, json!("invalid")] {
+                    value[mean_field] = invalid;
+                    assert_eq!(period_mean(&value, mean_field, objective_field, mode.as_ref()), None);
+                }
+            }
+            let mut legacy = json!({});
+            legacy[objective_field] = json!(1.0);
+            assert_eq!(period_mean(&legacy, mean_field, objective_field, None), Some(1.0));
+            assert_eq!(period_mean(&legacy, mean_field, objective_field, Some(&json!("mean"))), Some(1.0));
+            for mode in [json!("forecast"), json!("blend"), json!("invalid"), Value::Null] {
+                assert_eq!(period_mean(&legacy, mean_field, objective_field, Some(&mode)), None);
+            }
+        }
+    }
 }

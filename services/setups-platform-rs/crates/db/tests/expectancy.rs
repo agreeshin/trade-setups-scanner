@@ -88,7 +88,26 @@ async fn chain_with_trend(pool: &PgPool, trend: &Value) -> (scheduler::ChainJob,
     let analytics = json!({"clusterEnabled":false,"clusterGapMinutes":null,"timeShiftMinutes":0,"priceChangePct":null,"horizonMinutes":60,"setupMaturity":null});
     let matrix: Vec<_> = (1..=9).flat_map(|tp| (1..=9).map(move |sl| json!({"tpPct":tp as f64,"slPct":sl as f64,
         "tpCount":2,"slCount":1,"closedCount":3,"riskExpectancy":(2.0*tp as f64-sl as f64)/3.0/sl as f64}))).collect();
-    let original = json!({"progress":{},"best":{"score":1.0,"matrix":matrix,"analytics":analytics,"provenance":provenance},"scienceSentinel":1.2345678901234567});
+    let mut original = json!({"progress":{},"best":{"score":1.0,"matrix":matrix,"analytics":analytics,"provenance":provenance},"scienceSentinel":1.2345678901234567});
+    if matches!(trend["trendMode"].as_str(), Some("forecast" | "blend")) {
+        let forecast_weight = if trend["trendMode"] == "blend" {
+            trend["trendBlendLambda"].as_f64().unwrap_or(0.7)
+        } else {
+            1.0
+        };
+        let best = &mut original["best"];
+        best["trendMode"] = trend["trendMode"].clone();
+        best["meanScore"] = json!(1.0);
+        best["score"] = json!(1.0 + forecast_weight);
+        for cell in best["matrix"].as_array_mut().unwrap() {
+            let mean = cell["riskExpectancy"].as_f64().unwrap();
+            cell["meanRiskExpectancy"] = json!(mean);
+            cell["riskExpectancy"] = json!(mean + forecast_weight);
+            if trend["trendMode"] == "blend" {
+                cell["forecastRiskExpectancy"] = json!(mean + 1.0);
+            }
+        }
+    }
     scheduler::finish_search(pool, &job, &original, true)
         .await
         .unwrap();
@@ -297,6 +316,107 @@ async fn legacy_mean_and_winrate_remain_available_without_inventing_daily_outcom
         assert_eq!(db::collect_unreferenced(&pool,0).await.unwrap(),0);
         assert_eq!(db::collect_unreferenced(&pool,1).await.unwrap(),1);
         assert!(db::get(&pool,"admin",id).await.unwrap().is_none());
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn forward_objectives_seal_period_means_with_atomic_gate() {
+    for mode in ["blend", "forecast"] {
+        isolated(move |pool| async move {
+            let (job, identity, original) = chain_with_trend(&pool, &json!({"trendMode":mode})).await;
+            let cell = original["best"]["matrix"].as_array().unwrap().iter()
+                .find(|cell| cell["tpPct"] == 2.0 && cell["slPct"] == 1.0).unwrap();
+            assert_eq!(cell["meanRiskExpectancy"], 1.0);
+            assert_ne!(cell["riskExpectancy"], cell["meanRiskExpectancy"]);
+            assert_ne!(original["best"]["score"], original["best"]["meanScore"]);
+            let before: String = sqlx::query_scalar("select result::text from optimization_studies where id=$1")
+                .bind(job.study_id).fetch_one(&pool).await.unwrap();
+            sqlx::query("insert into continuous_runtime_artifacts(generation_id,identity,snapshot_manifest,reserved_bytes,snapshot_bytes) values($1,'{}','{}',1048576,1)")
+                .bind(job.generation_id).execute(&pool).await.unwrap();
+            let numerical = artifact(&identity, false);
+            let gate = recovery::Gate {
+                result: json!({"best":original["best"],"selectedCell":{"tpPct":2.0,"slPct":1.0,"rawR":1.0},
+                    "meanExpectancy":1.0,"analytics":{"evaluation":{"matrix":original["best"]["matrix"]}}}),
+                accepted: false,
+                mean: Some(1.0),
+                selected: Some(json!({"tpPct":2.0,"slPct":1.0,"rawR":1.0})),
+            };
+            assert!(recovery::save_gate_with_expectancy(&pool, &job, &json!({}), &gate, Some((&identity, &numerical)))
+                .await.unwrap(), "{mode} period means must seal atomically with the gate");
+            let id = db::seal_for_chain(&pool, &job, &identity, &numerical).await.unwrap().unwrap();
+            assert!(scheduler::finalize(&pool, &job, &gate.result, false, gate.mean, gate.selected.as_ref()).await.unwrap());
+            assert_eq!(db::get(&pool, "admin", id).await.unwrap().unwrap().numerical_snapshot, numerical);
+            assert_eq!(sqlx::query_scalar::<_, String>("select result::text from optimization_studies where id=$1")
+                .bind(job.study_id).fetch_one(&pool).await.unwrap(), before);
+        }).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn saved_forward_enrichment_retains_period_means_without_rewriting_results() {
+    for mode in ["blend", "forecast"] {
+        isolated(move |pool| async move {
+            let (job, identity, original) = chain_with_trend(&pool, &json!({"trendMode":mode})).await;
+            finish(&pool, &job, &original).await;
+            let before: (String, String) = sqlx::query_as("select g.result::text,s.result::text from continuous_generations g join optimization_studies s on s.id=g.study_id where g.id=$1")
+                .bind(job.generation_id).fetch_one(&pool).await.unwrap();
+            let id = db::enrich_saved_generation(&pool, "admin", job.generation_id).await.unwrap().unwrap();
+            let saved = db::get(&pool, "admin", id).await.unwrap().unwrap();
+            assert_eq!(saved.numerical_snapshot, artifact(&identity, true));
+            assert_eq!(db::enrich_saved_generation(&pool, "admin", job.generation_id).await.unwrap(), Some(id));
+            let after: (String, String) = sqlx::query_as("select g.result::text,s.result::text from continuous_generations g join optimization_studies s on s.id=g.study_id where g.id=$1")
+                .bind(job.generation_id).fetch_one(&pool).await.unwrap();
+            assert_eq!(before, after, "{mode} enrichment must not rewrite scientific inputs");
+        }).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn explicit_mean_enrichment_falls_back_only_when_additive_fields_are_absent() {
+    isolated(|pool| async move {
+        let (job, identity, original) = chain_with_trend(&pool, &json!({"trendMode":"mean"})).await;
+        assert!(original["best"].get("meanScore").is_none());
+        assert!(original["best"]["matrix"].as_array().unwrap().iter().all(|cell| cell.get("meanRiskExpectancy").is_none()));
+        finish(&pool, &job, &original).await;
+        let id = db::enrich_saved_generation(&pool, "admin", job.generation_id).await.unwrap().unwrap();
+        assert_eq!(db::get(&pool, "admin", id).await.unwrap().unwrap().numerical_snapshot, artifact(&identity, true));
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn forward_period_seal_still_rejects_tampered_metrics_counts_provenance_and_analytics() {
+    isolated(|pool| async move {
+        let (job, identity, original) = chain_with_trend(&pool, &json!({"trendMode":"blend"})).await;
+        let canonical: ExpectancyArtifact = serde_json::from_value(artifact(&identity, true)).unwrap();
+        for (raw, mean, tp, sl) in [(1.7, 1.0, 2, 1), (1.0, 1.7, 2, 1), (1.0, 1.0, 3, 1), (1.0, 1.0, 2, 2)] {
+            let tampered = build_expectancy_artifact(ExpectancyInput {
+                source: canonical.source.clone(),
+                selected_cell: Some(SelectedCellInput {raw_r:Some(raw), tp_count:tp, sl_count:sl}),
+                matrix_mean_r: Some(mean),
+                daily: MetricAvailability::Unavailable {reason:ExpectancyUnavailableReason::MissingFrozenOutcomes},
+            }).unwrap();
+            let error = db::seal_for_chain(&pool, &job, &identity, &db::encode_artifact(&tampered).unwrap()).await.unwrap_err();
+            assert!(error.to_string().contains("original_metrics_mismatch"), "{error}");
+        }
+        let mut wrong_provenance = identity.clone();
+        wrong_provenance.provenance["snapshotHash"] = json!("tampered");
+        assert!(db::seal_for_chain(&pool, &job, &wrong_provenance, &artifact(&wrong_provenance, true))
+            .await.unwrap_err().to_string().contains("provenance_mismatch"));
+        let mut wrong_analytics = identity.clone();
+        wrong_analytics.effective_analytics["timeShiftMinutes"] = json!(1);
+        assert!(db::seal_for_chain(&pool, &job, &wrong_analytics, &artifact(&wrong_analytics, true))
+            .await.unwrap_err().to_string().contains("provenance_mismatch"));
+        let mut wrong_source = canonical.clone();
+        wrong_source.source.analytics.time_shift_minutes = 1;
+        assert!(db::seal_for_chain(&pool, &job, &identity, &db::encode_artifact(&wrong_source).unwrap())
+            .await.unwrap_err().to_string().contains("original_analytics_mismatch"));
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from study_expectancy_artifacts").fetch_one(&pool).await.unwrap(), 0);
+        db::seal_for_chain(&pool, &job, &identity, &artifact(&identity, false)).await.unwrap().unwrap();
+        finish(&pool, &job, &original).await;
     }).await;
 }
 
