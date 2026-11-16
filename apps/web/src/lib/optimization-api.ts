@@ -72,6 +72,12 @@ export interface OptimizationBest {
   provenance: { optimizerVersion: string; seed: number; snapshotHash: string; capturedAt: string };
   conclusions: string[];
 }
+export interface OptimizationForecastBestPair {
+  forecastR: number;
+  meanR: number;
+  tpPct: number;
+  slPct: number;
+}
 export interface OptimizationStudy {
   id: number;
   origin?: "manual" | "continuous";
@@ -82,6 +88,8 @@ export interface OptimizationStudy {
   progress: OptimizationProgress;
   result: { progress: OptimizationProgress; best: OptimizationBest | null; reason: "trial_budget" | "time_budget" | "space_exhausted" | "cancelled" } | null;
   error: { code: string; message: string } | null;
+  /** Read-only server projection; absent on old APIs, null without saved forecast data. */
+  forecastBest?: OptimizationForecastBestPair | null;
   createdAt: string;
   updatedAt: string;
   events: { at: string; kind: string; message: string }[];
@@ -102,7 +110,8 @@ export function summarizeOptimizationStudy(study: OptimizationStudy): Optimizati
     ...(study.origin ? { origin: study.origin } : {}),
     ...(study.continuousGenerationId !== undefined ? { continuousGenerationId: study.continuousGenerationId } : {}),
     ...(study.continuousSlotId !== undefined ? { continuousSlotId: study.continuousSlotId } : {}),
-    createdAt: study.createdAt, updatedAt: study.updatedAt, bestScore: study.result?.best?.score ?? study.progress.bestScore ?? null };
+    createdAt: study.createdAt, updatedAt: study.updatedAt, bestScore: study.result?.best?.score ?? study.progress.bestScore ?? null,
+    forecastBest: study.forecastBest ?? null };
 }
 
 export const isActiveStudy = (study: Pick<OptimizationStudy, "status">): boolean =>

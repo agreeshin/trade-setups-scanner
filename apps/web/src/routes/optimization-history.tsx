@@ -75,7 +75,7 @@ export function OptimizationHistory({ algorithmId, algorithmName, controller, on
     {actions}
     <div className="overflow-x-auto">
       <Table aria-label={`Исследования · ${algorithmName}`} aria-busy={loading}>
-        <TableHeader><TableRow>{["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
+        <TableHeader><TableRow>{["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Лучший прогноз матожидания", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
         <TableBody>{page?.studies.map((study) => <TableRow key={study.id}>
           <TableCell><Button id={`${instanceId}-study-${study.id}`} type="button" variant="outline" size="sm" aria-label={`Результат исследования ${study.id}`} onClick={() => onSelect(study.id, `${instanceId}-study-${study.id}`, isContinuousStudy(study))}>#{study.id}</Button></TableCell>
           <TableCell><Badge>{isContinuousStudy(study) ? "Непрерывное" : "Ручное"}</Badge></TableCell>
@@ -83,6 +83,7 @@ export function OptimizationHistory({ algorithmId, algorithmName, controller, on
           <TableCell className="whitespace-nowrap">{formatElapsedDuration(study.progress.elapsedSeconds)}</TableCell>
           <TableCell>{study.spec.minSetupsPerDay ?? "Гейт не применялся"}</TableCell>
           <TableCell>{study.bestScore === null || !Number.isFinite(study.bestScore) ? "—" : `${scoreFormatter.format(study.bestScore)} R`}</TableCell>
+          <TableCell>{study.forecastBest == null || !Number.isFinite(study.forecastBest.forecastR) ? "—" : `${scoreFormatter.format(study.forecastBest.forecastR)} R`}</TableCell>
           <TableCell>{isActiveStudy(study)
             ? isContinuousStudy(study) ? <span className="text-xs text-muted-foreground">Общая остановка в настройках алгоритма</span> : <Button type="button" variant="outline" size="sm" disabled={busy || study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested")} aria-label={`Остановить исследование ${study.id}`} onClick={() => { void controller.stop(study); }}>{study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested") ? "Остановка запрошена" : controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить"}</Button>
             : <Button type="button" variant="outline" size="sm" disabled={busy} aria-label={`Удалить исследование ${study.id}`} onClick={() => onDelete(study)}><OptimizationTrashIcon /></Button>}</TableCell>

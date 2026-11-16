@@ -4,7 +4,7 @@ import { deleteOptimizationStudy, listOptimizationStudies, summarizeOptimization
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 it("requests bounded paginated compact summaries and keeps top-level bestScore", async () => {
-  const page = { studies: [{ id: 7, bestScore: 0.25 }], total: 42, limit: 10, offset: 20 };
+  const page = { studies: [{ id: 7, bestScore: 0.25, forecastBest: { forecastR: 0.8, meanR: -0.3, tpPct: 6, slPct: 4 } }], total: 42, limit: 10, offset: 20 };
   const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(page)));
   vi.stubGlobal("fetch", fetch);
   const controller = new AbortController();
@@ -30,7 +30,19 @@ it("preserves an interim bestScore without retaining full mutation-response deta
   const study = { id: 7, status: "cancel_requested", spec: {}, progress: { bestScore: 0.125 }, result: null, events: ["large-event"], error: null, createdAt: "now", updatedAt: "now" } as unknown as OptimizationStudy;
   const summary = summarizeOptimizationStudy(study);
   expect(summary.bestScore).toBe(0.125);
+  expect(summary.forecastBest).toBeNull();
   expect(summary).not.toHaveProperty("result");
   expect(summary).not.toHaveProperty("events");
   expect(summarizeOptimizationStudy({ ...study, result: { best: { score: 0 }, progress: study.progress, reason: "cancelled" } } as OptimizationStudy).bestScore).toBe(0);
+});
+
+it("preserves the server forecast pair in a compact mutation summary without inferring it from score", () => {
+  const forecastBest = { forecastR: 0, meanR: -0.75, tpPct: 6, slPct: 4 };
+  const study = { id: 7, status: "completed", spec: {}, progress: { bestScore: 9 }, result: { best: { score: 8, matrix: [{ forecastRiskExpectancy: 100 }] } },
+    forecastBest, events: ["large-event"], error: null, createdAt: "now", updatedAt: "now" } as unknown as OptimizationStudy;
+  const summary = summarizeOptimizationStudy(study);
+  expect(summary).toMatchObject({ bestScore: 8, forecastBest });
+  expect(summary).not.toHaveProperty("result");
+  expect(summary).not.toHaveProperty("events");
+  expect(summarizeOptimizationStudy({ ...study, forecastBest: null }).forecastBest).toBeNull();
 });

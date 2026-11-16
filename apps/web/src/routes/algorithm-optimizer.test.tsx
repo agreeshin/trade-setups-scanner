@@ -330,6 +330,7 @@ it("labels a forecast winner and keeps its recorded negative period mean separat
       closedCount: 10, tpCount: 4, slCount: 6, unclosedCount: 1, noDataCount: 0, priceChangeFilteredCount: 0 }],
     provenance: { optimizerVersion: "plan-a-3", seed: 42, snapshotHash: "forecast-fixture", capturedAt: saved.createdAt }, conclusions: [],
   } };
+  saved.forecastBest = { forecastR: 0.5, meanR: -0.3, tpPct: 4, slPct: 4 };
   studies = [saved];
   render(<AlgorithmsPage />); await openOptimizer();
   expect(await screen.findByText("Лучший score: 0.5 R")).toBeInTheDocument();
@@ -337,6 +338,33 @@ it("labels a forecast winner and keeps its recorded negative period mean separat
   expect(screen.getByText(/Среднее всей матрицы за период: -0.3 R/)).toBeInTheDocument();
   expect(screen.getByRole("columnheader", { name: "Прогноз R" })).toBeInTheDocument();
   expect(screen.getByRole("columnheader", { name: "Среднее R за период" })).toBeInTheDocument();
+  const pair = within(screen.getByRole("region", { name: "Лучшая forecast-пара" }));
+  expect(pair.getByText("0.50 R")).toBeInTheDocument();
+  expect(pair.getByText("-0.30 R")).toBeInTheDocument();
+  expect(pair.getByText("4% / 4%")).toBeInTheDocument();
+});
+
+it.each([0, -0.126])("opens the exact history ID and shows its server forecast pair (%s), not blend or maximum mean", async (forecastR) => {
+  const saved = record("completed");
+  saved.spec = { ...spec, trendMode: "blend", trendBlendLambda: 0.7 };
+  saved.forecastBest = { forecastR, meanR: -0.7, tpPct: 6, slPct: 4 };
+  saved.result = { progress, reason: "trial_budget", best: {
+    score: 8, meanScore: 9, trendMode: "blend", partial: false, params: algorithm.params,
+    analytics: spec.analyticsParams, matrix: [],
+    provenance: { optimizerVersion: "fixture", seed: 42, snapshotHash: "saved-pair", capturedAt: saved.createdAt }, conclusions: [],
+  } };
+  studies = [saved];
+  render(<AlgorithmsPage />);
+  const table = within(await screen.findByRole("table", { name: "Исследования · Новый алгоритм" }));
+  const trigger = await table.findByRole("button", { name: "Результат исследования 17" }, { timeout: 5000 });
+  expect(within(trigger.closest("tr")!).getAllByRole("cell")[6]).toHaveTextContent(`${forecastR.toFixed(2)} R`);
+  fireEvent.click(trigger);
+  const dialog = within(await screen.findByRole("dialog", { name: "Исследование #17 · Новый алгоритм" }));
+  const pair = within(await dialog.findByRole("region", { name: "Лучшая forecast-пара" }));
+  expect(pair.getAllByRole("definition").map((item) => item.textContent)).toEqual([`${forecastR.toFixed(2)} R`, "-0.70 R", "6% / 4%"]);
+  expect(dialog.getByText("Лучший score: 8 R")).toBeInTheDocument();
+  expect(requests.filter((request) => /^\/v1\/optimization-studies\/\d+$/.test(request.path)).map((request) => request.path)).toEqual(["/v1/optimization-studies/17"]);
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
 
 it("submits blend lambda and forward gate, persists and restores them on reopen", async () => {
@@ -491,11 +519,12 @@ it.each([false, true])("restores full terminal inputs with exact UI labels and c
     ...(clusterEnabled ? { support: { selectedSetupCount: 9, avgSetupsPerDay: null } } : {}),
     provenance: { optimizerVersion: "plan-a-1", seed: 42, snapshotHash: "snapshot-test-hash", capturedAt: "2026-11-10T00:00:00Z" }, conclusions: ["Проверенный вывод"],
   };
-  studies = [{ ...record("completed"), result: { progress: { ...progress, bestScore: best.score }, best, reason: "trial_budget" } }];
+  studies = [{ ...record("completed"), ...(clusterEnabled ? { forecastBest: null } : {}), result: { progress: { ...progress, bestScore: best.score }, best, reason: "trial_budget" } }];
   render(<AlgorithmsPage />);
   await openOptimizer();
   expect(await screen.findByText("Лучший score: 0.125 R")).toBeInTheDocument();
   expect(screen.getByText("snapshot-test-hash")).toBeInTheDocument();
+  expect(within(screen.getByRole("region", { name: "Лучшая forecast-пара" })).getByText("—")).toBeInTheDocument();
   expect(screen.getByRole("table", { name: "Матрица и поддержка результата" })).toHaveTextContent("Закрытых");
   expect(screen.getByText(/не доказанный глобальный оптимум/)).toBeInTheDocument();
   const requirements = within(screen.getByRole("region", { name: "Фиксированные требования исследования" }));
@@ -590,19 +619,22 @@ it("shows five inline summaries without pagination and all history in an open pa
   studies = Array.from({ length: 12 }, (_, index) => ({ ...record("completed"), id: 30 - index,
     progress: { ...progress, elapsedSeconds: index === 1 ? 90061 : 12, bestScore: index === 0 ? 0 : index === 1 ? null : index === 3 ? -0.126 : index === 4 ? 1e21 : 0.25 },
     spec: { ...spec, ...(index === 0 ? { minSetupsPerDay: 0 } : index > 1 ? { minSetupsPerDay: 4 } : {}) },
+    ...(index !== 1 ? { forecastBest: { forecastR: index === 0 ? 0 : index === 3 ? -0.126 : 0.876, meanR: -0.7, tpPct: 6, slPct: 4 } } : {}),
   }));
   render(<AlgorithmsPage />);
   const table = within(await screen.findByRole("table", { name: "Исследования · Новый алгоритм" }));
   await table.findByRole("button", { name: "Результат исследования 30" });
   expect(screen.queryByText("Загрузка истории исследований…")).not.toBeInTheDocument();
-  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"]);
+  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Лучший прогноз матожидания", "Действия"]);
   expect(table.getAllByRole("row")).toHaveLength(6);
   const first = within(table.getAllByRole("row")[1]!);
-  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#30", "Ручное", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "Менее 1 мин", "0", "0.00 R", ""]);
+  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#30", "Ручное", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "Менее 1 мин", "0", "0.00 R", "0.00 R", ""]);
   expect(table.getAllByRole("row")[2]).toHaveTextContent("Гейт не применялся");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("—");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("1 дн 1 ч 1 мин");
   expect(table.getAllByRole("row")[3]).toHaveTextContent("0.25 R");
+  expect(within(table.getAllByRole("row")[2]!).getAllByRole("cell")[6]).toHaveTextContent("—");
+  expect(within(table.getAllByRole("row")[3]!).getAllByRole("cell")[6]).toHaveTextContent("0.88 R");
   expect(table.getAllByRole("row")[4]).toHaveTextContent("-0.13 R");
   expect(table.getAllByRole("row")[5]).toHaveTextContent("1000000000000000000000.00 R");
   const section = within(screen.getByRole("region", { name: "История оптимизации · Новый алгоритм" }));
@@ -622,6 +654,8 @@ it("shows five inline summaries without pagination and all history in an open pa
   expect(fullTable.getAllByRole("row")[1]).toHaveTextContent("0.00 R");
   expect(fullTable.getAllByRole("row")[2]).toHaveTextContent("1 дн 1 ч 1 мин");
   expect(fullTable.getAllByRole("row")[4]).toHaveTextContent("-0.13 R");
+  expect(within(fullTable.getAllByRole("row")[2]!).getAllByRole("cell")[6]).toHaveTextContent("—");
+  expect(within(fullTable.getAllByRole("row")[4]!).getAllByRole("cell")[6]).toHaveTextContent("-0.13 R");
   expect(fullTable.getAllByRole("row")[5]).toHaveTextContent("1000000000000000000000.00 R");
   fireEvent.click(full.getByRole("button", { name: /Следующая страница/ }));
   expect(screen.queryByText("Загрузка истории исследований…")).not.toBeInTheDocument();

@@ -14,6 +14,9 @@ const statusLabels: Record<OptimizationStudy["status"], string> = {
 };
 const phaseLabels: Record<string, string> = { acquiring: "Подготовка снимка данных", initial: "Начальное исследование", sensitivity: "Чувствительность", refinement: "Уточнение", cleanup: "Очистка временных данных" };
 const reasonLabels = { trial_budget: "Исчерпан бюджет trials", time_budget: "Исчерпан бюджет времени", space_exhausted: "Конечное пространство исчерпано", cancelled: "Явная остановка" };
+const expectancyFormatter = new Intl.NumberFormat("en-US", {
+  notation: "standard", useGrouping: false, minimumFractionDigits: 2, maximumFractionDigits: 2,
+});
 // Match the existing Analytics controls, not the optimizer search-coordinate wording.
 const analyticsLabels: Record<string, string> = {
   clusterEnabled: "Кластеризовать сетапы", clusterGapMinutes: "Разрыв кластера, ч",
@@ -24,6 +27,7 @@ const analyticsLabels: Record<string, string> = {
 export function OptimizationResults({ study, algorithm, controller, onNew }: { study: OptimizationStudy; algorithm: Algorithm; controller: OptimizationController; onNew?: () => void }) {
   const { progress, spec, result } = study;
   const best = result?.best;
+  const pair = study.forecastBest;
   const mode = best?.trendMode ?? spec.trendMode ?? "mean";
   const blend = mode === "blend";
   const forecast = mode !== "mean";
@@ -71,6 +75,15 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
       <InfoNote>Хеши фиксируют происхождение входов, но не гарантируют точного повторения после изменения истории. Комиссии, funding и проскальзывание не учитываются.</InfoNote></div>
       <p className="text-sm">{best.partial ? "Частичный итог остановленного исследования." : "Лучший полностью проверенный кандидат в пределах бюджета."} Это не доказанный глобальный оптимум. Score — равное среднее {blend ? "blend R" : forecast ? "прогноза R" : "R"} всех выбранных TP×SL-ячеек, а не выбор лучшей TP/SL-пары.</p>
       {forecast && <p className="text-sm">{blend ? `Выбор по смеси среднего и прогноза (${blendLabel}).` : "Выбор по прогнозу тренда."} Среднее всей матрицы за период: {best.meanScore == null ? "Не сохранено" : `${best.meanScore} R`}. Прогноз не является экстраполяцией или средним за период.</p>}
+      <section aria-label="Лучшая forecast-пара" className="grid gap-2">
+        <h4 className="font-medium">Лучшая forecast-пара</h4>
+        <p className="text-xs text-muted-foreground">Максимальный чистый прогноз ячейки сохранённого победителя, не score всей матрицы. Среднее и TP/SL относятся к этой же ячейке.</p>
+        {pair == null ? <p className="text-sm">—</p> : <dl className="grid gap-2 text-sm sm:grid-cols-3">
+          <div><dt className="text-muted-foreground">Прогноз матожидания</dt><dd>{expectancyFormatter.format(pair.forecastR)} R</dd></div>
+          <div><dt className="text-muted-foreground">Среднее матожидание этой ячейки</dt><dd>{expectancyFormatter.format(pair.meanR)} R</dd></div>
+          <div><dt className="text-muted-foreground">TP / SL</dt><dd>{pair.tpPct}% / {pair.slPct}%</dd></div>
+        </dl>}
+      </section>
       <section aria-label="Полные параметры результата" className="grid gap-2">
         <h4 className="font-medium">Полные параметры алгоритма</h4>
         <dl className="grid gap-2 text-sm sm:grid-cols-2">{Object.entries(best.params).map(([key, value]) => {
