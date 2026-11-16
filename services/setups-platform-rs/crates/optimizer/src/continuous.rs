@@ -320,6 +320,10 @@ pub struct RobustCell {
     pub forecast_r: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forecast_matrix_r: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blend_r: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blend_matrix_r: Option<f64>,
 }
 
 pub fn validate_continuous_request(
@@ -798,7 +802,7 @@ fn analyze_inner_with_daily(
         working_base.saturating_add(capture.as_ref().map_or(0, SelectedDailyCapture::working_bytes)),
         limits.max_working_bytes,
     )?;
-    let mut daily = if spec.trend_mode == TrendMode::Forecast { Some(DailyMatrix::new(spec, limits)?) } else { None };
+    let mut daily = if !spec.trend_mode.is_mean() { Some(DailyMatrix::new(spec, limits)?) } else { None };
     let frequency = FrequencyGate::new(spec)?;
     let matrix = empty_matrix(spec);
     let diagnostics = matrix
@@ -1178,6 +1182,9 @@ pub fn select_robust_cell(
         && matrix.iter().any(|cell| cell.mean_risk_expectancy.is_none()) {
         return Err(StudyError::InvalidInput("mixed mean/forecast matrix".into()));
     }
+    let forecast_matrix_r = matrix.iter().any(|cell| cell.mean_risk_expectancy.is_some()).then(|| {
+        matrix.iter().map(|cell| cell.forecast_risk_expectancy.unwrap_or(cell.risk_expectancy.expect("scorable"))).sum::<f64>() / matrix.len() as f64
+    });
     let mut best: Option<RobustCell> = None;
     for (i, &tp_pct) in tp.iter().enumerate() {
         for (j, &sl_pct) in sl.iter().enumerate() {
@@ -1208,12 +1215,14 @@ pub fn select_robust_cell(
                 raw_r: selected.mean_risk_expectancy.unwrap_or(metric_cell_r),
                 mean_r,
                 robust_score: metric_cell_r.min(median),
-                forecast_r: selected.mean_risk_expectancy.map(|_| metric_cell_r),
-                forecast_matrix_r: selected.mean_risk_expectancy.map(|_| metric_r),
+                forecast_r: selected.mean_risk_expectancy.map(|_| selected.forecast_risk_expectancy.unwrap_or(metric_cell_r)),
+                forecast_matrix_r,
+                blend_r: selected.forecast_risk_expectancy.map(|_| metric_cell_r),
+                blend_matrix_r: selected.forecast_risk_expectancy.map(|_| metric_r),
             };
             if best.is_none_or(|old| {
                 next.robust_score > old.robust_score
-                    || (next.robust_score == old.robust_score && next.forecast_r.unwrap_or(next.raw_r) > old.forecast_r.unwrap_or(old.raw_r))
+                    || (next.robust_score == old.robust_score && next.blend_r.or(next.forecast_r).unwrap_or(next.raw_r) > old.blend_r.or(old.forecast_r).unwrap_or(old.raw_r))
             }) {
                 best = Some(next);
             }
@@ -1247,8 +1256,8 @@ pub fn recommend_continuous(
     else {
         return Ok(None);
     };
-    let metric_r = cell.forecast_matrix_r.unwrap_or(cell.mean_r);
-    if metric_r < minimum_mean_r || (spec.trend_mode == TrendMode::Forecast && metric_r <= 0.0) {
+    let metric_r = cell.blend_matrix_r.or(cell.forecast_matrix_r).unwrap_or(cell.mean_r);
+    if if spec.trend_mode.is_mean() { metric_r < minimum_mean_r } else { metric_r <= spec.min_forecast_expectancy } {
         return Ok(None);
     }
     Ok(Some(AdaptiveRecommendationSnapshot {
@@ -1263,6 +1272,9 @@ pub fn recommend_continuous(
         robust_score: cell.robust_score,
         search_forecast: cell.forecast_r.zip(cell.forecast_matrix_r).map(|(cell_r, matrix_r)| setups_domain::SearchForecast {
             bend_days: spec.trend_bend_days, cell_r, matrix_r,
+            blend: cell.blend_r.zip(cell.blend_matrix_r).map(|(cell_r, matrix_r)| setups_domain::SearchBlend {
+                lambda: spec.trend_blend_lambda, cell_r, matrix_r,
+            }),
         }),
         time_shift_minutes: candidate.analytics.time_shift_minutes,
         price_change_pct: candidate.analytics.price_change_pct,

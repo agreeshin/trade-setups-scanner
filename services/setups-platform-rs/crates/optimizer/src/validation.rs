@@ -299,6 +299,9 @@ pub(crate) fn validate_request_mode(
     if !spec.min_setups_per_day.is_finite() || spec.min_setups_per_day < 0.0 {
         return Err(invalid("minSetupsPerDay must be finite and nonnegative"));
     }
+    if !spec.min_forecast_expectancy.is_finite() || !(0.0..=100.0).contains(&spec.min_forecast_expectancy) {
+        return Err(invalid("minForecastExpectancy must be finite and in 0..100 R"));
+    }
     for levels in [&spec.tp_levels, &spec.sl_levels] {
         if levels.is_empty() || levels.len() > 64 {
             return Err(invalid("TP/SL axes require 1..64 levels"));

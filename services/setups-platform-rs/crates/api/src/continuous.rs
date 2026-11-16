@@ -462,6 +462,8 @@ mod tests {
         let old = normalize(legacy.clone()).unwrap();
         assert!(old.study.get("trendMode").is_none());
         assert!(old.study.get("trendBendDays").is_none());
+        assert!(old.study.get("trendBlendLambda").is_none());
+        assert!(old.study.get("minForecastExpectancy").is_none());
         let mut explicit = legacy.clone();
         explicit["study"]["trendMode"] = json!("mean");
         explicit["study"]["trendBendDays"] = json!("linear");
@@ -477,6 +479,14 @@ mod tests {
         for (field,value) in [("trendMode","median"),("trendBendDays","8")] {
             let mut request=legacy.clone();request["study"][field]=json!(value);
             assert!(normalize(request).is_err());
+        }
+        let mut blend=legacy.clone();blend["study"]["trendMode"]=json!("blend");
+        blend["study"]["trendBlendLambda"]=json!(0.6);blend["study"]["minForecastExpectancy"]=json!(0.2);
+        let normalized=normalize(blend).unwrap();
+        assert_eq!(normalized.study["trendBlendLambda"],0.6);
+        assert_eq!(normalized.study["minForecastExpectancy"],0.2);
+        for (field,value) in [("trendBlendLambda",0.705),("trendBlendLambda",1.0),("minForecastExpectancy",-0.1),("minForecastExpectancy",100.1)] {
+            let mut request=legacy.clone();request["study"][field]=json!(value);assert!(normalize(request).is_err());
         }
     }
 

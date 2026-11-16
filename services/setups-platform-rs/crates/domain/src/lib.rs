@@ -63,6 +63,16 @@ pub struct SearchForecast {
     pub bend_days: trend::TrendBendDays,
     pub cell_r: f64,
     pub matrix_r: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blend: Option<SearchBlend>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchBlend {
+    pub lambda: trend::TrendBlendLambda,
+    pub cell_r: f64,
+    pub matrix_r: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -74,8 +74,13 @@ pub fn recommendation_message(
     lines.push(format!("Алгоритм: {}", envelope.external_name));
     if let Some(forecast) = snapshot.search_forecast {
         if !forecast.cell_r.is_finite() || !forecast.matrix_r.is_finite() { return Err(invalid("invalid search forecast")); }
-        lines.push(format!("Выбор по прогнозу тренда ({}): {:+.2} R · score матрицы {:+.2} R",
-            if forecast.bend_days.is_linear() { "прямая" } else { forecast.bend_days.key() }, forecast.cell_r, forecast.matrix_r));
+        if let Some(blend)=forecast.blend {
+            if !blend.cell_r.is_finite() || !blend.matrix_r.is_finite() {return Err(invalid("invalid search blend"));}
+            lines.push(format!("Выбор по смеси {}/{}: {:+.2} R · score матрицы {:+.2} R",100-blend.lambda.percent(),blend.lambda.percent(),blend.cell_r,blend.matrix_r));
+        } else {
+            lines.push(format!("Выбор по прогнозу тренда ({}): {:+.2} R · score матрицы {:+.2} R",
+                if forecast.bend_days.is_linear() { "прямая" } else { forecast.bend_days.key() }, forecast.cell_r, forecast.matrix_r));
+        }
     }
     lines.push(format!("Исследование №{}", envelope.study_id));
     Ok(lines.join("\n"))

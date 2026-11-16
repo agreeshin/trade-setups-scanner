@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use setups_analytics::{OhlcCandle, TradeDirection};
 use setups_domain::DetectorBar;
-pub use setups_domain::trend::{TrendBendDays, TrendMode};
+pub use setups_domain::trend::{TrendBendDays, TrendBlendLambda, TrendMode};
 use std::collections::BTreeMap;
 
 pub type ParamMap = BTreeMap<String, Value>;
@@ -26,6 +26,7 @@ fn default_trials() -> usize {
 fn default_seconds() -> u64 {
     3600
 }
+fn is_zero(value: &f64) -> bool { *value == 0.0 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -63,6 +64,10 @@ pub struct StudyRequest {
     pub trend_mode: TrendMode,
     #[serde(default, skip_serializing_if = "TrendBendDays::is_linear")]
     pub trend_bend_days: TrendBendDays,
+    #[serde(default, skip_serializing_if = "TrendBlendLambda::is_default")]
+    pub trend_blend_lambda: TrendBlendLambda,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_forecast_expectancy: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -268,6 +273,8 @@ pub struct StudyBest {
     pub trend_mode: TrendMode,
     #[serde(default, skip_serializing_if = "TrendBendDays::is_linear")]
     pub trend_bend_days: TrendBendDays,
+    #[serde(default, skip_serializing_if = "TrendBlendLambda::is_default")]
+    pub trend_blend_lambda: TrendBlendLambda,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -296,6 +303,9 @@ pub struct MatrixCell {
     /// endpoint; this field retains the original period mean without rounding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mean_risk_expectancy: Option<f64>,
+    /// Only blend needs a separate pure endpoint; forecast uses riskExpectancy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast_risk_expectancy: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

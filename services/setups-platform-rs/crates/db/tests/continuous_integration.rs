@@ -1020,10 +1020,11 @@ async fn saved_matrix_payload_projects_own_mode_for_mean_forecast_and_legacy() {
     isolated(|pool| async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
         let slot = configured(&pool, OWNER, ALGORITHM).await;
-        for (index, mode) in [Some("mean"), Some("forecast"), None].into_iter().enumerate() {
+        for (index, (mode, lambda)) in [(Some("mean"),None),(Some("forecast"),None),(None,None),(Some("blend"),Some(0.6)),(Some("blend"),None)].into_iter().enumerate() {
             let id = generation(&pool, OWNER, ALGORITHM, slot, "completed").await;
             let mut saved_spec = spec(ALGORITHM);
             if let Some(mode) = mode { saved_spec["trendMode"] = json!(mode); }
+            if let Some(lambda) = lambda { saved_spec["trendBlendLambda"] = json!(lambda); }
             let selected = json!({"tpPct":14,"slPct":4,"rawR":0.32,"fixture":index});
             let result = json!({"meanExpectancy":0.21,"selectedCell":selected});
             sqlx::query("update continuous_generations set spec=$2,result=$3 where id=$1")
@@ -1044,14 +1045,18 @@ async fn saved_matrix_payload_projects_own_mode_for_mean_forecast_and_legacy() {
             let detail = serde_json::to_value(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap()).unwrap();
             assert_eq!(detail["slots"][0]["trendMode"], expected);
             assert_eq!(detail["slots"][0]["meanExpectancy"], 0.21);
+            let expected_lambda = if mode == Some("blend") { json!(lambda.unwrap_or(0.7)) } else { Value::Null };
+            assert_eq!(detail["slots"][0]["trendBlendLambda"], expected_lambda);
             let list = serde_json::to_value(db::list(&pool, OWNER, Some(ALGORITHM)).await.unwrap()).unwrap();
             assert_eq!(list[0]["slots"][0]["trendMode"], expected);
+            assert_eq!(list[0]["slots"][0]["trendBlendLambda"], expected_lambda);
             // Stopping/reconfiguration may clear live ownership while retaining
             // the saved mean: recover only from its matching frozen result.
             sqlx::query("update continuous_slots set active_generation_id=null where id=$1")
                 .bind(slot).execute(&pool).await.unwrap();
             let saved = serde_json::to_value(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap()).unwrap();
             assert_eq!(saved["slots"][0]["trendMode"], expected);
+            assert_eq!(saved["slots"][0]["trendBlendLambda"], expected_lambda);
         }
         sqlx::query("update continuous_slots set mean_expectancy=9.99 where id=$1")
             .bind(slot).execute(&pool).await.unwrap();

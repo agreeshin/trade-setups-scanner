@@ -267,13 +267,16 @@ fn format_caption(
     out.plain("\nВ среднем для других уровней TP и SL: ")?;
     out.code(&signed_r(snapshot.mean_r)?)?;
     if let Some(forecast) = snapshot.search_forecast {
-        out.plain("\nВыбор по прогнозу тренда (")?;
+        let (cell_r,matrix_r)=if let Some(blend)=forecast.blend {
+            out.plain(&format!("\nВыбор по смеси {}/{} (",100-blend.lambda.percent(),blend.lambda.percent()))?;
+            (blend.cell_r,blend.matrix_r)
+        } else {out.plain("\nВыбор по прогнозу тренда (")?;(forecast.cell_r,forecast.matrix_r)};
         out.plain(if forecast.bend_days.is_linear() { "прямая" } else { forecast.bend_days.key() })?;
         if !forecast.bend_days.is_linear() { out.plain(" д.")?; }
         out.plain("): ")?;
-        out.code(&signed_r(forecast.cell_r)?)?;
+        out.code(&signed_r(cell_r)?)?;
         out.plain("; score матрицы: ")?;
-        out.code(&signed_r(forecast.matrix_r)?)?;
+        out.code(&signed_r(matrix_r)?)?;
     }
     out.plain("\n\nАлгоритм: ")?;
     out.label(&envelope.external_name)?;
@@ -335,6 +338,11 @@ mod tests {
         v2::validate_entities(&caption.text, &caption.entities).unwrap();
         value["searchForecast"]["bendDays"] = json!("linear");
         assert!(recommendation_telegram_caption(&instrument, &raw, &value).unwrap().text.contains("Выбор по прогнозу тренда (прямая)"));
+        value["searchForecast"]["blend"]=json!({"lambda":0.7,"cellR":0.52,"matrixR":0.38});
+        let blend=recommendation_telegram_caption(&instrument,&raw,&value).unwrap();
+        assert!(blend.text.contains("Выбор по смеси 30/70 (прямая): +0.52 R; score матрицы: +0.38 R"));
+        assert!(blend.text.contains("Среднее МО за последние 1 суток: +0.32 R"));
+        v2::validate_entities(&blend.text,&blend.entities).unwrap();
     }
 
     #[test]

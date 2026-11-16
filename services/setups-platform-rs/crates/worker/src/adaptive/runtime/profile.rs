@@ -56,9 +56,17 @@ impl LiveProfile {
             (setups_optimizer::TrendMode::Mean, None) => {},
             (setups_optimizer::TrendMode::Forecast, Some(forecast))
                 if forecast.bend_days==spec.trend_bend_days && forecast.cell_r.is_finite()
-                    && forecast.matrix_r.is_finite() && forecast.matrix_r>0.0
+                    && forecast.blend.is_none() && forecast.matrix_r.is_finite() && forecast.matrix_r>spec.min_forecast_expectancy
                     && slot.selected_cell["forecastR"].as_f64()==Some(forecast.cell_r)
                     && slot.selected_cell["forecastMatrixR"].as_f64()==Some(forecast.matrix_r) => {},
+            (setups_optimizer::TrendMode::Blend, Some(forecast))
+                if forecast.bend_days==spec.trend_bend_days && forecast.cell_r.is_finite() && forecast.matrix_r.is_finite()
+                    && slot.selected_cell["forecastR"].as_f64()==Some(forecast.cell_r)
+                    && slot.selected_cell["forecastMatrixR"].as_f64()==Some(forecast.matrix_r)
+                    && forecast.blend.is_some_and(|blend| blend.lambda==spec.trend_blend_lambda
+                        && blend.cell_r.is_finite() && blend.matrix_r.is_finite() && blend.matrix_r>spec.min_forecast_expectancy
+                        && slot.selected_cell["blendR"].as_f64()==Some(blend.cell_r)
+                        && slot.selected_cell["blendMatrixR"].as_f64()==Some(blend.matrix_r)) => {},
             _ => return Err(invalid("accepted search metric identity mismatch")),
         }
         if let Some(init)=&slot.live_initialization

@@ -47,6 +47,7 @@ fn request() -> StudyRequest {
         seed: 42,
         trend_mode: TrendMode::Mean,
         trend_bend_days: TrendBendDays::Linear,
+        trend_blend_lambda: TrendBlendLambda::default(), min_forecast_expectancy: 0.0,
     }
 }
 fn candidate(spec: &StudyRequest) -> StudyCandidate {
@@ -757,6 +758,7 @@ fn cell(tp: f64, sl: f64, risk: f64) -> MatrixCell {
         no_data_count: 0,
         price_change_filtered_count: 0,
         mean_risk_expectancy: None,
+        forecast_risk_expectancy: None,
     }
 }
 
@@ -905,13 +907,15 @@ fn forecast_gate_uses_chosen_metric_not_source_mean_and_keeps_period_provenance(
     spec.trend_mode = TrendMode::Forecast;
     spec.trend_bend_days = TrendBendDays::Seven;
     for (forecast, period_mean, threshold, accepted) in [
-        (0.1499999999, 2.0, 0.15, false), (0.15, -0.4, 0.15, true),
-        (-0.1, 2.0, -1.0, false), (0.0, 2.0, 0.0, false), (0.01, -0.5, -1.0, true),
+        (0.1499999999, 2.0, 0.15, false), (0.15, -0.4, 0.15, false),
+        (0.1500000001, -0.4, 0.15, true), (-0.1, 2.0, 0.0, false),
+        (0.0, 2.0, 0.0, false), (0.01, -0.5, 0.0, true),
     ] {
+        spec.min_forecast_expectancy = threshold;
         let mut value = cell(4.0, 4.0, forecast);
         value.mean_risk_expectancy = Some(period_mean);
         result.evaluation.matrix = vec![value];
-        let recommendation = recommend_continuous(&spec, &candidate(&spec), &result, &raw.provenance, raw.context, threshold).unwrap();
+        let recommendation = recommend_continuous(&spec, &candidate(&spec), &result, &raw.provenance, raw.context, 99.0).unwrap();
         assert_eq!(recommendation.is_some(), accepted);
         if let Some(recommendation) = recommendation {
             assert_eq!(recommendation.raw_r, period_mean);
@@ -925,6 +929,24 @@ fn forecast_gate_uses_chosen_metric_not_source_mean_and_keeps_period_provenance(
     spec.trend_mode = TrendMode::Mean;
     result.evaluation.matrix = vec![cell(4.0, 4.0, -0.1)];
     assert!(recommend_continuous(&spec, &candidate(&spec), &result, &raw.provenance, raw.context, -1.0).unwrap().unwrap().search_forecast.is_none());
+}
+
+#[test]
+fn blend_gate_uses_the_forward_threshold_and_not_mean_or_pure_forecast() {
+    let (mut spec,data,raw)=observed_fixture();
+    let mut result=analyze_continuous(&spec,&data,&raw,&candidate(&spec),&StudyLimits::default(),&CancelToken::new()).unwrap().unwrap();
+    spec.trend_mode=TrendMode::Blend;
+    for (score,threshold,accepted) in [(0.0,0.0,false),(0.01,0.0,true),(0.2,0.2,false),(0.20000001,0.2,true)] {
+        spec.min_forecast_expectancy=threshold;
+        let mut mixed=cell(4.0,4.0,score);mixed.mean_risk_expectancy=Some(-0.5);mixed.forecast_risk_expectancy=Some(0.8);
+        result.evaluation.matrix=vec![mixed];
+        let next=recommend_continuous(&spec,&candidate(&spec),&result,&raw.provenance,raw.context,99.0).unwrap();
+        assert_eq!(next.is_some(),accepted);
+        if let Some(next)=next {
+            assert_eq!(next.raw_r,-0.5);let forecast=next.search_forecast.unwrap();assert_eq!(forecast.cell_r,0.8);
+            let blend=forecast.blend.unwrap();assert_eq!(blend.lambda,spec.trend_blend_lambda);assert_eq!(blend.matrix_r,score);
+        }
+    }
 }
 
 #[test]

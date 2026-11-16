@@ -18,7 +18,8 @@ fn fixture() -> (StudyRequest, StudyInput, ContinuousContext) {
         analytics_search:serde_json::from_value(json!({"clusterEnabled":[false,true],"timeShiftMinutes":[0,1,3],"priceChangePct":[null,0.10000000000000002,-0.0]})).unwrap(),
         instruments:vec![instrument.clone()],from_unix:T0+1450*60,to_unix:T0+1530*60,direction:TradeDirection::Short,setup_maturity:0.0,
         tp_levels:vec![4.0,8.0],sl_levels:vec![4.0,8.0],horizon_minutes:30,min_closed_per_cell:1,min_setups_per_day:0.0,
-        max_trials:48,max_seconds:120,seed:168,trend_mode:TrendMode::Mean,trend_bend_days:TrendBendDays::Linear};
+        max_trials:48,max_seconds:120,seed:168,trend_mode:TrendMode::Mean,trend_bend_days:TrendBendDays::Linear,
+        trend_blend_lambda:TrendBlendLambda::default(),min_forecast_expectancy:0.0};
     let mut bars = Vec::new();
     let mut candles = Vec::new();
     for minute in 0..1530 {
@@ -73,7 +74,7 @@ fn assert_legacy_checkpoint_has_no_new_metric_fields(bytes: &[u8]) {
         match value {
             Value::Map(entries) => for (key,value) in entries {
                 if let Value::Text(key)=key {
-                    assert!(!["trendMode","trendBendDays","meanRiskExpectancy","meanScore","searchForecast","forecastR","forecastMatrixR"].contains(&key.as_str()));
+                    assert!(!["trendMode","trendBendDays","meanRiskExpectancy","meanScore","searchForecast","forecastR","forecastMatrixR","trendBlendLambda","minForecastExpectancy","forecastRiskExpectancy"].contains(&key.as_str()));
                 }
                 check(value);
             },
@@ -220,6 +221,21 @@ fn crash_before_commit_replays_only_uncommitted_batch_and_commit_errors_fail_clo
     );
     assert!(observations.windows(2).all(|w| w[1] == w[0] + 1));
     assert_eq!(comparable(recovered), comparable(reference));
+}
+
+#[test]
+fn blend_checkpoint_binds_lambda_and_the_forward_gate_without_new_history_migration() {
+    let (mut spec,input,context)=fixture();spec.trend_mode=TrendMode::Blend;
+    let limits=StudyLimits::default();let cancel=CancelToken::new();let pause=CancelToken::new();let mut checkpoint=Vec::new();
+    search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,None),|_|{},|_,bytes| {
+        checkpoint=bytes.to_vec();Ok(CheckpointAction::Suspend)
+    }).unwrap();
+    assert!(!checkpoint.is_empty());
+    for changed in [StudyRequest {trend_blend_lambda:TrendBlendLambda::try_from(0.6).unwrap(),..spec.clone()},
+        StudyRequest {min_forecast_expectancy:0.2,..spec.clone()}] {
+        assert!(search_continuous_resumable(&changed,&input,context,&limits,control(&cancel,&pause,Some(&checkpoint)),|_|{},|_,_|Ok(CheckpointAction::Continue)).is_err());
+    }
+    assert!(search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,Some(&checkpoint)),|_|{},|_,_|Ok(CheckpointAction::Suspend)).is_ok());
 }
 
 #[test]

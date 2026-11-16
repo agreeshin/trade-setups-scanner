@@ -44,6 +44,7 @@ pub struct ContinuousSlot {
     pub mean_expectancy: Option<f64>,
     /// Objective of the saved matrix, never the currently editable process config.
     pub trend_mode: Option<setups_domain::trend::TrendMode>,
+    pub trend_blend_lambda: Option<setups_domain::trend::TrendBlendLambda>,
     pub selected_cell: Option<Value>,
     pub updated_at: DateTime<Utc>,
 }
@@ -79,8 +80,17 @@ fn saved_trend_mode(spec: Option<&Value>) -> Option<setups_domain::trend::TrendM
         Some(value) => match value.as_str() {
             Some("mean") => Some(TrendMode::Mean),
             Some("forecast") => Some(TrendMode::Forecast),
+            Some("blend") => Some(TrendMode::Blend),
             _ => None,
         },
+    }
+}
+
+fn saved_blend_lambda(spec: Option<&Value>) -> Option<setups_domain::trend::TrendBlendLambda> {
+    if saved_trend_mode(spec) != Some(setups_domain::trend::TrendMode::Blend) { return None; }
+    match spec?.get("trendBlendLambda") {
+        None => Some(Default::default()),
+        Some(value) => value.as_f64().and_then(|value| value.try_into().ok()),
     }
 }
 
@@ -134,6 +144,9 @@ pub async fn get(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Option<C
         study_id: row.try_get("finalized_study_id")?, mean_expectancy: row.try_get("mean_expectancy")?,
         trend_mode: if row.try_get::<Option<f64>,_>("mean_expectancy")?.is_some() {
             saved_trend_mode(row.try_get::<Option<Value>,_>("metric_spec")?.as_ref())
+        } else { None },
+        trend_blend_lambda: if row.try_get::<Option<f64>,_>("mean_expectancy")?.is_some() {
+            saved_blend_lambda(row.try_get::<Option<Value>,_>("metric_spec")?.as_ref())
         } else { None },
         selected_cell: row.try_get("selected_cell")?, updated_at: row.try_get("updated_at")?,
     })).collect::<Result<_,DbError>>()?;

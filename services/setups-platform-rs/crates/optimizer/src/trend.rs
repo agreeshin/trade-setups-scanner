@@ -71,13 +71,25 @@ impl DailyMatrix {
             for index in cells {
                 if control.stopped() { return Ok(false); }
                 points.clear();
+                let mut period_sum = 0.0;
+                let mut period_closed = 0_u64;
                 for day in first..=last {
                     let bucket = self.cells[index * self.days + day];
+                    period_sum += bucket.sum_r;
+                    period_closed += u64::from(bucket.closed);
                     points.push(TrendInput { day: (self.origin_day + day as i64) as f64,
                         value: (bucket.closed > 0).then(|| bucket.sum_r / f64::from(bucket.closed)), weight: self.rows[day] });
                 }
-                matrix[index].risk_expectancy = design.endpoint(&points)
+                let forecast = design.endpoint(&points)
                     .map_err(|e| StudyError::Execution(e.to_string()))?;
+                if spec.trend_mode == TrendMode::Blend {
+                    let mean = period_sum / period_closed as f64;
+                    matrix[index].mean_risk_expectancy = Some(mean);
+                    matrix[index].forecast_risk_expectancy = forecast;
+                    matrix[index].risk_expectancy = forecast.map(|forecast| spec.trend_blend_lambda.combine(mean, forecast));
+                } else {
+                    matrix[index].risk_expectancy = forecast;
+                }
             }
         }
         Ok(true)
@@ -103,6 +115,30 @@ mod tests {
     use crate::{CancelToken, TrendBendDays, evaluation::empty_matrix};
     use serde_json::json;
     use std::{sync::atomic::AtomicUsize, time::{Duration, Instant}};
+
+    #[test]
+    fn blend_uses_the_same_daily_buckets_and_closed_count_weighted_mean() {
+        let mut spec: StudyRequest = serde_json::from_value(json!({
+            "algorithmId":"price_volume_spike","algorithmVersion":"1.1.1","algorithmParams":{},
+            "analyticsParams":crate::AnalyticsParams::default(),"instruments":[],"fromUnix":0,"toUnix":4*86400,
+            "direction":"short","seed":42,"tpLevels":[4],"slLevels":[4],"trendMode":"forecast","trendBendDays":"7"
+        })).unwrap();
+        let limits=StudyLimits::default(); let mut daily=DailyMatrix::new(&spec,&limits).unwrap();
+        for (day, outcomes) in [(0,vec![Some(-1.0),Some(1.0)]),(1,vec![Some(4.0)]),(2,vec![Some(-1.0),None]),(3,vec![Some(2.0)])] {
+            for value in outcomes {let index=daily.record_setup(day*86400);if let Some(value)=value {daily.record_outcome(0,index,value);}}
+        }
+        let cancel=CancelToken::new(); let passes=AtomicUsize::new(0);
+        let control=Control {cancel:&cancel,deadline:Instant::now()+Duration::from_secs(30),detector_passes:&passes};
+        let mut forecast=empty_matrix(&spec);forecast[0].risk_expectancy=Some(1.0);forecast[0].closed_count=5;
+        let mut blend=forecast.clone();
+        daily.apply(&spec,&mut forecast,&control).unwrap();
+        spec.trend_mode=TrendMode::Blend;
+        assert_eq!(DailyMatrix::working_bytes(&spec).unwrap(),DailyMatrix::working_bytes(&StudyRequest {trend_mode:TrendMode::Forecast,..spec.clone()}).unwrap());
+        daily.apply(&spec,&mut blend,&control).unwrap();
+        assert_eq!(blend[0].mean_risk_expectancy,Some(1.0));
+        assert_eq!(blend[0].forecast_risk_expectancy,forecast[0].risk_expectancy);
+        assert_eq!(blend[0].risk_expectancy,Some(spec.trend_blend_lambda.combine(1.0,forecast[0].risk_expectancy.unwrap())));
+    }
 
     #[test]
     fn full_64_by_64_calendar_shares_basis_and_handles_distinct_finite_endpoints() {

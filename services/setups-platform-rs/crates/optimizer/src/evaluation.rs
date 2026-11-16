@@ -310,6 +310,7 @@ pub(crate) fn empty_matrix(spec: &StudyRequest) -> Vec<MatrixCell> {
                 no_data_count: 0,
                 price_change_filtered_count: 0,
                 mean_risk_expectancy: None,
+                forecast_risk_expectancy: None,
             })
         })
         .collect()
@@ -553,7 +554,7 @@ pub(crate) fn evaluate_group(
     let warmup_from = from_open - required as i64 * 60;
     let to_open = spec.to_unix - 60;
     let mut matrices: Vec<_> = candidates.iter().map(|_| empty_matrix(spec)).collect();
-    let mut dailies = if spec.trend_mode == TrendMode::Forecast {
+    let mut dailies = if !spec.trend_mode.is_mean() {
         candidates.iter().map(|_| DailyMatrix::new(spec, limits)).collect::<Result<Vec<_>, _>>()?
     } else { Vec::new() };
     let mut summary = TrialSummary {

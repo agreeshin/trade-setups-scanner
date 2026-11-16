@@ -45,15 +45,45 @@ pub enum TrendMode {
     #[default]
     Mean,
     Forecast,
+    Blend,
 }
 impl TrendMode {
     pub fn is_mean(&self) -> bool { *self == Self::Mean }
 }
+/// A bounded fixed percentage prevents float spelling from changing identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct TrendBlendLambda(u8);
+impl Default for TrendBlendLambda { fn default() -> Self { Self(70) } }
+impl TrendBlendLambda {
+    pub fn fraction(self) -> f64 { f64::from(self.0) / 100.0 }
+    pub fn percent(self) -> u8 { self.0 }
+    pub fn is_default(&self) -> bool { *self == Self::default() }
+    pub fn combine(self, mean: f64, forecast: f64) -> f64 {
+        let lambda = self.fraction();
+        (1.0 - lambda) * mean + lambda * forecast
+    }
+}
+impl TryFrom<f64> for TrendBlendLambda {
+    type Error = &'static str;
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        let percent = (value * 100.0).round();
+        if !value.is_finite() || !(0.05..=0.95).contains(&value) || percent / 100.0 != value {
+            return Err("trendBlendLambda must be 0.05..0.95 in steps of 0.01");
+        }
+        Ok(Self(percent as u8))
+    }
+}
+impl From<TrendBlendLambda> for f64 { fn from(value: TrendBlendLambda) -> f64 { value.fraction() } }
 /// Mean keys/payloads deliberately remain byte-compatible with pre-trend caches.
 pub fn trend_matrix_scope(scope: &str, mode: TrendMode, bend: TrendBendDays) -> String {
+    trend_matrix_scope_with_lambda(scope, mode, bend, TrendBlendLambda::default())
+}
+pub fn trend_matrix_scope_with_lambda(scope: &str, mode: TrendMode, bend: TrendBendDays, lambda: TrendBlendLambda) -> String {
     match mode {
         TrendMode::Mean => scope.to_owned(),
         TrendMode::Forecast => format!("{scope}:trend:v1:forecast:{}", bend.key()),
+        TrendMode::Blend => format!("{scope}:trend:v1:blend:{:02}:{}", lambda.percent(), bend.key()),
     }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -479,6 +509,26 @@ fn fit_weighted_trend_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blend_lambda_is_canonical_bounded_and_isolates_matrix_scope() {
+        for percent in 5..=95 {
+            let value = f64::from(percent) / 100.0;
+            let lambda = TrendBlendLambda::try_from(value).unwrap();
+            assert_eq!(lambda.percent(), percent);
+            assert_eq!(serde_json::from_value::<TrendBlendLambda>(serde_json::json!(value)).unwrap(), lambda);
+        }
+        for value in [0.0, 0.049, 0.951, 1.0, 0.705, f64::NAN, f64::INFINITY] {
+            assert!(TrendBlendLambda::try_from(value).is_err());
+        }
+        let lambda: TrendBlendLambda = serde_json::from_str("0.70").unwrap();
+        assert_eq!(serde_json::to_string(&lambda).unwrap(), "0.7");
+        assert_eq!(trend_matrix_scope_with_lambda("s", TrendMode::Blend, TrendBendDays::Seven, lambda), "s:trend:v1:blend:70:7");
+        let other = TrendBlendLambda::try_from(0.6).unwrap();
+        assert_ne!(trend_matrix_scope_with_lambda("s", TrendMode::Blend, TrendBendDays::Seven, lambda), trend_matrix_scope_with_lambda("s", TrendMode::Blend, TrendBendDays::Seven, other));
+        assert_eq!(trend_matrix_scope_with_lambda("s", TrendMode::Forecast, TrendBendDays::Seven, other), "s:trend:v1:forecast:7");
+        assert_eq!(trend_matrix_scope_with_lambda("s", TrendMode::Mean, TrendBendDays::Seven, other), "s");
+    }
     fn series(n: usize, f: impl Fn(f64) -> f64) -> Vec<TrendInput> {
         (0..n)
             .map(|i| TrendInput {

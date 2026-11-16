@@ -67,7 +67,56 @@ fn manual_and_continuous_rank_declining_cells_by_the_chosen_metric_deterministic
     let mut second = run_study(&spec, &input, &limits, &cancel, |_| {}).unwrap();
     first.progress.elapsed_seconds=0.0; second.progress.elapsed_seconds=0.0;
     assert_eq!(first, second);
-    assert_eq!(first.best.unwrap().trend_mode, TrendMode::Forecast);
+    assert!(first.best.is_none(), "negative forecast does not pass the default forward gate");
+}
+
+#[test]
+fn blend_ranking_is_deterministic_and_forward_gate_is_configurable() {
+    let (mut spec,input,candidate)=fixture();let limits=StudyLimits::default();let cancel=CancelToken::new();
+    spec.trend_mode=TrendMode::Forecast;spec.trend_bend_days=TrendBendDays::Seven;
+    let forecast=evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap();
+    spec.trend_mode=TrendMode::Blend;
+    let blend=evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap();
+    assert_eq!(blend,evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap());
+    for (mixed,pure) in blend.matrix.iter().zip(&forecast.matrix) {
+        assert_eq!(mixed.forecast_risk_expectancy,pure.risk_expectancy);
+        let mean=mixed.mean_risk_expectancy.unwrap();let pure=pure.risk_expectancy.unwrap();
+        assert_eq!(mixed.risk_expectancy,Some(spec.trend_blend_lambda.combine(mean,pure)));
+    }
+    spec.min_forecast_expectancy=100.0;
+    assert!(run_study(&spec,&input,&limits,&cancel,|_|{}).unwrap().best.is_none());
+    let mut invalid=spec.clone(); invalid.min_forecast_expectancy = -0.1;
+    assert!(evaluate_candidate(&invalid,&input,&candidate,&limits,&cancel).is_err());
+    for mode in [TrendMode::Mean,TrendMode::Forecast] {
+        spec.trend_mode=mode;spec.min_forecast_expectancy=0.0;
+        let before=serde_json::to_vec(&spec).unwrap();
+        assert!(!String::from_utf8(before.clone()).unwrap().contains("trendBlendLambda"));
+        assert_eq!(before,serde_json::to_vec(&serde_json::from_slice::<StudyRequest>(&before).unwrap()).unwrap());
+    }
+}
+
+#[test]
+#[ignore = "manual paired wall-time benchmark; not a timing-sensitive CI gate"]
+fn benchmark_blend_vs_forecast_same_seed_trials() {
+    use std::time::Instant;
+    let (mut spec,input,_)=fixture();spec.max_trials=8;spec.max_seconds=120;
+    spec.algorithm_search=serde_json::from_value(json!({"priceGrowthPct":["8","9","10","11","12","13","14","15"]})).unwrap();
+    spec.trend_bend_days=TrendBendDays::Seven;
+    let limits=StudyLimits {cpu_threads:1,..StudyLimits::default()};let cancel=CancelToken::new();
+    let mut forecast=Vec::new();let mut blend=Vec::new();let mut trials=None;
+    for pair in 0..5 {
+        for mode in if pair%2==0 {[TrendMode::Forecast,TrendMode::Blend]}else{[TrendMode::Blend,TrendMode::Forecast]} {
+            spec.trend_mode=mode;let started=Instant::now();
+            let result=run_study(&spec,&input,&limits,&cancel,|_|{}).unwrap();
+            let elapsed=started.elapsed().as_secs_f64();
+            assert_eq!(*trials.get_or_insert(result.progress.evaluated_candidates),result.progress.evaluated_candidates);
+            if mode==TrendMode::Blend {blend.push(elapsed);}else{forecast.push(elapsed);}
+        }
+    }
+    forecast.sort_by(f64::total_cmp);blend.sort_by(f64::total_cmp);
+    let ratio=blend[2]/forecast[2];
+    println!("N7 paired benchmark: seed={} trials/run={} pairs=5 forecast_median_s={:.6} blend_median_s={:.6} overhead_pct={:.2} forecast_samples={forecast:?} blend_samples={blend:?}",spec.seed,trials.unwrap(),forecast[2],blend[2],(ratio-1.0)*100.0);
+    assert!(ratio<=1.20,"blend exceeds the owner's +20% acceptance bound");
 }
 
 #[test]

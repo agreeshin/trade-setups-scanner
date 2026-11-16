@@ -558,7 +558,7 @@ fn post_chain_expectancy(job:&ChainJob,spec:&StudyRequest,best:&core::StudyBest,
         return Ok(None);
     };
     let daily=daily.ok_or_else(||JobError::new("post_chain_capture_missing","Canonical post-chain selected outcomes were not captured"))?;
-    if spec.trend_mode==core::TrendMode::Forecast {
+    if !spec.trend_mode.is_mean() {
         let points:Vec<_>=daily.points.iter().map(|point|Ok(setups_domain::trend::TrendInput {
             day:point.day_start_unix.div_euclid(86400) as f64,value:point.mean_r,
             weight:u32::try_from(point.row_count).map_err(|_|JobError::new("post_chain_forecast_invalid","Daily weight exceeds the forecast counter bound"))?,

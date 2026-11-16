@@ -136,7 +136,7 @@ struct Totals {
 
 impl Totals {
     fn new(pair:ContinuousCaptureCell)->Self {
-        Self {cell:core::MatrixCell {tp_pct:pair.tp_pct,sl_pct:pair.sl_pct,risk_expectancy:None,avg_move_pct:None,closed_count:0,tp_count:0,sl_count:0,unclosed_count:0,no_data_count:0,price_change_filtered_count:0,mean_risk_expectancy:None},
+        Self {cell:core::MatrixCell {tp_pct:pair.tp_pct,sl_pct:pair.sl_pct,risk_expectancy:None,avg_move_pct:None,closed_count:0,tp_count:0,sl_count:0,unclosed_count:0,no_data_count:0,price_change_filtered_count:0,mean_risk_expectancy:None,forecast_risk_expectancy:None},
             diagnostics:core::ContinuousCellDiagnostics {tp_pct:pair.tp_pct,sl_pct:pair.sl_pct,future_entry_count:0,missing_entry_count:0,right_censored_count:0,observation_gap_count:0,horizon_expired_count:0},
             setup_count:0,selected_setup_count:0,evaluated_minutes:0,warmup_minutes:0,days:BTreeMap::new()}
     }

@@ -51,6 +51,7 @@ fn spec() -> StudyRequest {
         seed: 42,
         trend_mode: TrendMode::Mean,
         trend_bend_days: TrendBendDays::Linear,
+        trend_blend_lambda: TrendBlendLambda::default(), min_forecast_expectancy: 0.0,
     }
 }
 
@@ -544,6 +545,7 @@ fn scalar_matrix_from_setups(
                 no_data_count: aggregate.no_data_count,
                 price_change_filtered_count: filtered,
                 mean_risk_expectancy: None,
+                forecast_risk_expectancy: None,
             });
         }
     }

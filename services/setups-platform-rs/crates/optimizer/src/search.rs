@@ -524,6 +524,7 @@ fn make_best(
         trial_index: trial,
         trend_mode: spec.trend_mode,
         trend_bend_days: if spec.trend_mode.is_mean() { TrendBendDays::Linear } else { spec.trend_bend_days },
+        trend_blend_lambda: if spec.trend_mode == TrendMode::Blend { spec.trend_blend_lambda } else { TrendBlendLambda::default() },
         provenance: Provenance {
             optimizer_version: if continuous {
                 CONTINUOUS_OPTIMIZER_VERSION
@@ -941,7 +942,8 @@ fn run_engine(
             let improves = evaluation
                 .summary
                 .score
-                .is_some_and(|score| best.as_ref().is_none_or(|old| score > old.score));
+                .is_some_and(|score| (continuous.is_some() || spec.trend_mode.is_mean() || score > spec.min_forecast_expectancy)
+                    && best.as_ref().is_none_or(|old| score > old.score));
             let incumbent = if improves {
                 best = Some(make_best(
                     spec,
@@ -1303,6 +1305,7 @@ fn decode_checkpoint(
         if !best.score.is_finite()
             || best.trend_mode != spec.trend_mode
             || (!spec.trend_mode.is_mean() && best.trend_bend_days != spec.trend_bend_days)
+            || (spec.trend_mode == TrendMode::Blend && best.trend_blend_lambda != spec.trend_blend_lambda)
             || best.mean_score != (!spec.trend_mode.is_mean()).then(|| score_period_mean(&best.matrix, spec.min_closed_per_cell)).flatten()
             || best.trial_index >= state.submitted
             || !finite_summary(&best.support)
@@ -1327,6 +1330,9 @@ fn decode_checkpoint(
                     || cell.risk_expectancy.is_some_and(|v| !v.is_finite())
                     || cell.avg_move_pct.is_some_and(|v| !v.is_finite())
                     || cell.mean_risk_expectancy.is_some_and(|v| !v.is_finite())
+                    || cell.forecast_risk_expectancy.is_some_and(|v| !v.is_finite())
+                    || ((spec.trend_mode == TrendMode::Blend) != cell.forecast_risk_expectancy.is_some())
+                    || (spec.trend_mode == TrendMode::Blend && cell.risk_expectancy != cell.mean_risk_expectancy.zip(cell.forecast_risk_expectancy).map(|(mean,forecast)|spec.trend_blend_lambda.combine(mean,forecast)))
                     || (spec.trend_mode.is_mean() == cell.mean_risk_expectancy.is_some())
             })
             || score_matrix(&best.matrix, spec.min_closed_per_cell) != Some(best.score)
