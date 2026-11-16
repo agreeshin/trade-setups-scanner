@@ -140,7 +140,8 @@ it("shows retained Segmented live panels and keeps fixed controls independent wh
   expect(first.getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual([
     "Live-сканирование с гибкими параметрами", "Live-сканирование с постоянными параметрами",
   ]);
-  expect(first.getByRole("separator")).toHaveClass("my-4");
+  expect(first.getAllByRole("separator")).toHaveLength(2);
+  for (const divider of first.getAllByRole("separator")) expect(divider).toHaveClass("my-4");
   const flexible = within(first.getByRole("region", { name: "Live-сканирование с гибкими параметрами" }));
   expect(flexible.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" })).toBeDisabled();
   expect(flexible.getByRole("button", { name: "Сохранить разрешение адаптивного live" })).toBeDisabled();
@@ -690,6 +691,10 @@ it("keeps shared discovery fast for a hidden algorithm's running process between
     return original(path, init);
   }));
   render(<AlgorithmsPage />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  fireEvent.click(screen.getByRole("tab", { name: "Второй алгоритм" }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  fireEvent.click(screen.getByRole("tab", { name: "Новый алгоритм" }));
   await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   expect(screen.getByRole("tab", { name: "Новый алгоритм" })).toHaveAttribute("aria-selected", "true");
   fireEvent.click(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));

@@ -73,12 +73,17 @@ it("changes a continuous observer idle → running between children → stopping
 it.each([
   { status: "error" as const, error: { code: "source_unavailable", message: "Retry pending" } },
   { desiredRunning: true }, { activeStudyId: 17 },
-  { slots: [{ ...emptySlot, pendingGenerationId: 8, pendingStatus: "warming" }] },
-  { slots: [{ ...emptySlot, pendingGenerationId: 8, pendingStatus: "ready" }] },
 ])("keeps three-second observation for known retry/desired/pending work: %j", async (patch) => {
   processes.first = { ...emptyProcess(), ...patch };
   renderHook(() => useContinuousStudy("first"));
   await tick(); await tick(3000); expect(continuousReads()).toBe(2);
+});
+
+it.each(["warming", "ready"])("does not accelerate stopped research because an independent profile is %s", async (pendingStatus) => {
+  processes.first = { ...emptyProcess(), slots: [{ ...emptySlot, pendingGenerationId: 8, pendingStatus }] };
+  renderHook(() => useContinuousStudy("first"));
+  await tick(); await tick(3000); expect(continuousReads()).toBe(1);
+  await tick(12000); expect(continuousReads()).toBe(2);
 });
 
 it("pauses both observers on hidden document/inactive route, refreshes immediately on return, and releases timers", async () => {

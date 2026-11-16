@@ -3,7 +3,9 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { ContinuousConfig, ContinuousProcess, ContinuousSlot } from "../lib/continuous-api";
 import { applyInterfaceSettings, formatUnix } from "../lib/datetime-format";
-import { ContinuousResearch } from "./continuous-study";
+import { AdaptiveProfiles, ContinuousControls, ContinuousResearch as ResearchSummary } from "./continuous-study";
+import type { AdaptiveProfile } from "../lib/adaptive-profiles-api";
+import type { AdaptiveProfilesController } from "./use-adaptive-profiles";
 import type { ContinuousController } from "./use-continuous-study";
 import { summarizeOptimizationStudy, type OptimizationSpec, type OptimizationStudy } from "../lib/optimization-api";
 import { AlgorithmsPage } from "./algorithms-page";
@@ -21,9 +23,25 @@ let unavailable: boolean;
 let draftStatus: number;
 let drafts: Record<string, unknown>;
 let renameStatus: number;
+let permission: boolean | null;
+let standaloneProfiles: AdaptiveProfile[] | null;
+function asProfile(slot: ContinuousSlot): AdaptiveProfile {
+  return { ...slot, algorithmId: "future", controlRevision: 1, acceptedGenerationId: slot.finalizedGenerationId ?? slot.pendingGenerationId ?? slot.activeGenerationId ?? 1,
+    desiredRunning: slot.status !== "stopped", activeStatus: slot.activeStatus ?? (slot.activeGenerationId === null ? "inactive" : "active"), pendingGenerationId: slot.pendingGenerationId ?? null,
+    direction: "short", adaptiveEnabled: true, blockingReason: null, error: null, pendingAttempts: 0, attemptLimit: 3, initializationStatus: "active", inResearchQueue: true };
+}
+function profileFixture(controller: ContinuousController): AdaptiveProfilesController {
+  return { page: { profiles: controller.process?.slots.filter((slot) => slot.studyId !== null || slot.activeGenerationId !== null || slot.pendingGenerationId != null).map((slot) => ({ ...asProfile(slot), activeStatus: slot.activeStatus, pendingGenerationId: slot.pendingGenerationId })) ?? [], total: controller.process?.slots.length ?? 0, offset: 0, limit: 50,
+    limits: { totalProfiles: 50, runningProfiles: 30 }, blockedHandoffs: [] }, permission: true, available: controller.available, loading: false, error: null, rowErrors: {}, busy: {}, permissionBusy: false,
+    offset: 0, setOffset: vi.fn(), refresh: vi.fn(), command: vi.fn(), savePermission: vi.fn() } as AdaptiveProfilesController;
+}
+// Compose the same independent surfaces for the retained badge/popup regression matrix.
+function ContinuousResearch({ algorithm, controller }: { algorithm: Algorithm; controller: ContinuousController }) {
+  return <><ContinuousControls algorithm={algorithm} controller={controller} /><AdaptiveProfiles algorithm={algorithm} controller={profileFixture(controller)} research={controller} /><ResearchSummary controller={controller} /></>;
+}
 const requests: { path: string; method: string; body: unknown }[] = [];
 beforeEach(() => {
-  process = null; studies = []; unavailable = false; draftStatus = 200; drafts = {}; renameStatus = 200; requests.length = 0;
+  process = null; studies = []; unavailable = false; draftStatus = 200; drafts = {}; renameStatus = 200; requests.length = 0; permission = null; standaloneProfiles = null;
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : null;
@@ -42,6 +60,14 @@ beforeEach(() => {
       return json({ algorithmId: id, value: drafts[id] ?? null });
     }
     if (path.startsWith("/v1/continuous-studies?")) return unavailable ? json({}, 404) : json({ processes: process ? [process] : [] });
+    if (path.startsWith("/v1/adaptive-profiles?")) {
+      const profiles = standaloneProfiles ?? (process?.slots.filter((slot) => slot.activeGenerationId !== null || slot.pendingGenerationId != null).map(asProfile) ?? []);
+      return json({ profiles, total: profiles.length, offset: 0, limit: 50, limits: { totalProfiles: 50, runningProfiles: 30 }, blockedHandoffs: [] });
+    }
+    if (path === "/v1/adaptive-live/future/permission") {
+      if (method === "PUT") { permission = (body as { enabled: boolean }).enabled; if (process?.config) process = { ...process, config: { ...process.config, adaptiveEnabled: permission } }; }
+      return json({ algorithmId: "future", enabled: permission ?? process?.config?.adaptiveEnabled ?? false });
+    }
     if (path === "/v1/continuous-studies/future" && method === "PUT") {
       const config = body as ContinuousConfig;
       if (process?.config && JSON.stringify({ ...process.config, adaptiveEnabled: false }) === JSON.stringify({ ...config, adaptiveEnabled: false })) {
@@ -54,7 +80,8 @@ beforeEach(() => {
       return json(process);
     }
     if (path.endsWith("/future/start") && process) { process = { ...process, status: "running", phase: "queued" }; return json(process, 202); }
-    if (path.endsWith("/future/stop") && process) { process = { ...process, status: "stopping", phase: "cleanup", slots: process.slots.map((slot) => ({ ...slot, activeGenerationId: null, status: "stopped" })) }; return json(process, 202); }
+    if (path.endsWith("/future/stop") && process) { process = { ...process, status: "stopping", phase: "cleanup" }; return json(process, 202); }
+    if (path.endsWith("/future/recovery/retry") && process) { process = { ...process, status: "running", error: null }; return json(process, 202); }
     if (path.startsWith("/v1/optimization-studies?")) {
       const query = new URL(path, "http://localhost").searchParams;
       const limit = Number(query.get("limit")); const offset = Number(query.get("offset"));
@@ -129,7 +156,7 @@ function profileController(patch: Partial<ContinuousSlot> = {}, processPatch: Pa
         runningStudyId: null, finalizedGenerationId: 8, activeStudyId: 41, pendingStudyId: null, meanExpectancy: 0.21,
         selectedCell: { tpPct: 14, slPct: 4, rawR: 0.32, meanR: 0.21, robustScore: 0.01 }, updatedAt: "2026-11-12T12:00:00Z", ...patch }], ...processPatch },
     available: true, loading: false, error: null, busy: null, revision: 0,
-    refresh: vi.fn(), save: vi.fn(() => Promise.resolve(true)), start: vi.fn(() => Promise.resolve(true)), stop: vi.fn(() => Promise.resolve(true)),
+    refresh: vi.fn(), save: vi.fn(() => Promise.resolve(true)), start: vi.fn(() => Promise.resolve(true)), stop: vi.fn(() => Promise.resolve(true)), retryRecovery: vi.fn(() => Promise.resolve(true)),
     ...controllerPatch,
   };
   return controller;
@@ -145,7 +172,7 @@ it("labels the accepted winner from saved forecast fields even when the edited c
   expect(screen.getByText(/TP 14% \/ SL 4% · -0.30 R/)).toBeInTheDocument();
 });
 function liveButton() {
-  const row = within(screen.getByRole("table", { name: "Настроенные адаптивные профили · Мой алгоритм" })).getAllByRole("row")[1]!;
+  const row = within(screen.getByRole("table", { name: "Адаптивные профили · Мой алгоритм" })).getAllByRole("row")[1]!;
   return within(within(row).getAllByRole("cell")[2]!).getByRole("button");
 }
 function liveDetails() {
@@ -287,14 +314,14 @@ it.each([{ lambda: 0.7, shares: "30/70" }, { lambda: 0.6, shares: "40/60" }, { l
 });
 it("omits the mode when the saved matrix mean is missing", () => {
   render(profileView({ meanExpectancy: null, trendMode: "blend", trendBlendLambda: 0.6 }));
-  const row = within(screen.getByRole("table", { name: "Настроенные адаптивные профили · Мой алгоритм" })).getAllByRole("row")[1]!;
+  const row = within(screen.getByRole("table", { name: "Адаптивные профили · Мой алгоритм" })).getAllByRole("row")[1]!;
   expect(within(row).getAllByRole("cell")[4]).toHaveTextContent(/^—$/);
 });
 const exhaustedRecovery: Partial<ContinuousProcess> = { status: "error", activeStudyId: 42,
   error: { code: "durable_resume_retry_exhausted", message: "Исчерпан бюджет восстановления." } };
 const recoveryLabel = "Повторить восстановление исследования";
 
-it("explicitly retries an exhausted same-study recovery via Start POST, never Stop, maintenance Resume or a configuration write", async () => {
+it("explicitly retries an exhausted same-study recovery via its distinct recovery POST, never Stop, maintenance Resume or a configuration write", async () => {
   process = profileController({ activeStatus: "active" }, exhaustedRecovery).process;
   const initialConfig = process?.config;
   render(<AlgorithmsPage />);
@@ -307,7 +334,7 @@ it("explicitly retries an exhausted same-study recovery via Start POST, never St
   expect(requests.filter((request) => request.method !== "GET")).toHaveLength(0);
   await userEvent.click(retry);
   await waitFor(() => expect(requests.filter((request) => request.method !== "GET")).toEqual([
-    { path: "/v1/continuous-studies/future/start", method: "POST", body: null },
+    { path: "/v1/continuous-studies/future/recovery/retry", method: "POST", body: null },
   ]));
   expect(process?.activeStudyId).toBe(42);
   expect(process?.slots[0]?.activeGenerationId).toBe(7);
@@ -402,13 +429,13 @@ it("updates readiness as waiting instruments join the same generation without in
   expect(screen.queryByText(/Готовы \d+ из/)).not.toBeInTheDocument();
   expect(requests).toHaveLength(0);
 });
-it("labels configured profiles separately from research history and marks cleared results without deleting the slot", () => {
+it("does not turn a configured empty research slot into a standalone live profile", () => {
   render(profileView({ status: "stopped", activeGenerationId: null, activeStatus: "inactive", studyId: null, finalizedGenerationId: null, meanExpectancy: null, selectedCell: null,
     pendingGenerationId: null, pendingStatus: null, readinessFrontier: null, pendingError: null, liveWatermark: null }));
-  expect(screen.getByRole("heading", { name: "Настроенные адаптивные профили" })).toBeInTheDocument();
-  const table = within(screen.getByRole("table", { name: "Настроенные адаптивные профили · Мой алгоритм" }));
-  expect(table.getAllByRole("row")).toHaveLength(2);
-  expect(table.getByText("Результатов нет")).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Адаптивные профили" })).toBeInTheDocument();
+  const table = within(screen.getByRole("table", { name: "Адаптивные профили · Мой алгоритм" }));
+  expect(table.getAllByRole("row")).toHaveLength(1);
+  expect(screen.getByText(/Принятых адаптивных профилей пока нет/)).toBeInTheDocument();
   expect(table.getByRole("columnheader", { name: "Изменение состояния профиля" })).toBeInTheDocument();
   expect(screen.queryByText(/не дата исследования/)).not.toBeInTheDocument();
   fireEvent.mouseEnter(screen.getByRole("button", { name: "О настроенных адаптивных профилях" }));
@@ -418,7 +445,7 @@ it("labels configured profiles separately from research history and marks cleare
 it("keeps finalized and incumbent provenance while new research starts, completes only its search, and fails downstream", () => {
   const saved = { finalizedGenerationId: 8, studyId: 42, activeStudyId: 41, activeStatus: "active" as const,
     pendingGenerationId: 8, pendingStudyId: 42, pendingStatus: "warming" };
-  const view = render(profileView({ ...saved, runningStudyId: 43, status: "acquiring" }));
+  const view = render(<ContinuousResearch algorithm={algorithm} controller={profileController(saved, { activeStudyId: 43, phase: "acquiring" })} />);
   const research = () => within(screen.getByRole("cell", { name: /Сохранённое исследование #42/ }));
   const unchanged = () => {
     expect(research().getByText("Сохранённое исследование #42")).toBeInTheDocument();
@@ -428,30 +455,30 @@ it("keeps finalized and incumbent provenance while new research starts, complete
     expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Исследование кандидата #42");
     expect(screen.getByText("SHORT · TP 14% / SL 4% · 0.32 R")).toBeInTheDocument();
   };
-  expect(research().getByText("Идёт исследование #43")).toBeInTheDocument(); unchanged();
-  view.rerender(profileView({ ...saved, runningStudyId: 43, status: "analytics" }));
-  expect(research().getByText("Идёт исследование #43")).toBeInTheDocument(); unchanged();
-  view.rerender(profileView({ ...saved, runningStudyId: null, status: "error" }));
-  expect(screen.queryByText("Идёт исследование #43")).not.toBeInTheDocument(); unchanged();
+  expect(screen.getByRole("region", { name: "Непрерывные исследования" })).toHaveTextContent("Исследование #43"); unchanged();
+  view.rerender(<ContinuousResearch algorithm={algorithm} controller={profileController(saved, { activeStudyId: 43, phase: "analytics" })} />);
+  expect(screen.getByRole("region", { name: "Непрерывные исследования" })).toHaveTextContent("Исследование #43"); unchanged();
+  view.rerender(<ContinuousResearch algorithm={algorithm} controller={profileController(saved, { status: "error", activeStudyId: null })} />);
+  expect(screen.getByRole("region", { name: "Непрерывные исследования" })).not.toHaveTextContent("Исследование #43"); unchanged();
   expect(requests).toHaveLength(0);
 });
-it("does not call an unfinalized first research or an ambiguous legacy binding a saved result", () => {
-  const view = render(profileView({ runningStudyId: 26, finalizedGenerationId: null, studyId: null,
+it("never uses unfinalized or legacy research slots as a fallback for the independent profiles endpoint", async () => {
+  process = profileController({ runningStudyId: 26, finalizedGenerationId: null, studyId: null,
     activeGenerationId: null, activeStudyId: null, pendingGenerationId: null, pendingStatus: null,
-    meanExpectancy: null, selectedCell: null, status: "acquiring" }));
-  expect(screen.getByText("Идёт исследование #26")).toBeInTheDocument();
+    meanExpectancy: null, selectedCell: null, status: "acquiring" }, { activeStudyId: 26 }).process;
+  standaloneProfiles = [];
+  render(<AlgorithmsPage />);
+  await screen.findByText(/Принятых адаптивных профилей пока нет/);
+  expect(screen.getByRole("region", { name: "Непрерывные исследования" })).toHaveTextContent("Исследование #26");
   expect(screen.queryByText("Сохранённое исследование #26")).not.toBeInTheDocument();
-  const legacy = profileController({ studyId: 26 });
-  if (!legacy.process?.slots[0]) throw new Error("Expected legacy slot");
-  delete legacy.process.slots[0].finalizedGenerationId;
-  delete legacy.process.slots[0].runningStudyId;
-  view.rerender(<ContinuousResearch algorithm={algorithm} controller={legacy} />);
-  expect(screen.getByText("Происхождение сохранённого результата неизвестно (старый API)")).toBeInTheDocument();
+  process = profileController({ studyId: 26 }).process;
+  await userEvent.click(screen.getByRole("button", { name: "Обновить статус непрерывного процесса" }));
+  expect(screen.getByRole("table", { name: "Адаптивные профили · Мой алгоритм" })).not.toHaveTextContent("#26");
   expect(screen.queryByText("Сохранённое исследование #26")).not.toBeInTheDocument();
 });
 it("separates successful research, incumbent live and the warming candidate without relabelling its study as the incumbent", () => {
   render(profileView({ activeStatus: "active", pendingGenerationId: 8, pendingStatus: "warming", readinessFrontier: null, pendingError: null, liveWatermark: closedBoundary }));
-  const table = within(screen.getByRole("table", { name: "Настроенные адаптивные профили · Мой алгоритм" }));
+  const table = within(screen.getByRole("table", { name: "Адаптивные профили · Мой алгоритм" }));
   const incumbent = table.getByRole("cell", { name: /Действующее поколение #7/ });
   const candidate = table.getByRole("cell", { name: /Кандидат #8/ });
   expect(table.getByText("Исследование принято")).toBeInTheDocument();
@@ -762,6 +789,7 @@ it("keeps an accepted profile visible through technical failure, allows common S
     slots: [{ id: 1, minSetupsPerDay: 4, status: "error", activeGenerationId: 7, studyId: 42, meanExpectancy: 0.21, selectedCell: { tpPct: 14, slPct: 4, rawR: 0.32, meanR: 0.21, robustScore: 0.01 }, updatedAt: "2026-11-12T12:00:00Z" }] };
   studies = [study(42, "continuous", "completed")];
   await userEvent.click(screen.getByRole("button", { name: "Обновить статус непрерывного процесса" }));
+  await userEvent.click(screen.getByRole("button", { name: "Обновить статус адаптивных профилей" }));
   await screen.findByText("Адаптивный live разрешён · принято профилей: 1.");
   liveDetails();
   expect(screen.getByText("Принятое поколение сохранено")).toBeInTheDocument();
@@ -769,8 +797,9 @@ it("keeps an accepted profile visible through technical failure, allows common S
   await screen.findByRole("button", { name: "Результат исследования 42" });
   await userEvent.click(screen.getByRole("button", { name: "Остановить непрерывное исследование" }));
   await screen.findByText("Останавливается");
-  expect(screen.queryByText("Принятое поколение сохранено")).not.toBeInTheDocument();
-  expect(screen.queryByText("SHORT · TP 14% / SL 4% · 0.32 R")).not.toBeInTheDocument();
+  liveDetails();
+  expect(screen.getByText("Принятое поколение сохранено")).toBeInTheDocument();
+  expect(screen.getByText("SHORT · TP 14% / SL 4% · 0.32 R")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Результат исследования 42" })).toBeInTheDocument();
   expect(requests.some((request) => request.method === "DELETE")).toBe(false);
 });
@@ -788,13 +817,15 @@ it("changes only live permission during running research without revision change
   ] };
   const before = process;
   await userEvent.click(screen.getByRole("button", { name: "Обновить статус непрерывного процесса" }));
+  await userEvent.click(screen.getByRole("button", { name: "Обновить статус адаптивных профилей" }));
   await screen.findByText("Адаптивный live разрешён · принято профилей: 1.");
   await userEvent.click(screen.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" }));
   await userEvent.click(screen.getByRole("button", { name: "Сохранить разрешение адаптивного live" }));
   await screen.findByText("Разрешение адаптивного live сохранено.");
   expect(process).toEqual({ ...before, config: { ...before.config, adaptiveEnabled: false } });
   expect(process?.configRevision).toBe(1);
-  expect(requests.filter((request) => request.path === "/v1/continuous-studies/future" && request.method === "PUT").at(-1)?.body).toEqual({ ...before.config, adaptiveEnabled: false });
+  expect(requests.filter((request) => request.path === "/v1/adaptive-live/future/permission" && request.method === "PUT").at(-1)?.body).toEqual({ enabled: false });
+  expect(requests.filter((request) => request.path === "/v1/continuous-studies/future" && request.method === "PUT")).toHaveLength(1);
   expect(requests.filter((request) => request.method === "POST").map((request) => request.path)).toEqual(["/v1/continuous-studies/future/start"]);
   expect(screen.getByText("Непрерывное исследование включено")).toBeInTheDocument();
   liveDetails();

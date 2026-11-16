@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
-import { RefreshCw, Settings, Square } from "lucide-react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Play, RefreshCw, Settings, Square } from "lucide-react";
+import type { AdaptiveProfilesController } from "./use-adaptive-profiles";
+import type { AdaptiveProfile } from "../lib/adaptive-profiles-api";
 import { Alert } from "../components/ui/alert";
 import { Badge, type BadgeVariant } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -25,7 +27,6 @@ import { applyOptimizationDraftScope, createOptimizationDraft, restoreOptimizati
 
 const statuses = { stopped: "Остановлено", running: "Непрерывное исследование включено", stopping: "Останавливается", error: "Ошибка непрерывного исследования" };
 const phases: Record<string, string> = { queued: "Ожидание очереди", idle: "Ожидание следующего исследования", research: "Исследование", acquiring: "Подготовка снимка", replay: "Служебный replay", analytics: "Аналитика сохранённого набора", cleanup: "Очистка незавершённых данных" };
-const slotStatuses: Record<string, string> = { idle: "Ожидает исследования", active: "Исследование принято", warming: "Исследование принято", inactive: "Профиль неактивен", pending: "Ожидает исследования", running: "Подготовка поколения", researching: "Исследование", error: "Техническая ошибка", failed: "Техническая ошибка", nonpass: "Допуск не пройден", rejected: "Допуск не пройден", no_winner: "Нет оценимого победителя", stopped: "Остановлен" };
 const pendingStatuses: Record<string, string> = { warming: "Инициализация live по текущим данным", ready: "Готов к переключению · ещё не действует", error: "Ошибка инициализации live" };
 const closedTime = (time: number) => `${formatUnix(time)} (${effectiveTimezone()})`;
 const waitingReasonLabels: Record<string, string> = {
@@ -68,6 +69,7 @@ function SlotReadiness({ slot, invalid }: { slot: ContinuousSlot; invalid: boole
 function liveStatus(slot: ContinuousSlot): { label: string; variant: BadgeVariant } {
   if (["error", "failed"].includes(slot.status) || slot.pendingStatus === "error" || slot.pendingError != null || slot.activeStatus === "error") return { label: "Ошибка", variant: "danger" };
   if (slot.activeGenerationId !== null && slot.activeStatus === "active") return { label: "Активно", variant: "success" };
+  if (slot.status === "stopping") return { label: "Останавливается", variant: "warning" };
   if (slot.status === "stopped") return { label: "Остановлен", variant: "warning" };
   if (slot.pendingStatus === "warming" || slot.status === "warming") return { label: "Идёт инициализация", variant: "warning" };
   if (slot.pendingStatus != null || slot.pendingGenerationId != null) return { label: "Ожидает", variant: "warning" };
@@ -77,11 +79,11 @@ function liveStatus(slot: ContinuousSlot): { label: string; variant: BadgeVarian
   return { label: "Нет действующего поколения", variant: "warning" };
 }
 
-function liveProblems(slot: ContinuousSlot, process: ContinuousProcess, available: boolean, invalidCounts: boolean): string[] {
+function liveProblems(slot: ContinuousSlot, process: Pick<ContinuousProcess, "status" | "error"> | null, available: boolean, invalidCounts: boolean): string[] {
   // Render-local, at most seven bounded descriptions; no diagnostic history is retained.
   const problems: string[] = [];
   if (!available) problems.push("Актуальность снимка не подтверждена. Показано последнее известное состояние live.");
-  if (process.status === "error" || process.error !== null) problems.push(`Ошибка непрерывного процесса (status=${process.status}): ${pendingErrorMessage(process.error) ?? "Описание ошибки не передано."}`);
+  if (process && (process.status === "error" || process.error !== null)) problems.push(`Ошибка непрерывного процесса (status=${process.status}): ${pendingErrorMessage(process.error) ?? "Описание ошибки не передано."}`);
   if (["error", "failed"].includes(slot.status)) problems.push(`Техническая ошибка профиля (status=${slot.status}).`);
   if (slot.activeStatus === "error") problems.push("Ошибка действующего live (activeStatus=error).");
   if (slot.pendingStatus === "error" || slot.pendingError != null) problems.push(`Ошибка инициализации live${slot.pendingStatus === "error" ? " (pendingStatus=error)" : ""}: ${pendingErrorMessage(slot.pendingError) ?? "Описание ошибки не передано."}`);
@@ -91,7 +93,7 @@ function liveProblems(slot: ContinuousSlot, process: ContinuousProcess, availabl
   return problems;
 }
 
-function SlotIncumbent({ slot, process, available }: { slot: ContinuousSlot; process: ContinuousProcess; available: boolean }) {
+function SlotIncumbent({ slot, process, available }: { slot: ContinuousSlot; process: Pick<ContinuousProcess, "status" | "error"> | null; available: boolean }) {
   const absent = slot.activeGenerationId === null;
   const status = liveStatus(slot);
   const invalidCounts = invalidReadinessCounts(slot.liveReadinessSummary);
@@ -140,19 +142,10 @@ function SlotPending({ slot }: { slot: ContinuousSlot }) {
   </div>;
 }
 
-function hasNoProfileResults(slot: ContinuousSlot): boolean {
-  return slot.studyId === null && slot.activeGenerationId === null && slot.pendingGenerationId == null
-    && slot.meanExpectancy === null && slot.selectedCell === null && slot.pendingStatus == null
-    && slot.pendingError == null && slot.readinessFrontier == null && slot.liveWatermark == null;
-}
-
 function SlotResearch({ slot }: { slot: ContinuousSlot }) {
   return <div className="grid gap-1 text-xs">
-    <Badge>{slotStatuses[slot.status] ?? phases[slot.status] ?? slot.status}</Badge>
-    {slot.runningStudyId != null && <span>Идёт исследование #{slot.runningStudyId}</span>}
-    <span>{slot.finalizedGenerationId === undefined ? "Происхождение сохранённого результата неизвестно (старый API)"
-      : slot.studyId === null ? hasNoProfileResults(slot) ? "Результатов нет" : "Полностью завершённых исследований нет"
-      : `Сохранённое исследование #${slot.studyId}`}</span>
+    <Badge>Исследование принято</Badge>
+    <span>{slot.studyId === null ? "Исследование принятой версии неизвестно" : `Сохранённое исследование #${slot.studyId}`}</span>
     {slot.finalizedGenerationId != null && <span>Полностью завершённое поколение #{slot.finalizedGenerationId}</span>}
   </div>;
 }
@@ -165,22 +158,64 @@ function SlotMatrixMean({ slot }: { slot: ContinuousSlot }) {
   return <>{`${slot.meanExpectancy.toFixed(2)} R`}{marker != null && <span className="text-xs text-muted-foreground">{` · ${marker}`}</span>}</>;
 }
 
-export function AdaptiveLive({ controller }: { controller: ContinuousController }) {
-  const savedPermission = controller.process?.config?.adaptiveEnabled ?? false;
+export function AdaptiveLive({ controller }: { controller: AdaptiveProfilesController }) {
+  const savedPermission = controller.permission ?? false;
   const [draft, setDraft] = useState<boolean | null>(null);
   const [saved, setSaved] = useState(false);
   const enabled = draft ?? savedPermission;
-  const accepted = controller.process?.slots.filter((slot) => slot.activeGenerationId !== null).length ?? 0;
+  const accepted = controller.page?.profiles.filter((profile) => profile.activeStatus === "active").length ?? 0;
   return <div className="grid gap-3">
-    <div className="flex items-center gap-2"><label className="flex items-center gap-2 text-sm"><Checkbox checked={enabled} disabled={!controller.available || controller.busy !== null} onCheckedChange={(checked) => { setDraft(checked === true); setSaved(false); }} />Разрешить адаптивное live-сканирование</label>
+    <div className="flex items-center gap-2"><label className="flex items-center gap-2 text-sm"><Checkbox checked={enabled} disabled={!controller.available || controller.permissionBusy} onCheckedChange={(checked) => { setDraft(checked === true); setSaved(false); }} />Разрешить адаптивное live-сканирование</label>
     <InfoNote>Отдельное разрешение; исследование не включает live автоматически. Постоянные параметры не меняются. Готовность данных и общий выключатель live проверяются отдельно.</InfoNote></div>
     <p role="status" className="text-sm">{!controller.available ? "Состояние адаптивного live не подтверждено." : !savedPermission ? "Адаптивный live не разрешён." : accepted === 0 ? "Адаптивный live разрешён · действующих профилей нет, ожидается инициализация." : `Адаптивный live разрешён · принято профилей: ${accepted}.`}</p>
-    <div><Button type="button" variant="outline" disabled={!controller.available || !controller.process?.config || controller.busy !== null || enabled === savedPermission} onClick={() => {
-      const config = controller.process?.config;
-      if (config) void controller.save({ ...config, adaptiveEnabled: enabled }).then((ok) => { if (ok) { setDraft(null); setSaved(true); } });
+    <div><Button type="button" variant="outline" disabled={!controller.available || controller.permissionBusy || enabled === savedPermission} onClick={() => {
+      void controller.savePermission(enabled).then((ok) => { if (ok) { setDraft(null); setSaved(true); } });
     }}>Сохранить разрешение адаптивного live</Button></div>
-    {controller.available && !controller.process?.config && <p className="text-xs text-muted-foreground">Сначала сохраните настройки непрерывного исследования в разделе «Оптимизации».</p>}
     {saved && <p role="status" className="text-sm">Разрешение адаптивного live сохранено.</p>}
+  </div>;
+}
+
+export function AdaptiveProfiles({ algorithm, controller, research, children }: { algorithm: Algorithm; controller: AdaptiveProfilesController; research?: ContinuousController; children?: ReactNode }) {
+  const profiles = controller.page?.profiles ?? [];
+  return <div className="grid min-w-0 gap-3">
+    <div className="flex items-center gap-2"><h5 className="font-semibold">Адаптивные профили</h5><InfoNote label="О настроенных адаптивных профилях">Исследование принято — это готовность рекомендаций, а не live. Кандидат инициализируется независимо, без повторной проверки исторического результата. Сохранённое исследование относится к последнему полностью завершённому поколению после replay, аналитики и gate. Дата ниже — изменение состояния профиля, не дата исследования. Stop исследования и удаление порога из очереди сохраняют самостоятельный профиль.</InfoNote></div>
+    {children}
+    {controller.loading && <Spinner label="Проверка самостоятельных профилей" />}
+    {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
+    {!controller.available && controller.page && <p className="text-sm">Показан последний подтверждённый снимок профилей; актуальность не подтверждена.</p>}
+    <div><IconButton label="Обновить статус адаптивных профилей" icon={RefreshCw} onClick={controller.refresh} /></div>
+    {controller.page && <>
+      <div className="overflow-x-auto"><Table aria-label={`Адаптивные профили · ${algorithmDisplayName(algorithm)}`}>
+        <TableHeader><TableRow>{["Минимум сетапов в день", "Принятый результат", "Принятое поколение / live", "Кандидат / инициализация live", "Среднее матрицы", "Рекомендация", "Изменение состояния профиля", "Управление профилем"].map((title) => <TableHead key={title}>{title}</TableHead>)}</TableRow></TableHeader>
+        <TableBody>{profiles.map((profile) => <TableRow key={profile.id}>
+          <TableCell>{profile.minSetupsPerDay === 0 ? "0 · без частотного допуска" : profile.minSetupsPerDay}{!profile.inResearchQueue && <p className="text-xs text-muted-foreground">Вне исследовательской очереди</p>}</TableCell>
+          <TableCell><SlotResearch slot={{ ...profile, finalizedGenerationId: profile.acceptedGenerationId, runningStudyId: null }} /></TableCell>
+          <TableCell><SlotIncumbent slot={profile} process={research?.process ?? null} available={controller.available} /></TableCell>
+          <TableCell><SlotPending slot={profile} /></TableCell>
+          <TableCell><SlotMatrixMean slot={profile} /></TableCell>
+          <TableCell>{profile.activeGenerationId !== null && profile.selectedCell ? <>{`${profile.direction?.toUpperCase() ?? ""} · TP ${profile.selectedCell.tpPct}% / SL ${profile.selectedCell.slPct}% · ${profile.selectedCell.rawR.toFixed(2)} R`}{profile.selectedCell.forecastR !== undefined && <p className="text-xs">Выбор по прогнозу: {profile.selectedCell.forecastR.toFixed(2)} R · score матрицы {profile.selectedCell.forecastMatrixR?.toFixed(2) ?? "—"} R</p>}</> : "Нет пригодного результата"}</TableCell>
+          <TableCell>{profile.updatedAt ? formatIsoDateTime(profile.updatedAt) : "—"}</TableCell>
+          <TableCell><ProfileControl profile={profile} controller={controller} /></TableCell>
+        </TableRow>)}</TableBody>
+      </Table></div>
+      {profiles.length === 0 && <p className="text-sm text-muted-foreground">Принятых адаптивных профилей пока нет. Настройка исследования сама по себе профиль не создаёт.</p>}
+      <p className="text-xs text-muted-foreground">Всего профилей: {controller.page.total} · квоты: всего {controller.page.limits.totalProfiles}, active/warming {controller.page.limits.runningProfiles}.</p>
+      {(controller.page.total > 50 || controller.offset > 0) && <div className="flex gap-2"><Button type="button" variant="outline" disabled={controller.offset === 0 || !controller.available} onClick={() => controller.setOffset(Math.max(0, controller.offset - 50))}>Предыдущие профили</Button><Button type="button" variant="outline" disabled={controller.offset + 50 >= controller.page.total || !controller.available} onClick={() => controller.setOffset(controller.offset + 50)}>Следующие профили</Button></div>}
+      {controller.page.blockedHandoffs.map((handoff) => <Alert key={handoff.generationId} variant="destructive" role="alert">Результат поколения #{handoff.generationId} сохранён, профиль не допущен: {pendingErrorMessage(handoff.error)}</Alert>)}
+    </>}
+  </div>;
+}
+function ProfileControl({ profile, controller }: { profile: AdaptiveProfile; controller: AdaptiveProfilesController }) {
+  const action = profile.desiredRunning ? "stop" : "play";
+  const blocked = profile.blockingReason !== null && action === "play";
+  const label = `${action === "stop" ? "Остановить" : "Запустить"} адаптивный профиль ${profile.id}`;
+  return <div className="grid gap-1" aria-busy={controller.busy[profile.id] !== undefined}>
+    <IconButton label={label} icon={action === "stop" ? Square : Play} disabled={!controller.available || controller.busy[profile.id] !== undefined || profile.status === "stopping" || blocked} onClick={() => { void controller.command(profile, action); }} />
+    {profile.desiredRunning && profile.initializationStatus === "exhausted" && <IconButton label={`Повторить запуск адаптивного профиля ${profile.id}`} icon={Play} disabled={!controller.available || controller.busy[profile.id] !== undefined || profile.status === "stopping" || profile.blockingReason !== null} onClick={() => { void controller.command(profile, "play"); }} />}
+    {profile.status === "stopping" && <span className="text-xs">Останавливается · ожидаем drain</span>}
+    {profile.initializationStatus === "exhausted" && <span className="text-xs">Попытки исчерпаны: {profile.pendingAttempts}/{profile.attemptLimit}. Play выдаст ещё 3.</span>}
+    {profile.blockingReason && <span className="text-xs">{profile.blockingReason === "global_live_disabled" ? "Общий live выключен" : profile.blockingReason === "adaptive_permission_disabled" ? "Адаптивный live не разрешён" : profile.blockingReason.slice(0, 120)}</span>}
+    {controller.rowErrors[profile.id] && <Alert variant="destructive" role="alert">{controller.rowErrors[profile.id]}</Alert>}
   </div>;
 }
 
@@ -259,15 +294,11 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
   </form>;
 }
 
-export function ContinuousResearch({ algorithm, controller }: { algorithm: Algorithm; controller: ContinuousController }) {
-  const [open, setOpen] = useState(false);
+export function ContinuousResearch({ controller }: { algorithm?: Algorithm; controller: ContinuousController }) {
   const process = controller.process;
-  const recoveryExhausted = process?.status === "error" && process.error?.code === "durable_resume_retry_exhausted"
-    && process.config !== null && process.activeStudyId !== null;
   return <section aria-label="Непрерывные исследования" className="grid min-w-0 gap-3">
-    <div className="flex items-center gap-2"><h5 className="font-semibold">Настроенные адаптивные профили</h5>
-      {process && <InfoNote label="О настроенных адаптивных профилях"><span className="grid gap-2"><span>Исследование принято — это готовность рекомендаций, а не live. Кандидат независимо инициализируется по текущим закрытым свечам, без повторной проверки исторического результата. Сохранённое исследование относится к последнему полностью завершённому поколению после replay, аналитики и gate; идущее исследование показано отдельно. При сохранённом принятом поколении среднее и рекомендация относятся к его собственному исследованию. Новые рекомендации поступят после следующего полного исследования слота. Новое поколение действует после watermark закрытой минуты.</span><span>Это настроенные пороги, а не история исследований. Очистка сохраняет их настройки. Дата ниже — изменение состояния профиля, включая сброс при очистке, а не дата исследования.</span></span></InfoNote>}
-    <InfoNote label="Об остановке и расчёте доходности"><span className="grid gap-2"><span>Остановка общая для алгоритма: деактивирует его адаптивные профили. После drain очищаются только незавершённые дочерние данные; завершённая история и постоянный live сохраняются.</span><span>R рассчитан только по наблюдавшимся закрытым TP/SL-сделкам. Правый край последних N суток может быть незрелым: будущие входы, незакрытые сделки и пропуски не подменяются нулевой доходностью или SL. Частота eligible-входов и доходность — разные показатели.</span></span></InfoNote></div>
+    <div className="flex items-center gap-2"><h4 className="font-semibold">Непрерывные исследования</h4>
+      <InfoNote label="Об остановке и расчёте доходности">Stop отменяет только исследовательскую цепочку и очищает её незавершённые данные после drain. Профили и завершённая история сохраняются. Следующий Start создаёт новое исследование; техническое восстановление — отдельное действие. R рассчитан только по наблюдавшимся закрытым TP/SL-сделкам, без вымышленных нулей или SL на правом краю.</InfoNote></div>
     {controller.loading && <Spinner label="Проверка непрерывного процесса" />}
     {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
     {!controller.available && process && <p className="text-sm">Показан последний подтверждённый снимок; актуальность не подтверждена.</p>}
@@ -275,28 +306,28 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
     {process && <>
       <p className="text-sm">Ревизия конфигурации: {process.configRevision}{process.activeStudyId !== null ? ` · Исследование #${process.activeStudyId}` : ""}{process.phase ? ` · ${phases[process.phase] ?? process.phase}` : ""}</p>
       {process.error && <Alert variant="destructive">{process.error.code}: {process.error.message}. Технический сбой не означает непрохождение допуска; прежний принятый профиль может сохраняться.</Alert>}
-      <div className="overflow-x-auto"><Table aria-label={`Настроенные адаптивные профили · ${algorithmDisplayName(algorithm)}`}>
-        <TableHeader><TableRow>{["Минимум сетапов в день", "Исследование / допуск", "Принятое поколение / live", "Кандидат / инициализация live", "Среднее матрицы", "Рекомендация", "Изменение состояния профиля"].map((title) => <TableHead key={title}>{title}</TableHead>)}</TableRow></TableHeader>
-        <TableBody>{process.slots.map((slot) => <TableRow key={slot.id}>
-          <TableCell>{slot.minSetupsPerDay === 0 ? "0 · без частотного допуска" : slot.minSetupsPerDay}</TableCell>
-          <TableCell><SlotResearch slot={slot} /></TableCell>
-          <TableCell><SlotIncumbent slot={slot} process={process} available={controller.available} /></TableCell>
-          <TableCell><SlotPending slot={slot} /></TableCell>
-          <TableCell><SlotMatrixMean slot={slot} /></TableCell>
-          <TableCell>{slot.activeGenerationId !== null && slot.selectedCell ? <>{`${process.config?.study.direction.toUpperCase() ?? ""} · TP ${slot.selectedCell.tpPct}% / SL ${slot.selectedCell.slPct}% · ${slot.selectedCell.rawR.toFixed(2)} R`}{slot.selectedCell.forecastR !== undefined && <p className="text-xs">Выбор по прогнозу: {slot.selectedCell.forecastR.toFixed(2)} R · score матрицы {slot.selectedCell.forecastMatrixR?.toFixed(2) ?? "—"} R</p>}</> : "Нет пригодного результата"}</TableCell>
-          <TableCell>{slot.updatedAt ? formatIsoDateTime(slot.updatedAt) : "—"}</TableCell>
-        </TableRow>)}</TableBody>
-      </Table></div>
-      {process.slots.length === 0 && <p className="text-sm text-muted-foreground">Настроенных профилей пока нет. Включённое исследование не означает готовый live.</p>}
+      {process.config && <p className="text-sm">Очередь порогов: {process.config.minSetupsPerDay.join(", ")} · последние {process.config.lookbackDays} суток. Изменение очереди не удаляет адаптивные профили.</p>}
     </>}
-    <div className="flex flex-wrap gap-2">
-      <IconButton label="Обновить статус непрерывного процесса" icon={RefreshCw} onClick={controller.refresh} disabled={controller.busy !== null} />
-      <IconButton label="Настроить непрерывное исследование" icon={Settings} onClick={() => setOpen(true)} disabled={!controller.available || controller.busy !== null} />
-      {process && process.status !== "stopped" ? <IconButton label={process.status === "stopping" ? "Остановка запрошена · ожидаем drain" : "Остановить непрерывное исследование"} icon={Square} disabled={!controller.available || controller.busy !== null || process.status === "stopping"} onClick={() => { void controller.stop(); }} />
-        : <Button type="button" disabled={!controller.available || !process?.config || controller.busy !== null} onClick={() => { void controller.start(); }}>Запустить непрерывное исследование</Button>}
-      {recoveryExhausted && <Button type="button" variant="outline" disabled={!controller.available || controller.busy !== null} onClick={() => { void controller.start(); }}>Повторить восстановление исследования</Button>}
+  </section>;
+}
+
+/** Shared control block above the table. Commands here affect research only. */
+export function ContinuousControls({ algorithm, controller, children }: { algorithm: Algorithm; controller: ContinuousController; children?: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const process = controller.process;
+  const recoveryExhausted = process?.status === "error" && process.error?.code === "durable_resume_retry_exhausted"
+    && process.config !== null && process.activeStudyId !== null;
+  return <section aria-label="Управление непрерывным исследованием" className="grid min-w-0 gap-3">
+    <div className="flex flex-wrap items-center gap-3">
+      <span className="text-sm font-medium">Исследование</span>
+      <IconButton className="size-14 [&_svg]:size-6" label="Обновить статус непрерывного процесса" icon={RefreshCw} onClick={controller.refresh} disabled={controller.busy !== null} />
+      <IconButton className="size-14 [&_svg]:size-6" label="Настроить непрерывное исследование" icon={Settings} onClick={() => setOpen(true)} disabled={!controller.available || controller.busy !== null} />
+      {process && process.status !== "stopped" ? <IconButton className="size-14 [&_svg]:size-6" label={process.status === "stopping" ? "Остановка запрошена · ожидаем drain" : "Остановить непрерывное исследование"} icon={Square} disabled={!controller.available || controller.busy !== null || process.status === "stopping"} onClick={() => { void controller.stop(); }} />
+        : <IconButton className="size-14 [&_svg]:size-6" label="Запустить непрерывное исследование" icon={Play} disabled={!controller.available || !process?.config || controller.busy !== null} onClick={() => { void controller.start(); }} />}
+      {recoveryExhausted && <Button type="button" variant="outline" disabled={!controller.available || controller.busy !== null} onClick={() => { void controller.retryRecovery(); }}>Повторить восстановление исследования</Button>}
+      {children}
     </div>
-    {recoveryExhausted && <InfoNote label="О повторе восстановления">Повтор восстановления сохраняет тот же ID исследования, сохранённый вход и исходный абсолютный дедлайн, без нового окна. Эта явная команда Start сбрасывает бюджет попыток; возобновление допуска обслуживания его не сбрасывает.</InfoNote>}
+    {recoveryExhausted && <InfoNote label="О повторе восстановления">Повтор восстановления сохраняет тот же ID исследования, сохранённый вход и исходный абсолютный дедлайн, без нового окна. Отдельная команда recovery/retry разрешает повтор технического восстановления; возобновление допуска обслуживания его не сбрасывает. Start после Stop создаёт новое исследование.</InfoNote>}
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="max-w-4xl">
         <DialogHeader><div className="flex items-center gap-2"><DialogTitle>Непрерывное исследование · {algorithmDisplayName(algorithm)}</DialogTitle><InfoNote>Сохранение не запускает исследование и не включает live. Сервер фиксирует последние N суток при фактическом старте, без lag; вся цепочка использует один период и снимок. Включённая кластеризация выбирает только первый сетап.</InfoNote></div><DialogDescription>Метаданные и домены как в ручной оптимизации. Даты и зрелость первого сетапа фиксирует сервер.</DialogDescription></DialogHeader>

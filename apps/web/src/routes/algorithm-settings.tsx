@@ -17,7 +17,8 @@ import { AlgorithmOptimizer, OptimizationStudyDialog } from "./algorithm-optimiz
 import { OptimizationDeleteDialog, OptimizationHistory } from "./optimization-history";
 import { useOptimizationStudies, type OptimizationController } from "./use-optimization-studies";
 import { useContinuousStudy } from "./use-continuous-study";
-import { AdaptiveLive, ContinuousResearch } from "./continuous-study";
+import { useAdaptiveProfiles } from "./use-adaptive-profiles";
+import { AdaptiveLive, AdaptiveProfiles, ContinuousControls, ContinuousResearch } from "./continuous-study";
 import { ContinuousHistoryCleanup } from "./continuous-history-cleanup";
 
 const groups = [
@@ -27,17 +28,18 @@ const groups = [
 ];
 
 type SavedAlgorithm = Partial<Pick<Algorithm, "enabled" | "externalName">> & { adaptiveEnabled?: boolean };
-function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuousRevision, cleanupRevision }: { algorithm: Algorithm; optimization: OptimizationController; onSaved: (id: string, patch: SavedAlgorithm) => void; onActivity: (id: string, active: boolean) => void; continuousRevision: number; cleanupRevision: number }) {
-  const continuous = useContinuousStudy(algorithm.id, continuousRevision);
+function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuousRevision, cleanupRevision, selected, onCleanup, refreshStates }: { algorithm: Algorithm; optimization: OptimizationController; onSaved: (id: string, patch: SavedAlgorithm) => void; onActivity: (id: string, active: boolean) => void; continuousRevision: number; cleanupRevision: number; selected: boolean; onCleanup: () => void; refreshStates: () => void }) {
+  const [liveMode, setLiveMode] = useState("flexible");
+  const continuous = useContinuousStudy(algorithm.id, continuousRevision, selected && liveMode === "flexible");
+  const profiles = useAdaptiveProfiles(algorithm.id, selected && liveMode === "flexible", continuousRevision);
   const displayName = algorithmDisplayName(algorithm);
   const [externalName, setExternalName] = useState(displayName);
   const [nameBusy, setNameBusy] = useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
   const [nameSaved, setNameSaved] = useState(false);
   const nameRequest = useRef(false);
-  const [liveMode, setLiveMode] = useState("flexible");
   const { refresh: refreshOptimization } = optimization;
-  const adaptiveSaved = continuous.available ? continuous.process?.config?.adaptiveEnabled ?? false : undefined;
+  const adaptiveSaved = profiles.available ? profiles.permission ?? undefined : undefined;
   const continuousActive = isContinuousWorkActive(continuous.process);
   useEffect(() => { onActivity(algorithm.id, continuousActive); }, [algorithm.id, continuousActive, onActivity]);
   useEffect(() => { if (adaptiveSaved !== undefined) onSaved(algorithm.id, { adaptiveEnabled: adaptiveSaved }); }, [adaptiveSaved, algorithm.id, onSaved]);
@@ -145,14 +147,21 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     </section></div>
     <div role="tabpanel" id={`${optimizerTriggerId}-panel-flexible`} aria-labelledby={`${optimizerTriggerId}-tab-flexible`} hidden={liveMode !== "flexible"} tabIndex={0} className="grid min-w-0 gap-4">
     <section aria-labelledby={`${optimizerTriggerId}-flexible`} className="grid min-w-0 gap-3">
-      <h4 id={`${optimizerTriggerId}-flexible`} className="font-semibold">Live-сканирование с гибкими параметрами</h4>
-      <AdaptiveLive controller={continuous} />
+      <div className="flex flex-wrap items-center gap-2"><h4 id={`${optimizerTriggerId}-flexible`} className="font-semibold">Live-сканирование с гибкими параметрами</h4>
+        <InfoNote label="О самостоятельных адаптивных профилях">Профиль появляется только после полного принятого исследования. Stop/Play каждой строки не управляет исследованием. Research Stop и изменение очереди сохраняют профили, их рекомендации и историю. Кандидат инициализируется независимо, без повторной проверки исторического результата. Дата профиля — изменение состояния, не дата исследования.</InfoNote></div>
+      <AdaptiveLive controller={profiles} />
+      <AdaptiveProfiles algorithm={optimizerAlgorithm} controller={profiles} research={continuous}>
+      <ContinuousControls algorithm={optimizerAlgorithm} controller={continuous}>
+        {selected && <ContinuousHistoryCleanup disabled={optimization.creating || optimization.cancelling !== null || optimization.deleting !== null} onRefreshStates={refreshStates} onDeleted={onCleanup} />}
+      </ContinuousControls>
+      </AdaptiveProfiles>
     </section>
     <Separator />
+    <ContinuousResearch controller={continuous} />
+    <Separator />
     <section aria-labelledby={`${optimizerTriggerId}-optimizations`} className="grid min-w-0 gap-4">
-    <h4 id={`${optimizerTriggerId}-optimizations`} className="font-semibold">Оптимизации</h4>
+    <h4 id={`${optimizerTriggerId}-optimizations`} className="font-semibold">Ручные оптимизации</h4>
     {optimization.error && <Alert variant="destructive" role="alert">{optimization.error}<Button type="button" variant="outline" onClick={optimization.refresh}>Обновить статус оптимизации</Button></Alert>}
-    <ContinuousResearch algorithm={optimizerAlgorithm} controller={continuous} />
     <OptimizationHistory algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} pageSize={5} pagination={false} onSelect={selectHistory} onDelete={requestDelete} actions={<div className="flex flex-wrap gap-2">
       <Button id={optimizerTriggerId} type="button" variant="outline" aria-label={`Запустить новую оптимизацию ${displayName}`} onClick={() => { setHistoryOpen(false); setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setOptimizationOpen(true); }}>Запустить новую оптимизацию</Button>
       <Button id={historyTriggerId} type="button" variant="outline" onClick={() => { setOptimizationOpen(false); setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setHistoryOpen(true); }}>Посмотреть весь список</Button>
@@ -200,10 +209,9 @@ function AlgorithmForms({ algorithms }: { algorithms: Algorithm[] }) {
     ...(hasEnabledLiveMode({ enabled: saved[algorithm.id]?.enabled ?? algorithm.enabled, adaptiveEnabled: saved[algorithm.id]?.adaptiveEnabled ?? false }) ? { status: "Live-сканирование включено" } : {}),
   }));
   return <>
-    <ContinuousHistoryCleanup disabled={optimization.creating || optimization.cancelling !== null || optimization.deleting !== null} onRefreshStates={refreshStates} onDeleted={() => { refreshStates(); setCleanupRevision((value) => value + 1); }} />
     <PageSidebar label="Алгоритмы" items={items} value={selected} onValueChange={setSelected}>
     {displayAlgorithms.map((algorithm) => <PageSidebarPanel key={algorithm.id} value={algorithm.id}>
-      <AlgorithmForm algorithm={algorithm} optimization={optimization} onSaved={onSaved} onActivity={onActivity} continuousRevision={continuousRevision} cleanupRevision={cleanupRevision} />
+      <AlgorithmForm algorithm={algorithm} optimization={optimization} onSaved={onSaved} onActivity={onActivity} continuousRevision={continuousRevision} cleanupRevision={cleanupRevision} selected={selected === algorithm.id} refreshStates={refreshStates} onCleanup={() => { refreshStates(); setCleanupRevision((value) => value + 1); }} />
     </PageSidebarPanel>)}
     {algorithms.length === 0 && <p className="text-sm text-muted-foreground">Алгоритмов пока нет.</p>}
   </PageSidebar></>;

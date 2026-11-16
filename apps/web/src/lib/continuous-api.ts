@@ -80,11 +80,9 @@ export interface ContinuousProcess {
   slots: ContinuousSlot[];
 }
 
-/** Research/replacement work, not the mere existence of a retained live profile. */
+/** Research work only: profile replacement/readiness has its own observer. */
 export function isContinuousWorkActive(process: ContinuousProcess | null): boolean {
-  return process !== null && (process.desiredRunning === true || process.status !== "stopped" || process.activeStudyId !== null
-    || process.slots.some((slot) => slot.pendingGenerationId != null || slot.pendingStatus != null
-      || ["running", "researching", "warming"].includes(slot.status)));
+  return process !== null && (process.desiredRunning === true || process.status !== "stopped" || process.activeStudyId !== null);
 }
 
 export class ContinuousApiError extends Error {
@@ -171,3 +169,4 @@ export const getContinuousStudy = (algorithmId: string, signal: AbortSignal): Pr
 export const saveContinuousStudy = (algorithmId: string, config: ContinuousConfig, signal: AbortSignal): Promise<ContinuousProcess> => processRequest(algorithmId, signal, "PUT", config);
 export const startContinuousStudy = (algorithmId: string, signal: AbortSignal): Promise<ContinuousProcess> => processRequest(algorithmId, signal, "POST", undefined, "/start");
 export const stopContinuousStudy = (algorithmId: string, signal: AbortSignal): Promise<ContinuousProcess> => processRequest(algorithmId, signal, "POST", undefined, "/stop");
+export const retryContinuousRecovery = (algorithmId: string, signal: AbortSignal): Promise<ContinuousProcess> => processRequest(algorithmId, signal, "POST", undefined, "/recovery/retry");
