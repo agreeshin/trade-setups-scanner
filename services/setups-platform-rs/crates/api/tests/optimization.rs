@@ -723,12 +723,14 @@ async fn frequency_gate_legacy_running_and_completed_records_remain_raw() {
                     &json!({
                         "id":before.id,"status":before.status,"spec":before.spec,
                         "progress":before.progress,"error":before.error,
-                        "createdAt":before.created_at,"updatedAt":before.updated_at,"bestScore":1.0,
+                        "createdAt":before.created_at,"updatedAt":before.updated_at,"bestScore":1.0,"forecastBest":null,
                         "origin":"manual","ownerId":"admin","continuousGenerationId":null,"continuousSlotId":null
                     })
                 );
             } else {
-                assert_eq!(record, &json!(before));
+                let mut expected = json!(before);
+                expected["forecastBest"] = Value::Null;
+                assert_eq!(record, &expected);
             }
             assert_eq!(record["spec"], legacy_spec);
             assert!(record["spec"].get("minSetupsPerDay").is_none());
@@ -808,7 +810,7 @@ async fn history_list_is_paginated_filtered_ordered_and_compact() {
         [active, drop, failed, cancelled, completed]
     );
     for summary in summaries {
-        assert_eq!(summary.as_object().unwrap().len(), 12);
+        assert_eq!(summary.as_object().unwrap().len(), 13);
         for field in [
             "id",
             "status",
@@ -818,6 +820,7 @@ async fn history_list_is_paginated_filtered_ordered_and_compact() {
             "createdAt",
             "updatedAt",
             "bestScore",
+            "forecastBest",
         ] {
             assert!(summary.get(field).is_some(), "{field}");
         }
@@ -911,6 +914,56 @@ async fn history_list_is_paginated_filtered_ordered_and_compact() {
     let page = db::list(&db.pool, None, 100, 0).await.unwrap();
     assert!(page.studies[0].best_score.is_none());
     db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn forecast_best_summary_and_detail_project_the_same_frozen_pair_without_writes() {
+    let database = TestDb::new().await;
+    let router = app(database.pool.clone(), OptimizationConfig::default());
+    let cell = |forecast, mean, tp| json!({"tpPct":tp,"slPct":4,"riskExpectancy":99,
+        "meanRiskExpectancy":mean,"forecastRiskExpectancy":forecast});
+    let cases = [
+        (json!({"trendMode":"blend"}), json!({"trendMode":"blend","score":99,"matrix":[cell(0.3,9.0,4),cell(0.30001,-0.7,6)]}),
+            json!({"forecastR":0.30001,"meanR":-0.7,"tpPct":6.0,"slPct":4.0})),
+        (json!({}), json!({"score":1,"trendMode":"forecast","matrix":[{"tpPct":4,"slPct":6,"riskExpectancy":0.5,"meanRiskExpectancy":-0.3}]}),
+            json!({"forecastR":0.5,"meanR":-0.3,"tpPct":4.0,"slPct":6.0})),
+        (json!({"trendMode":"forecast"}), json!({"score":1,"matrix":[{"tpPct":4,"slPct":6,"riskExpectancy":0,"meanRiskExpectancy":-0.3}]}),
+            json!({"forecastR":0.0,"meanR":-0.3,"tpPct":4.0,"slPct":6.0})),
+        (json!({}), json!({"score":1,"matrix":[cell(-0.8,2.0,4),cell(-0.2,-3.0,6),cell(-0.2,7.0,8)]}),
+            json!({"forecastR":-0.2,"meanR":-3.0,"tpPct":6.0,"slPct":4.0})),
+        (json!({}), json!({"score":1,"matrix":[{"tpPct":4,"slPct":4,"riskExpectancy":1}]}), Value::Null),
+        (json!({"trendMode":"forecast"}), json!({"score":1,"trendMode":"mean","matrix":[{"tpPct":4,"slPct":4,"riskExpectancy":1,"meanRiskExpectancy":1}]}), Value::Null),
+        (json!({"trendMode":"blend"}), json!({"score":1,"matrix":[{"tpPct":4,"slPct":4,"riskExpectancy":1,"meanRiskExpectancy":1}]}), Value::Null),
+        (json!({}), json!({"score":1,"trendMode":"forecast","matrix":[{"tpPct":4,"slPct":4,"riskExpectancy":1,"meanRiskExpectancy":1,"forecastRiskExpectancy":null}]}), Value::Null),
+        (json!({}), json!({"score":1,"matrix":[{"tpPct":4,"slPct":4,"forecastRiskExpectancy":1}]}), Value::Null),
+        (json!({}), json!({"score":1,"matrix":[]}), Value::Null),
+        (json!({}), json!({"score":1,"matrix":null}), Value::Null),
+        (json!({}), Value::Null, Value::Null),
+    ];
+    for (index, (settings, best, expected)) in cases.into_iter().enumerate() {
+        let mut saved_spec = spec();
+        saved_spec.as_object_mut().unwrap().extend(settings.as_object().unwrap().clone());
+        let saved_result = json!({"best":best});
+        let id: i64 = sqlx::query_scalar("insert into optimization_studies (algorithm_id,status,spec,progress,result,origin) values ('price_volume_spike',$1,$2,$3,$4,$5) returning id")
+            .bind(if index % 2 == 0 { "completed" } else { "cancelled" })
+            .bind(&saved_spec).bind(json!({"bestScore":88})).bind(&saved_result)
+            .bind(if index % 2 == 0 { "manual" } else { "continuous" })
+            .fetch_one(&database.pool).await.unwrap();
+        let before = db::get(&database.pool, id).await.unwrap().unwrap();
+        let (status, detail) = request(&router,"GET",&format!("/v1/optimization-studies/{id}"),Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["forecastBest"], expected, "detail case {index}");
+        assert_eq!(detail["result"], saved_result);
+        let (status, page) = request(&router,"GET","/v1/optimization-studies?limit=1",Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["studies"][0]["id"], id);
+        assert_eq!(page["studies"][0]["forecastBest"], expected, "summary case {index}");
+        assert!(page["studies"][0].get("result").is_none());
+        assert!(page["studies"][0].get("events").is_none());
+        assert_eq!(json!(db::get(&database.pool,id).await.unwrap().unwrap()), json!(before));
+    }
+    database.cleanup().await;
 }
 
 async fn adjacent_history_snapshot(pool: &PgPool) -> Value {

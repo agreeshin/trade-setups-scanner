@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use setups_db::optimization::{self as db, Admission, StudyRecord};
 use setups_domain::{
@@ -94,7 +94,15 @@ fn response(status: StatusCode, body: Value) -> Response {
 }
 
 fn record_response(status: StatusCode, record: StudyRecord) -> Response {
-    (status, [("cache-control", "no-store")], Json(record)).into_response()
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StudyResponse {
+        #[serde(flatten)]
+        record: StudyRecord,
+        forecast_best: Option<db::ForecastBestPair>,
+    }
+    let forecast_best = db::forecast_best_pair(record.result.as_ref(), &record.spec);
+    (status, [("cache-control", "no-store")], Json(StudyResponse { record, forecast_best })).into_response()
 }
 
 fn internal_error(operation: &str, error: impl std::fmt::Display) -> Response {

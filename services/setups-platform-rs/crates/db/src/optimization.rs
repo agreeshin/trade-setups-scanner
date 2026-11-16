@@ -97,6 +97,49 @@ pub async fn get(pool: &PgPool, id: i64) -> Result<Option<StudyRecord>, DbError>
         .transpose()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForecastBestPair {
+    pub forecast_r: f64,
+    pub mean_r: f64,
+    pub tp_pct: f64,
+    pub sl_pct: f64,
+}
+
+fn forecast_mode<'a>(best: &'a Value, spec: &'a Value) -> Option<&'a str> {
+    // Only persisted inputs belong to this result; never use a current config.
+    best.get("trendMode").or_else(|| spec.get("trendMode"))?.as_str()
+}
+
+fn forecast_pair(cell: &Value, mode: Option<&str>) -> Option<ForecastBestPair> {
+    let finite = |value: &Value| value.as_f64().filter(|value| value.is_finite());
+    let forecast = match cell.get("forecastRiskExpectancy") {
+        Some(value) => value,
+        None if mode == Some("forecast") => cell.get("riskExpectancy")?,
+        None => return None,
+    };
+    let pair = ForecastBestPair {
+        forecast_r: finite(forecast)?,
+        mean_r: finite(cell.get("meanRiskExpectancy")?)?,
+        tp_pct: finite(cell.get("tpPct")?)?,
+        sl_pct: finite(cell.get("slPct")?)?,
+    };
+    (pair.tp_pct > 0.0 && pair.tp_pct <= 100.0 && pair.sl_pct > 0.0 && pair.sl_pct <= 100.0)
+        .then_some(pair)
+}
+
+/// Read-only projection of the frozen winner, not a new optimization or fit.
+/// O(matrix) time, O(1) scratch; ties keep the first persisted cell.
+pub fn forecast_best_pair(result: Option<&Value>, spec: &Value) -> Option<ForecastBestPair> {
+    let best = result?.get("best")?;
+    let mode = forecast_mode(best, spec);
+    best.get("matrix")?.as_array()?.iter().filter_map(|cell| forecast_pair(cell, mode))
+        .fold(None::<ForecastBestPair>, |winner, pair| match winner {
+            Some(current) if current.forecast_r >= pair.forecast_r => Some(current),
+            _ => Some(pair),
+        })
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StudySummary {
@@ -108,6 +151,7 @@ pub struct StudySummary {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub best_score: Option<f64>,
+    pub forecast_best: Option<ForecastBestPair>,
     pub origin: String,
     pub owner_id: String,
     pub continuous_generation_id: Option<i64>,
@@ -141,14 +185,33 @@ pub async fn list(
     .bind(algorithm)
     .fetch_one(&mut *tx)
     .await?;
-    // Extract only the scalar winner score in PostgreSQL. Never transfer or
-    // retain full result matrices/events for a history page (at most 100 rows).
+    // Page BEFORE inspecting matrices. PostgreSQL returns at most one cell per
+    // row, never full result matrices/events to API memory (at most 100 rows).
     let rows = sqlx::query(
-        "select id,status,spec,progress,error,created_at,updated_at,origin,owner_id,continuous_generation_id,continuous_slot_id, \
-         (case when status in ('queued','running','cancel_requested') \
-          then progress->>'bestScore' else result#>>'{best,score}' end)::double precision as best_score \
-         from optimization_studies where ($1::text is null or algorithm_id=$1) \
-         order by (status in ('queued','running','cancel_requested')) desc, id desc limit $2 offset $3",
+        "select page.id,page.status,page.spec,page.progress,page.error,page.created_at,page.updated_at, \
+         page.origin,page.owner_id,page.continuous_generation_id,page.continuous_slot_id, \
+         (case when page.status in ('queued','running','cancel_requested') \
+          then page.progress->>'bestScore' else page.result#>>'{best,score}' end)::double precision as best_score, \
+         coalesce(page.result#>'{best,trendMode}',page.spec->'trendMode') as forecast_mode, \
+         winner.cell as best_forecast_cell \
+         from (select * from optimization_studies where ($1::text is null or algorithm_id=$1) \
+          order by (status in ('queued','running','cancel_requested')) desc, id desc limit $2 offset $3) page \
+         left join lateral ( \
+          select entry.cell from jsonb_array_elements(case when jsonb_typeof(page.result#>'{best,matrix}')='array' \
+           then page.result#>'{best,matrix}' else '[]'::jsonb end) with ordinality entry(cell,position) \
+          cross join lateral (select case when entry.cell ? 'forecastRiskExpectancy' then entry.cell->'forecastRiskExpectancy' \
+           when coalesce(page.result#>'{best,trendMode}',page.spec->'trendMode')='\"forecast\"'::jsonb \
+           then entry.cell->'riskExpectancy' end as forecast) metric \
+          where case when jsonb_typeof(metric.forecast)='number' then abs((metric.forecast#>>'{}')::numeric) <= 1.7976931348623157e308 else false end \
+           and case when jsonb_typeof(entry.cell->'meanRiskExpectancy')='number' \
+            then abs((entry.cell->>'meanRiskExpectancy')::numeric) <= 1.7976931348623157e308 else false end \
+           and case when jsonb_typeof(entry.cell->'tpPct')='number' then (entry.cell->>'tpPct')::numeric > 0 \
+            and (entry.cell->>'tpPct')::numeric <= 100 else false end \
+           and case when jsonb_typeof(entry.cell->'slPct')='number' then (entry.cell->>'slPct')::numeric > 0 \
+            and (entry.cell->>'slPct')::numeric <= 100 else false end \
+          order by (metric.forecast#>>'{}')::numeric desc,entry.position limit 1 \
+         ) winner on true \
+         order by (page.status in ('queued','running','cancel_requested')) desc,page.id desc",
     )
     .bind(algorithm)
     .bind(limit)
@@ -159,6 +222,8 @@ pub async fn list(
     let studies = rows
         .into_iter()
         .map(|row| {
+            let cell: Option<Value> = row.try_get("best_forecast_cell")?;
+            let mode: Option<Value> = row.try_get("forecast_mode")?;
             Ok(StudySummary {
                 id: row.try_get("id")?,
                 status: row.try_get("status")?,
@@ -168,6 +233,7 @@ pub async fn list(
                 created_at: row.try_get("created_at")?,
                 updated_at: row.try_get("updated_at")?,
                 best_score: row.try_get("best_score")?,
+                forecast_best: cell.as_ref().and_then(|cell| forecast_pair(cell, mode.as_ref().and_then(Value::as_str))),
                 origin: row.try_get("origin")?,
                 owner_id: row.try_get("owner_id")?,
                 continuous_generation_id: row.try_get("continuous_generation_id")?,
@@ -358,4 +424,68 @@ pub async fn interrupt(pool: &PgPool) -> Result<u64, DbError> {
     .execute(pool)
     .await?
     .rows_affected())
+}
+
+#[cfg(test)]
+mod forecast_tests {
+    use super::*;
+
+    fn cell(forecast: f64, mean: f64, tp: f64) -> Value {
+        json!({"forecastRiskExpectancy":forecast,"meanRiskExpectancy":mean,
+            "riskExpectancy":99,"tpPct":tp,"slPct":4})
+    }
+
+    #[test]
+    fn forecast_best_keeps_mean_and_levels_of_the_maximum_pure_forecast() {
+        let result = json!({"best":{"score":99,"trendMode":"blend","matrix":[
+            cell(0.2, 5.0, 4.0),cell(0.30001, -0.7, 6.0),cell(0.3, 9.0, 8.0)
+        ]}});
+        let before = result.clone();
+        assert_eq!(forecast_best_pair(Some(&result), &json!({})), Some(ForecastBestPair {
+            forecast_r: 0.30001, mean_r: -0.7, tp_pct: 6.0, sl_pct: 4.0,
+        }));
+        assert_eq!(result, before, "projection must not rewrite saved results");
+    }
+
+    #[test]
+    fn forecast_best_handles_negative_zero_and_ties_without_rounding() {
+        for (values, expected, tp) in [
+            (vec![cell(-0.8, 1.0, 4.0), cell(-0.2, -3.0, 6.0)], -0.2, 6.0),
+            (vec![cell(-0.1, 1.0, 4.0), cell(0.0, -3.0, 6.0)], 0.0, 6.0),
+            (vec![cell(0.5, 1.0, 4.0), cell(0.5, -3.0, 6.0)], 0.5, 4.0),
+        ] {
+            let pair = forecast_best_pair(Some(&json!({"best":{"matrix":values}})), &json!({})).unwrap();
+            assert_eq!((pair.forecast_r, pair.tp_pct), (expected, tp));
+        }
+    }
+
+    #[test]
+    fn n6_forecast_uses_frozen_mode_but_never_mistakes_blend_or_mean_for_forecast() {
+        let mut result = json!({"best":{"matrix":[{"riskExpectancy":0.5,
+            "meanRiskExpectancy":-0.3,"tpPct":4,"slPct":6}]}});
+        assert!(forecast_best_pair(Some(&result), &json!({})).is_none());
+        assert!(forecast_best_pair(Some(&result), &json!({"trendMode":"blend"})).is_none());
+        assert_eq!(forecast_best_pair(Some(&result), &json!({"trendMode":"forecast"})).unwrap().forecast_r, 0.5);
+        result["best"]["trendMode"] = json!("mean");
+        assert!(forecast_best_pair(Some(&result), &json!({"trendMode":"forecast"})).is_none());
+        result["best"]["trendMode"] = json!("forecast");
+        assert_eq!(forecast_best_pair(Some(&result), &json!({"trendMode":"mean"})).unwrap().mean_r, -0.3);
+        result["best"]["matrix"][0]["forecastRiskExpectancy"] = Value::Null;
+        assert!(forecast_best_pair(Some(&result), &json!({})).is_none(), "explicit null is not an absent field");
+    }
+
+    #[test]
+    fn legacy_empty_missing_and_incomplete_results_have_no_invented_forecast() {
+        assert!(forecast_best_pair(None, &json!({})).is_none());
+        for result in [Value::Null, json!({"best":null}), json!({"best":{"matrix":[]}}),
+            json!({"best":{"matrix":{}}}), json!({"best":{"matrix":[{"tpPct":4,"slPct":4,"riskExpectancy":9}]}})] {
+            assert!(forecast_best_pair(Some(&result), &json!({})).is_none());
+        }
+        for (field, value) in [("forecastRiskExpectancy", json!("NaN")), ("meanRiskExpectancy", Value::Null),
+            ("meanRiskExpectancy", json!("Infinity")), ("tpPct", json!(0)), ("slPct", json!(101))] {
+            let mut invalid = cell(2.0, 3.0, 4.0);
+            invalid[field] = value;
+            assert!(forecast_best_pair(Some(&json!({"best":{"matrix":[invalid]}})), &json!({})).is_none());
+        }
+    }
 }
