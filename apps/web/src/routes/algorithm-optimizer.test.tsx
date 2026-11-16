@@ -625,7 +625,7 @@ it("shows five inline summaries without pagination and all history in an open pa
   const table = within(await screen.findByRole("table", { name: "Исследования · Новый алгоритм" }));
   await table.findByRole("button", { name: "Результат исследования 30" });
   expect(screen.queryByText("Загрузка истории исследований…")).not.toBeInTheDocument();
-  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Лучший прогноз матожидания", "Действия"]);
+  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучший Score", "Лучший прогноз матожидания", "Действия"]);
   expect(table.getAllByRole("row")).toHaveLength(6);
   const first = within(table.getAllByRole("row")[1]!);
   expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#30", "Ручное", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "Менее 1 мин", "0", "0.00 R", "0.00 R", ""]);

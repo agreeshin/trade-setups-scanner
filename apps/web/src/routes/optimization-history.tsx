@@ -75,7 +75,7 @@ export function OptimizationHistory({ algorithmId, algorithmName, controller, on
     {actions}
     <div className="overflow-x-auto">
       <Table aria-label={`Исследования · ${algorithmName}`} aria-busy={loading}>
-        <TableHeader><TableRow>{["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Лучший прогноз матожидания", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
+        <TableHeader><TableRow>{["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучший Score", "Лучший прогноз матожидания", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
         <TableBody>{page?.studies.map((study) => <TableRow key={study.id}>
           <TableCell><Button id={`${instanceId}-study-${study.id}`} type="button" variant="outline" size="sm" aria-label={`Результат исследования ${study.id}`} onClick={() => onSelect(study.id, `${instanceId}-study-${study.id}`, isContinuousStudy(study))}>#{study.id}</Button></TableCell>
           <TableCell><Badge>{isContinuousStudy(study) ? "Непрерывное" : "Ручное"}</Badge></TableCell>
