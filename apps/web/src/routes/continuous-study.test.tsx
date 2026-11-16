@@ -76,20 +76,44 @@ async function configure() {
   return dialog;
 }
 
-it("saves and restores forecast settings and labels the gate by the selected metric", async () => {
+it("saves and restores forecast settings and separates the forward gate from the mean threshold", async () => {
   render(<AlgorithmsPage />);
   let dialog = await configure();
   expect(dialog.getByLabelText("Перегиб на N дней")).toBeDisabled();
   fireEvent.click(dialog.getByRole("button", { name: "Прогноз по тренду" }));
   fireEvent.change(dialog.getByLabelText("Перегиб на N дней"), { target: { value: "30" } });
-  expect(dialog.getByLabelText("Минимальный средний прогноз матрицы, R")).toHaveValue(0.15);
-  expect(dialog.getByLabelText("Минимальный средний прогноз матрицы, R")).toHaveAccessibleDescription(/строго больше 0/);
+  expect(dialog.getByLabelText("Минимальное среднее матожидание, R")).toHaveValue(0.15);
+  expect(dialog.getByLabelText("Минимальное среднее матожидание, R")).toBeDisabled();
+  expect(dialog.getByLabelText("Минимальное среднее матожидание, R")).toHaveAccessibleDescription(/score > minForecastExpectancy/);
+  expect(dialog.getByLabelText("Минимальный прогноз матрицы, R")).toHaveValue(0);
   fireEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   expect(process?.config?.study).toMatchObject({ trendMode: "forecast", trendBendDays: "30" });
   dialog = await configure();
   expect(dialog.getByRole("button", { name: "Прогноз по тренду" })).toHaveAttribute("aria-pressed", "true");
   expect(dialog.getByLabelText("Перегиб на N дней")).toHaveValue("30");
+  expect(requests.some((request) => request.path.endsWith("/start"))).toBe(false);
+});
+
+it("reopens saved continuous blend settings without a draft and restores the non-default lambda and forward threshold", async () => {
+  process = profileController({}, { status: "stopped" }).process;
+  if (!process?.config) throw new Error("Expected configured process");
+  process.config.study = { ...spec, trendMode: "blend", trendBendDays: "14", trendBlendLambda: 0.6, minForecastExpectancy: 0.25 };
+  render(<AlgorithmsPage />);
+  let dialog = await configure();
+  expect(dialog.getByRole("button", { name: "Смесь среднего и прогноза" })).toHaveAttribute("aria-pressed", "true");
+  expect(dialog.getByLabelText("Доля прогноза λ")).toHaveValue(0.6);
+  expect(dialog.getByLabelText("Минимальный прогноз матрицы, R")).toHaveValue(0.25);
+  expect(dialog.getByLabelText("Минимальное среднее матожидание, R")).toBeDisabled();
+  expect(dialog.getByLabelText("Минимальное среднее матожидание, R")).toHaveAccessibleDescription(/score > minForecastExpectancy/);
+  await userEvent.click(dialog.getByRole("button", { name: "Закрыть" }));
+  drafts = {};
+  dialog = await configure();
+  expect(dialog.getByLabelText("Доля прогноза λ")).toHaveValue(0.6);
+  expect(dialog.getByLabelText("Минимальный прогноз матрицы, R")).toHaveValue(0.25);
+  await userEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(process?.config?.study).toMatchObject({ trendMode: "blend", trendBlendLambda: 0.6, minForecastExpectancy: 0.25 });
   expect(requests.some((request) => request.path.endsWith("/start"))).toBe(false);
 });
 
@@ -239,7 +263,7 @@ it("reports a summary generation mismatch with both identities and leaves the ma
   expect(screen.getByRole("button", { name: /Действующее поколение #7/ }).querySelector('[data-slot="badge"]')).toHaveClass("text-success");
 });
 it.each(["mean", "forecast", null, undefined] as const)("labels the saved matrix mode %s without inferring it from the edited configuration", (trendMode) => {
-  const controller = profileController({ status: "active", activeStatus: "active", ...(trendMode === undefined ? {} : { trendMode }) });
+  const controller = profileController({ status: "active", activeStatus: "active", trendBlendLambda: null, ...(trendMode === undefined ? {} : { trendMode }) });
   if (!controller.process?.config) throw new Error("Expected configured process");
   controller.process.config.study = { ...spec, trendMode: trendMode === "forecast" ? "mean" : "forecast" };
   render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
@@ -249,8 +273,19 @@ it.each(["mean", "forecast", null, undefined] as const)("labels the saved matrix
   if (trendMode) expect(within(cell).getByText(`· ${trendMode}`)).toHaveClass("text-muted-foreground");
   expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
 });
+it.each([{ lambda: 0.7, shares: "30/70" }, { lambda: 0.6, shares: "40/60" }, { lambda: 0.29, shares: "71/29" }, { lambda: 0.95, shares: "5/95" }])("labels the saved blend shares $shares from lambda=$lambda, never the editable config", ({ lambda, shares }) => {
+  const controller = profileController({ status: "active", activeStatus: "active", trendMode: "blend", trendBlendLambda: lambda });
+  if (!controller.process?.config) throw new Error("Expected configured process");
+  controller.process.config.study = { ...spec, trendMode: "blend", trendBlendLambda: 0.8 };
+  render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
+  const cell = screen.getByRole("cell", { name: /^0\.21 R/ });
+  expect(cell.textContent).toBe(`0.21 R · blend · ${shares}`);
+  expect(within(cell).getByText(`· blend · ${shares}`)).toHaveClass("text-muted-foreground");
+  expect(cell.querySelector('[data-slot="badge"]')).toBeNull();
+  expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
+});
 it("omits the mode when the saved matrix mean is missing", () => {
-  render(profileView({ meanExpectancy: null, trendMode: "forecast" }));
+  render(profileView({ meanExpectancy: null, trendMode: "blend", trendBlendLambda: 0.6 }));
   const row = within(screen.getByRole("table", { name: "Настроенные адаптивные профили · Мой алгоритм" })).getAllByRole("row")[1]!;
   expect(within(row).getAllByRole("cell")[4]).toHaveTextContent(/^—$/);
 });

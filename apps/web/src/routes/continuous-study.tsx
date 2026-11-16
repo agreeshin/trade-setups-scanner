@@ -158,6 +158,13 @@ function SlotResearch({ slot }: { slot: ContinuousSlot }) {
 }
 
 
+function SlotMatrixMean({ slot }: { slot: ContinuousSlot }) {
+  if (slot.meanExpectancy === null) return <>—</>;
+  const forecastShare = slot.trendMode === "blend" && slot.trendBlendLambda != null ? Math.round(slot.trendBlendLambda * 100) : null;
+  const marker = forecastShare === null ? slot.trendMode : `blend · ${100 - forecastShare}/${forecastShare}`;
+  return <>{`${slot.meanExpectancy.toFixed(2)} R`}{marker != null && <span className="text-xs text-muted-foreground">{` · ${marker}`}</span>}</>;
+}
+
 export function AdaptiveLive({ controller }: { controller: ContinuousController }) {
   const savedPermission = controller.process?.config?.adaptiveEnabled ?? false;
   const [draft, setDraft] = useState<boolean | null>(null);
@@ -181,7 +188,8 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
   const saved = controller.process?.config;
   const baseline = saved ? { ...algorithm, params: saved.study.algorithmParams } : algorithm;
   const [scope, setScope] = useState<ScopeDraft>(() => saved ? { ...initialScope(), symbols: saved.study.instruments.map((item) => item.symbol).join("\n"), direction: saved.study.direction,
-    horizonMinutes: String(saved.study.horizonMinutes), tpLevels: saved.study.tpLevels.join(", "), slLevels: saved.study.slLevels.join(", "), minClosedPerCell: String(saved.study.minClosedPerCell), seed: String(saved.study.seed), maxTrials: String(saved.study.maxTrials), maxSeconds: String(saved.study.maxSeconds), trendMode: saved.study.trendMode ?? "mean", trendBendDays: saved.study.trendBendDays ?? "linear" } : initialScope());
+    horizonMinutes: String(saved.study.horizonMinutes), tpLevels: saved.study.tpLevels.join(", "), slLevels: saved.study.slLevels.join(", "), minClosedPerCell: String(saved.study.minClosedPerCell), seed: String(saved.study.seed), maxTrials: String(saved.study.maxTrials), maxSeconds: String(saved.study.maxSeconds), trendMode: saved.study.trendMode ?? "mean", trendBendDays: saved.study.trendBendDays ?? "linear",
+    trendBlendLambda: String(saved.study.trendBlendLambda ?? 0.7), minForecastExpectancy: String(saved.study.minForecastExpectancy ?? 0) } : initialScope());
   const [draft, setDraft] = useState<ContinuousDraft>(() => ({ lookbackDays: String(saved?.lookbackDays ?? 30), minSetupsPerDay: (saved?.minSetupsPerDay ?? [4]).join(", "), minMeanExpectancy: String(saved?.minMeanExpectancy ?? 0.15), adaptiveEnabled: saved?.adaptiveEnabled ?? false }));
   const [algorithmDomains, setAlgorithmDomains] = useState(() => saved ? restoreDomains(algorithm.fields, saved.study.algorithmParams, saved.study.algorithmSearch) : initialDomains(algorithm.fields, algorithm.params));
   const [analyticsDomains, setAnalyticsDomains] = useState(() => saved ? restoreDomains(ANALYTICS_SEARCH_FIELDS, { ...saved.study.analyticsParams }, saved.study.analyticsSearch) : initialDomains(ANALYTICS_SEARCH_FIELDS, { ...ANALYTICS_BASELINE }));
@@ -242,7 +250,7 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
       <legend className="mb-2 font-semibold">Период и отдельные пороговые профили</legend>
       <Field label="Последние N дней" hint="От 1 минуты до 3660 суток, в целых секундах; дробные сутки разрешены. Окно фиксируется сервером при старте.">{(control) => <Input {...control} type="number" min={MIN_CONTINUOUS_LOOKBACK_DAYS} max={MAX_CONTINUOUS_LOOKBACK_DAYS} step="any" value={draft.lookbackDays} onChange={(event) => setDraft({ ...draft, lookbackDays: event.target.value })} />}</Field>
       <Field label="Минимум сетапов в день — список профилей" hint="До 64 уникальных значений через запятую; 0 отключает частотный допуск. Не поисковый домен и не обещание числа live-сообщений.">{(control) => <Input {...control} maxLength={8192} value={draft.minSetupsPerDay} onChange={(event) => setDraft({ ...draft, minSetupsPerDay: event.target.value })} />}</Field>
-      <Field label={scope.trendMode === "forecast" ? "Минимальный средний прогноз матрицы, R" : "Минимальное среднее матожидание, R"} hint={scope.trendMode === "forecast" ? "Гейт среднего прогноза всей матрицы: не ниже порога и строго больше 0. По умолчанию 0.15 R. Среднее за период не является этим гейтом." : "Гейт всей неокруглённой матрицы, а не лучшей ячейки. По умолчанию 0.15 R."}>{(control) => <Input {...control} type="number" step="any" value={draft.minMeanExpectancy} onChange={(event) => setDraft({ ...draft, minMeanExpectancy: event.target.value })} />}</Field>
+      <Field label="Минимальное среднее матожидание, R" hint={scope.trendMode === "forecast" || scope.trendMode === "blend" ? "Только для режима mean. Для forecast/blend действует отдельный forward-гейт: score > minForecastExpectancy, default 0. Среднее за период не ограничивает этот гейт." : "Гейт всей неокруглённой mean-матрицы: score >= minMeanExpectancy, не лучшей ячейки. По умолчанию 0.15 R."}>{(control) => <Input {...control} type="number" step="any" disabled={scope.trendMode === "forecast" || scope.trendMode === "blend"} value={draft.minMeanExpectancy} onChange={(event) => setDraft({ ...draft, minMeanExpectancy: event.target.value })} />}</Field>
     </fieldset>
     {!ready && !error && <Spinner label="Загрузка historical-списка" />}
     {(error ?? draftSave.saveError) && <Alert variant="destructive" role="alert">{error ?? draftSave.saveError}{!ready && <Button type="button" variant="outline" onClick={() => setRetry((value) => value + 1)}>Повторить загрузку</Button>}</Alert>}
@@ -274,7 +282,7 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
           <TableCell><SlotResearch slot={slot} /></TableCell>
           <TableCell><SlotIncumbent slot={slot} process={process} available={controller.available} /></TableCell>
           <TableCell><SlotPending slot={slot} /></TableCell>
-          <TableCell>{slot.meanExpectancy === null ? "—" : <>{`${slot.meanExpectancy.toFixed(2)} R`}{slot.trendMode != null && <span className="text-xs text-muted-foreground">{` · ${slot.trendMode}`}</span>}</>}</TableCell>
+          <TableCell><SlotMatrixMean slot={slot} /></TableCell>
           <TableCell>{slot.activeGenerationId !== null && slot.selectedCell ? <>{`${process.config?.study.direction.toUpperCase() ?? ""} · TP ${slot.selectedCell.tpPct}% / SL ${slot.selectedCell.slPct}% · ${slot.selectedCell.rawR.toFixed(2)} R`}{slot.selectedCell.forecastR !== undefined && <p className="text-xs">Выбор по прогнозу: {slot.selectedCell.forecastR.toFixed(2)} R · score матрицы {slot.selectedCell.forecastMatrixR?.toFixed(2) ?? "—"} R</p>}</> : "Нет пригодного результата"}</TableCell>
           <TableCell>{slot.updatedAt ? formatIsoDateTime(slot.updatedAt) : "—"}</TableCell>
         </TableRow>)}</TableBody>
