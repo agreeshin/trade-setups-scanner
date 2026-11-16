@@ -64,6 +64,26 @@ it("defaults legacy form scopes to mean/linear and retains an inactive bend with
   expect(build({ trendBendDays: "7" })).toMatchObject({ trendMode: "mean", trendBendDays: "7" });
 });
 
+it("uses the same fixed blend lambda and forward gate for manual and continuous specs", () => {
+  const selected = { trendMode: "blend" as const, trendBlendLambda: "0.6", minForecastExpectancy: "0.2" };
+  const continuous = buildContinuousConfig(algorithm, { ...scope, ...selected }, catalog,
+    initialDomains(algorithm.fields, algorithm.params), initialDomains(ANALYTICS_SEARCH_FIELDS, { ...ANALYTICS_BASELINE }),
+    { lookbackDays: "30", minSetupsPerDay: "4", minMeanExpectancy: "0.15", adaptiveEnabled: false });
+  for (const result of [build(selected), continuous.study]) {
+    expect(result).toMatchObject({ trendMode: "blend", trendBlendLambda: 0.6, minForecastExpectancy: 0.2 });
+    expect(result.algorithmSearch).not.toHaveProperty("trendBlendLambda");
+    expect(result.analyticsSearch).not.toHaveProperty("minForecastExpectancy");
+  }
+  expect(build({ trendMode: "blend" })).toMatchObject({ trendBlendLambda: 0.7, minForecastExpectancy: 0 });
+  expect(build({ trendMode: "forecast" })).not.toHaveProperty("trendBlendLambda");
+});
+it.each(["0", "1", "0.705", "NaN", "Infinity"])("rejects unsupported blend lambda %s", (trendBlendLambda) => {
+  expect(() => build({ trendMode: "blend", trendBlendLambda })).toThrow("Доля прогноза");
+});
+it.each(["-0.1", "100.1", "NaN", "Infinity", ""])("rejects invalid forward gate %s", (minForecastExpectancy) => {
+  expect(() => build({ minForecastExpectancy })).toThrow("Минимальный прогноз");
+});
+
 it("keeps full baseline, typed dynamic defaults and independent axes", () => {
   expect(build({ tpLevels: "25, 100", slLevels: "0.1, 0.5" })).toMatchObject({
     algorithmParams: algorithm.params, algorithmSearch: { addedDecimal: ["0.25", "1.5"] },

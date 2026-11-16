@@ -1,9 +1,9 @@
-import type { OptimizationAnalytics, OptimizationSpec, OptimizationValue } from "../lib/optimization-api";
+import { isTrendBlendLambda, type OptimizationAnalytics, type OptimizationSpec, type OptimizationValue, type StudyTrendMode } from "../lib/optimization-api";
 import { isContinuousLookbackDays, MAX_CONTINUOUS_THRESHOLDS, type ContinuousConfig, type ContinuousStudySpec } from "../lib/continuous-api";
 import type { Algorithm } from "./platform-controls";
 import { replayRange } from "./platform-controls";
 import type { CatalogInstrument } from "./instrument-picker";
-import type { TrendBendDays, TrendMode } from "../lib/analytics-api";
+import type { TrendBendDays } from "../lib/analytics-api";
 
 export interface SearchField {
   key: string; label: string; type: "decimal" | "integer" | "boolean" | "nullable";
@@ -104,9 +104,10 @@ export interface ScopeDraft {
   from: string; to: string; symbols: string; direction: "short" | "long";
   setupMaturity: string; horizonMinutes: string; tpLevels: string; slLevels: string;
   minClosedPerCell: string; minSetupsPerDay: string; seed: string; maxTrials: string; maxSeconds: string;
-  trendMode?: TrendMode; trendBendDays?: TrendBendDays;
+  trendMode?: StudyTrendMode; trendBendDays?: TrendBendDays;
+  trendBlendLambda?: string; minForecastExpectancy?: string;
 }
-export const initialScope = (): ScopeDraft => ({ from: "", to: "", symbols: "", direction: "short", setupMaturity: "0", horizonMinutes: "10080", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, minClosedPerCell: "1", minSetupsPerDay: "4", seed: "42", maxTrials: "256", maxSeconds: "3600", trendMode: "mean", trendBendDays: "linear" });
+export const initialScope = (): ScopeDraft => ({ from: "", to: "", symbols: "", direction: "short", setupMaturity: "0", horizonMinutes: "10080", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, minClosedPerCell: "1", minSetupsPerDay: "4", seed: "42", maxTrials: "256", maxSeconds: "3600", trendMode: "mean", trendBendDays: "linear", trendBlendLambda: "0.7", minForecastExpectancy: "0" });
 
 export function restoreDomains(fields: SearchField[], baseline: Record<string, OptimizationValue>, search: Record<string, OptimizationValue[]>): DomainDrafts {
   return Object.fromEntries(fields.map((field) => [field.key, {
@@ -118,7 +119,11 @@ export function restoreDomains(fields: SearchField[], baseline: Record<string, O
 function buildStudyParameters(algorithm: Algorithm, scope: ScopeDraft, catalog: CatalogInstrument[], params: DomainDrafts, analytics: DomainDrafts): ContinuousStudySpec {
   const trendMode = scope.trendMode ?? "mean";
   const trendBendDays = scope.trendBendDays ?? "linear";
-  if (!["mean", "forecast"].includes(trendMode) || !["7", "14", "30", "linear"].includes(trendBendDays)) throw new Error("Проверьте тип матожидания и перегиб тренда.");
+  if (!["mean", "forecast", "blend"].includes(trendMode) || !["7", "14", "30", "linear"].includes(trendBendDays)) throw new Error("Проверьте тип матожидания и перегиб тренда.");
+  const trendBlendLambda = Number(scope.trendBlendLambda ?? "0.7");
+  if (trendMode === "blend" && !isTrendBlendLambda(trendBlendLambda)) throw new Error("Доля прогноза λ: 0.05–0.95 с шагом 0.01.");
+  const minForecastExpectancy = nonnegativeDecimalInput(scope.minForecastExpectancy ?? "0", "Минимальный прогноз матрицы");
+  if (minForecastExpectancy > 100) throw new Error("Минимальный прогноз матрицы: от 0 до 100 R.");
   const symbols = [...new Set(scope.symbols.split(/[\s,;]+/).filter(Boolean))];
   if (!symbols.length) throw new Error("Выберите хотя бы один исторический инструмент.");
   const instruments = symbols.map((symbol) => {
@@ -145,6 +150,7 @@ function buildStudyParameters(algorithm: Algorithm, scope: ScopeDraft, catalog: 
     analyticsParams, analyticsSearch,
     instruments, direction: scope.direction,
     trendMode, trendBendDays,
+    ...(trendMode === "blend" ? { trendBlendLambda } : {}), minForecastExpectancy,
     horizonMinutes: integerInput(scope.horizonMinutes, "Горизонт", 1, 43200),
     tpLevels: parseAxis(scope.tpLevels, "TP"), slLevels: parseAxis(scope.slLevels, "SL"),
     minClosedPerCell: integerInput(scope.minClosedPerCell, "Минимум закрытых на ячейку", 1),

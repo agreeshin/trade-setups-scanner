@@ -1,5 +1,9 @@
 import { apiFetch } from "./platform-api";
-import type { TrendBendDays, TrendMode } from "./analytics-api";
+import type { TrendBendDays, TrendMode as AnalyticsTrendMode } from "./analytics-api";
+export type StudyTrendMode = AnalyticsTrendMode | "blend";
+export function isTrendBlendLambda(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0.05 && value <= 0.95 && Math.round(value * 100) / 100 === value;
+}
 
 export type OptimizationValue = string | number | boolean | null;
 export interface OptimizationAnalytics {
@@ -30,8 +34,10 @@ export interface OptimizationSpec {
   maxTrials: number;
   maxSeconds: number;
   /** Absent legacy settings mean period mean / linear. */
-  trendMode?: TrendMode;
+  trendMode?: StudyTrendMode;
   trendBendDays?: TrendBendDays;
+  trendBlendLambda?: number;
+  minForecastExpectancy?: number;
 }
 export interface OptimizationProgress {
   phase: string;
@@ -46,12 +52,14 @@ export interface OptimizationMatrixCell {
   closedCount: number; tpCount: number; slCount: number; unclosedCount: number;
   noDataCount: number; priceChangeFilteredCount: number;
   meanRiskExpectancy?: number | null;
+  forecastRiskExpectancy?: number | null;
 }
 export interface OptimizationBest {
   score: number;
   meanScore?: number | null;
-  trendMode?: TrendMode;
+  trendMode?: StudyTrendMode;
   trendBendDays?: TrendBendDays;
+  trendBlendLambda?: number;
   partial: boolean;
   params: Record<string, string | number>;
   analytics: Omit<OptimizationAnalytics, "clusterGapMinutes"> & { clusterGapMinutes: number | null };

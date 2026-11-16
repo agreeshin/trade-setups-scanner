@@ -14,6 +14,7 @@ interface SharedScopeDraft {
   maxSeconds: string;
   trendMode?: NonNullable<ScopeDraft["trendMode"]>;
   trendBendDays?: NonNullable<ScopeDraft["trendBendDays"]>;
+  trendBlendLambda?: string; minForecastExpectancy?: string;
 }
 
 export interface OptimizationFormDraft {
@@ -84,8 +85,10 @@ export function restoreOptimizationDraft(
     seed: text(storedScope.seed) ?? fallbackScope.seed,
     maxTrials: text(storedScope.maxTrials) ?? fallbackScope.maxTrials,
     maxSeconds: text(storedScope.maxSeconds) ?? fallbackScope.maxSeconds,
-    trendMode: storedScope.trendMode === "forecast" || storedScope.trendMode === "mean" ? storedScope.trendMode : fallbackScope.trendMode ?? "mean",
+    trendMode: storedScope.trendMode === "forecast" || storedScope.trendMode === "mean" || storedScope.trendMode === "blend" ? storedScope.trendMode : fallbackScope.trendMode ?? "mean",
     trendBendDays: storedScope.trendBendDays === "7" || storedScope.trendBendDays === "14" || storedScope.trendBendDays === "30" || storedScope.trendBendDays === "linear" ? storedScope.trendBendDays : fallbackScope.trendBendDays ?? "linear",
+    trendBlendLambda: text(storedScope.trendBlendLambda) ?? fallbackScope.trendBlendLambda ?? "0.7",
+    minForecastExpectancy: text(storedScope.minForecastExpectancy) ?? fallbackScope.minForecastExpectancy ?? "0",
   };
   return {
     version: 1,
@@ -121,6 +124,8 @@ function sharedScope(scope: ScopeDraft): SharedScopeDraft {
     maxSeconds: scope.maxSeconds,
     trendMode: scope.trendMode ?? "mean",
     trendBendDays: scope.trendBendDays ?? "linear",
+    trendBlendLambda: scope.trendBlendLambda ?? "0.7",
+    minForecastExpectancy: scope.minForecastExpectancy ?? "0",
   };
 }
 

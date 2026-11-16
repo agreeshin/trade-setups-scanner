@@ -237,7 +237,7 @@ it("builds unknown fields from metadata and submits the complete typed scope onl
   expect(creates[0]?.body).toEqual({
     ...spec, fromUnix: new Date(2026, 9, 1).getTime() / 1000, toUnix: new Date(2026, 9, 3).getTime() / 1000,
     direction: "long", tpLevels: [4, 25], slLevels: [0.5, 6], minSetupsPerDay: 4,
-    trendMode: "mean", trendBendDays: "linear",
+    trendMode: "mean", trendBendDays: "linear", minForecastExpectancy: 0,
     algorithmSearch: { futureThreshold: ["1.5", "2.5", "4"], futureWindow: [2, 3, 5] },
     analyticsSearch: { clusterEnabled: [false, true], clusterGapMinutes: [240, 480], timeShiftMinutes: [0, 5], priceChangePct: [null, 0, 1] },
   });
@@ -327,6 +327,26 @@ it("labels a forecast winner and keeps its recorded negative period mean separat
   expect(screen.getByText(/Среднее всей матрицы за период: -0.3 R/)).toBeInTheDocument();
   expect(screen.getByRole("columnheader", { name: "Прогноз R" })).toBeInTheDocument();
   expect(screen.getByRole("columnheader", { name: "Среднее R за период" })).toBeInTheDocument();
+});
+
+it("submits blend lambda and forward gate, persists and restores them on reopen", async () => {
+  render(<AlgorithmsPage />); let dialog = within(await openOptimizer());
+  await dialog.findByLabelText("Baseline: Новый порог");
+  fireEvent.click(dialog.getByRole("button", { name: "Смесь среднего и прогноза" }));
+  expect(dialog.getByLabelText("Доля прогноза λ")).toHaveValue(0.7);
+  expect(dialog.getByLabelText("Минимальный прогноз матрицы, R")).toHaveValue(0);
+  fireEvent.change(dialog.getByLabelText("Доля прогноза λ"), { target: { value: "0.6" } });
+  fireEvent.change(dialog.getByLabelText("Минимальный прогноз матрицы, R"), { target: { value: "0.2" } });
+  fireEvent.blur(dialog.getByLabelText("Минимальный прогноз матрицы, R"));
+  await waitFor(() => expect(drafts.future_algorithm).toMatchObject({ shared: { scope: { trendMode: "blend", trendBlendLambda: "0.6", minForecastExpectancy: "0.2" } } }));
+  await userEvent.click(dialog.getByRole("button", { name: "Закрыть" }));
+  dialog = within(await openOptimizer());
+  expect(await dialog.findByLabelText("Доля прогноза λ")).toHaveValue(0.6);
+  expect(dialog.getByLabelText("Минимальный прогноз матрицы, R")).toHaveValue(0.2);
+  enterDates(); const start = dialog.getByRole("button", { name: "Начать исследование" });
+  await waitFor(() => expect(start).toBeEnabled()); fireEvent.click(start); await screen.findByText("Исследование #17");
+  expect(requests.find((request) => request.path === "/v1/optimization-studies" && request.method === "POST")?.body)
+    .toMatchObject({ trendMode: "blend", trendBlendLambda: 0.6, minForecastExpectancy: 0.2 });
 });
 
 it("autosaves on blur, restores after reopening and isolates drafts by algorithm", async () => {

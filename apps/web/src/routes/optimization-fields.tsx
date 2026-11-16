@@ -67,7 +67,12 @@ export function OptimizationFields({ algorithm, scope, onScopeChange, catalog, r
     <DomainControls fields={ANALYTICS_SEARCH_FIELDS} value={analyticsDomains} onChange={onAnalyticsDomainsChange} />
     <h3 className="font-semibold">Оптимизируемое матожидание</h3>
     <AnalyticsTrendControls mode={scope.trendMode ?? "mean"} bend={scope.trendBendDays ?? "linear"} disableMeanBend
+      onBlendModeChange={() => onScopeChange({ trendMode: "blend" })} blendLambda={scope.trendBlendLambda ?? "0.7"}
+      onBlendLambdaChange={(trendBlendLambda) => onScopeChange({ trendBlendLambda })}
       onModeChange={(trendMode) => onScopeChange({ trendMode })} onBendChange={(trendBendDays) => onScopeChange({ trendBendDays })} />
+    <Field label="Минимальный прогноз матрицы, R" hint="Отдельный порог forecast/blend: score всей матрицы должен быть строго выше него. Default 0. Mean использует прежний mean-гейт.">
+      {(control) => <Input {...control} type="number" min={0} max={100} step="any" value={scope.minForecastExpectancy ?? "0"} onChange={(event) => onScopeChange({ minForecastExpectancy: event.target.value })} />}
+    </Field>
     <InfoNote>Фиксированная метрика всего исследования, не поисковый параметр. Прогноз — fitted-уровень на последней дате с закрытыми сделками; вес дня — число сетапов, без экстраполяции. Среднее за период сохраняется отдельно. Если хотя бы одной ячейке не хватает пригодных дней, весь кандидат неоценим.</InfoNote>
   </fieldset>;
 }

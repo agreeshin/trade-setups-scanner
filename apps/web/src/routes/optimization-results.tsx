@@ -24,7 +24,11 @@ const analyticsLabels: Record<string, string> = {
 export function OptimizationResults({ study, algorithm, controller, onNew }: { study: OptimizationStudy; algorithm: Algorithm; controller: OptimizationController; onNew?: () => void }) {
   const { progress, spec, result } = study;
   const best = result?.best;
-  const forecast = (best?.trendMode ?? spec.trendMode ?? "mean") === "forecast";
+  const mode = best?.trendMode ?? spec.trendMode ?? "mean";
+  const blend = mode === "blend";
+  const forecast = mode !== "mean";
+  const lambda = best?.trendBlendLambda ?? spec.trendBlendLambda ?? 0.7;
+  const blendLabel = `Смесь · ${100 - Math.round(lambda * 100)}/${Math.round(lambda * 100)}`;
   const bend = best?.trendBendDays ?? spec.trendBendDays ?? "linear";
   const frequencyThreshold = spec.minSetupsPerDay === undefined ? "Гейт не применялся"
     : spec.minSetupsPerDay === 0 ? "0 (гейт отключён)" : String(spec.minSetupsPerDay);
@@ -47,7 +51,8 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
       <dl className="grid gap-2 text-sm sm:grid-cols-2">
         <div><dt className="text-muted-foreground">Минимум закрытых на ячейку</dt><dd>{spec.minClosedPerCell}</dd></div>
         <div><dt className="text-muted-foreground">Минимум сетапов в день</dt><dd>{frequencyThreshold}</dd></div>
-        <div><dt className="text-muted-foreground">Метрика поиска</dt><dd>{forecast ? `Прогноз по тренду · ${bend === "linear" ? "∞ — прямая" : `перегиб ${bend} дней`}` : "Среднее за период"}</dd></div>
+        <div><dt className="text-muted-foreground">Метрика поиска</dt><dd>{forecast ? `${blend ? blendLabel : "Прогноз по тренду"} · ${bend === "linear" ? "∞ — прямая" : `перегиб ${bend} дней`}` : "Среднее за период"}</dd></div>
+        {forecast && <div><dt className="text-muted-foreground">Forward-гейт матрицы</dt><dd>score &gt; {spec.minForecastExpectancy ?? 0} R</dd></div>}
       </dl>
     </section>
     <div className="flex flex-wrap gap-2">
@@ -62,8 +67,8 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
     {result && !best && <Alert variant="warning">Нет оценимого кандидата, удовлетворившего требованиям всех выбранных ячеек и порогу «Минимум закрытых на ячейку»{spec.minSetupsPerDay !== undefined && spec.minSetupsPerDay > 0 ? " и частотному порогу «Минимум сетапов в день»" : ""}. Отсутствующий score не равен нулю.</Alert>}
     {best && <>
       <h3 className="font-semibold">Лучший score: {best.score} R</h3>
-      <p className="text-sm">{best.partial ? "Частичный итог остановленного исследования." : "Лучший полностью проверенный кандидат в пределах бюджета."} Это не доказанный глобальный оптимум. Score — равное среднее {forecast ? "прогноза R" : "R"} всех выбранных TP×SL-ячеек, а не выбор лучшей TP/SL-пары.</p>
-      {forecast && <p className="text-sm">Выбор по прогнозу тренда. Среднее всей матрицы за период: {best.meanScore == null ? "Не сохранено" : `${best.meanScore} R`}. Прогноз не является экстраполяцией или средним за период.</p>}
+      <p className="text-sm">{best.partial ? "Частичный итог остановленного исследования." : "Лучший полностью проверенный кандидат в пределах бюджета."} Это не доказанный глобальный оптимум. Score — равное среднее {blend ? "blend R" : forecast ? "прогноза R" : "R"} всех выбранных TP×SL-ячеек, а не выбор лучшей TP/SL-пары.</p>
+      {forecast && <p className="text-sm">{blend ? `Выбор по смеси среднего и прогноза (${blendLabel}).` : "Выбор по прогнозу тренда."} Среднее всей матрицы за период: {best.meanScore == null ? "Не сохранено" : `${best.meanScore} R`}. Прогноз не является экстраполяцией или средним за период.</p>}
       <section aria-label="Полные параметры результата" className="grid gap-2">
         <h4 className="font-medium">Полные параметры алгоритма</h4>
         <dl className="grid gap-2 text-sm sm:grid-cols-2">{Object.entries(best.params).map(([key, value]) => {
@@ -82,9 +87,9 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
       </section>
       <div className="overflow-x-auto">
         <Table aria-label="Матрица и поддержка результата">
-          <TableHeader><TableRow>{["TP %", "SL %", forecast ? "Прогноз R" : "R", ...(forecast ? ["Среднее R за период"] : []), "Среднее %", "Закрытых", "TP", "SL", "Не закрыты", "Нет данных", "Гейт исключил"].map((title) => <TableHead key={title} numeric>{title}</TableHead>)}</TableRow></TableHeader>
+          <TableHeader><TableRow>{["TP %", "SL %", blend ? "Blend R" : forecast ? "Прогноз R" : "R", ...(forecast ? ["Среднее R за период"] : []), ...(blend ? ["Чистый прогноз R"] : []), "Среднее %", "Закрытых", "TP", "SL", "Не закрыты", "Нет данных", "Гейт исключил"].map((title) => <TableHead key={title} numeric>{title}</TableHead>)}</TableRow></TableHeader>
           <TableBody>{best.matrix.map((cell) => <TableRow key={`${cell.tpPct}:${cell.slPct}`}>
-            {[cell.tpPct, cell.slPct, cell.riskExpectancy, ...(forecast ? [cell.meanRiskExpectancy] : []), cell.avgMovePct, cell.closedCount, cell.tpCount, cell.slCount, cell.unclosedCount, cell.noDataCount, cell.priceChangeFilteredCount].map((value, index) => <TableCell key={index} numeric>{value ?? "—"}</TableCell>)}
+            {[cell.tpPct, cell.slPct, cell.riskExpectancy, ...(forecast ? [cell.meanRiskExpectancy] : []), ...(blend ? [cell.forecastRiskExpectancy] : []), cell.avgMovePct, cell.closedCount, cell.tpCount, cell.slCount, cell.unclosedCount, cell.noDataCount, cell.priceChangeFilteredCount].map((value, index) => <TableCell key={index} numeric>{value ?? "—"}</TableCell>)}
           </TableRow>)}</TableBody>
         </Table>
       </div>

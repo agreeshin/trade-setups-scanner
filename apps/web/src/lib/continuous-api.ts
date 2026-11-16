@@ -1,5 +1,6 @@
 import { apiFetch } from "./platform-api";
 import type { OptimizationSpec } from "./optimization-api";
+import { isTrendBlendLambda } from "./optimization-api";
 
 // The server fixes dates and maturity at actual execution. Never manufacture them in a browser loop.
 export type ContinuousStudySpec = Omit<OptimizationSpec, "fromUnix" | "toUnix" | "minSetupsPerDay" | "setupMaturity">;
@@ -25,6 +26,7 @@ export interface RecommendedCell {
   robustScore: number;
   forecastR?: number;
   forecastMatrixR?: number;
+  blendR?: number; blendMatrixR?: number;
 }
 export interface LiveReadinessSummary {
   generationId: number;
@@ -59,7 +61,8 @@ export interface ContinuousSlot {
   studyId: number | null;
   meanExpectancy: number | null;
   /** Producing study mode, not editable config; meanExpectancy remains the period mean. */
-  trendMode?: "mean" | "forecast" | null;
+  trendMode?: "mean" | "forecast" | "blend" | null;
+  trendBlendLambda?: number | null;
   selectedCell: RecommendedCell | null;
   updatedAt: string;
 }
@@ -112,7 +115,9 @@ function isProcess(value: unknown): value is ContinuousProcess {
     && Array.isArray(config.minSetupsPerDay) && config.minSetupsPerDay.length > 0 && config.minSetupsPerDay.length <= MAX_CONTINUOUS_THRESHOLDS
     && new Set(config.minSetupsPerDay).size === config.minSetupsPerDay.length && config.minSetupsPerDay.every((threshold) => typeof threshold === "number" && Number.isFinite(threshold) && threshold >= 0)
     && config.study !== null && typeof config.study === "object" && config.study.algorithmId === process.algorithmId
-    && (config.study.trendMode === undefined || config.study.trendMode === "mean" || config.study.trendMode === "forecast")
+    && (config.study.trendMode === undefined || config.study.trendMode === "mean" || config.study.trendMode === "forecast" || config.study.trendMode === "blend")
+    && (config.study.trendBlendLambda === undefined || isTrendBlendLambda(config.study.trendBlendLambda))
+    && (config.study.minForecastExpectancy === undefined || (Number.isFinite(config.study.minForecastExpectancy) && config.study.minForecastExpectancy >= 0 && config.study.minForecastExpectancy <= 100))
     && (config.study.trendBendDays === undefined || ["7", "14", "30", "linear"].includes(config.study.trendBendDays))
     && Array.isArray(config.study.instruments) && (config.study.direction === "short" || config.study.direction === "long"));
   return typeof process.algorithmId === "string" && ["stopped", "running", "stopping", "error"].includes(process.status ?? "")
@@ -129,7 +134,8 @@ function isProcess(value: unknown): value is ContinuousProcess {
       && optionalClosedBoundary(slot.readinessFrontier) && optionalClosedBoundary(slot.liveWatermark)
       && (slot.liveReadinessSummary == null || isLiveReadinessSummary(slot.liveReadinessSummary))
       && (slot.meanExpectancy === null || Number.isFinite(slot.meanExpectancy))
-      && (slot.trendMode == null || slot.trendMode === "mean" || slot.trendMode === "forecast")
+      && (slot.trendMode == null || slot.trendMode === "mean" || slot.trendMode === "forecast" || slot.trendMode === "blend")
+      && (slot.trendBlendLambda == null || isTrendBlendLambda(slot.trendBlendLambda))
       && typeof slot.updatedAt === "string" && Number.isFinite(Date.parse(slot.updatedAt))
       && (slot.selectedCell === null || (typeof slot.selectedCell === "object" && slot.selectedCell !== undefined
         && [slot.selectedCell.tpPct, slot.selectedCell.slPct, slot.selectedCell.rawR, slot.selectedCell.meanR, slot.selectedCell.robustScore].every(Number.isFinite)
