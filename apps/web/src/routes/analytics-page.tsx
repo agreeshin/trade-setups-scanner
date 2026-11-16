@@ -418,8 +418,8 @@ function dayLabel(day: string): string {
   return `${dayNumber}.${month}`;
 }
 
-/** Daily UTC geometry with the shared weighted Rust curve and uncertainty. */
-function DailyExpectancyChart({ items, originUnix, meanRisk, trendBendDays }: { items: DailyExpectancyPoint[]; originUnix: number; meanRisk: number | null; trendBendDays: TrendBendDays }) {
+/** Daily UTC geometry with the shared weighted Rust curve. */
+function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendDays }: { items: DailyExpectancyPoint[]; originUnix: number; meanRisk: number | null; winRate: number | null; trendBendDays: TrendBendDays }) {
   const [result, setResult] = useState<{ items: DailyExpectancyPoint[]; bend: TrendBendDays; trend: TrendSummary | null; error: string | null } | null>(null);
   useEffect(() => {
     if (items.filter((item) => item.riskExpectancy !== null && item.computedCount > 0).length < 2) return;
@@ -442,11 +442,8 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, trendBendDays }: { 
   if (values.length === 0) {
     return <p className="text-xs text-muted-foreground">Пока нет дней с закрытыми TP/SL сделками.</p>;
   }
-  // Fitted endpoints may exceed observed extrema; keep the trend and both labels visible.
-  if (trend) for (const point of trend.curve) {
-    values.push(point.value);
-    if (point.se !== null) values.push(point.value - 1.96 * point.se, point.value + 1.96 * point.se);
-  }
+  // Scale to displayed values only, including fitted extrema but not hidden uncertainty.
+  if (trend) for (const point of trend.curve) values.push(point.value);
   const width = 760;
   const height = 280;
   const left = 64;
@@ -455,35 +452,30 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, trendBendDays }: { 
   const bottom = 56;
   const plotWidth = width - left - right;
   const plotHeight = height - top - bottom;
-  const minValue = Math.min(0, ...values);
-  const maxValue = Math.max(0, ...values);
-  const padding = Math.max(0.1, (maxValue - minValue) * 0.08);
-  const yMin = minValue === maxValue ? minValue - 0.5 : minValue - padding;
-  const yMax = minValue === maxValue ? maxValue + 0.5 : maxValue + padding;
+  const yMin = Math.min(0, ...values);
+  const yMax = Math.max(1, ...values);
   const yRange = yMax - yMin;
   const firstX = model.points[0]!.x;
   const xRange = model.points[model.points.length - 1]!.x - firstX;
   const xForDay = (x: number) => left + (xRange === 0 ? plotWidth / 2 : ((x - firstX) / xRange) * plotWidth);
   const xForTrend = (day: number) => xForDay(day - model.originUnix / 86400);
   const yForValue = (value: number) => top + ((yMax - value) / yRange) * plotHeight;
-  const zeroY = yMin <= 0 && yMax >= 0 ? yForValue(0) : null;
+  const zeroY = yForValue(0);
   const labelStep = Math.max(1, Math.ceil(items.length / 8));
   // Round presentation only so floating-point residuals cannot produce a -0.00R label.
   const fittedLabel = (value: number) => formatRisk(Number(value.toFixed(2)));
 
   return (
     <div className="grid gap-2">
-    <h3 className="text-sm font-medium">Дневное матожидание в рисках · Среднее МО: <span aria-label="Среднее МО за период" className={meanRisk !== null && meanRisk > 0 ? "text-success" : meanRisk !== null && meanRisk < 0 ? "text-danger" : "text-muted-foreground"}>{meanRisk === null ? "—" : fittedLabel(meanRisk)}</span></h3>
+    <h3 className="text-sm font-medium">Дневное матожидание в рисках · Среднее МО: <span aria-label="Среднее МО за период" className={meanRisk !== null && meanRisk > 0 ? "text-success" : meanRisk !== null && meanRisk < 0 ? "text-danger" : "text-muted-foreground"}>{meanRisk === null ? "—" : fittedLabel(meanRisk)}</span> · Винрейт: <span aria-label="Винрейт за период">{winRate === null ? "—" : `${winRate.toFixed(1)}%`}</span></h3>
     {current?.error && <p role="status" className="text-xs text-danger">Не удалось рассчитать тренд: {current.error}</p>}
     <svg className="w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание в рисках">
       <desc>Среднее закрытых сделок по UTC-дням сигнала. Расстояния по оси X соответствуют календарным суткам; дни без закрытых сделок не равны нулю.</desc>
       <line className="stroke-muted-foreground/40" x1={left} y1={top} x2={left} y2={height - bottom} />
       <line className="stroke-muted-foreground/40" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
-      {zeroY !== null ? <>
-        <line className="stroke-muted-foreground/50" x1={left} y1={zeroY} x2={width - right} y2={zeroY} />
-        <text className="fill-muted-foreground text-[10px]" x={left - 10} y={zeroY + 4} textAnchor="end" aria-label="Нулевой уровень">0 R</text>
-      </> : null}
-      {[yMin, (yMin + yMax) / 2, yMax].filter((value) => zeroY === null || Math.abs(yForValue(value) - zeroY) >= 14).map((value) => (
+      <line className="stroke-muted-foreground/50" x1={left} y1={zeroY} x2={width - right} y2={zeroY} />
+      <text className="fill-muted-foreground text-[10px]" x={left - 10} y={zeroY + 4} textAnchor="end" aria-label="Нулевой уровень">0</text>
+      {[yMin, (yMin + yMax) / 2, yMax].filter((value) => value !== 0 && (value === yMin || value === yMax || Math.abs(yForValue(value) - zeroY) >= 14)).map((value) => (
         <g key={value.toFixed(4)}>
           <line className="stroke-muted-foreground/20" x1={left} y1={yForValue(value)} x2={width - right} y2={yForValue(value)} />
           <text className="fill-muted-foreground text-[10px]" x={left - 10} y={yForValue(value) + 4} textAnchor="end">{formatRisk(value)}</text>
@@ -492,10 +484,6 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, trendBendDays }: { 
       {model.segments.map((segment, index) => segment.length > 1
         ? <polyline key={index} className="fill-none stroke-primary stroke-2" points={segment.map((point) => `${xForDay(point.x)},${yForValue(point.riskExpectancy!)}`).join(" ")} /> : null)}
       {trend !== null ? <>
-        {trend.curve.every((point) => point.se !== null) && <polygon data-testid="trend-ci-band" className="fill-warning/15" points={[
-          ...trend.curve.map((point) => `${xForTrend(point.day)},${yForValue(point.value + 1.96 * point.se!)}`),
-          ...[...trend.curve].reverse().map((point) => `${xForTrend(point.day)},${yForValue(point.value - 1.96 * point.se!)}`),
-        ].join(" ")}><title>95% неопределённость сглаженного уровня: ±1.96 SE, не прогноз отдельной сделки</title></polygon>}
         <polyline data-testid="trend-curve" className="fill-none stroke-warning" strokeWidth={2} strokeDasharray="4 4"
           points={trend.curve.map((point) => `${xForTrend(point.day)},${yForValue(point.value)}`).join(" ")}>
           <title>{`${trend.method === "p_spline" ? "P-spline" : "Взвешенная прямая"}: изменение ${formatRisk(trend.end.value - trend.start.value)}, текущий уровень ${formatRisk(trend.end.value)}, SE ${trend.endpointSe?.toFixed(3) ?? "—"} R. Без экстраполяции.`}</title>
@@ -703,7 +691,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
         {summary.avgRisk !== null && <Badge>Матожидание: {formatRisk(summary.avgRisk)} по {summary.closed} закрытым</Badge>}
         {filteredCount > 0 && <Badge variant="warning">Отфильтровано смещением цены: {filteredCount}</Badge>}
       </div>
-      {rows.length > 0 && <DailyExpectancyChart items={dailyPoints} originUnix={chartOriginUnix} meanRisk={summary.avgRisk} trendBendDays={trendBendDays} />}
+      {rows.length > 0 && <DailyExpectancyChart items={dailyPoints} originUnix={chartOriginUnix} meanRisk={summary.avgRisk} winRate={summary.winRate} trendBendDays={trendBendDays} />}
       {rows.length === 0 && !running && !error && <EmptyState title="Нет рассчитанных сделок" description="Выберите параметры и нажмите «Рассчитать». Сначала загружаются кешированные строки, затем досчитываются остальные." />}
       {rows.length > 0 && (
         <div className="overflow-x-auto">

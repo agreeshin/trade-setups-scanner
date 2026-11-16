@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AnalyticsPage } from "./analytics-page";
 import type { MatrixCellRef, TradeRow, TrendInput, TrendSummary } from "../lib/analytics-api";
@@ -341,6 +341,9 @@ it("runs the SHORT trade list cache-first and builds the daily expectancy chart"
   const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
   expect(chart).toBeInTheDocument();
   expect(chart.querySelectorAll("title").length).toBeGreaterThan(0);
+  const heading = screen.getByRole("heading", { name: /^Дневное матожидание в рисках/ });
+  expect(heading).toHaveTextContent("Среднее МО: +0.00R · Винрейт: 50.0%");
+  expect(within(heading).getByLabelText("Винрейт за период")).toHaveTextContent("50.0%");
 }, 10_000);
 
 it("keeps the cache summary in the third subsection and clears it", async () => {
@@ -426,11 +429,12 @@ it.each(["America/New_York", "Pacific/Auckland"])("renders calendar UTC spacing,
   expect(screen.getByRole("heading", { name: /^Дневное матожидание в рисках/ })).toHaveTextContent("Среднее МО: +0.80R");
   expect(screen.getByLabelText("Среднее МО за период")).toHaveClass("text-success");
   const zero = screen.getByLabelText("Нулевой уровень");
-  expect(zero).toHaveTextContent("0 R");
+  expect(zero).toHaveTextContent(/^0$/);
   expect(Number(zero.getAttribute("x"))).toBeLessThan(64);
   expect(Number(chart.querySelector('line[class="stroke-muted-foreground/50"]')?.getAttribute("y1"))).toBeCloseTo(Number(zero.getAttribute("y")) - 4, 8);
   expect(circles[0]).toHaveClass("fill-success"); expect(circles[1]).toHaveClass("fill-danger");
   expect(screen.getByText("Win rate: 60.0%")).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: /^Дневное матожидание в рисках/ })).toHaveTextContent("Винрейт: 60.0%");
   expect(screen.getByText("Матожидание: +0.80R по 5 закрытым")).toBeInTheDocument(); // Trade-weighted, not 2/3 daily mean.
   expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(1);
   expect(calls.some((call) => call.path.startsWith("/v1/analytics/trades/"))).toBe(false);
@@ -451,7 +455,43 @@ it.each([
   await screen.findByText("Сделок: 1 / 1");
   const mean = screen.getByLabelText("Среднее МО за период");
   expect(mean).toHaveTextContent(label); expect(mean).toHaveClass(color);
-  expect(screen.getByLabelText("Нулевой уровень")).toHaveTextContent("0 R");
+  expect(screen.getByLabelText("Нулевой уровень")).toHaveTextContent(/^0$/);
+});
+
+it.each([
+  { risks: [0.25, 0.75], upper: "+1.00R", lower: "0" },
+  { risks: [-2, -0.25], upper: "+1.00R", lower: "-2.00R" },
+  { risks: [-1, 2], upper: "+2.00R", lower: "-1.00R" },
+  { risks: [0, 0], upper: "+1.00R", lower: "0" },
+])("uses exact displayed extrema with a minimum [0, 1] vertical range ($risks)", async ({ risks, upper, lower }) => {
+  stubFetch({ ...utcChartOptions(risks.map((risk, index) => utcTrade(`2026-01-0${index + 1}T12:00:00Z`, risk, index))), trend: null });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByText("Сделок: 2 / 2");
+  const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
+  const topLabel = within(chart).getByText(upper, { selector: "text" });
+  const bottomLabel = within(chart).getByText(lower, { selector: "text" });
+  expect(topLabel).toHaveAttribute("y", "28");
+  expect(bottomLabel).toHaveAttribute("y", "228");
+  expect(topLabel).toHaveAttribute("text-anchor", "end");
+  expect(bottomLabel).toHaveAttribute("text-anchor", "end");
+  expect(Number(screen.getByLabelText("Нулевой уровень").getAttribute("x"))).toBeLessThan(64);
+});
+
+it("updates the chart mean and TP/(TP+SL) win rate for only the visible period", async () => {
+  stubFetch(utcChartOptions([
+    utcTrade("2026-01-01T12:00:00Z", 2, 0), utcTrade("2026-01-01T13:00:00Z", 2, 1),
+    utcTrade("2026-01-04T12:00:00Z", -1, 2), utcTrade("2026-01-04T13:00:00Z", null, 3),
+  ]));
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByText("Сделок: 4 / 4");
+  const heading = screen.getByRole("heading", { name: /^Дневное матожидание в рисках/ });
+  expect(heading).toHaveTextContent("Среднее МО: +1.00R · Винрейт: 66.7%");
+  expect(within(heading).getByLabelText("Среднее МО за период")).toHaveClass("text-success");
+  fireEvent.change(screen.getAllByLabelText("С даты")[1]!, { target: { value: "2026-01-04" } });
+  expect(heading).toHaveTextContent("Среднее МО: -1.00R · Винрейт: 0.0%");
+  expect(within(heading).getByLabelText("Среднее МО за период")).toHaveClass("text-danger");
 });
 
 it("renders a single UTC-day point centered without a fabricated trend or endpoint labels", async () => {
@@ -508,10 +548,10 @@ it("restores trend controls, sends forecast cache dimensions and exposes matrix 
   expect(saved).toMatchObject({ trendMode: "mean", trendBendDays: "7" });
 });
 
-it("draws the server P-spline and translucent CI within data bounds without changing the trade mean", async () => {
+it("draws only the server P-spline, scales to its extrema without CI and preserves the trade mean", async () => {
   const day = Date.parse("2026-01-01T00:00:00Z") / 86400000;
   const curve = [
-    { day, value: -0.5, se: 0.1 }, { day: day + 1, value: 0.5, se: 0.3 },
+    { day, value: -0.5, se: 0.1 }, { day: day + 1, value: 1.5, se: 0.3 },
     { day: day + 2, value: -0.25, se: 0.5 }, { day: day + 3, value: 0.75, se: 0.7 },
   ];
   const calls = stubFetch({ ...utcChartOptions([0, 1, 2, 3].map((i) => utcTrade(`2026-01-0${i + 1}T12:00:00Z`, i % 2 === 0 ? -1 : 1, i))),
@@ -522,11 +562,13 @@ it("draws the server P-spline and translucent CI within data bounds without chan
   expect(line.querySelector("title")).toHaveTextContent("P-spline");
   const vertices = line.getAttribute("points")!.split(" ").map((p) => p.split(",").map(Number));
   expect(vertices).toHaveLength(4); expect(vertices[0]![0]).toBe(64); expect(vertices[3]![0]).toBe(736);
-  const band = screen.getByTestId("trend-ci-band");
-  expect(band).toHaveClass("fill-warning/15");
-  const bandVertices = band.getAttribute("points")!.split(" ").map((p) => p.split(",").map(Number));
-  expect(bandVertices).toHaveLength(8);
-  expect(bandVertices.every(([x, y]) => x! >= 64 && x! <= 736 && y! >= 24 && y! <= 224)).toBe(true);
+  expect(screen.queryByTestId("trend-ci-band")).not.toBeInTheDocument();
+  const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
+  expect(chart.querySelector("polygon")).toBeNull();
+  expect(line).toHaveClass("fill-none", "stroke-warning");
+  expect(vertices.every(([x, y]) => x! >= 64 && x! <= 736 && y! >= 24 && y! <= 224)).toBe(true);
+  expect(within(chart).getByText("+1.50R", { selector: "text" })).toHaveAttribute("y", "28");
+  expect(within(chart).getByText("-1.00R", { selector: "text" })).toHaveAttribute("y", "228");
   expect(screen.getByLabelText("Конец тренда: +0.75R")).toBeInTheDocument();
   expect(screen.getByLabelText("Среднее МО за период")).toHaveTextContent("+0.00R");
   const request = JSON.parse(calls.find((call) => call.path === "/v1/analytics/trend")!.body!) as { trendBendDays: string };
