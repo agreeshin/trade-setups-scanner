@@ -86,8 +86,6 @@ impl CaptionBuilder {
 #[derive(Default)]
 struct Metrics {
     forecast_r: Option<f64>,
-    trend_delta_r: Option<f64>,
-    win_rate_pct: Option<f64>,
 }
 
 fn signed_r(value: f64) -> Result<String, WorkerError> {
@@ -95,13 +93,6 @@ fn signed_r(value: f64) -> Result<String, WorkerError> {
         return Err(invalid("non-finite adaptive Telegram metric"));
     }
     Ok(format!("{value:+.2} R"))
-}
-
-fn optional_r(builder: &mut CaptionBuilder, value: Option<f64>) -> Result<(), WorkerError> {
-    match value {
-        Some(value) => builder.code(&signed_r(value)?),
-        None => builder.plain("недоступно"),
-    }
 }
 
 fn validate_label(value: &str) -> Result<(), WorkerError> {
@@ -139,8 +130,6 @@ pub fn recommendation_telegram_caption(
                 Ok(saved) if saved.validate_for(&envelope, raw.close_time_unix).is_ok() => (
                     Metrics {
                         forecast_r: saved.forecast_r.as_ref().copied(),
-                        trend_delta_r: saved.trend_delta_r.as_ref().copied(),
-                        win_rate_pct: saved.win_rate_pct.as_ref().copied(),
                     },
                     if saved.image_key.is_none() {
                         Some("saved_chart_unavailable")
@@ -182,13 +171,6 @@ fn format_caption(
     {
         return Err(invalid("invalid adaptive Telegram recommendation values"));
     }
-    let period_seconds = snapshot
-        .provenance
-        .to_unix
-        .checked_sub(snapshot.provenance.from_unix)
-        .filter(|seconds| *seconds > 0)
-        .ok_or_else(|| invalid("invalid saved research period"))?;
-    let period_days = (period_seconds as f64 / 86400.0).to_string();
     let target = raw
         .close_time_unix
         .checked_add(
@@ -213,18 +195,26 @@ fn format_caption(
         &instrument.exchange
     })?;
     out.plain("\nЦена: ")?;
-    // Reuse the exact bounded decimal multiplication used by plain Web Push.
-    // Only the presentation separator differs; no price ever passes through f64.
+    // Reuse the bounded decimal helpers; no price ever passes through f64.
     out.code(&super::text::display_decimal(&raw.close_price)?.replace(',', "."))?;
     out.plain(" USDT\n\n")?;
-    out.bold("Условия сделки:")?;
+    if let Some(forecast) = metrics.forecast_r {
+        out.plain(if forecast < 0.0 {
+            "📉 Прогноз матожидание торговли: "
+        } else {
+            "📈 Прогноз матожидание торговли: "
+        })?;
+        out.code(&signed_r(forecast)?)?;
+        out.plain("\n\n")?;
+    }
+    out.plain("Условия сделки:")?;
     if snapshot.time_shift_minutes > 0 {
         let time = DateTime::<Utc>::from_timestamp(target, 0)
             .ok_or_else(|| invalid("invalid entry timestamp"))?;
         out.plain("\n⏳ Рекомендуемое время входа: ")?;
         out.code(&format!("{} UTC", time.format("%H:%M:%S")))?;
     }
-    out.plain("\n🔖 TP = ")?;
+    out.plain("\n🎯 TP = ")?;
     out.code(&format!("{}%", snapshot.tp_pct))?;
     out.plain(", SL = ")?;
     out.code(&format!("{}%", snapshot.sl_pct))?;
@@ -241,44 +231,8 @@ fn format_caption(
         out.plain(" USDT на момент входа")?;
     }
     out.plain("\n\n")?;
-    out.bold("Матожидание торговли:")?;
-    out.plain(match metrics.forecast_r {
-        Some(value) if value < 0.0 => "\n📉 Прогноз МО: ",
-        Some(_) => "\n📈 Прогноз МО: ", // Zero consistently uses the rising icon.
-        None => "\nПрогноз МО: ",       // Unknown is not a directional forecast.
-    })?;
-    optional_r(&mut out, metrics.forecast_r)?;
-    out.plain("\nСреднее МО за последние ")?;
-    out.code(&period_days)?;
-    out.plain(" суток: ")?;
-    out.code(&signed_r(snapshot.raw_r)?)?;
-    out.plain("\nДинамика МО за последние ")?;
-    out.code(&period_days)?;
-    out.plain(" суток: ")?;
-    optional_r(&mut out, metrics.trend_delta_r)?;
-    out.plain("\nСредний винрейт: ")?;
-    match metrics.win_rate_pct {
-        Some(value) if value.is_finite() && (0.0..=100.0).contains(&value) => {
-            out.code(&format!("{value:.2}%"))?
-        }
-        Some(_) => return Err(invalid("invalid saved win rate")),
-        None => out.plain("недоступно")?,
-    }
-    out.plain("\nВ среднем для других уровней TP и SL: ")?;
-    out.code(&signed_r(snapshot.mean_r)?)?;
-    if let Some(forecast) = snapshot.search_forecast {
-        let (cell_r,matrix_r)=if let Some(blend)=forecast.blend {
-            out.plain(&format!("\nВыбор по смеси {}/{} (",100-blend.lambda.percent(),blend.lambda.percent()))?;
-            (blend.cell_r,blend.matrix_r)
-        } else {out.plain("\nВыбор по прогнозу тренда (")?;(forecast.cell_r,forecast.matrix_r)};
-        out.plain(if forecast.bend_days.is_linear() { "прямая" } else { forecast.bend_days.key() })?;
-        if !forecast.bend_days.is_linear() { out.plain(" д.")?; }
-        out.plain("): ")?;
-        out.code(&signed_r(cell_r)?)?;
-        out.plain("; score матрицы: ")?;
-        out.code(&signed_r(matrix_r)?)?;
-    }
-    out.plain("\n\nАлгоритм: ")?;
+    out.bold("Алгоритм")?;
+    out.plain(": ")?;
     out.label(&envelope.external_name)?;
     out.finish()
 }
@@ -325,24 +279,22 @@ mod tests {
     }
 
     #[test]
-    fn forecast_search_label_is_additive_and_does_not_relabel_saved_period_means() {
+    fn search_scores_and_period_means_never_substitute_for_saved_signal_forecast() {
         let (instrument, raw, mut value) = fixture();
-        value["searchForecast"] = json!({"bendDays":"7","cellR":0.61,"matrixR":0.45});
-        let before = value.clone();
-        let caption = recommendation_telegram_caption(&instrument, &raw, &value).unwrap();
-        assert_eq!(value, before);
-        assert!(caption.text.contains("Среднее МО за последние 1 суток: +0.32 R"));
-        assert!(caption.text.contains("В среднем для других уровней TP и SL: +0.21 R"));
-        assert!(caption.text.contains("Выбор по прогнозу тренда (7 д.): +0.61 R; score матрицы: +0.45 R"));
-        assert!(caption.fits_photo_caption());
-        v2::validate_entities(&caption.text, &caption.entities).unwrap();
-        value["searchForecast"]["bendDays"] = json!("linear");
-        assert!(recommendation_telegram_caption(&instrument, &raw, &value).unwrap().text.contains("Выбор по прогнозу тренда (прямая)"));
-        value["searchForecast"]["blend"]=json!({"lambda":0.7,"cellR":0.52,"matrixR":0.38});
-        let blend=recommendation_telegram_caption(&instrument,&raw,&value).unwrap();
-        assert!(blend.text.contains("Выбор по смеси 30/70 (прямая): +0.52 R; score матрицы: +0.38 R"));
-        assert!(blend.text.contains("Среднее МО за последние 1 суток: +0.32 R"));
-        v2::validate_entities(&blend.text,&blend.entities).unwrap();
+        let expected = recommendation_telegram_caption(&instrument, &raw, &value).unwrap();
+        for search in [
+            json!({"bendDays":"7","cellR":0.61,"matrixR":0.45}),
+            json!({"bendDays":"linear","cellR":0.61,"matrixR":0.45}),
+            json!({"bendDays":"linear","cellR":0.61,"matrixR":0.45,
+                "blend":{"lambda":0.7,"cellR":0.52,"matrixR":0.38}}),
+        ] {
+            value["searchForecast"] = search;
+            let before = value.clone();
+            let caption = recommendation_telegram_caption(&instrument, &raw, &value).unwrap();
+            assert_eq!(value, before);
+            assert_eq!(caption, expected);
+            assert!(!caption.text.contains("Прогноз"));
+        }
     }
 
     #[test]
@@ -359,20 +311,26 @@ mod tests {
         assert!(
             caption
                 .text
-                .contains("⏳ Рекомендуемое время входа: 00:02:00 UTC\n🔖 TP")
+                .contains("⏳ Рекомендуемое время входа: 00:02:00 UTC\n🎯 TP")
         );
         assert!(!caption.text.contains("мин после сетапа"));
         assert!(
             caption
                 .text
-                .contains("🔖 TP = 14%, SL = 4% (от фактической цены входа)")
+                .contains("🎯 TP = 14%, SL = 4% (от фактической цены входа)")
         );
         assert!(
             caption
                 .text
                 .contains("⚠️ Заходить в сделку, если цена не опустится ниже 101.00 USDT")
         );
-        assert!(caption.text.contains("Прогноз МО: недоступно\nСреднее МО за последние 1 суток: +0.32 R\nДинамика МО за последние 1 суток: недоступно\nСредний винрейт: недоступно\nВ среднем для других уровней TP и SL: +0.21 R"));
+        assert!(
+            caption
+                .text
+                .contains("Цена: 100.00 USDT\n\nУсловия сделки:")
+        );
+        assert!(!caption.text.contains("Прогноз"));
+        assert_no_other_metrics(&caption.text);
         assert!(caption.text.ends_with("Алгоритм: <b>*plain name*😀"));
         assert!(!caption.text.contains("1970-") && !caption.text.contains("Исследование"));
         let headings: Vec<_> = caption
@@ -381,7 +339,7 @@ mod tests {
             .filter(|entity| entity.kind == EntityKind::Bold)
             .map(|entity| entity_text(&caption, entity))
             .collect();
-        assert_eq!(headings, ["Условия сделки:", "Матожидание торговли:"]);
+        assert_eq!(headings, ["Алгоритм"]);
         assert_eq!(caption.entities[0].offset, 3); // red circle = two UTF-16 units + space
         assert_eq!(entity_text(&caption, &caption.entities[0]), "SKYUSDT");
         assert!(caption.fits_photo_caption());
@@ -393,11 +351,11 @@ mod tests {
         let (instrument, raw, value) = fixture();
         let envelope: RecommendationEnvelope = serde_json::from_value(value).unwrap();
         for (forecast, expected) in [
-            (Some(0.4), "📈 Прогноз МО: +0.40 R"),
-            (Some(-0.4), "📉 Прогноз МО: -0.40 R"),
-            (Some(0.0), "📈 Прогноз МО: +0.00 R"),
-            (Some(-0.001), "📉 Прогноз МО: -0.00 R"),
-            (None, "Прогноз МО: недоступно"),
+            (Some(0.4), "📈 Прогноз матожидание торговли: +0.40 R"),
+            (Some(-0.4), "📉 Прогноз матожидание торговли: -0.40 R"),
+            (Some(0.0), "📈 Прогноз матожидание торговли: +0.00 R"),
+            (Some(-0.001), "📉 Прогноз матожидание торговли: -0.00 R"),
+            (None, "Цена: 100.00 USDT\n\nУсловия сделки:"),
         ] {
             let caption = format_caption(
                 &instrument,
@@ -405,16 +363,28 @@ mod tests {
                 &envelope,
                 Metrics {
                     forecast_r: forecast,
-                    ..Default::default()
                 },
             )
             .unwrap();
             assert!(caption.text.contains(expected));
-            assert!(!caption.text.contains("Прогноз МО торговли"));
+            assert_no_other_metrics(&caption.text);
+            assert!(!caption.text.contains("\n\n\n"));
             assert!(!caption.text.contains("мин после сетапа"));
             assert!(!caption.text.contains("только если цена не опустится ниже"));
             v2::validate_entities(&caption.text, &caption.entities).unwrap();
             if let Some(value) = forecast {
+                assert_eq!(
+                    caption
+                        .text
+                        .matches("Прогноз матожидание торговли:")
+                        .count(),
+                    1
+                );
+                assert!(
+                    caption
+                        .text
+                        .contains(&format!("USDT\n\n{expected}\n\nУсловия сделки:"))
+                );
                 assert!(
                     caption
                         .entities
@@ -423,6 +393,7 @@ mod tests {
                             && entity_text(&caption, entity) == signed_r(value).unwrap())
                 );
             } else {
+                assert!(!caption.text.contains("Прогноз"));
                 assert!(!caption.text.contains('📈') && !caption.text.contains('📉'));
             }
             assert!(
@@ -493,18 +464,15 @@ mod tests {
             &envelope,
             Metrics {
                 forecast_r: Some(0.4),
-                trend_delta_r: Some(-0.12),
-                win_rate_pct: Some(29.33),
             },
         )
         .unwrap();
-        assert!(caption.text.contains("📈 Прогноз МО: +0.40 R"));
         assert!(
             caption
                 .text
-                .contains("Динамика МО за последние 1 суток: -0.12 R")
+                .contains("📈 Прогноз матожидание торговли: +0.40 R")
         );
-        assert!(caption.text.contains("Средний винрейт: 29.33%"));
+        assert_no_other_metrics(&caption.text);
         assert!(caption.text.ends_with(&"😀".repeat(120)));
         v2::validate_entities(&caption.text, &caption.entities).unwrap();
         let mut builder = CaptionBuilder::default();
@@ -532,11 +500,80 @@ mod tests {
             caption.enrichment_unavailable_reason,
             Some("invalid_saved_enrichment")
         );
-        assert!(caption.text.contains("Средний винрейт: недоступно"));
+        assert!(!caption.text.contains("Прогноз"));
+        assert_no_other_metrics(&caption.text);
         let name = caption.entities.last().unwrap();
         assert_eq!(name.kind, EntityKind::Code);
         assert_eq!(entity_text(&caption, name), "😀<b>algo42</b>*literal*");
         value["rawSignalAt"] = json!(raw.close_time_unix + 60);
         assert!(recommendation_telegram_caption(&instrument, &raw, &value).is_err());
+    }
+
+    fn assert_no_other_metrics(text: &str) {
+        for forbidden in [
+            "Матожидание торговли:",
+            "Планируемое",
+            "Среднее МО",
+            "Динамика МО",
+            "винрейт",
+            "В среднем",
+            "матриц",
+            "Выбор по",
+            "Исследование",
+            "🔖",
+        ] {
+            assert!(!text.contains(forbidden), "unexpected {forbidden}: {text}");
+        }
+    }
+
+    #[test]
+    fn saved_snapshot_forecast_is_the_only_metric_and_target_template_is_exact() {
+        let (mut instrument, mut raw, mut value) = fixture();
+        instrument.symbol = "SPACEUSDT".into();
+        raw.close_price = "0.004156".into();
+        raw.close_time_unix = 18 * 3600 + 24 * 60;
+        value["rawSignalAt"] = json!(raw.close_time_unix);
+        value["tpPct"] = json!(20);
+        value["slPct"] = json!(6);
+        value["priceChangePct"] = json!(0);
+        value["externalName"] = json!("Всплеск цены и оборота");
+        // The source research is older than this signal, not ahead of it.
+        value["provenance"]["observationCutoff"] = json!(raw.close_time_unix);
+        let envelope = serde_json::from_value(value.clone()).unwrap();
+        let mut saved =
+            super::super::enrichment::freeze(&envelope, raw.close_time_unix, None).unwrap();
+        saved.forecast_r = setups_domain::expectancy::MetricAvailability::Available { value: 0.13 };
+        value["expectancy"] = serde_json::to_value(saved).unwrap();
+        let before = value.clone();
+        let caption = recommendation_telegram_caption(&instrument, &raw, &value).unwrap();
+        assert_eq!(value, before);
+        assert_eq!(
+            caption.text,
+            concat!(
+                "🔴 SPACEUSDT · SHORT · Bybit\nЦена: 0.004156 USDT\n\n",
+                "📈 Прогноз матожидание торговли: +0.13 R\n\n",
+                "Условия сделки:\n⏳ Рекомендуемое время входа: 18:27:00 UTC\n",
+                "🎯 TP = 20%, SL = 6% (от фактической цены входа)\n",
+                "⚠️ Заходить в сделку, если цена не опустится ниже 0.004156 USDT на момент входа\n\n",
+                "Алгоритм: Всплеск цены и оборота"
+            )
+        );
+        assert!(caption.fits_photo_caption());
+        let bold: Vec<_> = caption
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Bold)
+            .map(|e| entity_text(&caption, e))
+            .collect();
+        assert_eq!(bold, ["Алгоритм"]);
+        v2::validate_entities(&caption.text, &caption.entities).unwrap();
+        // A matching timestamp is required; never silently use an unrelated forecast.
+        value["expectancy"]["forecastAtUnix"] = json!(raw.close_time_unix + 60);
+        let invalid = recommendation_telegram_caption(&instrument, &raw, &value).unwrap();
+        assert!(!invalid.text.contains("Прогноз"));
+        assert_eq!(
+            invalid.enrichment_unavailable_reason,
+            Some("invalid_saved_enrichment")
+        );
     }
 }

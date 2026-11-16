@@ -633,8 +633,9 @@ fn saved_fixed_and_adaptive_rendering_use_immutable_names_params_and_expiry() {
     let bytes = render_message(&job, now).unwrap();
     let message = RelayMessage::parse(&bytes, now).unwrap();
     assert!(message.text.contains("SHORT"));
-    assert!(message.text.contains("101,00 USDT"));
-    assert!(message.text.contains("Исследование №21"));
+    assert!(message.text.contains("101.00 USDT"));
+    assert!(message.text.contains("🎯 TP = 14%, SL = 4% (от фактической цены входа)"));
+    assert!(!message.text.contains("Исследование") && !message.text.contains("Прогноз"));
     assert!(message.text.contains("Алгоритм: Captured name"));
     job.payload["externalName"] = "Renamed after persistence".into();
     assert_eq!(

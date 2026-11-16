@@ -203,7 +203,9 @@ mod tests {
         let value:Value=serde_json::from_slice(&payload(&adaptive()).unwrap()).unwrap();
         assert_eq!(value["recommendation"]["direction"],"short");assert_eq!(value["slotId"],7);
         let text=value["message"].as_str().unwrap();
-        assert!(text.contains("SHORT"));assert!(text.contains("1970-01-02 00:03:00 UTC"));assert!(text.contains("Saved adaptive name"));
+        assert!(text.contains("SHORT"));assert!(text.contains("⏳ Рекомендуемое время входа: 00:03:00 UTC"));assert!(text.contains("Saved adaptive name"));
+        assert!(text.contains("🎯 TP = 14%, SL = 4% (от фактической цены входа)"));
+        assert!(!text.contains("1970-") && !text.contains("Прогноз") && !text.contains("матрица"));
     }
     #[test]
     fn mixed_delivery_modes_mismatched_snapshots_and_oversized_payloads_fail() {

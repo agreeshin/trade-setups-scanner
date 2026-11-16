@@ -1,89 +1,16 @@
 use super::*;
-use chrono::{DateTime, Utc};
 use setups_domain::decimal::Decimal;
 
-/// Plain text, not Telegram/HTML markup. Rendering a name cannot inject markup.
+/// Plain-text projection for Web Push and legacy relay v1. New Telegram v2
+/// uses the same text with UTF-16 entities, both with and without a PNG.
+/// Never insert markup here: names remain literal in every delivery path.
 pub fn recommendation_message(
     instrument: &AdaptiveInstrument,
     raw: &SpikeSetup,
     value: &Value,
 ) -> Result<String, WorkerError> {
-    let envelope: RecommendationEnvelope = serde_json::from_value(value.clone())?;
-    let snapshot = &envelope.snapshot;
-    let target = raw
-        .close_time_unix
-        .checked_add(
-            snapshot
-                .time_shift_minutes
-                .checked_mul(60)
-                .ok_or_else(|| invalid("entry time overflow"))?,
-        )
-        .ok_or_else(|| invalid("entry time overflow"))?;
-    let mut lines = vec![
-        format!(
-            "{} · {} · {}",
-            instrument.symbol,
-            match snapshot.direction {
-                RecommendationDirection::Short => "SHORT",
-                RecommendationDirection::Long => "LONG",
-            },
-            if instrument.exchange == "bybit" {
-                "Bybit"
-            } else {
-                &instrument.exchange
-            }
-        ),
-        format!("Цена: {} USDT", display_decimal(&raw.close_price)?),
-        String::new(),
-        "Условия сделки:".into(),
-    ];
-    if snapshot.time_shift_minutes > 0 {
-        let time = DateTime::<Utc>::from_timestamp(target, 0)
-            .ok_or_else(|| invalid("invalid entry timestamp"))?;
-        lines.push(format!(
-            "Рекомендуемое время входа: {} UTC (через {} мин после сигнала)",
-            time.format("%Y-%m-%d %H:%M:%S"),
-            snapshot.time_shift_minutes
-        ));
-    }
-    lines.push(format!(
-        "TP = {}%, SL = {}% (от фактической цены входа)",
-        snapshot.tp_pct.to_string().replace('.', ","),
-        snapshot.sl_pct.to_string().replace('.', ",")
-    ));
-    if let Some(pct) = snapshot.price_change_pct {
-        let threshold = price_threshold(&raw.close_price, pct, snapshot.direction)?;
-        lines.push(format!(
-            "Заходить в сделку, только если цена не {} {} USDT на момент входа",
-            match snapshot.direction {
-                RecommendationDirection::Short => "опустится ниже",
-                RecommendationDirection::Long => "поднимется выше",
-            },
-            threshold
-        ));
-    }
-    lines.push(String::new());
-    lines.push(
-        format!(
-            "Планируемое матожидание торговли: {:+.2} R · матрица {:+.2} R",
-            snapshot.raw_r, snapshot.mean_r
-        )
-        .replace('.', ","),
-    );
-    lines.push(String::new());
-    lines.push(format!("Алгоритм: {}", envelope.external_name));
-    if let Some(forecast) = snapshot.search_forecast {
-        if !forecast.cell_r.is_finite() || !forecast.matrix_r.is_finite() { return Err(invalid("invalid search forecast")); }
-        if let Some(blend)=forecast.blend {
-            if !blend.cell_r.is_finite() || !blend.matrix_r.is_finite() {return Err(invalid("invalid search blend"));}
-            lines.push(format!("Выбор по смеси {}/{}: {:+.2} R · score матрицы {:+.2} R",100-blend.lambda.percent(),blend.lambda.percent(),blend.cell_r,blend.matrix_r));
-        } else {
-            lines.push(format!("Выбор по прогнозу тренда ({}): {:+.2} R · score матрицы {:+.2} R",
-                if forecast.bend_days.is_linear() { "прямая" } else { forecast.bend_days.key() }, forecast.cell_r, forecast.matrix_r));
-        }
-    }
-    lines.push(format!("Исследование №{}", envelope.study_id));
-    Ok(lines.join("\n"))
+    super::caption::recommendation_telegram_caption(instrument, raw, value)
+        .map(|caption| caption.text)
 }
 
 pub(super) fn display_decimal(raw: &str) -> Result<String, WorkerError> {
@@ -233,7 +160,9 @@ fn format_amount(digits: &str, scale: usize, negative: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::DateTime;
     use setups_domain::AlgorithmParams;
+    use setups_domain::expectancy::MetricAvailability;
 
     #[test]
     fn adaptive_push_text_uses_saved_direction_risks_name_and_raw_time() {
@@ -259,13 +188,65 @@ mod tests {
             "rawSignalAt":86400,"recommendedEntryAt":86580});
         let message = recommendation_message(&instrument, &raw, &snapshot).unwrap();
         assert!(message.contains("BTCUSDT · SHORT · Bybit"));
-        assert!(message.contains("1970-01-02 00:03:00 UTC"));
-        assert!(message.contains("не опустится ниже 101,00 USDT"));
-        assert!(message.contains("TP = 14%, SL = 4% (от фактической цены входа)"));
-        assert!(message.contains("+0,32 R · матрица +0,21 R"));
+        assert!(message.contains("⏳ Рекомендуемое время входа: 00:03:00 UTC"));
+        assert!(message.contains("не опустится ниже 101.00 USDT"));
+        assert!(message.contains("🎯 TP = 14%, SL = 4% (от фактической цены входа)"));
+        assert!(!message.contains("Прогноз") && !message.contains("матрица"));
         assert!(message.contains("Алгоритм: <b>*plain name*"));
-        assert!(message.contains("Исследование №42"));
-        assert!(!message.contains("0,29"));
+        assert!(!message.contains("Исследование") && !message.contains("1970-"));
+
+        let envelope = serde_json::from_value(snapshot.clone()).unwrap();
+        let mut saved =
+            super::super::enrichment::freeze(&envelope, raw.close_time_unix, None).unwrap();
+        for (forecast, expected) in [
+            (Some(0.13), Some("📈 Прогноз матожидание торговли: +0.13 R")),
+            (
+                Some(-0.13),
+                Some("📉 Прогноз матожидание торговли: -0.13 R"),
+            ),
+            (Some(0.0), Some("📈 Прогноз матожидание торговли: +0.00 R")),
+            (
+                Some(-0.001),
+                Some("📉 Прогноз матожидание торговли: -0.00 R"),
+            ),
+            (None, None),
+        ] {
+            if let Some(value) = forecast {
+                saved.forecast_r = MetricAvailability::Available { value };
+            } else {
+                saved =
+                    super::super::enrichment::freeze(&envelope, raw.close_time_unix, None).unwrap();
+            }
+            snapshot["expectancy"] = serde_json::to_value(&saved).unwrap();
+            let before = snapshot.clone();
+            let text = recommendation_message(&instrument, &raw, &snapshot).unwrap();
+            let rich = super::super::caption::recommendation_telegram_caption(
+                &instrument,
+                &raw,
+                &snapshot,
+            )
+            .unwrap();
+            assert_eq!(snapshot, before);
+            assert_eq!(text, rich.text);
+            if let Some(expected) = expected {
+                assert!(text.contains(&format!("USDT\n\n{expected}\n\nУсловия сделки:")));
+                assert_eq!(text.matches("Прогноз матожидание торговли:").count(), 1);
+            } else {
+                assert!(!text.contains("Прогноз") && !text.contains('📈') && !text.contains('📉'));
+                assert!(text.contains("USDT\n\nУсловия сделки:"));
+            }
+            for forbidden in [
+                "Среднее МО",
+                "Планируемое",
+                "винрейт",
+                "матриц",
+                "Динамика",
+                "🔖",
+            ] {
+                assert!(!text.contains(forbidden));
+            }
+        }
+        snapshot.as_object_mut().unwrap().remove("expectancy");
 
         // A chart candle labelled 17:24 closes at 17:25; shift 3 enters at 17:28.
         raw.open_time_unix = DateTime::parse_from_rfc3339("2026-11-13T17:24:00Z")
@@ -275,19 +256,20 @@ mod tests {
         snapshot["rawSignalAt"] = json!(raw.close_time_unix);
         snapshot["recommendedEntryAt"] = json!(raw.close_time_unix + 3 * 60);
         let message = recommendation_message(&instrument, &raw, &snapshot).unwrap();
-        assert!(message.contains("2026-11-13 17:28:00 UTC"));
+        assert!(message.contains("⏳ Рекомендуемое время входа: 17:28:00 UTC"));
+        assert!(!message.contains("2026-11-13"));
 
         snapshot["direction"] = json!("long");
         snapshot["priceChangePct"] = json!(-1);
         snapshot["timeShiftMinutes"] = json!(0);
         let message = recommendation_message(&instrument, &raw, &snapshot).unwrap();
-        assert!(message.contains("не поднимется выше 101,00 USDT"));
+        assert!(message.contains("не поднимется выше 101.00 USDT"));
         assert!(!message.contains("Рекомендуемое время входа"));
         snapshot["priceChangePct"] = json!(0);
         assert!(
             recommendation_message(&instrument, &raw, &snapshot)
                 .unwrap()
-                .contains("не поднимется выше 100,00 USDT")
+                .contains("не поднимется выше 100.00 USDT")
         );
         snapshot["priceChangePct"] = Value::Null;
         assert!(

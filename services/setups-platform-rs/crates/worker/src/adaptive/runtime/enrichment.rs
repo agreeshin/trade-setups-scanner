@@ -814,18 +814,10 @@ mod tests {
             &setup.recommendation,
         )
         .unwrap();
-        assert!(caption.text.contains("📈 Прогноз МО: +2.11 R"));
-        assert!(caption.text.contains("Средний винрейт: 71.11%"));
-        assert!(
-            caption
-                .text
-                .contains("Динамика МО за последние 8 суток: +1.62 R")
-        );
-        assert!(
-            caption
-                .text
-                .contains("Среднее МО за последние 8 суток: +1.84 R")
-        );
+        assert!(caption.text.contains("📈 Прогноз матожидание торговли: +2.11 R"));
+        assert!(!caption.text.contains("винрейт"));
+        assert!(!caption.text.contains("Динамика МО"));
+        assert!(!caption.text.contains("Среднее МО"));
     }
 
     #[test]
@@ -849,7 +841,7 @@ mod tests {
             &legacy,
         )
         .unwrap();
-        assert!(before.text.contains("Средний винрейт: недоступно"));
+        assert!(!before.text.contains("винрейт") && !before.text.contains("Прогноз"));
         attach(&slot, &instrument, &mut setup, None, None).unwrap();
         assert_eq!(legacy.get("expectancy"), None); // source value is not mutated
         assert_eq!(setup.recommendation["expectancy"]["tpCount"], Value::Null);
@@ -877,7 +869,7 @@ mod tests {
             &tampered,
         )
         .unwrap();
-        assert!(caption.text.contains("Прогноз МО: недоступно"));
+        assert!(!caption.text.contains("Прогноз"));
         assert_eq!(
             caption.enrichment_unavailable_reason,
             Some("invalid_saved_enrichment")
@@ -1042,8 +1034,7 @@ mod tests {
             &setup.recommendation,
         )
         .unwrap();
-        assert!(caption.text.contains("Средний винрейт: 71.11%"));
-        assert!(caption.text.contains("Прогноз МО: недоступно"));
+        assert!(!caption.text.contains("винрейт") && !caption.text.contains("Прогноз"));
     }
 
     #[test]
@@ -1110,7 +1101,7 @@ mod tests {
             &setup.recommendation,
         )
         .unwrap();
-        assert!(caption.text.contains("📈 Прогноз МО: +2.11 R"));
+        assert!(caption.text.contains("📈 Прогноз матожидание торговли: +2.11 R"));
         assert!(serde_json::to_vec(&saved).unwrap().len() < MAX_EXPECTANCY_SNAPSHOT_BYTES);
     }
 
