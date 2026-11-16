@@ -94,6 +94,9 @@ async fn snapshot(tx: &mut Transaction<'_, Postgres>, owner: &str) -> Result<Pre
     let fingerprint: String = sqlx::query_scalar("select md5($1::jsonb::text)")
         .bind(&state).fetch_one(&mut **tx).await?;
     let mut blockers = Vec::new();
+    let referenced:bool=sqlx::query_scalar("select exists(select 1 from adaptive_profiles where owner_id=$1) or exists(select 1 from adaptive_profile_handoffs where owner_id=$1 and status='pending')")
+        .bind(owner).fetch_one(&mut **tx).await?;
+    if referenced {blockers.push("accepted_profile_references".into());}
     if state["busy"] == true { blockers.push("continuous_not_stopped".into()); }
     if state["ownershipConflict"] == true { blockers.push("ownership_conflict".into()); }
     Ok(Preview { eligible: blockers.is_empty(), blockers, fingerprint,

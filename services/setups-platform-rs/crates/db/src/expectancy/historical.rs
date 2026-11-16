@@ -80,7 +80,7 @@ fn decode_stage(row: sqlx::postgres::PgRow) -> Result<HistoricalStage, DbError> 
 
 /// Capture only a currently enabled legacy binding, never pending/inactive history.
 pub async fn admit_historical_recalculation(pool:&PgPool, owner:&str, generation:i64) -> Result<Option<HistoricalAdmission>,DbError> {
-    let row = sqlx::query("select p.config_revision,g.expectancy_artifact_id from continuous_slots s join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id join continuous_generations g on g.id=s.active_generation_id and g.owner_id=s.owner_id and g.slot_id=s.id where s.owner_id=$1 and s.active_generation_id=$2 and s.enabled and p.desired_running and p.config->>'adaptiveEnabled'='true' and g.status='completed'")
+    let row = sqlx::query("select p.config_revision,g.expectancy_artifact_id from continuous_slots s join adaptive_live_controls p on p.id=s.id join continuous_generations g on g.id=s.active_generation_id and g.owner_id=s.owner_id and g.slot_id=s.id where s.owner_id=$1 and s.active_generation_id=$2 and p.desired_running and p.config->>'adaptiveEnabled'='true' and g.status='completed'")
         .bind(owner).bind(generation).fetch_optional(pool).await?;
     let Some(row)=row else {return Ok(None);};
     let id:Option<i64>=row.try_get("expectancy_artifact_id")?;
@@ -159,9 +159,9 @@ pub fn historical_expected_comparison(source:&SavedSource,tp:f64,sl:f64)->Result
 
 async fn binding_matches(tx:&mut Transaction<'_,Postgres>,admission:&HistoricalAdmission,lock:bool)->Result<bool,DbError> {
     let query=if lock {
-        "select p.config_revision,g.study_id,g.expectancy_artifact_id from continuous_slots s join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id join continuous_generations g on g.id=s.active_generation_id and g.slot_id=s.id and g.owner_id=s.owner_id where s.owner_id=$1 and s.id=$2 and s.active_generation_id=$3 and s.enabled and p.desired_running and p.config->>'adaptiveEnabled'='true' and g.status='completed' for update of s"
+        "select p.config_revision,g.study_id,g.expectancy_artifact_id from continuous_slots s join adaptive_live_controls p on p.id=s.id join continuous_generations g on g.id=s.active_generation_id and g.slot_id=s.id and g.owner_id=s.owner_id where s.owner_id=$1 and s.id=$2 and s.active_generation_id=$3 and p.desired_running and p.config->>'adaptiveEnabled'='true' and g.status='completed' for update of s"
     } else {
-        "select p.config_revision,g.study_id,g.expectancy_artifact_id from continuous_slots s join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id join continuous_generations g on g.id=s.active_generation_id and g.slot_id=s.id and g.owner_id=s.owner_id where s.owner_id=$1 and s.id=$2 and s.active_generation_id=$3 and s.enabled and p.desired_running and p.config->>'adaptiveEnabled'='true' and g.status='completed'"
+        "select p.config_revision,g.study_id,g.expectancy_artifact_id from continuous_slots s join adaptive_live_controls p on p.id=s.id join continuous_generations g on g.id=s.active_generation_id and g.slot_id=s.id and g.owner_id=s.owner_id where s.owner_id=$1 and s.id=$2 and s.active_generation_id=$3 and p.desired_running and p.config->>'adaptiveEnabled'='true' and g.status='completed'"
     };
     let row=sqlx::query(query).bind(&admission.original_artifact.identity.owner_id).bind(admission.source.slot_id)
         .bind(admission.source.generation_id).fetch_optional(&mut **tx).await?;

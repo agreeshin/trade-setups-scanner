@@ -14,7 +14,8 @@ const TELEGRAM_RELAY: &str = "0019_telegram_relay.sql";
 const STUDY_EXPECTANCY: &str = "0020_study_expectancy.sql";
 const TELEGRAM_V2_QUEUE: &str = "0021_telegram_v2_queue.sql";
 const HISTORICAL_EXPECTANCY: &str = "0022_historical_expectancy.sql";
-const MIGRATIONS: &[&str] = &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP, INDEPENDENT_LIVE_INITIALIZATION, CONTINUOUS_RESUME, LIVE_READMISSION, TELEGRAM_RELAY, STUDY_EXPECTANCY, TELEGRAM_V2_QUEUE, HISTORICAL_EXPECTANCY];
+const STANDALONE_PROFILES: &str = "0023_standalone_adaptive_profiles.sql";
+const MIGRATIONS: &[&str] = &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP, INDEPENDENT_LIVE_INITIALIZATION, CONTINUOUS_RESUME, LIVE_READMISSION, TELEGRAM_RELAY, STUDY_EXPECTANCY, TELEGRAM_V2_QUEUE, HISTORICAL_EXPECTANCY, STANDALONE_PROFILES];
 
 fn migration_source(name: &str) -> &'static str {
     match name {
@@ -31,6 +32,7 @@ fn migration_source(name: &str) -> &'static str {
         STUDY_EXPECTANCY => include_str!("../migrations/0020_study_expectancy.sql"),
         TELEGRAM_V2_QUEUE => include_str!("../migrations/0021_telegram_v2_queue.sql"),
         HISTORICAL_EXPECTANCY => include_str!("../migrations/0022_historical_expectancy.sql"),
+        STANDALONE_PROFILES => include_str!("../migrations/0023_standalone_adaptive_profiles.sql"),
         other => unreachable!("unknown migration {other}"),
     }
 }
@@ -90,7 +92,7 @@ mod tests {
 
     #[test]
     fn run_names_migration_is_registered_after_baseline() {
-        assert_eq!(MIGRATIONS, &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP, INDEPENDENT_LIVE_INITIALIZATION, CONTINUOUS_RESUME, LIVE_READMISSION, TELEGRAM_RELAY, STUDY_EXPECTANCY, TELEGRAM_V2_QUEUE, HISTORICAL_EXPECTANCY]);
+        assert_eq!(MIGRATIONS, &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP, INDEPENDENT_LIVE_INITIALIZATION, CONTINUOUS_RESUME, LIVE_READMISSION, TELEGRAM_RELAY, STUDY_EXPECTANCY, TELEGRAM_V2_QUEUE, HISTORICAL_EXPECTANCY, STANDALONE_PROFILES]);
         let source = migration_source(RUN_NAMES);
         assert!(
             source.contains("ALTER TABLE public.replay_runs ADD COLUMN IF NOT EXISTS name text")

@@ -191,11 +191,11 @@ pub struct ActiveEnrichmentBinding {
 }
 
 pub async fn active_enrichment_high_water(pool: &PgPool) -> Result<i64, DbError> {
-    Ok(sqlx::query_scalar("select coalesce(max(id),0) from continuous_slots where enabled and active_generation_id is not null").fetch_one(pool).await?)
+    Ok(sqlx::query_scalar("select coalesce(max(s.id),0) from continuous_slots s join adaptive_profiles p on p.id=s.id where p.desired_running and s.active_generation_id is not null").fetch_one(pool).await?)
 }
 
 pub async fn active_enrichment_page(pool: &PgPool, after_slot: i64, through_slot: i64) -> Result<Vec<ActiveEnrichmentBinding>, DbError> {
-    let rows=sqlx::query("select s.id,s.owner_id,s.active_generation_id from continuous_slots s join continuous_generations g on g.id=s.active_generation_id and g.owner_id=s.owner_id and g.slot_id=s.id where s.enabled and s.id>$1 and s.id<=$2 and not exists(select 1 from study_expectancy_artifacts a where a.owner_id=s.owner_id and a.source_generation_id=s.active_generation_id and a.calculation_version=$3) order by s.id limit 16")
+    let rows=sqlx::query("select s.id,s.owner_id,s.active_generation_id from continuous_slots s join adaptive_profiles p on p.id=s.id join continuous_generations g on g.id=s.active_generation_id and g.owner_id=s.owner_id and g.slot_id=s.id where p.desired_running and s.id>$1 and s.id<=$2 and not exists(select 1 from study_expectancy_artifacts a where a.owner_id=s.owner_id and a.source_generation_id=s.active_generation_id and a.calculation_version=$3) order by s.id limit 16")
         .bind(after_slot).bind(through_slot).bind(setups_domain::expectancy::EXPECTANCY_CALCULATION_VERSION.to_string()).fetch_all(pool).await?;
     rows.into_iter().map(|row|Ok(ActiveEnrichmentBinding {slot_id:row.try_get("id")?,owner_id:row.try_get("owner_id")?,generation_id:row.try_get("active_generation_id")?})).collect()
 }

@@ -53,7 +53,7 @@ impl PromotionStore for PgPromotion<'_> {
     async fn reread(&self)->Result<Durable,WorkerError> {
         let mut tx=self.pool.begin().await?;
         sqlx::query("set transaction isolation level repeatable read read only").execute(&mut *tx).await?;
-        let slot=sqlx::query("select s.active_generation_id,s.pending_generation_id,s.enabled,p.desired_running,p.config_revision,p.config,g.live_readiness from continuous_slots s join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id left join continuous_generations g on g.id=s.active_generation_id where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3")
+        let slot=sqlx::query("select s.active_generation_id,s.pending_generation_id,p.desired_running as enabled,p.desired_running,p.config_revision,p.config,g.live_readiness from continuous_slots s join adaptive_live_controls p on p.id=s.id left join continuous_generations g on g.id=s.active_generation_id where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3")
             .bind(self.lease.slot_id).bind(&self.lease.owner_id).bind(&self.lease.algorithm_id).fetch_optional(&mut *tx).await?;
         let Some(slot)=slot else {return Ok(Durable::Lost);};
         if !slot.try_get::<bool,_>("enabled")? || !slot.try_get::<bool,_>("desired_running")?
@@ -116,6 +116,7 @@ mod tests {
             .execute(&mut *connection).await.unwrap();drop(connection);
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
         continuous::configure(&pool,"admin","price_volume_spike",&json!({"adaptiveEnabled":true}),&[0.0,1.0]).await.unwrap();
+        continuous::profiles::set_permission(&pool,"admin","price_volume_spike",true).await.unwrap();
         continuous::start(&pool,"admin","price_volume_spike").await.unwrap();
         setups_db::settings_set(&pool,"live",&json!({"enabled":true})).await.unwrap();
         let slot:i64=sqlx::query_scalar("select min(id) from continuous_slots").fetch_one(&pool).await.unwrap();
@@ -125,6 +126,8 @@ mod tests {
                 .bind(slot).bind(json!({"instruments":[{"exchange":"test","category":"linear","symbol":"TESTUSDT"},{"exchange":"test","category":"linear","symbol":"WAITUSDT"}]}))
                 .bind(json!({"meanExpectancy":0.21,"selectedCell":{}})).fetch_one(&pool).await.unwrap();generations.push(generation);
         }
+        sqlx::query("insert into adaptive_profiles(id,owner_id,algorithm_id,min_setups_per_day,accepted_generation_id) select id,owner_id,algorithm_id,min_setups_per_day,$2 from continuous_slots where id=$1")
+            .bind(slot).bind(generations[1]).execute(&pool).await.unwrap();
         let lease=live::WarmupLease {owner_id:"admin".into(),algorithm_id:"price_volume_spike".into(),slot_id:slot,
             generation_id:generations[1],config_revision:1,worker:"fixture".into(),token:42,
             initialization:live::LiveInitialization {version:1,anchor_close_unix:180,detector_from_open_unix:0,emit_from_close_unix:240},
@@ -180,7 +183,10 @@ mod tests {
         assert_eq!(lost_join.0.reread().await.unwrap(),super::super::store::JoinDurable::Changed);
         sqlx::query("update adaptive_live_checkpoints set state=jsonb_set(state,'{nextOpenUnix}','240'::jsonb) where slot_id=$1").bind(slot).execute(&pool).await.unwrap();
         assert_eq!(store.0.reread().await.unwrap(),Durable::Advanced);
-        continuous::stop(&pool,"admin","price_volume_spike").await.unwrap();assert_eq!(store.0.reread().await.unwrap(),Durable::Lost);
+        continuous::stop(&pool,"admin","price_volume_spike").await.unwrap();assert_eq!(store.0.reread().await.unwrap(),Durable::Advanced);
+        let command=continuous::profiles::ProfileCommand{expected_revision:1,expected_generation_id:generations[1],request_id:"promotion-stop-000001".into()};
+        assert!(matches!(continuous::profiles::command(&pool,"admin",slot,false,&command).await.unwrap(),continuous::profiles::CommandOutcome::Applied(_)));
+        assert_eq!(store.0.reread().await.unwrap(),Durable::Lost);
         pool.close().await;sqlx::query(&format!("drop database {name} with (force)")).execute(&mut admin).await.unwrap();
     }
 

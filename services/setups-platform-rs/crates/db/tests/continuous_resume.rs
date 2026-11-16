@@ -164,7 +164,7 @@ async fn incompatible_generation_fails_visibly_preserves_completed_child_and_rec
 
 #[tokio::test]
 #[ignore="requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
-async fn uncertain_recovery_claims_are_bounded_keep_head_and_explicit_start_retries_same_ids() {
+async fn uncertain_recovery_claims_are_bounded_keep_head_and_explicit_recovery_retries_same_ids() {
     isolated(|pool|async move {
         let mut current=job(&pool).await;snapshot(&pool,&current).await;
         recovery::save_checkpoint(&pool,&current,&identity(),b"committed",2*1024*1024).await.unwrap();
@@ -195,7 +195,8 @@ async fn uncertain_recovery_claims_are_bounded_keep_head_and_explicit_start_retr
         assert_eq!(sqlx::query_scalar::<_,Vec<u8>>("select checkpoint from continuous_runtime_artifacts").fetch_one(&pool).await.unwrap(),b"committed");
         maintenance::set_paused(&pool,OWNER,true).await.unwrap();maintenance::set_paused(&pool,OWNER,false).await.unwrap();
         assert!(scheduler::claim_owner(&pool,"maintenance-is-not-start").await.unwrap().is_none());
-        assert!(db::start(&pool,OWNER,ALGORITHM).await.unwrap());
+        assert!(!db::start(&pool,OWNER,ALGORITHM).await.unwrap(),"new Start cannot silently retry an exhausted head");
+        assert!(db::retry_recovery(&pool,OWNER,ALGORITHM).await.unwrap());
         let lease=scheduler::claim_owner(&pool,"explicit-same-head-retry").await.unwrap().unwrap();scheduler::recover_owner(&pool,&lease).await.unwrap();
         let same=recovery::active_job(&pool,&lease).await.unwrap().unwrap();
         assert_eq!((same.generation_id,same.study_id,same.research_deadline),(original.generation_id,original.study_id,original.research_deadline));
@@ -230,7 +231,8 @@ async fn queued_or_stopping_other_algorithm_cannot_bypass_active_backoff_or_exha
         assert_eq!(sqlx::query_scalar::<_,Vec<u8>>("select checkpoint from continuous_runtime_artifacts").fetch_one(&pool).await.unwrap(),b"retained-head");
         scheduler::release(&pool,&housekeeping).await.unwrap();db::start(&pool,OWNER,OTHER).await.unwrap();
         assert!(scheduler::claim_owner(&pool,"restarted-b-still-cannot-bypass-a").await.unwrap().is_none());
-        db::start(&pool,OWNER,ALGORITHM).await.unwrap();
+        assert!(!db::start(&pool,OWNER,ALGORITHM).await.unwrap());
+        assert!(db::retry_recovery(&pool,OWNER,ALGORITHM).await.unwrap());
         let lease=scheduler::claim_owner(&pool,"explicitly-retry-a").await.unwrap().unwrap();scheduler::recover_owner(&pool,&lease).await.unwrap();
         let same=recovery::active_job(&pool,&lease).await.unwrap().unwrap();
         assert_eq!((same.generation_id,same.study_id,same.research_deadline),(original.generation_id,original.study_id,original.research_deadline));
@@ -269,7 +271,8 @@ async fn third_recovery_crash_before_defer_gets_metadata_only_latch_not_a_fourth
             if stop_other {assert_eq!(db::get(&pool,OWNER,OTHER).await.unwrap().unwrap().status,"stopped");}
             assert_eq!(sqlx::query_scalar::<_,Vec<u8>>("select checkpoint from continuous_runtime_artifacts").fetch_one(&pool).await.unwrap(),b"third-attempt-head");
             scheduler::release(&pool,&latch).await.unwrap();assert!(scheduler::claim_owner(&pool,"no-metadata-spin").await.unwrap().is_none());
-            db::start(&pool,OWNER,ALGORITHM).await.unwrap();
+            assert!(!db::start(&pool,OWNER,ALGORITHM).await.unwrap());
+            assert!(db::retry_recovery(&pool,OWNER,ALGORITHM).await.unwrap());
             let retry=scheduler::claim_owner(&pool,"explicit-after-crash").await.unwrap().unwrap();scheduler::recover_owner(&pool,&retry).await.unwrap();
             let same=recovery::active_job(&pool,&retry).await.unwrap().unwrap();
             assert_eq!((same.generation_id,same.study_id,same.research_deadline),(old.generation_id,old.study_id,old.research_deadline));

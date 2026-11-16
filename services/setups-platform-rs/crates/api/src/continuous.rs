@@ -240,9 +240,98 @@ pub fn continuous_router(state: Arc<ContinuousState>) -> Router {
         )
         .route("/v1/continuous-studies/{algorithm}/start", post(start))
         .route("/v1/continuous-studies/{algorithm}/stop", post(stop))
+        .route("/v1/continuous-studies/{algorithm}/recovery/retry",post(retry_recovery))
         .route("/v1/continuous-studies/{algorithm}/slots/{slot}/live-readmission",post(live_readmission))
+        .route("/v1/adaptive-profiles",get(profiles))
+        .route("/v1/adaptive-profiles/{profile}",get(profile_detail))
+        .route("/v1/adaptive-profiles/{profile}/stop",post(profile_stop))
+        .route("/v1/adaptive-profiles/{profile}/play",post(profile_play))
+        .route("/v1/adaptive-live/{algorithm}/permission",get(live_permission).put(save_live_permission))
         .layer(DefaultBodyLimit::max(cap))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct ProfilesQuery {algorithm_id:Option<String>,offset:Option<i64>,limit:Option<i64>}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LivePermissionRequest {enabled:bool}
+async fn live_permission(State(state):State<Arc<ContinuousState>>,headers:HeaderMap,Path(id):Path<String>)->Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,false) {return error;}
+    if !registered(&id) {return response(StatusCode::BAD_REQUEST,json!({"error":"unknown_algorithm"}));}
+    match db::profiles::permission(&state.pool,ADMIN_OWNER,&id).await {
+        Ok(enabled)=>response(StatusCode::OK,json!({"algorithmId":id,"enabled":enabled})),Err(error)=>failure("live permission",error),
+    }
+}
+async fn save_live_permission(State(state):State<Arc<ContinuousState>>,headers:HeaderMap,Path(id):Path<String>,body:String)->Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,true) {return error;}
+    if !registered(&id) {return response(StatusCode::BAD_REQUEST,json!({"error":"unknown_algorithm"}));}
+    let Ok(request)=serde_json::from_str::<LivePermissionRequest>(&body) else {return response(StatusCode::BAD_REQUEST,json!({"error":"invalid_live_permission"}));};
+    match db::profiles::set_permission(&state.pool,ADMIN_OWNER,&id,request.enabled).await {
+        Ok(())=>response(StatusCode::OK,json!({"algorithmId":id,"enabled":request.enabled})),Err(error)=>failure("live permission",error),
+    }
+}
+async fn profiles(State(state):State<Arc<ContinuousState>>,headers:HeaderMap,query:Result<Query<ProfilesQuery>,QueryRejection>)->Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,false) {return error;}
+    let Ok(Query(query))=query else {return response(StatusCode::BAD_REQUEST,json!({"error":"invalid_query"}));};
+    let offset=query.offset.unwrap_or(0);let limit=query.limit.unwrap_or(50);
+    if offset<0 || !(1..=100).contains(&limit) || query.algorithm_id.as_deref().is_some_and(|a|!registered(a)) {
+        return response(StatusCode::BAD_REQUEST,json!({"error":"invalid_query"}));
+    }
+    match db::profiles::list(&state.pool,ADMIN_OWNER,query.algorithm_id.as_deref(),offset,limit).await {
+        Ok(value)=>response(StatusCode::OK,value),Err(error)=>failure("profile list",error),
+    }
+}
+async fn profile_detail(State(state):State<Arc<ContinuousState>>,headers:HeaderMap,Path(id):Path<i64>)->Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,false) {return error;}
+    match db::profiles::detail(&state.pool,ADMIN_OWNER,id).await {
+        Ok(Some(value))=>response(StatusCode::OK,value),Ok(None)=>response(StatusCode::NOT_FOUND,json!({"error":"profile_not_found"})),
+        Err(error)=>failure("profile detail",error),
+    }
+}
+async fn profile_change(state:Arc<ContinuousState>,headers:HeaderMap,id:i64,body:String,play:bool)->Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,true) {return error;}
+    let request=match serde_json::from_str::<db::profiles::ProfileCommand>(&body) {
+        Ok(request) if id>0 && request.validate().is_ok()=>request,
+        _=>return response(StatusCode::BAD_REQUEST,json!({"error":"invalid_profile_command"})),
+    };
+    match db::profiles::command(&state.pool,ADMIN_OWNER,id,play,&request).await {
+        Ok(db::profiles::CommandOutcome::Applied(value))=>response(StatusCode::OK,value),
+        Ok(db::profiles::CommandOutcome::NotFound)=>response(StatusCode::NOT_FOUND,json!({"error":"profile_not_found"})),
+        Ok(db::profiles::CommandOutcome::Conflict(code))=>response(StatusCode::CONFLICT,json!({"error":code})),
+        Ok(db::profiles::CommandOutcome::Limited{resource,limit})=>response(StatusCode::TOO_MANY_REQUESTS,json!({"error":resource,"resource":resource,"limit":limit})),
+        Err(error)=>failure("profile command",error),
+    }
+}
+async fn profile_stop(State(state):State<Arc<ContinuousState>>,headers:HeaderMap,Path(id):Path<i64>,body:String)->Response {
+    profile_change(state,headers,id,body,false).await
+}
+async fn profile_play(State(state):State<Arc<ContinuousState>>,headers:HeaderMap,Path(id):Path<i64>,body:String)->Response {
+    profile_change(state,headers,id,body,true).await
+}
+async fn retry_recovery(State(state):State<Arc<ContinuousState>>,headers:HeaderMap,Path(id):Path<String>)->Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,true) {return error;}
+    if !registered(&id) {return response(StatusCode::BAD_REQUEST,json!({"error":"unknown_algorithm"}));}
+    match db::retry_recovery(&state.pool,ADMIN_OWNER,&id).await {
+        Ok(true)=>{state.notify.notify_waiters();current_response(&state,&id,StatusCode::ACCEPTED).await},
+        Ok(false)=>response(StatusCode::CONFLICT,json!({"error":"research_recovery_not_eligible"})),
+        Err(error)=>failure("research recovery",error),
+    }
+}
+
+/// Optional deployment overrides. Per-owner limits remain an externally owned
+/// DB configuration, never supplied by browser profile/research commands.
+pub async fn configure_profile_limits_from_env(pool:&sqlx::PgPool)->Result<(),String> {
+    let total=std::env::var("ADAPTIVE_PROFILE_TOTAL_LIMIT").ok();
+    let running=std::env::var("ADAPTIVE_PROFILE_RUNNING_LIMIT").ok();
+    if total.is_none() && running.is_none() {return Ok(());}
+    let base=setups_db::settings_get(pool,"adaptiveProfileLimits").await.map_err(|e|e.to_string())?.ok_or("missing adaptive profile limits")?;
+    let mut limits:db::profiles::ProfileLimits=serde_json::from_value(base).map_err(|e|e.to_string())?;
+    for (value,target,name) in [(total,&mut limits.total_profiles,"ADAPTIVE_PROFILE_TOTAL_LIMIT"),(running,&mut limits.running_profiles,"ADAPTIVE_PROFILE_RUNNING_LIMIT")] {
+        if let Some(value)=value {*target=value.parse().map_err(|_|format!("{name} must be a positive integer"))?;}
+    }
+    db::profiles::configure_default_limits(pool,limits).await.map_err(|e|e.to_string())
 }
 
 async fn live_readmission(State(state):State<Arc<ContinuousState>>,headers:HeaderMap,Path((algorithm,slot)):Path<(String,String)>,body:String)->Response {
@@ -447,6 +536,22 @@ async fn stop(
 #[cfg(test)]
 mod tests {
     use super::ContinuousRuntimeConfig;
+
+    #[tokio::test]
+    async fn independent_profile_and_permission_routes_authenticate_before_database_access() {
+        use std::sync::{Arc,atomic::AtomicBool};
+        use tower::ServiceExt;
+        let state=Arc::new(super::ContinuousState{pool:sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://invalid:invalid@127.0.0.1:1/never_connect_test").unwrap(),
+            auth:Arc::new(crate::auth::SessionAuth::new(&["fixture-key".into()])),config:ContinuousRuntimeConfig::default(),
+            notify:Arc::new(tokio::sync::Notify::new()),available:Arc::new(AtomicBool::new(true))});
+        let app=super::continuous_router(state);
+        for (method,path) in [("GET","/v1/adaptive-profiles"),("GET","/v1/adaptive-profiles/1"),("POST","/v1/adaptive-profiles/1/stop"),("POST","/v1/adaptive-profiles/1/play"),("GET","/v1/adaptive-live/price_volume_spike/permission"),("PUT","/v1/adaptive-live/price_volume_spike/permission"),("POST","/v1/continuous-studies/price_volume_spike/recovery/retry")] {
+            let response=app.clone().oneshot(axum::http::Request::builder().method(method).uri(path).body(axum::body::Body::from("{}")).unwrap()).await.unwrap();
+            assert_eq!(response.status(),axum::http::StatusCode::UNAUTHORIZED,"{method} {path}");
+        }
+        let response=app.oneshot(axum::http::Request::builder().method("POST").uri("/v1/adaptive-profiles/1/play").header("x-api-key","fixture-key").body(axum::body::Body::from(r#"{"expectedRevision":1,"expectedGenerationId":2,"requestId":"fixture-000000001","totalProfiles":999}"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(),axum::http::StatusCode::BAD_REQUEST,"browser cannot raise quotas through profile commands");
+    }
 
     #[test]
     fn trend_settings_are_additive_strict_and_preserve_legacy_mean_config() {

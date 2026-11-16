@@ -139,6 +139,7 @@ async fn configured(pool: &PgPool, owner: &str, algorithm: &str) -> i64 {
             .unwrap()
     );
     assert!(db::start(pool, owner, algorithm).await.unwrap());
+    db::profiles::set_permission(pool,owner,algorithm,true).await.unwrap();
     db::get(pool, owner, algorithm)
         .await
         .unwrap()
@@ -209,7 +210,7 @@ async fn accepted(pool: &PgPool) -> db::ActiveAdaptiveSlot {
     let selected = json!({"tpPct":14,"slPct":4,"rawR":0.32,"robustScore":0.29});
     let result = json!({"best":{"params":SpikeParams::default(),"analytics":{"clusterEnabled":true,
         "clusterGapMinutes":480,"timeShiftMinutes":5,"priceChangePct":1}},
-        "selectedCell":selected,"immutable":"accepted-profile"});
+        "selectedCell":selected,"meanExpectancy":0.21,"immutable":"accepted-profile"});
     sqlx::query(
         "update continuous_generations set study_id=$2,accepted=true,result=$3 where id=$1",
     )
@@ -221,6 +222,8 @@ async fn accepted(pool: &PgPool) -> db::ActiveAdaptiveSlot {
     .unwrap();
     sqlx::query("update continuous_slots set active_generation_id=$2,study_id=$3,mean_expectancy=0.21,selected_cell=$4,status='ready' where id=$1")
         .bind(slot).bind(generation).bind(study).bind(selected).execute(pool).await.unwrap();
+    sqlx::query("insert into adaptive_profiles(id,owner_id,algorithm_id,min_setups_per_day,accepted_generation_id) select id,owner_id,algorithm_id,min_setups_per_day,$2 from continuous_slots where id=$1")
+        .bind(slot).bind(generation).execute(pool).await.unwrap();
     sqlx::query("update continuous_processes set active_generation_id=$3,active_study_id=$4 where owner_id=$1 and algorithm_id=$2")
         .bind(OWNER).bind(ALGORITHM).bind(generation).bind(study).execute(pool).await.unwrap();
     sqlx::query("insert into settings(key,value) values('live','{\"enabled\":true}'),($1,$2) on conflict(key) do update set value=excluded.value")
@@ -250,6 +253,162 @@ fn adaptive_write(open: i64) -> db::AdaptiveSetupWrite {
             "meanR":0.21,"timeShiftMinutes":5,"priceChangePct":1,"rawSignalAt":open+60,
             "recommendedEntryAt":open+360,"externalName":"original recommendation"}),
     }
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn n8_migration_preserves_six_incumbents_17_to_22_and_all_durable_links() {
+    isolated(|pool|async move {
+        for (name,source) in [
+            ("0013_continuous_studies.sql",include_str!("../migrations/0013_continuous_studies.sql")),
+            ("0014_adaptive_live_readiness.sql",include_str!("../migrations/0014_adaptive_live_readiness.sql")),
+            ("0015_continuous_history_cleanup.sql",include_str!("../migrations/0015_continuous_history_cleanup.sql")),
+            ("0016_independent_live_initialization.sql",include_str!("../migrations/0016_independent_live_initialization.sql")),
+            ("0017_continuous_resume.sql",include_str!("../migrations/0017_continuous_resume.sql")),
+            ("0018_live_readmission.sql",include_str!("../migrations/0018_live_readmission.sql")),
+            ("0019_telegram_relay.sql",include_str!("../migrations/0019_telegram_relay.sql")),
+            ("0020_study_expectancy.sql",include_str!("../migrations/0020_study_expectancy.sql")),
+            ("0021_telegram_v2_queue.sql",include_str!("../migrations/0021_telegram_v2_queue.sql")),
+            ("0022_historical_expectancy.sql",include_str!("../migrations/0022_historical_expectancy.sql")),
+        ] {
+            sqlx::raw_sql(source).execute(&pool).await.unwrap();
+            sqlx::query("insert into kysely_migration values($1,'fixture')").bind(name).execute(&pool).await.unwrap();
+        }
+        sqlx::query("insert into continuous_owner_lanes(owner_id) values('admin')").execute(&pool).await.unwrap();
+        sqlx::query("insert into continuous_processes(owner_id,algorithm_id,status,desired_running,config_revision,config) values('admin',$1,'running',true,7,$2)")
+            .bind(ALGORITHM).bind(config(ALGORITHM)).execute(&pool).await.unwrap();
+        for generation in 17i64..=22 {
+            let slot:i64=sqlx::query_scalar("insert into continuous_slots(owner_id,algorithm_id,min_setups_per_day,status) values('admin',$1,$2::text::numeric,'active') returning id")
+                .bind(ALGORITHM).bind((generation-16).to_string()).fetch_one(&pool).await.unwrap();
+            sqlx::query("insert into continuous_generations(id,owner_id,algorithm_id,slot_id,config_revision,lease_token,status,phase,spec,result,accepted,execution_started_at,observation_cutoff,live_initialization,live_readiness,live_init_attempts,live_init_status) overriding system value values($1,'admin',$2,$3,7,1,'completed','completed',$4,$5,true,now(),$6,$7,$8,2,'active')")
+                .bind(generation).bind(ALGORITHM).bind(slot).bind(spec(ALGORITHM)).bind(json!({"immutable":generation,"meanExpectancy":0.21,"selectedCell":{"tpPct":14,"slPct":4}})).bind(CUTOFF)
+                .bind(json!({"version":1,"anchorCloseUnix":CUTOFF,"detectorFromOpenUnix":CUTOFF-86400,"emitFromCloseUnix":CUTOFF+60}))
+                .bind(json!([{"instrumentKey":INSTRUMENT,"status":"ready","reason":null,"publicationFloorCloseUnix":CUTOFF}])).execute(&pool).await.unwrap();
+            let study=study(&pool,OWNER,ALGORITHM,"completed",Some(generation),Some(slot)).await;
+            sqlx::query("update continuous_generations set study_id=$2 where id=$1").bind(generation).bind(study).execute(&pool).await.unwrap();
+            sqlx::query("update continuous_slots set active_generation_id=$2,study_id=$3,live_watermark=$4 where id=$1")
+                .bind(slot).bind(generation).bind(study).bind(CUTOFF).execute(&pool).await.unwrap();
+            sqlx::query("insert into adaptive_live_checkpoints(slot_id,instrument_key,generation_id,state) values($1,$2,$3,$4)")
+                .bind(slot).bind(INSTRUMENT).bind(generation).bind(json!({"generationId":generation,"nextOpenUnix":CUTOFF+600,"lastRawOpenUnix":CUTOFF})).execute(&pool).await.unwrap();
+            let now=chrono::Utc::now().timestamp();
+            let setup:i32=sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,adaptive_slot_id,adaptive_generation_id,recommendation) values('bybit','linear','BTCUSDT',$1,'1.1.1','{}',to_timestamp($2),to_timestamp($3),'100',$4,$5,$6) returning id")
+                .bind(ALGORITHM).bind((now-60)as f64).bind(now as f64).bind(slot).bind(generation).bind(json!({"snapshot":generation})).fetch_one(&pool).await.unwrap();
+            sqlx::query("insert into adaptive_notification_outbox(setup_id,owner_id,algorithm_id,slot_id,generation_id,config_revision,raw_close_unix,expires_at,payload) values($1,'admin',$2,$3,$4,7,$5,to_timestamp($6),'{}')")
+                .bind(setup).bind(ALGORITHM).bind(slot).bind(generation).bind(now).bind((now+3600)as f64).execute(&pool).await.unwrap();
+        }
+        async fn snapshot(pool:&PgPool)->Value {
+            sqlx::query_scalar("select jsonb_build_object('slots',(select jsonb_agg(to_jsonb(s) order by id) from continuous_slots s),'generations',(select jsonb_agg(to_jsonb(g) order by id) from continuous_generations g),'cursors',(select jsonb_agg(to_jsonb(c) order by slot_id,instrument_key) from adaptive_live_checkpoints c),'signals',(select jsonb_agg(to_jsonb(l) order by id) from live_setups l),'outbox',(select jsonb_agg(to_jsonb(o) order by id) from adaptive_notification_outbox o))")
+                .fetch_one(pool).await.unwrap()
+        }
+        let before=snapshot(&pool).await;
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        assert_eq!(snapshot(&pool).await,before,"migration must not rewrite any incumbent data");
+        assert_eq!(sqlx::query_scalar::<_,Vec<i64>>("select array_agg(accepted_generation_id order by accepted_generation_id) from adaptive_profiles").fetch_one(&pool).await.unwrap(),vec![17,18,19,20,21,22]);
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_profiles where desired_running and control_revision=7").fetch_one(&pool).await.unwrap(),6);
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_notification_outbox o join adaptive_live_controls p on p.id=o.slot_id where p.desired_running and p.config_revision=o.config_revision").fetch_one(&pool).await.unwrap(),6);
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();assert_eq!(snapshot(&pool).await,before);
+        assert_eq!(db::profiles::limits(&pool,OWNER).await.unwrap(),db::profiles::ProfileLimits{total_profiles:50,running_profiles:30});
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn n8_independent_lifecycle_research_stop_new_id_profile_play_grants_and_fences() {
+    isolated(|pool|async move {
+        use db::profiles::{self,ProfileCommand,CommandOutcome};
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        let active=accepted(&pool).await;
+        let checkpoint=json!({"generationId":active.generation_id,"nextOpenUnix":CUTOFF});
+        assert!(db::commit_adaptive_scan(&pool,&active,INSTRUMENT,None,&checkpoint,&[]).await.unwrap().applied);
+        db::stop(&pool,OWNER,ALGORITHM).await.unwrap();
+        assert!(db::adaptive_notification_allowed(&pool,&active).await.unwrap(),"research Stop cannot fence live");
+        let lease=scheduler::claim_owner(&pool,"n8-cleanup").await.unwrap().unwrap();
+        scheduler::drain_stops(&pool,&lease).await.unwrap();
+        let mut next=config(ALGORITHM);next["minSetupsPerDay"]=json!([8]);next["adaptiveEnabled"]=json!(false);
+        assert!(db::configure(&pool,OWNER,ALGORITHM,&next,&[8.0]).await.unwrap());
+        assert!(profiles::permission(&pool,OWNER,ALGORITHM).await.unwrap(),"research config cannot change the live permission");
+        assert_eq!(db::active_adaptive_slots(&pool,OWNER).await.unwrap()[0].generation_id,active.generation_id);
+        assert_eq!(profiles::list(&pool,OWNER,None,0,50).await.unwrap()["profiles"][0]["inResearchQueue"],false);
+        assert!(db::start(&pool,OWNER,ALGORITHM).await.unwrap());
+        let job=scheduler::prepare_next(&pool,&lease).await.unwrap().unwrap();
+        assert_ne!(job.study_id,active.study_id);assert_ne!(job.generation_id,active.generation_id);
+        let request=ProfileCommand{expected_revision:1,expected_generation_id:active.generation_id,request_id:"n8-stop-00000001".into()};
+        let stopped=match profiles::command(&pool,OWNER,active.slot_id,false,&request).await.unwrap() {CommandOutcome::Applied(v)=>v,_=>panic!("Stop rejected")};
+        assert!(!db::adaptive_notification_allowed(&pool,&active).await.unwrap());
+        assert_eq!(db::get_adaptive_checkpoint(&pool,active.slot_id,INSTRUMENT).await.unwrap().unwrap().state,checkpoint);
+        assert!(scheduler::current(&pool,&job).await.unwrap(),"profile Stop cannot cancel research");
+        assert_eq!(stopped["status"],"stopping");
+        profiles::acknowledge_stops(&pool,OWNER).await.unwrap();
+        let play=ProfileCommand{expected_revision:stopped["controlRevision"].as_i64().unwrap(),request_id:"n8-play-00000001".into(),..request.clone()};
+        assert!(matches!(profiles::command(&pool,OWNER,active.slot_id,true,&play).await.unwrap(),CommandOutcome::Applied(_)));
+        let pending=db::live::pending_adaptive_slots(&pool,OWNER).await.unwrap().remove(0);
+        assert_eq!(pending.profile.generation_id,active.generation_id);assert_eq!(pending.profile.config_revision,3);
+        let warm=db::live::claim_pending_warmup_at(&pool,&pending,"n8-warm",CUTOFF).await.unwrap().unwrap();
+        assert!(db::live::renew_pending_warmup(&pool,&warm).await.unwrap()==db::live::WarmupRenewal::Renewed);
+        assert!(db::live::report_warmup(&pool,&warm,"ready",Some(CUTOFF),None).await.unwrap());
+        assert!(db::live::promote_pending(&pool,&warm,None,&[db::live::CheckpointExpectation{instrument_key:INSTRUMENT.into(),checkpoint:None}],CUTOFF,
+            &[db::live::InitialAdaptiveCheckpoint{instrument_key:INSTRUMENT.into(),state:checkpoint.clone()}]).await.unwrap());
+        assert_eq!(sqlx::query_scalar::<_,Value>("select state from adaptive_profile_stopped_checkpoints where profile_id=$1").bind(active.slot_id).fetch_one(&pool).await.unwrap(),checkpoint);
+        assert!(!db::commit_adaptive_scan(&pool,&active,INSTRUMENT,None,&checkpoint,&[]).await.unwrap().applied,"old epoch remains fenced");
+        sqlx::query("update continuous_generations set live_init_attempts=3,live_init_attempt_limit=3,live_init_status='exhausted' where id=$1").bind(active.generation_id).execute(&pool).await.unwrap();
+        let grant=ProfileCommand{expected_revision:3,request_id:"n8-grant-00000001".into(),..request};
+        let first=match profiles::command(&pool,OWNER,active.slot_id,true,&grant).await.unwrap() {CommandOutcome::Applied(v)=>v,_=>panic!("Play must grant")};
+        assert_eq!(first["grantedAttempts"],3);assert_eq!(first["attemptsBefore"],3);assert_eq!(first["attemptLimit"],6);
+        assert_eq!(match profiles::command(&pool,OWNER,active.slot_id,true,&grant).await.unwrap(){CommandOutcome::Applied(v)=>v,_=>panic!()},first);
+        assert!(matches!(profiles::command(&pool,"another-user",active.slot_id,true,&grant).await.unwrap(),CommandOutcome::NotFound));
+        assert!(db::cleanup::preview(&pool,OWNER).await.unwrap().blockers.contains(&"accepted_profile_references".into()));
+        scheduler::release(&pool,&lease).await.unwrap();
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn n8_handoff_negative_outcomes_sticky_stop_ordering_and_configured_limits() {
+    isolated(|pool|async move {
+        use db::profiles::{self,ProfileCommand,CommandOutcome,ProfileLimits};
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        profiles::configure_default_limits(&pool,ProfileLimits{total_profiles:2,running_profiles:1}).await.unwrap();
+        let active=accepted(&pool).await;
+        async fn handoff(pool:&PgPool,slot:i64)->i64 {
+            let generation=generation(pool,OWNER,ALGORITHM,slot,"completed").await;
+            let study=study(pool,OWNER,ALGORITHM,"completed",Some(generation),Some(slot)).await;
+            sqlx::query("update continuous_generations set accepted=true,study_id=$2,result=$3 where id=$1").bind(generation).bind(study)
+                .bind(json!({"meanExpectancy":0.2,"selectedCell":{"tpPct":14,"slPct":4},"best":{"params":SpikeParams::default(),"analytics":{"clusterEnabled":true,"clusterGapMinutes":480}}})).execute(pool).await.unwrap();
+            sqlx::query("insert into adaptive_profile_handoffs(generation_id,owner_id,slot_id) values($1,'admin',$2)").bind(generation).bind(slot).execute(pool).await.unwrap();generation
+        }
+        let old=handoff(&pool,active.slot_id).await;let latest=handoff(&pool,active.slot_id).await;
+        assert_eq!(profiles::accept_handoffs(&pool,OWNER).await.unwrap(),2);
+        assert_eq!(profiles::detail(&pool,OWNER,active.slot_id).await.unwrap().unwrap()["acceptedGenerationId"],latest);
+        let negative=generation(&pool,OWNER,ALGORITHM,active.slot_id,"completed").await;
+        sqlx::query("update continuous_generations set accepted=false where id=$1").bind(negative).execute(&pool).await.unwrap();
+        assert_eq!(profiles::accept_handoffs(&pool,OWNER).await.unwrap(),0);
+        assert_eq!(db::live::pending_adaptive_slots(&pool,OWNER).await.unwrap()[0].profile.generation_id,latest,"newer nonpass must not fence accepted pending");
+        sqlx::query("update adaptive_profile_handoffs set status='pending' where generation_id=$1").bind(old).execute(&pool).await.unwrap();
+        profiles::accept_handoffs(&pool,OWNER).await.unwrap();
+        assert_eq!(profiles::detail(&pool,OWNER,active.slot_id).await.unwrap().unwrap()["acceptedGenerationId"],latest);
+        let stop=ProfileCommand{expected_revision:1,expected_generation_id:latest,request_id:"n8-sticky-stop-01".into()};
+        assert!(matches!(profiles::command(&pool,OWNER,active.slot_id,false,&stop).await.unwrap(),CommandOutcome::Applied(_)));
+        let replacement=handoff(&pool,active.slot_id).await;profiles::accept_handoffs(&pool,OWNER).await.unwrap();
+        let stopped=profiles::detail(&pool,OWNER,active.slot_id).await.unwrap().unwrap();assert_eq!(stopped["desiredRunning"],false);assert_eq!(stopped["acceptedGenerationId"],replacement);
+        assert!(db::live::pending_adaptive_slots(&pool,OWNER).await.unwrap().is_empty());
+        profiles::acknowledge_stops(&pool,OWNER).await.unwrap();
+        // Resume first to fill the active admission, then accept a second pairing.
+        let play=ProfileCommand{expected_revision:2,expected_generation_id:replacement,request_id:"n8-cap-play-00001".into()};
+        assert!(matches!(profiles::command(&pool,OWNER,active.slot_id,true,&play).await.unwrap(),CommandOutcome::Applied(_)));
+        let mut slots=Vec::new();
+        for frequency in [8,12] {
+            let id:i64=sqlx::query_scalar("insert into continuous_slots(owner_id,algorithm_id,min_setups_per_day) values('admin',$1,$2::text::numeric) returning id").bind(ALGORITHM).bind(frequency.to_string()).fetch_one(&pool).await.unwrap();
+            handoff(&pool,id).await;slots.push(id);
+        }
+        profiles::accept_handoffs(&pool,OWNER).await.unwrap();
+        let listed=profiles::list(&pool,OWNER,None,0,50).await.unwrap();assert_eq!(listed["total"],2);
+        assert_eq!(listed["profiles"][1]["error"]["code"],"profile_running_limit");
+        assert_eq!(listed["blockedHandoffs"][0]["error"]["code"],"profile_total_limit");
+        let second=profiles::detail(&pool,OWNER,slots[0]).await.unwrap().unwrap();
+        let play=ProfileCommand{expected_revision:1,expected_generation_id:second["acceptedGenerationId"].as_i64().unwrap(),request_id:"n8-cap-play-00002".into()};
+        assert!(matches!(profiles::command(&pool,OWNER,slots[0],true,&play).await.unwrap(),CommandOutcome::Limited{limit:1,..}));
+        assert_eq!(profiles::detail(&pool,OWNER,active.slot_id).await.unwrap().unwrap()["desiredRunning"],true,"cap cannot evict incumbent");
+    }).await;
 }
 
 #[tokio::test]

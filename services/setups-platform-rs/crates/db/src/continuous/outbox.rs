@@ -146,7 +146,7 @@ pub async fn notification_permitted(pool: &PgPool, worker: &str, job: &Notificat
             && fence["algorithmVersion"]==params.algorithm_version()
             && fence["params"]==serde_json::to_value(params).map_err(crate::json_error)?);
     }
-    Ok(sqlx::query_scalar("select exists(select 1 from adaptive_notification_outbox o join continuous_slots s on s.id=o.slot_id join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id where o.id=$1 and o.lease_owner=$2 and o.lease_token=$3 and o.lease_until>clock_timestamp() and o.expires_at>clock_timestamp() and s.enabled and s.active_generation_id is not null and p.desired_running and p.config_revision=o.config_revision and p.config->'adaptiveEnabled'='true'::jsonb and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb))")
+    Ok(sqlx::query_scalar("select exists(select 1 from adaptive_notification_outbox o join continuous_slots s on s.id=o.slot_id join adaptive_live_controls p on p.id=s.id where o.id=$1 and o.lease_owner=$2 and o.lease_token=$3 and o.lease_until>clock_timestamp() and o.expires_at>clock_timestamp() and s.active_generation_id is not null and p.desired_running and p.config_revision=o.config_revision and p.config->'adaptiveEnabled'='true'::jsonb and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb))")
         .bind(job.id).bind(worker).bind(job.lease_token).fetch_one(pool).await?)
 }
 

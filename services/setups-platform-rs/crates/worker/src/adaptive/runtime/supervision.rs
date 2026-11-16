@@ -630,6 +630,9 @@ mod tests {
                 .bind(fence.slot_id).fetch_one(&pool).await.unwrap());
         }
         fence.generation_id = generations[1];
+        continuous::profiles::set_permission(&pool,"admin","price_volume_spike",true).await.unwrap();
+        sqlx::query("insert into adaptive_profiles(id,owner_id,algorithm_id,min_setups_per_day,accepted_generation_id) select id,owner_id,algorithm_id,min_setups_per_day,$2 from continuous_slots where id=$1")
+            .bind(fence.slot_id).bind(fence.generation_id).execute(&pool).await.unwrap();
         sqlx::query("update continuous_generations set live_init_attempts=1,live_init_status='running',live_init_deadline=clock_timestamp()+interval '6 hours' where id=$1")
             .bind(fence.generation_id).execute(&pool).await.unwrap();
         sqlx::query("update continuous_slots set active_generation_id=$2,pending_generation_id=$3,pending_status='warming' where id=$1")

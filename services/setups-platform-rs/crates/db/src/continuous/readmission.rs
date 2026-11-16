@@ -70,13 +70,14 @@ pub async fn grant(pool:&PgPool,owner:&str,algorithm:&str,slot:i64,request:&Live
         }
         return Ok(LiveReadmissionOutcome::Granted(receipt(&prior,true)?));
     }
-    let process=sqlx::query("select desired_running,config_revision,config from continuous_processes where owner_id=$1 and algorithm_id=$2 for share")
-        .bind(owner).bind(algorithm).fetch_optional(&mut *tx).await?;
+    let process=sqlx::query("select desired_running,config_revision,config,accepted_generation_id from adaptive_live_controls where owner_id=$1 and algorithm_id=$2 and id=$3 for share")
+        .bind(owner).bind(algorithm).bind(slot).fetch_optional(&mut *tx).await?;
     let target_slot=sqlx::query("select enabled,active_generation_id,pending_generation_id,pending_error,updated_at from continuous_slots where id=$1 and owner_id=$2 and algorithm_id=$3 for update")
         .bind(slot).bind(owner).bind(algorithm).fetch_optional(&mut *tx).await?;
     let (Some(process),Some(target_slot))=(process,target_slot) else {return Ok(LiveReadmissionOutcome::NotFound);};
     if !process.try_get::<bool,_>("desired_running")? || process.try_get::<i64,_>("config_revision")?!=request.expected_config_revision
-        || process.try_get::<Value,_>("config")?["adaptiveEnabled"]!=true || !target_slot.try_get::<bool,_>("enabled")? {
+        || process.try_get::<Value,_>("config")?["adaptiveEnabled"]!=true
+        || process.try_get::<i64,_>("accepted_generation_id")?!=request.expected_generation_id {
         return Ok(LiveReadmissionOutcome::Conflict("live_readmission_stale_process"));
     }
     let global=sqlx::query("select value from settings where key='live' for share").fetch_optional(&mut *tx).await?;
@@ -90,17 +91,12 @@ pub async fn grant(pool:&PgPool,owner:&str,algorithm:&str,slot:i64,request:&Live
     let Some(generation)=generation else {return Ok(LiveReadmissionOutcome::NotFound);};
     let attempts:i32=generation.try_get("live_init_attempts")?;
     let limit:i32=generation.try_get("live_init_attempt_limit")?;
-    if generation.try_get::<i64,_>("config_revision")?!=request.expected_config_revision
-        || generation.try_get::<String,_>("status")?!="completed" || generation.try_get::<Option<bool>,_>("accepted")?!=Some(true)
+    if generation.try_get::<String,_>("status")?!="completed" || generation.try_get::<Option<bool>,_>("accepted")?!=Some(true)
         || generation.try_get::<Option<i64>,_>("study_id")?.is_none()
         || generation.try_get::<Option<Value>,_>("live_initialization")?.is_none()
         || generation.try_get::<Option<String>,_>("live_init_status")?.as_deref()!=Some("exhausted") || attempts!=limit {
         return Ok(LiveReadmissionOutcome::Conflict("live_readmission_ineligible"));
     }
-    let newer:bool=sqlx::query_scalar("select exists(select 1 from continuous_generations where owner_id=$1 and algorithm_id=$2 and slot_id=$3 and config_revision=$4 and status='completed' and id>$5)")
-        .bind(owner).bind(algorithm).bind(slot).bind(request.expected_config_revision).bind(request.expected_generation_id)
-        .fetch_one(&mut *tx).await?;
-    if newer {return Ok(LiveReadmissionOutcome::Conflict("live_readmission_superseded"));}
     if target_slot.try_get::<Option<i64>,_>("pending_generation_id")?.is_some()
         || target_slot.try_get::<Option<i64>,_>("active_generation_id")?==Some(request.expected_generation_id) {
         return Ok(LiveReadmissionOutcome::Conflict("live_readmission_pending_conflict"));

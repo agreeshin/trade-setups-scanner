@@ -207,7 +207,6 @@ pub async fn prepare_next(pool: &PgPool, lease: &OwnerLease) -> Result<Option<Ch
     sqlx::query("update continuous_generations set study_id=$2 where id=$1").bind(generation_id).bind(study_id).execute(&mut *tx).await?;
     sqlx::query("update continuous_processes set status='running',active_generation_id=$3,active_study_id=$4,phase='acquiring',error=null,updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(&lease.owner_id).bind(&algorithm).bind(generation_id).bind(study_id).execute(&mut *tx).await?;
-    sqlx::query("update continuous_slots set status='acquiring',updated_at=now() where id=$1").bind(slot_id).execute(&mut *tx).await?;
     sqlx::query("update continuous_owner_lanes set last_algorithm_id=$2 where owner_id=$1").bind(&lease.owner_id).bind(&algorithm).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(Some(ChainJob{lease:lease.clone(),algorithm_id:algorithm,generation_id,slot_id,study_id,config_revision:revision,observation_cutoff:cutoff,config,spec,execution_started_at:start,research_deadline:Some(deadline)}))
@@ -219,7 +218,6 @@ pub async fn phase(pool: &PgPool, job: &ChainJob, phase: &str, progress: Option<
     sqlx::query("update continuous_processes set phase=$3,updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(&job.lease.owner_id).bind(&job.algorithm_id).bind(phase).execute(&mut *tx).await?;
     sqlx::query("update continuous_generations set phase=$2,updated_at=now() where id=$1").bind(job.generation_id).bind(phase).execute(&mut *tx).await?;
-    sqlx::query("update continuous_slots set status=$2,updated_at=now() where id=$1").bind(job.slot_id).bind(phase).execute(&mut *tx).await?;
     if let Some(progress)=progress {
         sqlx::query("update optimization_studies set progress=$2,updated_at=now() where id=$1 and status='running'").bind(job.study_id).bind(progress).execute(&mut *tx).await?;
     }
@@ -367,18 +365,8 @@ async fn finalize_inner(pool: &PgPool, job: &ChainJob, result: &Value, accepted:
     sqlx::query("update continuous_generations set status='completed',phase='completed',result=$2,accepted=$3,error=null,updated_at=now() where id=$1")
         .bind(job.generation_id).bind(result).bind(accepted).execute(&mut *tx).await?;
     if accepted {
-        // Frozen search/replay/analytics proof is complete before this call. A
-        // research-prefix manifest is not an independent-live prerequisite.
-        super::live::supersede_pending(&mut tx,job.slot_id).await?;
-        let installed=sqlx::query("update continuous_slots set pending_generation_id=$2,pending_status='warming',pending_error=null,readiness_frontier=null,status='warming',study_id=$3,updated_at=now() where id=$1")
-            .bind(job.slot_id).bind(job.generation_id).bind(job.study_id).execute(&mut *tx).await?.rows_affected();
-        if installed!=1 {return Err(DbError::Json("continuous candidate slot disappeared during finalization".into()));}
-    } else {
-        sqlx::query("update continuous_slots set active_generation_id=null,pending_generation_id=null,pending_status=null,pending_error=null,readiness_frontier=null,status='rejected',study_id=$2,mean_expectancy=$3,selected_cell=$4,updated_at=now() where id=$1")
-            .bind(job.slot_id).bind(job.study_id).bind(mean).bind(selected).execute(&mut *tx).await?;
-        super::live::retire_inactive_checkpoints(&mut tx,&job.lease.owner_id,&job.algorithm_id,Some(job.slot_id)).await?;
-        sqlx::query("update adaptive_live_warmup_lane set slot_id=null,generation_id=null,lease_owner=null,lease_until=null,lease_token=lease_token+1 where slot_id=$1")
-            .bind(job.slot_id).execute(&mut *tx).await?;
+        sqlx::query("insert into adaptive_profile_handoffs(generation_id,owner_id,slot_id) values($1,$2,$3) on conflict do nothing")
+            .bind(job.generation_id).bind(&job.lease.owner_id).bind(job.slot_id).execute(&mut *tx).await?;
     }
     sqlx::query("update continuous_processes set active_generation_id=null,active_study_id=null,phase='queued',status='running',retry_count=0,error=null,next_slot=(next_slot+1)%jsonb_array_length(config->'minSetupsPerDay'),next_attempt_at=now()+interval '1 second',updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(&job.lease.owner_id).bind(&job.algorithm_id).execute(&mut *tx).await?;
@@ -401,7 +389,6 @@ pub async fn fail(pool: &PgPool, job: &ChainJob, error: &Value) -> Result<(),DbE
     // Accepted slot data stays intact on every technical failure. Three attempts, then explicit restart.
     sqlx::query("update continuous_processes set status='error',phase=null,error=$3,retry_count=least(retry_count+1,3),next_attempt_at=now()+(case when retry_count=0 then 1 else 5 end)*interval '1 second',active_generation_id=null,active_study_id=null,updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(&job.lease.owner_id).bind(&job.algorithm_id).bind(error).execute(&mut *tx).await?;
-    sqlx::query("update continuous_slots set status='error',updated_at=now() where id=$1").bind(job.slot_id).execute(&mut *tx).await?;
     sqlx::query("delete from continuous_runtime_artifacts where generation_id=$1").bind(job.generation_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())

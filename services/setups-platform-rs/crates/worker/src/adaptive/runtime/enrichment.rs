@@ -1361,6 +1361,7 @@ mod tests {
                 .execute(&mut *connection).await.unwrap();drop(connection);
             setups_db::migrate::ensure_migrations(&pool).await.unwrap();
             continuous::configure(&pool,"admin","price_volume_spike",&json!({"adaptiveEnabled":true}),&[0.0]).await.unwrap();
+            continuous::profiles::set_permission(&pool,"admin","price_volume_spike",true).await.unwrap();
             continuous::start(&pool,"admin","price_volume_spike").await.unwrap();
             setups_db::settings_set(&pool,"live",&json!({"enabled":true})).await.unwrap();
             setups_db::settings_set(&pool,"notifications",&json!({"maxAgeSeconds":86400})).await.unwrap();
@@ -1374,6 +1375,8 @@ mod tests {
                 .bind(&slot.spec).bind(&slot.result).bind(slot.generation_id).fetch_one(&pool).await.unwrap();
             sqlx::query("update continuous_generations set study_id=$2 where id=$1").bind(slot.generation_id).bind(slot.study_id).execute(&pool).await.unwrap();
             sqlx::query("update continuous_slots set active_generation_id=$2 where id=$1").bind(slot.slot_id).bind(slot.generation_id).execute(&pool).await.unwrap();
+            sqlx::query("insert into adaptive_profiles(id,owner_id,algorithm_id,min_setups_per_day,accepted_generation_id) select id,owner_id,algorithm_id,min_setups_per_day,$2 from continuous_slots where id=$1")
+                .bind(slot.slot_id).bind(slot.generation_id).execute(&pool).await.unwrap();
             let at=chrono::Utc::now().timestamp().div_euclid(60)*60;
             base.raw.open_time_unix=at-60;base.raw.close_time_unix=at;
             base.recommendation["rawSignalAt"]=json!(at);base.recommendation["recommendedEntryAt"]=json!(at+180);

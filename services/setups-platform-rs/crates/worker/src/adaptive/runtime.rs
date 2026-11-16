@@ -423,9 +423,11 @@ impl AdaptiveLiveRuntime {
     async fn tick_observed(&mut self,pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool,observation_unix:i64,trace:&mut diagnostics::TickTrace)->Result<(),WorkerError> {
         if stopped.load(Ordering::SeqCst) {return Ok(());}
         self.check_supervision()?;
+        continuous::profiles::accept_handoffs(pool,continuous::ADMIN_OWNER).await?;
         if settings_get(pool,"live").await?.unwrap_or(json!({}))["enabled"]!=true {
             self.shutdown_warmup(pool).await?;
-            self.state.clear();self.preparation.clear();return Ok(());
+            self.state.clear();self.preparation.clear();
+            continuous::profiles::acknowledge_stops(pool,continuous::ADMIN_OWNER).await?;return Ok(());
         }
         trace.enter("recovery");
         // The independent supervisor owns our claim. Never reap it ahead of
@@ -435,7 +437,7 @@ impl AdaptiveLiveRuntime {
         trace.enter("projection");
         let slots:Vec<_>=continuous::active_adaptive_slots(pool,continuous::ADMIN_OWNER).await?.into_iter().map(Arc::new).collect();
         let pending=live::pending_adaptive_slots(pool,continuous::ADMIN_OWNER).await?;
-        if slots.is_empty() && pending.is_empty() {self.discard_warmup().await?;self.state.clear();self.preparation.clear();return Ok(());}
+        if slots.is_empty() && pending.is_empty() {self.discard_warmup().await?;self.state.clear();self.preparation.clear();continuous::profiles::acknowledge_stops(pool,continuous::ADMIN_OWNER).await?;return Ok(());}
         trace.enter("catalog");
         let catalog=client.instruments().await.map_err(|e|invalid(&e.to_string()))?;
         trace.enter("plan_refresh");
@@ -447,6 +449,7 @@ impl AdaptiveLiveRuntime {
             wanted.entry(plan.epoch.clone()).or_default().extend(plan.specs.iter().map(ProfileSpec::key));
         }
         self.state.reconcile(&wanted);
+        continuous::profiles::acknowledge_stops(pool,continuous::ADMIN_OWNER).await?;
         // One current range per SOURCE, never alternating per-epoch origins.
         // Recomputed from the actual cohort so departed profiles do not leave
         // a min-ever origin or max-ever initialization boundary behind.

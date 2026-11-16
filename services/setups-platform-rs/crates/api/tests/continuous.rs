@@ -75,10 +75,12 @@ async fn continuous_cleanup_rejects_cookie_mutation_without_browser_origin_befor
     let s=state(pool);
     let setups_api::auth::PostSessionResult::Issued{token,..}=s.auth.post_session(Some("test-key"),setups_api::now_ms()) else {panic!("fixture login failed")};
     let router=continuous_router(s);
-    for path in ["/v1/continuous-studies/cleanup","/v1/continuous-studies/maintenance/drain","/v1/continuous-studies/maintenance/resume","/v1/continuous-studies/price_volume_spike/slots/1/live-readmission"] {
+    for path in ["/v1/continuous-studies/cleanup","/v1/continuous-studies/maintenance/drain","/v1/continuous-studies/maintenance/resume","/v1/continuous-studies/price_volume_spike/slots/1/live-readmission","/v1/adaptive-profiles/1/stop","/v1/adaptive-profiles/1/play","/v1/continuous-studies/price_volume_spike/recovery/retry"] {
         let response=router.clone().oneshot(Request::builder().method("POST").uri(path).header("cookie",format!("{}={token}",setups_api::COOKIE_NAME)).header("content-type","application/json").body(Body::from(json!({"confirm":true,"fingerprint":"0".repeat(32)}).to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(),StatusCode::FORBIDDEN);
     }
+    let response=router.oneshot(Request::builder().method("PUT").uri("/v1/adaptive-live/price_volume_spike/permission").header("cookie",format!("{}={token}",setups_api::COOKIE_NAME)).body(Body::from("{\"enabled\":true}")).unwrap()).await.unwrap();
+    assert_eq!(response.status(),StatusCode::FORBIDDEN);
 }
 
 struct TestDb{admin:PgPool,pool:PgPool,name:String}
@@ -101,12 +103,61 @@ impl TestDb {
 
 #[tokio::test]
 #[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn n8_profile_http_commands_permissions_receipts_recovery_and_reference_protection() {
+    let fixture=TestDb::new().await;let state=state(fixture.pool.clone());let router=continuous_router(state.clone());
+    let outcome=tokio::spawn(async move {
+        let permission="/v1/adaptive-live/price_volume_spike/permission";
+        assert_eq!(request(&router,"GET",permission,Value::Null).await.1["enabled"],false);
+        assert_eq!(request(&router,"PUT",permission,json!({"enabled":true})).await.0,StatusCode::OK);
+        assert!(db::get(&state.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().is_none(),"permission does not create research");
+        let mut config=config();config["adaptiveEnabled"]=false.into();
+        assert_eq!(request(&router,"PUT",&path(""),config.clone()).await.0,StatusCode::OK);
+        assert_eq!(request(&router,"GET",permission,Value::Null).await.1["enabled"],true,"research configuration cannot overwrite permission");
+        setups_db::settings_set(&state.pool,"live",&json!({"enabled":true})).await.unwrap();
+        let slot=db::get(&state.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap().slots[0].id;
+        let generation:i64=sqlx::query_scalar("insert into continuous_generations(owner_id,algorithm_id,slot_id,config_revision,lease_token,status,spec,result,accepted,execution_started_at,observation_cutoff) values('admin',$1,$2,1,1,'completed',$3,$4,true,now(),0) returning id")
+            .bind(ALGORITHM).bind(slot).bind(&config["study"]).bind(json!({"meanExpectancy":0.21,"best":{"params":config["study"]["algorithmParams"],"analytics":config["study"]["analyticsParams"]},"selectedCell":{"tpPct":1,"slPct":1,"rawR":0.21,"meanR":0.21,"robustScore":0.21}})).fetch_one(&state.pool).await.unwrap();
+        sqlx::query("insert into adaptive_profile_handoffs(generation_id,owner_id,slot_id) values($1,'admin',$2)").bind(generation).bind(slot).execute(&state.pool).await.unwrap();
+        db::profiles::accept_handoffs(&state.pool,ADMIN_OWNER).await.unwrap();
+        let profiles="/v1/adaptive-profiles?algorithmId=price_volume_spike";
+        let listed=request(&router,"GET",profiles,Value::Null).await;
+        assert_eq!(listed.0,StatusCode::OK);assert_eq!(listed.1["total"],1);assert_eq!(listed.1["limits"],json!({"totalProfiles":50,"runningProfiles":30}));
+        assert_eq!(request(&router,"GET","/v1/adaptive-profiles?ownerId=someone",Value::Null).await.0,StatusCode::BAD_REQUEST);
+        assert_eq!(request(&router,"GET","/v1/adaptive-profiles/999",Value::Null).await.0,StatusCode::NOT_FOUND);
+        let stop=format!("/v1/adaptive-profiles/{slot}/stop");let play=format!("/v1/adaptive-profiles/{slot}/play");
+        let command=json!({"expectedRevision":1,"expectedGenerationId":generation,"requestId":"n8-http-stop-00001"});
+        let receipt=request(&router,"POST",&stop,command.clone()).await;
+        assert_eq!(receipt.0,StatusCode::OK);assert_eq!(receipt.1["status"],"stopping");
+        assert_eq!(request(&router,"POST",&stop,command).await,receipt,"lost ACK returns the original receipt");
+        let mut command=json!({"expectedRevision":2,"expectedGenerationId":generation,"requestId":"n8-http-play-00001"});
+        assert_eq!(request(&router,"POST",&play,command.clone()).await.1["error"],"profile_stopping");
+        db::profiles::acknowledge_stops(&state.pool,ADMIN_OWNER).await.unwrap();
+        assert_eq!(request(&router,"GET",profiles,Value::Null).await.1["profiles"][0]["status"],"stopped");
+        sqlx::query("update continuous_generations set live_init_attempts=3,live_init_status='exhausted' where id=$1").bind(generation).execute(&state.pool).await.unwrap();
+        let grant=request(&router,"POST",&play,command.clone()).await;
+        assert_eq!(grant.0,StatusCode::OK);assert_eq!(grant.1["grantedAttempts"],3);assert_eq!(grant.1["attemptLimit"],6);
+        assert_eq!(request(&router,"POST",&play,command.clone()).await,grant);
+        command["requestId"]="n8-http-play-stale-01".into();
+        assert_eq!(request(&router,"POST",&play,command).await.1["error"],"profile_revision_changed");
+        assert_eq!(request(&router,"POST",&path("/recovery/retry"),Value::Null).await.1["error"],"research_recovery_not_eligible");
+        let (_,preview)=request(&router,"GET","/v1/continuous-studies/cleanup",Value::Null).await;
+        assert!(preview["blockers"].as_array().unwrap().contains(&json!("accepted_profile_references")));
+        let before=sqlx::query_scalar::<_,Value>("select to_jsonb(p) from adaptive_profiles p").fetch_one(&state.pool).await.unwrap();
+        assert_eq!(request(&router,"PUT",permission,json!({"enabled":false})).await.0,StatusCode::OK);
+        assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(p) from adaptive_profiles p").fetch_one(&state.pool).await.unwrap(),before,"global permission preserves individual intent");
+    }).await;
+    fixture.cleanup().await;outcome.expect("N8 HTTP assertions after isolated cleanup");
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn live_readmission_http_grants_exact_budget_replays_receipts_and_never_restarts_research_or_stopped_live() {
     let fixture=TestDb::new().await;
     let database=state(fixture.pool.clone());
     let result=tokio::spawn(async move {
     let router=continuous_router(database.clone());
     assert_eq!(request(&router,"PUT",&path(""),config()).await.0,StatusCode::OK);
+    db::profiles::set_permission(&database.pool,ADMIN_OWNER,ALGORITHM,true).await.unwrap();
     assert_eq!(request(&router,"POST",&path("/start"),Value::Null).await.0,StatusCode::ACCEPTED);
     setups_db::settings_set(&database.pool,"live",&json!({"enabled":true})).await.unwrap();
     let slot=db::get(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap().slots[0].id;
@@ -117,6 +168,8 @@ async fn live_readmission_http_grants_exact_budget_replays_receipts_and_never_re
     let study:i64=sqlx::query_scalar("insert into optimization_studies(algorithm_id,status,spec,progress,origin,owner_id,continuous_generation_id,continuous_slot_id) values($1,'completed',$2,'{}','continuous','admin',$3,$4) returning id")
         .bind(ALGORITHM).bind(&config()["study"]).bind(generation).bind(slot).fetch_one(&database.pool).await.unwrap();
     sqlx::query("update continuous_generations set study_id=$2 where id=$1").bind(generation).bind(study).execute(&database.pool).await.unwrap();
+    sqlx::query("insert into adaptive_profiles(id,owner_id,algorithm_id,min_setups_per_day,accepted_generation_id) select id,owner_id,algorithm_id,min_setups_per_day,$2 from continuous_slots where id=$1")
+        .bind(slot).bind(generation).execute(&database.pool).await.unwrap();
     sqlx::query("update continuous_slots set status='error',pending_status='error',pending_error='{\"code\":\"last_observed_failure\"}',study_id=$2 where id=$1").bind(slot).bind(study).execute(&database.pool).await.unwrap();
     let process_before:Value=sqlx::query_scalar("select to_jsonb(p) from continuous_processes p").fetch_one(&database.pool).await.unwrap();
     let url=path(&format!("/slots/{slot}/live-readmission"));
@@ -145,6 +198,9 @@ async fn live_readmission_http_grants_exact_budget_replays_receipts_and_never_re
     let mut fresh=body.clone();fresh["requestId"]=json!("http-study21-second-grant");
     let (status,second)=request(&router,"POST",&url,fresh).await;assert_eq!(status,StatusCode::OK);assert_eq!(second["attemptsBefore"],6);assert_eq!(second["attemptLimit"],9);
     assert!(db::stop(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap());
+    assert_eq!(db::get(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap().slots[0].pending_generation_id,Some(generation),"research Stop preserves live pending state");
+    let command=db::profiles::ProfileCommand{expected_revision:1,expected_generation_id:generation,request_id:"http-profile-stop-0001".into()};
+    assert!(matches!(db::profiles::command(&database.pool,ADMIN_OWNER,slot,false,&command).await.unwrap(),db::profiles::CommandOutcome::Applied(_)));
     sqlx::query("update continuous_processes set config_revision=config_revision+1").execute(&database.pool).await.unwrap();
     assert_eq!(request(&router,"POST",&url,body.clone()).await,(StatusCode::OK,expected),"Stop/revision changes cannot turn receipt replay into another grant");
     let stopped=db::get(&database.pool,ADMIN_OWNER,ALGORITHM).await.unwrap().unwrap();

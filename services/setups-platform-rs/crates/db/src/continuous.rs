@@ -7,6 +7,7 @@ pub mod cleanup;
 pub mod maintenance;
 pub mod recovery;
 pub mod frozen;
+pub mod profiles;
 use crate::DbError;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -183,8 +184,6 @@ pub async fn configure(pool: &PgPool, owner: &str, algorithm: &str, config: &Val
         let previous: Value = current.try_get("config")?;
         // Live permission is independent of research identity and accepted generation.
         if without_live_permission(&previous) == without_live_permission(config) {
-            sqlx::query("update continuous_processes set config=jsonb_set(config,'{adaptiveEnabled}',$3),updated_at=now() where owner_id=$1 and algorithm_id=$2")
-                .bind(owner).bind(algorithm).bind(&config["adaptiveEnabled"]).execute(&mut *tx).await?;
             tx.commit().await?;
             return Ok(true);
         }
@@ -192,12 +191,14 @@ pub async fn configure(pool: &PgPool, owner: &str, algorithm: &str, config: &Val
     }
     sqlx::query("insert into continuous_processes(owner_id,algorithm_id,config) values($1,$2,$3) on conflict(owner_id,algorithm_id) do update set config=excluded.config,config_revision=continuous_processes.config_revision+1,status='stopped',phase=null,error=null,next_slot=0,updated_at=now()")
         .bind(owner).bind(algorithm).bind(config).execute(&mut *tx).await?;
-    sqlx::query("update continuous_slots set enabled=false,active_generation_id=null,pending_generation_id=null,pending_status=null,pending_error=null,readiness_frontier=null,live_watermark=null,status='stopped',updated_at=now() where owner_id=$1 and algorithm_id=$2")
+    sqlx::query("insert into adaptive_live_permissions(owner_id,algorithm_id,enabled) values($1,$2,false) on conflict(owner_id,algorithm_id) do nothing")
         .bind(owner).bind(algorithm).execute(&mut *tx).await?;
-    live::retire_inactive_checkpoints(&mut tx,owner,algorithm,None).await?;
-    live::invalidate_warmup(&mut tx,owner,algorithm).await?;
+    sqlx::query("update continuous_processes set config=jsonb_set(config,'{adaptiveEnabled}',(select to_jsonb(enabled) from adaptive_live_permissions where owner_id=$1 and algorithm_id=$2)) where owner_id=$1 and algorithm_id=$2")
+        .bind(owner).bind(algorithm).execute(&mut *tx).await?;
+    sqlx::query("update continuous_slots set enabled=false where owner_id=$1 and algorithm_id=$2")
+        .bind(owner).bind(algorithm).execute(&mut *tx).await?;
     for frequency in thresholds {
-        sqlx::query("insert into continuous_slots(owner_id,algorithm_id,min_setups_per_day) values($1,$2,$3::text::numeric) on conflict(owner_id,algorithm_id,min_setups_per_day) do update set enabled=true,status='idle',updated_at=now()")
+        sqlx::query("insert into continuous_slots(owner_id,algorithm_id,min_setups_per_day) values($1,$2,$3::text::numeric) on conflict(owner_id,algorithm_id,min_setups_per_day) do update set enabled=true")
             .bind(owner).bind(algorithm).bind(frequency.to_string()).execute(&mut *tx).await?;
     }
     tx.commit().await?;
@@ -207,14 +208,18 @@ pub async fn configure(pool: &PgPool, owner: &str, algorithm: &str, config: &Val
 pub async fn start(pool: &PgPool, owner: &str, algorithm: &str) -> Result<bool,DbError> {
     let mut tx = pool.begin().await?;
     owner_lock(&mut tx, owner).await?;
-    let changed = sqlx::query("update continuous_processes set desired_running=true,status='running',error=null,retry_count=0,next_attempt_at=now(),phase=coalesce(phase,'queued'),updated_at=now() where owner_id=$1 and algorithm_id=$2 and status<>'stopping'")
+    if let Some(row)=sqlx::query("select desired_running,status from continuous_processes where owner_id=$1 and algorithm_id=$2 for update")
+        .bind(owner).bind(algorithm).fetch_optional(&mut *tx).await?
+        && row.try_get::<bool,_>("desired_running")? {
+        let already_running=row.try_get::<String,_>("status")?=="running";
+        tx.commit().await?;return Ok(already_running);
+    }
+    let changed = sqlx::query("update continuous_processes set desired_running=true,status='running',error=null,retry_count=0,next_attempt_at=now(),phase=coalesce(phase,'queued'),updated_at=now() where owner_id=$1 and algorithm_id=$2 and status<>'stopping' and not exists(select 1 from continuous_generations g where g.id=continuous_processes.active_generation_id and g.status='running' and continuous_processes.error->>'code'='durable_resume_retry_exhausted')")
         .bind(owner).bind(algorithm).execute(&mut *tx).await?.rows_affected()>0;
-    // Also repair inactive cursors persisted before retirement was implemented;
-    // retrying a technical failure must leave every accepted incumbent intact.
+    // Research-only state; live control and retained detector cursors are independent.
     if changed {
         sqlx::query("update continuous_generations g set recovery_pending=false,error=null from continuous_processes p where p.owner_id=$1 and p.algorithm_id=$2 and p.active_generation_id=g.id and g.status='running'")
             .bind(owner).bind(algorithm).execute(&mut *tx).await?;
-        live::retire_inactive_checkpoints(&mut tx,owner,algorithm,None).await?;
     }
     tx.commit().await?;
     Ok(changed)
@@ -236,16 +241,22 @@ pub async fn stop(pool: &PgPool, owner: &str, algorithm: &str) -> Result<bool,Db
         .bind(owner).bind(algorithm).fetch_all(&mut *tx).await?;
     sqlx::query("update continuous_processes set desired_running=false,status='stopping',config_revision=config_revision+1,phase='stopping',cleanup_targets=$3,updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(owner).bind(algorithm).bind(json!({"studies":studies,"runs":runs,"batches":batches})).execute(&mut *tx).await?;
-    sqlx::query("update continuous_slots set active_generation_id=null,pending_generation_id=null,pending_status=null,pending_error=null,readiness_frontier=null,status='stopped',updated_at=now() where owner_id=$1 and algorithm_id=$2")
-        .bind(owner).bind(algorithm).execute(&mut *tx).await?;
-    live::retire_inactive_checkpoints(&mut tx,owner,algorithm,None).await?;
-    live::invalidate_warmup(&mut tx,owner,algorithm).await?;
     sqlx::query("update optimization_studies set status='cancel_requested',updated_at=now() where id=any($1)")
         .bind(&studies).execute(&mut *tx).await?;
     sqlx::query("update replay_runs set status='cancel_requested',updated_at=now() where id=any($1)")
         .bind(&runs).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// Explicit recovery intent: never shared with the user's fresh Start.
+pub async fn retry_recovery(pool:&PgPool,owner:&str,algorithm:&str)->Result<bool,DbError> {
+    let mut tx=pool.begin().await?;owner_lock(&mut tx,owner).await?;
+    let changed=sqlx::query("update continuous_processes p set status='running',error=null,retry_count=0,next_attempt_at=now(),updated_at=now() where p.owner_id=$1 and p.algorithm_id=$2 and p.desired_running and p.error->>'code'='durable_resume_retry_exhausted' and exists(select 1 from continuous_generations g where g.id=p.active_generation_id and g.status='running' and g.resume_version=1)")
+        .bind(owner).bind(algorithm).execute(&mut *tx).await?.rows_affected()==1;
+    if changed {sqlx::query("update continuous_generations g set recovery_pending=true,error=null from continuous_processes p where p.owner_id=$1 and p.algorithm_id=$2 and p.active_generation_id=g.id")
+        .bind(owner).bind(algorithm).execute(&mut *tx).await?;}
+    tx.commit().await?;Ok(changed)
 }
 
 /// Caller must have joined its in-flight CPU/I/O tasks, or acquired the expired owner's lease.
@@ -316,7 +327,7 @@ pub struct ActiveAdaptiveSlot {
 }
 
 pub async fn active_adaptive_slots(pool: &PgPool, owner: &str) -> Result<Vec<ActiveAdaptiveSlot>,DbError> {
-    let rows = sqlx::query("select s.id slot_id,s.owner_id,s.algorithm_id,s.min_setups_per_day::double precision frequency,g.id generation_id,g.study_id,g.config_revision,g.spec,g.result,g.live_initialization,g.live_readiness,g.result#>'{best,params}' as params,g.result#>'{best,analytics}' as analytics,g.result->'selectedCell' as selected_cell,s.mean_expectancy,g.spec->>'direction' as direction,n.value->>'externalName' external_name from continuous_slots s join continuous_generations g on g.id=s.active_generation_id join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id left join settings n on n.key='algorithm:'||s.algorithm_id where s.owner_id=$1 and s.enabled and p.desired_running and coalesce((p.config->>'adaptiveEnabled')::boolean,false) and g.accepted=true and g.status='completed' order by s.id")
+    let rows = sqlx::query("select s.id slot_id,s.owner_id,s.algorithm_id,s.min_setups_per_day::double precision frequency,g.id generation_id,g.study_id,p.config_revision,g.spec,g.result,g.live_initialization,g.live_readiness,g.result#>'{best,params}' as params,g.result#>'{best,analytics}' as analytics,g.result->'selectedCell' as selected_cell,s.mean_expectancy,g.spec->>'direction' as direction,n.value->>'externalName' external_name from continuous_slots s join continuous_generations g on g.id=s.active_generation_id join adaptive_live_controls p on p.id=s.id left join settings n on n.key='algorithm:'||s.algorithm_id where s.owner_id=$1 and p.desired_running and coalesce((p.config->>'adaptiveEnabled')::boolean,false) and g.accepted=true and g.status='completed' order by s.id")
         .bind(owner).fetch_all(pool).await?;
     rows.into_iter().map(|r|Ok(ActiveAdaptiveSlot {
         owner_id:r.try_get("owner_id")?,algorithm_id:r.try_get("algorithm_id")?,
@@ -499,8 +510,8 @@ async fn commit_adaptive_scan_refs(
     }
     adaptive_commit_budget(deadline)?;
     // Same process -> slot lock order as atomic promotion; no locks are held during CPU/I/O.
-    let process = sqlx::query("select desired_running,config,config_revision from continuous_processes where owner_id=$1 and algorithm_id=$2 for share")
-        .bind(&expected.owner_id).bind(&expected.algorithm_id).fetch_optional(&mut *tx).await?;
+    let process = sqlx::query("select desired_running,config,config_revision from adaptive_live_controls where id=$3 and owner_id=$1 and algorithm_id=$2 for share")
+        .bind(&expected.owner_id).bind(&expected.algorithm_id).bind(expected.slot_id).fetch_optional(&mut *tx).await?;
     let slot = sqlx::query("select active_generation_id,enabled from continuous_slots where id=$1 and owner_id=$2 and algorithm_id=$3 for update")
         .bind(expected.slot_id).bind(&expected.owner_id).bind(&expected.algorithm_id).fetch_optional(&mut *tx).await?;
     let global = sqlx::query("select value from settings where key='live' for share").fetch_optional(&mut *tx).await?;
@@ -508,7 +519,6 @@ async fn commit_adaptive_scan_refs(
         (Some(p),Some(s),Some(g)) => p.try_get::<bool,_>("desired_running")?
             && p.try_get::<i64,_>("config_revision")?==expected.config_revision
             && p.try_get::<Value,_>("config")?["adaptiveEnabled"]==json!(true)
-            && s.try_get::<bool,_>("enabled")?
             && s.try_get::<Option<i64>,_>("active_generation_id")?==Some(expected.generation_id)
             && g.try_get::<Value,_>("value")?["enabled"]==json!(true),
         _ => false,
@@ -697,7 +707,7 @@ fn without_live_permission(value: &Value) -> Value {
 
 /// Recheck immediately before each external notification. No historical row is rewritten.
 pub async fn adaptive_notification_allowed(pool: &PgPool, expected: &ActiveAdaptiveSlot) -> Result<bool,DbError> {
-    Ok(sqlx::query_scalar("select exists(select 1 from continuous_slots s join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id join continuous_generations g on g.id=s.active_generation_id where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3 and s.active_generation_id=$4 and p.config_revision=$5 and s.enabled and p.desired_running and p.status in ('running','error') and p.config->'adaptiveEnabled'='true'::jsonb and g.status='completed' and g.accepted=true and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb))")
+    Ok(sqlx::query_scalar("select exists(select 1 from continuous_slots s join adaptive_live_controls p on p.id=s.id join continuous_generations g on g.id=s.active_generation_id where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3 and s.active_generation_id=$4 and p.config_revision=$5 and p.desired_running and p.status in ('running','error') and p.config->'adaptiveEnabled'='true'::jsonb and g.status='completed' and g.accepted=true and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb))")
         .bind(expected.slot_id).bind(&expected.owner_id).bind(&expected.algorithm_id).bind(expected.generation_id).bind(expected.config_revision).fetch_one(pool).await?)
 }
 

@@ -219,7 +219,7 @@ pub async fn permitted(pool:&PgPool,worker:&str,job:&TelegramJob)->Result<bool,D
         return Ok(global.as_ref().is_some_and(|value|value["enabled"]==true)&&algorithm.as_ref().is_none_or(|value|value["enabled"]!=false)
             &&fence["algorithmVersion"]==params.algorithm_version()&&fence["params"]==serde_json::to_value(params).map_err(crate::json_error)?);
     }
-    Ok(sqlx::query_scalar("select exists(select 1 from continuous_slots s join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3 and s.enabled and s.active_generation_id is not null and p.desired_running and p.config_revision=$4 and p.config->'adaptiveEnabled'='true'::jsonb and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb))")
+    Ok(sqlx::query_scalar("select exists(select 1 from continuous_slots s join adaptive_live_controls p on p.id=s.id where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3 and s.active_generation_id is not null and p.desired_running and p.config_revision=$4 and p.config->'adaptiveEnabled'='true'::jsonb and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb))")
         .bind(job.slot_id).bind(&job.owner_id).bind(&job.algorithm_id).bind(job.config_revision).fetch_one(pool).await?)
 }
 pub async fn renew(pool:&PgPool,worker:&str,job:&TelegramJob)->Result<bool,DbError> {

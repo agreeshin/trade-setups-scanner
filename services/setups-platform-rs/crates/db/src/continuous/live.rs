@@ -131,7 +131,7 @@ pub struct InitialAdaptiveCheckpoint {
 }
 
 pub async fn pending_adaptive_slots(pool: &PgPool, owner: &str) -> Result<Vec<PendingAdaptiveSlot>, DbError> {
-    let rows = sqlx::query("select s.id slot_id,s.owner_id,s.algorithm_id,s.min_setups_per_day::double precision frequency,s.active_generation_id,s.pending_status,s.readiness_frontier,g.id generation_id,g.study_id,g.config_revision,g.spec,g.result,g.live_initialization,g.live_readiness,g.result#>'{best,params}' params,g.result#>'{best,analytics}' analytics,g.result->'selectedCell' selected_cell,(g.result->>'meanExpectancy')::double precision mean_expectancy,g.spec->>'direction' direction,n.value->>'externalName' external_name from continuous_slots s join continuous_generations g on g.id=s.pending_generation_id join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id left join settings n on n.key='algorithm:'||s.algorithm_id where s.owner_id=$1 and s.enabled and p.desired_running and p.config_revision=g.config_revision and p.config->'adaptiveEnabled'='true'::jsonb and g.accepted=true and g.status='completed' and g.live_init_status is distinct from 'exhausted' and g.live_init_status is distinct from 'superseded' order by s.id limit 257")
+    let rows = sqlx::query("select s.id slot_id,s.owner_id,s.algorithm_id,s.min_setups_per_day::double precision frequency,s.active_generation_id,s.pending_status,s.readiness_frontier,g.id generation_id,g.study_id,p.config_revision,g.spec,g.result,g.live_initialization,g.live_readiness,g.result#>'{best,params}' params,g.result#>'{best,analytics}' analytics,g.result->'selectedCell' selected_cell,(g.result->>'meanExpectancy')::double precision mean_expectancy,g.spec->>'direction' direction,n.value->>'externalName' external_name from continuous_slots s join continuous_generations g on g.id=s.pending_generation_id join adaptive_live_controls p on p.id=s.id left join settings n on n.key='algorithm:'||s.algorithm_id where s.owner_id=$1 and p.desired_running and p.config->'adaptiveEnabled'='true'::jsonb and g.accepted=true and g.status='completed' and g.live_init_status is distinct from 'exhausted' and g.live_init_status is distinct from 'superseded' order by s.id limit 257")
         .bind(owner).fetch_all(pool).await?;
     if rows.len() > 256 { return Err(DbError::Json("pending live slot admission exceeds 256 profiles".into())); }
     rows.into_iter().map(|r| Ok(PendingAdaptiveSlot {
@@ -162,15 +162,14 @@ fn valid_worker(worker: &str) -> Result<(), DbError> {
 // Always process -> slot -> warmup lane, shared with Stop and scan commit.
 async fn lock_pending(tx: &mut Transaction<'_, Postgres>, fence: &WarmupLease) -> Result<bool, DbError> {
     owner_lock(tx, &fence.owner_id).await?;
-    let process = sqlx::query("select desired_running,config_revision,config from continuous_processes where owner_id=$1 and algorithm_id=$2 for share")
-        .bind(&fence.owner_id).bind(&fence.algorithm_id).fetch_optional(&mut **tx).await?;
+    let process = sqlx::query("select desired_running,config_revision,config from adaptive_live_controls where owner_id=$1 and algorithm_id=$2 and id=$3 for share")
+        .bind(&fence.owner_id).bind(&fence.algorithm_id).bind(fence.slot_id).fetch_optional(&mut **tx).await?;
     let slot = sqlx::query("select pending_generation_id,enabled from continuous_slots where id=$1 and owner_id=$2 and algorithm_id=$3 for update")
         .bind(fence.slot_id).bind(&fence.owner_id).bind(&fence.algorithm_id).fetch_optional(&mut **tx).await?;
     Ok(match (process,slot) {
         (Some(p),Some(s)) => p.try_get::<bool,_>("desired_running")?
             && p.try_get::<i64,_>("config_revision")? == fence.config_revision
             && p.try_get::<Value,_>("config")?["adaptiveEnabled"] == true
-            && s.try_get::<bool,_>("enabled")?
             && s.try_get::<Option<i64>,_>("pending_generation_id")? == Some(fence.generation_id),
         _ => false,
     })
@@ -206,7 +205,7 @@ pub async fn renew_pending_warmup_until(pool:&PgPool,fence:&WarmupLease)->Result
     // without this step a lease expiring during that wait could be resurrected.
     sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update")
         .execute(&mut *tx).await?;
-    let remaining:Option<i64>=sqlx::query_scalar("update adaptive_live_warmup_lane w set lease_until=least(clock_timestamp()+$5::bigint*interval '1 second',g.live_init_deadline) from continuous_generations g,continuous_slots s,continuous_processes p where w.id=1 and w.slot_id=$1 and w.generation_id=$2 and w.lease_owner=$3 and w.lease_token=$4 and w.lease_until>clock_timestamp() and g.id=w.generation_id and g.live_init_deadline>clock_timestamp() and g.live_init_status='running' and g.live_init_attempts=$6 and g.status='completed' and g.accepted and s.id=w.slot_id and s.pending_generation_id=g.id and s.enabled and p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id and p.desired_running and p.config_revision=g.config_revision and p.config_revision=$7 and p.owner_id=$8 and p.algorithm_id=$9 and p.config->'adaptiveEnabled'='true'::jsonb and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb) returning floor(extract(epoch from (w.lease_until-clock_timestamp()))*1000)::bigint")
+    let remaining:Option<i64>=sqlx::query_scalar("update adaptive_live_warmup_lane w set lease_until=least(clock_timestamp()+$5::bigint*interval '1 second',g.live_init_deadline) from continuous_generations g,continuous_slots s,adaptive_live_controls p where w.id=1 and w.slot_id=$1 and w.generation_id=$2 and w.lease_owner=$3 and w.lease_token=$4 and w.lease_until>clock_timestamp() and g.id=w.generation_id and g.live_init_deadline>clock_timestamp() and g.live_init_status='running' and g.live_init_attempts=$6 and g.status='completed' and g.accepted and s.id=w.slot_id and s.pending_generation_id=g.id and p.id=s.id and p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id and p.desired_running and p.config_revision=$7 and p.owner_id=$8 and p.algorithm_id=$9 and p.config->'adaptiveEnabled'='true'::jsonb and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb) returning floor(extract(epoch from (w.lease_until-clock_timestamp()))*1000)::bigint")
         .bind(fence.slot_id).bind(fence.generation_id).bind(&fence.worker).bind(fence.token).bind(WARMUP_LEASE_SECONDS)
         .bind(fence.attempt).bind(fence.config_revision).bind(&fence.owner_id).bind(&fence.algorithm_id)
         .fetch_optional(&mut *tx).await?;
@@ -218,7 +217,7 @@ async fn control_timeouts(tx:&mut Transaction<'_,Postgres>)->Result<(),DbError> 
         .execute(&mut **tx).await?;Ok(())
 }
 async fn pending_control_current(tx:&mut Transaction<'_,Postgres>,fence:&WarmupLease)->Result<bool,DbError> {
-    Ok(sqlx::query_scalar("select exists(select 1 from continuous_slots s join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id join continuous_generations g on g.id=s.pending_generation_id where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3 and s.pending_generation_id=$4 and s.enabled and p.desired_running and p.config_revision=$5 and g.config_revision=$5 and p.config->'adaptiveEnabled'='true'::jsonb and g.live_init_status='running' and g.live_init_attempts=$6)")
+    Ok(sqlx::query_scalar("select exists(select 1 from continuous_slots s join adaptive_live_controls p on p.id=s.id join continuous_generations g on g.id=s.pending_generation_id where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3 and s.pending_generation_id=$4 and p.desired_running and p.config_revision=$5 and p.config->'adaptiveEnabled'='true'::jsonb and g.live_init_status='running' and g.live_init_attempts=$6)")
         .bind(fence.slot_id).bind(&fence.owner_id).bind(&fence.algorithm_id).bind(fence.generation_id)
         .bind(fence.config_revision).bind(fence.attempt).fetch_one(&mut **tx).await?)
 }
@@ -269,7 +268,7 @@ pub async fn claim_pending_warmup_with_budget(pool: &PgPool, pending: &PendingAd
     if !lock_pending(&mut tx,&fence).await? { return Ok(None); }
     // Process -> slot -> global lane -> generation: no long reads under locks.
     sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update").execute(&mut *tx).await?;
-    let eligible: bool = sqlx::query_scalar("select exists(select 1 from continuous_generations g where id=$1 and status='completed' and accepted=true and live_init_attempts<live_init_attempt_limit and live_init_status is distinct from 'exhausted' and live_init_status is distinct from 'superseded' and (live_init_next_attempt_at is null or live_init_next_attempt_at<=clock_timestamp()) and not exists(select 1 from continuous_generations newer where newer.owner_id=g.owner_id and newer.algorithm_id=g.algorithm_id and newer.slot_id=g.slot_id and newer.config_revision=g.config_revision and newer.status='completed' and newer.id>g.id))")
+    let eligible: bool = sqlx::query_scalar("select exists(select 1 from continuous_generations g where id=$1 and status='completed' and accepted=true and live_init_attempts<live_init_attempt_limit and live_init_status is distinct from 'exhausted' and live_init_status is distinct from 'superseded' and (live_init_next_attempt_at is null or live_init_next_attempt_at<=clock_timestamp()) and exists(select 1 from adaptive_profiles p where p.id=g.slot_id and p.accepted_generation_id=g.id))")
         .bind(p.generation_id).fetch_one(&mut *tx).await?;
     if !eligible { return Ok(None); }
     fence.lease_valid_until=std::time::Instant::now()+std::time::Duration::from_secs(WARMUP_LEASE_SECONDS as u64);
@@ -382,7 +381,7 @@ pub async fn release_pending_warmup(pool:&PgPool,fence:&WarmupLease)->Result<boo
 pub async fn recover_pending_warmups(pool:&PgPool,owner:&str)->Result<u64,DbError> {
     let mut tx=pool.begin().await?;
     owner_lock(&mut tx,owner).await?;
-    sqlx::query("select owner_id from continuous_processes where owner_id=$1 order by algorithm_id for update").bind(owner).execute(&mut *tx).await?;
+    sqlx::query("select id from adaptive_profiles where owner_id=$1 order by id for update").bind(owner).execute(&mut *tx).await?;
     let rows=sqlx::query("select s.id slot_id,g.id generation_id from continuous_slots s join continuous_generations g on g.id=s.pending_generation_id where s.owner_id=$1 and g.live_init_status='running' order by s.id for update of s")
         .bind(owner).fetch_all(&mut *tx).await?;
     sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update").execute(&mut *tx).await?;
@@ -477,7 +476,7 @@ pub async fn promote_pending_with_dispositions_guarded(pool: &PgPool, fence: &Wa
     if !lock_pending(&mut tx,fence).await? { return Ok(false); }
     sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update").execute(&mut *tx).await?;
     if !lease_current(&mut tx,fence).await? { return Ok(false); }
-    let ready: bool = sqlx::query_scalar("select exists(select 1 from continuous_slots s join continuous_generations g on g.id=s.pending_generation_id where s.id=$1 and s.active_generation_id is not distinct from $2 and s.pending_status='ready' and s.readiness_frontier=$3 and g.status='completed' and g.accepted=true and g.owner_id=$4 and g.algorithm_id=$5 and g.config_revision=$6 and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb) and not exists(select 1 from continuous_generations newer where newer.owner_id=g.owner_id and newer.algorithm_id=g.algorithm_id and newer.slot_id=g.slot_id and newer.config_revision=g.config_revision and newer.status='completed' and newer.id>g.id))")
+    let ready: bool = sqlx::query_scalar("select exists(select 1 from continuous_slots s join continuous_generations g on g.id=s.pending_generation_id where s.id=$1 and s.active_generation_id is not distinct from $2 and s.pending_status='ready' and s.readiness_frontier=$3 and g.status='completed' and g.accepted=true and g.owner_id=$4 and g.algorithm_id=$5 and exists(select 1 from adaptive_profiles p where p.id=s.id and p.control_revision=$6 and p.accepted_generation_id=g.id) and exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb) and exists(select 1 from adaptive_profiles p where p.id=g.slot_id and p.accepted_generation_id=g.id))")
         .bind(fence.slot_id).bind(expected_active_generation_id).bind(readiness_frontier).bind(&fence.owner_id).bind(&fence.algorithm_id).bind(fence.config_revision).fetch_one(&mut *tx).await?;
     if !ready { return Ok(false); }
     let candidate_spec: Value=sqlx::query_scalar("select spec from continuous_generations where id=$1").bind(fence.generation_id).fetch_one(&mut *tx).await?;
@@ -541,14 +540,14 @@ pub async fn join_waiting_adaptive_instrument(pool:&PgPool,expected:&ActiveAdapt
         return Err(DbError::Json("invalid waiting instrument join state/frontier".into()));
     }
     let mut tx=pool.begin().await?;
-    let process=sqlx::query("select desired_running,config_revision,config from continuous_processes where owner_id=$1 and algorithm_id=$2 for share")
-        .bind(&expected.owner_id).bind(&expected.algorithm_id).fetch_optional(&mut *tx).await?;
+    let process=sqlx::query("select desired_running,config_revision,config from adaptive_live_controls where owner_id=$1 and algorithm_id=$2 and id=$3 for share")
+        .bind(&expected.owner_id).bind(&expected.algorithm_id).bind(expected.slot_id).fetch_optional(&mut *tx).await?;
     let slot=sqlx::query("select active_generation_id,enabled from continuous_slots where id=$1 and owner_id=$2 and algorithm_id=$3 for update")
         .bind(expected.slot_id).bind(&expected.owner_id).bind(&expected.algorithm_id).fetch_optional(&mut *tx).await?;
     let global:bool=sqlx::query_scalar("select exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb)").fetch_one(&mut *tx).await?;
     let valid=match (process,slot) {
         (Some(p),Some(s))=>global && p.try_get::<bool,_>("desired_running")? && p.try_get::<i64,_>("config_revision")?==expected.config_revision
-            && p.try_get::<Value,_>("config")?["adaptiveEnabled"]==true && s.try_get::<bool,_>("enabled")?
+            && p.try_get::<Value,_>("config")?["adaptiveEnabled"]==true
             && s.try_get::<Option<i64>,_>("active_generation_id")?==Some(expected.generation_id),
         _=>false,
     };
@@ -585,24 +584,8 @@ fn scope_keys(spec: &Value) -> Result<BTreeSet<String>,DbError> {
     Ok(keys)
 }
 
-/// Caller holds the owner mutation lock and the process write lock. Scans share
-/// that process lock, so a captured old generation cannot recreate these cursors
-/// after deactivation. Only obsolete ephemeral state is retired: accepted live
-/// incumbents, signal dedup/history, outbox and research are never deletion targets.
-pub(super) async fn retire_inactive_checkpoints(tx: &mut Transaction<'_,Postgres>, owner: &str, algorithm: &str, slot: Option<i64>) -> Result<(),DbError> {
-    sqlx::query("delete from adaptive_live_checkpoints c using continuous_slots s where c.slot_id=s.id and s.owner_id=$1 and s.algorithm_id=$2 and s.active_generation_id is null and ($3::bigint is null or s.id=$3)")
-        .bind(owner).bind(algorithm).bind(slot).execute(&mut **tx).await?;
-    Ok(())
-}
-
-pub(super) async fn invalidate_warmup(tx: &mut Transaction<'_,Postgres>, owner: &str, algorithm: &str) -> Result<(),DbError> {
-    sqlx::query("update adaptive_live_warmup_lane w set slot_id=null,generation_id=null,lease_owner=null,lease_until=null,lease_token=lease_token+1 where w.slot_id in (select id from continuous_slots where owner_id=$1 and algorithm_id=$2)")
-        .bind(owner).bind(algorithm).execute(&mut **tx).await?;
-    Ok(())
-}
-
-/// Research never waits for live. A newer complete result fences an older
-/// pending candidate, but does not touch the active incumbent or research data.
+/// Only a newer accepted handoff supersedes pending live work; completed
+/// nonpass/no-winner research does not revoke an already accepted candidate.
 pub(super) async fn supersede_pending(tx:&mut Transaction<'_,Postgres>,slot:i64)->Result<(),DbError> {
     let previous:Option<i64>=sqlx::query_scalar("select pending_generation_id from continuous_slots where id=$1 for update")
         .bind(slot).fetch_one(&mut **tx).await?;

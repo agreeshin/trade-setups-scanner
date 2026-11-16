@@ -65,6 +65,8 @@ async fn main() {
         }
     }
     let live_pool=connect_lane(&config.database_url,config.resources.live_db_connections,"live").await;
+    setups_api::continuous::configure_profile_limits_from_env(&pool).await
+        .unwrap_or_else(|error|{eprintln!("profile limit configuration failed: {error}");std::process::exit(1)});
     let manual_pool=connect_lane(&config.database_url,config.resources.manual_db_connections,"manual").await;
     let continuous_pool=connect_lane(&config.database_url,config.resources.continuous_db_connections,"continuous").await;
     setups_db::continuous::outbox::configure_limits(&live_pool,config.resources.notification_max_jobs,config.resources.notification_max_bytes)

@@ -135,6 +135,7 @@ fn profile_with_gap(now:i64,gap:Option<i64>)->(Value,Value) {
 }
 
 async fn configure(pool: &PgPool) {
+    continuous::profiles::set_permission(pool,"admin","price_volume_spike",true).await.unwrap();
     continuous::configure(
         pool,
         "admin",
@@ -169,6 +170,8 @@ async fn activate(pool: &PgPool, slot_id: i64, spec: &Value, result: &Value) {
         .bind(spec).fetch_one(pool).await.unwrap();
     let generation:i64=sqlx::query_scalar("insert into continuous_generations(owner_id,algorithm_id,slot_id,config_revision,lease_token,status,phase,spec,execution_started_at,observation_cutoff,study_id,result,accepted) values('admin','price_volume_spike',$1,(select config_revision from continuous_processes where owner_id='admin' and algorithm_id='price_volume_spike'),1,'completed','completed',$2,now(),$3,$4,$5,true) returning id")
         .bind(slot_id).bind(spec).bind(spec["toUnix"].as_i64().unwrap()).bind(study).bind(result).fetch_one(pool).await.unwrap();
+    sqlx::query("insert into adaptive_profiles(id,owner_id,algorithm_id,min_setups_per_day,accepted_generation_id) select id,owner_id,algorithm_id,min_setups_per_day,$2 from continuous_slots where id=$1 on conflict(id) do update set accepted_generation_id=excluded.accepted_generation_id")
+        .bind(slot_id).bind(generation).execute(pool).await.unwrap();
     sqlx::query("update continuous_slots set active_generation_id=$2,study_id=$3,mean_expectancy=0.21,selected_cell=$4,status='active' where id=$1")
         .bind(slot_id).bind(generation).bind(study).bind(&result["selectedCell"]).execute(pool).await.unwrap();
     // Explicit operational fixture metadata. Production derives and persists
@@ -200,8 +203,14 @@ async fn stage(pool:&PgPool,slot:i64,spec:&Value,result:&Value)->i64 {
         .bind(spec).fetch_one(pool).await.unwrap();
     let generation:i64=sqlx::query_scalar("insert into continuous_generations(owner_id,algorithm_id,slot_id,config_revision,lease_token,status,phase,spec,execution_started_at,observation_cutoff,study_id,result,accepted) values('admin','price_volume_spike',$1,(select config_revision from continuous_processes where owner_id='admin' and algorithm_id='price_volume_spike'),1,'completed','completed',$2,now(),$3,$4,$5,true) returning id")
         .bind(slot).bind(spec).bind(spec["toUnix"].as_i64().unwrap()).bind(study).bind(result).fetch_one(pool).await.unwrap();
-    sqlx::query("update continuous_slots set pending_generation_id=$2,pending_status='warming',pending_error=null where id=$1")
-        .bind(slot).bind(generation).execute(pool).await.unwrap();generation
+    sqlx::query("insert into adaptive_profile_handoffs(generation_id,owner_id,slot_id) values($1,'admin',$2)")
+        .bind(generation).bind(slot).execute(pool).await.unwrap();
+    continuous::profiles::accept_handoffs(pool,"admin").await.unwrap();generation
+}
+
+async fn stop_profile(pool:&PgPool,slot:&continuous::ActiveAdaptiveSlot,key:&str) {
+    let request=continuous::profiles::ProfileCommand{expected_revision:slot.config_revision,expected_generation_id:slot.generation_id,request_id:key.into()};
+    assert!(matches!(continuous::profiles::command(pool,"admin",slot.slot_id,false,&request).await.unwrap(),continuous::profiles::CommandOutcome::Applied(_)));
 }
 
 #[derive(Clone)]
@@ -480,6 +489,9 @@ async fn actual_tick_uses_live_initialization_listing_intersection_and_independe
     continuous::stop(&db.pool, "admin", "price_volume_spike")
         .await
         .unwrap();
+    let retained=continuous::active_adaptive_slots(&db.pool,"admin").await.unwrap();
+    assert_eq!(retained.len(),active.len(),"research Stop must preserve standalone live profiles");
+    for slot in &retained {stop_profile(&db.pool,slot,&format!("worker-stop-{:016}",slot.slot_id)).await;}
     assert!(
         continuous::active_adaptive_slots(&db.pool, "admin")
             .await
@@ -594,6 +606,8 @@ async fn store_cas_fences_competing_checkpoint_and_stop_without_local_advance() 
     continuous::stop(&db.pool, "admin", "price_volume_spike")
         .await
         .unwrap();
+    assert!(store.current(&fence).await.unwrap(),"research Stop cannot invalidate live control fences");
+    stop_profile(&db.pool,&slot,"worker-cas-stop-00001").await;
     let mut stale = newer.clone();
     stale.next_open_unix += 60;
     assert!(
@@ -603,8 +617,8 @@ async fn store_cas_fences_competing_checkpoint_and_stop_without_local_advance() 
             .unwrap()
             .is_none()
     );
-    assert!(continuous::get_adaptive_checkpoint(&db.pool, id, "bybit/linear/BTCUSDT").await.unwrap().is_none(),
-        "Stop retires inactive detector cursors and a stale writer must not recreate them");
+    assert_eq!(continuous::get_adaptive_checkpoint(&db.pool, id, "bybit/linear/BTCUSDT").await.unwrap().unwrap().state,serde_json::to_value(&newer).unwrap(),
+        "profile Stop preserves the last confirmed cursor; stale work must not advance it");
     assert!(!store.current(&fence).await.unwrap());
     db.close().await;
 }

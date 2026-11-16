@@ -157,6 +157,7 @@ async fn insert_artifact(pool: &PgPool, identity: &artifacts::ArtifactIdentity) 
 }
 
 async fn fixture(pool: &PgPool) -> Fixture {
+    db::profiles::set_permission(pool,"admin","price_volume_spike",true).await.unwrap();
     db::configure(
         pool,
         "admin",
@@ -203,6 +204,8 @@ async fn fixture(pool: &PgPool) -> Fixture {
         .await
         .unwrap();
     sqlx::query("update continuous_slots set active_generation_id=$2,study_id=$3,mean_expectancy=0.5,selected_cell=$4,status='active' where id=$1").bind(slot).bind(generation).bind(study).bind(selected).execute(pool).await.unwrap();
+    sqlx::query("insert into adaptive_profiles(id,owner_id,algorithm_id,min_setups_per_day,accepted_generation_id) select id,owner_id,algorithm_id,min_setups_per_day,$2 from continuous_slots where id=$1")
+        .bind(slot).bind(generation).execute(pool).await.unwrap();
     let identity = artifacts::ArtifactIdentity {
         owner_id: "admin".into(),
         generation_id: generation,

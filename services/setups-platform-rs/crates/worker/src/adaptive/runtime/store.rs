@@ -39,7 +39,7 @@ impl JoinStore for PgJoin<'_> {
     async fn reread(&self)->Result<JoinDurable,WorkerError> {
         // One MVCC statement observes permission, generation, readiness/floor
         // and the checkpoint together. A later cohort must never be adopted.
-        let row=sqlx::query("select s.active_generation_id,s.enabled,p.desired_running,p.config_revision,p.config,g.live_readiness,c.generation_id checkpoint_generation,c.state,exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb) permitted from continuous_slots s join continuous_processes p on p.owner_id=s.owner_id and p.algorithm_id=s.algorithm_id left join continuous_generations g on g.id=s.active_generation_id left join adaptive_live_checkpoints c on c.slot_id=s.id and c.instrument_key=$4 where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3")
+        let row=sqlx::query("select s.active_generation_id,p.desired_running as enabled,p.desired_running,p.config_revision,p.config,g.live_readiness,c.generation_id checkpoint_generation,c.state,exists(select 1 from settings where key='live' and value->'enabled'='true'::jsonb) permitted from continuous_slots s join adaptive_live_controls p on p.id=s.id left join continuous_generations g on g.id=s.active_generation_id left join adaptive_live_checkpoints c on c.slot_id=s.id and c.instrument_key=$4 where s.id=$1 and s.owner_id=$2 and s.algorithm_id=$3")
             .bind(self.slot.slot_id).bind(&self.slot.owner_id).bind(&self.slot.algorithm_id).bind(self.instrument_key).fetch_optional(self.pool).await?;
         let Some(row)=row else {return Ok(JoinDurable::Changed);};
         if !row.try_get::<bool,_>("enabled")? || !row.try_get::<bool,_>("desired_running")? || !row.try_get::<bool,_>("permitted")?

@@ -1248,6 +1248,9 @@ async fn saved_png_regression(pool: &PgPool, relay: &LocalRelay) {
         .await
         .unwrap();
     sqlx::query("update continuous_processes set active_generation_id=$1,active_study_id=$2 where owner_id='admin'").bind(generation).bind(study).execute(pool).await.unwrap();
+    sqlx::query("insert into adaptive_live_permissions(owner_id,algorithm_id,enabled) values('admin','price_volume_spike',true)").execute(pool).await.unwrap();
+    sqlx::query("insert into adaptive_profiles(id,owner_id,algorithm_id,min_setups_per_day,accepted_generation_id) select id,owner_id,algorithm_id,min_setups_per_day,$2 from continuous_slots where id=$1")
+        .bind(slot).bind(generation).execute(pool).await.unwrap();
     let mut job = fixed_job(now);
     job.wire_version = 2;
     job.slot_id = Some(slot);
