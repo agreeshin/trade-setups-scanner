@@ -13,6 +13,22 @@ async function open() {
   await userEvent.click(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…" }));
   return within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
 }
+it("uses only the standard-size trash icon, preserving the accessible name and confirmation", async () => {
+  const fetch = vi.fn(() => Promise.resolve(json(preview)));
+  vi.stubGlobal("fetch", fetch);
+  render(<ContinuousHistoryCleanup onDeleted={vi.fn()} onRefreshStates={vi.fn()} />);
+  const trigger = screen.getByRole("button", { name: "Удалить историю непрерывных исследований…" });
+  expect(trigger).toHaveAttribute("aria-label", "Удалить историю непрерывных исследований…");
+  expect(trigger).toHaveClass("size-9");
+  expect(trigger).toHaveTextContent(/^$/);
+  expect(trigger.querySelector("svg")).toHaveClass("lucide-trash-2", "size-4");
+  expect(trigger.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+  const dialog = await open();
+  expect(dialog.getByRole("button", { name: "Отмена" })).toHaveFocus();
+  expect(fetch).toHaveBeenCalledOnce();
+  await userEvent.click(dialog.getByRole("button", { name: "Отмена" }));
+  expect(trigger).toHaveFocus();
+});
 it.each([401, 404, 503])("fails closed when preview is unavailable (%s) and does not issue a mutation", async (status) => {
   const fetch = vi.fn(() => Promise.resolve(json({}, status)));
   vi.stubGlobal("fetch", fetch);

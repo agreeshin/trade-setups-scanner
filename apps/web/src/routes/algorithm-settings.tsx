@@ -150,14 +150,14 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
       <div className="flex flex-wrap items-center gap-2"><h4 id={`${optimizerTriggerId}-flexible`} className="font-semibold">Live-сканирование с гибкими параметрами</h4>
         <InfoNote label="О самостоятельных адаптивных профилях">Профиль появляется только после полного принятого исследования. Stop/Play каждой строки не управляет исследованием. Research Stop и изменение очереди сохраняют профили, их рекомендации и историю. Кандидат инициализируется независимо, без повторной проверки исторического результата. Дата профиля — изменение состояния, не дата исследования.</InfoNote></div>
       <AdaptiveLive controller={profiles} />
-      <AdaptiveProfiles algorithm={optimizerAlgorithm} controller={profiles} research={continuous}>
+      <AdaptiveProfiles algorithm={optimizerAlgorithm} controller={profiles} research={continuous} />
+    </section>
+    <Separator />
+    <ContinuousResearch controller={continuous}>
       <ContinuousControls algorithm={optimizerAlgorithm} controller={continuous}>
         {selected && <ContinuousHistoryCleanup disabled={optimization.creating || optimization.cancelling !== null || optimization.deleting !== null} onRefreshStates={refreshStates} onDeleted={onCleanup} />}
       </ContinuousControls>
-      </AdaptiveProfiles>
-    </section>
-    <Separator />
-    <ContinuousResearch controller={continuous} />
+    </ContinuousResearch>
     <Separator />
     <section aria-labelledby={`${optimizerTriggerId}-optimizations`} className="grid min-w-0 gap-4">
     <h4 id={`${optimizerTriggerId}-optimizations`} className="font-semibold">Ручные оптимизации</h4>

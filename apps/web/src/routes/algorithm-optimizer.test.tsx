@@ -800,7 +800,9 @@ it("does not offer repeated stop or deletion for cancel_requested", async () => 
 it.each(["completed", "cancelled", "failed"] as const)("confirms terminal %s deletion, closes selected detail and refreshes history", async (status) => {
   studies = [{ ...record("completed"), id: 20 }, record(status)];
   render(<AlgorithmsPage />);
-  fireEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }));
+  // Initial mount + discovery + history are distinct async steps; the 1s query
+  // default can expire before history is requested on the larger Algorithms page.
+  fireEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }, { timeout: 5000 }));
   await screen.findByText("Исследование #17");
   fireEvent.click(screen.getByRole("button", { name: "Удалить исследование 17" }));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
@@ -852,7 +854,7 @@ it.each(["completed", "cancelled", "failed"] as const)("allows explicit deletion
 it("explains study deletion authentication failure and retains the confirmation and row", async () => {
   studies = [record("failed")]; deleteStatus = 401;
   render(<AlgorithmsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }, { timeout: 5000 }));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
   await userEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
   expect(await confirmation.findByRole("alert")).toHaveTextContent(/Сессия истекла|Войдите/);
@@ -865,7 +867,7 @@ it("distinguishes retained-chain deletion conflict and refreshes study discovery
   studies = [{ ...record("failed"), origin: "continuous", continuousGenerationId: 7, continuousSlotId: 5 }];
   deleteStatus = 409; deleteErrorCode = "continuous_history_referenced";
   render(<AlgorithmsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }, { timeout: 5000 }));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
   const readsBefore = requests.filter((request) => request.path.startsWith("/v1/optimization-studies?")).length;
   await userEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
@@ -883,6 +885,8 @@ it("previews owner-wide continuous cleanup once, cancels safely, and preserves d
   fireEvent.change(fixed, { target: { value: "8.5" } });
   fireEvent.click(screen.getByRole("tab", { name: "Live-сканирование с гибкими параметрами" }));
   expect(screen.getAllByRole("button", { name: "Удалить историю непрерывных исследований…" })).toHaveLength(1);
+  const controls = within(screen.getByRole("region", { name: "Непрерывные исследования" })).getByRole("region", { name: "Управление непрерывным исследованием" });
+  expect(within(controls).getByRole("button", { name: "Удалить историю непрерывных исследований…" })).toHaveTextContent(/^$/);
   expect(requests.some((request) => request.path === "/v1/continuous-studies/cleanup")).toBe(false);
   await userEvent.click(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…" }));
   let confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
@@ -944,7 +948,7 @@ it("keeps the exact selected manual detail open across continuous cleanup", asyn
   await userEvent.click(await screen.findByRole("button", { name: "Результат исследования 20" }));
   await screen.findByRole("dialog", { name: "Исследование #20 · Новый алгоритм" });
   // Simulates an owner-wide cleanup completing while an existing selection is retained.
-  fireEvent.click(screen.getByText("Удалить историю непрерывных исследований…"));
+  fireEvent.click(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…", hidden: true }));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
   await confirmation.findByText("Непрерывные исследования: 12");
   await userEvent.click(confirmation.getByRole("button", { name: "Удалить историю" }));
@@ -962,7 +966,7 @@ it("preserves the mounted manual form and its shared saved draft when cleanup re
   fireEvent.blur(horizon);
   await waitFor(() => expect(drafts.future_algorithm).toMatchObject({ shared: { scope: { horizonMinutes: "720" } } }));
   const savedDraft = structuredClone(drafts.future_algorithm);
-  fireEvent.click(screen.getByText("Удалить историю непрерывных исследований…"));
+  fireEvent.click(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…", hidden: true }));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
   await confirmation.findByText("Непрерывные исследования: 12");
   await userEvent.click(confirmation.getByRole("button", { name: "Удалить историю" }));
@@ -976,9 +980,9 @@ it("preserves the mounted manual form and its shared saved draft when cleanup re
 it("closes a deleted continuous selection without closing retained manual optimizer state", async () => {
   studies = [{ ...record("completed"), id: 20, origin: "manual" }, { ...record("failed"), origin: "continuous" }];
   render(<AlgorithmsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }, { timeout: 5000 }));
   await screen.findByRole("dialog", { name: "Исследование #17 · Новый алгоритм" });
-  fireEvent.click(screen.getByText("Удалить историю непрерывных исследований…"));
+  fireEvent.click(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…", hidden: true }));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
   await confirmation.findByText("Непрерывные исследования: 12");
   await userEvent.click(confirmation.getByRole("button", { name: "Удалить историю" }));

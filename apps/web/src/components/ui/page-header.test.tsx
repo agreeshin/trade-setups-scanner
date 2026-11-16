@@ -31,6 +31,6 @@ describe("PageHeader", () => {
     const info = screen.getByRole("button", { name: "О разделе" });
     expect(heading.parentElement).toHaveClass("flex", "items-center");
     expect(heading.nextElementSibling).toContainElement(info);
-    expect(info).toHaveClass("size-10.5", "border-0", "bg-muted/60");
+    expect(info).toHaveClass("size-7", "border-0", "bg-muted/60");
   });
 });

@@ -1,6 +1,8 @@
 import { useEffect, useId, useRef, useState } from "react";
+import { Trash2 } from "lucide-react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
+import { IconButton } from "../components/ui/icon-button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Spinner } from "../components/ui/spinner";
 import { ContinuousCleanupApiError, deleteContinuousHistory, previewContinuousCleanup, type ContinuousCleanupCounts, type ContinuousCleanupPreview, type ContinuousCleanupRetained, type ContinuousCleanupResult } from "../lib/continuous-cleanup-api";
@@ -74,7 +76,7 @@ export function ContinuousHistoryCleanup({ onDeleted, onRefreshStates, disabled 
     }
   }
   return <section aria-label="Очистка истории непрерывных исследований" className="grid min-w-0 gap-3">
-    <div><Button id={triggerId} type="button" variant="outline" disabled={disabled || deleting} onClick={showModal}>Удалить историю непрерывных исследований…</Button></div>
+    <div><IconButton id={triggerId} label="Удалить историю непрерывных исследований…" icon={Trash2} disabled={disabled || deleting} onClick={showModal} /></div>
     {result && <div role="status" className="grid gap-2 text-sm"><p>История непрерывных исследований удалена. Исторические запуски, аналитика, live-сетапы, настройки и черновики сохранены.</p><Counters value={result.deleted} labels={removedLabels} /></div>}
     <Dialog open={open} onOpenChange={(next) => { if (!mutation.current && !next) closeModal(); }}>
       <DialogContent className="max-w-2xl" onOpenAutoFocus={(event) => { event.preventDefault(); document.getElementById(cancelId)?.focus(); }} onCloseAutoFocus={(event) => { event.preventDefault(); document.getElementById(triggerId)?.focus(); }}>

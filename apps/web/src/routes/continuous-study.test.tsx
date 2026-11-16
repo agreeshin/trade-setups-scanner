@@ -37,7 +37,7 @@ function profileFixture(controller: ContinuousController): AdaptiveProfilesContr
 }
 // Compose the same independent surfaces for the retained badge/popup regression matrix.
 function ContinuousResearch({ algorithm, controller }: { algorithm: Algorithm; controller: ContinuousController }) {
-  return <><ContinuousControls algorithm={algorithm} controller={controller} /><AdaptiveProfiles algorithm={algorithm} controller={profileFixture(controller)} research={controller} /><ResearchSummary controller={controller} /></>;
+  return <><AdaptiveProfiles algorithm={algorithm} controller={profileFixture(controller)} research={controller} /><ResearchSummary controller={controller}><ContinuousControls algorithm={algorithm} controller={controller} /></ResearchSummary></>;
 }
 const requests: { path: string; method: string; body: unknown }[] = [];
 beforeEach(() => {
@@ -185,7 +185,8 @@ it.each([100, 95, 94, 50, 49, 0])("keeps only the active status green at readine
   render(profileView({ activeStatus: "active", liveReadinessSummary: { ...readinessSummary, totalInstruments: 100, readyInstruments: ready, waitingInstruments: 100 - ready, waitingReasons: [], otherWaitingInstruments: 100 - ready } }));
   const button = screen.getByRole("button", { name: /Действующее поколение #7/ });
   const badge = button.querySelector('[data-slot="badge"]');
-  expect(button).toHaveClass("cursor-help", "decoration-dotted");
+  expect(button).toHaveClass("cursor-help", "focus-visible:ring-2");
+  expect(button).not.toHaveClass("underline", "decoration-dotted", "underline-offset-4");
   expect(badge).toHaveClass("text-success");
   expect(badge).toHaveTextContent(/^Активно$/);
   expect(badge).not.toHaveTextContent("поколение");
@@ -228,7 +229,7 @@ it.each(liveStatusCases)("renders only $label in a $color badge for $patch", ({ 
   expect(popup.queryByRole("alert") !== null).toBe(problem === true);
 });
 
-it("explains an unconfirmed snapshot without recoloring the saved live status and retains icon-only actions", () => {
+it("explains an unconfirmed snapshot without recoloring the saved live status and retains icon-only actions", async () => {
   const controller = profileController({ activeStatus: "active", liveReadinessSummary: readinessSummary }, {}, { available: false });
   const view = render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
   expect(screen.getByRole("button", { name: /Действующее поколение #7/ }).querySelector('[data-slot="badge"]')).toHaveClass("text-success");
@@ -237,13 +238,92 @@ it("explains an unconfirmed snapshot without recoloring the saved live status an
   for (const label of labels) {
     const button = screen.getByRole("button", { name: label });
     expect(button.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+    expect(button).toHaveClass("size-9");
+    expect(button).not.toHaveClass("size-14");
+    expect(button.querySelector("svg")).toHaveClass("size-4");
     expect(button.textContent).toBe("");
   }
   expect(screen.getByRole("button", { name: labels[1] })).toBeDisabled();
   fireEvent.click(screen.getByRole("button", { name: labels[0] })); expect(controller.refresh).toHaveBeenCalledOnce();
   view.rerender(<ContinuousResearch algorithm={algorithm} controller={{ ...controller, available: true }} />);
   expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: labels[2] })); expect(controller.stop).toHaveBeenCalledOnce();
+  fireEvent.click(screen.getByRole("button", { name: labels[2] }));
+  expect(controller.stop).not.toHaveBeenCalled();
+  fireEvent.click(within(screen.getByRole("dialog", { name: "Остановить непрерывное исследование?" })).getByRole("button", { name: "Остановить исследование" }));
+  expect(controller.stop).toHaveBeenCalledOnce();
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+});
+
+it("puts research commands and history cleanup only in Continuous Research, outside adaptive profiles", async () => {
+  render(<AlgorithmsPage />);
+  const controls = await screen.findByRole("region", { name: "Управление непрерывным исследованием" });
+  const research = screen.getByRole("region", { name: "Непрерывные исследования" });
+  expect(research).toContainElement(controls);
+  for (const name of ["Обновить статус непрерывного процесса", "Настроить непрерывное исследование", "Запустить непрерывное исследование", "Удалить историю непрерывных исследований…"]) {
+    expect(within(controls).getByRole("button", { name })).toBeInTheDocument();
+  }
+  const profiles = screen.getByRole("heading", { name: "Адаптивные профили" }).parentElement!.parentElement!;
+  expect(profiles).not.toContainElement(controls);
+  expect(within(profiles).queryByRole("button", { name: "Настроить непрерывное исследование" })).not.toBeInTheDocument();
+  expect(within(controls).getByRole("button", { name: "Запустить непрерывное исследование" })).toHaveClass("size-9");
+});
+
+it("requires explicit research Stop confirmation, defaults focus to Cancel and restores trigger focus", async () => {
+  const controller = profileController();
+  render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
+  const trigger = screen.getByRole("button", { name: "Остановить непрерывное исследование" });
+  await userEvent.click(trigger);
+  let dialog = within(screen.getByRole("dialog", { name: "Остановить непрерывное исследование?" }));
+  expect(dialog.getByText(/Профили, завершённая история и постоянный live сохраняются/)).toBeInTheDocument();
+  expect(dialog.getByRole("button", { name: "Отмена" })).toHaveFocus();
+  expect(controller.stop).not.toHaveBeenCalled();
+  await userEvent.click(dialog.getByRole("button", { name: "Отмена" }));
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(trigger).toHaveFocus();
+  await userEvent.click(trigger);
+  await userEvent.keyboard("{Escape}");
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(trigger).toHaveFocus();
+  expect(controller.stop).not.toHaveBeenCalled();
+  await userEvent.click(trigger);
+  dialog = within(screen.getByRole("dialog", { name: "Остановить непрерывное исследование?" }));
+  await userEvent.click(dialog.getByRole("button", { name: "Остановить исследование" }));
+  expect(controller.stop).toHaveBeenCalledOnce();
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+});
+
+it.each([
+  { available: false }, { busy: "save" as const }, { busy: "stop" as const },
+  { process: null }, { process: profileController({}, { status: "stopped" }).process },
+  { process: profileController({}, { status: "stopping" }).process },
+])("rechecks command eligibility if the snapshot changes while research Stop confirmation is open: %j", (patch) => {
+  const controller = profileController();
+  const view = render(<ContinuousControls algorithm={algorithm} controller={controller} />);
+  fireEvent.click(screen.getByRole("button", { name: "Остановить непрерывное исследование" }));
+  view.rerender(<ContinuousControls algorithm={algorithm} controller={{ ...controller, ...patch }} />);
+  const confirm = within(screen.getByRole("dialog")).getByRole("button", { name: "Остановить исследование" });
+  expect(confirm).toBeDisabled();
+  fireEvent.click(confirm);
+  expect(controller.stop).not.toHaveBeenCalled();
+});
+
+it("serializes research Stop confirmation and keeps a failed command visible without auto-retry", async () => {
+  let resolveStop: ((ok: boolean) => void) | undefined;
+  const controller = profileController({}, {}, { stop: vi.fn(() => new Promise<boolean>((resolve) => { resolveStop = resolve; })) });
+  const view = render(<ContinuousControls algorithm={algorithm} controller={controller} />);
+  fireEvent.click(screen.getByRole("button", { name: "Остановить непрерывное исследование" }));
+  const dialog = within(screen.getByRole("dialog"));
+  const confirm = dialog.getByRole("button", { name: "Остановить исследование" });
+  fireEvent.click(confirm); fireEvent.click(confirm);
+  expect(controller.stop).toHaveBeenCalledOnce();
+  expect(dialog.getByRole("button", { name: "Отмена" })).toBeDisabled();
+  await userEvent.keyboard("{Escape}");
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
+  await act(async () => { resolveStop?.(false); await Promise.resolve(); });
+  view.rerender(<ContinuousControls algorithm={algorithm} controller={{ ...controller, error: "Ошибка остановки. Обновите статус." }} />);
+  expect(dialog.getByRole("alert")).toHaveTextContent("Ошибка остановки");
+  expect(dialog.getByRole("button", { name: "Остановить исследование" })).toBeEnabled();
+  expect(controller.stop).toHaveBeenCalledOnce();
 });
 
 it.each(["running", "error"] as const)("explains a retained process error in state %s without repainting active slots", (status) => {
@@ -629,6 +709,8 @@ it("keeps adaptive permission independent and drains only through the common alg
   await screen.findByText("Непрерывное исследование включено");
   expect(screen.getByText("Адаптивный live разрешён · действующих профилей нет, ожидается инициализация.")).toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "Остановить непрерывное исследование" }));
+  expect(requests.filter((request) => request.path.endsWith("/stop"))).toHaveLength(0);
+  await userEvent.click(within(screen.getByRole("dialog", { name: "Остановить непрерывное исследование?" })).getByRole("button", { name: "Остановить исследование" }));
   await screen.findByText("Останавливается");
   expect(screen.getByRole("button", { name: "Остановка запрошена · ожидаем drain" })).toBeDisabled();
   expect(requests.filter((request) => request.path.endsWith("/stop"))).toHaveLength(1);
@@ -796,6 +878,7 @@ it("keeps an accepted profile visible through technical failure, allows common S
   expect(screen.getByText("SHORT · TP 14% / SL 4% · 0.32 R")).toBeInTheDocument();
   await screen.findByRole("button", { name: "Результат исследования 42" });
   await userEvent.click(screen.getByRole("button", { name: "Остановить непрерывное исследование" }));
+  await userEvent.click(within(screen.getByRole("dialog", { name: "Остановить непрерывное исследование?" })).getByRole("button", { name: "Остановить исследование" }));
   await screen.findByText("Останавливается");
   liveDetails();
   expect(screen.getByText("Принятое поколение сохранено")).toBeInTheDocument();

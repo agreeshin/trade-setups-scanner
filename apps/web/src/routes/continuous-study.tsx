@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Play, RefreshCw, Settings, Square } from "lucide-react";
 import type { AdaptiveProfilesController } from "./use-adaptive-profiles";
 import type { AdaptiveProfile } from "../lib/adaptive-profiles-api";
@@ -109,7 +109,7 @@ function SlotIncumbent({ slot, process, available }: { slot: ContinuousSlot; pro
     <SlotReadiness slot={slot} invalid={invalidCounts} />
     {!absent && <span>{slot.liveWatermark == null ? "Watermark переключения неизвестен" : `Watermark переключения: ${closedTime(slot.liveWatermark)}`}</span>}
   </div>}>
-    <button type="button" className="inline-flex cursor-help flex-wrap items-center gap-1 rounded-lg text-left underline decoration-dotted underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
+    <button type="button" className="inline-flex cursor-help flex-wrap items-center gap-1 rounded-lg text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
       {!absent ? <span>{`${slot.activeStatus === "active" ? "Действующее" : "Принятое"} поколение #${slot.activeGenerationId}`}</span>
         : status.label !== "Нет действующего поколения" && <span>Нет действующего поколения</span>}
       <Badge variant={status.variant} className="whitespace-normal text-left">{status.label}</Badge>
@@ -175,11 +175,10 @@ export function AdaptiveLive({ controller }: { controller: AdaptiveProfilesContr
   </div>;
 }
 
-export function AdaptiveProfiles({ algorithm, controller, research, children }: { algorithm: Algorithm; controller: AdaptiveProfilesController; research?: ContinuousController; children?: ReactNode }) {
+export function AdaptiveProfiles({ algorithm, controller, research }: { algorithm: Algorithm; controller: AdaptiveProfilesController; research?: ContinuousController }) {
   const profiles = controller.page?.profiles ?? [];
   return <div className="grid min-w-0 gap-3">
     <div className="flex items-center gap-2"><h5 className="font-semibold">Адаптивные профили</h5><InfoNote label="О настроенных адаптивных профилях">Исследование принято — это готовность рекомендаций, а не live. Кандидат инициализируется независимо, без повторной проверки исторического результата. Сохранённое исследование относится к последнему полностью завершённому поколению после replay, аналитики и gate. Дата ниже — изменение состояния профиля, не дата исследования. Stop исследования и удаление порога из очереди сохраняют самостоятельный профиль.</InfoNote></div>
-    {children}
     {controller.loading && <Spinner label="Проверка самостоятельных профилей" />}
     {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
     {!controller.available && controller.page && <p className="text-sm">Показан последний подтверждённый снимок профилей; актуальность не подтверждена.</p>}
@@ -294,11 +293,12 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
   </form>;
 }
 
-export function ContinuousResearch({ controller }: { algorithm?: Algorithm; controller: ContinuousController }) {
+export function ContinuousResearch({ controller, children }: { algorithm?: Algorithm; controller: ContinuousController; children?: ReactNode }) {
   const process = controller.process;
   return <section aria-label="Непрерывные исследования" className="grid min-w-0 gap-3">
     <div className="flex items-center gap-2"><h4 className="font-semibold">Непрерывные исследования</h4>
       <InfoNote label="Об остановке и расчёте доходности">Stop отменяет только исследовательскую цепочку и очищает её незавершённые данные после drain. Профили и завершённая история сохраняются. Следующий Start создаёт новое исследование; техническое восстановление — отдельное действие. R рассчитан только по наблюдавшимся закрытым TP/SL-сделкам, без вымышленных нулей или SL на правом краю.</InfoNote></div>
+    {children}
     {controller.loading && <Spinner label="Проверка непрерывного процесса" />}
     {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
     {!controller.available && process && <p className="text-sm">Показан последний подтверждённый снимок; актуальность не подтверждена.</p>}
@@ -311,23 +311,52 @@ export function ContinuousResearch({ controller }: { algorithm?: Algorithm; cont
   </section>;
 }
 
-/** Shared control block above the table. Commands here affect research only. */
+/** Control block in Continuous Research. Commands here affect research only. */
 export function ContinuousControls({ algorithm, controller, children }: { algorithm: Algorithm; controller: ContinuousController; children?: ReactNode }) {
   const [open, setOpen] = useState(false);
+  const [stopOpen, setStopOpen] = useState(false);
+  const [stopPending, setStopPending] = useState(false);
+  const stopRequest = useRef(false);
+  const stopTriggerId = useId();
+  const stopCancelId = useId();
   const process = controller.process;
+  const canStop = controller.available && controller.busy === null && !stopPending && process !== null && process.status !== "stopped" && process.status !== "stopping";
   const recoveryExhausted = process?.status === "error" && process.error?.code === "durable_resume_retry_exhausted"
     && process.config !== null && process.activeStudyId !== null;
+  async function confirmStop() {
+    if (!canStop || stopRequest.current) return;
+    stopRequest.current = true; setStopPending(true);
+    try {
+      if (await controller.stop()) setStopOpen(false);
+    } finally {
+      stopRequest.current = false; setStopPending(false);
+    }
+  }
   return <section aria-label="Управление непрерывным исследованием" className="grid min-w-0 gap-3">
     <div className="flex flex-wrap items-center gap-3">
       <span className="text-sm font-medium">Исследование</span>
-      <IconButton className="size-14 [&_svg]:size-6" label="Обновить статус непрерывного процесса" icon={RefreshCw} onClick={controller.refresh} disabled={controller.busy !== null} />
-      <IconButton className="size-14 [&_svg]:size-6" label="Настроить непрерывное исследование" icon={Settings} onClick={() => setOpen(true)} disabled={!controller.available || controller.busy !== null} />
-      {process && process.status !== "stopped" ? <IconButton className="size-14 [&_svg]:size-6" label={process.status === "stopping" ? "Остановка запрошена · ожидаем drain" : "Остановить непрерывное исследование"} icon={Square} disabled={!controller.available || controller.busy !== null || process.status === "stopping"} onClick={() => { void controller.stop(); }} />
-        : <IconButton className="size-14 [&_svg]:size-6" label="Запустить непрерывное исследование" icon={Play} disabled={!controller.available || !process?.config || controller.busy !== null} onClick={() => { void controller.start(); }} />}
+      <IconButton label="Обновить статус непрерывного процесса" icon={RefreshCw} onClick={controller.refresh} disabled={controller.busy !== null} />
+      <IconButton label="Настроить непрерывное исследование" icon={Settings} onClick={() => setOpen(true)} disabled={!controller.available || controller.busy !== null} />
+      {process && process.status !== "stopped" ? <IconButton id={stopTriggerId} label={process.status === "stopping" ? "Остановка запрошена · ожидаем drain" : "Остановить непрерывное исследование"} icon={Square} disabled={!canStop} onClick={() => setStopOpen(true)} />
+        : <IconButton id={stopTriggerId} label="Запустить непрерывное исследование" icon={Play} disabled={!controller.available || !process?.config || controller.busy !== null} onClick={() => { void controller.start(); }} />}
       {recoveryExhausted && <Button type="button" variant="outline" disabled={!controller.available || controller.busy !== null} onClick={() => { void controller.retryRecovery(); }}>Повторить восстановление исследования</Button>}
       {children}
     </div>
     {recoveryExhausted && <InfoNote label="О повторе восстановления">Повтор восстановления сохраняет тот же ID исследования, сохранённый вход и исходный абсолютный дедлайн, без нового окна. Отдельная команда recovery/retry разрешает повтор технического восстановления; возобновление допуска обслуживания его не сбрасывает. Start после Stop создаёт новое исследование.</InfoNote>}
+    <Dialog open={stopOpen} onOpenChange={(next) => { if (!stopRequest.current) setStopOpen(next); }}>
+      <DialogContent className="max-w-2xl" onOpenAutoFocus={(event) => { event.preventDefault(); document.getElementById(stopCancelId)?.focus(); }} onCloseAutoFocus={(event) => { event.preventDefault(); document.getElementById(stopTriggerId)?.focus(); }}>
+        <DialogHeader>
+          <DialogTitle>Остановить непрерывное исследование?</DialogTitle>
+          <DialogDescription>Алгоритм: {algorithmDisplayName(algorithm)}. Остановится только исследовательская цепочка; её незавершённые данные будут очищены после drain. Профили, завершённая история и постоянный live сохраняются.</DialogDescription>
+        </DialogHeader>
+        {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
+        {!canStop && !stopPending && <p role="status" className="text-sm">Остановка сейчас недоступна: обновите статус и проверьте состояние исследования.</p>}
+        <div className="flex shrink-0 flex-wrap justify-end gap-2" aria-busy={stopPending}>
+          <Button id={stopCancelId} type="button" variant="outline" disabled={stopPending} onClick={() => setStopOpen(false)}>Отмена</Button>
+          <Button type="button" disabled={!canStop} onClick={() => { void confirmStop(); }}>{stopPending ? "Запрашиваем остановку…" : "Остановить исследование"}</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="max-w-4xl">
         <DialogHeader><div className="flex items-center gap-2"><DialogTitle>Непрерывное исследование · {algorithmDisplayName(algorithm)}</DialogTitle><InfoNote>Сохранение не запускает исследование и не включает live. Сервер фиксирует последние N суток при фактическом старте, без lag; вся цепочка использует один период и снимок. Включённая кластеризация выбирает только первый сетап.</InfoNote></div><DialogDescription>Метаданные и домены как в ручной оптимизации. Даты и зрелость первого сетапа фиксирует сервер.</DialogDescription></DialogHeader>

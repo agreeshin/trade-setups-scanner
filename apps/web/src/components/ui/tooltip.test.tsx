@@ -7,11 +7,11 @@ import { IconButton } from "./icon-button";
 
 afterEach(cleanup);
 
-it("renders a 1.5x larger borderless info trigger with a subtle theme background", () => {
+it("reduces the info trigger and glyph by 1.5x while retaining its borderless theme background", () => {
   render(<InfoNote>Подробности</InfoNote>);
   const button = screen.getByRole("button", { name: "Пояснение" });
-  expect(button).toHaveClass("size-10.5", "border-0", "bg-muted/60");
-  expect(button.querySelector('[aria-hidden="true"]')).toHaveClass("text-2xl");
+  expect(button).toHaveClass("size-7", "border-0", "bg-muted/60");
+  expect(button.querySelector('[aria-hidden="true"]')).toHaveClass("text-base");
   expect(button.querySelector("svg")).toBeNull();
 });
 
