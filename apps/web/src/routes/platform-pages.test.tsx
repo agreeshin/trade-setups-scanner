@@ -307,6 +307,7 @@ describe("platform screens", () => {
     expect(screen.getByRole("heading", { level: 1, name: "Алгоритмы" })).toHaveClass("sr-only");
     const growth = await screen.findByLabelText("Рост цены (%)");
     expect(growth).toHaveValue(12);
+    await userEvent.click(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
     expect(screen.getByLabelText("Окно (мин)")).toHaveValue(5);
     fireEvent.change(growth, { target: { value: "15" } });
     await userEvent.click(screen.getAllByRole("button", { name: "Сохранить алгоритм" })[0]!);
@@ -359,7 +360,8 @@ describe("platform screens", () => {
     expect(screen.getByText("Падение цены и всплеск оборота · 1.1.1")).toBeInTheDocument();
     expect(screen.getByText("Падение цены и всплеск оборота · 1.1.1")).not.toBeVisible();
     await userEvent.click(screen.getByRole("tab", { name: "Падение цены и всплеск оборота" }));
-    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+    expect(screen.getAllByRole("tabpanel")).toHaveLength(2);
+    await userEvent.click(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
     const drop = screen.getByLabelText("Падение цены (%)");
     expect(drop).toHaveValue(12);
     expect(screen.getByLabelText("Окно падения цены и оборота (мин)")).toHaveValue(5);

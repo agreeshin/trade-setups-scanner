@@ -70,8 +70,7 @@ export function PushSettings() {
   }
 
   return <section className="grid gap-3" aria-label="Web Push">
-    <SectionHeader title="Web Push" />
-    <InfoNote>Возраст уведомления ограничивает доставку, но сам по себе не включает её. Подключите этот браузер отдельно.</InfoNote>
+    <SectionHeader title="Web Push" description="Возраст уведомления ограничивает доставку, но сам по себе не включает её. Подключите этот браузер отдельно." />
     {!supported ? <p role="status" className="text-sm">Web Push недоступен: нужны HTTPS, Service Worker и поддержка Push API. На HTTP-адресе сервера подключение заблокировано.</p> : <>
       <p className="text-sm text-muted-foreground">{subscription
         ? "В браузере есть подписка. Обновите подключение, чтобы подтвердить её сохранение на сервере."
@@ -85,4 +84,3 @@ export function PushSettings() {
     {error && <Alert variant="destructive" role="alert">{error}</Alert>}
   </section>;
 }
-import { InfoNote } from "./ui/info-note";

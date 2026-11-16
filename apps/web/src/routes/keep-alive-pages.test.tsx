@@ -52,6 +52,7 @@ describe("keep-alive navigation tabs", () => {
     await user.click(algorithmsLink);
     expect(screen.getByRole("heading", { level: 1, name: "Алгоритмы" })).toHaveClass("sr-only");
     expect(algorithmsLink).toHaveAttribute("aria-current", "page");
+    await user.click(await screen.findByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
     const growth = await screen.findByRole("spinbutton", { name: "Рост цены (%)" });
     fireEvent.change(growth, { target: { value: "15" } });
     await user.click(screen.getByRole("checkbox", { name: "Включён для live-сканирования" }));

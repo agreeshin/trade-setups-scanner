@@ -35,10 +35,11 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
   return <section className="grid min-w-0 gap-4" aria-label="Статус исследования">
     <div className="flex flex-wrap items-center gap-2">
       <h3 className="font-semibold">Исследование #{study.id}</h3>
+      {isContinuousStudy(study) && <InfoNote>Непрерывная оценка последних N суток: R учитывает только наблюдавшиеся закрытые TP/SL-сделки. На правом крае возможны будущие входы и незакрытые сделки; это не нулевая доходность, не принудительный SL и не полностью созревшая оценка всей выборки.</InfoNote>}
+      <InfoNote>{isContinuousStudy(study) ? "Адаптивный профиль допускается только после готовности всей серверной цепочки и гейта при отдельном разрешении live. Постоянные настройки не меняются." : "Результат не применяется к live-алгоритму или настройкам аналитики."} Закрытие окна не останавливает серверную работу.</InfoNote>
       <Badge variant={study.status === "failed" ? "danger" : study.status === "completed" ? "success" : "info"}>{statusLabels[study.status]}</Badge>
       <Badge>{isContinuousStudy(study) ? "Непрерывное" : "Ручное"}</Badge>
     </div>
-    {isContinuousStudy(study) && <InfoNote>Непрерывная оценка последних N суток: R учитывает только наблюдавшиеся закрытые TP/SL-сделки. На правом крае возможны будущие входы и незакрытые сделки; это не нулевая доходность, не принудительный SL и не полностью созревшая оценка всей выборки.</InfoNote>}
     <p className="text-sm" role="status">{phaseLabels[progress.phase] ?? progress.phase}</p>
     <dl className="grid gap-2 text-sm sm:grid-cols-2">
       <div><dt className="text-muted-foreground">Завершено trials / бюджет</dt><dd>{progress.evaluatedCandidates} / {progress.maxTrials}</dd></div>
@@ -66,7 +67,8 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
     {result && <p className="text-sm">Причина завершения: {reasonLabels[result.reason]}.</p>}
     {result && !best && <Alert variant="warning">Нет оценимого кандидата, удовлетворившего требованиям всех выбранных ячеек и порогу «Минимум закрытых на ячейку»{spec.minSetupsPerDay !== undefined && spec.minSetupsPerDay > 0 ? " и частотному порогу «Минимум сетапов в день»" : ""}. Отсутствующий score не равен нулю.</Alert>}
     {best && <>
-      <h3 className="font-semibold">Лучший score: {best.score} R</h3>
+      <div className="flex items-center gap-2"><h3 className="font-semibold">Лучший score: {best.score} R</h3>
+      <InfoNote>Хеши фиксируют происхождение входов, но не гарантируют точного повторения после изменения истории. Комиссии, funding и проскальзывание не учитываются.</InfoNote></div>
       <p className="text-sm">{best.partial ? "Частичный итог остановленного исследования." : "Лучший полностью проверенный кандидат в пределах бюджета."} Это не доказанный глобальный оптимум. Score — равное среднее {blend ? "blend R" : forecast ? "прогноза R" : "R"} всех выбранных TP×SL-ячеек, а не выбор лучшей TP/SL-пары.</p>
       {forecast && <p className="text-sm">{blend ? `Выбор по смеси среднего и прогноза (${blendLabel}).` : "Выбор по прогнозу тренда."} Среднее всей матрицы за период: {best.meanScore == null ? "Не сохранено" : `${best.meanScore} R`}. Прогноз не является экстраполяцией или средним за период.</p>}
       <section aria-label="Полные параметры результата" className="grid gap-2">
@@ -94,7 +96,6 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
         </Table>
       </div>
       <dl className="grid gap-2 text-xs sm:grid-cols-2">{Object.entries(best.provenance).map(([key, value]) => <div className="break-all" key={key}><dt className="text-muted-foreground">{key}</dt><dd>{String(value)}</dd></div>)}</dl>
-      <InfoNote>Хеши фиксируют происхождение входов, но не гарантируют точного повторения после изменения истории. Комиссии, funding и проскальзывание не учитываются.</InfoNote>
       <ul className="grid gap-1 text-sm">{best.conclusions.slice(0, 32).map((item, index) => <li className="break-words" key={index}>{item.slice(0, 1000)}</li>)}</ul>
     </>}
     <details><summary className="cursor-pointer font-medium">Все входы исследования</summary><pre aria-label="Сохранённый spec" className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs">{JSON.stringify(spec, null, 2)}</pre></details>
@@ -102,7 +103,6 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
       <h4 className="font-medium">Главные события · последние {Math.min(study.events.length, 50)}</h4>
       <ol className="grid max-h-64 gap-2 overflow-y-auto text-xs">{study.events.slice(-50).map((event, index) => <li key={`${event.at}:${index}`} className="break-words">{formatIsoDateTime(event.at)} · {event.kind} · {event.message.slice(0, 1000)}</li>)}</ol>
     </section>
-    <InfoNote>{isContinuousStudy(study) ? "Адаптивный профиль допускается только после готовности всей серверной цепочки и гейта при отдельном разрешении live. Постоянные настройки не меняются." : "Результат не применяется к live-алгоритму или настройкам аналитики."} Закрытие окна не останавливает серверную работу.</InfoNote>
   </section>;
 }
 import { InfoNote } from "../components/ui/info-note";

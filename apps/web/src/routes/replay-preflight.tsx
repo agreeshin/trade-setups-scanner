@@ -19,11 +19,11 @@ export interface PreflightResponse {
 
 export function ReplayPreflight({ preview }: { preview: PreflightResponse }) {
   return <Card asChild><section aria-label="Предварительная проверка" className="grid gap-3">
-    <h2 className="text-lg font-semibold">Предварительная проверка данных</h2>
+    <div className="flex items-center gap-2"><h2 className="text-lg font-semibold">Предварительная проверка данных</h2>
+    <InfoNote>Это снимок на момент проверки. Кеш и покрытие могут измениться до исполнения; исполнитель повторно проверяет кеш. Покрытие минут не гарантирует пригодность по допускам алгоритма. Частичный расчёт по имеющимся данным разрешён; история автоматически не догружается.</InfoNote></div>
     <p className="text-sm">Проверено: {formatIsoDateTime(preview.checkedAt)}. Версия алгоритма: {preview.algorithmVersion}. Требуемая история: {preview.requiredHistoryMinutes} мин.</p>
     <p className="text-sm">Период расчёта: {localTime(preview.request.fromUnix)} – {localTime(preview.request.toUnix)} ({localTimezoneLabel()}).</p>
     <details><summary className="cursor-pointer">Снимок параметров для подтверждения</summary><dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">{Object.entries(preview.request.params).map(([key, value]) => <div key={key}><dt className="break-words text-muted-foreground">{key}</dt><dd>{value}</dd></div>)}</dl></details>
-    <InfoNote>Это снимок на момент проверки. Кеш и покрытие могут измениться до исполнения; исполнитель повторно проверяет кеш. Покрытие минут не гарантирует пригодность по допускам алгоритма. Частичный расчёт по имеющимся данным разрешён; история автоматически не догружается.</InfoNote>
     {preview.results.length > 0 && <Dialog>
       <DialogTrigger asChild><Button variant="outline" className="h-auto whitespace-normal py-2 text-left">Показать проверенные наборы свечей</Button></DialogTrigger>
       <DialogContent className="max-w-2xl">

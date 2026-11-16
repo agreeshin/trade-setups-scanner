@@ -24,4 +24,13 @@ describe("PageHeader", () => {
     render(<SectionHeader id="live-heading" title="Live-сканирование" />);
     expect(screen.getByRole("heading", { level: 2, name: "Live-сканирование" })).toHaveAttribute("id", "live-heading");
   });
+
+  it("keeps section help to the right of its heading in the same flex row", () => {
+    render(<SectionHeader title="Исследования" description="Подробности раздела" />);
+    const heading = screen.getByRole("heading", { name: "Исследования" });
+    const info = screen.getByRole("button", { name: "О разделе" });
+    expect(heading.parentElement).toHaveClass("flex", "items-center");
+    expect(heading.nextElementSibling).toContainElement(info);
+    expect(info).toHaveClass("size-10.5", "border-0", "bg-muted/60");
+  });
 });

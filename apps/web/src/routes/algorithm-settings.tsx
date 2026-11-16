@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
 import { Checkbox } from "../components/ui/checkbox";
@@ -8,6 +8,7 @@ import { Input } from "../components/ui/input";
 import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
 import { InfoNote } from "../components/ui/info-note";
 import { Separator } from "../components/ui/separator";
+import { SegmentedList, SegmentedTrigger } from "../components/ui/segmented";
 import { fetchPlatform, type PlatformState } from "../lib/platform-api";
 import type { OptimizationStudyAction } from "../lib/optimization-api";
 import { isContinuousWorkActive } from "../lib/continuous-api";
@@ -33,6 +34,8 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
   const [nameBusy, setNameBusy] = useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
   const [nameSaved, setNameSaved] = useState(false);
+  const nameRequest = useRef(false);
+  const [liveMode, setLiveMode] = useState("flexible");
   const { refresh: refreshOptimization } = optimization;
   const adaptiveSaved = continuous.available ? continuous.process?.config?.adaptiveEnabled ?? false : undefined;
   const continuousActive = isContinuousWorkActive(continuous.process);
@@ -87,26 +90,48 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     finally { setBusy(false); }
   }
   async function saveName() {
+    if (nameRequest.current) return;
     const name = externalName.trim();
     setNameError(null); setNameSaved(false);
     if ([...name].length < 1 || [...name].length > 120 || /\p{Cc}/u.test(name)) { setNameError("Название: от 1 до 120 символов, без управляющих символов."); return; }
+    if (name === displayName) { setExternalName(name); return; }
+    nameRequest.current = true;
     setNameBusy(true);
     try {
       // A rename is its own partial update. Never resend stale params/enabled with it.
       await writePlatform(`/v1/algorithms/${encodeURIComponent(algorithm.id)}`, { externalName: name });
       setExternalName(name); onSaved(algorithm.id, { externalName: name }); setNameSaved(true);
     } catch (cause) { setNameError(errorText(cause)); }
-    finally { setNameBusy(false); }
+    finally { nameRequest.current = false; setNameBusy(false); }
   }
+  const liveTabs = [
+    { id: "flexible", label: "Live-сканирование с гибкими параметрами", enabled: adaptiveSaved === true },
+    { id: "constant", label: "Live-сканирование с постоянными параметрами", enabled: algorithm.enabled },
+  ];
   return <><form onSubmit={(event) => { void save(event); }} className="grid min-w-0 gap-4">
-    <h3 className="text-lg font-semibold">{displayName} · {algorithm.version}</h3>
-    <InfoNote label="Описание алгоритма">{algorithm.description}</InfoNote>
-    <Field label="Внешнее название алгоритма" hint="До 120 символов. Отдельная пользовательская подпись; служебное имя, ID, версия и старые сетапы не меняются.">{(control) => <Input {...control} maxLength={240} value={externalName} onChange={(event) => { setExternalName(event.target.value); setNameSaved(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); if (!nameBusy) void saveName(); } }} />}</Field>
-    <div><Button type="button" variant="outline" disabled={nameBusy} onClick={() => { void saveName(); }}>{nameBusy ? "Сохранение названия…" : "Сохранить название"}</Button></div>
+    <div className="flex items-center gap-2"><h3 className="text-lg font-semibold">{displayName} · {algorithm.version}</h3><InfoNote label="Описание алгоритма">{algorithm.description}</InfoNote></div>
+    <Field label="Внешнее название алгоритма" hint="До 120 символов. Сохраняется при потере фокуса. Отдельная пользовательская подпись; служебное имя, ID, версия и старые сетапы не меняются.">{(control) => <Input {...control} maxLength={240} disabled={nameBusy} value={externalName} onChange={(event) => { setExternalName(event.target.value); setNameSaved(false); setNameError(null); }} onBlur={() => { void saveName(); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); event.currentTarget.blur(); } }} />}</Field>
+    {nameBusy && <p role="status" className="text-sm">Сохранение названия…</p>}
     {nameError && <Alert variant="destructive" role="alert">{nameError}</Alert>}
     {nameSaved && <p role="status" className="text-sm">Название алгоритма сохранено.</p>}
-    <section aria-labelledby={`${optimizerTriggerId}-constant`} className="grid min-w-0 gap-4">
-    <h4 id={`${optimizerTriggerId}-constant`} className="font-semibold">Live-сканирование с постоянными параметрами</h4>
+    <SegmentedList role="tablist" aria-label={`Режим live · ${displayName}`}>
+      {liveTabs.map((tab, index) => <SegmentedTrigger key={tab.id} id={`${optimizerTriggerId}-tab-${tab.id}`} role="tab" aria-label={tab.label}
+        aria-selected={liveMode === tab.id} aria-controls={`${optimizerTriggerId}-panel-${tab.id}`} tabIndex={liveMode === tab.id ? 0 : -1}
+        aria-describedby={tab.enabled ? `${optimizerTriggerId}-status-${tab.id}` : undefined} className="h-auto gap-2 whitespace-normal py-2 text-left"
+        onClick={() => setLiveMode(tab.id)} onKeyDown={(event) => {
+          const next = event.key === "Home" ? 0 : event.key === "End" ? liveTabs.length - 1
+            : event.key === "ArrowRight" ? (index + 1) % liveTabs.length : event.key === "ArrowLeft" ? (index + liveTabs.length - 1) % liveTabs.length : null;
+          if (next === null) return;
+          event.preventDefault();
+          const target = liveTabs[next]!; setLiveMode(target.id); document.getElementById(`${optimizerTriggerId}-tab-${target.id}`)?.focus();
+        }}>
+        {tab.label}{tab.enabled && <><span data-slot="segmented-status-dot" aria-hidden="true" className="size-2 shrink-0 rounded-full bg-success" /><span id={`${optimizerTriggerId}-status-${tab.id}`} className="sr-only">Live-сканирование включено</span></>}
+      </SegmentedTrigger>)}
+    </SegmentedList>
+    <div role="tabpanel" id={`${optimizerTriggerId}-panel-constant`} aria-labelledby={`${optimizerTriggerId}-tab-constant`} hidden={liveMode !== "constant"} tabIndex={0}>
+    <section className="grid min-w-0 gap-4">
+    <div className="flex items-center gap-2"><h4 className="font-semibold">Live-сканирование с постоянными параметрами</h4>
+    <InfoNote>Порог цены задаётся в процентах — рост или падение, зависит от алгоритма; окно в минутах. Множитель объёма 3 означает 3× (300% базового объёма). Изменения общие для live и новых исторических запусков; завершённые запуски сохраняют свой снимок параметров.</InfoNote></div>
     <label className="flex items-center gap-2 text-sm"><Checkbox checked={enabled} onCheckedChange={(checked) => { setEnabled(checked === true); setSaved(false); }} />Включён для live-сканирования</label>
     {fieldGroups.map((group) => <fieldset key={group.title} className="grid gap-3 sm:grid-cols-2">
       <legend className="mb-2 font-medium">{group.title}</legend>
@@ -114,12 +139,11 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
         {(control) => <Input type="number" required min={field.min} max={field.max} step={field.type === "integer" ? "1" : "any"} value={params[field.key] ?? ""} onChange={(event) => { setParams({ ...params, [field.key]: event.target.value }); setSaved(false); }} {...control} />}
       </Field>)}
     </fieldset>)}
-    <InfoNote>Порог цены задаётся в процентах — рост или падение, зависит от алгоритма; окно в минутах. Множитель объёма 3 означает 3× (300% базового объёма). Изменения общие для live и новых исторических запусков; завершённые запуски сохраняют свой снимок параметров.</InfoNote>
     {error && <Alert variant="destructive" role="alert">{error}</Alert>}
     {saved && <Alert variant="success" role="status">Настройки алгоритма сохранены.</Alert>}
     <div><Button disabled={busy} type="submit">{busy ? "Сохранение…" : "Сохранить алгоритм"}</Button></div>
-    </section>
-    <Separator />
+    </section></div>
+    <div role="tabpanel" id={`${optimizerTriggerId}-panel-flexible`} aria-labelledby={`${optimizerTriggerId}-tab-flexible`} hidden={liveMode !== "flexible"} tabIndex={0} className="grid min-w-0 gap-4">
     <section aria-labelledby={`${optimizerTriggerId}-flexible`} className="grid min-w-0 gap-3">
       <h4 id={`${optimizerTriggerId}-flexible`} className="font-semibold">Live-сканирование с гибкими параметрами</h4>
       <AdaptiveLive controller={continuous} />
@@ -128,13 +152,13 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     <section aria-labelledby={`${optimizerTriggerId}-optimizations`} className="grid min-w-0 gap-4">
     <h4 id={`${optimizerTriggerId}-optimizations`} className="font-semibold">Оптимизации</h4>
     {optimization.error && <Alert variant="destructive" role="alert">{optimization.error}<Button type="button" variant="outline" onClick={optimization.refresh}>Обновить статус оптимизации</Button></Alert>}
-    <div className="flex flex-wrap gap-2">
-      <Button id={optimizerTriggerId} type="button" variant="outline" aria-label={`Оптимизировать ${displayName}`} onClick={() => { setHistoryOpen(false); setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setOptimizationOpen(true); }}>Оптимизировать</Button>
-      <Button id={historyTriggerId} type="button" variant="outline" onClick={() => { setOptimizationOpen(false); setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setHistoryOpen(true); }}>Посмотреть весь список</Button>
-    </div>
     <ContinuousResearch algorithm={optimizerAlgorithm} controller={continuous} />
-    <OptimizationHistory algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} pageSize={5} pagination={false} onSelect={selectHistory} onDelete={requestDelete} />
+    <OptimizationHistory algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} pageSize={5} pagination={false} onSelect={selectHistory} onDelete={requestDelete} actions={<div className="flex flex-wrap gap-2">
+      <Button id={optimizerTriggerId} type="button" variant="outline" aria-label={`Запустить новую оптимизацию ${displayName}`} onClick={() => { setHistoryOpen(false); setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setOptimizationOpen(true); }}>Запустить новую оптимизацию</Button>
+      <Button id={historyTriggerId} type="button" variant="outline" onClick={() => { setOptimizationOpen(false); setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setHistoryOpen(true); }}>Посмотреть весь список</Button>
+    </div>} />
     </section>
+    </div>
   </form>
     <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
       <DialogContent id={historyDialogId} tabIndex={-1} className="max-w-[96rem]" onCloseAutoFocus={(event) => { event.preventDefault(); document.getElementById(historyTriggerId)?.focus(); }}>
@@ -170,7 +194,7 @@ function AlgorithmForms({ algorithms }: { algorithms: Algorithm[] }) {
   const [saved, setSaved] = useState<Record<string, SavedAlgorithm>>({});
   const onSaved = useCallback((id: string, patch: SavedAlgorithm) => setSaved((previous) => ({ ...previous, [id]: { ...previous[id], ...patch } })), []);
   // Keep metadata identity stable during refresh: open forms must not restore their draft over local edits.
-  const displayAlgorithms = useMemo(() => algorithms.map((algorithm) => ({ ...algorithm, externalName: saved[algorithm.id]?.externalName ?? algorithmDisplayName(algorithm) })), [algorithms, saved]);
+  const displayAlgorithms = useMemo(() => algorithms.map((algorithm) => ({ ...algorithm, enabled: saved[algorithm.id]?.enabled ?? algorithm.enabled, externalName: saved[algorithm.id]?.externalName ?? algorithmDisplayName(algorithm) })), [algorithms, saved]);
   const refreshStates = () => { optimization.refresh(); setContinuousRevision((value) => value + 1); };
   const items = algorithms.map((algorithm) => ({ id: algorithm.id, label: saved[algorithm.id]?.externalName ?? algorithmDisplayName(algorithm),
     ...(hasEnabledLiveMode({ enabled: saved[algorithm.id]?.enabled ?? algorithm.enabled, adaptiveEnabled: saved[algorithm.id]?.adaptiveEnabled ?? false }) ? { status: "Live-сканирование включено" } : {}),

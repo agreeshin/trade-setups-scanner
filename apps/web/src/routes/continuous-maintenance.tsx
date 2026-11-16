@@ -94,8 +94,9 @@ export function ContinuousMaintenance({ active }: { active: boolean }) {
   const visible = active && routeActive && document.visibilityState !== "hidden";
   const disabled = !visible || !available || loading || busy !== null;
   return <section aria-labelledby="continuous-maintenance-heading" className="grid gap-3">
-    <SectionHeader id="continuous-maintenance-heading" title="Обслуживание непрерывных исследований" />
+    <div className="flex flex-wrap items-center gap-2"><SectionHeader id="continuous-maintenance-heading" title="Обслуживание непрерывных исследований" />
     <InfoNote label="Об обслуживании непрерывных исследований"><span className="grid gap-2"><span>Для всех алгоритмов вашей учётной записи. Новые непрерывные цепочки временно не допускаются; уже допущенные завершают исследование, служебный replay, аналитику и допуск полностью.</span><span>Это не Stop: действующие адаптивные профили не отключаются. Постоянный live, ручные расчёты, настройки и разрешения live не меняются.</span></span></InfoNote>
+    <InfoNote label="О снимках и возобновлении допуска"><span className="grid gap-2"><span>Счётчик сохранённых снимков учитывает только полностью зафиксированный вход. Это не гарантия совместимости будущей версии или полного восстановления поиска.</span><span>Возобновление открывает только допуск: не запускает ранее остановленные процессы и не сбрасывает retries. Start во время обслуживания не обходит закрытый допуск. Завершение drain не разрешает очистку истории и само не обновляет сервер.</span></span></InfoNote></div>
     {loading && <Spinner label="Обновление статуса обслуживания" />}
     {!snapshot && <p role="status" className="text-sm">Статус обслуживания неизвестен.</p>}
     {snapshot && <>
@@ -107,7 +108,6 @@ export function ContinuousMaintenance({ active }: { active: boolean }) {
         <p className="text-muted-foreground">Изменение флага обслуживания: {snapshot.updatedAt === null ? "флаг ещё не изменялся" : formatIsoDateTime(snapshot.updatedAt)}</p>
       </div>
     </>}
-    <InfoNote label="О снимках и возобновлении допуска"><span className="grid gap-2"><span>Счётчик сохранённых снимков учитывает только полностью зафиксированный вход. Это не гарантия совместимости будущей версии или полного восстановления поиска.</span><span>Возобновление открывает только допуск: не запускает ранее остановленные процессы и не сбрасывает retries. Start во время обслуживания не обходит закрытый допуск. Завершение drain не разрешает очистку истории и само не обновляет сервер.</span></span></InfoNote>
     {readError && <Alert variant="destructive" role="alert">{readError}</Alert>}
     {commandError && <Alert variant="destructive" role="alert">{commandError}</Alert>}
     <div className="flex flex-wrap gap-2">

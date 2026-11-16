@@ -7,11 +7,12 @@ afterEach(cleanup);
 describe("Separator", () => {
   it("renders a horizontal separator by default", () => {
     render(<Separator data-testid="separator" />);
-    expect(screen.getByTestId("separator").className).toContain("h-px");
+    expect(screen.getByTestId("separator")).toHaveClass("h-px", "my-4", "w-full");
   });
 
   it("renders a vertical separator", () => {
     render(<Separator data-testid="separator" orientation="vertical" />);
-    expect(screen.getByTestId("separator").className).toContain("w-px");
+    expect(screen.getByTestId("separator")).toHaveClass("w-px");
+    expect(screen.getByTestId("separator")).not.toHaveClass("my-4");
   });
 });

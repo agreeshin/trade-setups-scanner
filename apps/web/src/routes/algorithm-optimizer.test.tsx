@@ -124,7 +124,9 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 async function openOptimizer() {
-  await userEvent.click(await screen.findByRole("button", { name: "Оптимизировать Новый алгоритм" }));
+  const flexible = await screen.findByRole("tab", { name: "Live-сканирование с гибкими параметрами" });
+  if (flexible.getAttribute("aria-selected") !== "true") fireEvent.click(flexible);
+  await userEvent.click(await screen.findByRole("button", { name: "Запустить новую оптимизацию Новый алгоритм" }));
   return screen.findByRole("dialog", { name: "Оптимизация · Новый алгоритм" });
 }
 function enterDates() {
@@ -132,20 +134,24 @@ function enterDates() {
   fireEvent.change(screen.getByLabelText("Конец периода сигналов"), { target: { value: "2026-10-03T00:00" } });
 }
 
-it("shows three separated sections and keeps fixed controls independent when the continuous backend is unavailable", async () => {
+it("shows retained Segmented live panels and keeps fixed controls independent when continuous is unavailable", async () => {
   render(<AlgorithmsPage />);
   const first = within((await screen.findByText("Новый алгоритм · 2.0")).closest("form")!);
-  expect(first.getAllByRole("heading", { level: 4 }).map((heading) => heading.textContent)).toEqual([
-    "Live-сканирование с постоянными параметрами", "Live-сканирование с гибкими параметрами", "Оптимизации",
+  expect(first.getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual([
+    "Live-сканирование с гибкими параметрами", "Live-сканирование с постоянными параметрами",
   ]);
-  expect(first.getAllByRole("separator")).toHaveLength(2);
-  const constant = within(first.getByRole("region", { name: "Live-сканирование с постоянными параметрами" }));
+  expect(first.getByRole("separator")).toHaveClass("my-4");
   const flexible = within(first.getByRole("region", { name: "Live-сканирование с гибкими параметрами" }));
   expect(flexible.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" })).toBeDisabled();
   expect(flexible.getByRole("button", { name: "Сохранить разрешение адаптивного live" })).toBeDisabled();
-  expect(first.getByRole("button", { name: "Оптимизировать Новый алгоритм" })).toHaveTextContent("Оптимизировать");
+  expect(first.getByRole("button", { name: "Запустить новую оптимизацию Новый алгоритм" })).toHaveTextContent("Запустить новую оптимизацию");
   expect(first.getByRole("button", { name: "Посмотреть весь список" })).toHaveAttribute("type", "button");
   expect(screen.queryByText("Статус / результат оптимизации")).not.toBeInTheDocument();
+  const history = first.getByRole("region", { name: "История оптимизации · Новый алгоритм" });
+  expect(within(history).getByRole("heading", { name: "Последние исследования" }).nextElementSibling).toContainElement(first.getByRole("button", { name: "Посмотреть весь список" }));
+  expect(within(history).getByRole("button", { name: "Запустить новую оптимизацию Новый алгоритм" }).closest("div")?.nextElementSibling).toContainElement(within(history).getByRole("table"));
+  await userEvent.click(first.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
+  const constant = within(first.getByRole("tabpanel", { name: "Live-сканирование с постоянными параметрами" }));
   const toggle = constant.getByRole("checkbox", { name: "Включён для live-сканирования" });
   expect(toggle).toBeChecked();
   await userEvent.click(toggle);
@@ -157,6 +163,7 @@ it("shows three separated sections and keeps fixed controls independent when the
     expect.objectContaining({ path: `/v1/algorithms/${algorithm.id}`, method: "PUT", body: { params: algorithm.params, enabled: false } }),
   ]);
   await userEvent.click(screen.getByRole("tab", { name: "Второй алгоритм" }));
+  await userEvent.click(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
   expect(screen.getByRole("checkbox", { name: "Включён для live-сканирования" })).toBeChecked();
   await userEvent.click(screen.getByRole("tab", { name: "Новый алгоритм" }));
   expect(toggle).not.toBeChecked();
@@ -168,14 +175,16 @@ it("shows one retained algorithm panel and derives live dots from saved enabled 
   const firstTab = await screen.findByRole("tab", { name: "Новый алгоритм" });
   const secondTab = screen.getByRole("tab", { name: "Второй алгоритм" });
   expect(screen.getByRole("heading", { name: "Алгоритмы" })).toHaveClass("sr-only");
-  expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  expect(screen.getAllByRole("tabpanel")).toHaveLength(2);
   expect(firstTab).toHaveAccessibleDescription("Live-сканирование включено");
   expect(secondTab.querySelector('[data-slot="sidebar-status-dot"]')).toBeNull();
+  await userEvent.click(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
   const firstInput = screen.getByRole("spinbutton", { name: "Новый порог (%)" });
   fireEvent.change(firstInput, { target: { value: "8.5" } });
   await userEvent.click(screen.getByRole("checkbox", { name: "Включён для live-сканирования" }));
   expect(firstTab.querySelector('[data-slot="sidebar-status-dot"]')).toBeInTheDocument();
   await userEvent.click(secondTab);
+  await userEvent.click(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
   expect(firstInput).toBeInTheDocument(); expect(firstInput).not.toBeVisible();
   const secondInput = screen.getByRole("spinbutton", { name: "Новый порог (%)" });
   expect(secondInput).not.toBe(firstInput); expect(secondInput).toHaveValue(2.5);
@@ -184,7 +193,7 @@ it("shows one retained algorithm panel and derives live dots from saved enabled 
   expect(screen.getByRole("spinbutton", { name: "Новый порог (%)" })).toBe(firstInput);
   expect(firstInput).toHaveValue(8.5);
   expect(screen.getByRole("checkbox", { name: "Включён для live-сканирования" })).not.toBeChecked();
-  expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  expect(screen.getAllByRole("tabpanel")).toHaveLength(2);
   expect(container.querySelectorAll('[data-slot="page-sidebar-content"] form')).toHaveLength(2);
   await userEvent.click(screen.getByRole("button", { name: "Сохранить алгоритм" }));
   await screen.findByText("Настройки алгоритма сохранены.");
@@ -254,12 +263,12 @@ it.each([0, 1])("switches algorithm cards without stale metadata and submits onl
   const otherLabel = targetIndex === 0 ? "Падение цены" : "Рост цены";
   render(<AlgorithmsPage />);
   await userEvent.click(await screen.findByRole("tab", { name: other.name }));
-  fireEvent.click(await screen.findByRole("button", { name: `Оптимизировать ${other.name}` }));
+  fireEvent.click(await screen.findByRole("button", { name: `Запустить новую оптимизацию ${other.name}` }));
   const previous = within(await screen.findByRole("dialog", { name: `Оптимизация · ${other.name}` }));
   fireEvent.change(await previous.findByLabelText(`Baseline: ${otherLabel}`), { target: { value: "91" } });
   await userEvent.click(previous.getByRole("button", { name: "Закрыть" }));
   await userEvent.click(screen.getByRole("tab", { name: target.name }));
-  fireEvent.click(screen.getByRole("button", { name: `Оптимизировать ${target.name}` }));
+  fireEvent.click(screen.getByRole("button", { name: `Запустить новую оптимизацию ${target.name}` }));
   const controls = within(await screen.findByRole("dialog", { name: `Оптимизация · ${target.name}` }));
   expect(await controls.findByLabelText(`Baseline: ${ownLabel}`)).toHaveValue("12");
   expect(controls.queryByLabelText(`Baseline: ${otherLabel}`)).not.toBeInTheDocument();
@@ -371,7 +380,7 @@ it("autosaves on blur, restores after reopening and isolates drafts by algorithm
   expect(dialog.getByLabelText("Baseline: Новый порог")).toHaveValue("8.75");
   await userEvent.click(dialog.getByRole("button", { name: "Закрыть" }));
   await userEvent.click(screen.getByRole("tab", { name: "Второй алгоритм" }));
-  await userEvent.click(screen.getByRole("button", { name: "Оптимизировать Второй алгоритм" }));
+  await userEvent.click(screen.getByRole("button", { name: "Запустить новую оптимизацию Второй алгоритм" }));
   const second = within(await screen.findByRole("dialog", { name: "Оптимизация · Второй алгоритм" }));
   expect(await second.findByLabelText("Горизонт сделки, мин (фиксирован)")).toHaveValue(10080);
   expect(second.getByLabelText("Baseline: Новый порог")).toHaveValue("2.5");
@@ -394,6 +403,7 @@ it("renders ungrouped metadata in normal settings and uses its saved values as t
   render(<AlgorithmsPage />);
   const heading = await screen.findByText("Новый алгоритм · 2.0");
   const settings = within(heading.closest("form")!);
+  fireEvent.click(settings.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
   const threshold = settings.getByLabelText("Новый порог (%)");
   const window = settings.getByLabelText("Новое окно (мин)");
   expect(threshold).toHaveValue(2.5);
@@ -425,7 +435,7 @@ it("restores the same server study after remount without starting or cancelling 
   expect(screen.getByText("Подготовка снимка данных")).toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "Закрыть" }));
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  await waitFor(() => expect(screen.getByRole("button", { name: "Оптимизировать Новый алгоритм" })).toHaveFocus());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Запустить новую оптимизацию Новый алгоритм" })).toHaveFocus());
   await openOptimizer();
   expect(screen.getByText("Исследование #17")).toBeInTheDocument();
   first.unmount();
@@ -562,7 +572,7 @@ it("discovers compact summaries without loading matrices until a dialog opens an
   expect(lists.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "5")).toHaveLength(2);
   expect(lists.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "10")).toHaveLength(0);
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(0);
-  fireEvent.click(screen.getByRole("button", { name: "Оптимизировать Новый алгоритм" }));
+  fireEvent.click(screen.getByRole("button", { name: "Запустить новую оптимизацию Новый алгоритм" }));
   await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(1);
   await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
@@ -682,6 +692,7 @@ it("keeps shared discovery fast for a hidden algorithm's running process between
   render(<AlgorithmsPage />);
   await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   expect(screen.getByRole("tab", { name: "Новый алгоритм" })).toHaveAttribute("aria-selected", "true");
+  fireEvent.click(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
   const fixed = screen.getByRole("spinbutton", { name: "Новый порог (%)" });
   fireEvent.change(fixed, { target: { value: "8.5" } });
   const globalReads = () => requests.filter((request) => request.path === "/v1/optimization-studies?limit=1&offset=0").length;
@@ -813,8 +824,10 @@ it.each(["completed", "cancelled", "failed"] as const)("allows explicit deletion
   studies = [{ ...record("completed"), id: 20, origin: "manual" },
     { ...record(status), origin: "continuous", continuousGenerationId: null, continuousSlotId: null }];
   render(<AlgorithmsPage />);
+  fireEvent.click(await screen.findByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
   const fixed = await screen.findByRole("spinbutton", { name: "Новый порог (%)" });
   fireEvent.change(fixed, { target: { value: "8.5" } });
+  fireEvent.click(screen.getByRole("tab", { name: "Live-сканирование с гибкими параметрами" }));
   await userEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
   expect(requests.every((request) => request.method === "GET")).toBe(true);
@@ -860,8 +873,10 @@ it("distinguishes retained-chain deletion conflict and refreshes study discovery
 it("previews owner-wide continuous cleanup once, cancels safely, and preserves drafts/manual rows after one confirmed command", async () => {
   studies = [{ ...record("completed"), id: 20, origin: "manual" }, { ...record("failed"), origin: "continuous" }];
   render(<AlgorithmsPage />);
+  fireEvent.click(await screen.findByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
   const fixed = await screen.findByRole("spinbutton", { name: "Новый порог (%)" });
   fireEvent.change(fixed, { target: { value: "8.5" } });
+  fireEvent.click(screen.getByRole("tab", { name: "Live-сканирование с гибкими параметрами" }));
   expect(screen.getAllByRole("button", { name: "Удалить историю непрерывных исследований…" })).toHaveLength(1);
   expect(requests.some((request) => request.path === "/v1/continuous-studies/cleanup")).toBe(false);
   await userEvent.click(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…" }));

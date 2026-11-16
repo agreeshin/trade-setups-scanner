@@ -47,9 +47,8 @@ function QualityIntervals({ id, offset, revision, onPage }: { id: number; offset
   if (state.kind === "unreachable") return <Alert variant="destructive" role="alert">Интервалы качества недоступны ({state.detail}). Это не означает отсутствие пропусков.</Alert>;
   if (!state.data.available) return <p>Интервалы качества не сохранены или исходный расчёт удалён. Если сводка качества сохранена, она продолжает описывать исходный расчёт.</p>;
   return <div className="mt-3 grid gap-3">
-    <InfoNote>Интервалы [начало, конец): правая граница не включена. Время: {localTimezoneLabel()}. Пригодные интервалы могут содержать допускаемые настройками пропуски входного окна.</InfoNote>
     <div className="overflow-x-auto"><Table>
-      <caption className="text-left">Интервалы оценки и пропусков</caption>
+      <caption className="text-left"><span className="inline-flex items-center gap-2">Интервалы оценки и пропусков<InfoNote>Интервалы [начало, конец): правая граница не включена. Время: {localTimezoneLabel()}. Пригодные интервалы могут содержать допускаемые настройками пропуски входного окна.</InfoNote></span></caption>
       <TableHeader><TableRow><TableHead>Начало</TableHead><TableHead>Конец (не включая)</TableHead><TableHead>Результат оценки</TableHead></TableRow></TableHeader>
       <TableBody>{state.data.intervals.slice(0, 50).map((interval, index) => <TableRow key={`${interval.fromUnix}-${index}`}>
         <TableCell>{localTime(interval.fromUnix)}</TableCell>
@@ -80,11 +79,11 @@ export function ReplayQualitySummary({ run, panel, onPanel, revision }: {
 }) {
   const quality = run.quality;
   return <Card asChild><section className="mt-4 grid gap-3" aria-label="Качество расчёта">
-    <h3 className="font-semibold">Качество расчёта: {qualityLabel(quality)}</h3>
+    <div className="flex items-center gap-2"><h3 className="font-semibold">Качество расчёта: {qualityLabel(quality)}</h3>
+    {quality && <InfoNote>Качество данных и статус выполнения различаются. Полная оценка означает пригодность всех минут по настроенным допускам, а не отсутствие любых пропусков входных данных.</InfoNote>}</div>
     <p className="text-sm">{run.cacheHit ? "Из кеша" : "Результат этого запуска"}. Исходное вычисление завершено: {run.qualityComputedAt ? formatIsoDateTime(run.qualityComputedAt) : "время не сохранено или расчёт не завершён"}.{run.qualitySourceRunId != null && ` Исходный запуск: #${run.qualitySourceRunId}.`}</p>
     {run.cacheHit && <p className="text-xs text-muted-foreground">Качество относится к исходным данным кешированного расчёта. Последующая дозагрузка истории не обновляет эту сводку.</p>}
     {quality ? <>
-      <InfoNote>Качество данных и статус выполнения различаются. Полная оценка означает пригодность всех минут по настроенным допускам, а не отсутствие любых пропусков входных данных.</InfoNote>
       <dl className="grid gap-2 text-sm sm:grid-cols-2">
         {[["Запрошено минут", quality.requestedMinutes], ["Рассмотрено минут", quality.evaluatedMinutes + quality.skippedMinutes], ["Оценено пригодных минут", quality.evaluatedMinutes], ["Из них с допустимыми пропусками окна", quality.evaluatedWithGapsMinutes], ["Пропущено непригодных минут", quality.skippedMinutes], ["Ещё не рассмотрено минут", quality.unassessedMinutes], ["Требуемая история (минут)", quality.requiredHistoryMinutes]].map(([label, value]) => <div key={label}><dt className="text-muted-foreground">{label}</dt><dd>{value}</dd></div>)}
         <div><dt className="text-muted-foreground">Граница рассмотренной части ({localTimezoneLabel()})</dt><dd>{localTime(quality.assessedThroughUnix)}</dd></div>

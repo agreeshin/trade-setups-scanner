@@ -1,4 +1,4 @@
-import { useContext, useEffect, useId, useState } from "react";
+import { useContext, useEffect, useId, useState, type ReactNode } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
@@ -20,10 +20,10 @@ export function OptimizationTrashIcon() {
 }
 
 /** One replaceable page of compact summaries per card; no full detail or page archive. */
-export function OptimizationHistory({ algorithmId, algorithmName, controller, onSelect, onDelete, pageSize = 10, pagination = true, active = true }: {
+export function OptimizationHistory({ algorithmId, algorithmName, controller, onSelect, onDelete, pageSize = 10, pagination = true, active = true, actions }: {
   algorithmId: string; algorithmName: string; controller: OptimizationController;
   onSelect: (id: number, triggerId: string, continuous: boolean) => void; onDelete: (study: OptimizationStudyAction) => void;
-  pageSize?: number; pagination?: boolean; active?: boolean;
+  pageSize?: number; pagination?: boolean; active?: boolean; actions?: ReactNode;
 }) {
   const instanceId = useId();
   const routeActive = useContext(RouteActiveContext);
@@ -72,6 +72,7 @@ export function OptimizationHistory({ algorithmId, algorithmName, controller, on
   return <section aria-label={`История оптимизации · ${algorithmName}`} className="grid min-w-0 gap-3">
     <h5 className="font-semibold">{pagination ? "История оптимизации" : "Последние исследования"}</h5>
     {error && <Alert variant="destructive" role="alert">{error}<Button type="button" variant="outline" onClick={() => setRetry((value) => value + 1)}>Повторить загрузку истории</Button></Alert>}
+    {actions}
     <div className="overflow-x-auto">
       <Table aria-label={`Исследования · ${algorithmName}`} aria-busy={loading}>
         <TableHeader><TableRow>{["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучшее среднее матожидание", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>

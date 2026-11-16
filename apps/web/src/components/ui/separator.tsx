@@ -6,5 +6,5 @@ export interface SeparatorProps extends HTMLAttributes<HTMLHRElement> {
 }
 
 export function Separator({ className, orientation = "horizontal", ...props }: SeparatorProps) {
-  return <hr data-slot="separator" className={cn("border-0 bg-input/70", orientation === "horizontal" ? "h-px w-full" : "h-full w-px self-stretch", className)} {...props} />;
+  return <hr data-slot="separator" className={cn("border-0 bg-input/70", orientation === "horizontal" ? "my-4 h-px w-full" : "h-full w-px self-stretch", className)} {...props} />;
 }

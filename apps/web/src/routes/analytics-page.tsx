@@ -192,9 +192,10 @@ function MatrixSection({
   const commitGradientMax = () => { setGradientMax(gradientMaxDraft); onCommit?.(); };
 
   return <section className="grid min-w-0 gap-4">
-      <div className="grid gap-1">
+      <div className="flex items-center gap-2">
         <h2 className="text-lg font-semibold">{trendMode === "forecast" ? "Прогноз матожидания по тренду" : "Среднее матожидание сетапов"}</h2>
         <InfoNote>{description}</InfoNote>
+        <InfoNote>{trendMode === "forecast" ? "Ячейка — сглаженный уровень МО на последней дате с закрытыми сделками, без экстраполяции. «—» — недостаточно пригодных дней. Подсказка содержит SE и 95% неопределённость уровня, не будущей сделки." : "Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок."} Спорная свеча считается Stop Loss. Цвет жирных значений интерполируется от красного к зелёному между порогами ползунков.</InfoNote>
       </div>
       <div className="flex flex-wrap items-end gap-3">
         <TimeRangeControls setId={setId} setBounds={setBounds} value={timeRange} onChange={setTimeRange} onCommit={onCommit} />
@@ -298,7 +299,6 @@ function MatrixSection({
           </TableBody>
         </Table>
       </div>
-       <InfoNote>{trendMode === "forecast" ? "Ячейка — сглаженный уровень МО на последней дате с закрытыми сделками, без экстраполяции. «—» — недостаточно пригодных дней. Подсказка содержит SE и 95% неопределённость уровня, не будущей сделки." : "Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок."} Спорная свеча считается Stop Loss. Цвет жирных значений интерполируется от красного к зелёному между порогами ползунков.</InfoNote>
   </section>;
 }
 
@@ -662,7 +662,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
   const chartOriginUnix = effectiveDays !== null ? Date.parse(`${effectiveDays.from}T00:00:00Z`) / 1000 : dailyPoints[0]?.dayStartUnix ?? 0;
 
   return <section className="grid min-w-0 gap-4">
-      <div className="grid gap-1">
+      <div className="flex items-center gap-2">
         <h2 className="text-lg font-semibold">Матожидание по сетапам</h2>
         <InfoNote>{description}</InfoNote>
       </div>
@@ -782,7 +782,7 @@ function AnalyticsCacheCard() {
   };
 
   return <section className="grid min-w-0 gap-4">
-      <div className="grid gap-1">
+      <div className="flex items-center gap-2">
         <h2 className="text-lg font-semibold">Кеш аналитики</h2>
         <InfoNote>Кеш результатов хранится в БД платформы рядом с сетапами. Догрузка истории не сбрасывает его автоматически; очистка удаляет только кеш аналитики, не трогая запуски, сетапы и рыночные данные.</InfoNote>
       </div>
@@ -964,7 +964,8 @@ export function AnalyticsPage() {
         </div>
         <Separator />
         <div className="grid gap-3">
-          <h3 className="text-sm font-semibold text-muted-foreground">Кластеризация</h3>
+          <div className="flex items-center gap-2"><h3 className="text-sm font-semibold text-muted-foreground">Кластеризация</h3>
+          <InfoNote>Настройки кластеризации действуют одновременно на все разделы SHORT и LONG. 0 — первый сетап кластера, 1 — последний, 0.5 — середина; соседние сигналы одной монеты с разрывом до {(appliedClusterGapHours ?? 8).toString()} часов образуют кластер. При выключенной галочке кластеризация не выполняется — в расчёт входят все сетапы.</InfoNote></div>
           <div className="flex flex-wrap items-end gap-3">
             <label className="flex items-center gap-2 text-sm">
               <Checkbox checked={clusterize} onCheckedChange={(checked) => { setClusterize(checked === true); onSettingsCommit(); }} />
@@ -989,15 +990,14 @@ export function AnalyticsPage() {
               {(control) => <Input {...control} inputMode="decimal" disabled={!clusterize} value={clusterGapInput} onBlur={() => onSettingsCommit()} onChange={(event) => setClusterGapInput(event.target.value)} />}
             </Field>
           </div>
-          <InfoNote>Настройки кластеризации действуют одновременно на все разделы SHORT и LONG. 0 — первый сетап кластера, 1 — последний, 0.5 — середина; соседние сигналы одной монеты с разрывом до {(appliedClusterGapHours ?? 8).toString()} часов образуют кластер. При выключенной галочке кластеризация не выполняется — в расчёт входят все сетапы.</InfoNote>
         </div>
         <Separator />
         <div className="grid gap-3">
-          <h3 className="text-sm font-semibold text-muted-foreground">Тренд матожидания</h3>
+          <div className="flex items-center gap-2"><h3 className="text-sm font-semibold text-muted-foreground">Тренд матожидания</h3>
+          <InfoNote>Вес дня — число сетапов. «Перегиб» задаёт расстояние между узлами кубического P-spline, ∞ — взвешенная прямая. Прогноз — сглаженный уровень на последней дате с данными, без экстраполяции. Полоса графика — 95% неопределённость уровня (±1.96 SE), не доходности будущей сделки.</InfoNote></div>
           <AnalyticsTrendControls mode={trendMode} bend={trendBendDays}
             onModeChange={(mode) => { setTrendMode(mode); onSettingsCommit(); }}
             onBendChange={(bend) => { setTrendBendDays(bend); onSettingsCommit(); }} />
-          <InfoNote>Вес дня — число сетапов. «Перегиб» задаёт расстояние между узлами кубического P-spline, ∞ — взвешенная прямая. Прогноз — сглаженный уровень на последней дате с данными, без экстраполяции. Полоса графика — 95% неопределённость уровня (±1.96 SE), не доходности будущей сделки.</InfoNote>
         </div>
         {saveStatus === "error" && <p role="status" className="text-xs text-danger">Не удалось сохранить настройки</p>}
     </section>

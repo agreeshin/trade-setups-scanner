@@ -79,7 +79,6 @@ function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algori
     draftSave.save(next);
   }
   return <form noValidate onSubmit={(event) => { void submit(event); }} onBlur={saveDraft} className="grid min-w-0 gap-5">
-    <InfoNote>Исследование изолировано от live, обычных прогонов и кешей. Все выбранные TP×SL-ячейки имеют равный вес; baseline оценивается как trial 0 и входит в бюджет. Открытие и изменение формы ничего не запускают.</InfoNote>
     {!ready && !loadError && <Spinner label="Загрузка historical-списка" />}
     {loadError && <Alert variant="destructive" role="alert">{loadError}<Button type="button" variant="outline" onClick={() => setRevision((value) => value + 1)}>Повторить загрузку</Button></Alert>}
     <OptimizationFields algorithm={algorithm} scope={scope} onScopeChange={change} catalog={catalog} ready={ready} disabled={controller.creating} algorithmDomains={algorithmDomains} onAlgorithmDomainsChange={setAlgorithmDomains} analyticsDomains={analyticsDomains} onAnalyticsDomainsChange={setAnalyticsDomains} />
@@ -128,7 +127,7 @@ export function AlgorithmOptimizer({ algorithm, controller, open, onOpenChange, 
   return <Dialog open={open} onOpenChange={(next) => { if (!next) setDrafting(false); onOpenChange(next); }}>
     <DialogContent className="max-w-4xl" onCloseAutoFocus={(event) => { event.preventDefault(); document.getElementById(returnFocusId)?.focus(); }}>
       <DialogHeader>
-        <DialogTitle>Оптимизация · {algorithmDisplayName(algorithm)}</DialogTitle>
+        <div className="flex items-center gap-2"><DialogTitle>Оптимизация · {algorithmDisplayName(algorithm)}</DialogTitle><InfoNote>Исследование изолировано от live, обычных прогонов и кешей. Все выбранные TP×SL-ячейки имеют равный вес; baseline оценивается как trial 0 и входит в бюджет. Открытие и изменение формы ничего не запускают.</InfoNote></div>
         <DialogDescription>Серверное исследование Plan A. Закрытие окна не останавливает работу; для остановки нужна отдельная команда.</DialogDescription>
       </DialogHeader>
       <div className="grid min-w-0 gap-4">

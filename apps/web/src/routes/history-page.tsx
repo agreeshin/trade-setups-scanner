@@ -9,7 +9,6 @@ import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { PageHeader, SectionHeader } from "../components/ui/page-header";
 import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
-import { InfoNote } from "../components/ui/info-note";
 import { Select } from "../components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
@@ -54,8 +53,8 @@ function CoverageOverview({ revision }: { revision: number }) {
   const needle = filter.trim().toLowerCase();
   const rows = all.filter((row) => (!withDataOnly || row.totalCandles > 0) && row.symbol.toLowerCase().includes(needle));
   return <section aria-labelledby="coverage-overview-heading" className="grid gap-3">
-    <SectionHeader id="coverage-overview-heading" title="Обзор покрытия истории" />
-    <div className="flex flex-wrap items-center gap-2"><span className="text-xs text-muted-foreground">Инструментов со свечами: {withData} из {all.length}.</span><InfoNote>«Пропущено минут» — суммарные разрывы между первой и последней сохранённой минутой инструмента; точные интервалы — в детальном покрытии ниже.</InfoNote></div>
+    <SectionHeader id="coverage-overview-heading" title="Обзор покрытия истории" description="«Пропущено минут» — суммарные разрывы между первой и последней сохранённой минутой инструмента; точные интервалы — в детальном покрытии ниже." />
+    <span className="text-xs text-muted-foreground">Инструментов со свечами: {withData} из {all.length}.</span>
     <div className="flex flex-wrap items-end gap-4">
       <Field label="Фильтр по символу" className="min-w-48">{(control) => <Input value={filter} onChange={(event) => setFilter(event.target.value)} {...control} />}</Field>
       <label className="flex items-center gap-2 pb-1 text-sm"><Checkbox checked={withDataOnly} onCheckedChange={(checked) => setWithDataOnly(checked === true)} /> Только инструменты со свечами</label>
@@ -224,8 +223,7 @@ export function HistoryPage() {
     {message && <Alert variant="success" role="status">{message}</Alert>}
 
     <PageSidebarPanel value="upload" lazy><section className="grid gap-3" aria-labelledby="upload-heading">
-      <SectionHeader id="upload-heading" title="Загрузить историю" />
-      <InfoNote>Выберите инструменты вручную, импортом CSV без заголовка или текущим листингом Bybit, при необходимости отредактируйте список и подтвердите загрузку для выбранных дат. Создаётся отдельное задание на каждый инструмент.</InfoNote>
+      <SectionHeader id="upload-heading" title="Загрузить историю" description="Выберите инструменты вручную, импортом CSV без заголовка или текущим листингом Bybit, при необходимости отредактируйте список и подтвердите загрузку для выбранных дат. Создаётся отдельное задание на каждый инструмент." />
       <div className="flex flex-wrap gap-2">
         <Button type="button" variant="outline" disabled={busy} onClick={() => { void importListing(); }}>Импортировать текущий листинг Bybit (линейные USDT perpetual)</Button>
         <Button type="button" variant="outline" disabled={busy || symbols.trim().length === 0} onClick={() => { setSymbols(""); setMessage(null); }}>Очистить выбор</Button>
@@ -254,10 +252,9 @@ export function HistoryPage() {
     </section></PageSidebarPanel>
 
     <PageSidebarPanel value="collection" lazy><section className="grid gap-3" aria-labelledby="collection-heading">
-      <SectionHeader id="collection-heading" title="Текущий сбор свечей" />
+      <SectionHeader id="collection-heading" title="Текущий сбор свечей" description="Массовое управление сбором: выберите инструменты чек-боксами, «Все из БД» выбирает весь каталог, импорт листинга Bybit обновляет каталог биржи и добавляет её символы в выбор. Лимита на количество нет." />
       <CoverageOverview revision={revision} />
       <div className="grid gap-3">
-        <InfoNote>Массовое управление сбором: выберите инструменты чек-боксами, «Все из БД» выбирает весь каталог, импорт листинга Bybit обновляет каталог биржи и добавляет её символы в выбор. Лимита на количество нет.</InfoNote>
         <div><Button type="button" variant="outline" disabled={busy} onClick={() => { void importListingToCollection(); }}>Импортировать листинг для сбора</Button></div>
         <InstrumentPicker catalog={instruments} symbols={collectionSymbols} onChange={(value) => { setCollectionSymbols(value); setMessage(null); }} disabled={busy || catalog.kind !== "ready"} limit={null} />
         <div className="flex flex-wrap gap-2">
@@ -298,7 +295,7 @@ export function HistoryPage() {
     </section></PageSidebarPanel>
 
     <PageSidebarPanel value="jobs" lazy><section className="grid gap-3" aria-labelledby="backfill-heading">
-      <SectionHeader id="backfill-heading" title="Задания загрузки" /><InfoNote>Обновление каждые 3 секунды в видимой вкладке. Прогресс отражает checkpoint диапазона, не полноту свечей.</InfoNote>
+      <SectionHeader id="backfill-heading" title="Задания загрузки" description="Обновление каждые 3 секунды в видимой вкладке. Прогресс отражает checkpoint диапазона, не полноту свечей." />
       {counts !== null && <p className="text-sm text-muted-foreground">Активных: {activeJobs}. Завершено успешно: {counts.done}. С ошибкой: {counts.failed}. Отменено: {counts.cancelled}.</p>}
       {jobs.kind === "loading" && <p className="text-sm text-muted-foreground">Загрузка заданий…</p>}{jobs.kind === "unreachable" && <Alert variant="destructive" role="alert">Задания недоступны ({jobs.detail})</Alert>}
       {jobs.kind === "ready" && <div className="overflow-x-auto"><Table>

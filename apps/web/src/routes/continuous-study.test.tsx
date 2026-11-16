@@ -20,9 +20,10 @@ let studies: OptimizationStudy[];
 let unavailable: boolean;
 let draftStatus: number;
 let drafts: Record<string, unknown>;
+let renameStatus: number;
 const requests: { path: string; method: string; body: unknown }[] = [];
 beforeEach(() => {
-  process = null; studies = []; unavailable = false; draftStatus = 200; drafts = {}; requests.length = 0;
+  process = null; studies = []; unavailable = false; draftStatus = 200; drafts = {}; renameStatus = 200; requests.length = 0;
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : null;
@@ -61,7 +62,7 @@ beforeEach(() => {
     }
     const detail = /^\/v1\/optimization-studies\/(\d+)$/.exec(path);
     if (detail) return json(studies.find((item) => item.id === Number(detail[1])));
-    if (path.startsWith("/v1/algorithms/") && method === "PUT") return json({});
+    if (path.startsWith("/v1/algorithms/") && method === "PUT") return json({}, renameStatus);
     return json({});
   }));
 });
@@ -547,12 +548,12 @@ it("saves actual metadata controls, date-free list/gate config and locked maturi
   for (const key of ["fromUnix", "toUnix", "minSetupsPerDay", "setupMaturity"]) expect(config.study).not.toHaveProperty(key);
   expect(requests.filter((request) => request.method !== "GET" && !request.path.startsWith("/v1/optimization-drafts/"))).toHaveLength(1);
   expect(screen.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" })).not.toBeChecked();
-  expect(screen.getByRole("checkbox", { name: "Включён для live-сканирования" })).not.toBeChecked();
+  expect(screen.getByLabelText("Включён для live-сканирования")).not.toBeChecked();
 });
 
 it("shares common draft fields in both directions while preserving mode-specific values", async () => {
   render(<AlgorithmsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Оптимизировать Мой алгоритм" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Запустить новую оптимизацию Мой алгоритм" }));
   let manual = within(await screen.findByRole("dialog", { name: "Оптимизация · Мой алгоритм" }));
   const manualBaseline = await manual.findByLabelText("Baseline: Новый порог");
   fireEvent.change(manual.getByLabelText("Начало периода сигналов"), { target: { value: "2026-10-05T01:02" } });
@@ -579,7 +580,7 @@ it("shares common draft fields in both directions while preserving mode-specific
   });
   await userEvent.click(continuous.getByRole("button", { name: "Закрыть" }));
 
-  await userEvent.click(screen.getByRole("button", { name: "Оптимизировать Мой алгоритм" }));
+  await userEvent.click(screen.getByRole("button", { name: "Запустить новую оптимизацию Мой алгоритм" }));
   manual = within(await screen.findByRole("dialog", { name: "Оптимизация · Мой алгоритм" }));
   expect(await manual.findByLabelText("Начало периода сигналов")).toHaveValue("2026-10-05T01:02");
   expect(manual.getByLabelText("Направление сделки")).toHaveValue("long");
@@ -605,15 +606,16 @@ it("keeps adaptive permission independent and drains only through the common alg
   expect(screen.getByRole("button", { name: "Остановка запрошена · ожидаем drain" })).toBeDisabled();
   expect(requests.filter((request) => request.path.endsWith("/stop"))).toHaveLength(1);
   expect(requests.some((request) => request.path.includes("/cancel") || request.method === "DELETE")).toBe(false);
-  expect(screen.getByRole("checkbox", { name: "Включён для live-сканирования" })).not.toBeChecked();
+  expect(screen.getByLabelText("Включён для live-сканирования")).not.toBeChecked();
 });
 
 it("renames with an isolated partial PUT and never overwrites unsaved fixed parameters", async () => {
   render(<AlgorithmsPage />);
+  await userEvent.click(await screen.findByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
   const input = await screen.findByRole("spinbutton", { name: "Новый порог (%)" });
   fireEvent.change(input, { target: { value: "8.5" } });
   fireEvent.change(screen.getByLabelText("Внешнее название алгоритма"), { target: { value: "  <b>Мой профиль</b>  " } });
-  await userEvent.click(screen.getByRole("button", { name: "Сохранить название" }));
+  fireEvent.blur(screen.getByLabelText("Внешнее название алгоритма"));
   await screen.findByText("Название алгоритма сохранено.");
   expect(requests.find((request) => request.method === "PUT")?.body).toEqual({ externalName: "<b>Мой профиль</b>" });
   expect(screen.getByRole("tab", { name: "<b>Мой профиль</b>" })).toBeInTheDocument();
@@ -623,14 +625,80 @@ it("renames with an isolated partial PUT and never overwrites unsaved fixed para
   expect(requests.filter((request) => request.method === "PUT")[1]?.body).toEqual({ params: { futureThreshold: "8.5", opaqueFixed: "kept" }, enabled: false });
 });
 
+it("keeps heading/name above Segmented and preserves fixed drafts across keyboard tab changes", async () => {
+  render(<AlgorithmsPage />);
+  const name = await screen.findByLabelText("Внешнее название алгоритма");
+  const tabs = screen.getByRole("tablist", { name: "Режим live · Мой алгоритм" });
+  expect(name.compareDocumentPosition(tabs) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  expect(screen.queryByRole("button", { name: "Сохранить название" })).not.toBeInTheDocument();
+  const flexible = within(tabs).getByRole("tab", { name: "Live-сканирование с гибкими параметрами" });
+  const fixed = within(tabs).getByRole("tab", { name: "Live-сканирование с постоянными параметрами" });
+  expect(flexible).toHaveAttribute("aria-selected", "true");
+  expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
+  expect(fixed.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
+  fireEvent.keyDown(flexible, { key: "ArrowRight" });
+  expect(fixed).toHaveFocus();
+  expect(fixed).toHaveAttribute("tabindex", "0");
+  const input = screen.getByRole("spinbutton", { name: "Новый порог (%)" });
+  fireEvent.change(input, { target: { value: "8.5" } });
+  fireEvent.click(screen.getByRole("checkbox", { name: "Включён для live-сканирования" }));
+  expect(fixed.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
+  fireEvent.keyDown(fixed, { key: "Home" });
+  expect(flexible).toHaveFocus(); expect(input).not.toBeVisible();
+  expect(document.getElementById(flexible.getAttribute("aria-controls")!)).toHaveAttribute("aria-labelledby", flexible.id);
+  fireEvent.keyDown(flexible, { key: "End" });
+  expect(screen.getByRole("spinbutton", { name: "Новый порог (%)" })).toBe(input);
+  expect(input).toHaveValue(8.5);
+  await userEvent.click(screen.getByRole("button", { name: "Сохранить алгоритм" }));
+  await screen.findByText("Настройки алгоритма сохранены.");
+  expect(fixed.querySelector('[data-slot="segmented-status-dot"]')).toHaveClass("bg-success");
+  expect(fixed).toHaveAccessibleDescription("Live-сканирование включено");
+});
+
+it("maps the adaptive dot to saved permission, never research state, draft or readiness", async () => {
+  process = profileController({}, { status: "running" }).process;
+  if (!process?.config) throw new Error("Expected configured process");
+  process = { ...process, config: { ...process.config, adaptiveEnabled: false } };
+  render(<AlgorithmsPage />);
+  const flexible = await screen.findByRole("tab", { name: "Live-сканирование с гибкими параметрами" });
+  await screen.findByText("Непрерывное исследование включено");
+  expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
+  await userEvent.click(screen.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" }));
+  expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Сохранить разрешение адаптивного live" }));
+  await screen.findByText("Разрешение адаптивного live сохранено.");
+  expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toHaveClass("bg-success");
+  expect(flexible).toHaveAccessibleDescription("Live-сканирование включено");
+  expect(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }).querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
+});
+
+it("skips unchanged blur saves and surfaces rename failure without losing the retry draft", async () => {
+  render(<AlgorithmsPage />);
+  const input = await screen.findByLabelText("Внешнее название алгоритма");
+  fireEvent.blur(input);
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+  renameStatus = 503;
+  fireEvent.change(input, { target: { value: "Новое название" } });
+  fireEvent.blur(input);
+  expect(await screen.findByRole("alert")).toHaveTextContent("Не удалось сохранить: HTTP 503");
+  expect(screen.getByRole("tab", { name: "Мой алгоритм" })).toBeInTheDocument();
+  expect(input).toHaveValue("Новое название"); expect(input).toBeEnabled();
+  renameStatus = 200;
+  fireEvent.blur(input); fireEvent.blur(input);
+  await screen.findByText("Название алгоритма сохранено.");
+  expect(requests.filter((request) => request.method === "PUT")).toHaveLength(2);
+  fireEvent.blur(input);
+  expect(requests.filter((request) => request.method === "PUT")).toHaveLength(2);
+});
+
 it("shows unavailable rather than pretending the endpoint works and preserves fixed/manual controls", async () => {
   unavailable = true;
   render(<AlgorithmsPage />);
   await screen.findByText(/Непрерывные исследования пока недоступны на сервере/);
   expect(screen.getByRole("button", { name: "Настроить непрерывное исследование" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "Запустить непрерывное исследование" })).toBeDisabled();
-  expect(screen.getByRole("button", { name: "Сохранить алгоритм" })).toBeEnabled();
-  expect(screen.getByRole("button", { name: "Оптимизировать Мой алгоритм" })).toBeEnabled();
+  expect(screen.getByText("Сохранить алгоритм")).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Запустить новую оптимизацию Мой алгоритм" })).toBeEnabled();
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
 
@@ -647,7 +715,7 @@ it("shows active and completed continuous history with structured origin, withou
   await detail.findByText("Непрерывное");
   expect(detail.queryByRole("button", { name: "Остановить исследование" })).not.toBeInTheDocument();
   await userEvent.click(detail.getByRole("button", { name: "Закрыть" }));
-  await userEvent.click(screen.getByRole("button", { name: "Оптимизировать Мой алгоритм" }));
+  await userEvent.click(screen.getByRole("button", { name: "Запустить новую оптимизацию Мой алгоритм" }));
   const manual = within(await screen.findByRole("dialog", { name: "Оптимизация · Мой алгоритм" }));
   await waitFor(() => expect(manual.getByRole("button", { name: "Начать исследование" })).toBeEnabled());
   expect(requests.some((request) => request.path.endsWith("/cancel"))).toBe(false);
@@ -656,7 +724,7 @@ it("shows active and completed continuous history with structured origin, withou
 it.each(["", "x".repeat(121), "bad\u0001name"])("rejects invalid external names without a write", async (name) => {
   render(<AlgorithmsPage />);
   fireEvent.change(await screen.findByLabelText("Внешнее название алгоритма"), { target: { value: name } });
-  await userEvent.click(screen.getByRole("button", { name: "Сохранить название" }));
+  fireEvent.blur(screen.getByLabelText("Внешнее название алгоритма"));
   await screen.findByText("Название: от 1 до 120 символов, без управляющих символов.");
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
@@ -664,6 +732,7 @@ it("accepts 120 Unicode characters and Enter saves the name, not the fixed setti
   render(<AlgorithmsPage />);
   const input = await screen.findByLabelText("Внешнее название алгоритма");
   const name = "𐐷".repeat(120);
+  input.focus();
   fireEvent.change(input, { target: { value: name } });
   fireEvent.keyDown(input, { key: "Enter" });
   await screen.findByText("Название алгоритма сохранено.");
@@ -730,5 +799,5 @@ it("changes only live permission during running research without revision change
   expect(screen.getByText("Непрерывное исследование включено")).toBeInTheDocument();
   liveDetails();
   expect(screen.getByText("Принятое поколение сохранено")).toBeInTheDocument();
-  expect(screen.getByRole("checkbox", { name: "Включён для live-сканирования" })).not.toBeChecked();
+  expect(screen.getByLabelText("Включён для live-сканирования")).not.toBeChecked();
 });

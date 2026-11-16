@@ -47,8 +47,8 @@ export function InstrumentPicker({ catalog, symbols, onChange, disabled, live = 
     } catch { setError("Не удалось прочитать CSV-файл."); }
   }
   return <fieldset className="grid gap-3 rounded-md border border-input p-4" disabled={disabled}>
-    <legend className="font-medium">{live ? "Live-инструменты" : "Инструменты из БД"} · Bybit Linear</legend>
-    <InfoNote>{live ? "Только активные инструменты каталога. Этот список независим от исторических запусков; пустой сохранённый выбор означает отсутствие инструментов для live." : "По умолчанию все инструменты каталога БД, включая делистнутые. Наличие инструмента не гарантирует полноту истории выбранного периода."}</InfoNote>
+    <legend className="font-medium"><span className="inline-flex items-center gap-2">{live ? "Live-инструменты" : "Инструменты из БД"} · Bybit Linear
+    <InfoNote>{live ? "Только активные инструменты каталога. Этот список независим от исторических запусков; пустой сохранённый выбор означает отсутствие инструментов для live." : "По умолчанию все инструменты каталога БД, включая делистнутые. Наличие инструмента не гарантирует полноту истории выбранного периода."}</InfoNote></span></legend>
     <div className="flex flex-wrap gap-2"><Button type="button" variant="outline" size="sm" onClick={() => onChange(catalog.map((instrument) => instrument.symbol).join("\n"))}>{live ? "Все активные" : "Все из БД"}</Button><Button type="button" variant="outline" size="sm" onClick={() => onChange("")}>Убрать все</Button></div>
     <Field label="Поиск инструмента">{(control) => <Input value={search} onChange={(event) => setSearch(event.target.value)} {...control} />}</Field>
     <div className="grid max-h-64 gap-2 overflow-y-auto sm:grid-cols-2">

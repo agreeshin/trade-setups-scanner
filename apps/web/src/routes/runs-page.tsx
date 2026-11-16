@@ -110,8 +110,7 @@ function RunResults({ id, isBatch, revision }: { id: number; isBatch: boolean; r
   }
   return <section className="mt-8" aria-labelledby="run-results-heading">
     <Card className="grid gap-3">
-      <SectionHeader id="run-results-heading" title={`Результаты запуска #${id}`} actions={<Button variant="outline" size="sm" disabled={downloading} onClick={() => { void exportCsv(); }}>{downloading ? "Подготовка CSV…" : "Скачать CSV запуска"}</Button>} />
-      <InfoNote>CSV содержит все результаты запуска, не только текущую страницу. Большой файл потребует времени и памяти браузера.</InfoNote>
+      <SectionHeader id="run-results-heading" title={`Результаты запуска #${id}`} actions={<><Button variant="outline" size="sm" disabled={downloading} onClick={() => { void exportCsv(); }}>{downloading ? "Подготовка CSV…" : "Скачать CSV запуска"}</Button><InfoNote>CSV содержит все результаты запуска, не только текущую страницу. Большой файл потребует времени и памяти браузера.</InfoNote></>} />
       {error && <Alert variant="destructive" role="alert">{error}</Alert>}
       <RunResultPage key={offset} id={id} isBatch={isBatch} offset={offset} revision={revision} onPage={setOffset} qualityPanel={qualityPanel} onQualityPanel={setQualityPanel} />
     </Card>
@@ -323,7 +322,7 @@ export function RunsPage() {
     finally { setDeleting(false); }
   }
   return <section aria-labelledby="runs-heading">
-    <PageHeader id="runs-heading" title="Исторические запуски" />
+    <PageHeader id="runs-heading" title="Исторические запуски" description="Расчёт выполняется в фоне. Список обновляется каждые 3 секунды в видимой вкладке. Закрытие страницы не отменяет расчёт; используйте кнопку отмены." />
     <form onSubmit={(event) => { void submit(event); }} className="mt-6">
       <Card className="grid gap-4">
         <Field label="Алгоритм">
@@ -344,7 +343,6 @@ export function RunsPage() {
         <InfoNote>Локальное время: {localTimezoneLabel()}. В API передаются Unix-секунды.</InfoNote>
         {error && <Alert variant="destructive" role="alert">{error}</Alert>}
         {message && <Alert variant="success" role="status">{message}</Alert>}
-        <InfoNote>Расчёт выполняется в фоне. Список обновляется каждые 3 секунды в видимой вкладке. Закрытие страницы не отменяет расчёт; используйте кнопку отмены.</InfoNote>
         <div className="flex flex-wrap gap-2"><Button type="submit" disabled={busy || checking || !ready || algorithms.kind !== "ready"}>{checking ? "Проверка…" : "Проверить данные"}</Button><Button type="button" variant="outline" disabled={busy || checking || !ready} onClick={() => { void saveForm(); }}>Сохранить форму</Button></div>
         {preview && <><ReplayPreflight preview={preview} /><Button type="button" disabled={busy || !preview.canRun} onClick={() => { void launch(); }}>Запустить проверенный расчёт</Button></>}
       </Card>
