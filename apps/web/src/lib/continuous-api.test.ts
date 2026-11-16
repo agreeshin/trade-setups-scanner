@@ -55,6 +55,23 @@ const incumbentSlot = { id: 5, minSetupsPerDay: 4, status: "warming", activeGene
   selectedCell: { tpPct: 14, slPct: 4, rawR: 0.32, meanR: 0.21, robustScore: 0.01 }, updatedAt: "2026-11-12T12:00:00Z" };
 const readinessSummary = { generationId: 7, totalInstruments: 822, readyInstruments: 815, waitingInstruments: 7,
   waitingReasons: [{ reason: "insufficient_history", count: 5 }, { reason: "waiting_tail", count: 2 }], otherWaitingInstruments: 0 };
+it.each(["mean", "forecast", null, undefined])("preserves saved slot mode %s independently of the configured study mode", async (trendMode) => {
+  const configured = { ...process, config: { ...config, study: { ...config.study, trendMode: "forecast" } },
+    slots: [{ ...incumbentSlot, ...(trendMode === undefined ? {} : { trendMode }) }] };
+  vi.stubGlobal("fetch", vi.fn((path: string) => Promise.resolve(new Response(JSON.stringify(path.includes("?") ? { processes: [configured] } : configured)))));
+  const signal = new AbortController().signal;
+  expect(await getContinuousStudy("future", signal)).toEqual(configured);
+  expect(await listContinuousStudies("future", signal)).toEqual([configured]);
+});
+it.each(["active", "inactive", "error"])("accepts explicit live status %s for status-only badge rendering", async (activeStatus) => {
+  const configured = { ...process, slots: [{ ...incumbentSlot, activeStatus }] };
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(configured)))));
+  expect(await getContinuousStudy("future", new AbortController().signal)).toEqual(configured);
+});
+it.each(["other", false, 1])("rejects an invalid saved matrix mode %j", async (trendMode) => {
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ...process, slots: [{ ...incumbentSlot, trendMode }] })))));
+  await expect(getContinuousStudy("future", new AbortController().signal)).rejects.toThrow("неподдерживаемый статус");
+});
 it("preserves separate running, finalized, pending and incumbent study provenance", async () => {
   const slot = { ...incumbentSlot, runningStudyId: 43, finalizedGenerationId: 8, pendingGenerationId: 8, pendingStudyId: 42, activeStudyId: 41 };
   vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ...process, slots: [slot] })))));

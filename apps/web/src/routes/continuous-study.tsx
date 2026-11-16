@@ -14,7 +14,7 @@ import { Spinner } from "../components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { effectiveTimezone, formatIsoDateTime, formatUnix } from "../lib/datetime-format";
 import { fetchPlatform } from "../lib/platform-api";
-import { MAX_CONTINUOUS_LOOKBACK_DAYS, MIN_CONTINUOUS_LOOKBACK_DAYS, type ContinuousSlot } from "../lib/continuous-api";
+import { MAX_CONTINUOUS_LOOKBACK_DAYS, MIN_CONTINUOUS_LOOKBACK_DAYS, type ContinuousProcess, type ContinuousSlot, type LiveReadinessSummary } from "../lib/continuous-api";
 import { getOptimizationDraft } from "../lib/optimization-api";
 import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildContinuousConfig, initialDomains, initialScope, restoreDomains, type ContinuousDraft, type ScopeDraft } from "./optimization-form";
 import { OptimizationFields } from "./optimization-fields";
@@ -39,9 +39,17 @@ function waitingReasonLabel(reason: string): string {
   return `Другая причина: ${reason.slice(0, 120).replace(/\s+/g, " ")}${reason.length > 120 ? "…" : ""}`;
 }
 
-function SlotReadiness({ slot }: { slot: ContinuousSlot }) {
+function invalidReadinessCounts(summary: LiveReadinessSummary | null | undefined): boolean {
+  if (!summary) return false;
+  const counts = [summary.totalInstruments, summary.readyInstruments, summary.waitingInstruments, summary.otherWaitingInstruments, ...summary.waitingReasons.map((entry) => entry.count)];
+  return summary.totalInstruments <= 0 || counts.some((count) => !Number.isSafeInteger(count) || count < 0)
+    || summary.readyInstruments + summary.waitingInstruments !== summary.totalInstruments
+    || summary.waitingReasons.reduce((total, entry) => total + entry.count, summary.otherWaitingInstruments) !== summary.waitingInstruments;
+}
+
+function SlotReadiness({ slot, invalid }: { slot: ContinuousSlot; invalid: boolean }) {
   const summary = slot.liveReadinessSummary;
-  if (!summary || slot.activeGenerationId === null || slot.activeStatus === "inactive" || summary.generationId !== slot.activeGenerationId) return <span>Готовность инструментов неизвестна.</span>;
+  if (!summary || invalid || slot.activeGenerationId === null || slot.activeStatus === "inactive" || slot.activeStatus === "error" || summary.generationId !== slot.activeGenerationId) return <span>Готовность инструментов неизвестна.</span>;
   const shown = [...summary.waitingReasons].filter((entry) => entry.count > 0).sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason)).slice(0, 3);
   const other = summary.waitingInstruments - shown.reduce((total, entry) => total + entry.count, 0);
   return <div className="grid gap-1">
@@ -57,30 +65,52 @@ function SlotReadiness({ slot }: { slot: ContinuousSlot }) {
   </div>;
 }
 
-function readinessVariant(slot: ContinuousSlot, problem: boolean): BadgeVariant {
-  const summary = slot.liveReadinessSummary;
-  if (problem || slot.activeGenerationId === null || slot.activeStatus !== "active" || summary?.generationId !== slot.activeGenerationId
-    || summary.totalInstruments <= 0 || !Number.isFinite(summary.readyInstruments) || summary.readyInstruments < 0 || summary.readyInstruments > summary.totalInstruments
-    || ["error", "failed"].includes(slot.status) || slot.pendingStatus === "error" || slot.pendingError != null) return "danger";
-  const ready = summary.readyInstruments / summary.totalInstruments;
-  return ready >= 0.95 ? "success" : ready >= 0.5 ? "warning" : "danger";
+function liveStatus(slot: ContinuousSlot): { label: string; variant: BadgeVariant } {
+  if (["error", "failed"].includes(slot.status) || slot.pendingStatus === "error" || slot.pendingError != null || slot.activeStatus === "error") return { label: "Ошибка", variant: "danger" };
+  if (slot.activeGenerationId !== null && slot.activeStatus === "active") return { label: "Активно", variant: "success" };
+  if (slot.status === "stopped") return { label: "Остановлен", variant: "warning" };
+  if (slot.pendingStatus === "warming" || slot.status === "warming") return { label: "Идёт инициализация", variant: "warning" };
+  if (slot.pendingStatus != null || slot.pendingGenerationId != null) return { label: "Ожидает", variant: "warning" };
+  if ((slot.activeGenerationId !== null && slot.activeStatus === "inactive") || ["inactive", "nonpass", "rejected", "no_winner"].includes(slot.status)) return { label: "Неактивно", variant: "warning" };
+  if (slot.activeGenerationId !== null) return { label: "Состояние live неизвестно (старый API)", variant: "warning" };
+  if (["idle", "pending", "running", "researching", "queued", "research", "acquiring", "replay", "analytics", "cleanup"].includes(slot.status)) return { label: "Ожидает", variant: "warning" };
+  return { label: "Нет действующего поколения", variant: "warning" };
 }
 
-function SlotIncumbent({ slot, problem }: { slot: ContinuousSlot; problem: boolean }) {
+function liveProblems(slot: ContinuousSlot, process: ContinuousProcess, available: boolean, invalidCounts: boolean): string[] {
+  // Render-local, at most seven bounded descriptions; no diagnostic history is retained.
+  const problems: string[] = [];
+  if (!available) problems.push("Актуальность снимка не подтверждена. Показано последнее известное состояние live.");
+  if (process.status === "error" || process.error !== null) problems.push(`Ошибка непрерывного процесса (status=${process.status}): ${pendingErrorMessage(process.error) ?? "Описание ошибки не передано."}`);
+  if (["error", "failed"].includes(slot.status)) problems.push(`Техническая ошибка профиля (status=${slot.status}).`);
+  if (slot.activeStatus === "error") problems.push("Ошибка действующего live (activeStatus=error).");
+  if (slot.pendingStatus === "error" || slot.pendingError != null) problems.push(`Ошибка инициализации live${slot.pendingStatus === "error" ? " (pendingStatus=error)" : ""}: ${pendingErrorMessage(slot.pendingError) ?? "Описание ошибки не передано."}`);
+  const summary = slot.liveReadinessSummary;
+  if (summary && slot.activeGenerationId !== null && summary.generationId !== slot.activeGenerationId) problems.push(`Сводка готовности относится к поколению #${summary.generationId} вместо действующего поколения #${slot.activeGenerationId}.`);
+  if (summary && invalidCounts) problems.push(`Некорректные числа готовности: всего ${summary.totalInstruments}, готовы ${summary.readyInstruments}, ожидают ${summary.waitingInstruments}; counts или сумма причин ожидания несогласованы.`);
+  return problems;
+}
+
+function SlotIncumbent({ slot, process, available }: { slot: ContinuousSlot; process: ContinuousProcess; available: boolean }) {
   const absent = slot.activeGenerationId === null;
+  const status = liveStatus(slot);
+  const invalidCounts = invalidReadinessCounts(slot.liveReadinessSummary);
+  const problems = liveProblems(slot, process, available, invalidCounts);
   return <Tooltip content={<div className="grid gap-2">
+    {problems.length > 0 && <Alert variant="destructive" role="alert" className="break-words">
+      <ul aria-label="Проблемы адаптивного live" className="grid gap-1">{problems.map((problem) => <li key={problem}>{problem}</li>)}</ul>
+    </Alert>}
     {absent ? <span>Адаптивные сигналы этого профиля не формируются.</span> : <>
       <span>{slot.activeStudyId == null ? "Исследование действующего поколения неизвестно" : `Источник метрик и рекомендации: исследование #${slot.activeStudyId} · поколение #${slot.activeGenerationId}`}</span>
       <span>Принятое поколение сохранено</span>
     </>}
-    <SlotReadiness slot={slot} />
+    <SlotReadiness slot={slot} invalid={invalidCounts} />
     {!absent && <span>{slot.liveWatermark == null ? "Watermark переключения неизвестен" : `Watermark переключения: ${closedTime(slot.liveWatermark)}`}</span>}
   </div>}>
-    <button type="button" className="inline-flex cursor-help rounded-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
-      <Badge variant={readinessVariant(slot, problem)} className="flex-wrap justify-start whitespace-normal text-left underline decoration-dotted underline-offset-4">
-        <span>{absent ? "Нет действующего поколения" : `${slot.activeStatus === "active" ? "Действующее" : "Принятое"} поколение #${slot.activeGenerationId}`}</span>
-        {!absent && <><span aria-hidden="true">·</span><span>{slot.activeStatus === "active" ? "Активно" : slot.activeStatus === "inactive" ? "Неактивно" : "Состояние live неизвестно (старый API)"}</span></>}
-      </Badge>
+    <button type="button" className="inline-flex cursor-help flex-wrap items-center gap-1 rounded-lg text-left underline decoration-dotted underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
+      {!absent ? <span>{`${slot.activeStatus === "active" ? "Действующее" : "Принятое"} поколение #${slot.activeGenerationId}`}</span>
+        : status.label !== "Нет действующего поколения" && <span>Нет действующего поколения</span>}
+      <Badge variant={status.variant} className="whitespace-normal text-left">{status.label}</Badge>
     </button>
   </Tooltip>;
 }
@@ -242,9 +272,9 @@ export function ContinuousResearch({ algorithm, controller }: { algorithm: Algor
         <TableBody>{process.slots.map((slot) => <TableRow key={slot.id}>
           <TableCell>{slot.minSetupsPerDay === 0 ? "0 · без частотного допуска" : slot.minSetupsPerDay}</TableCell>
           <TableCell><SlotResearch slot={slot} /></TableCell>
-          <TableCell><SlotIncumbent slot={slot} problem={!controller.available || process.status === "error" || process.error !== null} /></TableCell>
+          <TableCell><SlotIncumbent slot={slot} process={process} available={controller.available} /></TableCell>
           <TableCell><SlotPending slot={slot} /></TableCell>
-          <TableCell>{slot.meanExpectancy === null ? "—" : `${slot.meanExpectancy.toFixed(2)} R`}</TableCell>
+          <TableCell>{slot.meanExpectancy === null ? "—" : <>{`${slot.meanExpectancy.toFixed(2)} R`}{slot.trendMode != null && <span className="text-xs text-muted-foreground">{` · ${slot.trendMode}`}</span>}</>}</TableCell>
           <TableCell>{slot.activeGenerationId !== null && slot.selectedCell ? <>{`${process.config?.study.direction.toUpperCase() ?? ""} · TP ${slot.selectedCell.tpPct}% / SL ${slot.selectedCell.slPct}% · ${slot.selectedCell.rawR.toFixed(2)} R`}{slot.selectedCell.forecastR !== undefined && <p className="text-xs">Выбор по прогнозу: {slot.selectedCell.forecastR.toFixed(2)} R · score матрицы {slot.selectedCell.forecastMatrixR?.toFixed(2) ?? "—"} R</p>}</> : "Нет пригодного результата"}</TableCell>
           <TableCell>{slot.updatedAt ? formatIsoDateTime(slot.updatedAt) : "—"}</TableCell>
         </TableRow>)}</TableBody>

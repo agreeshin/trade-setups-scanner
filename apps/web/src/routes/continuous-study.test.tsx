@@ -119,32 +119,68 @@ it("labels the accepted winner from saved forecast fields even when the edited c
   expect(screen.getByText("Выбор по прогнозу: 0.50 R · score матрицы 0.60 R")).toBeInTheDocument();
   expect(screen.getByText(/TP 14% \/ SL 4% · -0.30 R/)).toBeInTheDocument();
 });
+function liveButton() {
+  const row = within(screen.getByRole("table", { name: "Настроенные адаптивные профили · Мой алгоритм" })).getAllByRole("row")[1]!;
+  return within(within(row).getAllByRole("cell")[2]!).getByRole("button");
+}
 function liveDetails() {
   fireEvent.keyDown(document, { key: "Escape" });
-  fireEvent.mouseEnter(screen.getByRole("button", { name: /^(Действующее|Принятое) поколение #|^Нет действующего поколения$/ }));
+  fireEvent.mouseEnter(liveButton());
   return within(screen.getByRole("tooltip"));
 }
 
-it.each([{ ready: 100, color: "success" }, { ready: 95, color: "success" }, { ready: 94, color: "warning" }, { ready: 50, color: "warning" }, { ready: 49, color: "danger" }, { ready: 0, color: "danger" }])("uses a compact $color badge at $ready% and reveals readiness only on hover", ({ ready, color }) => {
+it.each([100, 95, 94, 50, 49, 0])("keeps only the active status green at readiness %s/100 and reveals counts only on hover", (ready) => {
   render(profileView({ activeStatus: "active", liveReadinessSummary: { ...readinessSummary, totalInstruments: 100, readyInstruments: ready, waitingInstruments: 100 - ready, waitingReasons: [], otherWaitingInstruments: 100 - ready } }));
   const button = screen.getByRole("button", { name: /Действующее поколение #7/ });
-  expect(button).toHaveClass("cursor-help");
-  expect(button.querySelector('[data-slot="badge"]')).toHaveClass(`text-${color}`, "decoration-dotted");
+  const badge = button.querySelector('[data-slot="badge"]');
+  expect(button).toHaveClass("cursor-help", "decoration-dotted");
+  expect(badge).toHaveClass("text-success");
+  expect(badge).toHaveTextContent(/^Активно$/);
+  expect(badge).not.toHaveTextContent("поколение");
+  expect(within(button).getByText("Действующее поколение #7").closest('[data-slot="badge"]')).toBeNull();
   const summary = `Готовы ${ready} из 100 · ожидают ${100 - ready}`;
   expect(screen.queryByText(summary)).not.toBeInTheDocument();
-  expect(liveDetails().getByText(summary)).toBeVisible();
+  const popup = liveDetails();
+  expect(popup.getByText(summary)).toBeVisible();
+  expect(popup.queryByRole("alert")).not.toBeInTheDocument();
   expect(button).toHaveAccessibleDescription(expect.stringContaining(summary));
 });
 
-it.each([{ status: "error" }, { status: "failed" }, { pendingStatus: "error" }, { pendingError: { code: "initialization_error" } }, { activeStatus: "inactive" as const }])("shows problems as red even when cached readiness is 100%: %j", (patch) => {
-  render(profileView({ activeStatus: "active", liveReadinessSummary: { ...readinessSummary, readyInstruments: 822, waitingInstruments: 0, waitingReasons: [] }, ...patch }));
-  expect(screen.getByRole("button", { name: /поколение #7/ }).querySelector('[data-slot="badge"]')).toHaveClass("text-danger");
+const liveStatusCases: { patch: Partial<ContinuousSlot>; label: string; color: "success" | "warning" | "danger"; problem?: boolean }[] = [
+  ...["error", "failed"].map((status) => ({ patch: { status, activeStatus: "active" as const }, label: "Ошибка", color: "danger" as const, problem: true })),
+  { patch: { activeStatus: "error" }, label: "Ошибка", color: "danger", problem: true },
+  { patch: { activeStatus: "active", pendingStatus: "error" }, label: "Ошибка", color: "danger", problem: true },
+  { patch: { activeStatus: "active", pendingError: { code: "initialization_error" } }, label: "Ошибка", color: "danger", problem: true },
+  { patch: { activeStatus: "active", pendingError: false }, label: "Ошибка", color: "danger", problem: true },
+  ...["active", "warming", "idle", "pending", "running", "researching", "queued", "research", "acquiring", "replay", "analytics", "cleanup", "inactive", "nonpass", "rejected", "no_winner", "stopped"].map((status) => ({
+    patch: { status, activeStatus: "active" as const, pendingStatus: "warming" }, label: "Активно", color: "success" as const,
+  })),
+  { patch: { status: "stopped", activeGenerationId: null }, label: "Остановлен", color: "warning" },
+  { patch: { status: "warming", activeGenerationId: null }, label: "Идёт инициализация", color: "warning" },
+  { patch: { status: "active", activeStatus: "inactive", pendingStatus: "warming" }, label: "Идёт инициализация", color: "warning" },
+  ...["pending", "ready", "waiting_resource"].map((pendingStatus) => ({ patch: { status: "active", activeGenerationId: null, pendingGenerationId: 8, pendingStatus }, label: "Ожидает", color: "warning" as const })),
+  { patch: { status: "active", activeGenerationId: null, pendingGenerationId: 8 }, label: "Ожидает", color: "warning" },
+  { patch: { status: "active", activeStatus: "inactive" }, label: "Неактивно", color: "warning" },
+  ...["inactive", "nonpass", "rejected", "no_winner"].map((status) => ({ patch: { status, activeGenerationId: null }, label: "Неактивно", color: "warning" as const })),
+  { patch: { status: "active" }, label: "Состояние live неизвестно (старый API)", color: "warning" },
+  ...["idle", "pending", "running", "researching", "queued", "research", "acquiring", "replay", "analytics", "cleanup"].map((status) => ({ patch: { status, activeGenerationId: null }, label: "Ожидает", color: "warning" as const })),
+  ...["active", "unrecognised"].map((status) => ({ patch: { status, activeGenerationId: null }, label: "Нет действующего поколения", color: "warning" as const })),
+];
+it.each(liveStatusCases)("renders only $label in a $color badge for $patch", ({ patch, label, color, problem }) => {
+  render(profileView(patch));
+  const popup = liveDetails();
+  const badge = liveButton().querySelector('[data-slot="badge"]');
+  expect(badge).toHaveTextContent(label);
+  expect(badge?.textContent).toBe(label);
+  expect(badge).toHaveClass(`text-${color}`);
+  expect(popup.queryByRole("alert") !== null).toBe(problem === true);
 });
 
-it("does not paint a stale snapshot green and retains named, icon-only actions and their handlers", () => {
-  const controller = profileController({ activeStatus: "active", liveReadinessSummary: { ...readinessSummary, readyInstruments: 822, waitingInstruments: 0, waitingReasons: [] } }, {}, { available: false });
+it("explains an unconfirmed snapshot without recoloring the saved live status and retains icon-only actions", () => {
+  const controller = profileController({ activeStatus: "active", liveReadinessSummary: readinessSummary }, {}, { available: false });
   const view = render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
-  expect(screen.getByRole("button", { name: /Действующее поколение #7/ }).querySelector('[data-slot="badge"]')).toHaveClass("text-danger");
+  expect(screen.getByRole("button", { name: /Действующее поколение #7/ }).querySelector('[data-slot="badge"]')).toHaveClass("text-success");
+  expect(liveDetails().getByRole("alert")).toHaveTextContent("Актуальность снимка не подтверждена");
   const labels = ["Обновить статус непрерывного процесса", "Настроить непрерывное исследование", "Остановить непрерывное исследование"] as const;
   for (const label of labels) {
     const button = screen.getByRole("button", { name: label });
@@ -154,7 +190,69 @@ it("does not paint a stale snapshot green and retains named, icon-only actions a
   expect(screen.getByRole("button", { name: labels[1] })).toBeDisabled();
   fireEvent.click(screen.getByRole("button", { name: labels[0] })); expect(controller.refresh).toHaveBeenCalledOnce();
   view.rerender(<ContinuousResearch algorithm={algorithm} controller={{ ...controller, available: true }} />);
+  expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: labels[2] })); expect(controller.stop).toHaveBeenCalledOnce();
+});
+
+it.each(["running", "error"] as const)("explains a retained process error in state %s without repainting active slots", (status) => {
+  render(<ContinuousResearch algorithm={algorithm} controller={profileController({ activeStatus: "active", liveReadinessSummary: readinessSummary }, { status, error: { code: "source_unavailable", message: "Связь с источником потеряна." } })} />);
+  expect(screen.getByRole("button", { name: /Действующее поколение #7/ }).querySelector('[data-slot="badge"]')).toHaveClass("text-success");
+  const alert = liveDetails().getByRole("alert");
+  expect(alert).toHaveClass("bg-danger/10");
+  expect(alert).toHaveTextContent(`Ошибка непрерывного процесса (status=${status}): source_unavailable: Связь с источником потеряна.`);
+});
+it("explains process error status even without a server error description", () => {
+  render(<ContinuousResearch algorithm={algorithm} controller={profileController({ activeStatus: "active" }, { status: "error" })} />);
+  expect(liveDetails().getByRole("alert")).toHaveTextContent("status=error");
+  expect(within(screen.getByRole("tooltip")).getByRole("alert")).toHaveTextContent("Описание ошибки не передано.");
+});
+it("lists all simultaneous problems with bounded server descriptions and no opaque payload dump", () => {
+  render(<ContinuousResearch algorithm={algorithm} controller={profileController({ status: "failed", activeStatus: "error", pendingStatus: "error",
+    pendingError: { code: "init_failed", message: "Инициализация недоступна. " + "y".repeat(1000), debug: "private-init-payload" },
+    liveReadinessSummary: { ...readinessSummary, generationId: 8, readyInstruments: -1 } },
+  { status: "running", error: { code: "source_error", message: "Источник недоступен. " + "x".repeat(1000) } }, { available: false })} />);
+  const alert = liveDetails().getByRole("alert");
+  const items = within(alert).getAllByRole("listitem");
+  expect(items).toHaveLength(7);
+  for (const problem of ["status=failed", "activeStatus=error", "init_failed", "status=running", "source_error", "поколению #8", "действующего поколения #7", "Некорректные числа готовности", "Актуальность снимка не подтверждена"]) expect(alert).toHaveTextContent(problem);
+  expect(items.every((item) => item.textContent.length < 500)).toBe(true);
+  expect(alert).not.toHaveTextContent("private-init-payload");
+  expect(alert).not.toHaveTextContent("x".repeat(301));
+  expect(alert).not.toHaveTextContent("y".repeat(301));
+});
+it.each([
+  { totalInstruments: 0, readyInstruments: 0, waitingInstruments: 0 }, { totalInstruments: Number.NaN }, { totalInstruments: 1.5 },
+  { readyInstruments: Number.POSITIVE_INFINITY }, { readyInstruments: -1 }, { readyInstruments: 823 },
+  { waitingInstruments: -1 }, { waitingInstruments: 6 }, { otherWaitingInstruments: -1 },
+  { waitingReasons: [{ reason: "history_missing", count: -1 }] },
+])("reports invalid readiness numbers without presenting them as trusted coverage or changing active color: %j", (patch) => {
+  render(profileView({ activeStatus: "active", liveReadinessSummary: { ...readinessSummary, ...patch } }));
+  const popup = liveDetails();
+  expect(popup.getByRole("alert")).toHaveTextContent("Некорректные числа готовности");
+  expect(popup.getByText("Готовность инструментов неизвестна.")).toBeInTheDocument();
+  expect(popup.queryByText(/Готовы .* из/)).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Действующее поколение #7/ }).querySelector('[data-slot="badge"]')).toHaveClass("text-success");
+});
+it("reports a summary generation mismatch with both identities and leaves the main status active", () => {
+  render(profileView({ activeStatus: "active", liveReadinessSummary: { ...readinessSummary, generationId: 8 } }));
+  expect(liveDetails().getByRole("alert")).toHaveTextContent("Сводка готовности относится к поколению #8 вместо действующего поколения #7.");
+  expect(screen.getByRole("button", { name: /Действующее поколение #7/ }).querySelector('[data-slot="badge"]')).toHaveClass("text-success");
+});
+it.each(["mean", "forecast", null, undefined] as const)("labels the saved matrix mode %s without inferring it from the edited configuration", (trendMode) => {
+  const controller = profileController({ status: "active", activeStatus: "active", ...(trendMode === undefined ? {} : { trendMode }) });
+  if (!controller.process?.config) throw new Error("Expected configured process");
+  controller.process.config.study = { ...spec, trendMode: trendMode === "forecast" ? "mean" : "forecast" };
+  render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
+  const cell = screen.getByRole("cell", { name: /^0\.21 R/ });
+  expect(cell.textContent).toBe(`0.21 R${trendMode ? ` · ${trendMode}` : ""}`);
+  expect(cell.querySelector('[data-slot="badge"]')).toBeNull();
+  if (trendMode) expect(within(cell).getByText(`· ${trendMode}`)).toHaveClass("text-muted-foreground");
+  expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
+});
+it("omits the mode when the saved matrix mean is missing", () => {
+  render(profileView({ meanExpectancy: null, trendMode: "forecast" }));
+  const row = within(screen.getByRole("table", { name: "Настроенные адаптивные профили · Мой алгоритм" })).getAllByRole("row")[1]!;
+  expect(within(row).getAllByRole("cell")[4]).toHaveTextContent(/^—$/);
 });
 const exhaustedRecovery: Partial<ContinuousProcess> = { status: "error", activeStudyId: 42,
   error: { code: "durable_resume_retry_exhausted", message: "Исчерпан бюджет восстановления." } };
@@ -370,7 +468,7 @@ it("keeps accepted research visible but explicitly shows no adaptive emission af
   expect(screen.getByText("Сохранённое исследование #16")).toBeInTheDocument();
   expect(liveDetails().getByText("Адаптивные сигналы этого профиля не формируются.")).toBeInTheDocument();
   expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Ошибка инициализации live");
-  expect(screen.getByRole("alert")).toHaveTextContent("current_data_unavailable");
+  expect(within(screen.getByRole("cell", { name: /Кандидат #8/ })).getByRole("alert")).toHaveTextContent("current_data_unavailable");
   expect(screen.queryByText(/Действующее поколение #8/)).not.toBeInTheDocument();
   expect(screen.queryByText("SHORT · TP 14% / SL 4% · 0.32 R")).not.toBeInTheDocument();
   expect(requests).toHaveLength(0);

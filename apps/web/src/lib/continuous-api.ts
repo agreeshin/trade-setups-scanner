@@ -40,7 +40,7 @@ export interface ContinuousSlot {
   status: string;
   activeGenerationId: number | null;
   // Optional only for rollout compatibility; absence is unknown, never implicitly ready.
-  activeStatus?: "active" | "inactive";
+  activeStatus?: "active" | "inactive" | "error";
   pendingGenerationId?: number | null;
   pendingStatus?: string | null;
   /** Unix seconds at the CLOSED minute boundary, not candle-open time. */
@@ -58,7 +58,7 @@ export interface ContinuousSlot {
   /** Last fully finalized continuous result, not search-stage completion. */
   studyId: number | null;
   meanExpectancy: number | null;
-  /** Objective of this saved matrix; never inferred from the editable config. */
+  /** Producing study mode, not editable config; meanExpectancy remains the period mean. */
   trendMode?: "mean" | "forecast" | null;
   selectedCell: RecommendedCell | null;
   updatedAt: string;
@@ -122,7 +122,7 @@ function isProcess(value: unknown): value is ContinuousProcess {
     && (process.error === null || (process.error !== undefined && typeof process.error === "object" && typeof process.error.code === "string" && typeof process.error.message === "string"))
     && Array.isArray(process.slots) && process.slots.every((slot) => slot !== null && typeof slot === "object"
       && Number.isSafeInteger(slot.id) && slot.id > 0 && typeof slot.status === "string" && Number.isFinite(slot.minSetupsPerDay) && nullableId(slot.activeGenerationId) && nullableId(slot.studyId)
-      && (slot.activeStatus === undefined || slot.activeStatus === "active" || slot.activeStatus === "inactive")
+      && (slot.activeStatus === undefined || slot.activeStatus === "active" || slot.activeStatus === "inactive" || slot.activeStatus === "error")
       && (slot.pendingGenerationId === undefined || nullableId(slot.pendingGenerationId))
       && [slot.runningStudyId, slot.finalizedGenerationId, slot.activeStudyId, slot.pendingStudyId].every((id) => id === undefined || nullableId(id))
       && (slot.pendingStatus === undefined || slot.pendingStatus === null || typeof slot.pendingStatus === "string")
