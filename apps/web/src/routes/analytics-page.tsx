@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnalyticsTrendControls } from "../components/analytics-trend-controls";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -993,17 +994,9 @@ export function AnalyticsPage() {
         <Separator />
         <div className="grid gap-3">
           <h3 className="text-sm font-semibold text-muted-foreground">Тренд матожидания</h3>
-          <div className="flex flex-wrap items-end gap-3">
-            <Field label="Перегиб на N дней" className="w-48">
-              {(control) => <Select {...control} value={trendBendDays} onChange={(event) => { setTrendBendDays(event.target.value as TrendBendDays); onSettingsCommit(); }}>
-                <option value="7">7 дней</option><option value="14">14 дней</option><option value="30">30 дней</option><option value="linear">∞ — прямая</option>
-              </Select>}
-            </Field>
-            <div role="group" aria-label="Значения матрицы" className="flex flex-wrap gap-1">
-              <Button variant={trendMode === "mean" ? "default" : "outline"} aria-pressed={trendMode === "mean"} onClick={() => { setTrendMode("mean"); onSettingsCommit(); }}>Среднее</Button>
-              <Button variant={trendMode === "forecast" ? "default" : "outline"} aria-pressed={trendMode === "forecast"} onClick={() => { setTrendMode("forecast"); onSettingsCommit(); }}>Прогноз по тренду</Button>
-            </div>
-          </div>
+          <AnalyticsTrendControls mode={trendMode} bend={trendBendDays}
+            onModeChange={(mode) => { setTrendMode(mode); onSettingsCommit(); }}
+            onBendChange={(bend) => { setTrendBendDays(bend); onSettingsCommit(); }} />
           <InfoNote>Вес дня — число сетапов. «Перегиб» задаёт расстояние между узлами кубического P-spline, ∞ — взвешенная прямая. Прогноз — сглаженный уровень на последней дате с данными, без экстраполяции. Полоса графика — 95% неопределённость уровня (±1.96 SE), не доходности будущей сделки.</InfoNote>
         </div>
         {saveStatus === "error" && <p role="status" className="text-xs text-danger">Не удалось сохранить настройки</p>}

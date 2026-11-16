@@ -237,6 +237,7 @@ it("builds unknown fields from metadata and submits the complete typed scope onl
   expect(creates[0]?.body).toEqual({
     ...spec, fromUnix: new Date(2026, 9, 1).getTime() / 1000, toUnix: new Date(2026, 9, 3).getTime() / 1000,
     direction: "long", tpLevels: [4, 25], slLevels: [0.5, 6], minSetupsPerDay: 4,
+    trendMode: "mean", trendBendDays: "linear",
     algorithmSearch: { futureThreshold: ["1.5", "2.5", "4"], futureWindow: [2, 3, 5] },
     analyticsSearch: { clusterEnabled: [false, true], clusterGapMinutes: [240, 480], timeShiftMinutes: [0, 5], priceChangePct: [null, 0, 1] },
   });
@@ -288,6 +289,44 @@ it.each([0, 1])("switches algorithm cards without stale metadata and submits onl
   expect(payload.algorithmParams).not.toHaveProperty(otherKey);
   expect(payload.algorithmSearch).not.toHaveProperty(otherKey);
   expect(requests.some((request) => request.method === "PUT" && !request.path.startsWith("/v1/optimization-drafts/"))).toBe(false);
+});
+
+it("submits the selected forecast metric and persists its bend in the shared draft", async () => {
+  render(<AlgorithmsPage />);
+  const dialog = within(await openOptimizer());
+  await dialog.findByLabelText("Baseline: Новый порог");
+  const bend = dialog.getByLabelText("Перегиб на N дней");
+  expect(bend).toHaveValue("linear"); expect(bend).toBeDisabled();
+  fireEvent.click(dialog.getByRole("button", { name: "Прогноз по тренду" }));
+  expect(bend).toBeEnabled();
+  fireEvent.change(bend, { target: { value: "14" } });
+  fireEvent.blur(bend);
+  await waitFor(() => expect(drafts.future_algorithm).toMatchObject({ shared: { scope: { trendMode: "forecast", trendBendDays: "14" } } }));
+  enterDates();
+  const start = dialog.getByRole("button", { name: "Начать исследование" });
+  await waitFor(() => expect(start).toBeEnabled()); fireEvent.click(start);
+  await screen.findByText("Исследование #17");
+  expect(requests.find((request) => request.path === "/v1/optimization-studies" && request.method === "POST")?.body)
+    .toMatchObject({ trendMode: "forecast", trendBendDays: "14" });
+});
+
+it("labels a forecast winner and keeps its recorded negative period mean separate", async () => {
+  const saved = record("completed");
+  saved.spec = { ...spec, trendMode: "forecast", trendBendDays: "7" };
+  saved.result = { progress, reason: "trial_budget", best: {
+    score: 0.5, meanScore: -0.3, trendMode: "forecast", trendBendDays: "7", partial: false,
+    params: algorithm.params, analytics: { ...spec.analyticsParams },
+    matrix: [{ tpPct: 4, slPct: 4, riskExpectancy: 0.5, meanRiskExpectancy: -0.3, avgMovePct: -1.2,
+      closedCount: 10, tpCount: 4, slCount: 6, unclosedCount: 1, noDataCount: 0, priceChangeFilteredCount: 0 }],
+    provenance: { optimizerVersion: "plan-a-3", seed: 42, snapshotHash: "forecast-fixture", capturedAt: saved.createdAt }, conclusions: [],
+  } };
+  studies = [saved];
+  render(<AlgorithmsPage />); await openOptimizer();
+  expect(await screen.findByText("Лучший score: 0.5 R")).toBeInTheDocument();
+  expect(screen.getByText("Прогноз по тренду · перегиб 7 дней")).toBeInTheDocument();
+  expect(screen.getByText(/Среднее всей матрицы за период: -0.3 R/)).toBeInTheDocument();
+  expect(screen.getByRole("columnheader", { name: "Прогноз R" })).toBeInTheDocument();
+  expect(screen.getByRole("columnheader", { name: "Среднее R за период" })).toBeInTheDocument();
 });
 
 it("autosaves on blur, restores after reopening and isolates drafts by algorithm", async () => {

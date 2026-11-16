@@ -23,6 +23,8 @@ export interface RecommendedCell {
   rawR: number;
   meanR: number;
   robustScore: number;
+  forecastR?: number;
+  forecastMatrixR?: number;
 }
 export interface LiveReadinessSummary {
   generationId: number;
@@ -56,6 +58,8 @@ export interface ContinuousSlot {
   /** Last fully finalized continuous result, not search-stage completion. */
   studyId: number | null;
   meanExpectancy: number | null;
+  /** Objective of this saved matrix; never inferred from the editable config. */
+  trendMode?: "mean" | "forecast" | null;
   selectedCell: RecommendedCell | null;
   updatedAt: string;
 }
@@ -108,6 +112,8 @@ function isProcess(value: unknown): value is ContinuousProcess {
     && Array.isArray(config.minSetupsPerDay) && config.minSetupsPerDay.length > 0 && config.minSetupsPerDay.length <= MAX_CONTINUOUS_THRESHOLDS
     && new Set(config.minSetupsPerDay).size === config.minSetupsPerDay.length && config.minSetupsPerDay.every((threshold) => typeof threshold === "number" && Number.isFinite(threshold) && threshold >= 0)
     && config.study !== null && typeof config.study === "object" && config.study.algorithmId === process.algorithmId
+    && (config.study.trendMode === undefined || config.study.trendMode === "mean" || config.study.trendMode === "forecast")
+    && (config.study.trendBendDays === undefined || ["7", "14", "30", "linear"].includes(config.study.trendBendDays))
     && Array.isArray(config.study.instruments) && (config.study.direction === "short" || config.study.direction === "long"));
   return typeof process.algorithmId === "string" && ["stopped", "running", "stopping", "error"].includes(process.status ?? "")
     && (process.desiredRunning === undefined || typeof process.desiredRunning === "boolean")
@@ -123,8 +129,12 @@ function isProcess(value: unknown): value is ContinuousProcess {
       && optionalClosedBoundary(slot.readinessFrontier) && optionalClosedBoundary(slot.liveWatermark)
       && (slot.liveReadinessSummary == null || isLiveReadinessSummary(slot.liveReadinessSummary))
       && (slot.meanExpectancy === null || Number.isFinite(slot.meanExpectancy))
+      && (slot.trendMode == null || slot.trendMode === "mean" || slot.trendMode === "forecast")
       && typeof slot.updatedAt === "string" && Number.isFinite(Date.parse(slot.updatedAt))
-      && (slot.selectedCell === null || (typeof slot.selectedCell === "object" && slot.selectedCell !== undefined && [slot.selectedCell.tpPct, slot.selectedCell.slPct, slot.selectedCell.rawR, slot.selectedCell.meanR, slot.selectedCell.robustScore].every(Number.isFinite))));
+      && (slot.selectedCell === null || (typeof slot.selectedCell === "object" && slot.selectedCell !== undefined
+        && [slot.selectedCell.tpPct, slot.selectedCell.slPct, slot.selectedCell.rawR, slot.selectedCell.meanR, slot.selectedCell.robustScore].every(Number.isFinite)
+        && ((slot.selectedCell.forecastR === undefined && slot.selectedCell.forecastMatrixR === undefined)
+          || (Number.isFinite(slot.selectedCell.forecastR) && Number.isFinite(slot.selectedCell.forecastMatrixR))))));
 }
 
 async function request(path: string, signal: AbortSignal, method = "GET", config?: ContinuousConfig): Promise<unknown> {

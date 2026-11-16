@@ -1,4 +1,5 @@
 import { apiFetch } from "./platform-api";
+import type { TrendBendDays, TrendMode } from "./analytics-api";
 
 export type OptimizationValue = string | number | boolean | null;
 export interface OptimizationAnalytics {
@@ -28,6 +29,9 @@ export interface OptimizationSpec {
   seed: number;
   maxTrials: number;
   maxSeconds: number;
+  /** Absent legacy settings mean period mean / linear. */
+  trendMode?: TrendMode;
+  trendBendDays?: TrendBendDays;
 }
 export interface OptimizationProgress {
   phase: string;
@@ -41,9 +45,13 @@ export interface OptimizationMatrixCell {
   tpPct: number; slPct: number; riskExpectancy: number | null; avgMovePct: number | null;
   closedCount: number; tpCount: number; slCount: number; unclosedCount: number;
   noDataCount: number; priceChangeFilteredCount: number;
+  meanRiskExpectancy?: number | null;
 }
 export interface OptimizationBest {
   score: number;
+  meanScore?: number | null;
+  trendMode?: TrendMode;
+  trendBendDays?: TrendBendDays;
   partial: boolean;
   params: Record<string, string | number>;
   analytics: Omit<OptimizationAnalytics, "clusterGapMinutes"> & { clusterGapMinutes: number | null };

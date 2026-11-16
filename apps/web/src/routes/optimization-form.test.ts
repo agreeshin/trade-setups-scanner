@@ -47,6 +47,23 @@ function build(overrides: Partial<ScopeDraft> = {}, mutate?: (domains: ReturnTyp
   return buildOptimizationSpec(algorithm, { ...scope, ...overrides }, catalog, params, initialDomains(ANALYTICS_SEARCH_FIELDS, { ...ANALYTICS_BASELINE }));
 }
 
+it.each(["7", "14", "30", "linear"] as const)("plumbs fixed forecast %s into both study kinds, never search domains", (trendBendDays) => {
+  const selected = { trendMode: "forecast" as const, trendBendDays };
+  const manual = build(selected);
+  const continuous = buildContinuousConfig(algorithm, { ...scope, ...selected }, catalog,
+    initialDomains(algorithm.fields, algorithm.params), initialDomains(ANALYTICS_SEARCH_FIELDS, { ...ANALYTICS_BASELINE }),
+    { lookbackDays: "30", minSetupsPerDay: "4", minMeanExpectancy: "0.15", adaptiveEnabled: false });
+  for (const result of [manual, continuous.study]) {
+    expect(result).toMatchObject(selected);
+    expect(result.analyticsSearch).not.toHaveProperty("trendMode");
+    expect(result.algorithmSearch).not.toHaveProperty("trendBendDays");
+  }
+});
+it("defaults legacy form scopes to mean/linear and retains an inactive bend without changing the objective", () => {
+  expect(build()).toMatchObject({ trendMode: "mean", trendBendDays: "linear" });
+  expect(build({ trendBendDays: "7" })).toMatchObject({ trendMode: "mean", trendBendDays: "7" });
+});
+
 it("keeps full baseline, typed dynamic defaults and independent axes", () => {
   expect(build({ tpLevels: "25, 100", slLevels: "0.1, 0.5" })).toMatchObject({
     algorithmParams: algorithm.params, algorithmSearch: { addedDecimal: ["0.25", "1.5"] },

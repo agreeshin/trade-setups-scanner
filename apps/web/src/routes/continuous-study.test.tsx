@@ -76,6 +76,23 @@ async function configure() {
   return dialog;
 }
 
+it("saves and restores forecast settings and labels the gate by the selected metric", async () => {
+  render(<AlgorithmsPage />);
+  let dialog = await configure();
+  expect(dialog.getByLabelText("Перегиб на N дней")).toBeDisabled();
+  fireEvent.click(dialog.getByRole("button", { name: "Прогноз по тренду" }));
+  fireEvent.change(dialog.getByLabelText("Перегиб на N дней"), { target: { value: "30" } });
+  expect(dialog.getByLabelText("Минимальный средний прогноз матрицы, R")).toHaveValue(0.15);
+  expect(dialog.getByLabelText("Минимальный средний прогноз матрицы, R")).toHaveAccessibleDescription(/строго больше 0/);
+  fireEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(process?.config?.study).toMatchObject({ trendMode: "forecast", trendBendDays: "30" });
+  dialog = await configure();
+  expect(dialog.getByRole("button", { name: "Прогноз по тренду" })).toHaveAttribute("aria-pressed", "true");
+  expect(dialog.getByLabelText("Перегиб на N дней")).toHaveValue("30");
+  expect(requests.some((request) => request.path.endsWith("/start"))).toBe(false);
+});
+
 const closedBoundary = Date.parse("2026-11-12T12:00:00Z") / 1000;
 const readinessSummary = { generationId: 7, totalInstruments: 822, readyInstruments: 815, waitingInstruments: 7,
   waitingReasons: [{ reason: "insufficient_history", count: 5 }, { reason: "waiting_tail", count: 2 }], otherWaitingInstruments: 0 };
@@ -95,6 +112,13 @@ function profileController(patch: Partial<ContinuousSlot> = {}, processPatch: Pa
 function profileView(patch: Partial<ContinuousSlot> = {}) {
   return <ContinuousResearch algorithm={algorithm} controller={profileController(patch)} />;
 }
+
+it("labels the accepted winner from saved forecast fields even when the edited configuration has another metric", () => {
+  render(profileView({ activeStatus: "active", selectedCell: { tpPct: 14, slPct: 4, rawR: -0.3, meanR: -0.2,
+    robustScore: 0.4, forecastR: 0.5, forecastMatrixR: 0.6 } }));
+  expect(screen.getByText("Выбор по прогнозу: 0.50 R · score матрицы 0.60 R")).toBeInTheDocument();
+  expect(screen.getByText(/TP 14% \/ SL 4% · -0.30 R/)).toBeInTheDocument();
+});
 function liveDetails() {
   fireEvent.keyDown(document, { key: "Escape" });
   fireEvent.mouseEnter(screen.getByRole("button", { name: /^(Действующее|Принятое) поколение #|^Нет действующего поколения$/ }));

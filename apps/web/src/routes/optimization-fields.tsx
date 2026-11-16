@@ -1,4 +1,5 @@
 import { Checkbox } from "../components/ui/checkbox";
+import { AnalyticsTrendControls } from "../components/analytics-trend-controls";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { Select } from "../components/ui/select";
@@ -64,6 +65,10 @@ export function OptimizationFields({ algorithm, scope, onScopeChange, catalog, r
     {Object.entries(algorithm.params).filter(([key]) => !algorithm.fields.some((field) => field.key === key)).map(([key, value]) => <p key={key} className="text-sm">{key}: {value} (фиксирован)</p>)}
     <h3 className="font-semibold">Параметры аналитики</h3>
     <DomainControls fields={ANALYTICS_SEARCH_FIELDS} value={analyticsDomains} onChange={onAnalyticsDomainsChange} />
+    <h3 className="font-semibold">Оптимизируемое матожидание</h3>
+    <AnalyticsTrendControls mode={scope.trendMode ?? "mean"} bend={scope.trendBendDays ?? "linear"} disableMeanBend
+      onModeChange={(trendMode) => onScopeChange({ trendMode })} onBendChange={(trendBendDays) => onScopeChange({ trendBendDays })} />
+    <InfoNote>Фиксированная метрика всего исследования, не поисковый параметр. Прогноз — fitted-уровень на последней дате с закрытыми сделками; вес дня — число сетапов, без экстраполяции. Среднее за период сохраняется отдельно. Если хотя бы одной ячейке не хватает пригодных дней, весь кандидат неоценим.</InfoNote>
   </fieldset>;
 }
 import { InfoNote } from "../components/ui/info-note";

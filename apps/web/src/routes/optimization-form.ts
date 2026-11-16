@@ -3,6 +3,7 @@ import { isContinuousLookbackDays, MAX_CONTINUOUS_THRESHOLDS, type ContinuousCon
 import type { Algorithm } from "./platform-controls";
 import { replayRange } from "./platform-controls";
 import type { CatalogInstrument } from "./instrument-picker";
+import type { TrendBendDays, TrendMode } from "../lib/analytics-api";
 
 export interface SearchField {
   key: string; label: string; type: "decimal" | "integer" | "boolean" | "nullable";
@@ -103,8 +104,9 @@ export interface ScopeDraft {
   from: string; to: string; symbols: string; direction: "short" | "long";
   setupMaturity: string; horizonMinutes: string; tpLevels: string; slLevels: string;
   minClosedPerCell: string; minSetupsPerDay: string; seed: string; maxTrials: string; maxSeconds: string;
+  trendMode?: TrendMode; trendBendDays?: TrendBendDays;
 }
-export const initialScope = (): ScopeDraft => ({ from: "", to: "", symbols: "", direction: "short", setupMaturity: "0", horizonMinutes: "10080", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, minClosedPerCell: "1", minSetupsPerDay: "4", seed: "42", maxTrials: "256", maxSeconds: "3600" });
+export const initialScope = (): ScopeDraft => ({ from: "", to: "", symbols: "", direction: "short", setupMaturity: "0", horizonMinutes: "10080", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, minClosedPerCell: "1", minSetupsPerDay: "4", seed: "42", maxTrials: "256", maxSeconds: "3600", trendMode: "mean", trendBendDays: "linear" });
 
 export function restoreDomains(fields: SearchField[], baseline: Record<string, OptimizationValue>, search: Record<string, OptimizationValue[]>): DomainDrafts {
   return Object.fromEntries(fields.map((field) => [field.key, {
@@ -114,6 +116,9 @@ export function restoreDomains(fields: SearchField[], baseline: Record<string, O
 }
 
 function buildStudyParameters(algorithm: Algorithm, scope: ScopeDraft, catalog: CatalogInstrument[], params: DomainDrafts, analytics: DomainDrafts): ContinuousStudySpec {
+  const trendMode = scope.trendMode ?? "mean";
+  const trendBendDays = scope.trendBendDays ?? "linear";
+  if (!["mean", "forecast"].includes(trendMode) || !["7", "14", "30", "linear"].includes(trendBendDays)) throw new Error("Проверьте тип матожидания и перегиб тренда.");
   const symbols = [...new Set(scope.symbols.split(/[\s,;]+/).filter(Boolean))];
   if (!symbols.length) throw new Error("Выберите хотя бы один исторический инструмент.");
   const instruments = symbols.map((symbol) => {
@@ -139,6 +144,7 @@ function buildStudyParameters(algorithm: Algorithm, scope: ScopeDraft, catalog: 
     algorithmParams: { ...algorithm.params, ...algorithmValues.baseline }, algorithmSearch: algorithmValues.search,
     analyticsParams, analyticsSearch,
     instruments, direction: scope.direction,
+    trendMode, trendBendDays,
     horizonMinutes: integerInput(scope.horizonMinutes, "Горизонт", 1, 43200),
     tpLevels: parseAxis(scope.tpLevels, "TP"), slLevels: parseAxis(scope.slLevels, "SL"),
     minClosedPerCell: integerInput(scope.minClosedPerCell, "Минимум закрытых на ячейку", 1),

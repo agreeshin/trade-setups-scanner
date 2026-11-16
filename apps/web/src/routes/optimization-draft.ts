@@ -12,6 +12,8 @@ interface SharedScopeDraft {
   seed: string;
   maxTrials: string;
   maxSeconds: string;
+  trendMode?: NonNullable<ScopeDraft["trendMode"]>;
+  trendBendDays?: NonNullable<ScopeDraft["trendBendDays"]>;
 }
 
 export interface OptimizationFormDraft {
@@ -82,6 +84,8 @@ export function restoreOptimizationDraft(
     seed: text(storedScope.seed) ?? fallbackScope.seed,
     maxTrials: text(storedScope.maxTrials) ?? fallbackScope.maxTrials,
     maxSeconds: text(storedScope.maxSeconds) ?? fallbackScope.maxSeconds,
+    trendMode: storedScope.trendMode === "forecast" || storedScope.trendMode === "mean" ? storedScope.trendMode : fallbackScope.trendMode ?? "mean",
+    trendBendDays: storedScope.trendBendDays === "7" || storedScope.trendBendDays === "14" || storedScope.trendBendDays === "30" || storedScope.trendBendDays === "linear" ? storedScope.trendBendDays : fallbackScope.trendBendDays ?? "linear",
   };
   return {
     version: 1,
@@ -115,6 +119,8 @@ function sharedScope(scope: ScopeDraft): SharedScopeDraft {
     seed: scope.seed,
     maxTrials: scope.maxTrials,
     maxSeconds: scope.maxSeconds,
+    trendMode: scope.trendMode ?? "mean",
+    trendBendDays: scope.trendBendDays ?? "linear",
   };
 }
 
