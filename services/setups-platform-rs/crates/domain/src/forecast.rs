@@ -187,11 +187,67 @@ pub struct ProbabilityDay { pub day_start_unix: i64, pub tp_count: u64, pub sl_c
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClosedOutcome { TakeProfit, StopLoss }
 
+/// Exact nonnegative sum of binary f64 weights multiplied by integer counts.
+/// Eighteen limbs cover units of 2^-1074 through a u64 count of unit weights.
+/// Rounding happens once on read, so event order and daily batching cannot
+/// shift optimizer F versus the same graph/caption cohorts by an ULP. Fixed
+/// 144-byte storage; no per-day collection, quantized weights or global state.
+#[derive(Debug, Clone, Copy, Default)]
+struct ExactWeightSum { limbs: [u64;18] }
+impl ExactWeightSum {
+    fn add(&mut self, weight:f64, count:u64)->Result<(),ForecastError> {
+        if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {return Err(ForecastError::InvalidWeight);}
+        if weight==0.0 || count==0 {return Ok(());}
+        let bits=weight.to_bits();let exponent=((bits>>52)&0x7ff) as usize;
+        let significand=(bits&((1u64<<52)-1)) | if exponent==0 {0}else{1u64<<52};
+        let shift=exponent.saturating_sub(1);
+        let product=u128::from(significand)*u128::from(count);
+        let index=shift/64;let offset=shift%64;
+        let low=product as u64;let high=(product>>64) as u64;
+        self.add_limb(index,low<<offset)?;
+        if offset==0 {self.add_limb(index+1,high)?;} else {
+            self.add_limb(index+1,(high<<offset)|(low>>(64-offset)))?;
+            self.add_limb(index+2,high>>(64-offset))?;
+        }
+        Ok(())
+    }
+    fn add_limb(&mut self,mut index:usize,mut value:u64)->Result<(),ForecastError> {
+        while value!=0 {
+            let limb=self.limbs.get_mut(index).ok_or(ForecastError::CountOverflow)?;
+            let (sum,carry)=limb.overflowing_add(value);*limb=sum;
+            value=u64::from(carry);index+=1;
+        }
+        Ok(())
+    }
+    fn any_below(&self,bit:usize)->bool {
+        let whole=bit/64;let remainder=bit%64;
+        self.limbs[..whole].iter().any(|&word|word!=0)
+            || (remainder!=0 && self.limbs[whole]&((1u64<<remainder)-1)!=0)
+    }
+    fn value(&self)->f64 {
+        let Some(index)=self.limbs.iter().rposition(|&word|word!=0) else {return 0.0;};
+        let mut highest=index*64+63-self.limbs[index].leading_zeros() as usize;
+        if highest<52 {return f64::from_bits(self.limbs[0]);}
+        let shift=highest-52;let word=shift/64;let offset=shift%64;
+        let mut significand=self.limbs[word]>>offset;
+        if offset!=0 && word+1<self.limbs.len() {significand|=self.limbs[word+1]<<(64-offset);}
+        if shift>0 {
+            let half=shift-1;
+            let halfway=self.limbs[half/64]&(1u64<<(half%64))!=0;
+            if halfway && (self.any_below(half) || significand&1!=0) {
+                significand+=1;
+                if significand==1u64<<53 {significand>>=1;highest+=1;}
+            }
+        }
+        f64::from_bits(((highest as u64-51)<<52)|(significand&((1u64<<52)-1)))
+    }
+}
+
 /// Constant-size, evaluation-owned state. There is no retained daily vector.
 #[derive(Debug, Clone, Copy)]
 pub struct ProbabilityAccumulator {
     half_life_days: f64, kappa: f64, q: f64, cutoff: i64,
-    tp: u64, sl: u64, weighted_tp: f64, weighted_sl: f64,
+    tp: u64, sl: u64, weighted_tp: ExactWeightSum, weighted_sl: ExactWeightSum,
 }
 impl ProbabilityAccumulator {
     pub fn new(recipe: ForecastRecipe, q: f64, observation_cutoff: i64) -> Result<Self, ForecastError> {
@@ -199,7 +255,7 @@ impl ProbabilityAccumulator {
         if !q.is_finite() || q <= 0.0 { return Err(ForecastError::InvalidPayoff); }
         let ForecastRecipe::DecayedProbability { half_life_days, kappa, .. } = recipe else { return Err(ForecastError::WrongMethod); };
         Ok(Self { half_life_days, kappa, q, cutoff: observation_cutoff,
-            tp: 0, sl: 0, weighted_tp: 0.0, weighted_sl: 0.0 })
+            tp: 0, sl: 0, weighted_tp: ExactWeightSum::default(), weighted_sl: ExactWeightSum::default() })
     }
     pub fn add_day(&mut self, day: ProbabilityDay) -> Result<(), ForecastError> {
         if day.day_start_unix.rem_euclid(DAY_SECONDS) != 0 || day.day_start_unix > self.cutoff {
@@ -210,10 +266,11 @@ impl ProbabilityAccumulator {
         let tp = self.tp.checked_add(day.tp_count).ok_or(ForecastError::CountOverflow)?;
         let sl = self.sl.checked_add(day.sl_count).ok_or(ForecastError::CountOverflow)?;
         tp.checked_add(sl).ok_or(ForecastError::CountOverflow)?;
+        let mut weighted_tp=self.weighted_tp;let mut weighted_sl=self.weighted_sl;
+        weighted_tp.add(weight,day.tp_count)?;weighted_sl.add(weight,day.sl_count)?;
         // Commit all counters only after validation, including overflow.
         self.tp = tp; self.sl = sl;
-        self.weighted_tp += weight * day.tp_count as f64;
-        self.weighted_sl += weight * day.sl_count as f64;
+        self.weighted_tp=weighted_tp;self.weighted_sl=weighted_sl;
         Ok(())
     }
     /// Optional event adapter. A future raw signal/label is excluded, not SL.
@@ -229,19 +286,20 @@ impl ProbabilityAccumulator {
     pub fn finish(&self) -> Result<ProbabilityForecast, ForecastError> {
         let n = self.tp + self.sl; // add_day checked the combined count.
         if n == 0 { return Ok(ProbabilityForecast::Unavailable { reason: ForecastUnavailableReason::NoClosedOutcomes }); }
-        let w = self.weighted_tp + self.weighted_sl;
+        let weighted_tp=self.weighted_tp.value();let weighted_sl=self.weighted_sl.value();
+        let w = weighted_tp + weighted_sl;
         if w <= 0.0 { return Ok(ProbabilityForecast::Unavailable { reason: ForecastUnavailableReason::NoWeightedEvidence }); }
         let denominator = w + self.kappa;
         let prior_probability = 1.0 / (1.0 + self.q);
-        let tp_probability = self.weighted_tp / denominator + (self.kappa / denominator) * prior_probability;
+        let tp_probability = weighted_tp / denominator + (self.kappa / denominator) * prior_probability;
         // Equivalent to (1+q)*p-1, without cancellation near the neutral prior
         // or overflowing q*weightedTP before dividing by the denominator.
-        let forecast_r = self.q * (self.weighted_tp / denominator) - self.weighted_sl / denominator;
+        let forecast_r = self.q * (weighted_tp / denominator) - weighted_sl / denominator;
         let mean_r = self.q * (self.tp as f64 / n as f64) - self.sl as f64 / n as f64;
         if ![w, tp_probability, forecast_r, mean_r].iter().all(|v| v.is_finite()) { return Err(ForecastError::NonFiniteNumber); }
         Ok(ProbabilityForecast::Available { value: ProbabilityEstimate {
             observation_cutoff: self.cutoff, mean_r, forecast_r, tp_probability, prior_probability,
-            tp_count: self.tp, sl_count: self.sl, weighted_tp: self.weighted_tp, weighted_sl: self.weighted_sl, weight_sum: w,
+            tp_count: self.tp, sl_count: self.sl, weighted_tp, weighted_sl, weight_sum: w,
         } })
     }
 }
@@ -436,6 +494,35 @@ mod tests {
             }
         }
         assert!(values[0]>values[1] && values[1]>values[2]);
+    }
+    #[test]
+    fn scalar_event_order_and_aggregated_daily_counts_have_identical_forecast_bits() {
+        let r=ForecastRecipe::engineering_baseline();let c=30*DAY_SECONDS;
+        let daily=[day(0,70,30),day(1,80,20),day(14,9,50)];
+        let aggregated=evaluate_probability(r,2.5,c,&daily).unwrap();
+        let mut events=ProbabilityAccumulator::new(r,2.5,c).unwrap();
+        for d in daily.into_iter().rev() {
+            for _ in 0..d.sl_count {events.add_day(ProbabilityDay{sl_count:1,tp_count:0,..d}).unwrap();}
+            for _ in 0..d.tp_count {events.add_day(ProbabilityDay{sl_count:0,tp_count:1,..d}).unwrap();}
+        }
+        assert_eq!(events.finish().unwrap(),aggregated);
+    }
+    #[test]
+    fn exact_weight_sum_rounds_subnormal_ties_carries_and_large_counts_without_growth() {
+        for (weight,count) in [(1.0,1),(1.0,u64::MAX),(0.5,3),(f64::MIN_POSITIVE,7),
+            (f64::from_bits(1),1),(f64::from_bits(1),1u64<<63),(0.6095068271022377,10000)] {
+            let mut sum=ExactWeightSum::default();sum.add(weight,count).unwrap();
+            // Powers of two are exact across the whole supported count range;
+            // the arbitrary fractional case uses a small exactly-converted N.
+            assert_eq!(sum.value().to_bits(),(weight*count as f64).to_bits());
+        }
+        let mut sum=ExactWeightSum::default();sum.add(1.0,1).unwrap();sum.add(2f64.powi(-53),1).unwrap();
+        assert_eq!(sum.value(),1.0); // ties to even
+        sum.add(f64::from_bits(1),1).unwrap();assert_eq!(sum.value(),f64::from_bits(1.0f64.to_bits()+1));
+        let mut sum=ExactWeightSum::default();sum.add(1.0,1).unwrap();sum.add(2f64.powi(-52),1).unwrap();sum.add(2f64.powi(-53),1).unwrap();
+        assert_eq!(sum.value(),f64::from_bits(1.0f64.to_bits()+2));
+        assert_eq!(std::mem::size_of::<ExactWeightSum>(),144);
+        assert!(std::mem::size_of::<ProbabilityAccumulator>()<512);
     }
     #[test]
     fn missing_components_do_not_renormalize_or_expand_ui_lambda_domain() {

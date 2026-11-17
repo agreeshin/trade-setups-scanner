@@ -19,7 +19,7 @@ fn fixture() -> (StudyRequest, StudyInput, ContinuousContext) {
         instruments:vec![instrument.clone()],from_unix:T0+1450*60,to_unix:T0+1530*60,direction:TradeDirection::Short,setup_maturity:0.0,
         tp_levels:vec![4.0,8.0],sl_levels:vec![4.0,8.0],horizon_minutes:30,min_closed_per_cell:1,min_setups_per_day:0.0,
         max_trials:48,max_seconds:120,seed:168,trend_mode:TrendMode::Mean,trend_bend_days:TrendBendDays::Linear,
-        trend_blend_lambda:TrendBlendLambda::default(),min_forecast_expectancy:0.0};
+        trend_blend_lambda:TrendBlendLambda::default(),min_forecast_expectancy:0.0,forecast:None};
     let mut bars = Vec::new();
     let mut candles = Vec::new();
     for minute in 0..1530 {
@@ -74,7 +74,7 @@ fn assert_legacy_checkpoint_has_no_new_metric_fields(bytes: &[u8]) {
         match value {
             Value::Map(entries) => for (key,value) in entries {
                 if let Value::Text(key)=key {
-                    assert!(!["trendMode","trendBendDays","meanRiskExpectancy","meanScore","searchForecast","forecastR","forecastMatrixR","trendBlendLambda","minForecastExpectancy","forecastRiskExpectancy"].contains(&key.as_str()));
+                    assert!(!["trendMode","trendBendDays","meanRiskExpectancy","meanScore","searchForecast","forecastR","forecastMatrixR","trendBlendLambda","minForecastExpectancy","forecastRiskExpectancy","forecast","observationCutoff"].contains(&key.as_str()));
                 }
                 check(value);
             },
@@ -236,6 +236,30 @@ fn blend_checkpoint_binds_lambda_and_the_forward_gate_without_new_history_migrat
         assert!(search_continuous_resumable(&changed,&input,context,&limits,control(&cancel,&pause,Some(&checkpoint)),|_|{},|_,_|Ok(CheckpointAction::Continue)).is_err());
     }
     assert!(search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,Some(&checkpoint)),|_|{},|_,_|Ok(CheckpointAction::Suspend)).is_ok());
+}
+
+#[test]
+fn explicit_recipes_resume_exactly_and_method_settings_cutoff_changes_fail_closed() {
+    let (mut spec,input,context)=fixture();spec.max_trials=8;spec.forecast=Some(ForecastRecipe::engineering_baseline());
+    let limits=StudyLimits::default();let cancel=CancelToken::new();let pause=CancelToken::new();
+    for mode in [TrendMode::Mean,TrendMode::Forecast,TrendMode::Blend] {
+        spec.trend_mode=mode;
+        let reference=finished(search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,None),|_|{},|_,_|Ok(CheckpointAction::Continue)).unwrap());
+        let mut bytes=Vec::new();
+        let suspended=search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,None),|_|{},|info,encoded| {
+            bytes=encoded.to_vec();Ok(if info.sequence==2 {CheckpointAction::Suspend}else{CheckpointAction::Continue})
+        }).unwrap();assert!(matches!(suspended,ContinuousSearchExit::Suspended(_)));
+        let recovered=finished(search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,Some(&bytes)),|_|{},|_,_|Ok(CheckpointAction::Continue)).unwrap());
+        assert_eq!(comparable(recovered),comparable(reference));
+        for recipe in [None,Some(ForecastRecipe::Trend{version:1,bend_days:TrendBendDays::Linear}),
+            Some(serde_json::from_value(json!({"method":"decayed_probability","version":1,"halfLifeDays":7,"kappa":10,"priorPolicy":"gross_break_even"})).unwrap()),
+            Some(serde_json::from_value(json!({"method":"decayed_probability","version":1,"halfLifeDays":14,"kappa":20,"priorPolicy":"gross_break_even"})).unwrap())] {
+            let changed=StudyRequest{forecast:recipe,..spec.clone()};
+            assert!(search_continuous_resumable(&changed,&input,context,&limits,control(&cancel,&pause,Some(&bytes)),|_|{},|_,_|panic!("incompatible recipe must not restart")).is_err());
+        }
+        assert!(search_continuous_resumable(&spec,&input,ContinuousContext{observation_cutoff:context.observation_cutoff-60},&limits,
+            control(&cancel,&pause,Some(&bytes)),|_|{},|_,_|panic!("changed cutoff must not restart")).is_err());
+    }
 }
 
 #[test]

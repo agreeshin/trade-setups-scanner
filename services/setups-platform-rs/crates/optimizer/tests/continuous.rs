@@ -48,6 +48,7 @@ fn request() -> StudyRequest {
         trend_mode: TrendMode::Mean,
         trend_bend_days: TrendBendDays::Linear,
         trend_blend_lambda: TrendBlendLambda::default(), min_forecast_expectancy: 0.0,
+        forecast: None,
     }
 }
 fn candidate(spec: &StudyRequest) -> StudyCandidate {

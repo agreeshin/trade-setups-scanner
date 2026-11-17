@@ -802,7 +802,7 @@ fn analyze_inner_with_daily(
         working_base.saturating_add(capture.as_ref().map_or(0, SelectedDailyCapture::working_bytes)),
         limits.max_working_bytes,
     )?;
-    let mut daily = if !spec.trend_mode.is_mean() { Some(DailyMatrix::new(spec, limits)?) } else { None };
+    let mut daily = if !spec.trend_mode.is_mean() { Some(DailyMatrix::with_cutoff(spec, limits,replay.context.observation_cutoff)?) } else { None };
     let frequency = FrequencyGate::new(spec)?;
     let matrix = empty_matrix(spec);
     let diagnostics = matrix
@@ -883,7 +883,7 @@ fn analyze_inner_with_daily(
             if let Some(capture) = &mut capture {
                 let before = before.expect("capture took counters");
                 let after = &result.evaluation.matrix[capture.cell_index];
-                if spec.trend_mode.is_mean() || after.price_change_filtered_count == before.2 {
+                if (spec.trend_mode.is_mean() && spec.forecast.is_none()) || after.price_change_filtered_count == before.2 {
                     capture.record(setup.close_time_unix, (before.0, before.1), after)?;
                 }
             }
@@ -1130,12 +1130,28 @@ pub fn search_continuous(
 
 /// None rejects the WHOLE original matrix if any cell is invalid/underpowered.
 /// This ranking does not apply the separate mean-R or frequency admission gate.
+/// Compatibility entry for legacy field-presence conventions. New explicit
+/// recipes must use select_robust_cell_for_mode with their saved mode.
 pub fn select_robust_cell(
     matrix: &[MatrixCell],
     tp_levels: &[f64],
     sl_levels: &[f64],
     min_closed_per_cell: usize,
 ) -> Result<Option<RobustCell>, StudyError> {
+    select_robust_cell_inner(matrix,tp_levels,sl_levels,min_closed_per_cell,None)
+}
+
+/// New explicit recipes save pure F in forecastRiskExpectancy in BOTH forward
+/// modes. Use the immutable mode, not presence of that field, to identify blend.
+pub fn select_robust_cell_for_mode(
+    matrix:&[MatrixCell],tp_levels:&[f64],sl_levels:&[f64],min_closed_per_cell:usize,mode:TrendMode,
+) -> Result<Option<RobustCell>,StudyError> {
+    select_robust_cell_inner(matrix,tp_levels,sl_levels,min_closed_per_cell,Some(mode))
+}
+
+fn select_robust_cell_inner(
+    matrix:&[MatrixCell],tp_levels:&[f64],sl_levels:&[f64],min_closed_per_cell:usize,mode:Option<TrendMode>,
+) -> Result<Option<RobustCell>,StudyError> {
     if tp_levels.is_empty() || tp_levels.len() > 64 || sl_levels.is_empty() || sl_levels.len() > 64
     {
         return Err(invalid("invalid robust selection axis"));
@@ -1185,6 +1201,7 @@ pub fn select_robust_cell(
     let forecast_matrix_r = matrix.iter().any(|cell| cell.mean_risk_expectancy.is_some()).then(|| {
         matrix.iter().map(|cell| cell.forecast_risk_expectancy.unwrap_or(cell.risk_expectancy.expect("scorable"))).sum::<f64>() / matrix.len() as f64
     });
+    let is_blend=mode.map_or_else(||matrix.iter().any(|cell|cell.forecast_risk_expectancy.is_some()),|m|m==TrendMode::Blend);
     let mut best: Option<RobustCell> = None;
     for (i, &tp_pct) in tp.iter().enumerate() {
         for (j, &sl_pct) in sl.iter().enumerate() {
@@ -1217,8 +1234,8 @@ pub fn select_robust_cell(
                 robust_score: metric_cell_r.min(median),
                 forecast_r: selected.mean_risk_expectancy.map(|_| selected.forecast_risk_expectancy.unwrap_or(metric_cell_r)),
                 forecast_matrix_r,
-                blend_r: selected.forecast_risk_expectancy.map(|_| metric_cell_r),
-                blend_matrix_r: selected.forecast_risk_expectancy.map(|_| metric_r),
+                blend_r: is_blend.then_some(metric_cell_r),
+                blend_matrix_r: is_blend.then_some(metric_r),
             };
             if best.is_none_or(|old| {
                 next.robust_score > old.robust_score
@@ -1247,11 +1264,12 @@ pub fn recommend_continuous(
     if !FrequencyGate::new(spec)?.accepts(result.evaluation.summary.selected_setup_count) {
         return Ok(None);
     }
-    let Some(cell) = select_robust_cell(
+    let Some(cell) = select_robust_cell_for_mode(
         &result.evaluation.matrix,
         &spec.tp_levels,
         &spec.sl_levels,
         spec.min_closed_per_cell,
+        spec.trend_mode,
     )?
     else {
         return Ok(None);
@@ -1261,6 +1279,7 @@ pub fn recommend_continuous(
         return Ok(None);
     }
     Ok(Some(AdaptiveRecommendationSnapshot {
+        forecast: spec.forecast,
         direction: match spec.direction {
             TradeDirection::Short => RecommendationDirection::Short,
             TradeDirection::Long => RecommendationDirection::Long,
@@ -1271,7 +1290,7 @@ pub fn recommend_continuous(
         mean_r: cell.mean_r,
         robust_score: cell.robust_score,
         search_forecast: cell.forecast_r.zip(cell.forecast_matrix_r).map(|(cell_r, matrix_r)| setups_domain::SearchForecast {
-            bend_days: spec.trend_bend_days, cell_r, matrix_r,
+            bend_days: crate::trend::effective_bend(spec), cell_r, matrix_r,
             blend: cell.blend_r.zip(cell.blend_matrix_r).map(|(cell_r, matrix_r)| setups_domain::SearchBlend {
                 lambda: spec.trend_blend_lambda, cell_r, matrix_r,
             }),

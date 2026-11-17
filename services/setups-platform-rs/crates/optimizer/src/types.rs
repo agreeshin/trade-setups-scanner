@@ -3,6 +3,7 @@ use serde_json::Value;
 use setups_analytics::{OhlcCandle, TradeDirection};
 use setups_domain::DetectorBar;
 pub use setups_domain::trend::{TrendBendDays, TrendBlendLambda, TrendMode};
+pub use setups_domain::forecast::{ForecastMethod, ForecastRecipe};
 use std::collections::BTreeMap;
 
 pub type ParamMap = BTreeMap<String, Value>;
@@ -68,6 +69,9 @@ pub struct StudyRequest {
     pub trend_blend_lambda: TrendBlendLambda,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub min_forecast_expectancy: f64,
+    /// Explicit new recipe; missing remains the byte-compatible legacy path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<ForecastRecipe>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -275,6 +279,11 @@ pub struct StudyBest {
     pub trend_bend_days: TrendBendDays,
     #[serde(default, skip_serializing_if = "TrendBlendLambda::is_default")]
     pub trend_blend_lambda: TrendBlendLambda,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<ForecastRecipe>,
+    /// Frozen outcome boundary of this new explicit recipe, not UI/send time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_cutoff: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -303,7 +312,7 @@ pub struct MatrixCell {
     /// endpoint; this field retains the original period mean without rounding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mean_risk_expectancy: Option<f64>,
-    /// Only blend needs a separate pure endpoint; forecast uses riskExpectancy.
+    /// Legacy blend or explicit forecast/blend stores a separate pure F.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forecast_risk_expectancy: Option<f64>,
 }

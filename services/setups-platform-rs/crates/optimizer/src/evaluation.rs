@@ -49,6 +49,19 @@ pub fn snapshot_bytes(input: &StudyInput) -> usize {
     bytes
 }
 
+/// Manual studies observe the frozen OHLC snapshot through its actual last
+/// closed candle, capped by the original full-horizon input bound. This is
+/// shared by scoring and saved-result provenance, not derived from wall time.
+pub fn manual_forecast_observation_cutoff(spec:&StudyRequest,input:&StudyInput)->Result<i64,StudyError> {
+    let bound=crate::validation::input_bounds_inner(spec)?.candles_to_unix;
+    let observed=input.instruments.iter().filter_map(|data|data.candles.last())
+        .try_fold(None,|maximum:Option<i64>,bar| {
+            let next=bar.open_time_unix.checked_add(60).ok_or_else(||StudyError::InvalidInput("forecast cutoff overflow".into()))?;
+            Ok::<_,StudyError>(Some(maximum.map_or(next,|old|old.max(next))))
+        })?.unwrap_or(spec.to_unix);
+    Ok(observed.min(bound))
+}
+
 pub(crate) fn limit(resource: &str, requested: usize, maximum: usize) -> Result<(), StudyError> {
     if requested > maximum {
         Err(StudyError::ResourceLimit {
@@ -555,7 +568,8 @@ pub(crate) fn evaluate_group(
     let to_open = spec.to_unix - 60;
     let mut matrices: Vec<_> = candidates.iter().map(|_| empty_matrix(spec)).collect();
     let mut dailies = if !spec.trend_mode.is_mean() {
-        candidates.iter().map(|_| DailyMatrix::new(spec, limits)).collect::<Result<Vec<_>, _>>()?
+        let cutoff=if spec.forecast.is_some() {manual_forecast_observation_cutoff(spec,input)?} else {spec.to_unix};
+        candidates.iter().map(|_| DailyMatrix::with_cutoff(spec, limits, cutoff)).collect::<Result<Vec<_>, _>>()?
     } else { Vec::new() };
     let mut summary = TrialSummary {
         score: None,

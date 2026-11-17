@@ -302,6 +302,9 @@ pub(crate) fn validate_request_mode(
     if !spec.min_forecast_expectancy.is_finite() || !(0.0..=100.0).contains(&spec.min_forecast_expectancy) {
         return Err(invalid("minForecastExpectancy must be finite and in 0..100 R"));
     }
+    if let Some(recipe) = spec.forecast {
+        recipe.validate().map_err(|error| invalid(error.to_string()))?;
+    }
     for levels in [&spec.tp_levels, &spec.sl_levels] {
         if levels.is_empty() || levels.len() > 64 {
             return Err(invalid("TP/SL axes require 1..64 levels"));

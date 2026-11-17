@@ -499,6 +499,7 @@ fn make_best(
     evaluation: CandidateEvaluation,
     trial: usize,
     continuous: bool,
+    observation_cutoff: Option<i64>,
 ) -> StudyBest {
     StudyBest {
         score: evaluation.summary.score.expect("scorable evaluation"),
@@ -523,8 +524,10 @@ fn make_best(
         support: evaluation.summary,
         trial_index: trial,
         trend_mode: spec.trend_mode,
-        trend_bend_days: if spec.trend_mode.is_mean() { TrendBendDays::Linear } else { spec.trend_bend_days },
+        trend_bend_days: if spec.trend_mode.is_mean() { TrendBendDays::Linear } else { crate::trend::effective_bend(spec) },
         trend_blend_lambda: if spec.trend_mode == TrendMode::Blend { spec.trend_blend_lambda } else { TrendBlendLambda::default() },
+        forecast: spec.forecast,
+        observation_cutoff,
         provenance: Provenance {
             optimizer_version: if continuous {
                 CONTINUOUS_OPTIMIZER_VERSION
@@ -630,6 +633,12 @@ fn run_engine(
     } else {
         validate_request(spec, &default_parameter_descriptors(&spec.algorithm_id)?)?;
     }
+    let forecast_cutoff = if spec.forecast.is_some() {
+        Some(match continuous {
+            Some(context) => context.observation_cutoff,
+            None => crate::evaluation::manual_forecast_observation_cutoff(spec,input)?,
+        })
+    } else { None };
     if limits.cpu_threads == 0
         || limits.cpu_threads > 64
         || limits.batch_size == 0
@@ -952,6 +961,7 @@ fn run_engine(
                     evaluation,
                     trial,
                     continuous.is_some(),
+                    forecast_cutoff,
                 ));
                 best.clone()
             } else {
@@ -1304,7 +1314,9 @@ fn decode_checkpoint(
         let provenance = &best.provenance;
         if !best.score.is_finite()
             || best.trend_mode != spec.trend_mode
-            || (!spec.trend_mode.is_mean() && best.trend_bend_days != spec.trend_bend_days)
+            || best.forecast != spec.forecast
+            || best.observation_cutoff != spec.forecast.map(|_| context.observation_cutoff)
+            || (!spec.trend_mode.is_mean() && best.trend_bend_days != crate::trend::effective_bend(spec))
             || (spec.trend_mode == TrendMode::Blend && best.trend_blend_lambda != spec.trend_blend_lambda)
             || best.mean_score != (!spec.trend_mode.is_mean()).then(|| score_period_mean(&best.matrix, spec.min_closed_per_cell)).flatten()
             || best.trial_index >= state.submitted
@@ -1331,7 +1343,10 @@ fn decode_checkpoint(
                     || cell.avg_move_pct.is_some_and(|v| !v.is_finite())
                     || cell.mean_risk_expectancy.is_some_and(|v| !v.is_finite())
                     || cell.forecast_risk_expectancy.is_some_and(|v| !v.is_finite())
-                    || ((spec.trend_mode == TrendMode::Blend) != cell.forecast_risk_expectancy.is_some())
+                    || (if spec.forecast.is_some() {
+                        (!spec.trend_mode.is_mean() != cell.forecast_risk_expectancy.is_some())
+                            || (spec.trend_mode == TrendMode::Forecast && cell.risk_expectancy != cell.forecast_risk_expectancy)
+                    } else { (spec.trend_mode == TrendMode::Blend) != cell.forecast_risk_expectancy.is_some() })
                     || (spec.trend_mode == TrendMode::Blend && cell.risk_expectancy != cell.mean_risk_expectancy.zip(cell.forecast_risk_expectancy).map(|(mean,forecast)|spec.trend_blend_lambda.combine(mean,forecast)))
                     || (spec.trend_mode.is_mean() == cell.mean_risk_expectancy.is_some())
             })

@@ -135,3 +135,92 @@ fn legacy_settings_roundtrip_byte_identically_and_mean_does_not_bucket_days() {
     assert!(matches!(evaluate_candidate(&spec, &input, &candidate, &limits, &CancelToken::new()), Err(StudyError::ResourceLimit { .. })));
     assert_eq!(spec.direction, TradeDirection::Short);
 }
+
+#[test]
+fn probability_recipe_matches_closed_cohorts_and_changes_rank_without_a_visual_fit() {
+    use setups_domain::forecast::{ProbabilityDay,evaluate_probability};
+    let (mut spec,input,candidate)=fixture();let limits=StudyLimits::default();let cancel=CancelToken::new();
+    let mean=evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap();
+    spec.forecast=Some(ForecastRecipe::engineering_baseline());spec.trend_mode=TrendMode::Forecast;
+    let forecast=evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap();
+    assert_eq!(forecast,evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap());
+    let context=ContinuousContext{observation_cutoff:spec.to_unix};
+    assert_eq!(manual_forecast_observation_cutoff(&spec,&input).unwrap(),context.observation_cutoff);
+    let replay=materialize_continuous(&spec,&input,&candidate,context,&limits,&cancel).unwrap().unwrap();
+    let captured=analyze_continuous_with_daily(&spec,&input,&replay,&candidate,&limits,&cancel,
+        Some(ContinuousCaptureCell{tp_pct:8.0,sl_pct:4.0})).unwrap().unwrap();
+    assert_eq!(captured.evaluation.evaluation,forecast);
+    let daily:Vec<_>=captured.selected_daily.unwrap().points.into_iter().map(|p|ProbabilityDay{
+        day_start_unix:p.day_start_unix,tp_count:p.tp_count,sl_count:p.sl_count}).collect();
+    let canonical=evaluate_probability(spec.forecast.unwrap(),2.0,context.observation_cutoff,&daily).unwrap();
+    assert_eq!(forecast.matrix[1].forecast_risk_expectancy,canonical.as_ref().map(|p|p.forecast_r));
+    for (new,old) in forecast.matrix.iter().zip(&mean.matrix) {
+        assert_eq!(new.mean_risk_expectancy,old.risk_expectancy);
+        assert_eq!(new.risk_expectancy,new.forecast_risk_expectancy);
+    }
+    let old_pair=select_robust_cell(&mean.matrix,&spec.tp_levels,&spec.sl_levels,1).unwrap().unwrap();
+    let new_pair=select_robust_cell_for_mode(&forecast.matrix,&spec.tp_levels,&spec.sl_levels,1,TrendMode::Forecast).unwrap().unwrap();
+    assert_eq!(old_pair.tp_pct,8.0);assert_eq!(new_pair.tp_pct,2.0);assert!(new_pair.blend_r.is_none());
+    let recommendation=recommend_continuous(&spec,&candidate,&captured.evaluation,&replay.provenance,context,100.0).unwrap().unwrap();
+    assert_eq!(recommendation.forecast,spec.forecast);assert!(recommendation.search_forecast.unwrap().blend.is_none());
+    let best=run_study(&spec,&input,&limits,&cancel,|_|{}).unwrap().best.unwrap();
+    assert_eq!(best.forecast,spec.forecast);assert_eq!(best.observation_cutoff,Some(context.observation_cutoff));
+    let json=serde_json::to_value(&best).unwrap();assert_eq!(json["forecast"]["method"],"decayed_probability");
+    assert_eq!(json["observationCutoff"],context.observation_cutoff);
+}
+
+#[test]
+fn explicit_blend_keeps_pure_forecast_distinct_and_preserves_strict_forward_gate() {
+    let (mut spec,input,candidate)=fixture();spec.forecast=Some(ForecastRecipe::engineering_baseline());
+    let limits=StudyLimits::default();let cancel=CancelToken::new();let context=ContinuousContext{observation_cutoff:spec.to_unix};
+    spec.trend_mode=TrendMode::Forecast;
+    let pure=evaluate_continuous(&spec,&input,&candidate,context,&limits,&cancel).unwrap().unwrap();
+    spec.trend_mode=TrendMode::Blend;
+    let mixed=evaluate_continuous(&spec,&input,&candidate,context,&limits,&cancel).unwrap().unwrap();
+    for (b,f) in mixed.evaluation.matrix.iter().zip(&pure.evaluation.matrix) {
+        assert_eq!(b.forecast_risk_expectancy,f.risk_expectancy);
+        assert_eq!(b.risk_expectancy,Some(spec.trend_blend_lambda.combine(b.mean_risk_expectancy.unwrap(),f.risk_expectancy.unwrap())));
+    }
+    let provenance=Provenance{optimizer_version:CONTINUOUS_OPTIMIZER_VERSION.into(),seed:spec.seed,
+        snapshot_hash:input.snapshot_hash.clone(),captured_at:input.captured_at.clone()};
+    let accepted=recommend_continuous(&spec,&candidate,&mixed,&provenance,context,100.0).unwrap().unwrap();
+    assert!(accepted.search_forecast.unwrap().blend.is_some());
+    spec.min_forecast_expectancy=mixed.evaluation.summary.score.unwrap();
+    assert!(recommend_continuous(&spec,&candidate,&mixed,&provenance,context,-100.0).unwrap().is_none());
+    assert!(run_study(&spec,&input,&limits,&cancel,|_|{}).unwrap().best.is_none());
+}
+
+#[test]
+fn probability_one_day_is_available_but_missing_cells_frequency_and_real_minimum_still_reject() {
+    let (mut spec,input,candidate)=fixture();let limits=StudyLimits::default();let cancel=CancelToken::new();
+    spec.from_unix=30*86400;spec.trend_mode=TrendMode::Forecast;
+    let legacy=evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap();
+    assert!(legacy.summary.score.is_none());
+    spec.forecast=Some(ForecastRecipe::engineering_baseline());
+    let new=evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap();
+    assert!(new.summary.score.is_some());assert!(new.matrix.iter().all(|c|c.closed_count==1 && c.forecast_risk_expectancy.is_some()));
+    spec.min_closed_per_cell=2;
+    assert!(evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap().summary.score.is_none());
+    spec.min_closed_per_cell=1;spec.min_setups_per_day=1.001;
+    let limited=evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap();
+    assert_eq!(limited.summary.selected_setup_count,1);assert!(limited.summary.score.is_none());
+    spec.min_setups_per_day=0.0;spec.tp_levels=vec![2.0,100.0];spec.sl_levels=vec![4.0,100.0];
+    let incomplete=evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap();
+    assert_eq!(incomplete.matrix.len(),4);assert!(incomplete.matrix.iter().any(|c|c.closed_count==0 && c.forecast_risk_expectancy.is_none()));
+    assert!(incomplete.summary.score.is_none());
+}
+
+#[test]
+fn explicit_mean_persists_recipe_without_computing_forward_metric_or_changing_default_science() {
+    let (mut spec,input,candidate)=fixture();let limits=StudyLimits::default();let cancel=CancelToken::new();
+    let legacy=evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap();
+    let before=serde_json::to_vec(&spec).unwrap();assert!(serde_json::to_value(&spec).unwrap().get("forecast").is_none());
+    assert_eq!(before,serde_json::to_vec(&serde_json::from_slice::<StudyRequest>(&before).unwrap()).unwrap());
+    spec.forecast=Some(ForecastRecipe::engineering_baseline());
+    let same=evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap();assert_eq!(same,legacy);
+    assert!(same.matrix.iter().all(|c|c.forecast_risk_expectancy.is_none()));
+    let best=run_study(&spec,&input,&limits,&cancel,|_|{}).unwrap().best.unwrap();
+    assert_eq!(best.trend_mode,TrendMode::Mean);assert_eq!(best.forecast,spec.forecast);assert!(best.observation_cutoff.is_some());
+    let mut invalid=spec.clone();invalid.analytics_search.insert("halfLifeDays".into(),vec![json!(7)]);
+    assert!(validate_request(&invalid,&default_parameter_descriptors(&spec.algorithm_id).unwrap()).is_err());
+}
