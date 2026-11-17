@@ -1,3 +1,6 @@
+#[path = "analytics_forecast.rs"]
+mod forecast_api;
+
 use crate::auth::SessionAuth;
 use crate::replay::guard_auth;
 use axum::extract::{Path, Query, State};
@@ -7,9 +10,10 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::future::join_all;
 use serde_json::{Map, Value, json};
+#[cfg(test)]
+use setups_analytics::manual_trend::trend_matrix_scope;
 use setups_analytics::manual_trend::{
-    TrendBendDays, TrendError, TrendInput, TrendMode, fit_daily_outcomes, fit_weighted_trend,
-    trend_matrix_scope,
+    TrendBendDays, TrendInput, TrendMode, fit_daily_outcomes, fit_weighted_trend,
 };
 use setups_analytics::{
     AnalyticsSetup, DEFAULT_CLUSTER_GAP_HOURS, DEFAULT_HORIZON_MINUTES, EvaluateLimitOptions,
@@ -24,9 +28,11 @@ use setups_db::analytics::{
     maturity_tenths_of, parse_set_id, price_change_ppm_of, save_matrix_cell, save_selection,
     save_trade_row, selection_scope_key,
 };
+use setups_domain::forecast::{ForecastRecipe, ProbabilityDay, decision_r, evaluate_probability};
+use setups_domain::trend::{TrendBlendLambda, trend_matrix_scope_with_lambda};
 use setups_mdclient::{CandlesQuery, MarketDataClient};
 use sqlx::postgres::PgPool;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,6 +46,8 @@ pub struct AnalyticsState {
     pub market_url: String,
     pub market_key: String,
     pub reader: AnalyticsCandleReader,
+    /// One bounded graph CPU lane, with no waiting request queue.
+    pub forecast_cpu: Arc<tokio::sync::Semaphore>,
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -234,6 +242,9 @@ struct RawAnalyticsQuery {
     category: Option<String>,
     trend_bend_days: Option<String>,
     trend_mode: Option<String>,
+    trend_blend_lambda: Option<String>,
+    forecast: Option<String>,
+    observation_cutoff: Option<String>,
 }
 
 fn parse_number(value: Option<&String>) -> Result<Option<f64>, String> {
@@ -303,9 +314,49 @@ struct ParsedAnalyticsParams {
     compute: ComputeParams,
     trend_bend_days: TrendBendDays,
     trend_mode: TrendMode,
+    trend_blend_lambda: TrendBlendLambda,
+    forecast: Option<ForecastRecipe>,
+    observation_cutoff: Option<i64>,
 }
 
 impl ParsedAnalyticsParams {
+    fn active_cutoff(&self) -> Option<i64> {
+        self.forecast
+            .filter(|_| !self.trend_mode.is_mean())
+            .and(self.observation_cutoff)
+    }
+
+    fn matrix_key(&self, scope: &str) -> String {
+        if self.trend_mode.is_mean() {
+            return scope.to_owned();
+        }
+        match self.forecast {
+            None => trend_matrix_scope_with_lambda(
+                scope,
+                self.trend_mode,
+                self.trend_bend_days,
+                self.trend_blend_lambda,
+            ),
+            Some(recipe) => {
+                let mut key = format!(
+                    "{scope}:{}:c{}:{}",
+                    recipe.identity_key().expect("validated recipe"),
+                    self.observation_cutoff
+                        .expect("explicit active recipe cutoff"),
+                    if self.trend_mode == TrendMode::Blend {
+                        "blend"
+                    } else {
+                        "forecast"
+                    }
+                );
+                if self.trend_mode == TrendMode::Blend {
+                    key.push_str(&format!(":l{}", self.trend_blend_lambda.percent()));
+                }
+                key
+            }
+        }
+    }
+
     fn direction_str(&self) -> &'static str {
         match self.direction {
             TradeDirection::Short => "short",
@@ -415,8 +466,33 @@ fn parse_analytics_query(
     let trend_mode = match query.trend_mode.as_deref() {
         None | Some("mean") => TrendMode::Mean,
         Some("forecast") => TrendMode::Forecast,
-        _ => return Err("trendMode must be mean or forecast".into()),
+        Some("blend") => TrendMode::Blend,
+        _ => return Err("trendMode must be mean, forecast or blend".into()),
     };
+    let trend_blend_lambda = query
+        .trend_blend_lambda
+        .as_deref()
+        .map(serde_json::from_str::<TrendBlendLambda>)
+        .transpose()
+        .map_err(|_| "invalid trendBlendLambda".to_string())?
+        .unwrap_or_default();
+    let forecast = query
+        .forecast
+        .as_deref()
+        .map(serde_json::from_str::<ForecastRecipe>)
+        .transpose()
+        .map_err(|_| "invalid forecast recipe".to_string())?;
+    let observation_cutoff = parse_integer(query.observation_cutoff.as_ref())?;
+    if let Some(cutoff) = observation_cutoff {
+        if chrono::DateTime::from_timestamp(cutoff, 0).is_none()
+            || cutoff > chrono::Utc::now().timestamp()
+        {
+            return Err("invalid observationCutoff".into());
+        }
+    }
+    if forecast.is_some() && !trend_mode.is_mean() && observation_cutoff.is_none() {
+        return Err("observationCutoff is required for an explicit forecast recipe".into());
+    }
     Ok(ParsedAnalyticsParams {
         set_ref,
         direction,
@@ -432,6 +508,9 @@ fn parse_analytics_query(
         price_change_pct,
         trend_bend_days,
         trend_mode,
+        trend_blend_lambda,
+        forecast,
+        observation_cutoff,
         compute: ComputeParams {
             direction: match direction {
                 TradeDirection::Short => "short".to_string(),
@@ -576,11 +655,16 @@ async fn compute_scope(
     {
         let from = last_setup.open_time_unix + params.time_shift_minutes * 60;
         let to = from + 60 + params.horizon_minutes * 60;
-        let candles = state
-            .reader
-            .read_window_lossy(instrument_id, from, to)
-            .await;
-        if let Some(last) = candles.last() {
+        let to = params.active_cutoff().map_or(to, |cutoff| to.min(cutoff));
+        let candles = if to <= from {
+            Arc::new(Vec::new())
+        } else {
+            state
+                .reader
+                .read_window_lossy(instrument_id, from, to)
+                .await
+        };
+        if let Some(last) = window_at_cutoff(&candles, params).last() {
             last_candle = last.open_time_unix;
         }
     }
@@ -604,6 +688,23 @@ fn no_data_evaluation() -> LimitEvaluation {
         close_time_unix: None,
         move_pct: None,
         close_minutes: None,
+    }
+}
+
+fn window_at_cutoff<'a>(
+    window: &'a [OhlcCandle],
+    params: &ParsedAnalyticsParams,
+) -> &'a [OhlcCandle] {
+    match params.active_cutoff() {
+        None => window,
+        Some(cutoff) => {
+            &window[..window.partition_point(|candle| {
+                candle
+                    .open_time_unix
+                    .checked_add(60)
+                    .is_some_and(|close| close <= cutoff)
+            })]
+        }
     }
 }
 
@@ -685,7 +786,13 @@ async fn prepare_evaluation<'a>(
                 Some(id) => Some(
                     state
                         .reader
-                        .read_window_lossy(*id, *min_open, *max_bound)
+                        .read_window_lossy(
+                            *id,
+                            *min_open,
+                            params
+                                .active_cutoff()
+                                .map_or(*max_bound, |cutoff| cutoff.min(*max_bound)),
+                        )
                         .await,
                 ),
             }
@@ -699,7 +806,11 @@ async fn prepare_evaluation<'a>(
         let group = group_of_row[row_index];
         let entry = match &windows[group] {
             None => PreparedEntry::NoData,
-            Some(window) => match resolve_entry(window, setup, params.time_shift_minutes) {
+            Some(window) => match resolve_entry(
+                window_at_cutoff(window, params),
+                setup,
+                params.time_shift_minutes,
+            ) {
                 None => PreparedEntry::NoData,
                 Some((entry_price, entry_candle)) => {
                     if let Some(price_change_pct) = params.price_change_pct {
@@ -766,7 +877,7 @@ fn evaluate_prepared(
                 close_minutes: None,
             },
             PreparedEntry::Eligible => evaluate_limit(EvaluateLimitOptions {
-                candles: &prepared.windows[input.group],
+                candles: window_at_cutoff(&prepared.windows[input.group], params),
                 setup: input.setup,
                 direction: params.direction,
                 tp_pct: params.tp_pct,
@@ -798,7 +909,7 @@ fn aggregate_payload(
     eligible_count: usize,
     filtered_count: usize,
     evaluations: &[LimitEvaluation],
-) -> Result<CachedPayload, TrendError> {
+) -> Result<CachedPayload, String> {
     let aggregate = aggregate_limit_outcomes(
         &evaluations
             .iter()
@@ -852,33 +963,119 @@ fn aggregate_payload(
         json!(aggregate.median_close_minutes),
     );
     payload.insert("riskExpectancy".into(), json!(aggregate.risk_expectancy));
-    if params.trend_mode == TrendMode::Forecast {
-        let trend = fit_daily_outcomes(
-            selection
-                .rows
-                .iter()
-                .zip(evaluations)
-                .filter_map(|(setup, evaluation)| {
-                    (evaluation.status != LimitStatus::PriceChangeFiltered).then(|| {
-                        (
-                            setup.close_time_unix,
-                            risk_return(evaluation.status, params.tp_pct, params.sl_pct),
-                        )
-                    })
-                }),
-            params.trend_bend_days,
-        )?;
-        let endpoint = trend.as_ref().map(|fit| fit.endpoint());
+    if !params.trend_mode.is_mean() {
+        let (forecast_r, endpoint_se) =
+            if let Some(recipe @ ForecastRecipe::DecayedProbability { .. }) = params.forecast {
+                let cutoff = params.active_cutoff().ok_or("missing observationCutoff")?;
+                let daily = probability_days(selection, evaluations, cutoff)?;
+                let estimate =
+                    evaluate_probability(recipe, params.tp_pct / params.sl_pct, cutoff, &daily)
+                        .map_err(|error| error.to_string())?;
+                let value = estimate.as_ref().map(|value| value.forecast_r);
+                payload.insert("forecastEstimate".into(), json!(estimate));
+                payload.insert("probabilityDays".into(), json!(daily));
+                (value, None)
+            } else {
+                let bend = match params.forecast {
+                    Some(ForecastRecipe::Trend { bend_days, .. }) => bend_days,
+                    _ => params.trend_bend_days,
+                };
+                let trend = fit_daily_outcomes(
+                    selection
+                        .rows
+                        .iter()
+                        .zip(evaluations)
+                        .filter_map(|(setup, evaluation)| {
+                            (evaluation.status != LimitStatus::PriceChangeFiltered).then(|| {
+                                (
+                                    setup.close_time_unix,
+                                    risk_return(evaluation.status, params.tp_pct, params.sl_pct),
+                                )
+                            })
+                        }),
+                    bend,
+                )
+                .map_err(|error| error.to_string())?;
+                let endpoint = trend.as_ref().map(|fit| fit.endpoint());
+                (
+                    endpoint.map(|point| point.value),
+                    endpoint.and_then(|point| point.se),
+                )
+            };
+        let decision = decision_r(
+            params.trend_mode,
+            aggregate.risk_expectancy,
+            forecast_r,
+            params.trend_blend_lambda,
+        )
+        .map_err(|error| error.to_string())?;
         payload.insert(
             "meanRiskExpectancy".into(),
             json!(aggregate.risk_expectancy),
         );
-        payload.insert("riskExpectancy".into(), json!(endpoint.map(|p| p.value)));
-        payload.insert("endpointSe".into(), json!(endpoint.and_then(|p| p.se)));
+        payload.insert("riskExpectancy".into(), json!(decision));
+        payload.insert("endpointSe".into(), json!(endpoint_se));
         payload.insert("trendMode".into(), json!(params.trend_mode));
         payload.insert("trendBendDays".into(), json!(params.trend_bend_days));
+        if params.forecast.is_some() || params.trend_mode == TrendMode::Blend {
+            payload.insert("meanR".into(), json!(aggregate.risk_expectancy));
+            payload.insert("forecastR".into(), json!(forecast_r));
+            payload.insert("decisionR".into(), json!(decision));
+            if let Some(recipe) = params.forecast {
+                payload.insert("forecast".into(), json!(recipe));
+            }
+            if let Some(cutoff) = params.active_cutoff() {
+                payload.insert("observationCutoff".into(), json!(cutoff));
+            }
+            if params.trend_mode == TrendMode::Blend {
+                payload.insert("trendBlendLambda".into(), json!(params.trend_blend_lambda));
+            }
+        }
     }
     Ok(Value::Object(payload))
+}
+
+fn probability_days(
+    selection: &SelectionResult,
+    evaluations: &[LimitEvaluation],
+    cutoff: i64,
+) -> Result<Vec<ProbabilityDay>, String> {
+    let mut daily = BTreeMap::<i64, ProbabilityDay>::new();
+    for (setup, evaluation) in selection.rows.iter().zip(evaluations) {
+        if setup.close_time_unix > cutoff || evaluation.status == LimitStatus::PriceChangeFiltered {
+            continue;
+        }
+        let day = setup
+            .close_time_unix
+            .div_euclid(86_400)
+            .checked_mul(86_400)
+            .ok_or("invalid probability day")?;
+        let point = daily.entry(day).or_insert(ProbabilityDay {
+            day_start_unix: day,
+            tp_count: 0,
+            sl_count: 0,
+        });
+        if matches!(evaluation.status, LimitStatus::Tp | LimitStatus::Sl) {
+            // Legacy trade closeTimeUnix is the touching candle's OPEN. Its
+            // outcome is observable only once that minute has actually closed.
+            let available = evaluation
+                .close_time_unix
+                .and_then(|open| open.checked_add(60))
+                .ok_or("closed outcome lacks an availability timestamp")?;
+            if available > cutoff {
+                return Err("closed outcome after observationCutoff".into());
+            }
+            if evaluation.status == LimitStatus::Tp {
+                point.tp_count += 1;
+            } else {
+                point.sl_count += 1;
+            }
+        }
+        if daily.len() > setups_domain::forecast::MAX_FORECAST_DAYS {
+            return Err("forecast: TooManyDays".into());
+        }
+    }
+    Ok(daily.into_values().collect())
 }
 
 fn setup_dto(setup: &AnalyticsSetup) -> Value {
@@ -929,7 +1126,18 @@ fn raw_query(params: &HashMap<String, String>) -> RawAnalyticsQuery {
         category: params.get("category").cloned(),
         trend_bend_days: params.get("trendBendDays").cloned(),
         trend_mode: params.get("trendMode").cloned(),
+        trend_blend_lambda: params.get("trendBlendLambda").cloned(),
+        forecast: params.get("forecast").cloned(),
+        observation_cutoff: params.get("observationCutoff").cloned(),
     }
+}
+
+fn raw_trade_query(params: &HashMap<String, String>) -> RawAnalyticsQuery {
+    let mut raw = raw_query(params);
+    // Forecasting never changes saved individual-outcome semantics or keys.
+    raw.forecast = None;
+    raw.observation_cutoff = None;
+    raw
 }
 
 async fn load_set(
@@ -947,7 +1155,11 @@ async fn load_set(
             "set not found",
         )));
     };
-    Ok((params, to_engine_setups(&rows)))
+    let mut setups = to_engine_setups(&rows);
+    if let Some(cutoff) = params.active_cutoff() {
+        setups.retain(|setup| setup.close_time_unix <= cutoff);
+    }
+    Ok((params, setups))
 }
 
 async fn analytics_sets(State(state): State<Arc<AnalyticsState>>, headers: HeaderMap) -> Response {
@@ -1046,7 +1258,7 @@ fn params_for_cell(
 }
 
 fn grid_item(tp_pct: f64, sl_pct: f64, payload: &Value, cached: bool) -> Value {
-    json!({
+    let mut item = json!({
         "tpPct": tp_pct,
         "slPct": sl_pct,
         "avgMovePct": payload.get("avgMovePct").filter(|value| !value.is_null()).and_then(Value::as_f64),
@@ -1054,7 +1266,38 @@ fn grid_item(tp_pct: f64, sl_pct: f64, payload: &Value, cached: bool) -> Value {
         "cached": cached,
         "endpointSe": payload.get("endpointSe").and_then(Value::as_f64),
         "meanRiskExpectancy": payload.get("meanRiskExpectancy").and_then(Value::as_f64),
-    })
+    });
+    project_forecast_fields(&mut item, payload);
+    item
+}
+
+fn project_forecast_fields(item: &mut Value, payload: &Value) {
+    if payload.get("forecast").is_none()
+        && payload.get("trendMode").and_then(Value::as_str) != Some("blend")
+    {
+        return;
+    }
+    // Daily graph inputs stay in the selected full cell, not every grid item:
+    // max 4096 cells must not multiply a max-3661-day vector in one response.
+    for key in [
+        "forecast",
+        "trendMode",
+        "trendBlendLambda",
+        "observationCutoff",
+        "meanR",
+        "forecastR",
+        "decisionR",
+        "forecastEstimate",
+        "tpCount",
+        "slCount",
+        "closedCount",
+        "unclosedCount",
+        "noDataCount",
+    ] {
+        if let Some(value) = payload.get(key) {
+            item[key] = value.clone();
+        }
+    }
 }
 
 /// Пакетный расчёт сетки TP×SL одним запросом: set/selection/окна свечей и
@@ -1096,11 +1339,7 @@ async fn analytics_matrix_grid(
     let in_scope = filter_setups_by_time(&setups, &base.time_filter);
     let selection = select_setup_rows(&state.pool, &setups, &base).await;
     let scope = compute_scope(&state, &setups, &base).await;
-    let scope_key = trend_matrix_scope(
-        &matrix_scope_key(&scope),
-        base.trend_mode,
-        base.trend_bend_days,
-    );
+    let scope_key = base.matrix_key(&matrix_scope_key(&scope));
     let mut items: Vec<Value> = Vec::new();
     let mut missing: Vec<(f64, f64)> = Vec::new();
     for &tp_pct in &tp_list {
@@ -1184,25 +1423,25 @@ async fn analytics_matrix_cells(
     let scope = compute_scope(&state, &setups, &params).await;
     let rows = list_matrix_cells(
         &state.pool,
-        &trend_matrix_scope(
-            &matrix_scope_key(&scope),
-            params.trend_mode,
-            params.trend_bend_days,
-        ),
+        &params.matrix_key(&matrix_scope_key(&scope)),
         &params.compute,
         &params.cache_time_key,
     )
     .await
     .unwrap_or_default();
     Json(json!({
-        "items": rows.iter().map(|row| json!({
+        "items": rows.iter().map(|row| {
+            let mut item=json!({
             "tpPct": row.tp_pct,
             "slPct": row.sl_pct,
             "avgMovePct": row.payload.get("avgMovePct").filter(|value| !value.is_null()).and_then(Value::as_f64),
             "riskExpectancy": row.payload.get("riskExpectancy").filter(|value| !value.is_null()).and_then(Value::as_f64),
             "endpointSe": row.payload.get("endpointSe").and_then(Value::as_f64),
             "meanRiskExpectancy": row.payload.get("meanRiskExpectancy").and_then(Value::as_f64),
-        })).collect::<Vec<_>>(),
+            });
+            project_forecast_fields(&mut item,&row.payload);
+            item
+        }).collect::<Vec<_>>(),
         "totalMatchingSetups": in_scope.len(),
         "filteredSetupsCount": selection.rows.len(),
         "avgSelectionOrdinal": selection.avg_selection_ordinal,
@@ -1237,11 +1476,7 @@ async fn analytics_matrix_cell(
     let in_scope = filter_setups_by_time(&setups, &params.time_filter);
     let selection = select_setup_rows(&state.pool, &setups, &params).await;
     let scope = compute_scope(&state, &setups, &params).await;
-    let scope_key = trend_matrix_scope(
-        &matrix_scope_key(&scope),
-        params.trend_mode,
-        params.trend_bend_days,
-    );
+    let scope_key = params.matrix_key(&matrix_scope_key(&scope));
     if !setups.is_empty()
         && let Ok(Some(cached)) = get_matrix_cell(
             &state.pool,
@@ -1295,7 +1530,7 @@ async fn analytics_trades(
     if let Err(response) = guard_auth(&state.auth, &headers, false) {
         return response;
     }
-    let raw = raw_query(&params);
+    let raw = raw_trade_query(&params);
     let parsed = parse_analytics_query(&raw, true);
     let (params, setups) = match load_set(&state, parsed).await {
         Ok(value) => value,
@@ -1358,7 +1593,7 @@ async fn analytics_trade_detail(
     if symbol.is_empty() || symbol.len() > 64 || close_time_unix < 0 {
         return error_response(StatusCode::BAD_REQUEST, "invalid_query");
     }
-    let raw = raw_query(&params);
+    let raw = raw_trade_query(&params);
     let parsed = parse_analytics_query(&raw, true);
     let (params, setups) = match load_set(&state, parsed).await {
         Ok(value) => value,
@@ -1605,6 +1840,10 @@ pub fn analytics_router(state: Arc<AnalyticsState>) -> Router {
         .route("/v1/analytics/matrix-grid", get(analytics_matrix_grid))
         .route("/v1/analytics/matrix-cell", get(analytics_matrix_cell))
         .route("/v1/analytics/trades", get(analytics_trades))
+        .route(
+            "/v1/analytics/forecast",
+            post(forecast_api::handle).layer(axum::extract::DefaultBodyLimit::max(512 * 1024)),
+        )
         .route(
             "/v1/analytics/trend",
             post(analytics_trend).layer(axum::extract::DefaultBodyLimit::max(256 * 1024)),

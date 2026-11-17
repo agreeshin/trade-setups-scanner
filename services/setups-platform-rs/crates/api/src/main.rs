@@ -138,6 +138,7 @@ async fn main() {
     let continuous_runtime=setups_api::continuous::runtime::start_continuous_runtime(continuous_pool,config.market_data_url.clone(),config.market_data_api_key.clone(),continuous_config.clone()).await.unwrap_or_else(|error|{eprintln!("continuous runtime failed to start: {error}");std::process::exit(1)});
     let continuous_state=Arc::new(setups_api::continuous::ContinuousState{pool:pool.clone(),auth:auth.clone(),config:continuous_config,notify:continuous_runtime.notify.clone(),available:continuous_runtime.available.clone()});
     let analytics_state = std::sync::Arc::new(setups_api::analytics::AnalyticsState {
+        forecast_cpu: Arc::new(tokio::sync::Semaphore::new(1)),
         pool: pool.clone(),
         auth: auth.clone(),
         market_url: config.market_data_url.clone(),

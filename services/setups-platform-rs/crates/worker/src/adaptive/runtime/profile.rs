@@ -16,6 +16,52 @@ pub(super) struct RecommendationEnvelope {
     pub params: AlgorithmParams,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use setups_domain::forecast::ForecastRecipe;
+    use setups_domain::trend::TrendBendDays;
+    use setups_optimizer::{ContinuousContext, ContinuousEvaluation, Provenance, StudyCandidate, recommend_continuous};
+
+    #[test]
+    fn producer_json_accepts_effective_recipe_bend_without_weakening_metric_identity() {
+        for (recipe, legacy_bend, effective_bend) in [
+            (Some(ForecastRecipe::engineering_baseline()), TrendBendDays::Seven, TrendBendDays::Linear),
+            (Some(ForecastRecipe::Trend { version: 1, bend_days: TrendBendDays::Seven }), TrendBendDays::Linear, TrendBendDays::Seven),
+            (None, TrendBendDays::Seven, TrendBendDays::Seven),
+        ] {
+            let (envelope, _, _, _, mut slot) = super::super::enrichment::tests::fixture();
+            let p = &envelope.snapshot.provenance;
+            let spec: StudyRequest = serde_json::from_value(json!({
+                "algorithmId":p.algorithm_id,"algorithmVersion":p.algorithm_version,"algorithmParams":slot.params,
+                "analyticsParams":{"clusterEnabled":envelope.snapshot.cluster_enabled,"clusterGapMinutes":envelope.snapshot.cluster_gap_minutes.unwrap_or(480),"timeShiftMinutes":envelope.snapshot.time_shift_minutes,"priceChangePct":envelope.snapshot.price_change_pct},
+                "instruments":[{"exchange":"bybit","category":"linear","symbol":"TESTUSDT"}],
+                "fromUnix":p.from_unix,"toUnix":p.to_unix,"direction":"short","seed":p.seed,
+                "minSetupsPerDay":0,"tpLevels":[envelope.snapshot.tp_pct],"slLevels":[envelope.snapshot.sl_pct],
+                "trendMode":"forecast","trendBendDays":legacy_bend,"forecast":recipe,
+            })).unwrap();
+            let candidate = StudyCandidate { params: spec.algorithm_params.clone(), analytics: spec.analytics_params.clone() };
+            let result: ContinuousEvaluation = serde_json::from_value(json!({"evaluation":{
+                "summary":{"score":0.5,"setupCount":45,"selectedSetupCount":45,"evaluatedMinutes":100,"warmupMinutes":0},
+                "matrix":[{"tpPct":envelope.snapshot.tp_pct,"slPct":envelope.snapshot.sl_pct,
+                    "riskExpectancy":0.5,"meanRiskExpectancy":envelope.snapshot.raw_r,"forecastRiskExpectancy":0.5,
+                    "avgMovePct":null,"closedCount":45,"tpCount":32,"slCount":13,"unclosedCount":0,"noDataCount":0,"priceChangeFilteredCount":0}]
+            },"diagnostics":[]})).unwrap();
+            let producer = recommend_continuous(&spec, &candidate, &result, &Provenance {
+                optimizer_version:p.optimizer_version.clone(), seed:p.seed, snapshot_hash:p.snapshot_hash.clone(), captured_at:p.captured_at.clone(),
+            }, ContinuousContext { observation_cutoff: p.observation_cutoff }, 0.0).unwrap().unwrap();
+            assert_eq!(producer.search_forecast.unwrap().bend_days, effective_bend);
+            slot.spec = serde_json::to_value(spec).unwrap();
+            slot.result["recommendation"] = serde_json::to_value(&producer).unwrap();
+            slot.selected_cell = json!({"tpPct":producer.tp_pct,"slPct":producer.sl_pct,"rawR":producer.raw_r,"forecastR":0.5,"forecastMatrixR":0.5});
+            slot.mean_expectancy = producer.mean_r;
+            LiveProfile::parse(&slot).unwrap();
+            slot.selected_cell["forecastR"] = json!(0.6);
+            assert!(LiveProfile::parse(&slot).is_err(), "real metric tampering still fails closed");
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct LiveProfile {
     pub fence: AdaptiveFence,
@@ -31,11 +77,18 @@ impl LiveProfile {
         let params:AlgorithmParams=serde_json::from_value(slot.params.clone())?;
         let snapshot:AdaptiveRecommendationSnapshot=serde_json::from_value(slot.result.get("recommendation").cloned().ok_or_else(||invalid("missing result.recommendation"))?)?;
         let spec:StudyRequest=serde_json::from_value(slot.spec.clone())?;
+        let forecast=spec.forecast;
+        let effective_bend=match forecast {
+            None=>spec.trend_bend_days,
+            Some(setups_domain::forecast::ForecastRecipe::DecayedProbability {..})=>setups_domain::trend::TrendBendDays::Linear,
+            Some(setups_domain::forecast::ForecastRecipe::Trend {bend_days,..})=>bend_days,
+        };
         let expected:BTreeSet<_>=spec.instruments.iter().cloned().collect();
         if params.algorithm_id()!=slot.algorithm_id || params.algorithm_version()!=spec.algorithm_version
             || snapshot.provenance.algorithm_id!=slot.algorithm_id || snapshot.provenance.algorithm_version!=spec.algorithm_version
             || snapshot.provenance.from_unix!=spec.from_unix || snapshot.provenance.to_unix!=spec.to_unix
             || snapshot.provenance.seed!=spec.seed
+            || snapshot.forecast!=forecast
             || serde_json::to_value(snapshot.direction)?.as_str()!=Some(slot.direction.as_str())
             || slot.analytics["clusterEnabled"].as_bool()!=Some(snapshot.cluster_enabled)
             || slot.analytics["timeShiftMinutes"].as_i64()!=Some(snapshot.time_shift_minutes)
@@ -55,12 +108,12 @@ impl LiveProfile {
         match (spec.trend_mode, snapshot.search_forecast) {
             (setups_optimizer::TrendMode::Mean, None) => {},
             (setups_optimizer::TrendMode::Forecast, Some(forecast))
-                if forecast.bend_days==spec.trend_bend_days && forecast.cell_r.is_finite()
+                if forecast.bend_days==effective_bend && forecast.cell_r.is_finite()
                     && forecast.blend.is_none() && forecast.matrix_r.is_finite() && forecast.matrix_r>spec.min_forecast_expectancy
                     && slot.selected_cell["forecastR"].as_f64()==Some(forecast.cell_r)
                     && slot.selected_cell["forecastMatrixR"].as_f64()==Some(forecast.matrix_r) => {},
             (setups_optimizer::TrendMode::Blend, Some(forecast))
-                if forecast.bend_days==spec.trend_bend_days && forecast.cell_r.is_finite() && forecast.matrix_r.is_finite()
+                if forecast.bend_days==effective_bend && forecast.cell_r.is_finite() && forecast.matrix_r.is_finite()
                     && slot.selected_cell["forecastR"].as_f64()==Some(forecast.cell_r)
                     && slot.selected_cell["forecastMatrixR"].as_f64()==Some(forecast.matrix_r)
                     && forecast.blend.is_some_and(|blend| blend.lambda==spec.trend_blend_lambda

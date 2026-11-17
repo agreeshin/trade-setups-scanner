@@ -523,6 +523,14 @@ async fn saved_presentation(
     pool: &PgPool,
     job: &TelegramJob,
 ) -> Result<TelegramV2Presentation, ClientFailure> {
+    saved_presentation_with_lane(pool, job, None).await
+}
+
+async fn saved_presentation_with_lane(
+    pool: &PgPool,
+    job: &TelegramJob,
+    charts: Option<&ChartRenderLane>,
+) -> Result<TelegramV2Presentation, ClientFailure> {
     // Validate saved identity/name/params using the unchanged v1 path too;
     // rendering rich text must not weaken the original snapshot fence.
     let body = render_message(job, chrono::Utc::now().timestamp())?;
@@ -539,7 +547,12 @@ async fn saved_presentation(
             &job.payload["recommendation"],
         )
         .map_err(|_| ClientFailure::before("invalid_saved_payload"))?;
-        let (png, unavailable_reason) = match saved_chart_png(pool, job).await {
+        let chart = if caption.enrichment_unavailable_reason == Some("invalid_saved_enrichment") {
+            Err("png_identity_mismatch")
+        } else {
+            saved_chart_png(pool, job, charts).await
+        };
+        let (png, unavailable_reason) = match chart {
             Ok(png) => (png, None),
             Err(code) => (None, Some(code)),
         };
@@ -564,6 +577,7 @@ async fn saved_presentation(
 async fn saved_chart_png(
     pool: &PgPool,
     job: &TelegramJob,
+    charts: Option<&ChartRenderLane>,
 ) -> Result<Option<Vec<u8>>, &'static str> {
     use setups_domain::{AdaptiveRecommendationSnapshot, expectancy::ExpectancyArtifact};
     let recommendation = &job.payload["recommendation"];
@@ -578,22 +592,123 @@ async fn saved_chart_png(
         serde_json::from_value(saved["imageKey"].clone()).map_err(|_| "png_identity_mismatch")?;
     let snapshot: AdaptiveRecommendationSnapshot =
         serde_json::from_value(recommendation.clone()).map_err(|_| "png_identity_mismatch")?;
-    let artifact = setups_db::expectancy::get(pool, &job.owner_id, id)
+    let fence = ChartSourceFence::from_job(job)?;
+    if let Some(recipe) = snapshot.forecast {
+        let charts = charts.ok_or("png_unavailable")?;
+        let saved: crate::adaptive::AdaptiveExpectancySnapshot =
+            serde_json::from_value(saved.clone()).map_err(|_| "png_identity_mismatch")?;
+        let forecast = saved
+            .forecast_r
+            .as_ref()
+            .copied()
+            .ok_or("png_unavailable")?;
+        let expected_overlay =
+            crate::adaptive::ExpectancyOverlayKey::new(&key, job.raw_close_unix, forecast)
+                .map_err(|_| "png_identity_mismatch")?;
+        if saved.forecast != Some(recipe)
+            || saved.image_key.as_ref() != Some(&key)
+            || saved.overlay_key.as_ref() != Some(&expected_overlay)
+            || saved.forecast_at_unix != job.raw_close_unix
+            || saved.artifact_id != Some(id)
+        {
+            return Err("png_identity_mismatch");
+        }
+        let raw_signal_at = job.raw_close_unix;
+        let pool = pool.clone();
+        // The sole sender-owned lane admits one blocking render. Cancellation
+        // drops a waiting closure/buffers; an already running closure keeps its
+        // permit until it actually exits, so timeouts cannot multiply work.
+        return charts
+            .render(move || {
+                // The validating DB decode also belongs to this CPU admission,
+                // not the async sender or a second concurrently admitted lane.
+                let mut artifact = tokio::runtime::Handle::current()
+                    .block_on(setups_db::expectancy::get(&pool, &fence.owner_id, id))
+                    .map_err(|_| "png_lookup_unavailable")?
+                    .ok_or("png_unavailable")?;
+                let numerical: ExpectancyArtifact =
+                    serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
+                        .map_err(|_| "png_identity_mismatch")?;
+                validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
+                setups_analytics::expectancy_chart::render_png_with_model(
+                    &numerical,
+                    raw_signal_at,
+                    forecast,
+                )
+                .map(Some)
+                .map_err(|_| "png_unavailable")
+            })
+            .await;
+    }
+    let mut artifact = setups_db::expectancy::get(pool, &job.owner_id, id)
         .await
         .map_err(|_| "png_lookup_unavailable")?
         .ok_or("png_unavailable")?;
     let numerical: ExpectancyArtifact =
-        serde_json::from_value(artifact.numerical_snapshot).map_err(|_| "png_identity_mismatch")?;
-    numerical.validate().map_err(|_| "png_identity_mismatch")?;
+        serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
+            .map_err(|_| "png_identity_mismatch")?;
+    validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
+    let version = key.render_version.to_string();
+    let png = setups_db::expectancy::load_png_by_image_key(pool, &job.owner_id, &key)
+        .await
+        .map_err(|_| "png_lookup_unavailable")?
+        .ok_or("png_unavailable")?;
+    if png.len() > v2::MAX_PNG_BYTES {
+        return Err("png_invalid");
+    }
+    if !db::chart_png_checksum_matches(pool, &job.owner_id, id, &version, &png)
+        .await
+        .map_err(|_| "png_lookup_unavailable")?
+    {
+        return Err("png_hash_mismatch");
+    }
+    Ok(Some(png))
+}
+
+/// Only bounded scalar source fences cross to the CPU lane, not the job's full
+/// recommendation, outbox body or PNG. No live/current-profile lookup occurs.
+struct ChartSourceFence {
+    owner_id: String,
+    generation_id: i64,
+    slot_id: i64,
+    study_id: i64,
+}
+
+impl ChartSourceFence {
+    fn from_job(job: &TelegramJob) -> Result<Self, &'static str> {
+        let recommendation = &job.payload["recommendation"];
+        if recommendation["ownerId"].as_str() != Some(job.owner_id.as_str()) {
+            return Err("png_identity_mismatch");
+        }
+        Ok(Self {
+            owner_id: job.owner_id.clone(),
+            generation_id: job.generation_id.ok_or("png_identity_mismatch")?,
+            slot_id: job.slot_id.ok_or("png_identity_mismatch")?,
+            study_id: recommendation["studyId"]
+                .as_i64()
+                .ok_or("png_identity_mismatch")?,
+        })
+    }
+}
+
+fn validate_chart_source(
+    fence: &ChartSourceFence,
+    id: i64,
+    key: &setups_domain::expectancy::ExpectancyImageKey,
+    snapshot: &setups_domain::AdaptiveRecommendationSnapshot,
+    artifact: &setups_db::expectancy::Artifact,
+    numerical: &setups_domain::expectancy::ExpectancyArtifact,
+) -> Result<(), &'static str> {
+    // This private adapter only consumes the very same owned snapshot returned
+    // by db::get, whose read boundary already validates/rebuilds numerical JSON.
     let identity = &artifact.identity;
     let source = &numerical.source;
     let provenance = &snapshot.provenance;
     if artifact.id != id
-        || identity.owner_id != job.owner_id
-        || Some(identity.generation_id) != job.generation_id
-        || Some(identity.slot_id) != job.slot_id
-        || recommendation["ownerId"].as_str() != Some(job.owner_id.as_str())
-        || recommendation["studyId"].as_i64() != Some(identity.study_id)
+        || identity.owner_id != fence.owner_id
+        || identity.generation_id != fence.generation_id
+        || identity.slot_id != fence.slot_id
+        || identity.study_id != fence.study_id
         || identity.calculation_version != key.calculation_version.to_string()
         || identity.tp_pct != snapshot.tp_pct
         || identity.sl_pct != snapshot.sl_pct
@@ -609,8 +724,21 @@ async fn saved_chart_png(
         || setups_db::expectancy::artifact_key(identity).map_err(|_| "png_identity_mismatch")?
             != artifact.key
         || key.derived_snapshot_id != artifact.key
-        || numerical.image_key(key.render_version) != key
-        || key.render_version != 1
+        || numerical.image_key(key.render_version) != *key
+        || key.render_version
+            != if snapshot.forecast.is_some() {
+                setups_analytics::expectancy_chart::PROBABILITY_RENDER_VERSION
+            } else {
+                1
+            }
+        || source.forecast != snapshot.forecast
+        || identity.forecast != snapshot.forecast
+        || numerical.calculation_version
+            != if snapshot.forecast.is_some() {
+                setups_domain::expectancy::EXPECTANCY_MODEL_CALCULATION_VERSION
+            } else {
+                setups_domain::expectancy::EXPECTANCY_CALCULATION_VERSION
+            }
         || source.generation_id.as_deref() != Some(identity.generation_id.to_string().as_str())
         || source.profile_id.as_deref() != Some(identity.slot_id.to_string().as_str())
         || source.provenance != *provenance
@@ -637,23 +765,66 @@ async fn saved_chart_png(
     {
         return Err("png_identity_mismatch");
     }
-    let version = key.render_version.to_string();
-    let png = setups_db::expectancy::load_png_by_image_key(pool, &job.owner_id, &key)
-        .await
-        .map_err(|_| "png_lookup_unavailable")?
-        .ok_or("png_unavailable")?;
-    if png.len() > v2::MAX_PNG_BYTES {
-        return Err("png_invalid");
+    if let Some(expected) = &identity.outcome_hash {
+        let daily = numerical
+            .daily
+            .as_ref()
+            .ok_or("png_identity_mismatch")?
+            .iter()
+            .map(|p| setups_domain::expectancy::UtcDailyInput {
+                day_start_unix: p.day_start_unix,
+                row_count: p.row_count,
+                tp_count: p.tp_count,
+                sl_count: p.sl_count,
+                mean_r: p.mean_r,
+            })
+            .collect::<Vec<_>>();
+        if setups_db::expectancy::captured_outcome_hash(&daily)
+            .map_err(|_| "png_identity_mismatch")?
+            != *expected
+        {
+            return Err("png_identity_mismatch");
+        }
     }
-    if !db::chart_png_checksum_matches(pool, &job.owner_id, id, &version, &png)
-        .await
-        .map_err(|_| "png_lookup_unavailable")?
-    {
-        return Err("png_hash_mismatch");
-    }
-    Ok(Some(png))
+    Ok(())
 }
-struct SecureRelayAccess;
+
+struct ChartRenderLane {
+    permit: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for ChartRenderLane {
+    fn default() -> Self {
+        Self {
+            permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+}
+
+impl ChartRenderLane {
+    async fn render<T: Send + 'static>(
+        &self,
+        render: impl FnOnce() -> Result<T, &'static str> + Send + 'static,
+    ) -> Result<T, &'static str> {
+        let permit = self
+            .permit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "png_unavailable")?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            render()
+        })
+        .await
+        .map_err(|_| "png_unavailable")?
+    }
+}
+
+#[derive(Default)]
+struct SecureRelayAccess {
+    charts: ChartRenderLane,
+}
 impl RelayAccess for SecureRelayAccess {
     fn key(&self) -> Result<SecretKey, ClientFailure> {
         signing_key()
@@ -664,6 +835,13 @@ impl RelayAccess for SecureRelayAccess {
         key: &'key SecretKey,
     ) -> Result<RelaySession<'key>, ClientFailure> {
         RelaySession::connect(origin, key).await
+    }
+    async fn presentation(
+        &self,
+        pool: &PgPool,
+        job: &TelegramJob,
+    ) -> Result<TelegramV2Presentation, ClientFailure> {
+        saved_presentation_with_lane(pool, job, Some(&self.charts)).await
     }
 }
 
@@ -733,7 +911,7 @@ fn readiness_diagnostic(
 /// Transport-only API adapter. Admission and revision-CAS persistence belong to
 /// the API's db::begin_probe / db::record_status boundary. Never sends text.
 pub async fn probe_telegram_relay(config: &TelegramConfig) -> TelegramStatusUpdate {
-    probe_via(config, &SecureRelayAccess).await
+    probe_via(config, &SecureRelayAccess::default()).await
 }
 async fn probe_via(config: &TelegramConfig, access: &impl RelayAccess) -> TelegramStatusUpdate {
     let attempt = async {
@@ -863,7 +1041,7 @@ fn test_result(
 /// Exactly one explicit test attempt. Uses the DB's frozen body, ID and expiry;
 /// callers own admission/idempotency and record_test's settings-revision fence.
 pub async fn test_telegram_relay(attempt: &TelegramTestAttempt) -> TelegramTestResult {
-    test_via(attempt, &SecureRelayAccess).await
+    test_via(attempt, &SecureRelayAccess::default()).await
 }
 async fn test_via(attempt: &TelegramTestAttempt, access: &impl RelayAccess) -> TelegramTestResult {
     let send = async {
@@ -978,8 +1156,9 @@ async fn send_job(
     worker: &str,
     job: &TelegramJob,
     stopped: &AtomicBool,
+    access: &SecureRelayAccess,
 ) -> Result<TelegramOutcome, WorkerError> {
-    send_job_via(pool, worker, job, stopped, &SecureRelayAccess).await
+    send_job_via(pool, worker, job, stopped, access).await
 }
 async fn send_job_via(
     pool: &PgPool,
@@ -1218,14 +1397,20 @@ async fn send_v2_job_via(
     })
 }
 
-async fn process_job(pool: &PgPool, worker: &str, job: Option<TelegramJob>, stopped: &AtomicBool) {
+async fn process_job(
+    pool: &PgPool,
+    worker: &str,
+    job: Option<TelegramJob>,
+    stopped: &AtomicBool,
+    access: &SecureRelayAccess,
+) {
     let Some(job) = job else {
         return;
     };
     let started = std::time::Instant::now();
     let outcome = match tokio::time::timeout(
         Duration::from_secs(22),
-        send_job(pool, worker, &job, stopped),
+        send_job(pool, worker, &job, stopped, access),
     )
     .await
     {
@@ -1271,13 +1456,14 @@ async fn process_job(pool: &PgPool, worker: &str, job: Option<TelegramJob>, stop
 /// transport can retain additional bounded copies; this is not a two-buffer peak.
 pub(crate) async fn run(pool: PgPool, stopped: Arc<AtomicBool>, notify: Arc<tokio::sync::Notify>) {
     let worker = format!("telegram-delivery-{}", std::process::id());
+    let access = SecureRelayAccess::default();
     while !stopped.load(Ordering::SeqCst) {
         match tokio::time::timeout(Duration::from_secs(3), db::claim(&pool, &worker, 2)).await {
             Ok(Ok(jobs)) => {
                 let mut jobs = jobs.into_iter();
                 tokio::join!(
-                    process_job(&pool, &worker, jobs.next(), &stopped),
-                    process_job(&pool, &worker, jobs.next(), &stopped)
+                    process_job(&pool, &worker, jobs.next(), &stopped, &access),
+                    process_job(&pool, &worker, jobs.next(), &stopped, &access)
                 );
             }
             _ => eprintln!("[telegram-delivery] code=claim_unavailable"),

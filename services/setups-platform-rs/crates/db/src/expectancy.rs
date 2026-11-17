@@ -41,6 +41,11 @@ pub struct ArtifactIdentity {
     /// Actual historical input identity; provenance above is the ORIGINAL reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub historical_input_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<setups_domain::forecast::ForecastRecipe>,
+    /// Hash of the exact captured UTC buckets, not an aggregate/rounded-R guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -112,10 +117,16 @@ fn identity_value(identity: &ArtifactIdentity) -> Result<Value, DbError> {
         || identity.from_unix < 0
         || identity.to_unix <= identity.from_unix
         || identity.observation_cutoff < 0
-        || identity.observation_cutoff > identity.to_unix
+        || (identity.forecast.is_none() && identity.observation_cutoff > identity.to_unix)
         || !identity.provenance.is_object()
         || !identity.effective_analytics.is_object()
         || identity.historical_input_hash.as_ref().is_some_and(|hash| !historical::valid_hash(hash))
+        || identity.outcome_hash.as_ref().is_some_and(|hash| !historical::valid_hash(hash))
+        || (identity.calculation_version == setups_domain::expectancy::EXPECTANCY_MODEL_CALCULATION_VERSION.to_string()
+            && (identity.forecast.is_none() || identity.outcome_hash.is_none()))
+        || (identity.forecast.is_some() && (identity.calculation_version != setups_domain::expectancy::EXPECTANCY_MODEL_CALCULATION_VERSION.to_string()
+            || identity.outcome_hash.is_none() || identity.forecast.is_some_and(|recipe| recipe.identity_key().is_err())))
+        || (identity.forecast.is_none() && identity.outcome_hash.is_some())
     {
         return Err(invalid("identity_invalid"));
     }
@@ -146,6 +157,15 @@ pub fn artifact_key(identity: &ArtifactIdentity) -> Result<String, DbError> {
     let mut hash = Sha256::new();
     hash.update(b"study-expectancy-artifact-v1\0");
     hash.update(serde_json::to_vec(&canonical(&value)).map_err(crate::json_error)?);
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+pub fn captured_outcome_hash(daily: &[setups_domain::expectancy::UtcDailyInput]) -> Result<String, DbError> {
+    if daily.len() > setups_domain::expectancy::EXPECTANCY_MAX_POINTS { return Err(invalid("outcome_resource_limit")); }
+    let bytes = serde_json::to_vec(daily).map_err(crate::json_error)?;
+    if bytes.len() > MAX_NUMERICAL_BYTES { return Err(invalid("outcome_resource_limit")); }
+    let mut hash = Sha256::new();
+    hash.update(b"study-expectancy-outcomes-v1\0"); hash.update(bytes);
     Ok(format!("{:x}", hash.finalize()))
 }
 
@@ -195,8 +215,21 @@ pub async fn get_for_generation(
     generation: i64,
     version: &str,
 ) -> Result<Option<Artifact>, DbError> {
+    if version == setups_domain::expectancy::EXPECTANCY_MODEL_CALCULATION_VERSION.to_string() {
+        return Err(invalid("model_exact_identity_required"));
+    }
     sqlx::query("select a.id,a.artifact_key,a.identity,a.numerical_snapshot from study_expectancy_artifacts a where owner_id=$1 and source_generation_id=$2 and calculation_version=$3 and revision_key='original' order by id limit 1")
         .bind(owner).bind(generation).bind(version).fetch_optional(pool).await?.map(decode).transpose()
+}
+
+/// Exact recipe + cutoff + outcome identity. No mutable/latest selection.
+pub async fn get_by_identity(pool: &PgPool, identity: &ArtifactIdentity) -> Result<Option<Artifact>, DbError> {
+    let row = sqlx::query("select id,artifact_key,identity,numerical_snapshot from study_expectancy_artifacts where artifact_key=$1 and owner_id=$2 and source_generation_id=$3 and calculation_version=$4")
+        .bind(artifact_key(identity)?).bind(&identity.owner_id).bind(identity.generation_id).bind(&identity.calculation_version)
+        .fetch_optional(pool).await?;
+    let record = row.map(decode).transpose()?;
+    if record.as_ref().is_some_and(|record| record.identity != *identity) { return Err(invalid("exact_identity_mismatch")); }
+    Ok(record)
 }
 
 /// Startup-only, keyset-paged admission for CURRENT active bindings. A fixed
@@ -213,7 +246,7 @@ pub async fn active_enrichment_high_water(pool: &PgPool) -> Result<i64, DbError>
 }
 
 pub async fn active_enrichment_page(pool: &PgPool, after_slot: i64, through_slot: i64) -> Result<Vec<ActiveEnrichmentBinding>, DbError> {
-    let rows=sqlx::query("select s.id,s.owner_id,s.active_generation_id from continuous_slots s join adaptive_profiles p on p.id=s.id join continuous_generations g on g.id=s.active_generation_id and g.owner_id=s.owner_id and g.slot_id=s.id where p.desired_running and s.id>$1 and s.id<=$2 and not exists(select 1 from study_expectancy_artifacts a where a.owner_id=s.owner_id and a.source_generation_id=s.active_generation_id and a.calculation_version=$3) order by s.id limit 16")
+    let rows=sqlx::query("select s.id,s.owner_id,s.active_generation_id from continuous_slots s join adaptive_profiles p on p.id=s.id join continuous_generations g on g.id=s.active_generation_id and g.owner_id=s.owner_id and g.slot_id=s.id where p.desired_running and s.id>$1 and s.id<=$2 and (g.spec->'forecast' is null or g.spec->'forecast'='null'::jsonb) and not exists(select 1 from study_expectancy_artifacts a where a.owner_id=s.owner_id and a.source_generation_id=s.active_generation_id and a.calculation_version=$3) order by s.id limit 16")
         .bind(after_slot).bind(through_slot).bind(setups_domain::expectancy::EXPECTANCY_CALCULATION_VERSION.to_string()).fetch_all(pool).await?;
     rows.into_iter().map(|row|Ok(ActiveEnrichmentBinding {slot_id:row.try_get("id")?,owner_id:row.try_get("owner_id")?,generation_id:row.try_get("active_generation_id")?})).collect()
 }
@@ -256,6 +289,7 @@ pub async fn enrich_saved_generation(
     let Some(saved) = saved_source(pool, owner, generation).await? else {
         return Ok(None);
     };
+    if saved.spec.get("forecast").is_some_and(|recipe| !recipe.is_null()) { return Ok(None); }
     let selected = &saved.result["selectedCell"];
     if !selected.is_object() {
         return Ok(None);
@@ -301,6 +335,8 @@ pub async fn enrich_saved_generation(
         provenance: best["provenance"].clone(),
         effective_analytics: analytics.clone(),
         historical_input_hash: None,
+        forecast: None,
+        outcome_hash: None,
     };
     let provenance: RecommendationProvenance = serde_json::from_value(serde_json::json!({
         "algorithmId":saved.spec["algorithmId"],"algorithmVersion":saved.spec["algorithmVersion"],
@@ -308,7 +344,7 @@ pub async fn enrich_saved_generation(
         "snapshotHash":identity.provenance["snapshotHash"],"capturedAt":identity.provenance["capturedAt"],
         "fromUnix":from_unix,"toUnix":to_unix,"observationCutoff":saved.observation_cutoff,
     })).map_err(crate::json_error)?;
-    let source = ExpectancySource { study_id:saved.study_id.to_string(),derived_snapshot_id:artifact_key(&identity)?,
+    let source = ExpectancySource { forecast:None,study_id:saved.study_id.to_string(),derived_snapshot_id:artifact_key(&identity)?,
         generation_id:Some(generation.to_string()),profile_id:Some(saved.slot_id.to_string()),provenance,
         direction:serde_json::from_value(saved.spec["direction"].clone()).map_err(crate::json_error)?,tp_pct:tp,sl_pct:sl,
         analytics:serde_json::from_value(serde_json::json!({"clusterEnabled":analytics["clusterEnabled"],
@@ -347,6 +383,7 @@ async fn insert_in(
     let artifact = decode_numerical(numerical)?;
     let source = &artifact.source;
     if artifact.calculation_version.to_string() != identity.calculation_version
+        || source.forecast != identity.forecast
         || source.derived_snapshot_id != key
         || source.study_id != identity.study_id.to_string()
         || source.generation_id.as_deref() != Some(identity.generation_id.to_string().as_str())
@@ -366,6 +403,14 @@ async fn insert_in(
             != identity.provenance["capturedAt"]
     {
         return Err(invalid("numerical_identity_mismatch"));
+    }
+    if let Some(expected) = &identity.outcome_hash {
+        let points = artifact.daily.as_ref().ok_or_else(|| invalid("model_outcomes_missing"))?;
+        let daily: Vec<_> = points.iter().map(|point| setups_domain::expectancy::UtcDailyInput {
+            day_start_unix: point.day_start_unix, row_count: point.row_count,
+            tp_count: point.tp_count, sl_count: point.sl_count, mean_r: point.mean_r,
+        }).collect();
+        if captured_outcome_hash(&daily)? != *expected { return Err(invalid("outcome_identity_mismatch")); }
     }
     sqlx::query("select pg_advisory_xact_lock($1)")
         .bind(STORAGE_LOCK)
@@ -433,11 +478,26 @@ async fn validate_source_in(
         })
         .ok_or_else(|| invalid("selected_cell_missing"))?;
     let artifact = decode_numerical(numerical)?;
+    let frozen_recipe = |value: &Value| -> Result<Option<setups_domain::forecast::ForecastRecipe>, DbError> {
+        value.get("forecast").filter(|recipe| !recipe.is_null()).cloned()
+            .map(serde_json::from_value).transpose().map_err(crate::json_error)
+    };
+    if frozen_recipe(&spec)? != identity.forecast || frozen_recipe(&search["best"])? != identity.forecast
+        || (identity.forecast.is_some() && search["best"]["observationCutoff"].as_i64() != Some(identity.observation_cutoff)) {
+        return Err(invalid("original_recipe_cutoff_mismatch"));
+    }
     let metrics = artifact
         .selected_cell
         .as_ref()
         .ok_or_else(|| invalid("selected_metrics_missing"))?;
     let trend_mode = search["best"].get("trendMode").or_else(|| spec.get("trendMode"));
+    if identity.forecast.is_some() && trend_mode.is_some_and(|mode| matches!(mode.as_str(), Some("forecast" | "blend"))) {
+        let forecast = artifact.forecast.as_ref().and_then(|model| {
+            model.probability.as_ref().and_then(|model| model.estimate.as_ref().map(|estimate| estimate.forecast_r))
+                .or_else(|| model.trend.as_ref().map(|model| model.end.value))
+        });
+        if forecast != original_cell["forecastRiskExpectancy"].as_f64() { return Err(invalid("original_forecast_mismatch")); }
+    }
     if Some(metrics.tp_count) != original_cell["tpCount"].as_u64()
         || Some(metrics.sl_count) != original_cell["slCount"].as_u64()
         || metrics.raw_r.as_ref().copied()
@@ -590,6 +650,10 @@ pub async fn store_png(
         .ok()
         .filter(|version| *version > 0)
         .ok_or_else(|| invalid("render_version_invalid"))?;
+    if (record.identity.forecast.is_some() && render_version != 2)
+        || (record.identity.forecast.is_none() && render_version == 2) {
+        return Err(invalid("render_recipe_version_mismatch"));
+    }
     let image_key = serde_json::to_value(
         decode_numerical(&record.numerical_snapshot)?.image_key(render_version),
     )
@@ -686,7 +750,7 @@ pub async fn claim_render(
     worker: &str,
     version: u32,
 ) -> Result<Option<RenderJob>, DbError> {
-    if worker.is_empty() || worker.len() > 200 || version == 0 || version > i32::MAX as u32 {
+    if worker.is_empty() || worker.len() > 200 || !matches!(version, 1 | 2) {
         return Err(invalid("render_claim_invalid"));
     }
     let mut tx = pool.begin().await?;
@@ -694,7 +758,7 @@ pub async fn claim_render(
         .bind(STORAGE_LOCK)
         .execute(&mut *tx)
         .await?;
-    let row=sqlx::query("select a.id,a.artifact_key,a.identity,a.numerical_snapshot,jsonb_strip_nulls(jsonb_build_object('trendMode',g.spec->'trendMode','trendBendDays',g.spec->'trendBendDays','trendBlendLambda',g.spec->'trendBlendLambda')) study_trend from study_expectancy_artifacts a left join study_expectancy_render_attempts r on r.artifact_id=a.id and r.render_version=$1 left join continuous_generations g on g.id=a.source_generation_id and g.owner_id=a.owner_id where (g.id is null or g.status='completed') and a.numerical_snapshot#>>'{daily,status}'='available' and jsonb_array_length(a.numerical_snapshot#>'{daily,value}')>0 and not exists(select 1 from study_expectancy_pngs p where p.artifact_id=a.id and p.rendering_version=$2) and (r.artifact_id is null or (r.attempts<3 and (r.lease_until is null or r.lease_until<=clock_timestamp()) and r.next_attempt_at<=clock_timestamp())) order by a.id limit 1")
+    let row=sqlx::query("select a.id,a.artifact_key,a.identity,a.numerical_snapshot,jsonb_strip_nulls(jsonb_build_object('trendMode',g.spec->'trendMode','trendBendDays',g.spec->'trendBendDays','trendBlendLambda',g.spec->'trendBlendLambda') || case when a.calculation_version='3' then jsonb_build_object('forecast',g.spec->'forecast','observationCutoff',g.observation_cutoff) else '{}'::jsonb end) study_trend from study_expectancy_artifacts a left join study_expectancy_render_attempts r on r.artifact_id=a.id and r.render_version=$1 left join continuous_generations g on g.id=a.source_generation_id and g.owner_id=a.owner_id where (($1=1 and a.calculation_version='2') or ($1=2 and a.calculation_version='3')) and (g.id is null or g.status='completed') and a.numerical_snapshot#>>'{daily,status}'='available' and jsonb_array_length(a.numerical_snapshot#>'{daily,value}')>0 and not exists(select 1 from study_expectancy_pngs p where p.artifact_id=a.id and p.rendering_version=$2) and (r.artifact_id is null or (r.attempts<3 and (r.lease_until is null or r.lease_until<=clock_timestamp()) and r.next_attempt_at<=clock_timestamp())) order by a.id limit 1")
         .bind(version as i32).bind(version.to_string()).fetch_optional(&mut *tx).await?;
     let Some(row) = row else {
         return Ok(None);

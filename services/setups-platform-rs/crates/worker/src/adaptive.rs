@@ -17,7 +17,7 @@ pub use state::{AdaptiveRuntime, AdaptiveRuntimeLimits};
 pub(crate) use runtime::{adaptive_live_loop, recommendation_message};
 pub use runtime::{AdaptiveLiveBootstrap, AdaptiveLiveRuntime, PgAdaptiveStore, adaptive_live_tick};
 pub use runtime::{AdaptiveTelegramCaption, recommendation_telegram_caption};
-pub use runtime::AdaptiveExpectancySnapshot;
+pub use runtime::{AdaptiveExpectancySnapshot, ExpectancyOverlayKey};
 
 /// Reporting a technical failure can itself lose its fence. Keep that outcome
 /// typed and visible without replacing the original worker error/cause.

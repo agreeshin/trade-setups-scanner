@@ -108,6 +108,26 @@ async fn chain_with_trend(pool: &PgPool, trend: &Value) -> (scheduler::ChainJob,
             }
         }
     }
+    let forecast = trend.get("forecast").cloned().map(serde_json::from_value::<setups_domain::forecast::ForecastRecipe>).transpose().unwrap();
+    if let Some(recipe) = forecast {
+        original["best"]["forecast"] = json!(recipe);
+        original["best"]["observationCutoff"] = json!(job.observation_cutoff);
+        if matches!(trend["trendMode"].as_str(), Some("forecast" | "blend")) {
+            let first = utc_midnight_unix(job.spec["fromUnix"].as_i64().unwrap()).unwrap();
+            let days = [setups_domain::forecast::ProbabilityDay {day_start_unix:first,tp_count:1,sl_count:0},
+                setups_domain::forecast::ProbabilityDay {day_start_unix:first+2*86400,tp_count:1,sl_count:1}];
+            for cell in original["best"]["matrix"].as_array_mut().unwrap() {
+                let mean = cell["meanRiskExpectancy"].as_f64().unwrap();
+                let estimate = setups_domain::forecast::evaluate_probability(recipe,
+                    cell["tpPct"].as_f64().unwrap()/cell["slPct"].as_f64().unwrap(),job.observation_cutoff,&days).unwrap();
+                let f = estimate.as_ref().unwrap().forecast_r;
+                cell["forecastRiskExpectancy"] = json!(f);
+                cell["riskExpectancy"] = json!(if trend["trendMode"] == "blend" {
+                    let lambda = trend["trendBlendLambda"].as_f64().unwrap_or(0.7); (1.0-lambda)*mean+lambda*f
+                } else {f});
+            }
+        }
+    }
     scheduler::finish_search(pool, &job, &original, true)
         .await
         .unwrap();
@@ -133,8 +153,10 @@ async fn chain_with_trend(pool: &PgPool, trend: &Value) -> (scheduler::ChainJob,
         generation_id: job.generation_id,
         study_id: job.study_id,
         slot_id: job.slot_id,
-        calculation_version: EXPECTANCY_CALCULATION_VERSION.to_string(),
+        calculation_version: if forecast.is_some(){EXPECTANCY_MODEL_CALCULATION_VERSION}else{EXPECTANCY_CALCULATION_VERSION}.to_string(),
         historical_input_hash: None,
+        forecast,
+        outcome_hash: forecast.map(|_|db::captured_outcome_hash(&daily_fixture(job.spec["fromUnix"].as_i64().unwrap())).unwrap()),
         tp_pct: 2.0,
         sl_pct: 1.0,
         from_unix: job.spec["fromUnix"].as_i64().unwrap(),
@@ -146,9 +168,16 @@ async fn chain_with_trend(pool: &PgPool, trend: &Value) -> (scheduler::ChainJob,
     (job, identity, original)
 }
 
+fn daily_fixture(from: i64) -> Vec<UtcDailyInput> {
+    let first=utc_midnight_unix(from).unwrap();
+    vec![UtcDailyInput {day_start_unix:first,row_count:1,tp_count:1,sl_count:0,mean_r:Some(2.0)},
+        UtcDailyInput {day_start_unix:first+2*86400,row_count:2,tp_count:1,sl_count:1,mean_r:Some(0.5)}]
+}
+
 fn artifact(identity: &db::ArtifactIdentity, legacy: bool) -> Value {
     let first = utc_midnight_unix(identity.from_unix).unwrap();
     let source = ExpectancySource {
+        forecast: identity.forecast,
         study_id: identity.study_id.to_string(),
         derived_snapshot_id: db::artifact_key(identity).unwrap(),
         generation_id: Some(identity.generation_id.to_string()),
@@ -230,6 +259,13 @@ async fn finish(pool: &PgPool, job: &scheduler::ChainJob, original: &Value) {
         .await
         .unwrap()
     );
+}
+
+async fn bind_historical_profile(pool: &PgPool, job: &scheduler::ChainJob) {
+    // Research Start no longer creates an independently controlled live profile.
+    continuous::profiles::set_permission(pool,"admin","price_volume_spike",true).await.unwrap();
+    sqlx::query("insert into adaptive_profiles(id,owner_id,algorithm_id,min_setups_per_day,accepted_generation_id) select id,owner_id,algorithm_id,min_setups_per_day,$2 from continuous_slots where id=$1")
+        .bind(job.slot_id).bind(job.generation_id).execute(pool).await.unwrap();
 }
 
 #[tokio::test]
@@ -480,14 +516,7 @@ async fn png_exact_key_claim_recovery_retry_limit_and_live_history_reference_are
         assert!(db::load_png_by_image_key(&pool,"admin",&missing).await.unwrap().is_none());
         let mut changed=png.clone();*changed.last_mut().unwrap()^=1;
         assert!(db::store_png(&pool,"admin",id,"1",&changed).await.is_err());
-        for attempt in 1..=3 {
-            let claim=db::claim_render(&pool,"bounded-failure",2).await.unwrap().unwrap();
-            db::finish_render(&pool,&claim,None,Some("injected_render_failure")).await.unwrap();
-            assert!(db::claim_render(&pool,"backoff",2).await.unwrap().is_none());
-            assert_eq!(sqlx::query_scalar::<_,i16>("select attempts from study_expectancy_render_attempts where render_version=2").fetch_one(&pool).await.unwrap(),attempt);
-            sqlx::query("update study_expectancy_render_attempts set next_attempt_at=clock_timestamp()-interval '1 second'").execute(&pool).await.unwrap();
-        }
-        assert!(db::claim_render(&pool,"retry-exhausted",2).await.unwrap().is_none());
+        assert!(db::claim_render(&pool,"new-recipe-does-not-enqueue-history",2).await.unwrap().is_none());
         let setup:i32=sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,details,adaptive_slot_id,adaptive_generation_id) values('bybit','linear','BTCUSDT','price_volume_spike','1.1.1','{}',to_timestamp(0),to_timestamp(60),'100','{}',$1,$2) returning id")
             .bind(job.slot_id).bind(job.generation_id).fetch_one(&pool).await.unwrap();
         assert_eq!(sqlx::query_scalar::<_,i64>("select expectancy_artifact_id from live_setups where id=$1").bind(setup).fetch_one(&pool).await.unwrap(),id);
@@ -532,6 +561,140 @@ async fn render_claim_uses_original_study_trend_not_current_research_config() {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn model_recipe_exact_identity_cutoff_capture_and_bounded_claims_preserve_saved_science() {
+    for mode in ["mean", "forecast", "blend"] {
+        let trend=json!({"forecast":setups_domain::forecast::ForecastRecipe::engineering_baseline(),
+            "trendMode":mode,"trendBlendLambda":0.7});
+        isolated(move |pool| async move {
+            let (job,identity,original)=chain_with_trend(&pool,&trend).await;
+            assert_eq!(identity.calculation_version,"3");
+            let before:String=sqlx::query_scalar("select result::text from optimization_studies where id=$1")
+                .bind(job.study_id).fetch_one(&pool).await.unwrap();
+            let numerical=artifact(&identity,false);
+            let id=db::seal_for_chain(&pool,&job,&identity,&numerical).await.unwrap().unwrap();
+            assert_eq!(db::seal_for_chain(&pool,&job,&identity,&numerical).await.unwrap(),Some(id));
+            assert_eq!(db::get_by_identity(&pool,&identity).await.unwrap().unwrap().id,id);
+            assert!(db::get_for_generation(&pool,"admin",job.generation_id,"3").await.is_err(),"no generation-only v3 lookup");
+            assert!(db::get_for_generation(&pool,"admin",job.generation_id,"2").await.unwrap().is_none());
+            for field in 0..3 {
+                let mut other=identity.clone();
+                match field {
+                    0 => { let mut recipe=serde_json::to_value(other.forecast.unwrap()).unwrap();recipe["halfLifeDays"]=json!(7.0);other.forecast=Some(serde_json::from_value(recipe).unwrap()); },
+                    1 => other.observation_cutoff-=60,
+                    _ => other.outcome_hash=Some("b".repeat(64)),
+                }
+                assert!(db::get_by_identity(&pool,&other).await.unwrap().is_none());
+                let other_numerical=artifact(&other,false);
+                assert!(db::seal_for_chain(&pool,&job,&other,&other_numerical).await.is_err());
+            }
+            assert!(db::claim_render(&pool,"before-finalize",2).await.unwrap().is_none());
+            finish(&pool,&job,&original).await;
+            assert!(db::enrich_saved_generation(&pool,"admin",job.generation_id).await.unwrap().is_none(),"startup never converts explicit recipes into v2");
+            assert_eq!(sqlx::query_scalar::<_,String>("select result::text from optimization_studies where id=$1")
+                .bind(job.study_id).fetch_one(&pool).await.unwrap(),before);
+            assert!(db::claim_render(&pool,"legacy-lane",1).await.unwrap().is_none());
+            for attempt in 1..=3 {
+                let claim=db::claim_render(&pool,"model-bounded-failure",2).await.unwrap().unwrap();
+                assert_eq!(claim.artifact.id,id);
+                assert_eq!(claim.study_trend["forecast"],trend["forecast"]);
+                assert_eq!(claim.study_trend["observationCutoff"],job.observation_cutoff);
+                db::finish_render(&pool,&claim,None,Some("injected_model_render_failure")).await.unwrap();
+                assert!(db::claim_render(&pool,"model-backoff",2).await.unwrap().is_none());
+                assert_eq!(sqlx::query_scalar::<_,i16>("select attempts from study_expectancy_render_attempts where artifact_id=$1 and render_version=2")
+                    .bind(id).fetch_one(&pool).await.unwrap(),attempt);
+                sqlx::query("update study_expectancy_render_attempts set next_attempt_at=clock_timestamp()-interval '1 second' where artifact_id=$1")
+                    .bind(id).execute(&pool).await.unwrap();
+            }
+            assert!(db::claim_render(&pool,"model-retry-exhausted",2).await.unwrap().is_none());
+            assert_eq!(db::get_by_identity(&pool,&identity).await.unwrap().unwrap().numerical_snapshot,numerical);
+        }).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn model_atomic_gate_checkpoint_recovery_retains_recipe_cutoff_and_outcome_hash() {
+    isolated(|pool|async move {
+        let recipe=setups_domain::forecast::ForecastRecipe::engineering_baseline();
+        let (old,identity,original)=chain_with_trend(&pool,&json!({"forecast":recipe,"trendMode":"forecast"})).await;
+        let science:String=sqlx::query_scalar("select result::text from optimization_studies where id=$1")
+            .bind(old.study_id).fetch_one(&pool).await.unwrap();
+        let resume_identity=json!({"forecast":recipe,"observationCutoff":old.observation_cutoff});
+        sqlx::query("insert into continuous_runtime_artifacts(generation_id,identity,snapshot_manifest,reserved_bytes,snapshot_bytes) values($1,$2,'{}',1048576,1)")
+            .bind(old.generation_id).bind(&resume_identity).execute(&pool).await.unwrap();
+        sqlx::query("insert into continuous_frozen_chunks values($1,0,decode('01','hex'),repeat('0',64))")
+            .bind(old.generation_id).execute(&pool).await.unwrap();
+        // Recovery owns opaque checkpoint bytes; optimizer codec coverage is
+        // separate. This fixture proves exact durable bytes and identity fences.
+        let checkpoint=serde_json::to_vec(&resume_identity).unwrap();
+        assert_eq!(recovery::save_checkpoint(&pool,&old,&resume_identity,&checkpoint,1048576).await.unwrap(),1);
+        let numerical=artifact(&identity,false);
+        let gate=recovery::Gate {result:json!({"best":original["best"],
+            "selectedCell":{"tpPct":2.0,"slPct":1.0,"rawR":1.0},"meanExpectancy":1.0,
+            "analytics":{"evaluation":{"matrix":original["best"]["matrix"]}}}),
+            accepted:false,mean:Some(1.0),selected:Some(json!({"tpPct":2.0,"slPct":1.0,"rawR":1.0}))};
+        for _ in 0..2 {
+            assert!(recovery::save_gate_with_expectancy(&pool,&old,&resume_identity,&gate,Some((&identity,&numerical))).await.unwrap());
+        }
+        let sealed=db::get_by_identity(&pool,&identity).await.unwrap().unwrap();
+        assert_eq!(sealed.identity.forecast,Some(recipe));
+        assert_eq!(sealed.identity.observation_cutoff,old.observation_cutoff);
+        assert_eq!(sealed.identity.outcome_hash,identity.outcome_hash);
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_expectancy_artifacts").fetch_one(&pool).await.unwrap(),1);
+        sqlx::query("update continuous_owner_lanes set lease_until=clock_timestamp()-interval '1 second'").execute(&pool).await.unwrap();
+        let lease=scheduler::claim_owner(&pool,"model-after-atomic-gate-crash").await.unwrap().unwrap();
+        scheduler::recover_owner(&pool,&lease).await.unwrap();
+        let same=recovery::active_job(&pool,&lease).await.unwrap().unwrap();
+        assert_eq!((same.generation_id,same.study_id,same.observation_cutoff,same.research_deadline),
+            (old.generation_id,old.study_id,old.observation_cutoff,old.research_deadline));
+        assert!(!recovery::save_gate_with_expectancy(&pool,&old,&resume_identity,&gate,Some((&identity,&numerical))).await.unwrap());
+        let mut wrong=resume_identity.clone();wrong["observationCutoff"]=json!(old.observation_cutoff-60);
+        assert!(recovery::load(&pool,&same,&wrong).await.err().unwrap().to_string().contains("resume_identity_incompatible"));
+        let loaded=recovery::load(&pool,&same,&resume_identity).await.unwrap();
+        assert_eq!(loaded.checkpoint,Some(checkpoint));assert_eq!(loaded.checkpoint_sequence,1);
+        let recovered=loaded.gate.unwrap();assert_eq!(recovered.result,gate.result);
+        assert!(recovery::save_gate_with_expectancy(&pool,&same,&resume_identity,&recovered,Some((&identity,&numerical))).await.unwrap());
+        assert_eq!(db::get_by_identity(&pool,&identity).await.unwrap().unwrap(),sealed);
+        assert!(scheduler::finalize(&pool,&same,&recovered.result,false,recovered.mean,recovered.selected.as_ref()).await.unwrap());
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from continuous_runtime_artifacts").fetch_one(&pool).await.unwrap(),0);
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from continuous_frozen_chunks").fetch_one(&pool).await.unwrap(),0);
+        assert_eq!(sqlx::query_scalar::<_,String>("select result::text from optimization_studies where id=$1")
+            .bind(old.study_id).fetch_one(&pool).await.unwrap(),science);
+        assert_eq!(sqlx::query_scalar::<_,Value>("select spec from continuous_generations where id=$1")
+            .bind(old.generation_id).fetch_one(&pool).await.unwrap(),old.spec);
+        assert_eq!(db::get_by_identity(&pool,&identity).await.unwrap().unwrap(),sealed);
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn model_png_is_separate_and_exact_recipe_cutoff_image_identity_is_required() {
+    isolated(|pool|async move {
+        let trend=json!({"forecast":setups_domain::forecast::ForecastRecipe::engineering_baseline(),"trendMode":"forecast"});
+        let (job,identity,original)=chain_with_trend(&pool,&trend).await;
+        let numerical=artifact(&identity,false);
+        let id=db::seal_for_chain(&pool,&job,&identity,&numerical).await.unwrap().unwrap();
+        finish(&pool,&job,&original).await;
+        let canonical=ExpectancyArtifact::from_json(&serde_json::to_vec(&numerical).unwrap()).unwrap();
+        let key=canonical.image_key(2);
+        assert_eq!(key.forecast,identity.forecast);assert_eq!(key.observation_cutoff,Some(identity.observation_cutoff));
+        let png=png_fixture();
+        assert!(db::store_png(&pool,"admin",id,"1",&png).await.is_err());
+        let claim=db::claim_render(&pool,"model-renderer",2).await.unwrap().unwrap();
+        db::finish_render(&pool,&claim,Some(&png),None).await.unwrap();
+        assert_eq!(db::load_png_by_image_key(&pool,"admin",&key).await.unwrap(),Some(png));
+        assert!(db::claim_render(&pool,"model-cached",2).await.unwrap().is_none());
+        assert!(db::claim_render(&pool,"legacy-not-enqueued",1).await.unwrap().is_none());
+        let mut wrong=key.clone();wrong.observation_cutoff=Some(identity.observation_cutoff-60);
+        assert!(db::load_png_by_image_key(&pool,"admin",&wrong).await.is_err());
+        let mut wrong=key.clone();wrong.forecast=Some(setups_domain::forecast::ForecastRecipe::Trend {
+            version:1,bend_days:setups_domain::trend::TrendBendDays::Seven});
+        assert!(db::load_png_by_image_key(&pool,"admin",&wrong).await.is_err());
+    }).await;
+}
+
 #[test]
 fn identity_key_is_order_independent_and_bounded() {
     let mut identity = db::ArtifactIdentity {
@@ -541,6 +704,8 @@ fn identity_key_is_order_independent_and_bounded() {
         slot_id: 3,
         calculation_version: "2".into(),
         historical_input_hash: None,
+        forecast: None,
+        outcome_hash: None,
         tp_pct: 2.0,
         sl_pct: 1.0,
         from_unix: 86400,
@@ -567,6 +732,7 @@ async fn historical_revision_stages_without_rewriting_history_then_publishes_cas
         let (job,identity,original)=chain(&pool).await;finish(&pool,&job,&original).await;
         let original_id=db::seal_existing(&pool,&identity,&artifact(&identity,true)).await.unwrap();
         sqlx::query("update continuous_slots set active_generation_id=$2,status='active' where id=$1").bind(job.slot_id).bind(job.generation_id).execute(&pool).await.unwrap();
+        bind_historical_profile(&pool,&job).await;
         let admission=db::admit_historical_recalculation(&pool,"admin",job.generation_id).await.unwrap().unwrap();
         let before:(String,String,String)=sqlx::query_as("select g.result::text,s.result::text,a.numerical_snapshot::text from continuous_generations g join optimization_studies s on s.id=g.study_id join study_expectancy_artifacts a on a.id=g.expectancy_artifact_id where g.id=$1").bind(job.generation_id).fetch_one(&pool).await.unwrap();
         let provenance=db::HistoricalRecalculationProvenance {revision:1,input_hash:"a".repeat(64),raw_setups_hash:"b".repeat(64),
@@ -594,6 +760,8 @@ async fn historical_revision_stages_without_rewriting_history_then_publishes_cas
         assert_eq!(before,after);
         assert!(sqlx::query("update study_expectancy_recalculations set matched=false where id=$1").bind(stage.id).execute(&pool).await.is_err());
         sqlx::query("update continuous_processes set desired_running=false where owner_id='admin'").execute(&pool).await.unwrap();
+        assert!(db::publish_historical_recalculation(&pool,"admin",job.generation_id,&provenance.input_hash).await.unwrap().is_some(),"research Stop does not revoke independent profile control");
+        sqlx::query("update adaptive_profiles set desired_running=false where id=$1").bind(job.slot_id).execute(&pool).await.unwrap();
         assert!(db::publish_historical_recalculation(&pool,"admin",job.generation_id,&provenance.input_hash).await.unwrap().is_none());
         assert!(db::stage_historical_recalculation(&pool,&admission,&provenance,&comparison,Some(&numerical)).await.unwrap().is_none());
     }).await;
@@ -606,6 +774,7 @@ async fn historical_mismatch_is_immutable_evidence_not_a_publishable_artifact() 
         let (job,identity,original)=chain(&pool).await;finish(&pool,&job,&original).await;
         db::seal_existing(&pool,&identity,&artifact(&identity,true)).await.unwrap();
         sqlx::query("update continuous_slots set active_generation_id=$2,status='active' where id=$1").bind(job.slot_id).bind(job.generation_id).execute(&pool).await.unwrap();
+        bind_historical_profile(&pool,&job).await;
         let admission=db::admit_historical_recalculation(&pool,"admin",job.generation_id).await.unwrap().unwrap();
         let provenance=db::HistoricalRecalculationProvenance {revision:1,input_hash:"c".repeat(64),raw_setups_hash:"d".repeat(64),
             recalculated_at_unix:chrono::Utc::now().timestamp(),data_source:"existing_market_data_history".into(),

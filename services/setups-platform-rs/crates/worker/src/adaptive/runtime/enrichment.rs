@@ -2,12 +2,67 @@
 //! outbox job. Daily series stay in the bounded research artifact, not live RAM.
 use super::*;
 use setups_domain::expectancy::{
-    EXPECTANCY_CALCULATION_VERSION, ExpectancyArtifact, ExpectancyImageKey, ExpectancyTimezone,
-    ExpectancyUnavailableReason, MetricAvailability,
+    EXPECTANCY_CALCULATION_VERSION, EXPECTANCY_MODEL_CALCULATION_VERSION, ExpectancyArtifact,
+    ExpectancyImageKey, ExpectancyTimezone, ExpectancyUnavailableReason, MetricAvailability,
 };
+use setups_domain::forecast::ForecastRecipe;
+use sha2::{Digest, Sha256};
 
 pub(super) const MAX_EXPECTANCY_SNAPSHOT_BYTES: usize = 8 * 1024;
 const IMAGE_RENDER_VERSION: u32 = 1;
+
+fn calculation_version(recipe: Option<ForecastRecipe>) -> u32 {
+    if recipe.is_some() {
+        EXPECTANCY_MODEL_CALCULATION_VERSION
+    } else {
+        EXPECTANCY_CALCULATION_VERSION
+    }
+}
+
+fn image_render_version(recipe: Option<ForecastRecipe>) -> u32 {
+    if recipe.is_some() {
+        setups_analytics::expectancy_chart::PROBABILITY_RENDER_VERSION
+    } else {
+        IMAGE_RENDER_VERSION
+    }
+}
+
+/// Small delivery identity, not another numerical artifact or PNG cache entry.
+/// The base digest binds the original population/hash, q, recipe, C and version;
+/// the two scalar fields distinguish each exact signal overlay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExpectancyOverlayKey {
+    pub base_image_key_sha256: String,
+    pub raw_signal_at: i64,
+    pub forecast_r: f64,
+}
+
+impl ExpectancyOverlayKey {
+    pub(crate) fn new(
+        base: &ExpectancyImageKey,
+        raw_signal_at: i64,
+        forecast_r: f64,
+    ) -> Result<Self, WorkerError> {
+        if !forecast_r.is_finite()
+            || base.forecast.is_none()
+            || base
+                .observation_cutoff
+                .is_none_or(|cutoff| raw_signal_at < cutoff)
+            || base.render_version != image_render_version(base.forecast)
+        {
+            return Err(invalid("invalid new-model overlay inputs"));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"expectancy-signal-overlay-base-v1\0");
+        digest.update(serde_json::to_vec(base)?);
+        Ok(Self {
+            base_image_key_sha256: format!("{:x}", digest.finalize()),
+            raw_signal_at,
+            forecast_r,
+        })
+    }
+}
 
 /// Actual historical input is separate from the immutable research reference.
 /// Publication time, not the old market cutoff, bounds eligible raw signals.
@@ -68,6 +123,10 @@ pub struct AdaptiveExpectancySnapshot {
     pub image_key: Option<ExpectancyImageKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub historical_recalculation: Option<HistoricalExpectancySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<ForecastRecipe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_key: Option<ExpectancyOverlayKey>,
 }
 
 fn unavailable(reason: ExpectancyUnavailableReason) -> MetricAvailability<f64> {
@@ -93,7 +152,13 @@ impl AdaptiveExpectancySnapshot {
         raw: i64,
     ) -> Result<(), WorkerError> {
         let p = &envelope.snapshot.provenance;
-        if self.calculation_version != EXPECTANCY_CALCULATION_VERSION
+        if let Some(recipe) = self.forecast {
+            recipe
+                .validate()
+                .map_err(|_| invalid("invalid saved forecast recipe"))?;
+        }
+        if self.calculation_version != calculation_version(envelope.snapshot.forecast)
+            || self.forecast != envelope.snapshot.forecast
             || self.timezone != ExpectancyTimezone::UTC
             || (self.study_id, self.generation_id, self.slot_id)
                 != (envelope.study_id, envelope.generation_id, envelope.slot_id)
@@ -157,10 +222,23 @@ impl AdaptiveExpectancySnapshot {
                 || key.sl_pct != envelope.snapshot.sl_pct
                 || key.calculation_version != self.calculation_version
                 || key.timezone != self.timezone
-                || key.render_version != IMAGE_RENDER_VERSION
+                || key.render_version != image_render_version(self.forecast)
+                || key.forecast != self.forecast
+                || key.observation_cutoff != self.forecast.map(|_| self.source_cutoff)
             {
                 return Err(invalid("saved expectancy image identity mismatch"));
             }
+        }
+        match (
+            &self.image_key,
+            self.forecast,
+            self.forecast_r.as_ref(),
+            &self.overlay_key,
+        ) {
+            (Some(base), Some(_), Some(value), Some(overlay))
+                if *overlay == ExpectancyOverlayKey::new(base, raw, *value)? => {}
+            (_, None, _, None) | (None, Some(_), _, None) => {}
+            _ => return Err(invalid("saved expectancy signal-overlay identity mismatch")),
         }
         Ok(())
     }
@@ -173,13 +251,22 @@ pub(super) fn freeze(
     raw_signal_at: i64,
     artifact: Option<&ExpectancyArtifact>,
 ) -> Result<AdaptiveExpectancySnapshot, WorkerError> {
+    freeze_with_forecast(envelope, raw_signal_at, artifact, None)
+}
+
+fn freeze_with_forecast(
+    envelope: &RecommendationEnvelope,
+    raw_signal_at: i64,
+    artifact: Option<&ExpectancyArtifact>,
+    validated_forecast: Option<&MetricAvailability<f64>>,
+) -> Result<AdaptiveExpectancySnapshot, WorkerError> {
     let snapshot = &envelope.snapshot;
     let p = &snapshot.provenance;
     if p.observation_cutoff > raw_signal_at {
         return Err(invalid("expectancy source cutoff is after raw signal"));
     }
     let mut saved = AdaptiveExpectancySnapshot {
-        calculation_version: EXPECTANCY_CALCULATION_VERSION,
+        calculation_version: calculation_version(snapshot.forecast),
         timezone: ExpectancyTimezone::UTC,
         study_id: envelope.study_id,
         generation_id: envelope.generation_id,
@@ -206,11 +293,16 @@ pub(super) fn freeze(
         forecast_at_unix: raw_signal_at,
         image_key: None,
         historical_recalculation: None,
+        forecast: snapshot.forecast,
+        overlay_key: None,
     };
     if let Some(artifact) = artifact {
-        let forecast = artifact
-            .forecast_at_raw_signal(raw_signal_at)
-            .map_err(|error| invalid(&error.to_string()))?;
+        let forecast = match validated_forecast {
+            Some(value) if artifact.source.forecast.is_some() => value.clone(),
+            _ => artifact
+                .forecast_at_raw_signal(raw_signal_at)
+                .map_err(|error| invalid(&error.to_string()))?,
+        };
         let source = &artifact.source;
         if source.study_id != envelope.study_id.to_string()
             || source.generation_id.as_deref() != Some(envelope.generation_id.to_string().as_str())
@@ -219,6 +311,8 @@ pub(super) fn freeze(
             || source.direction != snapshot.direction
             || source.tp_pct != snapshot.tp_pct
             || source.sl_pct != snapshot.sl_pct
+            || source.forecast != snapshot.forecast
+            || artifact.calculation_version != saved.calculation_version
             || source.analytics.cluster_enabled != snapshot.cluster_enabled
             || source.analytics.cluster_gap_minutes != snapshot.cluster_gap_minutes
             || source.analytics.time_shift_minutes != snapshot.time_shift_minutes
@@ -255,7 +349,15 @@ pub(super) fn freeze(
             .as_ref()
             .is_some_and(|days| days.iter().any(|day| day.mean_r.is_some()))
         {
-            saved.image_key = Some(artifact.image_key(IMAGE_RENDER_VERSION));
+            if snapshot.forecast.is_none() || saved.forecast_r.as_ref().is_some() {
+                let key = artifact.image_key(image_render_version(snapshot.forecast));
+                saved.overlay_key = snapshot
+                    .forecast
+                    .and_then(|_| saved.forecast_r.as_ref())
+                    .map(|value| ExpectancyOverlayKey::new(&key, raw_signal_at, *value))
+                    .transpose()?;
+                saved.image_key = Some(key);
+            }
         }
     }
     saved.validate_for(envelope, raw_signal_at)?;
@@ -349,7 +451,14 @@ pub(super) fn attach(
             let matches_horizon = slot.spec["horizonMinutes"].as_i64()
                 == Some(artifact.source.analytics.horizon_minutes);
             match matches_horizon
-                .then(|| freeze(&envelope, setup.raw.close_time_unix, Some(artifact)))
+                .then(|| {
+                    freeze_with_forecast(
+                        &envelope,
+                        setup.raw.close_time_unix,
+                        Some(&artifact.artifact),
+                        artifact.frozen_forecast.as_ref(),
+                    )
+                })
                 .transpose()
             {
                 Ok(Some(saved)) => (saved, false),
@@ -391,14 +500,93 @@ pub(super) fn attach(
 /// Every OPTIONAL lookup failure degrades here. This function never executes or
 /// catches the authoritative setup/checkpoint/outbox CAS that follows it.
 pub(super) struct CapturedArtifact {
-    original: ExpectancyArtifact,
+    original: ValidatedArtifact,
     preferred: Option<PreferredExpectancy>,
 }
 
 struct PreferredExpectancy {
-    artifact: ExpectancyArtifact,
+    artifact: ValidatedArtifact,
     artifact_id: i64,
     historical: HistoricalExpectancySnapshot,
+}
+
+/// One immutable owned artifact per bounded capture/commit. Only this private
+/// constructor can authorize the scalar fast path; validation is never skipped
+/// for untrusted JSON and no full artifact is cloned for individual signals.
+struct ValidatedArtifact {
+    artifact: ExpectancyArtifact,
+    frozen_forecast: Option<MetricAvailability<f64>>,
+}
+
+impl std::ops::Deref for ValidatedArtifact {
+    type Target = ExpectancyArtifact;
+    fn deref(&self) -> &Self::Target {
+        &self.artifact
+    }
+}
+
+impl ValidatedArtifact {
+    fn new(artifact: ExpectancyArtifact) -> Result<Self, WorkerError> {
+        Self::validate_with(artifact, |artifact| {
+            artifact
+                .validate()
+                .map_err(|error| invalid(&error.to_string()))
+        })
+    }
+
+    fn validate_with(
+        artifact: ExpectancyArtifact,
+        validate: impl FnOnce(&ExpectancyArtifact) -> Result<(), WorkerError>,
+    ) -> Result<Self, WorkerError> {
+        validate(&artifact)?;
+        Ok(Self::from_validated(artifact))
+    }
+
+    /// Consumes proof established by our own validator or the DB reader, whose
+    /// decode_numerical/from_json boundary already rebuilds and validates core.
+    /// This constructor is private: arbitrary JSON must use new/validate_with.
+    fn from_validated(artifact: ExpectancyArtifact) -> Self {
+        // Copy canonical, already rebuilt model output, not a second formula.
+        // Availability mapping mirrors the domain's typed contract; raw/C and
+        // complete source identity remain checked separately for every signal.
+        let frozen_forecast = artifact.source.forecast.map(|recipe| {
+            use setups_domain::forecast::{ForecastUnavailableReason, ProbabilityForecast};
+            match (&artifact.forecast, recipe) {
+                (Some(model), ForecastRecipe::DecayedProbability { .. }) => match model
+                    .probability
+                    .as_ref()
+                    .expect("validated probability method")
+                    .estimate
+                {
+                    ProbabilityForecast::Available { value } => MetricAvailability::Available {
+                        value: value.forecast_r,
+                    },
+                    ProbabilityForecast::Unavailable { reason } => unavailable(match reason {
+                        ForecastUnavailableReason::NoClosedOutcomes => {
+                            ExpectancyUnavailableReason::NoClosedOutcomes
+                        }
+                        ForecastUnavailableReason::NoWeightedEvidence => {
+                            ExpectancyUnavailableReason::NoWeightedEvidence
+                        }
+                    }),
+                },
+                (Some(model), ForecastRecipe::Trend { .. }) => match &model.trend {
+                    Some(trend) => MetricAvailability::Available {
+                        value: trend.end.value,
+                    },
+                    None => unavailable(ExpectancyUnavailableReason::InsufficientFiniteDays),
+                },
+                (None, _) => unavailable(match &artifact.daily {
+                    MetricAvailability::Unavailable { reason } => *reason,
+                    _ => ExpectancyUnavailableReason::MissingFrozenOutcomes,
+                }),
+            }
+        });
+        Self {
+            artifact,
+            frozen_forecast,
+        }
+    }
 }
 
 pub(super) struct CapturedExpectancy {
@@ -408,31 +596,78 @@ pub(super) struct CapturedExpectancy {
 }
 
 pub(super) async fn load(pool: &PgPool, slot: &ActiveAdaptiveSlot) -> CapturedExpectancy {
-    let row = setups_db::expectancy::get_for_generation(
-        pool,
-        &slot.owner_id,
-        slot.generation_id,
-        &EXPECTANCY_CALCULATION_VERSION.to_string(),
-    )
-    .await;
-    let mut captured = capture_result(row, slot);
+    let recipe = match saved_recipe(slot) {
+        Ok(recipe) => recipe,
+        Err(_) => {
+            return CapturedExpectancy {
+                artifact: None,
+                artifact_id: None,
+                invalid_evidence: true,
+            };
+        }
+    };
+    let version = calculation_version(recipe).to_string();
+    // Production uses Tokio's multithread runtime. A bounded, non-cancellable
+    // capture validates once without monopolizing an async executor thread or
+    // detaching a validation job that could outlive its commit admission.
+    let capture = async {
+        let row = async {
+            if recipe.is_some() {
+                // The chain's immutable committed reference owns the exact
+                // outcome hash. Do not guess it from means, choose any v3 row,
+                // or fall back to an old generation's version-only lookup.
+                let id: Option<Option<i64>> = sqlx::query_scalar("select expectancy_artifact_id from continuous_generations where id=$1 and owner_id=$2 and slot_id=$3 and study_id=$4")
+                    .bind(slot.generation_id).bind(&slot.owner_id).bind(slot.slot_id).bind(slot.study_id)
+                    .fetch_optional(pool).await?;
+                match id.flatten() {
+                    Some(id) => setups_db::expectancy::get(pool, &slot.owner_id, id).await,
+                    None => Ok(None),
+                }
+            } else {
+                setups_db::expectancy::get_for_generation(pool, &slot.owner_id, slot.generation_id, &version).await
+            }
+        }.await;
+        match row {
+            // Both DB readers validate numerical JSON before returning it.
+            // Carry that private proof through source/identity checks rather
+            // than rebuilding the same O(days²) model for a second time.
+            Ok(Some(row)) => decode_validated_record(ReadValidatedRecord(row), slot),
+            other => capture_result(other, slot),
+        }
+    };
+    let mut captured = if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(capture))
+    } else {
+        capture.await
+    };
     // Native post-chain capture stays on the original one-query path. Both
     // copies below belong to this commit only, with no live/profile RAM cache.
-    if captured
-        .artifact
-        .as_ref()
-        .is_some_and(|artifact| artifact.original.daily.as_ref().is_none())
-    {
+    if captured.artifact.as_ref().is_some_and(|artifact| {
+        artifact.original.source.forecast.is_none() && artifact.original.daily.as_ref().is_none()
+    }) {
         let preferred = setups_db::expectancy::get_published_recalculation(
             pool,
             &slot.owner_id,
             slot.generation_id,
-            &EXPECTANCY_CALCULATION_VERSION.to_string(),
+            &version,
         )
         .await;
         capture_preferred(&mut captured, preferred, slot);
     }
     captured
+}
+
+fn saved_recipe(slot: &ActiveAdaptiveSlot) -> Result<Option<ForecastRecipe>, WorkerError> {
+    let snapshot: setups_domain::AdaptiveRecommendationSnapshot =
+        serde_json::from_value(slot.result["recommendation"].clone())?;
+    if let Some(recipe) = snapshot.forecast {
+        recipe
+            .validate()
+            .map_err(|_| invalid("invalid accepted forecast recipe"))?;
+    }
+    Ok(snapshot.forecast)
 }
 
 fn capture_result(
@@ -481,17 +716,53 @@ fn decode_record(
     }
 }
 
+/// Only created immediately after a successful validating DB get. It is not a
+/// public alternate entry point for raw artifacts or test-created records.
+struct ReadValidatedRecord(setups_db::expectancy::Artifact);
+
+fn decode_validated_record(
+    row: ReadValidatedRecord,
+    slot: &ActiveAdaptiveSlot,
+) -> CapturedExpectancy {
+    let id = row.0.id;
+    match decode_artifact_fields(row.0, slot, None) {
+        Some(artifact) => CapturedExpectancy {
+            artifact: Some(CapturedArtifact {
+                original: ValidatedArtifact::from_validated(artifact),
+                preferred: None,
+            }),
+            artifact_id: Some(id),
+            invalid_evidence: false,
+        },
+        None => CapturedExpectancy {
+            artifact: None,
+            artifact_id: None,
+            invalid_evidence: true,
+        },
+    }
+}
+
 fn decode_artifact(
     row: setups_db::expectancy::Artifact,
     slot: &ActiveAdaptiveSlot,
     historical_input_hash: Option<&str>,
+) -> Option<ValidatedArtifact> {
+    ValidatedArtifact::new(decode_artifact_fields(row, slot, historical_input_hash)?).ok()
+}
+
+fn decode_artifact_fields(
+    row: setups_db::expectancy::Artifact,
+    slot: &ActiveAdaptiveSlot,
+    historical_input_hash: Option<&str>,
 ) -> Option<ExpectancyArtifact> {
+    let recipe = saved_recipe(slot).ok()?;
     let valid = row.id > 0
         && row.identity.owner_id == slot.owner_id
         && row.identity.generation_id == slot.generation_id
         && row.identity.study_id == slot.study_id
         && row.identity.slot_id == slot.slot_id
-        && row.identity.calculation_version == EXPECTANCY_CALCULATION_VERSION.to_string()
+        && row.identity.calculation_version == calculation_version(recipe).to_string()
+        && row.identity.forecast == recipe
         && row.identity.tp_pct == slot.selected_cell["tpPct"].as_f64().unwrap_or(f64::NAN)
         && row.identity.sl_pct == slot.selected_cell["slPct"].as_f64().unwrap_or(f64::NAN)
         && row.identity.effective_analytics == slot.analytics
@@ -501,7 +772,34 @@ fn decode_artifact(
         .then(|| serde_json::from_value::<ExpectancyArtifact>(row.numerical_snapshot))
         .transpose();
     match artifact {
-        Ok(Some(artifact)) if artifact.source.derived_snapshot_id == row.key => Some(artifact),
+        Ok(Some(artifact))
+            if artifact.source.derived_snapshot_id == row.key
+                && artifact.calculation_version == calculation_version(recipe)
+                && artifact.source.forecast == recipe =>
+        {
+            if let Some(expected) = &row.identity.outcome_hash {
+                let daily = artifact
+                    .daily
+                    .as_ref()?
+                    .iter()
+                    .map(|p| setups_domain::expectancy::UtcDailyInput {
+                        day_start_unix: p.day_start_unix,
+                        row_count: p.row_count,
+                        tp_count: p.tp_count,
+                        sl_count: p.sl_count,
+                        mean_r: p.mean_r,
+                    })
+                    .collect::<Vec<_>>();
+                if setups_db::expectancy::captured_outcome_hash(&daily)
+                    .ok()
+                    .as_ref()
+                    != Some(expected)
+                {
+                    return None;
+                }
+            }
+            Some(artifact)
+        }
         _ => None,
     }
 }
@@ -557,7 +855,6 @@ fn capture_preferred(
         || artifact.selected_cell != original.selected_cell
         || artifact.matrix_mean_r != original.matrix_mean_r
         || artifact.daily.as_ref().is_none()
-        || artifact.validate().is_err()
     {
         captured.invalid_evidence = true;
         return;
@@ -579,7 +876,7 @@ pub(super) fn report_degraded(slot: &ActiveAdaptiveSlot, affected_setups: usize)
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use setups_domain::{
         AlgorithmParams,
@@ -588,7 +885,7 @@ mod tests {
 
     fn original(artifact: &ExpectancyArtifact) -> CapturedArtifact {
         CapturedArtifact {
-            original: artifact.clone(),
+            original: ValidatedArtifact::new(artifact.clone()).unwrap(),
             preferred: None,
         }
     }
@@ -604,7 +901,7 @@ mod tests {
             generation_id: slot.generation_id,
             study_id: slot.study_id,
             slot_id: slot.slot_id,
-            calculation_version: EXPECTANCY_CALCULATION_VERSION.to_string(),
+            calculation_version: artifact.calculation_version.to_string(),
             tp_pct: artifact.source.tp_pct,
             sl_pct: artifact.source.sl_pct,
             from_unix: artifact.from_unix,
@@ -613,6 +910,28 @@ mod tests {
             provenance: serde_json::to_value(&artifact.source.provenance).unwrap(),
             effective_analytics: slot.analytics.clone(),
             historical_input_hash,
+            forecast: artifact.source.forecast,
+            outcome_hash: artifact.source.forecast.map(|_| {
+                setups_db::expectancy::captured_outcome_hash(
+                    &artifact
+                        .daily
+                        .as_ref()
+                        .map(|points| {
+                            points
+                                .iter()
+                                .map(|p| setups_domain::expectancy::UtcDailyInput {
+                                    day_start_unix: p.day_start_unix,
+                                    row_count: p.row_count,
+                                    tp_count: p.tp_count,
+                                    sl_count: p.sl_count,
+                                    mean_r: p.mean_r,
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                )
+                .unwrap()
+            }),
         };
         let key = setups_db::expectancy::artifact_key(&identity).unwrap();
         artifact.source.derived_snapshot_id = key.clone();
@@ -675,7 +994,7 @@ mod tests {
         (captured, published)
     }
 
-    pub(super) fn fixture() -> (
+    pub(in crate::adaptive::runtime) fn fixture() -> (
         RecommendationEnvelope,
         ExpectancyArtifact,
         AdaptiveInstrument,
@@ -713,6 +1032,7 @@ mod tests {
                 cluster_gap_minutes: source.analytics.cluster_gap_minutes,
                 provenance: source.provenance.clone(),
                 search_forecast: None,
+                forecast: source.forecast,
             },
             study_id: 42,
             generation_id: 3,
@@ -766,6 +1086,246 @@ mod tests {
         (envelope, artifact, instrument, setup, slot)
     }
 
+    fn probability_fixture() -> (
+        RecommendationEnvelope,
+        ExpectancyArtifact,
+        AdaptiveInstrument,
+        AdaptiveSetup,
+        ActiveAdaptiveSlot,
+    ) {
+        use setups_domain::expectancy::{SelectedCellInput, UtcDailyInput};
+        let (mut envelope, legacy, instrument, mut setup, mut slot) = fixture();
+        let recipe = ForecastRecipe::engineering_baseline();
+        envelope.snapshot.forecast = Some(recipe);
+        let mut source = legacy.source.clone();
+        source.forecast = Some(recipe);
+        let cell = legacy.selected_cell.as_ref().unwrap();
+        let artifact = build_expectancy_artifact(ExpectancyInput {
+            source,
+            selected_cell: Some(SelectedCellInput {
+                raw_r: cell.raw_r.as_ref().copied(),
+                tp_count: cell.tp_count,
+                sl_count: cell.sl_count,
+            }),
+            matrix_mean_r: legacy.matrix_mean_r.as_ref().copied(),
+            daily: MetricAvailability::Available {
+                value: legacy
+                    .daily
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|p| UtcDailyInput {
+                        day_start_unix: p.day_start_unix,
+                        row_count: p.row_count,
+                        tp_count: p.tp_count,
+                        sl_count: p.sl_count,
+                        mean_r: p.mean_r,
+                    })
+                    .collect(),
+            },
+        })
+        .unwrap();
+        setup.recommendation["forecast"] = serde_json::to_value(recipe).unwrap();
+        slot.result["recommendation"] = serde_json::to_value(&envelope.snapshot).unwrap();
+        slot.spec["forecast"] = serde_json::to_value(recipe).unwrap();
+        (envelope, artifact, instrument, setup, slot)
+    }
+
+    #[test]
+    fn explicit_recipe_freezes_pure_f_and_scalar_overlay_identity_without_legacy_fallback() {
+        let (envelope, artifact, instrument, mut setup, slot) = probability_fixture();
+        let sealed = artifact.to_json().unwrap();
+        let at = setup.raw.close_time_unix;
+        let expected = artifact.forecast_at_raw_signal(at).unwrap();
+        let pure = *expected.as_ref().unwrap();
+        let blend = setups_domain::forecast::decision_r(
+            setups_domain::trend::TrendMode::Blend,
+            Some(envelope.snapshot.raw_r),
+            Some(pure),
+            Default::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(pure, blend);
+        assert!(
+            !attach(
+                &slot,
+                &instrument,
+                &mut setup,
+                Some(&original(&artifact)),
+                Some(23)
+            )
+            .unwrap()
+        );
+        let saved: AdaptiveExpectancySnapshot =
+            serde_json::from_value(setup.recommendation["expectancy"].clone()).unwrap();
+        assert_eq!(
+            saved.calculation_version,
+            EXPECTANCY_MODEL_CALCULATION_VERSION
+        );
+        assert_eq!(saved.forecast, envelope.snapshot.forecast);
+        assert_eq!(saved.forecast_r, expected);
+        assert_eq!(
+            saved.selected_mean_r.as_ref(),
+            Some(&envelope.snapshot.raw_r)
+        );
+        assert_eq!(
+            saved.matrix_mean_r.as_ref(),
+            Some(&envelope.snapshot.mean_r)
+        );
+        assert_eq!(
+            saved.image_key,
+            Some(
+                artifact.image_key(setups_analytics::expectancy_chart::PROBABILITY_RENDER_VERSION)
+            )
+        );
+        let later = freeze(&envelope, at + 30 * 86400, Some(&artifact)).unwrap();
+        assert_eq!(later.forecast_r, saved.forecast_r);
+        assert_eq!(later.image_key, saved.image_key);
+        assert_ne!(later.overlay_key, saved.overlay_key);
+        let caption = super::super::caption::recommendation_telegram_caption(
+            &instrument,
+            &setup.raw,
+            &setup.recommendation,
+        )
+        .unwrap();
+        assert!(caption.text.contains(&format!("{pure:+.2} R")));
+        let mut tampered = saved.clone();
+        tampered.overlay_key.as_mut().unwrap().raw_signal_at += 60;
+        assert!(tampered.validate_for(&envelope, at).is_err());
+        let fallback = freeze(&envelope, at, None).unwrap();
+        assert_eq!(
+            fallback.calculation_version,
+            EXPECTANCY_MODEL_CALCULATION_VERSION
+        );
+        assert!(fallback.forecast_r.as_ref().is_none());
+        assert!(fallback.image_key.is_none() && fallback.overlay_key.is_none());
+        let (_, legacy, _, _, _) = fixture();
+        assert!(freeze(&envelope, at, Some(&legacy)).is_err());
+        let mut missing = setup.clone();
+        missing
+            .recommendation
+            .as_object_mut()
+            .unwrap()
+            .remove("expectancy");
+        assert!(
+            attach(
+                &slot,
+                &instrument,
+                &mut missing,
+                Some(&original(&legacy)),
+                Some(23)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            missing.recommendation["expectancy"]["forecastR"]["status"],
+            "unavailable"
+        );
+        assert!(missing.recommendation["expectancy"]["imageKey"].is_null());
+        // An already materialized intent, including explicit unavailable, wins
+        // even if compatible evidence appears on an ambiguous retry.
+        let first = serde_json::to_vec(&missing.recommendation).unwrap();
+        attach(
+            &slot,
+            &instrument,
+            &mut missing,
+            Some(&original(&artifact)),
+            Some(23),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_vec(&missing.recommendation).unwrap(), first);
+        assert_eq!(artifact.to_json().unwrap(), sealed);
+    }
+
+    #[test]
+    fn explicit_generation_lookup_checks_saved_recipe_and_version_not_any_available_artifact() {
+        let (_, artifact, _, _, slot) = probability_fixture();
+        let good = decode_record(record(artifact.clone(), &slot, 23, None), &slot);
+        assert!(!good.invalid_evidence && good.artifact.is_some());
+        let (_, legacy, _, _, _) = fixture();
+        let bad = decode_record(record(legacy, &slot, 24, None), &slot);
+        assert!(bad.invalid_evidence && bad.artifact.is_none());
+        let mut changed = slot.clone();
+        changed.result["recommendation"]["forecast"]["halfLifeDays"] = json!(7);
+        let bad = decode_record(record(artifact, &slot, 25, None), &changed);
+        assert!(bad.invalid_evidence && bad.artifact.is_none());
+    }
+
+    #[test]
+    fn one_validated_capture_serves_many_new_signals_without_rebuilding_the_probability_curve() {
+        let (_, artifact, instrument, setup, slot) = probability_fixture();
+        let checks = std::cell::Cell::new(0);
+        let original = ValidatedArtifact::validate_with(artifact, |artifact| {
+            checks.set(checks.get() + 1);
+            artifact
+                .validate()
+                .map_err(|error| invalid(&error.to_string()))
+        })
+        .unwrap();
+        let expected = original.frozen_forecast.clone().unwrap();
+        let captured = CapturedArtifact {
+            original,
+            preferred: None,
+        };
+        for minute in 0..8 {
+            let mut next = setup.clone();
+            next.raw.close_time_unix += minute * 60;
+            next.raw.open_time_unix += minute * 60;
+            next.recommendation["rawSignalAt"] = json!(next.raw.close_time_unix);
+            next.recommendation["recommendedEntryAt"] = json!(next.raw.close_time_unix + 180);
+            assert!(!attach(&slot, &instrument, &mut next, Some(&captured), Some(23)).unwrap());
+            let saved: AdaptiveExpectancySnapshot =
+                serde_json::from_value(next.recommendation["expectancy"].clone()).unwrap();
+            assert_eq!(saved.forecast_r, expected);
+        }
+        assert_eq!(checks.get(), 1);
+        let mut bad_source = setup.clone();
+        bad_source.recommendation["provenance"]["snapshotHash"] = json!("wrong-source");
+        assert!(
+            attach(
+                &slot,
+                &instrument,
+                &mut bad_source,
+                Some(&captured),
+                Some(23)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            bad_source.recommendation["expectancy"]["forecastR"]["status"],
+            "unavailable"
+        );
+        let mut before_cutoff = setup;
+        before_cutoff.raw.close_time_unix =
+            captured.original.source.provenance.observation_cutoff - 60;
+        before_cutoff.recommendation["rawSignalAt"] = json!(before_cutoff.raw.close_time_unix);
+        assert!(
+            attach(
+                &slot,
+                &instrument,
+                &mut before_cutoff,
+                Some(&captured),
+                Some(23)
+            )
+            .is_err()
+        );
+        assert_eq!(checks.get(), 1);
+        let mut corrupt = captured.original.artifact.clone();
+        corrupt
+            .forecast
+            .as_mut()
+            .unwrap()
+            .probability
+            .as_mut()
+            .unwrap()
+            .curve
+            .last_mut()
+            .unwrap()
+            .forecast_r = Some(99.0);
+        assert!(ValidatedArtifact::new(corrupt).is_err());
+    }
+
     #[test]
     fn same_generation_scalars_use_shared_forecast_at_raw_close_and_leave_recipe_and_artifact_unchanged()
      {
@@ -814,7 +1374,11 @@ mod tests {
             &setup.recommendation,
         )
         .unwrap();
-        assert!(caption.text.contains("📈 Прогноз матожидание торговли: +2.11 R"));
+        assert!(
+            caption
+                .text
+                .contains("📈 Прогноз матожидание торговли: +2.11 R")
+        );
         assert!(!caption.text.contains("винрейт"));
         assert!(!caption.text.contains("Динамика МО"));
         assert!(!caption.text.contains("Среднее МО"));
@@ -932,6 +1496,8 @@ mod tests {
             provenance: serde_json::to_value(&artifact.source.provenance).unwrap(),
             effective_analytics: slot.analytics.clone(),
             historical_input_hash: None,
+            forecast: None,
+            outcome_hash: None,
         };
         let key = setups_db::expectancy::artifact_key(&identity).unwrap();
         artifact.source.derived_snapshot_id = key.clone();
@@ -1101,7 +1667,11 @@ mod tests {
             &setup.recommendation,
         )
         .unwrap();
-        assert!(caption.text.contains("📈 Прогноз матожидание торговли: +2.11 R"));
+        assert!(
+            caption
+                .text
+                .contains("📈 Прогноз матожидание торговли: +2.11 R")
+        );
         assert!(serde_json::to_vec(&saved).unwrap().len() < MAX_EXPECTANCY_SNAPSHOT_BYTES);
     }
 
@@ -1415,6 +1985,36 @@ mod tests {
             let durable:Value=sqlx::query_scalar("select state from adaptive_live_checkpoints where slot_id=$1 and instrument_key=$2")
                 .bind(slot.slot_id).bind(key).fetch_one(&pool).await.unwrap();
             assert_eq!(durable,serde_json::to_value(second_checkpoint).unwrap());
+            assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups").fetch_one(&pool).await.unwrap(),2);
+            assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_notification_outbox").fetch_one(&pool).await.unwrap(),2);
+            // Restore optional storage, then exercise the real v3 committed-ID
+            // lookup. A missing/wrong pointer must not pick any available v3
+            // row or silently substitute the coexisting legacy artifact.
+            sqlx::query("alter table fixture_hidden_expectancy_artifacts rename to study_expectancy_artifacts").execute(&pool).await.unwrap();
+            let (_, model, _, mut next, mut model_slot) = probability_fixture();
+            model_slot.slot_id=slot.slot_id;model_slot.generation_id=slot.generation_id;model_slot.study_id=slot.study_id;
+            next.recommendation["generationId"]=json!(slot.generation_id);next.recommendation["studyId"]=json!(slot.study_id);next.recommendation["slotId"]=json!(slot.slot_id);
+            let (_,legacy,_,_,_)=fixture();
+            let mut ids=Vec::with_capacity(2);
+            for mut artifact in [legacy,model] {
+                artifact.source.study_id=slot.study_id.to_string();artifact.source.generation_id=Some(slot.generation_id.to_string());artifact.source.profile_id=Some(slot.slot_id.to_string());
+                let row=record(artifact,&model_slot,1,None);
+                let id:i64=sqlx::query_scalar("insert into study_expectancy_artifacts(artifact_key,owner_id,source_generation_id,source_study_id,source_slot_id,calculation_version,tp_pct,sl_pct,identity,numerical_snapshot) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning id")
+                    .bind(&row.key).bind(&row.identity.owner_id).bind(row.identity.generation_id).bind(row.identity.study_id).bind(row.identity.slot_id).bind(&row.identity.calculation_version).bind(row.identity.tp_pct).bind(row.identity.sl_pct)
+                    .bind(serde_json::to_value(&row.identity).unwrap()).bind(row.numerical_snapshot).fetch_one(&pool).await.unwrap();
+                ids.push(id);
+            }
+            let missing=load(&pool,&model_slot).await;
+            assert!(missing.artifact.is_none() && !missing.invalid_evidence);
+            sqlx::query("update continuous_generations set expectancy_artifact_id=$2 where id=$1").bind(slot.generation_id).bind(ids[0]).execute(&pool).await.unwrap();
+            let wrong=load(&pool,&model_slot).await;
+            assert!(wrong.artifact.is_none() && wrong.invalid_evidence);
+            sqlx::query("update continuous_generations set expectancy_artifact_id=$2 where id=$1").bind(slot.generation_id).bind(ids[1]).execute(&pool).await.unwrap();
+            let captured=load(&pool,&model_slot).await;
+            assert_eq!(captured.artifact_id,Some(ids[1]));assert!(!captured.invalid_evidence);
+            assert!(!attach(&model_slot,&instrument,&mut next,captured.artifact.as_ref(),captured.artifact_id).unwrap());
+            assert_eq!(next.recommendation["expectancy"]["calculationVersion"],3);
+            assert_eq!(next.recommendation["expectancy"]["forecastR"]["status"],"available");
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups").fetch_one(&pool).await.unwrap(),2);
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_notification_outbox").fetch_one(&pool).await.unwrap(),2);
         }).catch_unwind().await;

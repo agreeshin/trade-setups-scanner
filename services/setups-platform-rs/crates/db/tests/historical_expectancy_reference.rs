@@ -90,6 +90,7 @@ async fn insert_artifact(pool: &PgPool, identity: &artifacts::ArtifactIdentity) 
     let key = artifacts::artifact_key(identity).unwrap();
     let numerical = build_expectancy_artifact(ExpectancyInput {
         source: ExpectancySource {
+            forecast: None,
             study_id: identity.study_id.to_string(),
             derived_snapshot_id: key.clone(),
             generation_id: Some(identity.generation_id.to_string()),
@@ -220,6 +221,8 @@ async fn fixture(pool: &PgPool) -> Fixture {
         provenance: serde_json::to_value(&provenance).unwrap(),
         effective_analytics: analytics,
         historical_input_hash: None,
+        forecast: None,
+        outcome_hash: None,
     };
     let (base, _) = insert_artifact(pool, &identity).await;
     sqlx::query("update continuous_generations set expectancy_artifact_id=$2 where id=$1")

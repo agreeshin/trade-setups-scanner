@@ -530,7 +530,9 @@ async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&Continuo
     let persisted:ContinuousReplay=serde_json::from_value(stored).map_err(|e|JobError::new("invalid_persisted_replay",e.to_string()))?;
     // Select only from the already frozen winner. Capture is post-chain only;
     // optimizer trials and the original matrix calculation stay unchanged.
-    let expected_selected=core::select_robust_cell(&best.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell).map_err(compute_error)?;
+    let expected_selected=if spec.forecast.is_some() {
+        core::select_robust_cell_for_mode(&best.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell,spec.trend_mode)
+    } else {core::select_robust_cell(&best.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell)}.map_err(compute_error)?;
     let capture=expected_selected.map(|cell|core::ContinuousCaptureCell{tp_pct:cell.tp_pct,sl_pct:cell.sl_pct});
     let cpu_spec=spec.clone();let cpu_input=input.clone();let cpu_candidate=candidate.clone();let limits=config.optimizer.study_limits();
     let (captured,_)=blocking(cancel,None,move|token|core::analyze_continuous_with_daily(&cpu_spec,&cpu_input,&persisted,&cpu_candidate,&limits,&token,capture)).await?;
@@ -540,7 +542,9 @@ async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&Continuo
         return Err(JobError::new("post_chain_mismatch","Сохранённый replay/аналитика не совпали с frozen исследованием"));
     }
     let recommendation=core::recommend_continuous(&spec,&candidate,&evaluation,&best.provenance,context,job.config["minMeanExpectancy"].as_f64().ok_or_else(||JobError::new("invalid_persisted_config","Нет mean gate"))?).map_err(compute_error)?;
-    let selected=core::select_robust_cell(&evaluation.evaluation.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell).map_err(compute_error)?;
+    let selected=if spec.forecast.is_some() {
+        core::select_robust_cell_for_mode(&evaluation.evaluation.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell,spec.trend_mode)
+    } else {core::select_robust_cell(&evaluation.evaluation.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell)}.map_err(compute_error)?;
     if selected!=expected_selected {return Err(JobError::new("post_chain_selected_cell_mismatch","Frozen selected pair changed during post-chain analytics"));}
     let derived=post_chain_expectancy(job,&spec,&best,&evaluation,selected.as_ref(),captured.selected_daily)?;
     let selected=selected.map(|cell|json!(cell));
@@ -566,14 +570,27 @@ fn post_chain_expectancy(job:&ChainJob,spec:&StudyRequest,best:&core::StudyBest,
         return Ok(None);
     };
     let daily=daily.ok_or_else(||JobError::new("post_chain_capture_missing","Canonical post-chain selected outcomes were not captured"))?;
+    if best.forecast != spec.forecast || (spec.forecast.is_some() && best.observation_cutoff != Some(job.observation_cutoff)) {
+        return Err(JobError::new("post_chain_recipe_mismatch","Frozen winning recipe/cutoff differs from the generation"));
+    }
     if !spec.trend_mode.is_mean() {
+        let forecast = if let Some(recipe @ setups_domain::forecast::ForecastRecipe::DecayedProbability {..}) = spec.forecast {
+            let points:Vec<_> = daily.points.iter().map(|point| setups_domain::forecast::ProbabilityDay {
+                day_start_unix: point.day_start_unix, tp_count: point.tp_count, sl_count: point.sl_count,
+            }).collect();
+            setups_domain::forecast::evaluate_probability(recipe,selected.tp_pct / selected.sl_pct,job.observation_cutoff,&points)
+                .map_err(|error|JobError::new("post_chain_forecast_invalid",error.to_string()))?.as_ref().map(|estimate|estimate.forecast_r)
+        } else {
         let points:Vec<_>=daily.points.iter().map(|point|Ok(setups_domain::trend::TrendInput {
             day:point.day_start_unix.div_euclid(86400) as f64,value:point.mean_r,
             weight:u32::try_from(point.row_count).map_err(|_|JobError::new("post_chain_forecast_invalid","Daily weight exceeds the forecast counter bound"))?,
         })).collect::<Result<_,JobError>>()?;
-        let fit=setups_domain::trend::fit_weighted_trend(&points,spec.trend_bend_days)
+        let bend = match spec.forecast {Some(setups_domain::forecast::ForecastRecipe::Trend {bend_days,..})=>bend_days,_=>spec.trend_bend_days};
+        let fit=setups_domain::trend::fit_weighted_trend(&points,bend)
             .map_err(|error|JobError::new("post_chain_forecast_invalid",error.to_string()))?;
-        if fit.map(|fit|fit.endpoint().value)!=selected.forecast_r {
+        fit.map(|fit|fit.endpoint().value)
+        };
+        if forecast!=selected.forecast_r {
             return Err(JobError::new("post_chain_forecast_mismatch","Captured daily series differs from the optimizing forecast"));
         }
     }
@@ -583,11 +600,12 @@ fn post_chain_expectancy(job:&ChainJob,spec:&StudyRequest,best:&core::StudyBest,
     let cell=evaluation.evaluation.matrix.iter().find(|cell|cell.tp_pct==selected.tp_pct && cell.sl_pct==selected.sl_pct)
         .ok_or_else(||JobError::new("post_chain_capture_mismatch","Selected pair is absent from the frozen matrix"))?;
     let identity=setups_db::expectancy::ArtifactIdentity {owner_id:job.lease.owner_id.clone(),generation_id:job.generation_id,
-        study_id:job.study_id,slot_id:job.slot_id,calculation_version:EXPECTANCY_CALCULATION_VERSION.to_string(),historical_input_hash:None,
+        study_id:job.study_id,slot_id:job.slot_id,calculation_version:if spec.forecast.is_some(){EXPECTANCY_MODEL_CALCULATION_VERSION}else{EXPECTANCY_CALCULATION_VERSION}.to_string(),historical_input_hash:None,
+        forecast:spec.forecast,outcome_hash:if spec.forecast.is_some(){Some(setups_db::expectancy::captured_outcome_hash(&daily.points).map_err(|error|JobError::new("expectancy_outcome_identity_invalid",error.to_string()))?)}else{None},
         tp_pct:selected.tp_pct,sl_pct:selected.sl_pct,from_unix:spec.from_unix,to_unix:spec.to_unix,observation_cutoff:job.observation_cutoff,
         provenance:json!(best.provenance),effective_analytics:json!(best.analytics)};
     let artifact=build_expectancy_artifact(ExpectancyInput {
-        source:ExpectancySource {study_id:job.study_id.to_string(),derived_snapshot_id:setups_db::expectancy::artifact_key(&identity).map_err(|error|JobError::new("expectancy_identity_invalid",error.to_string()))?,
+        source:ExpectancySource {forecast:spec.forecast,study_id:job.study_id.to_string(),derived_snapshot_id:setups_db::expectancy::artifact_key(&identity).map_err(|error|JobError::new("expectancy_identity_invalid",error.to_string()))?,
             generation_id:Some(job.generation_id.to_string()),profile_id:Some(job.slot_id.to_string()),
             provenance:RecommendationProvenance {algorithm_id:spec.algorithm_id.clone(),algorithm_version:spec.algorithm_version.clone(),
                 optimizer_version:best.provenance.optimizer_version.clone(),seed:best.provenance.seed,snapshot_hash:best.provenance.snapshot_hash.clone(),

@@ -3,6 +3,79 @@ use protocol::{RelayMessage, RelayMessageResponse, RelayOutcome, VERSION};
 use reqwest::header::HeaderValue;
 use sha2::Digest;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chart_cpu_lane_cancellation_holds_running_permit_and_releases_waiting_payloads() {
+    use std::sync::atomic::AtomicUsize;
+    struct DropProbe(Arc<AtomicUsize>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let charts = Arc::new(ChartRenderLane::default());
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let first_lane = charts.clone();
+    let first_probe = DropProbe(dropped.clone());
+    let first = tokio::spawn(async move {
+        first_lane
+            .render(move || {
+                let _probe = first_probe;
+                started_tx.send(()).unwrap();
+                release_rx.blocking_recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    started_rx.await.unwrap();
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        charts.permit.available_permits(),
+        0,
+        "aborting await must not free a running CPU slot"
+    );
+    let waiting_lane = charts.clone();
+    let waiting_probe = DropProbe(dropped.clone());
+    let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+    let waiting = tokio::spawn(async move {
+        let render = move || {
+            let _probe = waiting_probe;
+            Ok(())
+        };
+        waiting_tx.send(()).unwrap();
+        waiting_lane.render(render).await
+    });
+    waiting_rx.await.unwrap();
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "cancelled waiter drops its owned buffers without entering the CPU lane"
+    );
+    release_tx.send(()).unwrap();
+    let permit = tokio::time::timeout(Duration::from_secs(2), charts.permit.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(permit);
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    for _ in 0..8 {
+        assert_eq!(
+            charts.render(|| Ok(vec![0u8; 1024])).await.unwrap().len(),
+            1024
+        );
+        assert_eq!(charts.permit.available_permits(), 1);
+    }
+    assert_eq!(
+        charts.render::<()>(|| Err("fixture_render_failure")).await,
+        Err("fixture_render_failure")
+    );
+    assert_eq!(charts.permit.available_permits(), 1);
+}
+
 #[test]
 fn origin_policy_rejects_arbitrary_urls_without_exposing_them() {
     for value in [
@@ -634,7 +707,11 @@ fn saved_fixed_and_adaptive_rendering_use_immutable_names_params_and_expiry() {
     let message = RelayMessage::parse(&bytes, now).unwrap();
     assert!(message.text.contains("SHORT"));
     assert!(message.text.contains("101.00 USDT"));
-    assert!(message.text.contains("🎯 TP = 14%, SL = 4% (от фактической цены входа)"));
+    assert!(
+        message
+            .text
+            .contains("🎯 TP = 14%, SL = 4% (от фактической цены входа)")
+    );
     assert!(!message.text.contains("Исследование") && !message.text.contains("Прогноз"));
     assert!(message.text.contains("Алгоритм: Captured name"));
     job.payload["externalName"] = "Renamed after persistence".into();
@@ -692,6 +769,7 @@ struct LocalRelay {
     photo: Arc<AtomicBool>,
     presentation_calls: Arc<std::sync::atomic::AtomicUsize>,
     calls: Arc<std::sync::Mutex<Vec<RecordedCall>>>,
+    charts: Arc<ChartRenderLane>,
 }
 impl RelayAccess for LocalRelay {
     fn key(&self) -> Result<SecretKey, ClientFailure> {
@@ -721,7 +799,7 @@ impl RelayAccess for LocalRelay {
         job: &TelegramJob,
     ) -> Result<TelegramV2Presentation, ClientFailure> {
         assert!(self.presentation_calls.fetch_add(1, Ordering::SeqCst) < 8);
-        let mut content = saved_presentation(pool, job).await?;
+        let mut content = saved_presentation_with_lane(pool, job, Some(&self.charts)).await?;
         if self.photo.load(Ordering::SeqCst) {
             content.png = Some(png_fixture());
         }
@@ -845,6 +923,7 @@ async fn local_relay(mode: u8) -> (LocalRelay, tokio::task::JoinHandle<()>) {
         photo: Arc::new(AtomicBool::new(false)),
         presentation_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         calls: Arc::default(),
+        charts: Arc::new(ChartRenderLane::default()),
     };
     let app = Router::new()
         .route(protocol::STATUS_PATH, get(handle))
@@ -1280,6 +1359,8 @@ async fn saved_png_regression(pool: &PgPool, relay: &LocalRelay) {
         provenance: serde_json::to_value(&snapshot.provenance).unwrap(),
         effective_analytics: json!({"clusterEnabled":false,"clusterGapMinutes":null,"timeShiftMinutes":3,"priceChangePct":1,"horizonMinutes":60}),
         historical_input_hash: None,
+        forecast: None,
+        outcome_hash: None,
     };
     let key = artifacts::artifact_key(&identity).unwrap();
     let first = utc_midnight_unix(identity.from_unix).unwrap() + 86400;
@@ -1293,6 +1374,7 @@ async fn saved_png_regression(pool: &PgPool, relay: &LocalRelay) {
             direction: RecommendationDirection::Short,
             tp_pct: 14.,
             sl_pct: 4.,
+            forecast: None,
             analytics: ExpectancyAnalytics {
                 cluster_enabled: false,
                 cluster_gap_minutes: None,
@@ -1356,6 +1438,8 @@ async fn saved_png_regression(pool: &PgPool, relay: &LocalRelay) {
         forecast_at_unix: now,
         image_key: Some(numeric.image_key(1)),
         historical_recalculation: None,
+        forecast: None,
+        overlay_key: None,
     };
     job.payload["recommendation"]["expectancy"] = serde_json::to_value(saved).unwrap();
     let setup:i32=sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,adaptive_slot_id,adaptive_generation_id,recommendation,external_name,expectancy_artifact_id) values('bybit','linear','TESTUSDT','price_volume_spike','1.1.1',$1,to_timestamp($2),to_timestamp($3),'100',$4,$5,$6,'Captured name',$7) returning id")
@@ -1462,9 +1546,17 @@ async fn saved_png_regression(pool: &PgPool, relay: &LocalRelay) {
         .execute(pool)
         .await
         .unwrap();
-    artifacts::store_png(pool, "admin", id, "2", &png_fixture())
-        .await
-        .unwrap();
+    assert!(
+        artifacts::store_png(pool, "admin", id, "2", &png_fixture())
+            .await
+            .is_err(),
+        "new-model render version cannot be stored through the legacy writer"
+    );
+    // Fault injection only in this disposable DB: a wrong-version cache row
+    // still must not substitute for the immutable legacy key.
+    sqlx::query("insert into study_expectancy_pngs(artifact_id,rendering_version,image_key,png,sha256) values($1,'2',$2,$3,$4)")
+        .bind(id).bind(serde_json::to_value(numeric.image_key(2)).unwrap()).bind(png_fixture())
+        .bind(format!("{:x}",sha2::Sha256::digest(png_fixture()))).execute(pool).await.unwrap();
     let absent = saved_presentation(pool, &job).await.unwrap();
     assert!(
         absent.png.is_none(),
@@ -1529,6 +1621,238 @@ async fn saved_png_regression(pool: &PgPool, relay: &LocalRelay) {
         "png_unavailable",
         "expected adaptive chart retains its reason after successful text-only delivery"
     );
+    model_png_regression(pool, &job, &identity, &numeric).await;
+}
+
+async fn model_png_regression(
+    pool: &PgPool,
+    old_job: &TelegramJob,
+    old_identity: &setups_db::expectancy::ArtifactIdentity,
+    old_numeric: &setups_domain::expectancy::ExpectancyArtifact,
+) {
+    use serde_json::json;
+    use setups_db::expectancy as artifacts;
+    use setups_domain::expectancy::*;
+    // Successful finish removes terminal outbox work. Historical identity lives
+    // on the setup; byte-stable retry assertions above run before that cleanup.
+    let before: serde_json::Value =
+        sqlx::query_scalar("select recommendation from live_setups where id::bigint=$1")
+            .bind(old_job.setup_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let old_setup_count: i64 = sqlx::query_scalar("select count(*) from live_setups")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let old_outbox_count: i64 = sqlx::query_scalar("select count(*) from telegram_delivery_outbox")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let recipe = setups_domain::forecast::ForecastRecipe::engineering_baseline();
+    let mut identity = old_identity.clone();
+    identity.calculation_version = EXPECTANCY_MODEL_CALCULATION_VERSION.to_string();
+    identity.forecast = Some(recipe);
+    let daily: Vec<_> = old_numeric
+        .daily
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|p| UtcDailyInput {
+            day_start_unix: p.day_start_unix,
+            row_count: p.row_count,
+            tp_count: p.tp_count,
+            sl_count: p.sl_count,
+            mean_r: p.mean_r,
+        })
+        .collect();
+    identity.outcome_hash = Some(artifacts::captured_outcome_hash(&daily).unwrap());
+    let mut source = old_numeric.source.clone();
+    source.forecast = Some(recipe);
+    source.derived_snapshot_id = artifacts::artifact_key(&identity).unwrap();
+    let cell = old_numeric.selected_cell.as_ref().unwrap();
+    let numeric = build_expectancy_artifact(ExpectancyInput {
+        source,
+        selected_cell: Some(SelectedCellInput {
+            raw_r: cell.raw_r.as_ref().copied(),
+            tp_count: cell.tp_count,
+            sl_count: cell.sl_count,
+        }),
+        matrix_mean_r: old_numeric.matrix_mean_r.as_ref().copied(),
+        daily: MetricAvailability::Available {
+            value: old_numeric
+                .daily
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|p| UtcDailyInput {
+                    day_start_unix: p.day_start_unix,
+                    row_count: p.row_count,
+                    tp_count: p.tp_count,
+                    sl_count: p.sl_count,
+                    mean_r: p.mean_r,
+                })
+                .collect(),
+        },
+    })
+    .unwrap();
+    let id = insert_chart_artifact(pool, &identity, &numeric).await;
+    assert_eq!(
+        artifacts::get_for_generation(pool, &identity.owner_id, identity.generation_id, "2")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        old_job.payload["recommendation"]["expectancy"]["artifactId"]
+            .as_i64()
+            .unwrap()
+    );
+    assert_eq!(
+        artifacts::get_by_identity(pool, &identity)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        id
+    );
+    assert!(
+        artifacts::get_for_generation(pool, &identity.owner_id, identity.generation_id, "3")
+            .await
+            .is_err(),
+        "v3 never accepts a version-only latest lookup"
+    );
+    // A study-level PNG, even with the new base version, cannot substitute for
+    // the delivery's raw-close overlay. This synthetic cache entry is ignored.
+    artifacts::store_png(pool, &identity.owner_id, id, "2", &png_fixture())
+        .await
+        .unwrap();
+    let mut model_job = old_job.clone();
+    model_job.delivery_id = "explicit:model:chart".into();
+    model_job.request_body = None;
+    model_job.payload["recommendation"]["forecast"] = serde_json::to_value(recipe).unwrap();
+    let mut saved: crate::adaptive::AdaptiveExpectancySnapshot =
+        serde_json::from_value(model_job.payload["recommendation"]["expectancy"].clone()).unwrap();
+    saved.calculation_version = numeric.calculation_version;
+    saved.artifact_id = Some(id);
+    saved.derived_snapshot_id = Some(numeric.source.derived_snapshot_id.clone());
+    saved.forecast = Some(recipe);
+    saved.forecast_r = numeric
+        .forecast_at_raw_signal(model_job.raw_close_unix)
+        .unwrap();
+    saved.trend_delta_r = numeric.trend_delta_r.clone();
+    let pure = *saved.forecast_r.as_ref().unwrap();
+    let key = numeric.image_key(setups_analytics::expectancy_chart::PROBABILITY_RENDER_VERSION);
+    saved.image_key = Some(key.clone());
+    saved.overlay_key = Some(
+        crate::adaptive::ExpectancyOverlayKey::new(&key, model_job.raw_close_unix, pure).unwrap(),
+    );
+    model_job.payload["recommendation"]["expectancy"] = serde_json::to_value(&saved).unwrap();
+    let (relay, server) = local_relay(3).await;
+    let content = saved_presentation_with_lane(pool, &model_job, Some(&relay.charts))
+        .await
+        .unwrap();
+    assert!(
+        content.unavailable_reason.is_none(),
+        "new model must produce its per-delivery PNG"
+    );
+    let png = content.png.unwrap();
+    assert_ne!(png, png_fixture());
+    assert!(content.text.contains(&format!("{pure:+.2} R")));
+    let mut other = model_job.clone();
+    other.payload["recommendation"]["expectancy"]["overlayKey"]["rawSignalAt"] =
+        json!(model_job.raw_close_unix + 60);
+    let wrong = saved_presentation_with_lane(pool, &other, Some(&relay.charts))
+        .await
+        .unwrap();
+    assert!(wrong.png.is_none());
+    assert_eq!(wrong.unavailable_reason, Some("png_identity_mismatch"));
+    let another = relay
+        .charts
+        .render(move || {
+            setups_analytics::expectancy_chart::render_png_with_model(
+                &numeric,
+                saved.forecast_at_unix + 86400,
+                pure,
+            )
+            .map_err(|_| "png_unavailable")
+        })
+        .await
+        .unwrap();
+    assert_ne!(
+        another, png,
+        "another raw close must not reuse the final PNG"
+    );
+    let setup: i32 = sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,adaptive_slot_id,adaptive_generation_id,recommendation,external_name,expectancy_artifact_id) values('bybit','linear','MODELUSDT','price_volume_spike','1.1.1',$1,to_timestamp($2),to_timestamp($3),'100',$4,$5,$6,'Captured name',$7) returning id")
+        .bind(model_job.payload["raw"]["params"].clone()).bind((model_job.raw_close_unix-60)as f64).bind(model_job.raw_close_unix as f64).bind(model_job.slot_id).bind(model_job.generation_id).bind(model_job.payload["recommendation"].clone()).bind(id).fetch_one(pool).await.unwrap();
+    sqlx::query("insert into telegram_delivery_outbox(setup_id,delivery_id,endpoint_url,settings_revision,owner_id,algorithm_id,slot_id,generation_id,config_revision,raw_close_unix,expires_at,payload,wire_version) values($1,$2,'https://relay.example/',1,'admin','price_volume_spike',$3,$4,1,$5,to_timestamp($6),$7,2)")
+        .bind(setup).bind(&model_job.delivery_id).bind(model_job.slot_id).bind(model_job.generation_id).bind(model_job.raw_close_unix).bind(model_job.expires_at_unix as f64).bind(&model_job.payload).execute(pool).await.unwrap();
+    let pending_count: i64 = sqlx::query_scalar("select count(*) from telegram_delivery_outbox")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        pending_count,
+        old_outbox_count + 1,
+        "only the explicitly inserted new intent is pending"
+    );
+    let worker = "explicit-model-worker";
+    let job = db::claim(pool, worker, 1).await.unwrap().remove(0);
+    let outcome = send_job_via(pool, worker, &job, &AtomicBool::new(false), &relay)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, TelegramOutcome::Retry { .. }));
+    let frozen: Vec<u8> =
+        sqlx::query_scalar("select request_body from telegram_delivery_outbox where id=$1")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let parsed = v2::RelayMessage::parse(&frozen, chrono::Utc::now().timestamp()).unwrap();
+    assert_eq!(parsed.attachment.unwrap().decode_png().unwrap(), png);
+    db::finish(pool, worker, &job, outcome).await.unwrap();
+    sqlx::query("delete from study_expectancy_pngs where artifact_id=$1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("update telegram_delivery_outbox set not_before=clock_timestamp()-interval '1 second' where id=$1").bind(job.id).execute(pool).await.unwrap();
+    let mut retry = db::claim(pool, worker, 1).await.unwrap().remove(0);
+    retry.payload = serde_json::Value::Null;
+    relay.mode.store(0, Ordering::SeqCst);
+    relay.photo.store(true, Ordering::SeqCst);
+    let outcome = send_job_via(pool, worker, &retry, &AtomicBool::new(false), &relay)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, TelegramOutcome::Sent));
+    assert_eq!(relay.presentation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(relay.calls.lock().unwrap().last().unwrap().1, frozen);
+    db::finish(pool, worker, &retry, outcome).await.unwrap();
+    let after: serde_json::Value =
+        sqlx::query_scalar("select recommendation from live_setups where id::bigint=$1")
+            .bind(old_job.setup_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(after, before, "no historical recommendation changes");
+    let count: i64 = sqlx::query_scalar("select count(*) from telegram_delivery_outbox")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, old_outbox_count,
+        "terminal outbox work is removed; no historical resend"
+    );
+    let setup_count: i64 = sqlx::query_scalar("select count(*) from live_setups")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        setup_count,
+        old_setup_count + 1,
+        "only the explicitly inserted new setup exists"
+    );
+    server.abort();
+    let _ = server.await;
 }
 
 async fn insert_chart_artifact(
