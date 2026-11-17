@@ -313,6 +313,150 @@ async fn n8_migration_preserves_six_incumbents_17_to_22_and_all_durable_links() 
 
 #[tokio::test]
 #[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn maintenance_drained_configure_preserves_running_research_and_independent_live() {
+    isolated(|pool| async move {
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        let active = accepted(&pool).await;
+        let checkpoint = json!({"generationId":active.generation_id,"nextOpenUnix":CUTOFF});
+        assert!(db::commit_adaptive_scan(&pool, &active, INSTRUMENT, None, &checkpoint, &[]).await.unwrap().applied);
+        sqlx::query("update continuous_processes set active_generation_id=null,active_study_id=null,status='running',phase='queued',error='{\"code\":\"retained_backoff\"}',retry_count=2,next_attempt_at=to_timestamp(123),next_slot=7 where owner_id=$1 and algorithm_id=$2")
+            .bind(OWNER).bind(ALGORITHM).execute(&pool).await.unwrap();
+        assert_eq!(db::maintenance::set_paused(&pool, OWNER, true).await.unwrap().state, "drained");
+        let before: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p where owner_id=$1 and algorithm_id=$2")
+            .bind(OWNER).bind(ALGORITHM).fetch_one(&pool).await.unwrap();
+        let live_before = maintenance_live_snapshot(&pool).await;
+        let slot_before: Value = sqlx::query_scalar("select to_jsonb(s)-'enabled' from continuous_slots s where id=$1")
+            .bind(active.slot_id).fetch_one(&pool).await.unwrap();
+        let mut next = before["config"].clone();
+        next["minSetupsPerDay"] = json!([8, 16]);
+        next["adaptiveEnabled"] = json!(false);
+        next["study"]["trendMode"] = json!("forecast");
+        next["study"]["forecast"] = json!({"version":1,"method":"decayed_probability","halfLifeDays":14,"kappa":10,"priorPolicy":"gross_break_even"});
+        assert!(db::configure(&pool, OWNER, ALGORITHM, &next, &[8.0, 16.0]).await.unwrap());
+        let after: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p where owner_id=$1 and algorithm_id=$2")
+            .bind(OWNER).bind(ALGORITHM).fetch_one(&pool).await.unwrap();
+        let mut expected_config = next.clone();
+        expected_config["adaptiveEnabled"] = json!(true);
+        assert_eq!(after["config"], expected_config, "persist exact research config with the independent permission projection");
+        assert_eq!(after["config_revision"], before["config_revision"].as_i64().unwrap() + 1);
+        let mut expected_process = before.clone();
+        for key in ["config", "config_revision", "updated_at"] {
+            expected_process[key] = after[key].clone();
+        }
+        assert_eq!(after, expected_process, "configuration must preserve all operational/retry/scheduling fields");
+        assert_eq!(maintenance_live_snapshot(&pool).await, live_before);
+        assert_eq!(sqlx::query_scalar::<_, Value>("select to_jsonb(s)-'enabled' from continuous_slots s where id=$1")
+            .bind(active.slot_id).fetch_one(&pool).await.unwrap(), slot_before);
+        assert_eq!(sqlx::query_as::<_, (f64, bool)>("select min_setups_per_day::double precision,enabled from continuous_slots where owner_id=$1 and algorithm_id=$2 order by min_setups_per_day")
+            .bind(OWNER).bind(ALGORITHM).fetch_all(&pool).await.unwrap(), vec![(4.0, false), (8.0, true), (16.0, true)]);
+        assert!(db::adaptive_notification_allowed(&pool, &active).await.unwrap(), "queue removal cannot fence the live profile");
+        assert!(db::configure(&pool, OWNER, ALGORITHM, &next, &[8.0, 16.0]).await.unwrap());
+        assert_eq!(sqlx::query_scalar::<_, Value>("select to_jsonb(p) from continuous_processes p where owner_id=$1 and algorithm_id=$2")
+            .bind(OWNER).bind(ALGORITHM).fetch_one(&pool).await.unwrap(), after, "same research config does not increment the revision again");
+        assert!(scheduler::claim_owner(&pool, "paused-config").await.unwrap().is_none());
+        db::maintenance::set_paused(&pool, OWNER, false).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i32>("select retry_count from continuous_processes where owner_id=$1 and algorithm_id=$2")
+            .bind(OWNER).bind(ALGORITHM).fetch_one(&pool).await.unwrap(), 2);
+        let lease = scheduler::claim_owner(&pool, "new-config").await.unwrap().unwrap();
+        let job = scheduler::prepare_next(&pool, &lease).await.unwrap().unwrap();
+        assert_eq!(job.config, expected_config);
+        assert_eq!(job.config_revision, after["config_revision"].as_i64().unwrap());
+        assert_eq!(job.spec["trendMode"], "forecast");
+        assert_eq!(job.spec["forecast"], next["study"]["forecast"]);
+        assert_eq!(job.spec["minSetupsPerDay"], 16.0, "scheduler modulo-normalizes the preserved next_slot");
+        assert_ne!(job.generation_id, active.generation_id);
+        assert_ne!(job.study_id, active.study_id);
+        assert_eq!(sqlx::query_scalar::<_, Value>("select spec from optimization_studies where id=$1").bind(job.study_id).fetch_one(&pool).await.unwrap(), job.spec);
+        assert_eq!(sqlx::query_scalar::<_, i32>("select retry_count from continuous_processes where owner_id=$1 and algorithm_id=$2")
+            .bind(OWNER).bind(ALGORITHM).fetch_one(&pool).await.unwrap(), 2, "admission is not a hidden Start/retry reset");
+        assert_eq!(maintenance_live_snapshot(&pool).await, live_before);
+        scheduler::release(&pool, &lease).await.unwrap();
+    }).await;
+}
+
+async fn maintenance_live_snapshot(pool: &PgPool) -> Value {
+    sqlx::query_scalar("select jsonb_build_object('profiles',(select jsonb_agg(to_jsonb(p) order by id) from adaptive_profiles p),'controls',(select jsonb_agg(to_jsonb(c) order by id) from adaptive_live_controls c),'permissions',(select jsonb_agg(to_jsonb(p) order by owner_id,algorithm_id) from adaptive_live_permissions p),'checkpoints',(select jsonb_agg(to_jsonb(c) order by slot_id,instrument_key) from adaptive_live_checkpoints c),'generations',(select jsonb_agg(to_jsonb(g) order by id) from continuous_generations g where exists(select 1 from adaptive_profiles p where p.accepted_generation_id=g.id)),'settings',(select jsonb_agg(to_jsonb(s) order by key) from settings s))")
+        .fetch_one(pool).await.unwrap()
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn maintenance_configure_rejects_unpaused_owner_chains_stopping_and_stale_heads() {
+    isolated(|pool| async move {
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        let slot = configured(&pool, OWNER, ALGORITHM).await;
+        let mut next = config(ALGORITHM);
+        next["study"]["trendMode"] = json!("forecast");
+        async fn rejected(pool: &PgPool, next: &Value) {
+            async fn state(pool: &PgPool) -> Value {
+                sqlx::query_scalar("select jsonb_build_object('processes',(select jsonb_agg(to_jsonb(p) order by owner_id,algorithm_id) from continuous_processes p),'slots',(select jsonb_agg(to_jsonb(s) order by id) from continuous_slots s),'generations',(select jsonb_agg(to_jsonb(g) order by id) from continuous_generations g),'maintenance',(select jsonb_agg(to_jsonb(m) order by owner_id) from continuous_maintenance m),'permissions',(select jsonb_agg(to_jsonb(p) order by owner_id,algorithm_id) from adaptive_live_permissions p))")
+                    .fetch_one(pool).await.unwrap()
+            }
+            let before = state(pool).await;
+            assert!(!db::configure(pool, OWNER, ALGORITHM, next, &[4.0]).await.unwrap());
+            assert_eq!(state(pool).await, before, "rejection must leave configuration and state unchanged");
+        }
+        rejected(&pool, &next).await; // No durable maintenance row.
+        db::maintenance::set_paused(&pool, OWNER, false).await.unwrap();
+        rejected(&pool, &next).await;
+        db::maintenance::set_paused(&pool, OWNER, true).await.unwrap();
+        let other_slot = configured(&pool, OWNER, OTHER_ALGORITHM).await;
+        let other = generation(&pool, OWNER, OTHER_ALGORITHM, other_slot, "running").await;
+        assert_eq!(db::maintenance::status(&pool, OWNER).await.unwrap().state, "draining");
+        rejected(&pool, &next).await; // Owner-wide, even when another algorithm owns the chain.
+        sqlx::query("update continuous_generations set status='completed' where id=$1").bind(other).execute(&pool).await.unwrap();
+        sqlx::query("update continuous_processes set status='stopping' where owner_id=$1 and algorithm_id=$2").bind(OWNER).bind(ALGORITHM).execute(&pool).await.unwrap();
+        rejected(&pool, &next).await;
+        sqlx::query("update continuous_processes set status='running' where owner_id=$1 and algorithm_id=$2").bind(OWNER).bind(ALGORITHM).execute(&pool).await.unwrap();
+        let terminal = generation(&pool, OWNER, ALGORITHM, slot, "completed").await;
+        sqlx::query("update continuous_processes set active_generation_id=$3 where owner_id=$1 and algorithm_id=$2").bind(OWNER).bind(ALGORITHM).bind(terminal).execute(&pool).await.unwrap();
+        assert_eq!(db::maintenance::status(&pool, OWNER).await.unwrap().state, "drained");
+        rejected(&pool, &next).await;
+        let terminal_study = study(&pool, OWNER, ALGORITHM, "completed", Some(terminal), Some(slot)).await;
+        sqlx::query("update continuous_processes set active_generation_id=null,active_study_id=$3 where owner_id=$1 and algorithm_id=$2").bind(OWNER).bind(ALGORITHM).bind(terminal_study).execute(&pool).await.unwrap();
+        rejected(&pool, &next).await;
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn maintenance_configure_locks_durable_pause_and_serializes_concurrent_resume() {
+    isolated(|pool| async move {
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        configured(&pool, OWNER, ALGORITHM).await;
+        db::maintenance::set_paused(&pool, OWNER, true).await.unwrap();
+        let mut next = config(ALGORITHM);
+        next["study"]["trendMode"] = json!("forecast");
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("select admission_paused from continuous_maintenance where owner_id=$1 for update")
+            .bind(OWNER).fetch_one(&mut *blocker).await.unwrap();
+        let configured_pool = pool.clone();
+        let configured = tokio::spawn(async move { db::configure(&configured_pool, OWNER, ALGORITHM, &next, &[4.0]).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let free: bool = sqlx::query_scalar("select pg_try_advisory_xact_lock(hashtextextended($1,72423415))")
+                    .bind(OWNER).fetch_one(&pool).await.unwrap();
+                if !free { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("configure must hold the owner mutation lock while waiting for the maintenance row");
+        assert!(!configured.is_finished(), "durable maintenance row must be locked, not read optimistically");
+        let resumed_pool = pool.clone();
+        let mut resumed = tokio::spawn(async move { db::maintenance::set_paused(&resumed_pool, OWNER, false).await });
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut resumed).await.is_err(), "resume must wait behind the same owner mutation fence");
+        blocker.commit().await.unwrap();
+        assert!(configured.await.unwrap().unwrap());
+        assert!(!resumed.await.unwrap().unwrap().admission_paused);
+        let lease = scheduler::claim_owner(&pool, "after-fenced-resume").await.unwrap().unwrap();
+        let job = scheduler::prepare_next(&pool, &lease).await.unwrap().unwrap();
+        assert_eq!(job.config_revision, 2);
+        assert_eq!(job.spec["trendMode"], "forecast");
+        scheduler::release(&pool, &lease).await.unwrap();
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
 async fn n8_independent_lifecycle_research_stop_new_id_profile_play_grants_and_fences() {
     isolated(|pool|async move {
         use db::profiles::{self,ProfileCommand,CommandOutcome};

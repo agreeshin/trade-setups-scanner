@@ -174,12 +174,13 @@ pub(crate) async fn owner_lock(tx: &mut Transaction<'_,Postgres>, owner: &str) -
     Ok(())
 }
 
-/// Editing a process is fenced and intentionally refused until its current chain drains.
+/// Research edits preserve running intent only under an owner-wide drained maintenance fence.
 pub async fn configure(pool: &PgPool, owner: &str, algorithm: &str, config: &Value, thresholds: &[f64]) -> Result<bool,DbError> {
     let mut tx = pool.begin().await?;
     owner_lock(&mut tx, owner).await?;
-    let current = sqlx::query("select config,desired_running,status from continuous_processes where owner_id=$1 and algorithm_id=$2 for update")
+    let current = sqlx::query("select config,desired_running,status,active_generation_id,active_study_id from continuous_processes where owner_id=$1 and algorithm_id=$2 for update")
         .bind(owner).bind(algorithm).fetch_optional(&mut *tx).await?;
+    let mut preserve_operational_state = false;
     if let Some(current) = current {
         let previous: Value = current.try_get("config")?;
         // Live permission is independent of research identity and accepted generation.
@@ -187,10 +188,32 @@ pub async fn configure(pool: &PgPool, owner: &str, algorithm: &str, config: &Val
             tx.commit().await?;
             return Ok(true);
         }
-        if current.try_get::<bool,_>("desired_running")? || current.try_get::<String,_>("status")?=="stopping" { return Ok(false); }
+        if current.try_get::<String,_>("status")? == "stopping" { return Ok(false); }
+        if current.try_get::<bool,_>("desired_running")? {
+            // The owner mutation lock also serializes maintenance resume and
+            // scheduler admission. Lock the durable row until this commit;
+            // an absent row is not permission to edit a running process.
+            let paused: Option<bool> = sqlx::query_scalar("select admission_paused from continuous_maintenance where owner_id=$1 for update")
+                .bind(owner).fetch_optional(&mut *tx).await?;
+            if paused != Some(true)
+                || current.try_get::<Option<i64>,_>("active_generation_id")?.is_some()
+                || current.try_get::<Option<i64>,_>("active_study_id")?.is_some()
+            {
+                return Ok(false);
+            }
+            let active: bool = sqlx::query_scalar("select exists(select 1 from continuous_generations where owner_id=$1 and status='running')")
+                .bind(owner).fetch_one(&mut *tx).await?;
+            if active { return Ok(false); }
+            preserve_operational_state = true;
+        }
     }
-    sqlx::query("insert into continuous_processes(owner_id,algorithm_id,config) values($1,$2,$3) on conflict(owner_id,algorithm_id) do update set config=excluded.config,config_revision=continuous_processes.config_revision+1,status='stopped',phase=null,error=null,next_slot=0,updated_at=now()")
-        .bind(owner).bind(algorithm).bind(config).execute(&mut *tx).await?;
+    if preserve_operational_state {
+        sqlx::query("update continuous_processes set config=$3,config_revision=config_revision+1,updated_at=now() where owner_id=$1 and algorithm_id=$2")
+            .bind(owner).bind(algorithm).bind(config).execute(&mut *tx).await?;
+    } else {
+        sqlx::query("insert into continuous_processes(owner_id,algorithm_id,config) values($1,$2,$3) on conflict(owner_id,algorithm_id) do update set config=excluded.config,config_revision=continuous_processes.config_revision+1,status='stopped',phase=null,error=null,next_slot=0,updated_at=now()")
+            .bind(owner).bind(algorithm).bind(config).execute(&mut *tx).await?;
+    }
     sqlx::query("insert into adaptive_live_permissions(owner_id,algorithm_id,enabled) values($1,$2,false) on conflict(owner_id,algorithm_id) do nothing")
         .bind(owner).bind(algorithm).execute(&mut *tx).await?;
     sqlx::query("update continuous_processes set config=jsonb_set(config,'{adaptiveEnabled}',(select to_jsonb(enabled) from adaptive_live_permissions where owner_id=$1 and algorithm_id=$2)) where owner_id=$1 and algorithm_id=$2")

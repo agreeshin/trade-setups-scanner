@@ -103,6 +103,69 @@ impl TestDb {
 
 #[tokio::test]
 #[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn maintenance_drained_put_updates_running_research_without_start_retry_reset_or_auth_bypass() {
+    let fixture = TestDb::new().await;
+    let database = state(fixture.pool.clone());
+    let outcome = tokio::spawn(async move {
+        let router = continuous_router(database.clone());
+        let permission = "/v1/adaptive-live/price_volume_spike/permission";
+        assert_eq!(request(&router, "PUT", permission, json!({"enabled":true})).await.0, StatusCode::OK);
+        let mut original = config();
+        original["study"]["trendMode"] = json!("blend");
+        assert_eq!(request(&router, "PUT", &path(""), original).await.0, StatusCode::OK);
+        assert_eq!(request(&router, "POST", &path("/start"), Value::Null).await.0, StatusCode::ACCEPTED);
+        sqlx::query("update continuous_processes set retry_count=2,next_slot=5,next_attempt_at=to_timestamp(123),error='{\"code\":\"retained_backoff\"}' where owner_id=$1 and algorithm_id=$2")
+            .bind(ADMIN_OWNER).bind(ALGORITHM).execute(&database.pool).await.unwrap();
+        let before: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p where owner_id=$1 and algorithm_id=$2")
+            .bind(ADMIN_OWNER).bind(ALGORITHM).fetch_one(&database.pool).await.unwrap();
+        let mut next = before["config"].clone();
+        next["adaptiveEnabled"] = json!(false);
+        next["study"]["trendMode"] = json!("forecast");
+        next["study"]["forecast"] = json!({"version":1,"method":"decayed_probability","halfLifeDays":14,"kappa":10,"priorPolicy":"gross_break_even"});
+        let rejected = request(&router, "PUT", &path(""), next.clone()).await;
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        assert_eq!(rejected.1["error"], "continuous_process_active");
+        assert!(rejected.1["message"].as_str().unwrap().contains("maintenance"));
+        assert_eq!(sqlx::query_scalar::<_, Value>("select to_jsonb(p) from continuous_processes p where owner_id=$1 and algorithm_id=$2")
+            .bind(ADMIN_OWNER).bind(ALGORITHM).fetch_one(&database.pool).await.unwrap(), before);
+        let paused = request(&router, "POST", "/v1/continuous-studies/maintenance/drain", Value::Null).await;
+        assert_eq!(paused.0, StatusCode::OK);
+        assert_eq!(paused.1["state"], "drained");
+        let unauthorized = router.clone().oneshot(Request::builder().method("PUT").uri(path(""))
+            .header("content-type", "application/json").body(Body::from(next.to_string())).unwrap()).await.unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let setups_api::auth::PostSessionResult::Issued { token, .. } = database.auth.post_session(Some("test-key"), setups_api::now_ms()) else { panic!("fixture login failed") };
+        let forbidden = router.clone().oneshot(Request::builder().method("PUT").uri(path(""))
+            .header("cookie", format!("{}={token}", setups_api::COOKIE_NAME))
+            .header("content-type", "application/json").body(Body::from(next.to_string())).unwrap()).await.unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let applied = request(&router, "PUT", &path(""), next.clone()).await;
+        assert_eq!(applied.0, StatusCode::OK, "{}", applied.1);
+        assert_eq!(applied.1["status"], "running");
+        assert_eq!(applied.1["configRevision"], 2);
+        assert_eq!(applied.1["config"]["study"]["trendMode"], "forecast");
+        let after: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p where owner_id=$1 and algorithm_id=$2")
+            .bind(ADMIN_OWNER).bind(ALGORITHM).fetch_one(&database.pool).await.unwrap();
+        let mut expected_config = json!(normalize_config(serde_json::from_value(next.clone()).unwrap(), ALGORITHM, &database.config.optimizer).unwrap());
+        expected_config["adaptiveEnabled"] = json!(true);
+        assert_eq!(after["config"], expected_config);
+        let mut expected_process = before.clone();
+        for key in ["config", "config_revision", "updated_at"] { expected_process[key] = after[key].clone(); }
+        assert_eq!(after, expected_process, "PUT does not Stop/Start or reset operational state");
+        assert_eq!(request(&router, "GET", permission, Value::Null).await.1["enabled"], true);
+        assert_eq!(request(&router, "PUT", &path(""), next.clone()).await.1["configRevision"], 2);
+        assert_eq!(request(&router, "POST", "/v1/continuous-studies/maintenance/resume", Value::Null).await.0, StatusCode::OK);
+        next["study"]["forecast"]["halfLifeDays"] = json!(28);
+        assert_eq!(request(&router, "PUT", &path(""), next).await.0, StatusCode::CONFLICT);
+        assert_eq!(sqlx::query_scalar::<_, i32>("select retry_count from continuous_processes where owner_id=$1 and algorithm_id=$2")
+            .bind(ADMIN_OWNER).bind(ALGORITHM).fetch_one(&database.pool).await.unwrap(), 2);
+    }).await;
+    fixture.cleanup().await;
+    outcome.expect("maintenance configuration HTTP assertions after isolated cleanup");
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn n8_profile_http_commands_permissions_receipts_recovery_and_reference_protection() {
     let fixture=TestDb::new().await;let state=state(fixture.pool.clone());let router=continuous_router(state.clone());
     let outcome=tokio::spawn(async move {

@@ -473,7 +473,7 @@ async fn configure(
         Ok(true) => current_response(&state, &id, StatusCode::OK).await,
         Ok(false) => response(
             StatusCode::CONFLICT,
-            json!({"error":"continuous_process_active","message":"Stop and drain before changing research configuration; adaptiveEnabled can be changed independently"}),
+            json!({"error":"continuous_process_active","message":"Stop and drain research, or pause maintenance and wait for all owner chains to drain before changing research configuration; adaptive live permission is independent"}),
         ),
         Err(e) => failure("configure", e),
     }
