@@ -12,6 +12,11 @@ use resvg::{tiny_skia, usvg};
 use setups_domain::expectancy::{
     ExpectancyArtifact, ExpectancyError, ExpectancyUnavailableReason, UtcDailyPoint,
 };
+use setups_domain::forecast::{
+    ForecastError, ForecastRecipe, ForecastUnavailableReason, ProbabilityCurve,
+    ProbabilityCurveRequest, ProbabilityDay, ProbabilityForecast, evaluate_probability,
+    probability_curve,
+};
 use setups_domain::trend::{
     TrendBendDays, TrendBlendLambda, TrendError, TrendInput, TrendMode, fit_weighted_trend,
 };
@@ -22,6 +27,9 @@ pub use setups_domain::expectancy::ExpectancyImageKey;
 // Keep existing asset keys: claim_render would queue historical PNGs again on a
 // version bump. These presentation fixes apply only to future missing renders.
 pub const RENDER_VERSION: u32 = 1;
+/// Explicit opt-in only. Never pass this to the legacy missing-asset scanner:
+/// existing study PNGs and queued delivery bodies retain their original bytes.
+pub const PROBABILITY_RENDER_VERSION: u32 = 2;
 pub const WIDTH: u32 = 900;
 pub const HEIGHT: u32 = 320;
 pub const MAX_PNG_BYTES: usize = 256 * 1024;
@@ -57,6 +65,9 @@ pub struct StudyTrend {
 pub enum RenderError {
     InvalidArtifact(ExpectancyError),
     InvalidTrend(TrendError),
+    InvalidForecast(ForecastError),
+    ForecastUnavailable(ForecastUnavailableReason),
+    ForecastMismatch,
     SeriesUnavailable(ExpectancyUnavailableReason),
     NoFiniteDays,
     InvalidGeometry,
@@ -72,6 +83,9 @@ impl RenderError {
         match self {
             Self::InvalidArtifact(_) => "invalid_expectancy_artifact",
             Self::InvalidTrend(_) => "expectancy_chart_invalid_trend",
+            Self::InvalidForecast(_) => "expectancy_chart_invalid_forecast",
+            Self::ForecastUnavailable(_) => "expectancy_chart_forecast_unavailable",
+            Self::ForecastMismatch => "expectancy_chart_forecast_mismatch",
             Self::SeriesUnavailable(_) => "expectancy_series_unavailable",
             Self::NoFiniteDays => "expectancy_no_finite_days",
             Self::InvalidGeometry => "expectancy_chart_invalid_geometry",
@@ -94,6 +108,7 @@ impl std::error::Error for RenderError {
         match self {
             Self::InvalidArtifact(error) => Some(error),
             Self::InvalidTrend(error) => Some(error),
+            Self::InvalidForecast(error) => Some(error),
             _ => None,
         }
     }
@@ -123,6 +138,74 @@ pub fn render_png_with_trend(
     study: StudyTrend,
 ) -> Result<Vec<u8>, RenderError> {
     let svg = render_svg_with_trend(artifact, study)?;
+    rasterize_svg(&svg)
+}
+
+/// A scalar adapter for the NEW explicit probability recipe. It deliberately
+/// does not use rowCount, fit a second trend, or apply the decision/blend weight.
+/// The research owner must establish outcome availability/provenance at C;
+/// sealed cohort prefixes alone are not historical online-availability proof.
+pub fn probability_forecast(
+    artifact: &ExpectancyArtifact,
+    recipe: ForecastRecipe,
+) -> Result<ProbabilityForecast, RenderError> {
+    let request = probability_request(artifact, recipe)?;
+    evaluate_probability(
+        recipe,
+        request.q,
+        request.observation_cutoff,
+        &request.daily,
+    )
+    .map_err(RenderError::InvalidForecast)
+}
+
+/// One per-setup render, never a shared final study image. The exact saved
+/// scalar is checked before allocating a pixmap. All points, SVG, pixels and
+/// encoded scratch belong to this call and are released on every return path.
+pub fn render_png_with_probability(
+    artifact: &ExpectancyArtifact,
+    recipe: ForecastRecipe,
+    raw_signal_at: i64,
+    saved_forecast_r: f64,
+) -> Result<Vec<u8>, RenderError> {
+    let svg = render_svg_with_probability(artifact, recipe, raw_signal_at, saved_forecast_r)?;
+    rasterize_svg(&svg)
+}
+
+fn probability_request(
+    artifact: &ExpectancyArtifact,
+    recipe: ForecastRecipe,
+) -> Result<ProbabilityCurveRequest, RenderError> {
+    artifact.validate().map_err(RenderError::InvalidArtifact)?;
+    let points = daily_points(artifact)?;
+    Ok(ProbabilityCurveRequest {
+        recipe,
+        q: artifact.source.tp_pct / artifact.source.sl_pct,
+        observation_cutoff: artifact.source.provenance.observation_cutoff,
+        daily: points
+            .iter()
+            .map(|point| ProbabilityDay {
+                day_start_unix: point.day_start_unix,
+                tp_count: point.tp_count,
+                sl_count: point.sl_count,
+            })
+            .collect(),
+    })
+}
+
+fn daily_points(artifact: &ExpectancyArtifact) -> Result<&[UtcDailyPoint], RenderError> {
+    match &artifact.daily {
+        setups_domain::expectancy::MetricAvailability::Available { value } => Ok(value),
+        setups_domain::expectancy::MetricAvailability::Unavailable { reason } => {
+            Err(RenderError::SeriesUnavailable(*reason))
+        }
+    }
+}
+
+fn rasterize_svg(svg: &str) -> Result<Vec<u8>, RenderError> {
+    if svg.len() > MAX_SVG_BYTES {
+        return Err(RenderError::SvgTooLarge);
+    }
     let mut options = usvg::Options {
         font_family: FONT_FAMILY.into(),
         ..Default::default()
@@ -133,7 +216,7 @@ pub fn render_png_with_trend(
     if options.fontdb.faces().count() != 1 {
         return Err(RenderError::FontUnavailable);
     }
-    let tree = usvg::Tree::from_str(&svg, &options).map_err(|_| RenderError::SvgInvalid)?;
+    let tree = usvg::Tree::from_str(svg, &options).map_err(|_| RenderError::SvgInvalid)?;
     if tree.size().width() != WIDTH as f32 || tree.size().height() != HEIGHT as f32 {
         return Err(RenderError::InvalidGeometry);
     }
@@ -366,57 +449,8 @@ fn render_svg_with_trend(
         svg,
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="320" viewBox="0 0 900 320" font-family="{FONT_FAMILY}"><rect width="900" height="320" fill="{BACKGROUND}"/><text id="title" x="450" y="28" text-anchor="middle" font-size="18" fill="{title_color}">{TITLE} · Среднее МО: {mean_label} · Win rate: {win_rate}</text>"#
     )?;
-    write!(
-        svg,
-        r#"<g fill="none" stroke="{AXIS}" stroke-width="1" stroke-opacity="0.4"><path d="M {LEFT} {TOP} V {BOTTOM} H {RIGHT}"/></g><text x="42" y="56" text-anchor="middle" font-size="12" fill="{AXIS}">R</text>"#
-    )?;
-    let zero = geometry.y(0.0);
-    for (id, value) in [
-        ("axis-min", geometry.y_min),
-        ("axis-mid", geometry.y_min / 2.0 + geometry.y_max / 2.0),
-        ("axis-max", geometry.y_max),
-    ] {
-        let y = geometry.y(value);
-        if value == 0.0 || (id == "axis-mid" && (y - zero).abs() < 14.0) {
-            continue; // Reserve the explicit zero label; avoid overlapping ticks.
-        }
-        write!(
-            svg,
-            r#"<line x1="{LEFT}" y1="{y:.3}" x2="{RIGHT}" y2="{y:.3}" stroke="{AXIS}" stroke-opacity="0.18"/><text id="{id}" x="70" y="{:.3}" text-anchor="end" font-size="11" fill="{AXIS}">{}</text>"#,
-            y + 4.0,
-            risk_label(value)
-        )?;
-    }
-    write!(
-        svg,
-        r#"<line id="zero" x1="{LEFT}" y1="{zero:.3}" x2="{RIGHT}" y2="{zero:.3}" stroke="{AXIS}" stroke-opacity="0.55"/><text id="zero-label" x="70" y="{:.3}" text-anchor="end" font-size="11" fill="{AXIS}">0</text>"#,
-        zero + if zero - TOP < 14.0 { 18.0 } else { 4.0 },
-    )?;
-
-    // A null represented day ends a segment. Missing calendar dates are NOT
-    // inserted as zero/null days; continuous represented finite days connect
-    // over their true calendar distance, exactly like the browser model.
-    let mut segment_start = 0;
-    for end in 0..=points.len() {
-        if end == points.len() || points[end].mean_r.is_none() {
-            if end.saturating_sub(segment_start) > 1 {
-                write!(
-                    svg,
-                    r#"<polyline class="daily-segment" fill="none" stroke="{LINE}" stroke-width="2" stroke-linejoin="round" points=""#
-                )?;
-                for point in &points[segment_start..end] {
-                    write!(
-                        svg,
-                        "{:.3},{:.3} ",
-                        geometry.x(point.x_utc_days),
-                        geometry.y(point.mean_r.expect("finite segment"))
-                    )?;
-                }
-                write!(svg, "\"/>")?;
-            }
-            segment_start = end + 1;
-        }
-    }
+    write_axes(&mut svg, geometry)?;
+    write_daily_segments(&mut svg, points, geometry)?;
     if let Some(trend) = &trend {
         write!(
             svg,
@@ -428,17 +462,7 @@ fn render_svg_with_trend(
         }
         write!(svg, "\"/>")?;
     }
-    for point in points {
-        if let Some(value) = point.mean_r {
-            let fill = if value >= 0.0 { POSITIVE } else { NEGATIVE };
-            write!(
-                svg,
-                r#"<circle class="daily-point" cx="{:.3}" cy="{:.3}" r="4" fill="{fill}"/>"#,
-                geometry.x(point.x_utc_days),
-                geometry.y(value)
-            )?;
-        }
-    }
+    write_daily_points(&mut svg, points, geometry)?;
     if let Some(trend) = &trend {
         let &(first_x, start_r) = trend.points.first().expect("two finite dates");
         let &(last_x, end_r) = trend.points.last().expect("two finite dates");
@@ -521,6 +545,248 @@ fn trend_label(
         risk_label(value)
     )?;
     Ok(())
+}
+
+fn write_axes(svg: &mut BoundedSvg, geometry: Geometry) -> Result<(), RenderError> {
+    write!(
+        svg,
+        r#"<g fill="none" stroke="{AXIS}" stroke-width="1" stroke-opacity="0.4"><path d="M {LEFT} {TOP} V {BOTTOM} H {RIGHT}"/></g><text x="42" y="56" text-anchor="middle" font-size="12" fill="{AXIS}">R</text>"#
+    )?;
+    let zero = geometry.y(0.0);
+    for (id, value) in [
+        ("axis-min", geometry.y_min),
+        ("axis-mid", geometry.y_min / 2.0 + geometry.y_max / 2.0),
+        ("axis-max", geometry.y_max),
+    ] {
+        let y = geometry.y(value);
+        if value == 0.0 || (id == "axis-mid" && (y - zero).abs() < 14.0) {
+            continue;
+        }
+        write!(
+            svg,
+            r#"<line x1="{LEFT}" y1="{y:.3}" x2="{RIGHT}" y2="{y:.3}" stroke="{AXIS}" stroke-opacity="0.18"/><text id="{id}" x="70" y="{:.3}" text-anchor="end" font-size="11" fill="{AXIS}">{}</text>"#,
+            y + 4.0,
+            risk_label(value)
+        )?;
+    }
+    write!(
+        svg,
+        r#"<line id="zero" x1="{LEFT}" y1="{zero:.3}" x2="{RIGHT}" y2="{zero:.3}" stroke="{AXIS}" stroke-opacity="0.55"/><text id="zero-label" x="70" y="{:.3}" text-anchor="end" font-size="11" fill="{AXIS}">0</text>"#,
+        zero + if zero - TOP < 14.0 { 18.0 } else { 4.0 }
+    )?;
+    Ok(())
+}
+
+fn write_daily_segments(
+    svg: &mut BoundedSvg,
+    points: &[UtcDailyPoint],
+    geometry: Geometry,
+) -> Result<(), RenderError> {
+    // Null buckets break the line; absent calendar dates retain their distance.
+    let mut segment_start = 0;
+    for end in 0..=points.len() {
+        if end == points.len() || points[end].mean_r.is_none() {
+            if end.saturating_sub(segment_start) > 1 {
+                write!(
+                    svg,
+                    r#"<polyline class="daily-segment" fill="none" stroke="{LINE}" stroke-width="2" stroke-linejoin="round" points=""#
+                )?;
+                for point in &points[segment_start..end] {
+                    write!(
+                        svg,
+                        "{:.3},{:.3} ",
+                        geometry.x(point.x_utc_days),
+                        geometry.y(point.mean_r.expect("finite segment"))
+                    )?;
+                }
+                write!(svg, "\"/>")?;
+            }
+            segment_start = end + 1;
+        }
+    }
+    Ok(())
+}
+
+fn write_daily_points(
+    svg: &mut BoundedSvg,
+    points: &[UtcDailyPoint],
+    geometry: Geometry,
+) -> Result<(), RenderError> {
+    for point in points {
+        if let Some(value) = point.mean_r {
+            let fill = if value >= 0.0 { POSITIVE } else { NEGATIVE };
+            write!(
+                svg,
+                r#"<circle class="daily-point" cx="{:.3}" cy="{:.3}" r="4" fill="{fill}"/>"#,
+                geometry.x(point.x_utc_days),
+                geometry.y(value)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn utc_day_offset(origin: i64, at: i64) -> Result<f64, RenderError> {
+    let seconds = at.checked_sub(origin).ok_or(RenderError::InvalidGeometry)?;
+    Ok(seconds as f64 / setups_domain::expectancy::UTC_DAY_SECONDS as f64)
+}
+
+fn probability_geometry(
+    points: &[UtcDailyPoint],
+    model: &ProbabilityCurve,
+    origin: i64,
+    raw_signal_at: i64,
+) -> Result<Geometry, RenderError> {
+    let mut geometry = Geometry::from_points(points, None)?;
+    let estimate = model.estimate.as_ref().ok_or(RenderError::NoFiniteDays)?;
+    // The same scale includes actual daily R, M, every model point and the
+    // raw-close marker, not just fitted endpoints or a decorative spline.
+    for value in model
+        .curve
+        .iter()
+        .filter_map(|point| point.forecast_r)
+        .chain([estimate.mean_r, estimate.forecast_r])
+    {
+        if !value.is_finite() {
+            return Err(RenderError::InvalidGeometry);
+        }
+        geometry.y_min = geometry.y_min.min(value);
+        geometry.y_max = geometry.y_max.max(value);
+    }
+    geometry.x_span = utc_day_offset(origin, raw_signal_at)? - geometry.first_x;
+    if !geometry.x_span.is_finite()
+        || geometry.x_span < 0.0
+        || !(geometry.y_max - geometry.y_min).is_finite()
+    {
+        return Err(RenderError::InvalidGeometry);
+    }
+    Ok(geometry)
+}
+
+fn render_svg_with_probability(
+    artifact: &ExpectancyArtifact,
+    recipe: ForecastRecipe,
+    raw_signal_at: i64,
+    saved_forecast_r: f64,
+) -> Result<String, RenderError> {
+    let request = probability_request(artifact, recipe)?;
+    if raw_signal_at < request.observation_cutoff {
+        return Err(RenderError::InvalidForecast(ForecastError::BeforeCutoff));
+    }
+    let model = probability_curve(&request).map_err(RenderError::InvalidForecast)?;
+    let estimate = match &model.estimate {
+        ProbabilityForecast::Available { value } => value,
+        ProbabilityForecast::Unavailable { reason } => {
+            return Err(RenderError::ForecastUnavailable(*reason));
+        }
+    };
+    let forecast = model
+        .estimate
+        .at(raw_signal_at)
+        .map_err(RenderError::InvalidForecast)?;
+    if !saved_forecast_r.is_finite() || forecast != Some(saved_forecast_r) {
+        return Err(RenderError::ForecastMismatch);
+    }
+    // Matches the caption's signed, two-decimal formatting, including -0.00.
+    // An unreasonably wide label degrades to text, never clips a false value.
+    let marker_label = format!("{saved_forecast_r:+.2} R");
+    if marker_label.len() > 32 {
+        return Err(RenderError::InvalidGeometry);
+    }
+    let points = daily_points(artifact)?;
+    let geometry = probability_geometry(points, &model, artifact.origin_unix, raw_signal_at)?;
+    let cutoff_x = geometry.x(utc_day_offset(
+        artifact.origin_unix,
+        request.observation_cutoff,
+    )?);
+    let marker_x = geometry.x(utc_day_offset(artifact.origin_unix, raw_signal_at)?);
+    let marker_y = geometry.y(saved_forecast_r);
+    let mean_y = geometry.y(estimate.mean_r);
+    let title_color = if estimate.mean_r > 0.0 {
+        POSITIVE
+    } else if estimate.mean_r < 0.0 {
+        NEGATIVE
+    } else {
+        FOREGROUND
+    };
+    let win_rate = period_win_rate_pct(points).ok_or(RenderError::NoFiniteDays)?;
+    let mut svg = BoundedSvg(String::with_capacity(
+        (points.len() * 160 + 8192).min(MAX_SVG_BYTES),
+    ));
+    write!(
+        svg,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="320" viewBox="0 0 900 320" font-family="{FONT_FAMILY}" data-render-version="{PROBABILITY_RENDER_VERSION}"><rect width="900" height="320" fill="{BACKGROUND}"/><text id="title" x="450" y="28" text-anchor="middle" font-size="18" fill="{title_color}">{TITLE} · Среднее МО: {} · Win rate: {win_rate:.1}%</text><text id="retrospective-label" x="80" y="49" font-size="11" fill="{TREND}">Ретроспективная модельная оценка</text>"#,
+        risk_label(estimate.mean_r)
+    )?;
+    write_axes(&mut svg, geometry)?;
+    write_daily_segments(&mut svg, points, geometry)?;
+    write!(
+        svg,
+        r#"<line id="period-mean" data-value="{}" x1="{LEFT}" y1="{mean_y:.3}" x2="{RIGHT}" y2="{mean_y:.3}" stroke="{LINE}" stroke-width="1.5" stroke-dasharray="8 4"/><text id="period-mean-label" x="84" y="{:.3}" font-size="11" fill="{LINE}" stroke="{BACKGROUND}" stroke-width="3" paint-order="stroke fill">Среднее за период</text>"#,
+        estimate.mean_r,
+        (mean_y + 15.0).clamp(TOP + 14.0, BOTTOM - 5.0)
+    )?;
+    // Retrospective prefixes come only from the shared evaluator. Null prefixes
+    // are not zeroes and break segments; no timestamp/label-availability claim
+    // is inferred from the raw-signal cohort date.
+    let mut segment_start = 0;
+    for end in 0..=model.curve.len() {
+        if end == model.curve.len() || model.curve[end].forecast_r.is_none() {
+            if end > segment_start {
+                write!(
+                    svg,
+                    r#"<polyline class="probability-model" data-method="decayed_probability" fill="none" stroke="{TREND}" stroke-width="2" points=""#
+                )?;
+                for point in &model.curve[segment_start..end] {
+                    write!(
+                        svg,
+                        "{:.3},{:.3} ",
+                        geometry.x(utc_day_offset(artifact.origin_unix, point.at_unix)?),
+                        geometry.y(point.forecast_r.expect("finite model segment"))
+                    )?;
+                }
+                write!(svg, "\"/>")?;
+            }
+            segment_start = end + 1;
+        }
+    }
+    write!(
+        svg,
+        r#"<line id="observation-cutoff" data-at-unix="{}" x1="{cutoff_x:.3}" y1="{TOP}" x2="{cutoff_x:.3}" y2="{BOTTOM}" stroke="{AXIS}" stroke-dasharray="3 4"/><text id="cutoff-label" x="{:.3}" y="62" text-anchor="end" font-size="11" fill="{AXIS}">C</text><line id="frozen-forecast" data-value="{saved_forecast_r}" x1="{cutoff_x:.3}" y1="{marker_y:.3}" x2="{marker_x:.3}" y2="{marker_y:.3}" stroke="{TREND}" stroke-width="2" stroke-dasharray="4 4"/>"#,
+        request.observation_cutoff,
+        cutoff_x.clamp(LEFT + 12.0, RIGHT)
+    )?;
+    write_daily_points(&mut svg, points, geometry)?;
+    write!(
+        svg,
+        r#"<circle id="raw-close-marker" data-at-unix="{raw_signal_at}" data-forecast-r="{saved_forecast_r}" cx="{marker_x:.3}" cy="{marker_y:.3}" r="5" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="2"/><text id="raw-close-label" x="{RIGHT}" y="{:.3}" text-anchor="end" font-size="11" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="3" paint-order="stroke fill">Прогноз на закрытие сигнала: {marker_label}</text>"#,
+        (marker_y - 13.0).clamp(TOP + 14.0, BOTTOM - 6.0)
+    )?;
+    // Reserve the right edge for the explicit C/raw-close annotation. Calendar
+    // labels are spaced in pixels; a very late raw-close never overlaps them.
+    let mut previous_x: Option<f64> = None;
+    let step = points.len().div_ceil(8).max(1);
+    for point in points.iter().step_by(step) {
+        let x = geometry.x(point.x_utc_days);
+        if x > RIGHT - 70.0 || previous_x.is_some_and(|previous| x - previous < 70.0) {
+            continue;
+        }
+        write!(
+            svg,
+            r#"<text class="date" x="{x:.3}" y="283" text-anchor="middle" font-size="11" fill="{AXIS}">{}.{}</text>"#,
+            &point.date[8..10],
+            &point.date[5..7]
+        )?;
+        previous_x = Some(x);
+    }
+    write!(
+        svg,
+        r#"<text id="raw-close-axis" x="{RIGHT}" y="283" text-anchor="end" font-size="11" fill="{AXIS}">Закрытие сигнала</text><text x="476" y="308" text-anchor="middle" font-size="11" fill="{AXIS}">Дата сетапа (UTC) · TP: {} · SL: {} · Закрыто: {}</text></svg>"#,
+        estimate.tp_count,
+        estimate.sl_count,
+        estimate.tp_count + estimate.sl_count
+    )?;
+    Ok(svg.0)
 }
 
 struct BoundedPng(Vec<u8>, bool);
@@ -664,6 +930,163 @@ mod tests {
                 .collect(),
         };
         build_expectancy_artifact(input).unwrap()
+    }
+
+    #[test]
+    fn probability_render_uses_canonical_pure_forecast_and_frozen_raw_close_not_blend() {
+        let artifact = fixture();
+        let sealed = artifact.to_json().unwrap();
+        let recipe = ForecastRecipe::engineering_baseline();
+        let scalar = probability_forecast(&artifact, recipe).unwrap();
+        let estimate = *scalar.as_ref().unwrap();
+        let request = probability_request(&artifact, recipe).unwrap();
+        assert_eq!(
+            scalar,
+            evaluate_probability(
+                recipe,
+                request.q,
+                request.observation_cutoff,
+                &request.daily
+            )
+            .unwrap()
+        );
+        let core = probability_curve(&request).unwrap();
+        assert_eq!(
+            core.curve.last().unwrap().forecast_r,
+            Some(estimate.forecast_r)
+        );
+        let blend = setups_domain::forecast::decision_r(
+            TrendMode::Blend,
+            Some(estimate.mean_r),
+            Some(estimate.forecast_r),
+            TrendBlendLambda::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(blend, estimate.forecast_r);
+        let cutoff = request.observation_cutoff;
+        let svg =
+            render_svg_with_probability(&artifact, recipe, cutoff + 3 * 86400, estimate.forecast_r)
+                .unwrap();
+        assert!(svg.contains("Ретроспективная модельная оценка"));
+        assert!(svg.contains("Прогноз на закрытие сигнала"));
+        assert!(svg.contains("id=\"period-mean\""));
+        assert!(svg.contains(&format!("data-forecast-r=\"{}\"", estimate.forecast_r)));
+        assert!(svg.contains(&format!("data-at-unix=\"{}\"", cutoff + 3 * 86400)));
+        assert!(svg.contains(&format!(
+            "Прогноз на закрытие сигнала: {:+.2} R",
+            estimate.forecast_r
+        )));
+        assert!(
+            !svg.contains("id=\"trend\"") && !svg.contains("p_spline") && !svg.contains("<polygon")
+        );
+        let geometry = probability_geometry(
+            artifact.daily.as_ref().unwrap(),
+            &core,
+            artifact.origin_unix,
+            cutoff + 3 * 86400,
+        )
+        .unwrap();
+        let forecast_y = geometry.y(estimate.forecast_r);
+        assert!(svg.contains(&format!("id=\"frozen-forecast\" data-value=\"{}\" x1=\"{:.3}\" y1=\"{forecast_y:.3}\" x2=\"872.000\" y2=\"{forecast_y:.3}\"", estimate.forecast_r, geometry.x(11.0))));
+        for raw in [cutoff, cutoff + 86400, cutoff + 30 * 86400] {
+            assert_eq!(scalar.at(raw).unwrap(), Some(estimate.forecast_r));
+            let bytes =
+                render_png_with_probability(&artifact, recipe, raw, estimate.forecast_r).unwrap();
+            setups_relay_protocol::v2::validate_png(&bytes).unwrap();
+            assert_eq!(
+                bytes,
+                render_png_with_probability(&artifact, recipe, raw, estimate.forecast_r).unwrap()
+            );
+        }
+        assert_ne!(
+            render_png_with_probability(&artifact, recipe, cutoff, estimate.forecast_r).unwrap(),
+            render_png_with_probability(
+                &artifact,
+                recipe,
+                cutoff + 30 * 86400,
+                estimate.forecast_r
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            render_png_with_probability(&artifact, recipe, cutoff, blend),
+            Err(RenderError::ForecastMismatch)
+        );
+        assert_eq!(
+            render_png_with_probability(&artifact, recipe, cutoff - 1, estimate.forecast_r),
+            Err(RenderError::InvalidForecast(ForecastError::BeforeCutoff))
+        );
+        assert_eq!(artifact.to_json().unwrap(), sealed);
+        assert_eq!(RENDER_VERSION, 1);
+        assert_eq!(PROBABILITY_RENDER_VERSION, 2);
+    }
+
+    #[test]
+    fn probability_counts_ignore_unclosed_rows_and_never_invent_prior_only_forecast() {
+        let artifact = fixture();
+        let recipe = ForecastRecipe::engineering_baseline();
+        let scalar = probability_forecast(&artifact, recipe).unwrap();
+        let estimate = *scalar.as_ref().unwrap();
+        assert_eq!((estimate.tp_count, estimate.sl_count), (3, 2));
+        let mut extra_rows = artifact.clone();
+        let MetricAvailability::Available { value: points } = &mut extra_rows.daily else {
+            unreachable!()
+        };
+        for point in points {
+            point.row_count += 100_000_000;
+        }
+        assert_eq!(probability_forecast(&extra_rows, recipe).unwrap(), scalar);
+        let cutoff = artifact.source.provenance.observation_cutoff;
+        assert_eq!(
+            render_png_with_probability(&artifact, recipe, cutoff, estimate.forecast_r).unwrap(),
+            render_png_with_probability(&extra_rows, recipe, cutoff, estimate.forecast_r).unwrap()
+        );
+        let single = with_outcomes(2.0, 1.0, &[(0, 1, 0)]);
+        let single_r = probability_forecast(&single, recipe)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .forecast_r;
+        setups_relay_protocol::v2::validate_png(
+            &render_png_with_probability(&single, recipe, cutoff, single_r).unwrap(),
+        )
+        .unwrap();
+        for empty in [
+            with_outcomes(2.0, 1.0, &[]),
+            with_outcomes(2.0, 1.0, &[(0, 0, 0)]),
+        ] {
+            assert_eq!(
+                probability_forecast(&empty, recipe).unwrap(),
+                ProbabilityForecast::Unavailable {
+                    reason: ForecastUnavailableReason::NoClosedOutcomes
+                }
+            );
+            assert_eq!(
+                render_png_with_probability(&empty, recipe, cutoff, 0.0),
+                Err(RenderError::ForecastUnavailable(
+                    ForecastUnavailableReason::NoClosedOutcomes
+                ))
+            );
+        }
+        assert_eq!(
+            probability_forecast(
+                &artifact,
+                ForecastRecipe::Trend {
+                    version: 1,
+                    bend_days: TrendBendDays::Linear
+                }
+            ),
+            Err(RenderError::InvalidForecast(ForecastError::WrongMethod))
+        );
+        assert_eq!(
+            render_png_with_probability(&artifact, recipe, cutoff, f64::NAN),
+            Err(RenderError::ForecastMismatch)
+        );
+        assert_eq!(
+            rasterize_svg(&"x".repeat(MAX_SVG_BYTES + 1)),
+            Err(RenderError::SvgTooLarge)
+        );
     }
 
     #[test]
@@ -1165,6 +1588,19 @@ mod tests {
             assert!(bytes.len() <= MAX_PNG_BYTES);
             setups_relay_protocol::v2::validate_png(&bytes).unwrap();
         }
+        let recipe = ForecastRecipe::engineering_baseline();
+        let cutoff = artifact.source.provenance.observation_cutoff;
+        let value = probability_forecast(&artifact, recipe)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .forecast_r;
+        let svg = render_svg_with_probability(&artifact, recipe, cutoff + 60, value).unwrap();
+        assert!(svg.len() <= MAX_SVG_BYTES);
+        assert_eq!(svg.matches("class=\"daily-point\"").count(), 3661);
+        let bytes = render_png_with_probability(&artifact, recipe, cutoff + 60, value).unwrap();
+        assert!(bytes.len() <= MAX_PNG_BYTES);
+        setups_relay_protocol::v2::validate_png(&bytes).unwrap();
     }
 
     #[test]
