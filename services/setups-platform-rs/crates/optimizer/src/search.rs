@@ -10,7 +10,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-type PacketEvaluation = Result<Vec<(usize, Option<CandidateEvaluation>)>, StudyError>;
+// Packet-owned results are bounded by batch_size and never serialized. Keep
+// candidate infeasibility distinct from cancellation/deadline interruption.
+enum TrialEvaluation {
+    Evaluated(CandidateEvaluation),
+    SetupLimitExceeded { limit: usize, requested: usize },
+    Interrupted,
+}
+type PacketEvaluation = Result<Vec<(usize, TrialEvaluation)>, StudyError>;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -707,6 +714,7 @@ fn run_engine(
         mut snapshot,
         mut best,
         mut baseline,
+        mut baseline_infeasible,
         mut submitted,
         mut sequence,
         elapsed_before,
@@ -717,6 +725,7 @@ fn run_engine(
             state.progress,
             state.best,
             state.baseline,
+            state.baseline_infeasible,
             state.submitted,
             state.sequence,
             Duration::from_nanos(state.elapsed_nanos),
@@ -738,6 +747,7 @@ fn run_engine(
             },
             None,
             None,
+            false,
             0,
             0,
             Duration::ZERO,
@@ -791,6 +801,7 @@ fn run_engine(
                 &info,
                 &best,
                 &baseline,
+                baseline_infeasible,
                 submitted,
                 elapsed(),
                 passes.load(Ordering::Relaxed),
@@ -877,7 +888,7 @@ fn run_engine(
                         continuous_limits.max_working_bytes = worker_limits
                             .max_working_bytes
                             .saturating_sub(retained_matrices);
-                        let raw = crate::continuous::materialize_inner(
+                        let raw = match crate::continuous::materialize_inner(
                             spec,
                             input,
                             candidates[0],
@@ -885,7 +896,18 @@ fn run_engine(
                             &continuous_limits,
                             stats.as_ref().expect("validated stats"),
                             &control,
-                        )?;
+                        ) {
+                            // This raw-set bound is independent of analytics. Only
+                            // proposals sharing this detector pass are infeasible;
+                            // every other error, and final materialization, stays fatal.
+                            Err(StudyError::ResourceLimit { resource, limit, requested })
+                                if resource == "setups_per_candidate" => {
+                                return Ok(indexes.iter().map(|&index| (
+                                    index, TrialEvaluation::SetupLimitExceeded { limit, requested },
+                                )).collect());
+                            }
+                            result => result?,
+                        };
                         match raw {
                             None => vec![None; candidates.len()],
                             Some(raw) => {
@@ -924,7 +946,9 @@ fn run_engine(
                             &control,
                         )?
                     };
-                    Ok(indexes.iter().copied().zip(evaluated).collect())
+                    Ok(indexes.iter().copied().zip(evaluated).map(|(index, value)| {
+                        (index, value.map_or(TrialEvaluation::Interrupted, TrialEvaluation::Evaluated))
+                    }).collect())
                 })
                 .collect()
         });
@@ -935,11 +959,32 @@ fn run_engine(
         completed.sort_by_key(|(index, _)| *index);
         let mut interrupted = false;
         for (index, evaluation) in completed {
-            let Some(evaluation) = evaluation else {
-                interrupted = true;
-                continue;
-            };
             let trial = submitted + index;
+            let evaluation = match evaluation {
+                TrialEvaluation::Interrupted => {
+                    interrupted = true;
+                    continue;
+                }
+                TrialEvaluation::SetupLimitExceeded { limit, requested } => {
+                    // A completed feasibility decision consumes this proposal once,
+                    // without a fabricated matrix/baseline or a scorable record.
+                    snapshot.evaluated_candidates += 1;
+                    if trial == 0 { baseline_infeasible = true; }
+                    search.observe(&batch[index], None, trial);
+                    snapshot.elapsed_seconds = elapsed().as_secs_f64();
+                    progress(StudyUpdate {
+                        progress: snapshot.clone(),
+                        incumbent: None,
+                        event: Some(StudyEvent {
+                            at: chrono::Utc::now().to_rfc3339(),
+                            kind: "candidate_infeasible".into(),
+                            message: format!("Кандидат trial={trial} непригоден: setups_per_candidate requested={requested}, limit={limit}."),
+                        }),
+                    });
+                    continue;
+                }
+                TrialEvaluation::Evaluated(evaluation) => evaluation,
+            };
             if trial == 0 {
                 baseline = Some(evaluation.summary.clone());
             }
@@ -1001,6 +1046,7 @@ fn run_engine(
                 &info,
                 &best,
                 &baseline,
+                baseline_infeasible,
                 submitted,
                 elapsed(),
                 passes.load(Ordering::Relaxed),
@@ -1060,6 +1106,7 @@ fn run_engine(
 fn checkpoint_error(message: impl std::fmt::Display) -> StudyError {
     StudyError::InvalidInput(format!("continuous checkpoint: {message}"))
 }
+fn is_false(value: &bool) -> bool { !value }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1078,6 +1125,8 @@ struct Checkpoint<S> {
     progress: StudyProgress,
     best: Option<StudyBest>,
     baseline: Option<TrialSummary>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    baseline_infeasible: bool,
     detector_passes: usize,
     elapsed_nanos: u64,
     search: S,
@@ -1112,6 +1161,7 @@ fn encode_checkpoint(
     info: &ContinuousCheckpointInfo,
     best: &Option<StudyBest>,
     baseline: &Option<TrialSummary>,
+    baseline_infeasible: bool,
     submitted: usize,
     elapsed: Duration,
     detector_passes: usize,
@@ -1132,6 +1182,7 @@ fn encode_checkpoint(
         progress: info.progress.clone(),
         best: best.clone(),
         baseline: baseline.clone(),
+        baseline_infeasible,
         detector_passes,
         elapsed_nanos: u64::try_from(elapsed.as_nanos()).map_err(checkpoint_error)?,
         search,
@@ -1222,7 +1273,9 @@ fn decode_checkpoint(
         || state.sequence > state.submitted as u64
         || (state.submitted == 0) != (state.sequence == 0)
         || search.baseline_sent != (state.submitted > 0)
-        || state.baseline.is_some() != (state.submitted > 0)
+        || (if state.submitted == 0 {
+            state.baseline.is_some() || state.baseline_infeasible
+        } else { state.baseline.is_some() == state.baseline_infeasible })
         || search.records.len()
             != state
                 .submitted
@@ -1295,6 +1348,20 @@ fn decode_checkpoint(
                 .avg_setups_per_day
                 .is_none_or(|v| v.is_finite() && v >= 0.0)
     };
+    if state.baseline_infeasible {
+        let record = search.records.iter().find(|record| record.trial == 0);
+        // Out-of-domain baselines have never had coordinate records. Preserve
+        // that layout; their existing sent/seen identity still proves trial0.
+        let record_valid = match &search.baseline_coordinates {
+            Some(coordinates) => record.is_some_and(|r| r.score.is_none() && &r.coordinates == coordinates),
+            None => record.is_none(),
+        };
+        if !record_valid || state.best.as_ref().is_some_and(|best| best.trial_index == 0)
+            || !search.seen.contains(&canonical_candidate_key(&search.baseline)?)
+        {
+            return Err(checkpoint_error("inconsistent infeasible baseline marker"));
+        }
+    }
     if state.baseline.as_ref().is_some_and(|b| !finite_summary(b)) {
         return Err(checkpoint_error("invalid baseline"));
     }
@@ -1374,6 +1441,19 @@ mod tests {
             "algorithmSearch":{"priceGrowthPct":["4","6","8","10","12","14","16","18","20"],
                 "windowMinutes":[1,2,3,4,5,6,7,8,9],"cooldownMinutes":[1,2,3,4,5,6,7,8,9]}
         })).unwrap()
+    }
+
+    #[test]
+    fn setup_cap_is_inclusive_at_ten_thousand() {
+        assert_eq!(limit("setups_per_candidate", 10_000, 10_000), Ok(()));
+        assert_eq!(
+            limit("setups_per_candidate", 10_001, 10_000),
+            Err(StudyError::ResourceLimit {
+                resource: "setups_per_candidate".into(),
+                limit: 10_000,
+                requested: 10_001,
+            })
+        );
     }
 
     #[test]

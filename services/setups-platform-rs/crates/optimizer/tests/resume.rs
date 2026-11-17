@@ -99,6 +99,229 @@ fn control<'a>(
     }
 }
 
+fn setup_cap_fixture(baseline_cooldown: u32) -> (StudyRequest, StudyInput, ContinuousContext, StudyLimits) {
+    let (mut spec, input, context) = fixture();
+    spec.algorithm_params.insert("cooldownMinutes".into(), json!(baseline_cooldown));
+    spec.algorithm_search = BTreeMap::from([("cooldownMinutes".into(), vec![json!(5), json!(10), json!(20)])]);
+    spec.analytics_search = BTreeMap::from([("timeShiftMinutes".into(), vec![json!(0), json!(1)])]);
+    spec.max_trials = 8;
+    let cancel = CancelToken::new();
+    let mut params = spec.algorithm_params.clone();
+    params.insert("cooldownMinutes".into(), json!(10));
+    let exact_cap = materialize_continuous(
+        &spec, &input, &StudyCandidate { params, analytics: spec.analytics_params.clone() },
+        context, &StudyLimits::default(), &cancel,
+    ).unwrap().unwrap().instruments[0].setups.len();
+    assert!(exact_cap > 1);
+    let limits = StudyLimits { cpu_threads: 1, max_setups_per_candidate: exact_cap, ..StudyLimits::default() };
+    (spec, input, context, limits)
+}
+
+fn stable_checkpoint(bytes: &[u8]) -> ciborium::Value {
+    assert_legacy_checkpoint_has_no_new_metric_fields(bytes);
+    let mut value = ciborium::de::from_reader(bytes).unwrap();
+    replace_path(&mut value, &["elapsed_nanos"], ciborium::Value::Integer(0.into()));
+    replace_path(&mut value, &["progress", "elapsedSeconds"], ciborium::Value::Float(0.0));
+    value
+}
+
+#[test]
+fn oversized_continuous_proposals_are_counted_once_and_resume_deterministically() {
+    // Baseline may be infeasible in-domain, feasible, or infeasible outside the domain.
+    for baseline_cooldown in [5, 10, 7] {
+        for batch_size in [1, 4] {
+            let (spec, input, context, mut limits) = setup_cap_fixture(baseline_cooldown);
+            limits.batch_size = batch_size;
+            let cancel = CancelToken::new();
+            let pause = CancelToken::new();
+            let mut overflowing = spec.algorithm_params.clone();
+            overflowing.insert("cooldownMinutes".into(), json!(5));
+            let oversized = StudyCandidate { params: overflowing, analytics: spec.analytics_params.clone() };
+            // Actual detector/materialization guard, not an injected limit() error.
+            assert!(matches!(materialize_continuous(&spec, &input, &oversized, context, &limits, &cancel),
+                Err(StudyError::ResourceLimit { resource, requested, limit })
+                    if resource == "setups_per_candidate" && limit == limits.max_setups_per_candidate && requested == limit + 1));
+            let mut reference_states = Vec::new();
+            let mut infeasible = Vec::new();
+            let mut completed_counts = Vec::new();
+            let reference = finished(search_continuous_resumable(
+                &spec, &input, context, &limits, control(&cancel, &pause, None),
+                |update| {
+                    let count = update.progress.evaluated_candidates;
+                    if count > completed_counts.last().copied().unwrap_or(0) { completed_counts.push(count); }
+                    if let Some(event) = update.event.filter(|e| e.kind == "candidate_infeasible") {
+                        assert!(event.message.contains("setups_per_candidate"));
+                        assert!(event.message.contains(&format!("limit={}", limits.max_setups_per_candidate)));
+                        infeasible.push((count, update.progress.scorable_candidates));
+                    }
+                },
+                |info, bytes| { reference_states.push((info.sequence, stable_checkpoint(bytes))); Ok(CheckpointAction::Continue) },
+            ).expect("one oversized proposal must not abort the continuous search"));
+            let expected_trials = if baseline_cooldown == 7 { 7 } else { 6 };
+            assert_eq!(reference.reason, TerminationReason::SpaceExhausted);
+            assert_eq!(reference.progress.evaluated_candidates, expected_trials);
+            assert_eq!(completed_counts, (1..=expected_trials).collect::<Vec<_>>());
+            assert_eq!(reference.progress.scorable_candidates, 4);
+            assert_eq!(infeasible.len(), expected_trials - 4, "only the over-cap detector group is infeasible");
+            assert!(infeasible.windows(2).all(|w| w[0].0 < w[1].0));
+            assert_eq!(reference.baseline.is_some(), baseline_cooldown == 10);
+            if baseline_cooldown != 10 { assert_eq!(infeasible[0], (1, 0)); }
+            let best = reference.best.as_ref().expect("later feasible proposals must still be evaluated");
+            assert!(best.support.setup_count <= limits.max_setups_per_candidate);
+            assert_ne!(best.params["cooldownMinutes"], json!(5));
+            if baseline_cooldown != 10 { assert!(best.trial_index > 0); }
+            let winner = StudyCandidate { params: best.params.clone(), analytics: AnalyticsParams {
+                cluster_enabled: best.analytics.cluster_enabled,
+                cluster_gap_minutes: best.analytics.cluster_gap_minutes.unwrap_or(spec.analytics_params.cluster_gap_minutes),
+                time_shift_minutes: best.analytics.time_shift_minutes, price_change_pct: best.analytics.price_change_pct,
+            } };
+            let replay = materialize_continuous(&spec, &input, &winner, context, &limits, &cancel).unwrap().unwrap();
+            let reanalyzed = analyze_continuous(&spec, &input, &replay, &winner, &limits, &cancel).unwrap().unwrap();
+            assert_eq!(reanalyzed.evaluation.matrix, best.matrix);
+            assert_eq!(reanalyzed.evaluation.summary, best.support);
+            // Direct/final materialization is still strict after the search exception.
+            assert!(matches!(materialize_continuous(&spec, &input, &oversized, context, &limits, &cancel),
+                Err(StudyError::ResourceLimit { resource, .. }) if resource == "setups_per_candidate"));
+            let mut checkpoint = None;
+            let mut resumed_states = Vec::new();
+            let recovered = loop {
+                let mut committed = None;
+                let exit = search_continuous_resumable(
+                    &spec, &input, context, &limits, control(&cancel, &pause, checkpoint.as_deref()), |_| {},
+                    |info, bytes| {
+                        resumed_states.push((info.sequence, stable_checkpoint(bytes)));
+                        committed = Some(bytes.to_vec());
+                        Ok(if info.sequence > 0 { CheckpointAction::Suspend } else { CheckpointAction::Continue })
+                    },
+                ).expect("joined infeasible trials must be checkpoint-resumable without resampling");
+                if let Some(bytes) = committed { checkpoint = Some(bytes); }
+                assert!(resumed_states.len() <= reference_states.len());
+                if let ContinuousSearchExit::Completed(outcome) = exit { break outcome; }
+            };
+            // Includes exact RNG/frontier/seen/records/influence/counters/incumbent, not just score.
+            assert_eq!(resumed_states, reference_states);
+            assert_eq!(comparable(recovered), comparable(reference));
+        }
+    }
+}
+
+#[test]
+fn all_oversized_continuous_trials_finish_without_fake_baseline_or_winner() {
+    let (mut spec, input, context, limits) = setup_cap_fixture(5);
+    spec.algorithm_search.clear();
+    spec.analytics_search.clear();
+    spec.max_trials = 1;
+    let cancel = CancelToken::new();
+    let pause = CancelToken::new();
+    let mut checkpoint = Vec::new();
+    let exit = search_continuous_resumable(
+        &spec, &input, context, &limits, control(&cancel, &pause, None), |_| {},
+        |info, bytes| {
+            checkpoint = bytes.to_vec();
+            Ok(if info.sequence == 1 { CheckpointAction::Suspend } else { CheckpointAction::Continue })
+        },
+    ).expect("an infeasible baseline consumes trial0 without becoming a study error");
+    let ContinuousSearchExit::Suspended(info) = exit else { panic!("expected joined trial0 checkpoint") };
+    assert_eq!((info.progress.evaluated_candidates, info.progress.scorable_candidates, info.progress.best_score), (1, 0, None));
+    let outcome = finished(search_continuous_resumable(
+        &spec, &input, context, &limits, control(&cancel, &pause, Some(&checkpoint)), |_| {},
+        |_, _| panic!("trial budget already consumed"),
+    ).unwrap());
+    assert_eq!(outcome.reason, TerminationReason::TrialBudget);
+    assert!(outcome.baseline.is_none());
+    assert!(outcome.best.is_none());
+    assert_eq!((outcome.progress.evaluated_candidates, outcome.progress.scorable_candidates), (1, 0));
+    let value:ciborium::Value=ciborium::de::from_reader(checkpoint.as_slice()).unwrap();
+    let mut corruptions=Vec::new();
+    let mut changed=value.clone();replace_path(&mut changed,&["baseline_infeasible"],ciborium::Value::Bool(false));corruptions.push(changed);
+    let mut changed=value.clone();
+    let ciborium::Value::Map(fields)=&mut changed else {panic!("checkpoint map")};
+    fields.retain(|(key,_)|key.as_text()!=Some("baseline_infeasible"));corruptions.push(changed);
+    let mut changed=value.clone();replace_path(&mut changed,&["search","records"],ciborium::Value::Array(vec![]));corruptions.push(changed);
+    let mut changed=value.clone();
+    let ciborium::Value::Map(fields)=&mut changed else {panic!("checkpoint map")};
+    let (_,ciborium::Value::Map(search))=fields.iter_mut().find(|(key,_)|key.as_text()==Some("search")).unwrap() else {panic!("search map")};
+    let (_,ciborium::Value::Array(records))=search.iter_mut().find(|(key,_)|key.as_text()==Some("records")).unwrap() else {panic!("records")};
+    replace_path(&mut records[0],&["score"],ciborium::Value::Float(0.0));corruptions.push(changed);
+    for value in corruptions {
+        let mut bytes=Vec::new();ciborium::ser::into_writer(&value,&mut bytes).unwrap();
+        assert!(matches!(search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,Some(&bytes)),|_|{},|_,_|panic!("corruption must not commit")),Err(StudyError::InvalidInput(_))));
+    }
+}
+
+#[test]
+fn oversized_trial_handling_keeps_other_limits_corruption_and_commit_errors_fatal() {
+    let (spec, input, context, limits) = setup_cap_fixture(5);
+    let cancel = CancelToken::new();
+    let pause = CancelToken::new();
+    for (changed, expected_resource) in [
+        (StudyLimits { max_snapshot_bytes: 1, ..limits.clone() }, "snapshot_bytes"),
+        (StudyLimits { max_working_bytes: 700_000, ..limits.clone() }, "continuous_working_bytes"),
+    ] {
+        assert!(matches!(search_continuous_resumable(&spec, &input, context, &changed,
+            control(&cancel, &pause, None), |_| {}, |_, _| Ok(CheckpointAction::Continue)),
+            Err(StudyError::ResourceLimit { resource, .. }) if resource == expected_resource));
+    }
+    let mut corrupted = input.clone();
+    corrupted.instruments[0].candles[0].low = f64::NAN;
+    assert!(matches!(search_continuous_resumable(&spec, &corrupted, context, &limits,
+        control(&cancel, &pause, None), |_| {}, |_, _| Ok(CheckpointAction::Continue)), Err(StudyError::InvalidInput(_))));
+    let injected = StudyError::ResourceLimit { resource: "setups_per_candidate".into(), limit: 1, requested: 2 };
+    let mut committed_sequence = None;
+    let error = search_continuous_resumable(&spec, &input, context, &limits,
+        control(&cancel, &pause, None), |_| {}, |info, _| {
+            if info.sequence == 1 { return Err(injected.clone()); }
+            committed_sequence = Some(info.sequence);
+            Ok(CheckpointAction::Continue)
+        }).unwrap_err();
+    assert_eq!(error, injected, "even the same resource error from a checkpoint callback is fatal");
+    assert_eq!(committed_sequence, Some(0));
+}
+
+#[test]
+fn missing_unscorable_baseline_without_marker_fails_closed() {
+    let (mut spec,input,context)=fixture();
+    spec.algorithm_params.insert("priceGrowthPct".into(),json!("1000"));
+    spec.algorithm_search.clear(); spec.analytics_search.clear(); spec.max_trials=1;
+    let limits=StudyLimits::default(); let cancel=CancelToken::new(); let pause=CancelToken::new();
+    let mut checkpoint=Vec::new();
+    search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,None),|_|{},|info,bytes| {
+        checkpoint=bytes.to_vec();Ok(if info.sequence==1 {CheckpointAction::Suspend}else{CheckpointAction::Continue})
+    }).unwrap();
+    let mut value:ciborium::Value=ciborium::de::from_reader(checkpoint.as_slice()).unwrap();
+    assert!(value.as_map().unwrap().iter().all(|(key,_)|key.as_text()!=Some("baseline_infeasible")),"false marker must preserve legacy bytes");
+    let legacy=finished(search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,Some(&checkpoint)),|_|{},|_,_|panic!("budget consumed")).unwrap());
+    assert!(legacy.baseline.as_ref().is_some_and(|summary|summary.score.is_none()));
+    let mut contradictory=value.clone();
+    let ciborium::Value::Map(fields)=&mut contradictory else {panic!("checkpoint map")};
+    fields.push((ciborium::Value::Text("baseline_infeasible".into()),ciborium::Value::Bool(true)));
+    let mut corrupt=Vec::new();ciborium::ser::into_writer(&contradictory,&mut corrupt).unwrap();
+    assert!(matches!(search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,Some(&corrupt)),|_|{},|_,_|panic!("contradictory marker must not commit")),Err(StudyError::InvalidInput(_))));
+    replace_path(&mut value,&["baseline"],ciborium::Value::Null);
+    let mut corrupt=Vec::new();ciborium::ser::into_writer(&value,&mut corrupt).unwrap();
+    assert!(matches!(search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,Some(&corrupt)),|_|{},|_,_|panic!("corrupt baseline must not commit")),
+        Err(StudyError::InvalidInput(_))),"a missing ordinary non-scorable baseline is corruption, not inferred infeasibility");
+}
+
+#[test]
+fn infeasible_marker_rejects_initial_state_and_scored_trial_zero() {
+    let (mut spec,input,context)=fixture();spec.max_trials=1;
+    let limits=StudyLimits::default();let cancel=CancelToken::new();let pause=CancelToken::new();
+    let mut snapshots=Vec::new();
+    search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,None),|_|{},|_,bytes| {
+        snapshots.push(bytes.to_vec());Ok(CheckpointAction::Continue)
+    }).unwrap();
+    assert_eq!(snapshots.len(),2);
+    for (index,bytes) in snapshots.iter().enumerate() {
+        let mut value:ciborium::Value=ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let ciborium::Value::Map(fields)=&mut value else {panic!("checkpoint map")};
+        fields.push((ciborium::Value::Text("baseline_infeasible".into()),ciborium::Value::Bool(true)));
+        if index==1 {replace_path(&mut value,&["baseline"],ciborium::Value::Null);}
+        let mut corrupt=Vec::new();ciborium::ser::into_writer(&value,&mut corrupt).unwrap();
+        assert!(matches!(search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,Some(&corrupt)),|_|{},|_,_|panic!("invalid trial0 marker must not commit")),Err(StudyError::InvalidInput(_))));
+    }
+}
+
 #[test]
 fn joined_restarts_match_uninterrupted_and_legacy_manual_rng_proposals() {
     let (spec, input, context) = fixture();
@@ -543,6 +766,9 @@ fn corrupt_checkpoint_indices_versions_floats_and_trailing_bytes_return_typed_er
     )
     .unwrap();
     let cases: Vec<(&[&str], ciborium::Value)> = vec![
+        // A missing infeasible-baseline summary is valid, but deleting the
+        // summary of a scored trial0 must still fail closed.
+        (&["baseline"], ciborium::Value::Null),
         (&["version"], ciborium::Value::Integer(99.into())),
         (
             &["search", "enumeration"],
