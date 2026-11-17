@@ -93,7 +93,7 @@ pub struct TrendInput {
     pub value: Option<f64>,
     pub weight: u32,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrendPoint {
     pub day: f64,
@@ -108,6 +108,20 @@ pub struct TrendSummary {
     pub end: TrendPoint,
     pub endpoint_se: Option<f64>,
     pub curve: Vec<TrendPoint>,
+}
+impl<'de> Deserialize<'de> for TrendSummary {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire { method: String, start: TrendPoint, end: TrendPoint,
+            endpoint_se: Option<f64>, curve: Vec<TrendPoint> }
+        let w=Wire::deserialize(deserializer)?;
+        let method=match w.method.as_str() {
+            "linear" => "linear", "p_spline" => "p_spline",
+            _ => return Err(serde::de::Error::custom("unsupported saved trend method")),
+        };
+        Ok(Self {method,start:w.start,end:w.end,endpoint_se:w.endpoint_se,curve:w.curve})
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrendError {

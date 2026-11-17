@@ -1,5 +1,6 @@
 pub mod decimal;
 pub mod expectancy;
+pub mod forecast;
 pub mod parameter_metadata;
 pub mod trend;
 pub use parameter_metadata::algorithm_fields;
@@ -54,6 +55,8 @@ pub struct AdaptiveRecommendationSnapshot {
     pub provenance: RecommendationProvenance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_forecast: Option<SearchForecast>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<forecast::ForecastRecipe>,
 }
 
 /// Additive optimizing metric. rawR/meanR above always remain period means.

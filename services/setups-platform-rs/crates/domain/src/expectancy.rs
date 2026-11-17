@@ -2,11 +2,16 @@
 //! change to saved matrix arithmetic. Owned by one sealed research snapshot;
 //! at most 3,661 UTC buckets / 1 MiB JSON, with no process-wide retained state.
 use crate::{RecommendationDirection, RecommendationProvenance};
+use crate::forecast::{ForecastMethod, ForecastRecipe, ProbabilityCurve, ProbabilityCurveRequest,
+    ProbabilityDay, ProbabilityForecast, ForecastUnavailableReason, probability_curve};
+use crate::trend::{TrendInput, TrendSummary, fit_weighted_trend};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{fmt, io};
 
 pub const EXPECTANCY_CALCULATION_VERSION: u32 = 2;
+/// Opt-in common-model artifact. v2 remains valid and byte-compatible.
+pub const EXPECTANCY_MODEL_CALCULATION_VERSION: u32 = 3;
 pub const UTC_DAY_SECONDS: i64 = 86_400;
 /// Matches the existing continuous lookback admission (3660 days), not a new
 /// restriction on research. A fractional start can touch one additional day.
@@ -31,6 +36,7 @@ pub enum ExpectancyUnavailableReason {
     IncompleteOutcomeHistory,
     NoClosedOutcomes,
     InsufficientFiniteDays,
+    NoWeightedEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -93,6 +99,8 @@ pub struct ExpectancySource {
     pub tp_pct: f64,
     pub sl_pct: f64,
     pub analytics: ExpectancyAnalytics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<ForecastRecipe>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -185,6 +193,20 @@ pub struct ExpectancyArtifact {
     pub trend: Option<UtcLinearTrend>,
     pub trend_unavailable_reason: Option<ExpectancyUnavailableReason>,
     pub trend_delta_r: MetricAvailability<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<ExpectancyForecast>,
+}
+
+/// Exactly one method-specific payload is populated for explicit v3 recipes.
+/// Artifact validation rebuilds it from proven counts; fields are never a
+/// second authority independent of source.forecast/data/C.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExpectancyForecast {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probability: Option<ProbabilityCurve>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trend: Option<TrendSummary>,
 }
 
 /// A study asset identity, not PNG bytes copied into each recommendation. The
@@ -200,6 +222,10 @@ pub struct ExpectancyImageKey {
     pub calculation_version: u32,
     pub timezone: ExpectancyTimezone,
     pub render_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<ForecastRecipe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_cutoff: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +244,7 @@ pub enum ExpectancyError {
     InconsistentArtifact,
     ArtifactTooLarge,
     InvalidJson,
+    InvalidForecast,
 }
 impl fmt::Display for ExpectancyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -271,6 +298,11 @@ pub fn utc_day_coordinate(origin_unix: i64, timestamp: i64) -> f64 {
 }
 
 fn validate_source(source: &ExpectancySource) -> Result<(i64, f64), ExpectancyError> {
+    if let Some(recipe) = source.forecast {
+        recipe.validate().map_err(|_| ExpectancyError::InvalidForecast)?;
+        utc_date(source.provenance.observation_cutoff)?;
+        if source.provenance.observation_cutoff < source.provenance.from_unix { return Err(ExpectancyError::InvalidSource); }
+    }
     let p = &source.provenance;
     let duration = p
         .to_unix
@@ -308,7 +340,7 @@ fn validate_source(source: &ExpectancySource) -> Result<(i64, f64), ExpectancyEr
         || a.time_shift_minutes < 0
         || a.horizon_minutes <= 0
         || a.cluster_gap_minutes.is_some_and(|gap| gap <= 0)
-        || p.observation_cutoff > p.to_unix
+        || (source.forecast.is_none() && p.observation_cutoff > p.to_unix)
     {
         return Err(ExpectancyError::InvalidSource);
     }
@@ -441,8 +473,8 @@ pub fn build_expectancy_artifact(
             MetricAvailability::Available { value: points }
         }
     };
-    let trend = match &daily {
-        MetricAvailability::Available { value } => fit_daily(value)?,
+    let trend = match (&daily, input.source.forecast) {
+        (MetricAvailability::Available { value }, None) => fit_daily(value)?,
         _ => None,
     };
     let reason = if trend.is_some() {
@@ -461,8 +493,40 @@ pub fn build_expectancy_artifact(
             reason: reason.expect("unavailable trend has a reason"),
         },
     };
+    let forecast = match (input.source.forecast, daily.as_ref()) {
+        (Some(recipe), Some(points)) => {
+            let model = match recipe {
+                ForecastRecipe::DecayedProbability { .. } => ExpectancyForecast {
+                    probability: Some(probability_curve(&ProbabilityCurveRequest {
+                        recipe, q: input.source.tp_pct / input.source.sl_pct,
+                        observation_cutoff: input.source.provenance.observation_cutoff,
+                        daily: points.iter().map(|p| ProbabilityDay { day_start_unix: p.day_start_unix,
+                            tp_count: p.tp_count, sl_count: p.sl_count }).collect(),
+                    }).map_err(|_| ExpectancyError::InvalidForecast)?), trend: None,
+                },
+                ForecastRecipe::Trend { bend_days, .. } => ExpectancyForecast {
+                    probability: None,
+                    trend: fit_weighted_trend(&points.iter().map(|p| Ok(TrendInput {
+                        day: p.day_start_unix as f64 / UTC_DAY_SECONDS as f64,
+                        value: p.mean_r, weight: p.row_count.try_into().map_err(|_| ExpectancyError::InvalidCounts)?,
+                    })).collect::<Result<Vec<_>, ExpectancyError>>()?, bend_days).map_err(|_| ExpectancyError::InvalidForecast)?.map(|fit| fit.summary()),
+                },
+            };
+            Some(model)
+        }
+        _ => None,
+    };
+    let model_delta = match &forecast {
+        Some(ExpectancyForecast { probability: Some(p), .. }) => {
+            p.curve.iter().filter_map(|p| p.forecast_r).next().zip(p.estimate.as_ref().map(|p| p.forecast_r))
+                .map(|(first,last)| last-first)
+        }
+        Some(ExpectancyForecast { trend: Some(t), .. }) => Some(t.end.value-t.start.value),
+        _ => None,
+    };
+    let explicit = input.source.forecast.is_some();
     let artifact = ExpectancyArtifact {
-        calculation_version: EXPECTANCY_CALCULATION_VERSION,
+        calculation_version: if explicit { EXPECTANCY_MODEL_CALCULATION_VERSION } else { EXPECTANCY_CALCULATION_VERSION },
         timezone: ExpectancyTimezone::UTC,
         origin_unix,
         from_unix,
@@ -475,9 +539,10 @@ pub fn build_expectancy_artifact(
             ExpectancyUnavailableReason::MissingMatrixMean,
         )?,
         daily,
-        trend,
-        trend_unavailable_reason: reason,
-        trend_delta_r,
+        trend: if explicit { None } else { trend },
+        trend_unavailable_reason: if explicit { None } else { reason },
+        trend_delta_r: if explicit { available_or(model_delta, ExpectancyUnavailableReason::InsufficientFiniteDays)? } else { trend_delta_r },
+        forecast,
     };
     artifact.check_byte_budget()?;
     Ok(artifact)
@@ -535,7 +600,7 @@ impl ExpectancyArtifact {
     /// Validate persisted/untrusted structs before use; no silent upgrading of
     /// browser-local/indexed v1 or modified coefficients in an immutable copy.
     pub fn validate(&self) -> Result<(), ExpectancyError> {
-        if self.calculation_version != EXPECTANCY_CALCULATION_VERSION {
+        if self.calculation_version != EXPECTANCY_CALCULATION_VERSION && self.calculation_version != EXPECTANCY_MODEL_CALCULATION_VERSION {
             return Err(ExpectancyError::UnsupportedVersion);
         }
         let selected_cell = self.selected_cell.as_ref().map(|cell| SelectedCellInput {
@@ -584,6 +649,28 @@ impl ExpectancyArtifact {
         raw_signal_at_unix: i64,
     ) -> Result<MetricAvailability<f64>, ExpectancyError> {
         self.validate()?;
+        if let Some(recipe) = self.source.forecast {
+            if raw_signal_at_unix < self.source.provenance.observation_cutoff { return Err(ExpectancyError::InvalidForecast); }
+            if let Some(model) = &self.forecast {
+                match recipe.method() {
+                    ForecastMethod::DecayedProbability => match model.probability.as_ref().ok_or(ExpectancyError::InconsistentArtifact)?.estimate {
+                        ProbabilityForecast::Available { value } => return Ok(MetricAvailability::Available { value: value.forecast_r }),
+                        ProbabilityForecast::Unavailable { reason } => return Ok(MetricAvailability::Unavailable { reason: match reason {
+                            ForecastUnavailableReason::NoClosedOutcomes => ExpectancyUnavailableReason::NoClosedOutcomes,
+                            ForecastUnavailableReason::NoWeightedEvidence => ExpectancyUnavailableReason::NoWeightedEvidence,
+                        } }),
+                    },
+                    ForecastMethod::Trend => return Ok(match &model.trend {
+                        Some(trend) => MetricAvailability::Available { value: trend.end.value },
+                        None => MetricAvailability::Unavailable { reason: ExpectancyUnavailableReason::InsufficientFiniteDays },
+                    }),
+                }
+            }
+            return Ok(MetricAvailability::Unavailable { reason: match &self.daily {
+                MetricAvailability::Unavailable { reason } => *reason,
+                _ => ExpectancyUnavailableReason::MissingFrozenOutcomes,
+            } });
+        }
         match self.trend {
             Some(trend) => Ok(MetricAvailability::Available {
                 value: trend.evaluate(utc_day_coordinate(self.origin_unix, raw_signal_at_unix))?,
@@ -603,6 +690,8 @@ impl ExpectancyArtifact {
             calculation_version: self.calculation_version,
             timezone: self.timezone,
             render_version,
+            forecast: self.source.forecast,
+            observation_cutoff: self.source.forecast.map(|_| self.source.provenance.observation_cutoff),
         }
     }
     pub fn from_json(bytes: &[u8]) -> Result<Self, ExpectancyError> {
@@ -656,6 +745,63 @@ mod tests {
     }
     fn close(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-12, "{a} != {b}");
+    }
+    #[test]
+    fn explicit_probability_v3_is_typed_frozen_and_does_not_rewrite_legacy_v2() {
+        let (input, _) = fixture();
+        let old = build_expectancy_artifact(input.clone()).unwrap();
+        assert_eq!(old.calculation_version, 2);
+        let old_json = old.to_json().unwrap();
+        let old_value: serde_json::Value = serde_json::from_slice(&old_json).unwrap();
+        assert!(old_value.get("forecast").is_none());
+        assert!(old_value["source"].get("forecast").is_none());
+        assert!(serde_json::to_value(old.image_key(1)).unwrap().get("forecast").is_none());
+        let mut new_input = input;
+        new_input.source.forecast = Some(ForecastRecipe::engineering_baseline());
+        // Explicit recipes support the actual outcome cutoff after the end of
+        // the signal cohort period. This never relaxes legacy v2 validation.
+        new_input.source.provenance.observation_cutoff = new_input.source.provenance.to_unix + 3600;
+        let new = build_expectancy_artifact(new_input).unwrap();
+        assert_eq!(new.calculation_version, 3);
+        assert_eq!(new.selected_cell, old.selected_cell);
+        assert_eq!(new.matrix_mean_r, old.matrix_mean_r);
+        assert!(new.trend.is_none());
+        let p = new.forecast.as_ref().unwrap().probability.as_ref().unwrap();
+        let f = p.estimate.as_ref().unwrap().forecast_r;
+        assert_eq!(p.curve.last().unwrap().forecast_r, Some(f));
+        let c = new.source.provenance.observation_cutoff;
+        assert_eq!(new.forecast_at_raw_signal(c).unwrap().as_ref(),Some(&f));
+        assert_eq!(new.forecast_at_raw_signal(c+30*UTC_DAY_SECONDS).unwrap().as_ref(),Some(&f));
+        assert_eq!(new.forecast_at_raw_signal(c-1),Err(ExpectancyError::InvalidForecast));
+        let key = new.image_key(1);
+        assert_eq!(key.forecast,new.source.forecast);
+        assert_eq!(key.observation_cutoff,Some(c));
+        assert_ne!(key,old.image_key(1));
+        assert_eq!(ExpectancyArtifact::from_json(&new.to_json().unwrap()).unwrap(),new);
+        assert_eq!(ExpectancyArtifact::from_json(&old_json).unwrap(),old);
+        let mut corrupt = new.clone();
+        corrupt.calculation_version=2;
+        assert_eq!(corrupt.validate(),Err(ExpectancyError::InconsistentArtifact));
+        let mut corrupt = new.clone();
+        corrupt.forecast.as_mut().unwrap().probability.as_mut().unwrap().curve.last_mut().unwrap().forecast_r=Some(99.0);
+        assert_eq!(corrupt.validate(),Err(ExpectancyError::InconsistentArtifact));
+        let mut corrupt = new;
+        corrupt.source.forecast=Some(ForecastRecipe::DecayedProbability {version:1,half_life_days:7.0,kappa:10.0,prior_policy:crate::forecast::PriorPolicy::GrossBreakEven});
+        assert_eq!(corrupt.validate(),Err(ExpectancyError::InconsistentArtifact));
+    }
+    #[test]
+    fn explicit_trend_artifact_uses_shared_weighted_endpoint_not_legacy_ols_extrapolation() {
+        let (mut input,_) = fixture();
+        input.source.forecast=Some(ForecastRecipe::Trend {version:1,bend_days:crate::trend::TrendBendDays::Linear});
+        let new=build_expectancy_artifact(input).unwrap();
+        assert_eq!(new.calculation_version,3);
+        let model=new.forecast.as_ref().unwrap();
+        assert!(model.probability.is_none());
+        let endpoint=model.trend.as_ref().unwrap().end.value;
+        let c=new.source.provenance.observation_cutoff;
+        assert_eq!(new.forecast_at_raw_signal(c).unwrap().as_ref(),Some(&endpoint));
+        assert_eq!(new.forecast_at_raw_signal(c+86400).unwrap().as_ref(),Some(&endpoint));
+        assert_eq!(ExpectancyArtifact::from_json(&new.to_json().unwrap()).unwrap(),new);
     }
     #[test]
     fn calendar_gap_equal_weight_golden_and_fractional_raw_forecast() {
