@@ -2,6 +2,7 @@
 //! All collections are request/tick-local and bounded; scientific snapshots stay in DB.
 use super::{live, owner_lock};
 use crate::DbError;
+use crate::diagnostics::{self, Level};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -78,21 +79,61 @@ impl ProfileCommand {
 }
 pub enum CommandOutcome {Applied(Value),NotFound,Conflict(&'static str),Limited{resource:&'static str,limit:i32}}
 
+fn handoff_diagnostics(generation:i64,profile:i64,study:Option<i64>,algorithm:&str)->Value {
+    json!({"component":"continuous.profiles","stage":"handoff_consume","generation_id":generation,
+        "profile_id":profile,"slot_id":profile,"study_id":study,"algorithm_id":algorithm})
+}
+
 /// At most 32 durable events per tick. Blocked outcomes are visible and do not
 /// hold the research queue or accumulate retry payloads in memory.
 pub async fn accept_handoffs(pool:&PgPool,owner:&str)->Result<usize,DbError> {
+    let started=std::time::Instant::now();
+    // Transaction-local, at most 32 scalar projections. Discard on rollback;
+    // never report a handoff accepted before its COMMIT is acknowledged.
+    let mut events=Vec::new();
+    let result=accept_handoffs_inner(pool,owner,&mut events).await;
+    match &result {
+        Ok(_)=>for mut fields in events {
+            fields["duration_ms"]=(started.elapsed().as_millis() as u64).into();
+            let level=if fields["outcome"]=="blocked" {Level::Warn}else{Level::Info};
+            diagnostics::emit(level,"continuous_profile_handoff_finished",fields);
+        },
+        Err(error)=>{
+            let mut fields=events.pop().unwrap_or_else(||json!({"component":"continuous.profiles","stage":"handoff_consume"}));
+            fields["outcome"]="error".into();fields["error_code"]=diagnostics::db_error_code(error).into();
+            fields["admission_state"]="not_confirmed".into();
+            fields.as_object_mut().unwrap().remove("reason");
+            fields.as_object_mut().unwrap().remove("desired_running");
+            fields["duration_ms"]=(started.elapsed().as_millis() as u64).into();
+            diagnostics::emit(Level::Error,"continuous_profile_handoff_finished",fields);
+        },
+    }
+    result
+}
+async fn accept_handoffs_inner(pool:&PgPool,owner:&str,events:&mut Vec<Value>)->Result<usize,DbError> {
     let due:bool=sqlx::query_scalar("select exists(select 1 from adaptive_profile_handoffs where owner_id=$1 and status='pending')").bind(owner).fetch_one(pool).await?;
     if !due {return Ok(0);}
     let mut tx=pool.begin().await?;owner_lock(&mut tx,owner).await?;
     let limits=limits_in(&mut tx,owner).await?;
-    let rows=sqlx::query("select h.generation_id,h.slot_id,g.algorithm_id,s.min_setups_per_day::text frequency,g.study_id from adaptive_profile_handoffs h join continuous_generations g on g.id=h.generation_id join continuous_slots s on s.id=h.slot_id where h.owner_id=$1 and h.status='pending' and g.status='completed' and g.accepted order by h.generation_id limit 32 for update of h")
+    let rows=sqlx::query("select h.generation_id,h.slot_id,g.algorithm_id,s.min_setups_per_day::text frequency,g.study_id,g.config_revision,g.live_init_attempts,g.live_init_attempt_limit,(extract(epoch from (clock_timestamp()-h.created_at))*1000)::bigint handoff_age_ms from adaptive_profile_handoffs h join continuous_generations g on g.id=h.generation_id join continuous_slots s on s.id=h.slot_id where h.owner_id=$1 and h.status='pending' and g.status='completed' and g.accepted order by h.generation_id limit 32 for update of h")
         .bind(owner).fetch_all(&mut *tx).await?;
     let count=rows.len();
+    if count>0 {diagnostics::emit(Level::Info,"continuous_profile_handoff_started",json!({"component":"continuous.profiles","stage":"handoff_consume","handoff_count":count}));}
     for row in rows {
         let id:i64=row.try_get("slot_id")?;let generation:i64=row.try_get("generation_id")?;
-        let current=sqlx::query("select accepted_generation_id,desired_running from adaptive_profiles where id=$1 for update")
+        let mut fields=handoff_diagnostics(generation,id,row.try_get("study_id")?,&row.try_get::<String,_>("algorithm_id")?);
+        fields["config_revision"]=row.try_get::<i64,_>("config_revision")?.into();
+        fields["attempt"]=row.try_get::<i32,_>("live_init_attempts")?.into();
+        fields["attempt_limit"]=row.try_get::<i32,_>("live_init_attempt_limit")?.into();
+        fields["handoff_age_ms"]=row.try_get::<i64,_>("handoff_age_ms")?.into();
+        events.push(fields);
+        let fields=events.last_mut().unwrap();
+        let current=sqlx::query("select accepted_generation_id,desired_running,control_revision from adaptive_profiles where id=$1 for update")
             .bind(id).fetch_optional(&mut *tx).await?;
+        fields["previous_accepted_generation_id"]=json!(current.as_ref().map(|r|r.get::<i64,_>("accepted_generation_id")));
+        fields["control_revision"]=current.as_ref().map_or(1,|r|r.get::<i64,_>("control_revision")).into();
         if current.as_ref().is_some_and(|r|r.get::<i64,_>("accepted_generation_id")>=generation) {
+            fields["outcome"]="superseded".into();fields["reason"]="newer_or_same_accepted_generation".into();
             sqlx::query("update adaptive_profile_handoffs set status='superseded' where generation_id=$1").bind(generation).execute(&mut *tx).await?;continue;
         }
         let mut running=current.as_ref().is_none_or(|r|r.get::<bool,_>("desired_running"));
@@ -100,6 +141,7 @@ pub async fn accept_handoffs(pool:&PgPool,owner:&str)->Result<usize,DbError> {
         if current.is_none() {
             let total:i64=sqlx::query_scalar("select count(*) from adaptive_profiles where owner_id=$1").bind(owner).fetch_one(&mut *tx).await?;
             if total>=i64::from(limits.total_profiles) {
+                fields["outcome"]="blocked".into();fields["reason"]="profile_total_limit".into();fields["limit"]=limits.total_profiles.into();
                 sqlx::query("update adaptive_profile_handoffs set status='blocked',error=$2 where generation_id=$1")
                     .bind(generation).bind(json!({"code":"profile_total_limit","limit":limits.total_profiles})).execute(&mut *tx).await?;continue;
             }
@@ -119,6 +161,9 @@ pub async fn accept_handoffs(pool:&PgPool,owner:&str)->Result<usize,DbError> {
             .bind(id).bind(generation).bind(running).bind(&error).bind(row.try_get::<Option<i64>,_>("study_id")?).execute(&mut *tx).await?;
         sqlx::query("update adaptive_profile_handoffs set status='accepted',error=$2 where generation_id=$1")
             .bind(generation).bind(&error).execute(&mut *tx).await?;
+        fields["outcome"]="accepted".into();fields["desired_running"]=running.into();
+        fields["admission_state"]=if running {"awaiting_claim"}else{"stopped"}.into();
+        fields["reason"]=if running {"candidate_pending"}else if error.is_some(){"profile_running_limit"}else{"profile_stopped"}.into();
     }
     tx.commit().await?;Ok(count)
 }
@@ -242,6 +287,17 @@ pub async fn command(pool:&PgPool,owner:&str,id:i64,play:bool,request:&ProfileCo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn handoff_log_projection_links_identity_without_snapshots_and_is_bounded() {
+        let fields=handoff_diagnostics(31,4,Some(35),&"я".repeat(5000));
+        let record=diagnostics::record(Level::Info,"continuous_profile_handoff_finished",&fields);
+        assert_eq!(record["study_id"],35);assert_eq!(record["generation_id"],31);
+        assert_eq!(record["profile_id"],4);assert_eq!(record["slot_id"],4);
+        assert_eq!(record["stage"],"handoff_consume");
+        assert_eq!(record["algorithm_id"].as_str().unwrap().chars().count(),160);
+        assert!(record.to_string().len()+1<=diagnostics::MAX_RECORD_BYTES);
+        for key in ["spec","result","params","universe","owner_id","request_id"] {assert!(record.get(key).is_none());}
+    }
     #[test]
     fn profile_limits_are_external_validated_configuration_not_a_browser_field() {
         assert!(ProfileLimits{total_profiles:50,running_profiles:30}.validate().is_ok());

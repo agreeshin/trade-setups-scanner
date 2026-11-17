@@ -39,6 +39,8 @@ pub enum SharedDetectorError {
     Decimal(DecimalError),
     Invalid(&'static str),
     Capacity { required: usize, limit: usize },
+    /// An append was refused BEFORE mutation; the anchor is still retained.
+    RetentionRejected { requested: HistoryPosition, projected_oldest: HistoryPosition },
     Evicted { requested: HistoryPosition, oldest: HistoryPosition },
     Future(HistoryPosition),
     WrongHistory,
@@ -209,7 +211,7 @@ impl SharedHistory {
         let end = HistoryPosition(position.0.checked_add(1).ok_or(SharedDetectorError::Invalid("history position overflow"))?);
         let oldest = HistoryPosition(end.0.saturating_sub(self.limits.capacity_minutes as u64).max(self.oldest.0));
         if let Some(anchor) = anchor {
-            if anchor < oldest { return Err(SharedDetectorError::Evicted { requested: anchor, oldest }); }
+            if anchor < oldest { return Err(SharedDetectorError::RetentionRejected { requested: anchor, projected_oldest: oldest }); }
         }
         // Parse and validate all input BEFORE mutation; one parse serves all profiles.
         let close = Decimal::parse(&bar.close)?;
@@ -298,6 +300,12 @@ pub struct SharedProfile {
     last_setup_time: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileRetention {
+    pub anchor: HistoryPosition,
+    pub resets_for_gap: bool,
+}
+
 impl SharedProfile {
     pub fn new(params: AlgorithmParams, identity: HistoryIdentity, start: HistoryPosition, last_raw_open_unix: Option<i64>) -> Result<Self, SharedDetectorError> {
         let long = params.baseline_long_days() as usize * 1440;
@@ -339,6 +347,15 @@ impl SharedProfile {
             (Some(previous),Some(start)) => HistoryPosition(previous.0.saturating_add(1).saturating_sub(self.config.long.max(self.config.window+1) as u64).max(start.0)),
             _ => self.start,
         }
+    }
+    /// Requirement for a real bar this consumer WILL ingest next. A gap reset
+    /// needs no departure samples from the old series. Do not mutate scalar
+    /// state here: push still validates sequence/identity and preserves cooldown.
+    /// A skipped/held consumer must keep using retention_anchor instead.
+    pub fn retention_for_next(&self, position: HistoryPosition) -> ProfileRetention {
+        let resets_for_gap = self.previous.is_some_and(|previous|
+            position.0.checked_sub(previous.0.saturating_add(1)).is_some_and(|gap|gap>self.config.max_gap));
+        ProfileRetention {anchor:if resets_for_gap {position}else{self.retention_anchor()},resets_for_gap}
     }
     /// Conservative per-profile count: includes the shared config and its strings
     /// for EACH profile (thus overcounts clones rather than undercounting them).

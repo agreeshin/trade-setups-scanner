@@ -144,7 +144,7 @@ fn eviction_byte_caps_and_anchor_headroom_fail_explicitly_without_mutating_state
         profile.push(&history,pos).unwrap();
     }
     let next=bar(1442,"100","10");
-    assert!(matches!(history.push_retaining(&next,next.open_time_unix+60,held.retention_anchor()),Err(SharedDetectorError::Evicted{..})));
+    assert!(matches!(history.push_retaining(&next,next.open_time_unix+60,held.retention_anchor()),Err(SharedDetectorError::RetentionRejected{..})));
     assert_eq!(history.end_position(),HistoryPosition(1442));
     let pos=history.push_retaining(&next,next.open_time_unix+60,profile.retention_anchor()).unwrap();
     profile.push(&history,pos).unwrap();
@@ -228,4 +228,62 @@ fn repeated_eviction_releases_original_strings_and_profile_clones_do_not_own_his
         assert!(profile.retained_bytes()<2048);
         drop(profile);drop(clone);
     }
+}
+
+#[test]
+fn reset_aware_retention_preserves_exact_raw_parity_cooldown_and_fixed_history_bytes() {
+    let mut p=params();p.max_consecutive_gap_minutes=15;p.cooldown_minutes=2880;
+    let mut history=SharedHistory::new(ID,limits(1462)).unwrap();
+    let mut shared=SharedProfile::new(AlgorithmParams::Spike(p.clone()),ID,HistoryPosition(0),None).unwrap();
+    let mut reference=PriceVolumeSpikeDetector::new(p,None).unwrap();
+    let bytes=history.retained_bytes();let mut seed_before_gap=None;
+    for minute in 0..7000 {
+        if (3001..3195).contains(&minute) {continue;}
+        let input=bar(minute,if minute%2==0 {"100.00000001"}else{"100.00000002"},if minute%3==0 {"10.00000001"}else{"11"});
+        let incoming=HistoryPosition(minute as u64);
+        let before=format!("{shared:?}");
+        let retention=shared.retention_for_next(incoming);
+        assert_eq!(format!("{shared:?}"),before,"planning must not mutate cooldown or scalar state");
+        if minute==3195 {
+            assert!(retention.resets_for_gap);assert_eq!(retention.anchor,incoming);
+            assert!(matches!(history.push_retaining(&input,input.open_time_unix+60,shared.retention_anchor()),
+                Err(SharedDetectorError::RetentionRejected{..})),"old unconditional anchor reproduces the defect");
+        }
+        let position=history.push_retaining(&input,input.open_time_unix+60,retention.anchor).unwrap();
+        let result=shared.push(&history,position).unwrap();
+        assert_eq!(result,reference.push(&input).unwrap(),"minute {minute}");
+        if minute==3000 {seed_before_gap=shared.last_raw_open_unix();assert!(seed_before_gap.is_some());}
+        if minute==3195 {assert_eq!(shared.last_raw_open_unix(),seed_before_gap);assert_eq!(result.continuous_minutes,1);}
+        assert_eq!(history.retained_bytes(),bytes);assert!(history.len()<=1462);
+    }
+}
+
+#[test]
+fn mixed_reset_consumers_retain_required_departure_samples_and_distinguish_actual_eviction() {
+    let mut fast=params();fast.max_consecutive_gap_minutes=15;
+    let mut slow=fast.clone();slow.max_consecutive_gap_minutes=240;slow.max_gap_percent="100".into();
+    let mut history=SharedHistory::new(ID,limits(1687)).unwrap();
+    let mut profiles=[fast,slow].map(|p|SharedProfile::new(AlgorithmParams::Spike(p),ID,HistoryPosition(0),None).unwrap());
+    for minute in 0..=3000 {
+        let input=bar(minute,"100.00001","10.000001");
+        let pos=history.push_retaining(&input,input.open_time_unix+60,profiles.iter().map(SharedProfile::retention_anchor).min().unwrap()).unwrap();
+        for profile in &mut profiles {profile.push(&history,pos).unwrap();}
+    }
+    let incoming=HistoryPosition(3195);
+    let [fast,slow]=profiles.each_ref().map(|p|p.retention_for_next(incoming));
+    assert!(fast.resets_for_gap);assert!(!slow.resets_for_gap);assert!(slow.anchor<fast.anchor);
+    let input=bar(3195,"100.00001","10.000001");
+    let pos=history.push_retaining(&input,input.open_time_unix+60,fast.anchor.min(slow.anchor)).unwrap();
+    let reset=profiles[0].push(&history,pos).unwrap();let retained=profiles[1].push(&history,pos).unwrap();
+    assert_eq!(reset.continuous_minutes,1);assert_eq!(retained.continuous_minutes,1440);
+    assert_eq!(retained.missing_minutes,Some(194));
+    let held=profiles[1].clone();
+    let held_anchor=held.retention_anchor();let end=history.end_position();
+    let distant=bar(6000,"100","10");
+    assert_eq!(history.push_retaining(&distant,distant.open_time_unix+60,held_anchor).unwrap_err(),
+        SharedDetectorError::RetentionRejected{requested:held_anchor,projected_oldest:HistoryPosition(4314)});
+    assert_eq!(history.end_position(),end,"required held anchor remains protected atomically");
+    let frame=history.push(&distant,distant.open_time_unix+60).unwrap();
+    assert!(matches!(history.frame(held_anchor),Err(SharedDetectorError::Evicted{..})),"actual reads have a distinct typed outcome");
+    assert_eq!(profiles[0].retention_for_next(frame).anchor,frame);
 }

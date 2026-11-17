@@ -79,6 +79,8 @@ struct Warmup {
     // At most one bounded disposition per declared old/new scope member.
     waiting:BTreeMap<String,String>,
     retired:BTreeMap<String,String>,
+    started:Instant,
+    progress_reported_at:Instant,
 }
 pub struct AdaptiveLiveRuntime {
     state:AdaptiveRuntime,
@@ -90,11 +92,12 @@ pub struct AdaptiveLiveRuntime {
     peak_staging_epochs:usize,
     preparation:crate::preparation::Preparation,
     diagnostic_summary_at:Instant,
+    admission_wait_reported:bool,
 }
 impl AdaptiveLiveRuntime {
     pub fn new(limits:AdaptiveRuntimeLimits)->Self {
         Self {state:AdaptiveRuntime::new(limits),warmup:None,
-            worker:format!("adaptive-live-{}-{:016x}",std::process::id(),rand::random::<u64>()),next_pending:0,cold_schedule:schedule::ColdSchedule::default(),join_cursor:0,peak_staging_epochs:0,preparation:Default::default(),diagnostic_summary_at:Instant::now()}
+            worker:format!("adaptive-live-{}-{:016x}",std::process::id(),rand::random::<u64>()),next_pending:0,cold_schedule:schedule::ColdSchedule::default(),join_cursor:0,peak_staging_epochs:0,preparation:Default::default(),diagnostic_summary_at:Instant::now(),admission_wait_reported:false}
     }
     pub fn peak_staging_epochs(&self)->usize {self.peak_staging_epochs}
     pub fn retained_history_epochs(&self)->usize {self.state.retained_history_epochs()}
@@ -210,9 +213,9 @@ impl AdaptiveLiveRuntime {
                 return Ok(());
             }
             live::release_pending_warmup(pool,&warmup.lease).await?;
-            self.discard_warmup().await?;
+            self.discard_warmup("cohort_or_candidate_changed").await?;
         }
-        if pending.is_empty() {return Ok(());}
+        if pending.is_empty() {self.admission_wait_reported=false;return Ok(());}
         for offset in 0..pending.len() {
             let index=(self.next_pending+offset)%pending.len();
             let mut candidate=pending[index].clone();
@@ -228,6 +231,11 @@ impl AdaptiveLiveRuntime {
             // The claim, not the pre-claim pending DTO, owns the stable anchor.
             candidate.profile.live_initialization=Some(lease.initialization.clone());
             self.next_pending=(index+1)%pending.len();
+            self.admission_wait_reported=false;
+            let started=Instant::now();
+            let mut fields=live::warmup_diagnostic_fields(&lease);
+            fields["study_id"]=candidate.profile.study_id.into();fields["stage"]="plan_build".into();
+            fields["outcome"]="started".into();lifecycle::emit(Level::Info,"adaptive_warmup_started",fields);
             let build=self.build_warmup_plans(pool,&candidate,active,slots,catalog,supervisor.permit()).await.and_then(|built| {
                 supervisor.permit().check()?;Ok(built)
             });
@@ -237,7 +245,10 @@ impl AdaptiveLiveRuntime {
                         .map(|p|(instrument_key(&p.instrument),if p.catalog_id==0 {"unavailable_catalog".into()}else{"not_listed".into()})).collect();
                     let retired=plans.iter().filter(|p|!p.specs.iter().any(|s|s.key()==candidate_key) && !p.specs.iter().any(|s|s.publish_enabled))
                         .map(|p|(instrument_key(&p.instrument),if p.catalog_id==0 {"unavailable_catalog".into()}else{"not_listed".into()})).collect();
-                    self.warmup=Some(Warmup {pending:candidate,lease,supervisor,plans,candidate_key,cohort:cohort.clone(),barrier_attempts:0,waiting,retired});
+                    self.warmup=Some(Warmup {pending:candidate,lease,supervisor,plans,candidate_key,cohort:cohort.clone(),barrier_attempts:0,waiting,retired,started,progress_reported_at:started});
+                    let mut fields=diagnostics::warmup_fields(self.warmup.as_ref().unwrap(),&self.state,target);
+                    fields["stage"]="plan_build".into();fields["outcome"]="admitted".into();
+                    lifecycle::emit(Level::Info,"adaptive_warmup_plan_finished",fields);
                 },
                 Err(error)=>{
                     if let Err(cleanup)=supervisor.stop().await {
@@ -245,11 +256,19 @@ impl AdaptiveLiveRuntime {
                     }
                     let retryable=matches!(error,WorkerError::WarmupControl(_));
                     let report=live::report_warmup_failure(pool,&lease,&json!({"code":if retryable {"warmup_supervision_lost"}else{"invalid_live_candidate"},"message":error.to_string().chars().take(240).collect::<String>()}),retryable).await;
-                    let (error,fields)=diagnostics::failure_report(error,&report,live::warmup_diagnostic_fields(&lease));
+                    let mut fields=live::warmup_diagnostic_fields(&lease);
+                    fields["study_id"]=candidate.profile.study_id.into();fields["stage"]="plan_build".into();
+                    fields["duration_ms"]=(started.elapsed().as_millis() as u64).into();
+                    let (error,fields)=diagnostics::failure_report(error,&report,fields);
                     lifecycle::emit(Level::Error,"adaptive_warmup_failure_report",fields);return Err(error);
                 }
             }
             break;
+        }
+        if self.warmup.is_none() && !self.admission_wait_reported {
+            self.admission_wait_reported=true;
+            lifecycle::emit(Level::Info,"adaptive_warmup_waiting",json!({"runtime_instance":self.worker,"stage":"admission",
+                "outcome":"no_candidate_claimed","pending_candidates":pending.len()}));
         }
         Ok(())
     }
@@ -265,13 +284,18 @@ impl AdaptiveLiveRuntime {
         if let Some(w)=&self.warmup && let (Some(previous),Some(next))=(previous,self.candidate_cursor(plan))
             && next>previous {w.supervisor.permit().progress();}
     }
-    async fn discard_warmup(&mut self)->Result<(),WorkerError> {
+    async fn discard_warmup(&mut self,reason:&'static str)->Result<(),WorkerError> {
         if let Some(mut warmup)=self.warmup.take() {
+            let mut fields=diagnostics::warmup_fields(&warmup,&self.state,chrono::Utc::now().timestamp().div_euclid(60)*60);
+            fields["stage"]="cleanup".into();fields["reason"]=reason.into();
             let stopped=warmup.supervisor.stop().await;
             for plan in warmup.plans {
                 if plan.epoch==AdaptiveRuntime::epoch_key(&plan.instrument,None) {self.state.remove_profile(&plan.epoch,&warmup.candidate_key);}
                 else {self.state.invalidate(&plan.epoch,None);}
             }
+            fields["outcome"]=if stopped.is_ok(){"drained"}else{"supervisor_join_error"}.into();
+            fields["history_bytes_after"]=self.retained_history_bytes().into();
+            lifecycle::emit(if stopped.is_ok(){Level::Info}else{Level::Error},"adaptive_warmup_finished",fields);
             stopped?;
         }
         Ok(())
@@ -285,7 +309,14 @@ impl AdaptiveLiveRuntime {
         let mut fields=live::warmup_diagnostic_fields(&warmup.lease);
         fields["release_outcome"]=if released {"released_and_refunded"}else{"expired_or_fenced_not_refunded"}.into();
         lifecycle::emit(Level::Info,"adaptive_shutdown_claim_finished",fields);
-        self.discard_warmup().await?;Ok(released)
+        self.discard_warmup("graceful_shutdown").await?;Ok(released)
+    }
+    fn report_warmup_progress(&mut self,target:i64) {
+        if let Some(warmup)=self.warmup.as_mut() && warmup.progress_reported_at.elapsed()>=Duration::from_secs(30) {
+            warmup.progress_reported_at=Instant::now();
+            let mut fields=diagnostics::warmup_fields(warmup,&self.state,target);fields["outcome"]="in_progress".into();
+            lifecycle::emit(Level::Info,"adaptive_warmup_progress",fields);
+        }
     }
     fn cold_plans(&self,active:&[SymbolPlan],target:i64,completed:&BTreeSet<String>)->Vec<SymbolPlan> {
         let mut cold:BTreeMap<String,SymbolPlan>=active.iter().filter(|p|!self.state.is_current(&p.epoch,target-1800) && !completed.contains(&p.epoch))
@@ -319,6 +350,9 @@ impl AdaptiveLiveRuntime {
         if !plan.specs.iter().any(|spec|spec.key()==warmup.candidate_key) {return;}
         let Some(reason)=self.state.waiting_reason(&plan.epoch,&warmup.candidate_key,frontier) else {return;};
         warmup.waiting.insert(instrument_key(&plan.instrument),reason.into());
+        lifecycle::emit(Level::Debug,"adaptive_warmup_instrument_waiting",json!({"study_id":warmup.pending.profile.study_id,
+            "generation_id":warmup.lease.generation_id,"profile_id":warmup.lease.slot_id,"attempt":warmup.lease.attempt,
+            "instrument_key":instrument_key(&plan.instrument),"history_epoch":plan.epoch,"reason":reason,"frontier":frontier}));
         // Release duplicate staging rings so waiting instruments cannot block
         // admission. An already adopted candidate instead owns bounded scalar
         // state in canonical history: keep its verified origin/proof and muted
@@ -383,8 +417,10 @@ impl AdaptiveLiveRuntime {
             let production=AdaptiveRuntime::epoch_key(&plan.instrument,None);
             if !self.state.adopt_staging(&plan.epoch,&production,&candidate,&expected)? {
                 if let Some(warmup)=&self.warmup {live::release_pending_warmup(pool,&warmup.lease).await?;}
-                self.discard_warmup().await?;break;
+                self.discard_warmup("staging_cohort_changed").await?;break;
             }
+            lifecycle::emit(Level::Debug,"adaptive_warmup_history_adopted",json!({"instrument_key":instrument_key(&plan.instrument),
+                "history_epoch":production,"stage":"staging_adoption","frontier":frontier}));
             if let Some(warmup)=&mut self.warmup
                 && let Some(staged)=warmup.plans.iter_mut().find(|p|p.epoch==plan.epoch) {
                     staged.epoch=production;
@@ -413,7 +449,7 @@ impl AdaptiveLiveRuntime {
             let reported=live::report_warmup_failure(pool,&warmup.lease,&report,true).await;
             let (error,fields)=diagnostics::failure_report(error,&reported,trace.fields(self,target));
             lifecycle::emit(Level::Error,"adaptive_warmup_failure_report",fields);
-            if let Err(cleanup)=self.discard_warmup().await {
+            if let Err(cleanup)=self.discard_warmup("tick_failed").await {
                 lifecycle::emit(Level::Error,"live_supervision_join_failed",json!({"runtime_instance":self.worker,"error_code":diagnostics::error_code(&cleanup)}));
             }
             return Err(error);
@@ -437,7 +473,7 @@ impl AdaptiveLiveRuntime {
         trace.enter("projection");
         let slots:Vec<_>=continuous::active_adaptive_slots(pool,continuous::ADMIN_OWNER).await?.into_iter().map(Arc::new).collect();
         let pending=live::pending_adaptive_slots(pool,continuous::ADMIN_OWNER).await?;
-        if slots.is_empty() && pending.is_empty() {self.discard_warmup().await?;self.state.clear();self.preparation.clear();continuous::profiles::acknowledge_stops(pool,continuous::ADMIN_OWNER).await?;return Ok(());}
+        if slots.is_empty() && pending.is_empty() {self.discard_warmup("no_enabled_profiles").await?;self.state.clear();self.preparation.clear();self.admission_wait_reported=false;continuous::profiles::acknowledge_stops(pool,continuous::ADMIN_OWNER).await?;return Ok(());}
         trace.enter("catalog");
         let catalog=client.instruments().await.map_err(|e|invalid(&e.to_string()))?;
         trace.enter("plan_refresh");
@@ -514,6 +550,7 @@ impl AdaptiveLiveRuntime {
                 let page=match response {
                     Ok(page)=>page,
                     Err(failure)=>{
+                        if !failure.rebuild {diagnostics::source_failure(&plan,&failure.error,"cold_history",self.warmup.as_ref());}
                         if failure.invalidate {self.state.invalidate(&plan.epoch,None);}
                         // Drain the owned batch before releasing a lease. A
                         // repair invalidation retries from the same live
@@ -556,6 +593,7 @@ impl AdaptiveLiveRuntime {
         self.check_supervision()?;
         self.join_ready_waiting(pool,&active,target).await?;
         trace.enter("promotion");
+        self.report_warmup_progress(target);
         self.try_promote(pool,&slots,&catalog,target,stopped).await?;
         self.preparation.poll(client,stopped.load(Ordering::SeqCst));
         Ok(())
@@ -627,6 +665,10 @@ impl AdaptiveLiveRuntime {
                     let guard=guards.iter().find(|guard|guard.instrument_id==item.instrument_id).ok_or_else(||invalid("requested source guard missing"))?;
                     let token=guard.validated_token(item.read_guard.as_ref());
                     if item.status!="known" || token.is_none() {
+                        let error=invalid("source causal history changed or repair coverage is unknown");
+                        if item.status!="known" || !item.read_guard.as_ref().is_some_and(|guard|guard.status==setups_mdclient::TailReadGuardStatus::Invalid) {
+                            diagnostics::source_failure(plan,&error,"hot_tail_guard",self.warmup.as_ref());
+                        }
                         window.reject(&plan.epoch);
                         if item.status!="known" || !item.read_guard.as_ref().is_some_and(|guard|guard.status==setups_mdclient::TailReadGuardStatus::Invalid) {
                             first_error.get_or_insert_with(||invalid("source causal history changed or repair coverage is unknown"));
@@ -687,6 +729,9 @@ impl AdaptiveLiveRuntime {
         let waiting:Vec<_>=warmup.waiting.iter().map(|(key,reason)|live::WaitingInstrument {instrument_key:key.clone(),reason:reason.clone()}).collect();
         let retired:Vec<_>=warmup.retired.iter().map(|(key,reason)|live::WaitingInstrument {instrument_key:key.clone(),reason:reason.clone()}).collect();
         warmup.supervisor.permit().check()?;
+        let mut fields=diagnostics::warmup_fields(warmup,&self.state,frontier);
+        fields["stage"]="promotion".into();fields["outcome"]="started".into();fields["ready_instruments"]=initial.len().into();
+        lifecycle::emit(Level::Info,"adaptive_promotion_started",fields);
         if !live::report_warmup(pool,&warmup.lease,"ready",Some(frontier),None).await? {
             return Err(WorkerError::WarmupControl(WarmupControlOutcome::RenewalRejected));
         }
@@ -704,6 +749,9 @@ impl AdaptiveLiveRuntime {
         if !matches!(&result,Ok(promotion::Outcome::Adopt|promotion::Outcome::Rebuild)) {self.check_supervision()?;}
         match result {
             Ok(promotion::Outcome::Adopt)=>{
+                let mut fields=diagnostics::warmup_fields(self.warmup.as_ref().unwrap(),&self.state,frontier);
+                fields["outcome"]="active".into();fields["ready_instruments"]=initial.len().into();
+                lifecycle::emit(Level::Info,"adaptive_warmup_finished",fields);
                 let mut warmup=self.warmup.take().unwrap();warmup.supervisor.stop().await?;
                 for plan in &warmup.plans {
                     if initial.iter().any(|entry|entry.instrument_key==instrument_key(&plan.instrument)) {self.state.activate(&plan.epoch,&warmup.candidate_key,frontier)?;}
@@ -713,16 +761,18 @@ impl AdaptiveLiveRuntime {
                 }
             },
             Ok(promotion::Outcome::Rebuild)=>{
+                let mut fields=diagnostics::warmup_fields(self.warmup.as_ref().unwrap(),&self.state,frontier);
+                fields["outcome"]="committed_rebuild".into();lifecycle::emit(Level::Info,"adaptive_warmup_finished",fields);
                 let mut warmup=self.warmup.take().unwrap();warmup.supervisor.stop().await?;
                 for plan in &warmup.plans {self.state.invalidate(&plan.epoch,None);}
             },
-            Ok(promotion::Outcome::Lost)=>self.discard_warmup().await?,
+            Ok(promotion::Outcome::Lost)=>self.discard_warmup("promotion_fenced").await?,
             Ok(promotion::Outcome::Retry)=>{
                 let warmup=self.warmup.as_mut().unwrap();warmup.barrier_attempts+=1;
                 if warmup.barrier_attempts>=3 {
                     lifecycle::emit(Level::Info,"adaptive_promotion_yielded",live::warmup_diagnostic_fields(&warmup.lease));
                     live::release_pending_warmup(pool,&warmup.lease).await?;
-                    self.discard_warmup().await?;
+                    self.discard_warmup("promotion_barrier_retry_limit").await?;
                 }
             },
             Err(error)=>{
@@ -818,7 +868,7 @@ pub(crate) async fn adaptive_live_loop(pool:PgPool,market_url:String,market_key:
                 if let Some(warmup)=&owner.warmup {
                     let report=json!({"code":"adaptive_warmup_failed","message":error.to_string().chars().take(240).collect::<String>()});
                     let _=live::report_warmup(&scan_pool,&warmup.lease,"error",None,Some(&report)).await;
-                    if let Err(error)=owner.discard_warmup().await {lifecycle::emit(Level::Error,"live_supervision_join_failed",json!({"error_code":diagnostics::error_code(&error)}));}
+                    if let Err(error)=owner.discard_warmup("loop_failed").await {lifecycle::emit(Level::Error,"live_supervision_join_failed",json!({"error_code":diagnostics::error_code(&error)}));}
                 }
                 lifecycle::emit(Level::Error,"adaptive_tick_error",json!({"runtime_instance":owner.worker,"error_code":diagnostics::error_code(&error)}));
             }
@@ -864,7 +914,20 @@ mod tests {
         let checkpoint=owner.state.checkpoint_for(&f.epoch,&incumbent_key).unwrap();let history_bytes=owner.retained_history_bytes();
         let supervisor=supervision::Supervisor::fixture(&lease);let permit=supervisor.permit().clone();
         owner.warmup=Some(Warmup {pending:live::PendingAdaptiveSlot {profile,expected_active_generation_id:Some(1),warmup_status:"warming".into(),readiness_frontier:None},lease,supervisor,
-            plans:vec![plan.clone()],candidate_key:candidate_key.clone(),cohort:BTreeSet::new(),barrier_attempts:0,waiting:BTreeMap::new(),retired:BTreeMap::new()});
+             plans:vec![plan.clone()],candidate_key:candidate_key.clone(),cohort:BTreeSet::new(),barrier_attempts:0,waiting:BTreeMap::new(),retired:BTreeMap::new(),started:Instant::now(),progress_reported_at:Instant::now()});
+        let trace=diagnostics::TickTrace::new("owned-drain-test");
+        let (_,fields)=diagnostics::failure_report(invalid("history_lookup_evicted: fixture"),&Ok(true),trace.fields(&owner,f.frontier));
+        let record=lifecycle::record(Level::Error,"adaptive_warmup_failure_report",&fields);
+        assert_eq!(record["failure_report"],"persisted");assert_eq!(record["original_error_code"],"history_lookup_evicted");
+        assert_eq!(record["study_id"],2);assert_eq!(record["generation_id"],2);assert_eq!(record["attempt"],1);
+        assert_eq!(record["stage"],"settings");assert!(record.get("fields_truncated").is_none(),"{record}");
+        let canonical=SymbolPlan {specs:vec![f.spec.clone()],..plan.clone()};
+        let fields=diagnostics::source_failure_fields(&canonical,&invalid("source unavailable"),"hot_tail_guard",owner.warmup.as_ref());
+        let record=lifecycle::record(Level::Error,"adaptive_source_failed",&fields);
+        assert_eq!(record["candidate_in_plan"],false);assert_eq!(record["context_role"],"source_epoch");
+        assert_eq!(record["warmup_generation_id"],2);assert_eq!(record["warmup_study_id"],2);assert_eq!(record["warmup_attempt"],1);
+        for key in ["profile_id","generation_id","study_id"] {assert!(record.get(key).is_none(),"unrelated warmup is not culprit {key}");}
+        assert_eq!(record["history_epoch"],canonical.epoch);assert!(record.get("fields_truncated").is_none());
         let entered=Arc::new(AtomicUsize::new(0));let observed=entered.clone();let gate=Arc::new(tokio::sync::Semaphore::new(0));let blocked=gate.clone();
         let app=Router::new().route("/v1/candles/tail-batch",post(move || {
             let entered=observed.clone();let gate=blocked.clone();async move {
@@ -885,7 +948,7 @@ mod tests {
         gate.add_permits(1);let (mut owner,outcome)=tokio::time::timeout(Duration::from_secs(2),work).await.unwrap().unwrap();
         assert!(matches!(outcome,Err(WorkerError::WarmupControl(WarmupControlOutcome::RenewalRejected))));
         assert_eq!(entered.load(Ordering::SeqCst),IO_CONCURRENCY,"no next-wave admission after supervision loss");
-        owner.discard_warmup().await.unwrap();assert!(owner.warmup.is_none());
+        owner.discard_warmup("test_supervision_lost").await.unwrap();assert!(owner.warmup.is_none());
         assert_eq!(owner.retained_history_bytes(),history_bytes);
         assert_eq!(owner.state.checkpoint_for(&f.epoch,&incumbent_key),Some(checkpoint));
         assert!(owner.state.checkpoint_for(&f.epoch,&candidate_key).is_none());

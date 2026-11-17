@@ -10,6 +10,8 @@ pub(super) fn error_code(error: &WorkerError) -> &'static str {
         WorkerError::Detector(_) => "detector",
         WorkerError::Json(_) => "json_decode",
         WorkerError::PageLimitExceeded(_) => "page_limit",
+        WorkerError::Source(message) if message.starts_with("adaptive: history_retention_rejected")=>"history_retention_rejected",
+        WorkerError::Source(message) if message.starts_with("adaptive: history_lookup_evicted")=>"history_lookup_evicted",
         WorkerError::Source(message) if message.contains("market data network error") => {
             "source_transport"
         }
@@ -19,6 +21,48 @@ pub(super) fn error_code(error: &WorkerError) -> &'static str {
         }
         WorkerError::Source(_) => "source_validation",
     }
+}
+
+/// One bounded scalar snapshot of the owned attempt, not a history of ticks.
+pub(super) fn warmup_fields(warmup:&Warmup,state:&AdaptiveRuntime,target:i64)->Value {
+    let mut fields=live::warmup_diagnostic_fields(&warmup.lease);
+    let mut total=0;let mut resident=0;let mut ready=0;let mut uninspected=0;
+    let mut cursor_min:Option<i64>=None;let mut cursor_max:Option<i64>=None;
+    for plan in &warmup.plans {
+        if !plan.specs.iter().any(|spec|spec.key()==warmup.candidate_key) {continue;}
+        total+=1;
+        if let Some(checkpoint)=state.checkpoint_for(&plan.epoch,&warmup.candidate_key) {
+            resident+=1;
+            cursor_min=Some(cursor_min.map_or(checkpoint.next_open_unix,|old|old.min(checkpoint.next_open_unix)));
+            cursor_max=Some(cursor_max.map_or(checkpoint.next_open_unix,|old|old.max(checkpoint.next_open_unix)));
+        }else if !warmup.waiting.contains_key(&instrument_key(&plan.instrument)) {uninspected+=1;}
+        ready+=usize::from(state.ready(&plan.epoch,&warmup.candidate_key,target));
+    }
+    fields["study_id"]=warmup.pending.profile.study_id.into();
+    fields["stage"]="warmup".into();fields["duration_ms"]=(warmup.started.elapsed().as_millis() as u64).into();
+    fields["target_unix"]=target.into();fields["total_instruments"]=total.into();
+    fields["resident_instruments"]=resident.into();fields["ready_instruments"]=ready.into();
+    fields["waiting_instruments"]=warmup.waiting.len().into();fields["uninspected_instruments"]=uninspected.into();
+    fields["cursor_min_unix"]=cursor_min.into();fields["cursor_max_unix"]=cursor_max.into();
+    fields["initialization_from_unix"]=warmup.lease.initialization.detector_from_open_unix.into();
+    fields["initialization_anchor_unix"]=warmup.lease.initialization.anchor_close_unix.into();
+    fields
+}
+
+pub(super) fn source_failure_fields(plan:&SymbolPlan,error:&WorkerError,stage:&str,warmup:Option<&Warmup>)->Value {
+    // A canonical incumbent epoch may fail while a different candidate owns the
+    // warmup lane. The charged attempt is context, NOT the source/anchor owner.
+    json!({"component":"adaptive_source","stage":stage,"outcome":"error","context_role":"source_epoch",
+        "instrument_key":instrument_key(&plan.instrument),"source_instrument_id":plan.catalog_id,"history_epoch":plan.epoch,
+        "error_code":error_code(error),"profile_count":plan.specs.len(),
+        "runtime_instance":warmup.map(|w|w.lease.worker.as_str()),
+        "candidate_in_plan":warmup.map(|w|plan.specs.iter().any(|spec|spec.key()==w.candidate_key)),
+        "warmup_profile_id":warmup.map(|w|w.lease.slot_id),"warmup_generation_id":warmup.map(|w|w.lease.generation_id),
+        "warmup_study_id":warmup.map(|w|w.pending.profile.study_id),"warmup_attempt":warmup.map(|w|w.lease.attempt),
+        "warmup_control_revision":warmup.map(|w|w.lease.config_revision),"warmup_lease_token":warmup.map(|w|w.lease.token)})
+}
+pub(super) fn source_failure(plan:&SymbolPlan,error:&WorkerError,stage:&str,warmup:Option<&Warmup>) {
+    log::emit(Level::Error,"adaptive_source_failed",source_failure_fields(plan,error,stage,warmup));
 }
 
 pub(super) fn failure_report(
@@ -33,6 +77,11 @@ pub(super) fn failure_report(
     };
     fields["failure_report"] = json!(outcome);
     fields["original_error_code"] = error_code(&error).into();
+    // Failure outcome/cause must survive the common sink's 32-field ceiling.
+    // Initialization bounds already have their admission/progress records.
+    for key in ["initialization_from_unix","initialization_anchor_unix","resident_instruments","cursor_max_unix"] {
+        fields.as_object_mut().unwrap().remove(key);
+    }
     if let WorkerError::Source(message) = &error
         && let Some((_, status)) = message.split_once("market data api ")
     {
@@ -92,23 +141,7 @@ impl TickTrace {
     pub fn fields(&self, owner: &AdaptiveLiveRuntime, target: i64) -> Value {
         let mut fields = owner.warmup.as_ref().map_or_else(
             || json!({"runtime_instance":self.worker}),
-            |w| {
-                let mut fields = live::warmup_diagnostic_fields(&w.lease);
-                fields["study_id"] = w.pending.profile.study_id.into();
-                let candidate: Vec<_> = w
-                    .plans
-                    .iter()
-                    .filter(|p| p.specs.iter().any(|s| s.key() == w.candidate_key))
-                    .collect();
-                fields["ready_instruments"] = candidate
-                    .iter()
-                    .filter(|p| owner.state.ready(&p.epoch, &w.candidate_key, target))
-                    .count()
-                    .into();
-                fields["waiting_instruments"] = w.waiting.len().into();
-                fields["total_instruments"] = candidate.len().into();
-                fields
-            },
+            |w| warmup_fields(w,&owner.state,target),
         );
         fields["stage"] = self.stage.into();
         fields["duration_ms"] = (self.started.elapsed().as_millis() as u64).into();

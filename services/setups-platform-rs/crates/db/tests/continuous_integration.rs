@@ -413,6 +413,106 @@ async fn n8_handoff_negative_outcomes_sticky_stop_ordering_and_configured_limits
 
 #[tokio::test]
 #[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+async fn continuous_handoff_lifecycle_records_follow_commit_and_hide_payloads() {
+    const CHILD:&str="SETUPS_HANDOFF_LOG_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Capture the real shared stderr sink without adding a process-global
+        // collector/test hook to production logging. The child owns its test DB.
+        let output=tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored","--exact","continuous_handoff_lifecycle_records_follow_commit_and_hide_payloads","--nocapture"])
+            .env(CHILD,"1").env("RUST_LOG","info").output().await.unwrap();
+        assert!(output.status.success(),"log fixture failed: {}",String::from_utf8_lossy(&output.stderr));
+        let stderr=String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains("private-"),"private fixture snapshots, idempotency keys and raw DB errors must not be logged");
+        let records:Vec<Value>=stderr.lines().filter_map(|line|serde_json::from_str(line).ok()).collect();
+        for record in &records {assert!(record.to_string().len()+1<=setups_db::diagnostics::MAX_RECORD_BYTES);}
+        let outcomes=|event:&str|records.iter().filter(|r|r["event"]==event).map(|r|r["outcome"].as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(outcomes("continuous_finalization_finished"),["error","finalized","already_completed","finalized","finalized"]);
+        let nonpasses:Vec<_>=records.iter().filter(|r|r["event"]=="continuous_finalization_finished" && r["accepted"]==false).collect();
+        assert_eq!(nonpasses.iter().map(|r|r["reason"].as_str().unwrap()).collect::<Vec<_>>(),["no_winner","quality_gate_nonpass"]);
+        assert!(nonpasses.iter().all(|r|r["handoff_state"]=="not_created"));
+        assert_eq!(outcomes("continuous_profile_handoff_finished"),["error","accepted"],"idle polls must not add INFO records");
+        let failed_handoff=records.iter().find(|r|r["event"]=="continuous_profile_handoff_finished" && r["outcome"]=="error").unwrap();
+        assert_eq!(failed_handoff["admission_state"],"not_confirmed");
+        for field in ["reason","desired_running"] {assert!(failed_handoff.get(field).is_none(),"unconfirmed COMMIT must not retain tentative {field}");}
+        assert!(!failed_handoff.to_string().contains("rolled_back"),"an unconfirmed acknowledgement does not prove rollback");
+        assert_eq!(outcomes("live_initialization_claimed"),["claimed","claimed","claimed"]);
+        assert!(outcomes("live_initialization_claim_finished").is_empty(),"ordinary claim misses are DEBUG only");
+        assert_eq!(outcomes("live_readmission_finished"),["error","granted","already_granted","conflict","not_found"]);
+        for record in records.iter().filter(|r|matches!(r["event"].as_str(),Some("continuous_finalization_finished"|"continuous_profile_handoff_finished"|"live_initialization_claimed"))) {
+            assert!(record["study_id"].is_i64());assert!(record["generation_id"].is_i64());assert!(record["profile_id"].is_i64());
+            assert!(record["duration_ms"].is_u64());
+        }
+        for record in records.iter().filter(|r|r["event"]=="live_readmission_finished" && matches!(r["outcome"].as_str(),Some("granted"|"already_granted"))) {
+            assert!(record["study_id"].is_i64());assert_eq!(record["attempt"],3);assert_eq!(record["attempt_limit"],6);
+        }
+        return;
+    }
+    isolated(|pool|async move {
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        configured(&pool,OWNER,ALGORITHM).await;
+        setups_db::settings_set(&pool,"live",&json!({"enabled":true})).await.unwrap();
+        let lease=scheduler::claim_owner(&pool,"lifecycle-fixture").await.unwrap().unwrap();
+        let job=scheduler::prepare_next(&pool,&lease).await.unwrap().unwrap();
+        let result=json!({"best":{"params":SpikeParams::default(),"analytics":{"clusterEnabled":false}},
+            "analytics":{"payload":"private-candle-array-secret"},"recommendation":{"snapshot":"private-parameters-secret"},
+            "meanExpectancy":0.21,"selectedCell":{"tpPct":14,"slPct":4}});
+        let replay=batch(&pool,ALGORITHM,Some(job.generation_id)).await;
+        run(&pool,replay,ALGORITHM,"done",Some(job.generation_id)).await;
+        sqlx::query("update optimization_studies set status='completed',result=$2 where id=$1")
+            .bind(job.study_id).bind(&result).execute(&pool).await.unwrap();
+        sqlx::query("update continuous_generations set replay_batch_id=$2,replay_manifest='{}' where id=$1")
+            .bind(job.generation_id).bind(replay).execute(&pool).await.unwrap();
+        sqlx::raw_sql("create function reject_lifecycle_commit() returns trigger language plpgsql as $$begin raise exception 'private-db-error-sentinel';end$$;
+            create constraint trigger reject_lifecycle_commit after insert on adaptive_profile_handoffs deferrable initially deferred for each row execute function reject_lifecycle_commit()")
+            .execute(&pool).await.unwrap();
+        assert!(scheduler::finalize(&pool,&job,&result,true,Some(0.21),Some(&result["selectedCell"])).await.is_err());
+        assert_eq!(sqlx::query_scalar::<_,String>("select status from continuous_generations where id=$1").bind(job.generation_id).fetch_one(&pool).await.unwrap(),"running");
+        sqlx::query("drop trigger reject_lifecycle_commit on adaptive_profile_handoffs").execute(&pool).await.unwrap();
+        assert!(scheduler::finalize(&pool,&job,&result,true,Some(0.21),Some(&result["selectedCell"])).await.unwrap());
+        assert!(scheduler::finalize(&pool,&job,&result,true,Some(0.21),Some(&result["selectedCell"])).await.unwrap());
+
+        sqlx::raw_sql("create constraint trigger reject_lifecycle_commit after insert on adaptive_profiles deferrable initially deferred for each row execute function reject_lifecycle_commit()")
+            .execute(&pool).await.unwrap();
+        assert!(db::profiles::accept_handoffs(&pool,OWNER).await.is_err());
+        assert_eq!(sqlx::query_scalar::<_,String>("select status from adaptive_profile_handoffs where generation_id=$1").bind(job.generation_id).fetch_one(&pool).await.unwrap(),"pending");
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_profiles").fetch_one(&pool).await.unwrap(),0);
+        sqlx::query("drop trigger reject_lifecycle_commit on adaptive_profiles").execute(&pool).await.unwrap();
+        assert_eq!(db::profiles::accept_handoffs(&pool,OWNER).await.unwrap(),1);
+        for _ in 0..3 {assert_eq!(db::profiles::accept_handoffs(&pool,OWNER).await.unwrap(),0);}
+        let pending=db::live::pending_adaptive_slots(&pool,OWNER).await.unwrap().remove(0);
+        for attempt in 1..=3 {
+            sqlx::query("update continuous_generations set live_init_next_attempt_at=null where id=$1").bind(job.generation_id).execute(&pool).await.unwrap();
+            let fence=db::live::claim_pending_warmup_at(&pool,&pending,"lifecycle-fixture",CUTOFF).await.unwrap().unwrap();
+            assert_eq!(fence.attempt,attempt);
+            for _ in 0..3 {assert!(db::live::claim_pending_warmup_at(&pool,&pending,"contender",CUTOFF).await.unwrap().is_none());}
+            assert!(db::live::report_warmup_failure(&pool,&fence,&json!({"code":"test_failure","message":"private-candle-array-secret"}),true).await.unwrap());
+        }
+        let request=live_readmission_request(job.generation_id,"private-idempotency-key");
+        sqlx::raw_sql("create constraint trigger reject_lifecycle_commit after insert on continuous_live_readmissions deferrable initially deferred for each row execute function reject_lifecycle_commit()")
+            .execute(&pool).await.unwrap();
+        assert!(db::readmission::grant(&pool,OWNER,ALGORITHM,job.slot_id,&request).await.is_err());
+        assert_eq!(sqlx::query_scalar::<_,i32>("select live_init_attempt_limit from continuous_generations where id=$1").bind(job.generation_id).fetch_one(&pool).await.unwrap(),3);
+        sqlx::query("drop trigger reject_lifecycle_commit on continuous_live_readmissions").execute(&pool).await.unwrap();
+        assert!(!granted_live(&pool,job.slot_id,&request).await.duplicate);
+        assert!(granted_live(&pool,job.slot_id,&request).await.duplicate);
+        let stale=db::readmission::LiveReadmissionRequest{expected_config_revision:99,..request.clone()};
+        assert!(matches!(db::readmission::grant(&pool,OWNER,ALGORITHM,job.slot_id,&stale).await.unwrap(),db::readmission::LiveReadmissionOutcome::Conflict(_)));
+        assert!(matches!(db::readmission::grant(&pool,"missing-owner",ALGORITHM,job.slot_id,&request).await.unwrap(),db::readmission::LiveReadmissionOutcome::NotFound));
+        assert_eq!(sqlx::query_scalar::<_,Value>("select result from continuous_generations where id=$1").bind(job.generation_id).fetch_one(&pool).await.unwrap(),result);
+        for result in [json!({"best":null,"reason":"no_winner","private":"private-payload"}),json!({"best":{},"analytics":{"private":"private-payload"}})] {
+            sqlx::query("update continuous_processes set next_attempt_at=now() where owner_id=$1 and algorithm_id=$2").bind(OWNER).bind(ALGORITHM).execute(&pool).await.unwrap();
+            let next=scheduler::prepare_next(&pool,&lease).await.unwrap().unwrap();
+            scheduler::finish_search(&pool,&next,&json!({"progress":{}}),true).await.unwrap();
+            assert!(scheduler::finalize(&pool,&next,&result,false,None,None).await.unwrap());
+        }
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_profile_handoffs").fetch_one(&pool).await.unwrap(),1,"nonpass results create no handoff");
+        scheduler::release(&pool,&lease).await.unwrap();
+    }).await;
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
 async fn telegram_explicit_legacy_v1_keeps_original_utf8_body_and_32k_reservation() {
     isolated(|pool|async move {
         use setups_db::telegram as tg;

@@ -1,7 +1,7 @@
 //! Runtime-owned parsed history, scalar profile state and speculative effects.
 //! Nothing in this module performs IO or keeps a borrowed frame across await.
 use super::*;
-use setups_detector::shared::{HistoryIdentity, HistoryLimits, SharedHistory, SharedProfile};
+use setups_detector::shared::{HistoryIdentity, HistoryLimits, HistoryPosition, ProfileRetention, SharedDetectorError, SharedHistory, SharedProfile};
 use setups_domain::{PushStatus, SkipReason};
 #[cfg(test)]
 use setups_domain::decimal::Decimal;
@@ -91,6 +91,17 @@ impl CachedProfile {
         size_of::<Self>()+self.detector.as_ref().map_or(0,SharedProfile::retained_bytes)
             + key_len
     }
+    fn retention_for_bar(&self,bar:&DetectorBar,position:HistoryPosition)->Option<ProfileRetention> {
+        self.detector.as_ref().map(|detector| {
+            if bar.open_time_unix>=self.spec.from_open && bar.open_time_unix>=self.checkpoint.next_open_unix {
+                detector.retention_for_next(position)
+            }else{
+                // A consumer skipped by this page still owns its departure
+                // samples. Never release a held/CAS predecessor's anchor.
+                ProfileRetention {anchor:detector.retention_anchor(),resets_for_gap:false}
+            }
+        })
+    }
 }
 
 pub(crate) struct PreparedProfile {
@@ -119,6 +130,48 @@ struct SymbolState {
     observed_through: i64,
     source_token: Option<TailReadToken>,
     capacity_minutes: usize,
+}
+impl SymbolState {
+    fn history_failure_fields(&self,epoch:&str,instrument:&AdaptiveInstrument,profile:Option<&CachedProfile>,
+        bar:&DetectorBar,position:Option<HistoryPosition>,stage:&str,error:&SharedDetectorError,duration_ms:u64)->Value {
+        let (code,requested)=match error {
+            SharedDetectorError::RetentionRejected {requested,..}=>("history_retention_rejected",Some(requested.0)),
+            SharedDetectorError::Evicted {requested,..}=>("history_lookup_evicted",Some(requested.0)),
+            SharedDetectorError::Sequence {..}=>("history_consumer_sequence",None),
+            SharedDetectorError::Future(_)=>("history_future_position",None),
+            SharedDetectorError::Capacity {..}=>("history_capacity",None),
+            SharedDetectorError::WrongHistory=>("history_identity",None),
+            SharedDetectorError::Decimal(_)=>("history_decimal",None),
+            SharedDetectorError::Invalid(_)=>("history_validation",None),
+        };
+        let previous=profile.and_then(|p|p.detector.as_ref()).and_then(SharedProfile::last_position);
+        let retention=profile.and_then(|p|position.and_then(|position|p.retention_for_bar(bar,position)));
+        let projected_end=position.map(|position|position.0.saturating_add(1).max(self.history.end_position().0));
+        let projected_oldest=projected_end.map(|end|end.saturating_sub(self.capacity_minutes as u64).max(self.history.oldest_position().0));
+        serde_json::json!({"component":"adaptive_history","stage":stage,"error_code":code,
+            "instrument_key":format!("{}/{}/{}",instrument.exchange,instrument.category,instrument.symbol),"history_epoch":epoch,
+            "owner_id":profile.map(|p|p.spec.fence.owner_id.as_str()),"algorithm_id":profile.map(|p|p.spec.fence.algorithm_id.as_str()),
+            "profile_id":profile.map(|p|p.spec.fence.slot_id),"generation_id":profile.map(|p|p.spec.fence.generation_id),
+            "study_id":profile.and_then(|p|p.spec.recommendation["studyId"].as_i64()),"control_revision":profile.map(|p|p.spec.fence.config_revision),
+            "anchor_owner":if stage=="history_ingest" {"profile_id/generation_id"}else{"failing_consumer"},
+            "previous_position":previous.map(|p|p.0),"previous_open_unix":previous.and_then(|p|self.history.open_time(p).ok()),
+            "incoming_open_unix":bar.open_time_unix,"incoming_position":position.map(|p|p.0),
+            "current_oldest":self.history.oldest_position().0,"current_end":self.history.end_position().0,
+            "projected_oldest":projected_oldest,"projected_end":projected_end,"capacity_minutes":self.capacity_minutes,
+            "requested_position":requested,"required_anchor":retention.map(|r|r.anchor.0),"reset_eligible":retention.map(|r|r.resets_for_gap),
+            "pending":profile.map(|p|p.spec.pending),"duration_ms":duration_ms})
+    }
+    fn history_failure(&self,epoch:&str,instrument:&AdaptiveInstrument,profile:Option<&CachedProfile>,
+        bar:&DetectorBar,position:Option<HistoryPosition>,stage:&str,error:SharedDetectorError,started:std::time::Instant)->WorkerError {
+        let fields=self.history_failure_fields(epoch,instrument,profile,bar,position,stage,&error,started.elapsed().as_millis() as u64);
+        setups_db::diagnostics::emit(setups_db::diagnostics::Level::Error,"adaptive_history_failed",fields.clone());
+        // The durable error has a short actionable identity; the common log
+        // carries bounded numeric context, never source decimals/payloads.
+        let detail=if matches!(error,SharedDetectorError::Decimal(_)) {"detector decimal validation/arithmetic failed".into()}else{error.to_string()};
+        invalid(&format!("{}: symbol={} profile={} generation={} stage={stage}: {detail}",
+            fields["error_code"].as_str().unwrap_or("history_validation"),instrument.symbol.chars().take(48).collect::<String>(),
+            fields["profile_id"],fields["generation_id"]))
+    }
 }
 
 /// Sole owner of retained adaptive RAM. Drop/reconcile releases actual history
@@ -322,6 +375,7 @@ impl AdaptiveRuntime {
     /// here, BEFORE the caller performs persistence or promotion IO.
     pub(crate) fn prepare(&mut self,key:&str,instrument:&AdaptiveInstrument,bars:&[DetectorBar],target:i64,complete:bool)
         ->Result<Vec<PreparedProfile>,WorkerError> {
+        let started=std::time::Instant::now();
         if bars.len()>ADAPTIVE_PAGE_LIMIT {return Err(WorkerError::PageLimitExceeded(bars.len()));}
         let symbol=self.symbols.get_mut(key).ok_or_else(||invalid("missing history owner"))?;
         // Source completion can advance a consumer through trailing holes
@@ -340,19 +394,34 @@ impl AdaptiveRuntime {
         let mut setups:BTreeMap<String,Vec<AdaptiveSetup>>=BTreeMap::new();
         for bar in bars {
             if bar.close.len()>128 || bar.quote_turnover.len()>128 {return Err(invalid("source decimal exceeds byte budget"));}
-            let anchor=next.values().filter_map(|p|p.detector.as_ref().map(SharedProfile::retention_anchor)).min();
+            let incoming=if symbol.history.is_empty() {HistoryPosition(0)}else{
+                symbol.history.position_for_open(bar.open_time_unix).map_err(|error|
+                    symbol.history_failure(key,instrument,None,bar,None,"history_position",error,started))?
+            };
+            let anchor=next.values().filter_map(|p|p.retention_for_bar(bar,incoming).map(|retention|(p,retention)))
+                .min_by_key(|(_,retention)|retention.anchor);
+            if let Some((profile,retention))=anchor.filter(|(_,retention)|retention.resets_for_gap)
+                && setups_db::diagnostics::debug_enabled() {
+                setups_db::diagnostics::emit(setups_db::diagnostics::Level::Debug,"adaptive_history_gap_reset",serde_json::json!({
+                    "stage":"history_ingest","instrument_key":format!("{}/{}/{}",instrument.exchange,instrument.category,instrument.symbol),
+                    "history_epoch":key,"profile_id":profile.spec.fence.slot_id,"generation_id":profile.spec.fence.generation_id,
+                    "study_id":profile.spec.recommendation["studyId"],"previous_position":profile.detector.as_ref().and_then(SharedProfile::last_position).map(|p|p.0),
+                    "incoming_position":incoming.0,"incoming_open_unix":bar.open_time_unix,"released_anchor":profile.detector.as_ref().map(SharedProfile::retention_anchor).map(|p|p.0),
+                    "required_anchor":retention.anchor.0,"capacity_minutes":symbol.capacity_minutes}));
+            }
             let position=match anchor {
-                Some(anchor)=>symbol.history.push_retaining(bar,target,anchor),
+                Some((_,retention))=>symbol.history.push_retaining(bar,target,retention.anchor),
                 None=>symbol.history.push(bar,target),
-            }.map_err(shared_error)?;
-            for (key,profile) in &mut next {
+            }.map_err(|error|symbol.history_failure(key,instrument,anchor.map(|(profile,_)|profile),bar,Some(incoming),"history_ingest",error,started))?;
+            for (profile_key,profile) in &mut next {
                 if bar.open_time_unix<profile.spec.from_open || bar.open_time_unix<profile.checkpoint.next_open_unix {continue;}
                 profile.check_boundaries(bar.open_time_unix)?;
                 let detector=match profile.detector.as_mut() {
                     Some(detector)=>detector,
                     None=>profile.detector.insert(SharedProfile::new(profile.spec.params.clone(),symbol.history.identity(),position,None).map_err(shared_error)?),
                 };
-                let pushed=detector.push(&symbol.history,position).map_err(shared_error)?;
+                let pushed=detector.push(&symbol.history,position).map_err(|error|
+                    symbol.history_failure(key,instrument,Some(profile),bar,Some(position),"detector_advance",error,started))?;
                 profile.last_status=Some(pushed.status);
                 profile.last_skip=pushed.skip_reason;
                 profile.checkpoint.next_open_unix=bar.open_time_unix+60;
@@ -368,7 +437,7 @@ impl AdaptiveRuntime {
                         let shift=recommendation["timeShiftMinutes"].as_i64().ok_or_else(||invalid("missing recommended shift"))?;
                         recommendation["rawSignalAt"]=raw.close_time_unix.into();
                         recommendation["recommendedEntryAt"]=(raw.close_time_unix+shift*60).into();
-                        let events=setups.entry(key.clone()).or_default();
+                        let events=setups.entry(profile_key.clone()).or_default();
                         if events.len()>=ADAPTIVE_PAGE_LIMIT {return Err(invalid("live effect count exceeds page budget"));}
                         events.push(AdaptiveSetup {identity:adaptive_setup_identity(&profile.spec.fence,instrument,raw.close_time_unix),raw,recommendation});
                     }
@@ -459,6 +528,91 @@ pub(crate) mod tests {
     fn history_snapshot(history:&SharedHistory)->HistorySnapshot {
         (history.oldest_position().0,history.end_position().0,history.latest_position().map(|p|p.0),history.len(),
             history.frames_from(history.oldest_position()).unwrap().map(|f|(f.open_time_unix(),f.close(),f.quote_turnover(),f.original_close())).collect())
+    }
+
+    #[test]
+    fn history_failure_records_keep_real_epoch_anchor_owner_and_bounds_within_sink_budget() {
+        let mut f=fixture();f.instrument.symbol="10000SATSUSDT".into();
+        f.epoch=AdaptiveRuntime::epoch_key(&f.instrument,Some(30));
+        f.spec.fence.owner_id="diagnostic-owner".into();f.spec.fence.slot_id=4;f.spec.fence.generation_id=17;
+        f.spec.fence.config_revision=5;f.spec.recommendation=Arc::new(serde_json::json!({"studyId":21}));
+        f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();
+        feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars,f.frontier).unwrap();
+        let symbol=&f.runtime.symbols[&f.epoch];let profile=&symbol.profiles[&f.spec.key()];
+        let input=DetectorBar {open_time_unix:3000*60,close:"not-for-logs".into(),quote_turnover:"not-for-logs".into()};
+        for (error,stage,code) in [
+            (SharedDetectorError::RetentionRejected {requested:HistoryPosition(2761),projected_oldest:HistoryPosition(2921)},"history_ingest","history_retention_rejected"),
+            (SharedDetectorError::Evicted {requested:HistoryPosition(2761),oldest:HistoryPosition(2921)},"detector_advance","history_lookup_evicted"),
+        ] {
+            let fields=symbol.history_failure_fields(&f.epoch,&f.instrument,Some(profile),&input,Some(HistoryPosition(3000)),stage,&error,123);
+            let record=setups_db::diagnostics::record(setups_db::diagnostics::Level::Error,"adaptive_history_failed",&fields);
+            assert_eq!(record["history_epoch"],f.epoch);assert_ne!(record["history_epoch"],f.spec.key());
+            assert_eq!(record["error_code"],code);assert_eq!(record["profile_id"],4);assert_eq!(record["generation_id"],17);
+            assert_eq!(record["study_id"],21);assert_eq!(record["control_revision"],5);
+            for key in ["owner_id","incoming_open_unix","incoming_position","previous_position","previous_open_unix",
+                "current_oldest","current_end","projected_oldest","projected_end","capacity_minutes","reset_eligible","required_anchor"] {
+                assert_eq!(record[key],fields[key],"critical history field {key} was lost");assert!(!record[key].is_null(),"{key}");
+            }
+            assert!(record.get("fields_truncated").is_none(),"{record}");
+            assert!(record.to_string().len()<setups_db::diagnostics::MAX_RECORD_BYTES);
+            assert!(!record.to_string().contains("not-for-logs"));
+        }
+        let mut held=profile.clone();held.checkpoint.next_open_unix=input.open_time_unix+60;
+        let retained=held.retention_for_bar(&input,HistoryPosition(3000)).unwrap();
+        assert!(!retained.resets_for_gap);assert_eq!(retained.anchor,held.detector.as_ref().unwrap().retention_anchor());
+    }
+
+    #[test]
+    fn incident_gap_with_six_incumbent_shadows_and_each_candidate_preserves_parity_muting_and_cleanup() {
+        // Compact deterministic reconstruction of the Nov17 incident: gen17
+        // owns the 30-day ring; its anchor2761 must not block a 194-minute reset.
+        const ORIGIN:i64=1792045920;
+        let instrument=AdaptiveInstrument {exchange:"bybit".into(),category:"linear".into(),symbol:"10000SATSUSDT".into()};
+        let bars:Vec<_>=(0..47500).filter(|minute|!matches!(minute,1000|1100|45961..=46154)).map(|minute|DetectorBar {
+            open_time_unix:ORIGIN+minute*60,close:if minute%43==0 {"125.000001"}else{"100"}.into(),
+            quote_turnover:if minute%43==0 {"1000.000001"}else{"1.000001"}.into()}).collect();
+        for candidate in [30,31] {
+            let rows=[(17,4,30,6,18,"9","2",1792045920,Some(480)),(18,5,14,5,12,"4","20",1793394600,Some(1320)),
+                (19,6,14,12,4,"6","9",1793477340,Some(480)),(20,1,25,7,9,"8","10",1792490880,Some(1320)),
+                (21,2,18,12,18,"9","2",1793184480,Some(240)),(22,3,20,6,12,"6","10",1792965300,Some(1320)),
+                if candidate==30 {(30,4,14,12,3,"4","7",1793675520,None)}else{(31,5,25,3,12,"5","7",1792739040,None)}];
+            let target=ORIGIN+47500*60;
+            let specs:Vec<_>=rows.iter().map(|&(generation,slot,long,short,window,growth,multiplier,from,cluster)|ProfileSpec {
+                fence:AdaptiveFence {owner_id:"incident-fixture".into(),algorithm_id:"price_volume_spike".into(),slot_id:slot,generation_id:generation,config_revision:5},
+                params:AlgorithmParams::Spike(SpikeParams {baseline_long_days:long,baseline_short_days:short,window_minutes:window,
+                    price_growth_pct:growth.into(),volume_multiplier:multiplier.into(),cooldown_minutes:5,max_gap_percent:"10".into(),
+                    max_consecutive_gap_minutes:15,required_recent_minutes:30}),
+                recommendation:Arc::new(serde_json::json!({"timeShiftMinutes":0})),cluster_gap_minutes:cluster,from_open:from,
+                warmup_through:target-60,emit_from_close:target,checkpoint:None,pending:true,waiting:false,publish_enabled:true,
+            }).collect();
+            let mut f=fixture();let healthy_key=f.spec.key();
+            f.runtime.install(&f.epoch,std::slice::from_ref(&f.spec)).unwrap();feed(&mut f.runtime,&f.epoch,&f.instrument,&f.bars,f.frontier).unwrap();
+            let healthy=profile_snapshot(&f.runtime.symbols[&f.epoch].profiles[&healthy_key]);
+            let healthy_identity=f.runtime.symbols[&f.epoch].history.identity();
+            f.runtime.limits.max_profiles=8;
+            let epoch=AdaptiveRuntime::epoch_key(&instrument,Some(candidate));f.runtime.install(&epoch,&specs).unwrap();
+            assert_eq!(f.runtime.symbols[&epoch].capacity_minutes,43235);
+            let bytes=f.runtime.retained_history_bytes();
+            assert!(feed(&mut f.runtime,&epoch,&instrument,&bars,target).unwrap().is_empty(),"warmup must not publish old signals");
+            assert_eq!(f.runtime.retained_history_bytes(),bytes);
+            for spec in &specs {
+                let mut reference=PriceVolumeSpikeDetector::with_params(spec.params.clone(),None).unwrap();
+                let mut last=None;let mut result=None;
+                for bar in bars.iter().filter(|bar|bar.open_time_unix>=spec.from_open) {
+                    let pushed=reference.push(bar).unwrap();if let Some(raw)=&pushed.setup {last=Some(raw.open_time_unix);}result=Some(pushed);
+                }
+                let cached=&f.runtime.symbols[&epoch].profiles[&spec.key()];let result=result.unwrap();
+                assert_eq!(cached.checkpoint.last_raw_open_unix,last,"generation {} cooldown",spec.fence.generation_id);
+                assert_eq!(cached.detector.as_ref().unwrap().last_raw_open_unix(),last);
+                assert_eq!(cached.last_status,Some(result.status));assert_eq!(cached.last_skip,result.skip_reason);
+                assert_eq!(cached.checkpoint.next_open_unix,target);
+                assert_eq!(f.runtime.waiting_reason(&epoch,&spec.key(),target),Some("insufficient_history"));
+            }
+            assert_eq!(profile_snapshot(&f.runtime.symbols[&f.epoch].profiles[&healthy_key]),healthy);
+            assert_eq!(f.runtime.symbols[&f.epoch].history.identity(),healthy_identity);
+            f.runtime.invalidate(&epoch,None);assert!(!f.runtime.has_epoch(&epoch));assert_eq!(f.runtime.retained_history_epochs(),1);
+            f.runtime.clear();assert_eq!(f.runtime.retained_history_bytes(),0);assert_eq!(f.runtime.retained_profile_bytes(),0);assert!(f.runtime.locations.is_empty());
+        }
     }
 
     #[test]

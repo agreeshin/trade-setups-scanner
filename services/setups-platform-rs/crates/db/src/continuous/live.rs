@@ -225,11 +225,11 @@ async fn pending_control_current(tx:&mut Transaction<'_,Postgres>,fence:&WarmupL
 /// Capture control-plane facts BEFORE a terminal transition clears them. Never
 /// include scientific inputs/results or an error's potentially raw SQL/body.
 async fn attempt_diagnostics(tx:&mut Transaction<'_,Postgres>,generation:i64,slot:i64)->Result<Value,DbError> {
-    Ok(sqlx::query_scalar("select jsonb_build_object('slot_id',$2::bigint,'generation_id',g.id,'study_id',g.study_id,'algorithm_id',g.algorithm_id,'config_revision',g.config_revision,'runtime_instance',w.lease_owner,'lease_token',w.lease_token,'lane_generation_id',w.generation_id,'attempt',g.live_init_attempts,'attempt_limit',g.live_init_attempt_limit,'deadline_unix',extract(epoch from g.live_init_deadline)::bigint,'deadline_remaining_ms',(extract(epoch from (g.live_init_deadline-clock_timestamp()))*1000)::bigint,'lease_remaining_ms',case when w.generation_id=g.id then (extract(epoch from (w.lease_until-clock_timestamp()))*1000)::bigint end) from continuous_generations g left join adaptive_live_warmup_lane w on w.id=1 where g.id=$1")
+    Ok(sqlx::query_scalar("select jsonb_build_object('component','continuous.live','profile_id',$2::bigint,'slot_id',$2::bigint,'generation_id',g.id,'study_id',g.study_id,'algorithm_id',g.algorithm_id,'config_revision',g.config_revision,'runtime_instance',w.lease_owner,'lease_token',w.lease_token,'lane_generation_id',w.generation_id,'attempt',g.live_init_attempts,'attempt_limit',g.live_init_attempt_limit,'deadline_unix',extract(epoch from g.live_init_deadline)::bigint,'deadline_remaining_ms',(extract(epoch from (g.live_init_deadline-clock_timestamp()))*1000)::bigint,'lease_remaining_ms',case when w.generation_id=g.id then (extract(epoch from (w.lease_until-clock_timestamp()))*1000)::bigint end) from continuous_generations g left join adaptive_live_warmup_lane w on w.id=1 where g.id=$1")
         .bind(generation).bind(slot).fetch_one(&mut **tx).await?)
 }
 pub fn warmup_diagnostic_fields(fence:&WarmupLease)->Value {
-    json!({"runtime_instance":fence.worker,"slot_id":fence.slot_id,"generation_id":fence.generation_id,
+    json!({"component":"continuous.live","runtime_instance":fence.worker,"profile_id":fence.slot_id,"slot_id":fence.slot_id,"generation_id":fence.generation_id,
         "algorithm_id":fence.algorithm_id,"config_revision":fence.config_revision,"lease_token":fence.token,
         "attempt":fence.attempt,"deadline_unix":fence.attempt_deadline_unix,
         "deadline_remaining_ms":fence.attempt_deadline_unix.saturating_sub(chrono::Utc::now().timestamp()).saturating_mul(1000)})
@@ -254,6 +254,26 @@ pub async fn claim_pending_warmup_at(pool: &PgPool, pending: &PendingAdaptiveSlo
 /// Explicit 1 minute..24 hour wall budget, independent of renewable lease TTL.
 pub async fn claim_pending_warmup_with_budget(pool: &PgPool, pending: &PendingAdaptiveSlot, worker: &str, anchor_close_unix: i64, attempt_seconds: i64) -> Result<Option<WarmupLease>, DbError> {
     let started=std::time::Instant::now();
+    let mut fields=claim_diagnostics(pending,worker);
+    diagnostics::emit(Level::Debug,"live_initialization_claim_started",fields.clone());
+    let result=claim_pending_warmup_inner(pool,pending,worker,anchor_close_unix,attempt_seconds,&mut fields).await;
+    fields["stage"]="claim".into();fields["duration_ms"]=(started.elapsed().as_millis() as u64).into();
+    match &result {
+        Ok(Some(_))=>{fields["outcome"]="claimed".into();diagnostics::emit(Level::Info,"live_initialization_claimed",fields);},
+        // Claim is polled. Durable handoff/retry/readmission and successful claim
+        // provide the normal-level wait boundaries; do not log each miss at INFO.
+        Ok(None)=>{fields["outcome"]="not_claimed".into();diagnostics::emit(Level::Debug,"live_initialization_claim_finished",fields);},
+        Err(error)=>{fields["outcome"]="error".into();fields["error_code"]=diagnostics::db_error_code(error).into();
+            diagnostics::emit(Level::Error,"live_initialization_claim_finished",fields);},
+    }
+    result
+}
+fn claim_diagnostics(pending:&PendingAdaptiveSlot,worker:&str)->Value {
+    let p=&pending.profile;
+    json!({"component":"continuous.live","stage":"claim","runtime_instance":worker,"profile_id":p.slot_id,"slot_id":p.slot_id,
+        "study_id":p.study_id,"generation_id":p.generation_id,"algorithm_id":p.algorithm_id,"config_revision":p.config_revision})
+}
+async fn claim_pending_warmup_inner(pool:&PgPool,pending:&PendingAdaptiveSlot,worker:&str,anchor_close_unix:i64,attempt_seconds:i64,fields:&mut Value)->Result<Option<WarmupLease>,DbError> {
     valid_worker(worker)?;
     if anchor_close_unix < 0 || anchor_close_unix % 60 != 0 || !(60..=86400).contains(&attempt_seconds) {
         return Err(DbError::Json("invalid live initialization anchor/attempt budget".into()));
@@ -265,16 +285,16 @@ pub async fn claim_pending_warmup_with_budget(pool: &PgPool, pending: &PendingAd
         generation_id:p.generation_id,config_revision:p.config_revision,worker:worker.into(),token:0,
         initialization,attempt:0,attempt_deadline_unix:0,lease_valid_until:std::time::Instant::now()};
     let mut tx = pool.begin().await?;
-    if !lock_pending(&mut tx,&fence).await? { return Ok(None); }
+    if !lock_pending(&mut tx,&fence).await? { fields["reason"]="stale_control_or_candidate".into();return Ok(None); }
     // Process -> slot -> global lane -> generation: no long reads under locks.
     sqlx::query("select id from adaptive_live_warmup_lane where id=1 for update").execute(&mut *tx).await?;
     let eligible: bool = sqlx::query_scalar("select exists(select 1 from continuous_generations g where id=$1 and status='completed' and accepted=true and live_init_attempts<live_init_attempt_limit and live_init_status is distinct from 'exhausted' and live_init_status is distinct from 'superseded' and (live_init_next_attempt_at is null or live_init_next_attempt_at<=clock_timestamp()) and exists(select 1 from adaptive_profiles p where p.id=g.slot_id and p.accepted_generation_id=g.id))")
         .bind(p.generation_id).fetch_one(&mut *tx).await?;
-    if !eligible { return Ok(None); }
+    if !eligible { fields["reason"]="ineligible_or_retry_not_due".into();return Ok(None); }
     fence.lease_valid_until=std::time::Instant::now()+std::time::Duration::from_secs(WARMUP_LEASE_SECONDS as u64);
     let token: Option<i64> = sqlx::query_scalar("update adaptive_live_warmup_lane set slot_id=$1,generation_id=$2,lease_owner=$3,lease_token=lease_token+1,lease_until=clock_timestamp()+$4::bigint*interval '1 second' where id=1 and (lease_owner is null or lease_until<=clock_timestamp()) returning lease_token")
         .bind(p.slot_id).bind(p.generation_id).bind(worker).bind(WARMUP_LEASE_SECONDS).fetch_optional(&mut *tx).await?;
-    let Some(token) = token else { return Ok(None); };
+    let Some(token) = token else { fields["reason"]="warmup_lane_busy".into();return Ok(None); };
     fence.token = token;
     let row=sqlx::query("update continuous_generations set live_initialization=coalesce(live_initialization,$2),live_init_attempts=live_init_attempts+1,live_init_status='running',live_init_deadline=clock_timestamp()+$3::bigint*interval '1 second',live_init_next_attempt_at=null where id=$1 returning live_initialization,live_init_attempts,extract(epoch from live_init_deadline)::bigint deadline")
         .bind(p.generation_id).bind(json!(fence.initialization)).bind(attempt_seconds).fetch_one(&mut *tx).await?;
@@ -284,10 +304,8 @@ pub async fn claim_pending_warmup_with_budget(pool: &PgPool, pending: &PendingAd
     // Keep last error visible during retries instead of erasing a diagnostic.
     sqlx::query("update continuous_slots set pending_status='warming',readiness_frontier=null,updated_at=now() where id=$1")
         .bind(p.slot_id).execute(&mut *tx).await?;
-    let mut diagnostic=attempt_diagnostics(&mut tx,p.generation_id,p.slot_id).await?;
+    *fields=attempt_diagnostics(&mut tx,p.generation_id,p.slot_id).await?;
     tx.commit().await?;
-    diagnostic["duration_ms"]=(started.elapsed().as_millis() as u64).into();diagnostic["stage"]="claim".into();
-    diagnostics::emit(Level::Info,"live_initialization_claimed",diagnostic);
     Ok(Some(fence))
 }
 

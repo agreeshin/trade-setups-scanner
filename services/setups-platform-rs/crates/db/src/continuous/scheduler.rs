@@ -326,22 +326,23 @@ pub async fn load_replay(pool: &PgPool, job: &ChainJob, max_bytes: usize) -> Res
 
 pub async fn finalize(pool: &PgPool, job: &ChainJob, result: &Value, accepted: bool, mean: Option<f64>, selected: Option<&Value>) -> Result<bool,DbError> {
     let started=std::time::Instant::now();
-    crate::diagnostics::emit(crate::diagnostics::Level::Info,"continuous_finalization_started",finalization_diagnostics(job,accepted,started));
-    let outcome=finalize_inner(pool,job,result,accepted,mean,selected).await;
+    let reason=if accepted {"accepted"}else if result["reason"]=="no_winner" {"no_winner"}else{"quality_gate_nonpass"};
+    crate::diagnostics::emit(crate::diagnostics::Level::Info,"continuous_finalization_started",finalization_diagnostics(job,accepted,reason,started));
+    let outcome=finalize_inner(pool,job,result,accepted,mean,selected,reason).await;
     if !matches!(outcome,Ok(true)) {
-        let mut fields=finalization_diagnostics(job,accepted,started);
+        let mut fields=finalization_diagnostics(job,accepted,reason,started);
         fields["outcome"]=if outcome.is_err(){"error"}else{"rejected_fence"}.into();
         if let Err(error)=&outcome {fields["error_code"]=crate::diagnostics::db_error_code(error).into();}
         crate::diagnostics::emit(if outcome.is_err(){crate::diagnostics::Level::Error}else{crate::diagnostics::Level::Warn},"continuous_finalization_finished",fields);
     }
     outcome
 }
-fn finalization_diagnostics(job:&ChainJob,accepted:bool,started:std::time::Instant)->Value {
-    json!({"runtime_instance":job.lease.worker,"slot_id":job.slot_id,"generation_id":job.generation_id,
+fn finalization_diagnostics(job:&ChainJob,accepted:bool,reason:&str,started:std::time::Instant)->Value {
+    json!({"component":"continuous.scheduler","runtime_instance":job.lease.worker,"profile_id":job.slot_id,"slot_id":job.slot_id,"generation_id":job.generation_id,
         "study_id":job.study_id,"algorithm_id":job.algorithm_id,"config_revision":job.config_revision,
-        "lease_token":job.lease.token,"accepted":accepted,"stage":"finalization","duration_ms":started.elapsed().as_millis() as u64})
+        "lease_token":job.lease.token,"accepted":accepted,"reason":reason,"stage":"finalization","duration_ms":started.elapsed().as_millis() as u64})
 }
-async fn finalize_inner(pool: &PgPool, job: &ChainJob, result: &Value, accepted: bool, mean: Option<f64>, selected: Option<&Value>) -> Result<bool,DbError> {
+async fn finalize_inner(pool: &PgPool, job: &ChainJob, result: &Value, accepted: bool, mean: Option<f64>, selected: Option<&Value>, reason:&str) -> Result<bool,DbError> {
     let started=std::time::Instant::now();
     let mut tx=pool.begin().await?;
     // A lost response may retry finalization, including after a newer owner won.
@@ -349,8 +350,8 @@ async fn finalize_inner(pool: &PgPool, job: &ChainJob, result: &Value, accepted:
     let completed:bool=sqlx::query_scalar("select exists(select 1 from continuous_generations where id=$1 and owner_id=$2 and config_revision=$3 and status='completed' and result=$4 and accepted=$5)")
         .bind(job.generation_id).bind(&job.lease.owner_id).bind(job.config_revision).bind(result).bind(accepted).fetch_one(&mut *tx).await?;
     if completed {
-        let mut fields=finalization_diagnostics(job,accepted,started);fields["outcome"]="already_completed".into();
-        crate::diagnostics::emit(crate::diagnostics::Level::Debug,"continuous_finalization_finished",fields);
+        let mut fields=finalization_diagnostics(job,accepted,reason,started);fields["outcome"]="already_completed".into();
+        crate::diagnostics::emit(crate::diagnostics::Level::Info,"continuous_finalization_finished",fields);
         return Ok(true);
     }
     if !fenced(&mut tx,job).await? { return Ok(false); }
@@ -374,7 +375,8 @@ async fn finalize_inner(pool: &PgPool, job: &ChainJob, result: &Value, accepted:
     sqlx::query("delete from continuous_runtime_artifacts where generation_id=$1").bind(job.generation_id).execute(&mut *tx).await?;
     if !owns(&mut tx,&job.lease).await? {return Ok(false);}
     tx.commit().await?;
-    let mut fields=finalization_diagnostics(job,accepted,started);fields["outcome"]="finalized".into();
+    let mut fields=finalization_diagnostics(job,accepted,reason,started);fields["outcome"]="finalized".into();
+    fields["handoff_state"]=if accepted {"pending"}else{"not_created"}.into();
     crate::diagnostics::emit(crate::diagnostics::Level::Info,"continuous_finalization_finished",fields);
     Ok(true)
 }
