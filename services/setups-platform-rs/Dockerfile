@@ -6,14 +6,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
 COPY services/setups-platform-rs/ ./
 RUN --mount=type=cache,target=/build/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release --bin setups-platform-server && \
-    cp target/release/setups-platform-server /setups-platform-server
+    cargo build --release -j1 --bin setups-platform-server --bin expectancy-recalculate && \
+    cp target/release/setups-platform-server /setups-platform-server && \
+    cp target/release/expectancy-recalculate /expectancy-recalculate
 
 FROM node:24-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client openssl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /setups-platform-server /usr/local/bin/setups-platform-server
+COPY --from=build /expectancy-recalculate /usr/local/bin/expectancy-recalculate
 COPY scripts/postgres-backup.mjs /app/scripts/postgres-backup.mjs
 RUN chmod 0555 /app/scripts/postgres-backup.mjs
 ENV BACKUP_SCRIPT_PATH=/app/scripts/postgres-backup.mjs
