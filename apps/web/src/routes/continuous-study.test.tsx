@@ -107,8 +107,11 @@ async function configure() {
 it("saves and restores forecast settings and separates the forward gate from the mean threshold", async () => {
   render(<AlgorithmsPage />);
   let dialog = await configure();
-  expect(dialog.getByLabelText("Перегиб на N дней")).toBeDisabled();
-  fireEvent.click(dialog.getByRole("button", { name: "Прогноз по тренду" }));
+  expect(dialog.getByRole("button", { name: "Среднее" })).toHaveAttribute("aria-pressed", "true");
+  expect(dialog.queryByLabelText("Перегиб на N дней")).not.toBeInTheDocument();
+  fireEvent.click(dialog.getByRole("button", { name: "Прогноз" }));
+  expect(dialog.getByLabelText("Метод прогноза")).toHaveValue("decayed_probability");
+  fireEvent.change(dialog.getByLabelText("Метод прогноза"), { target: { value: "trend" } });
   fireEvent.change(dialog.getByLabelText("Перегиб на N дней"), { target: { value: "30" } });
   expect(dialog.getByLabelText("Минимальное среднее матожидание, R")).toHaveValue(0.15);
   expect(dialog.getByLabelText("Минимальное среднее матожидание, R")).toBeDisabled();
@@ -118,8 +121,37 @@ it("saves and restores forecast settings and separates the forward gate from the
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   expect(process?.config?.study).toMatchObject({ trendMode: "forecast", trendBendDays: "30" });
   dialog = await configure();
-  expect(dialog.getByRole("button", { name: "Прогноз по тренду" })).toHaveAttribute("aria-pressed", "true");
+  expect(dialog.getByRole("button", { name: "Прогноз" })).toHaveAttribute("aria-pressed", "true");
   expect(dialog.getByLabelText("Перегиб на N дней")).toHaveValue("30");
+  expect(requests.some((request) => request.path.endsWith("/start"))).toBe(false);
+});
+
+it("persists a probability recipe and restores it from saved continuous config without a draft", async () => {
+  render(<AlgorithmsPage />); let dialog = await configure();
+  expect(dialog.getByRole("button", { name: "Среднее" })).toHaveAttribute("aria-pressed", "true");
+  fireEvent.click(dialog.getByRole("button", { name: "Смесь среднего и прогноза" }));
+  expect(dialog.getByLabelText("Метод прогноза")).toHaveValue("decayed_probability");
+  expect(dialog.getByLabelText("Доля прогноза λ")).toHaveValue(0.7);
+  expect(dialog.getByLabelText("Доля прогноза λ")).toHaveAttribute("min", "0.05");
+  expect(dialog.getByLabelText("Доля прогноза λ")).toHaveAttribute("max", "0.95");
+  expect(dialog.getByLabelText("Доля прогноза λ")).toHaveAttribute("step", "0.01");
+  fireEvent.change(dialog.getByLabelText("Память модели H, дней"), { target: { value: "7.5" } });
+  fireEvent.click(dialog.getByRole("button", { name: "Расширенные настройки модели" }));
+  fireEvent.change(dialog.getByLabelText("Сила prior κ"), { target: { value: "20" } });
+  fireEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  const forecast = { method: "decayed_probability", version: 1, halfLifeDays: 7.5, kappa: 20, priorPolicy: "gross_break_even" };
+  expect(process?.config?.study).toMatchObject({ trendMode: "blend", trendBlendLambda: 0.7, forecast });
+  drafts = {};
+  dialog = await configure();
+  expect(dialog.getByLabelText("Память модели H, дней")).toHaveValue(7.5);
+  fireEvent.click(dialog.getByRole("button", { name: "Расширенные настройки модели" }));
+  expect(dialog.getByLabelText("Сила prior κ")).toHaveValue(20);
+  expect(dialog.getByLabelText("Метод прогноза")).toHaveValue("decayed_probability");
+  expect(dialog.queryByLabelText("Перегиб на N дней")).not.toBeInTheDocument();
+  fireEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(process?.config?.study.forecast).toEqual(forecast);
   expect(requests.some((request) => request.path.endsWith("/start"))).toBe(false);
 });
 

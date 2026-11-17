@@ -1,4 +1,5 @@
 import { apiFetch } from "./platform-api";
+import type { ForecastRecipe } from "./forecast-recipe";
 import type { TrendBendDays, TrendMode as AnalyticsTrendMode } from "./analytics-api";
 export type StudyTrendMode = AnalyticsTrendMode | "blend";
 export function isTrendBlendLambda(value: unknown): value is number {
@@ -38,6 +39,8 @@ export interface OptimizationSpec {
   trendBendDays?: TrendBendDays;
   trendBlendLambda?: number;
   minForecastExpectancy?: number;
+  /** Explicit new recipe; missing legacy forecast/blend retains its original trend semantics. */
+  forecast?: ForecastRecipe;
 }
 export interface OptimizationProgress {
   phase: string;
@@ -60,6 +63,8 @@ export interface OptimizationBest {
   trendMode?: StudyTrendMode;
   trendBendDays?: TrendBendDays;
   trendBlendLambda?: number;
+  forecast?: ForecastRecipe;
+  observationCutoff?: number;
   partial: boolean;
   params: Record<string, string | number>;
   analytics: Omit<OptimizationAnalytics, "clusterGapMinutes"> & { clusterGapMinutes: number | null };

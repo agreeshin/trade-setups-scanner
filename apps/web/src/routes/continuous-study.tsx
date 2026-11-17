@@ -18,6 +18,7 @@ import { effectiveTimezone, formatIsoDateTime, formatUnix } from "../lib/datetim
 import { fetchPlatform } from "../lib/platform-api";
 import { MAX_CONTINUOUS_LOOKBACK_DAYS, MIN_CONTINUOUS_LOOKBACK_DAYS, type ContinuousProcess, type ContinuousSlot, type LiveReadinessSummary } from "../lib/continuous-api";
 import { getOptimizationDraft } from "../lib/optimization-api";
+import { restoreForecastRecipeDraft } from "../lib/forecast-recipe";
 import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildContinuousConfig, initialDomains, initialScope, restoreDomains, type ContinuousDraft, type ScopeDraft } from "./optimization-form";
 import { OptimizationFields } from "./optimization-fields";
 import type { CatalogInstrument } from "./instrument-picker";
@@ -223,7 +224,8 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
   const baseline = saved ? { ...algorithm, params: saved.study.algorithmParams } : algorithm;
   const [scope, setScope] = useState<ScopeDraft>(() => saved ? { ...initialScope(), symbols: saved.study.instruments.map((item) => item.symbol).join("\n"), direction: saved.study.direction,
     horizonMinutes: String(saved.study.horizonMinutes), tpLevels: saved.study.tpLevels.join(", "), slLevels: saved.study.slLevels.join(", "), minClosedPerCell: String(saved.study.minClosedPerCell), seed: String(saved.study.seed), maxTrials: String(saved.study.maxTrials), maxSeconds: String(saved.study.maxSeconds), trendMode: saved.study.trendMode ?? "mean", trendBendDays: saved.study.trendBendDays ?? "linear",
-    trendBlendLambda: String(saved.study.trendBlendLambda ?? 0.7), minForecastExpectancy: String(saved.study.minForecastExpectancy ?? 0) } : initialScope());
+    trendBlendLambda: String(saved.study.trendBlendLambda ?? 0.7), minForecastExpectancy: String(saved.study.minForecastExpectancy ?? 0),
+    forecast: restoreForecastRecipeDraft(saved.study.forecast) } : initialScope());
   const [draft, setDraft] = useState<ContinuousDraft>(() => ({ lookbackDays: String(saved?.lookbackDays ?? 30), minSetupsPerDay: (saved?.minSetupsPerDay ?? [4]).join(", "), minMeanExpectancy: String(saved?.minMeanExpectancy ?? 0.15), adaptiveEnabled: saved?.adaptiveEnabled ?? false }));
   const [algorithmDomains, setAlgorithmDomains] = useState(() => saved ? restoreDomains(algorithm.fields, saved.study.algorithmParams, saved.study.algorithmSearch) : initialDomains(algorithm.fields, algorithm.params));
   const [analyticsDomains, setAnalyticsDomains] = useState(() => saved ? restoreDomains(ANALYTICS_SEARCH_FIELDS, { ...saved.study.analyticsParams }, saved.study.analyticsSearch) : initialDomains(ANALYTICS_SEARCH_FIELDS, { ...ANALYTICS_BASELINE }));

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Algorithm } from "./platform-controls";
-import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildContinuousConfig, buildOptimizationSpec, DEFAULT_AXIS, initialDomains, parseAxis, type ScopeDraft } from "./optimization-form";
+import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildContinuousConfig, buildOptimizationSpec, DEFAULT_AXIS, initialDomains, initialScope, parseAxis, type ScopeDraft } from "./optimization-form";
+import { initialForecastRecipeDraft } from "../lib/forecast-recipe";
 
 const algorithm: Algorithm = {
   id: "unknown", version: "1", enabled: true, name: "Unknown", description: "",
@@ -62,6 +63,36 @@ it.each(["7", "14", "30", "linear"] as const)("plumbs fixed forecast %s into bot
 it("defaults legacy form scopes to mean/linear and retains an inactive bend without changing the objective", () => {
   expect(build()).toMatchObject({ trendMode: "mean", trendBendDays: "linear" });
   expect(build({ trendBendDays: "7" })).toMatchObject({ trendMode: "mean", trendBendDays: "7" });
+});
+
+it.each(["forecast", "blend"] as const)("sends one explicit probability recipe for %s in manual and continuous, never as a search coordinate", (trendMode) => {
+  const selected = { trendMode, forecast: { method: "decayed_probability", version: 1, halfLifeDays: "28", kappa: "5", priorPolicy: "gross_break_even" } } as const;
+  const continuous = buildContinuousConfig(algorithm, { ...scope, ...selected }, catalog,
+    initialDomains(algorithm.fields, algorithm.params), initialDomains(ANALYTICS_SEARCH_FIELDS, { ...ANALYTICS_BASELINE }),
+    { lookbackDays: "30", minSetupsPerDay: "4", minMeanExpectancy: "0.15", adaptiveEnabled: false });
+  for (const result of [build(selected), continuous.study]) {
+    expect(result.forecast).toEqual({ method: "decayed_probability", version: 1, halfLifeDays: 28, kappa: 5, priorPolicy: "gross_break_even" });
+    for (const key of ["forecast", "halfLifeDays", "kappa", "priorPolicy", "trendBlendLambda"]) {
+      expect(result.algorithmSearch).not.toHaveProperty(key);
+      expect(result.analyticsSearch).not.toHaveProperty(key);
+      expect(result.algorithmParams).not.toHaveProperty(key);
+      expect(result.analyticsParams).not.toHaveProperty(key);
+    }
+  }
+});
+it("persists a new explicit mean recipe without upgrading legacy scopes or requiring a forecast score", () => {
+  const draft = initialForecastRecipeDraft();
+  if (draft.method !== "decayed_probability") throw new Error("Expected probability baseline");
+  expect(build({ ...initialScope(), ...scope })).toMatchObject({ trendMode: "mean", forecast: { method: "decayed_probability", version: 1, halfLifeDays: 14, kappa: 10, priorPolicy: "gross_break_even" } });
+  expect(build()).not.toHaveProperty("forecast");
+  expect(() => build({ forecast: { ...draft, halfLifeDays: "", kappa: "0" } })).toThrow("Память модели H");
+  expect(build({ trendMode: "forecast" })).not.toHaveProperty("forecast");
+  expect(build({ trendMode: "blend" })).not.toHaveProperty("forecast");
+  expect(() => build({ trendMode: "forecast", forecast: { ...draft, halfLifeDays: "0" } })).toThrow("Память модели H");
+});
+it("uses the explicit trend recipe bend as the authoritative fixed setting", () => {
+  expect(build({ trendMode: "forecast", trendBendDays: "7", forecast: { method: "trend", version: 1, bendDays: "30" } }))
+    .toMatchObject({ trendBendDays: "30", forecast: { method: "trend", version: 1, bendDays: "30" } });
 });
 
 it("uses the same fixed blend lambda and forward gate for manual and continuous specs", () => {

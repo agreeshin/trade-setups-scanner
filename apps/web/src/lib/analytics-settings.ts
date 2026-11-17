@@ -1,5 +1,6 @@
 import { apiFetch } from "./platform-api";
 import type { TrendBendDays, TrendMode } from "./analytics-api";
+import { restoreForecastRecipeDraft, type ForecastRecipeDraft } from "./forecast-recipe";
 
 export type AnalyticsSectionKey = "short-matrix" | "short-trades" | "long-matrix" | "long-trades";
 
@@ -12,6 +13,8 @@ export interface AnalyticsUserSettings {
   autoCalc: boolean;
   trendBendDays: TrendBendDays;
   trendMode: TrendMode;
+  trendBlendLambda?: string;
+  forecast?: ForecastRecipeDraft | undefined;
   sections: Partial<Record<AnalyticsSectionKey, Record<string, unknown>>>;
 }
 
@@ -29,7 +32,9 @@ export async function fetchAnalyticsSettings(): Promise<AnalyticsUserSettings | 
     clusterGapInput: typeof partial.clusterGapInput === "string" && partial.clusterGapInput !== "" ? partial.clusterGapInput : "8",
     autoCalc: partial.autoCalc === true,
     trendBendDays: partial.trendBendDays === "7" || partial.trendBendDays === "14" || partial.trendBendDays === "30" ? partial.trendBendDays : "linear",
-    trendMode: partial.trendMode === "forecast" ? "forecast" : "mean",
+    trendMode: partial.trendMode === "forecast" || partial.trendMode === "blend" ? partial.trendMode : "mean",
+    trendBlendLambda: typeof partial.trendBlendLambda === "string" || typeof partial.trendBlendLambda === "number" ? String(partial.trendBlendLambda) : "0.7",
+    forecast: restoreForecastRecipeDraft(partial.forecast),
     sections: partial.sections !== null && typeof partial.sections === "object" ? partial.sections : {},
   };
 }

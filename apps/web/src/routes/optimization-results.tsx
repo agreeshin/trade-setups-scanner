@@ -5,6 +5,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from ".
 import { formatIsoDateTime, formatUnix } from "../lib/datetime-format";
 import { isActiveStudy, isContinuousStudy, type OptimizationStudy } from "../lib/optimization-api";
 import { parameterLabels } from "../lib/parameter-labels";
+import { forecastRecipeLabel } from "../lib/forecast-recipe";
 import type { Algorithm } from "./platform-controls";
 import type { OptimizationController } from "./use-optimization-studies";
 
@@ -34,6 +35,8 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
   const lambda = best?.trendBlendLambda ?? spec.trendBlendLambda ?? 0.7;
   const blendLabel = `Смесь · ${100 - Math.round(lambda * 100)}/${Math.round(lambda * 100)}`;
   const bend = best?.trendBendDays ?? spec.trendBendDays ?? "linear";
+  const recipe = best?.forecast ?? spec.forecast;
+  const recipeLabel = forecastRecipeLabel(recipe, bend);
   const frequencyThreshold = spec.minSetupsPerDay === undefined ? "Гейт не применялся"
     : spec.minSetupsPerDay === 0 ? "0 (гейт отключён)" : String(spec.minSetupsPerDay);
   return <section className="grid min-w-0 gap-4" aria-label="Статус исследования">
@@ -56,7 +59,9 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
       <dl className="grid gap-2 text-sm sm:grid-cols-2">
         <div><dt className="text-muted-foreground">Минимум закрытых на ячейку</dt><dd>{spec.minClosedPerCell}</dd></div>
         <div><dt className="text-muted-foreground">Минимум сетапов в день</dt><dd>{frequencyThreshold}</dd></div>
-        <div><dt className="text-muted-foreground">Метрика поиска</dt><dd>{forecast ? `${blend ? blendLabel : "Прогноз по тренду"} · ${bend === "linear" ? "∞ — прямая" : `перегиб ${bend} дней`}` : "Среднее за период"}</dd></div>
+        <div><dt className="text-muted-foreground">Метрика поиска</dt><dd>{forecast ? `${blend ? `${blendLabel} · ` : ""}${recipeLabel}` : "Среднее за период"}</dd></div>
+        {recipe && <div><dt className="text-muted-foreground">Сохранённый рецепт прогноза</dt><dd>{recipeLabel}</dd></div>}
+        {best?.observationCutoff !== undefined && <div><dt className="text-muted-foreground">Cutoff C результата</dt><dd>{new Date(best.observationCutoff * 1000).toISOString()} · из сохранённого результата, не текущей формы</dd></div>}
         {forecast && <div><dt className="text-muted-foreground">Forward-гейт матрицы</dt><dd>score &gt; {spec.minForecastExpectancy ?? 0} R</dd></div>}
       </dl>
     </section>
@@ -74,7 +79,7 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
       <div className="flex items-center gap-2"><h3 className="font-semibold">Лучший score: {best.score} R</h3>
       <InfoNote>Хеши фиксируют происхождение входов, но не гарантируют точного повторения после изменения истории. Комиссии, funding и проскальзывание не учитываются.</InfoNote></div>
       <p className="text-sm">{best.partial ? "Частичный итог остановленного исследования." : "Лучший полностью проверенный кандидат в пределах бюджета."} Это не доказанный глобальный оптимум. Score — равное среднее {blend ? "blend R" : forecast ? "прогноза R" : "R"} всех выбранных TP×SL-ячеек, а не выбор лучшей TP/SL-пары.</p>
-      {forecast && <p className="text-sm">{blend ? `Выбор по смеси среднего и прогноза (${blendLabel}).` : "Выбор по прогнозу тренда."} Среднее всей матрицы за период: {best.meanScore == null ? "Не сохранено" : `${best.meanScore} R`}. Прогноз не является экстраполяцией или средним за период.</p>}
+      {forecast && <p className="text-sm">{blend ? `Выбор по смеси среднего и прогноза (${blendLabel}).` : recipe?.method === "decayed_probability" ? "Выбор по вероятностному прогнозу TP с памятью." : "Выбор по прогнозу тренда."} Среднее всей матрицы за период: {best.meanScore == null ? "Не сохранено" : `${best.meanScore} R`}. Прогноз не является средним за период; ретроспективная оценка не доказывает качество будущих сделок.</p>}
       <section aria-label="Лучшая forecast-пара" className="grid gap-2">
         <h4 className="font-medium">Лучшая forecast-пара</h4>
         <p className="text-xs text-muted-foreground">Максимальный чистый прогноз ячейки сохранённого победителя, не score всей матрицы. Среднее и TP/SL относятся к этой же ячейке.</p>

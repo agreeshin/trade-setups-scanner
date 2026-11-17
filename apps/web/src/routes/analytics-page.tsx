@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnalyticsTrendControls } from "../components/analytics-trend-controls";
+import { AnalyticsForecastChart } from "../components/analytics-forecast-chart";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -41,6 +42,10 @@ import {
 } from "../lib/analytics-settings";
 import { formatUnix } from "../lib/datetime-format";
 import { buildDailyExpectancy, buildDailyExpectancyModel, type DailyExpectancyPoint } from "../lib/daily-expectancy";
+import { buildForecastRecipe, forecastRecipeLabel, initialForecastRecipeDraft, type ForecastRecipeDraft } from "../lib/forecast-recipe";
+import { buildObservedForecastDays } from "../lib/forecast-observations";
+import type { ForecastCurveRequest } from "../lib/forecast-api";
+import { isTrendBlendLambda } from "../lib/optimization-api";
 
 const SHORT_MATRIX_LEVELS = Array.from({ length: 14 }, (_, index) => 4 + index * 2);
 const LONG_TP_LEVELS = [1, 2, 3, ...SHORT_MATRIX_LEVELS, 35, 40, 45, 50, 60];
@@ -85,6 +90,9 @@ function matrixCellTextStep(value: number, min: number, max: number): number {
 interface MatrixSectionProps {
   trendBendDays: TrendBendDays;
   trendMode: TrendMode;
+  forecast: ForecastRecipeDraft | undefined;
+  trendBlendLambda: string;
+  observationCutoff: number;
   setId: string;
   description: string;
   direction: "short" | "long";
@@ -106,7 +114,7 @@ interface MatrixSectionProps {
 function MatrixSection({
   setId, description, direction, tpLevels, slLevels, enablePriceChange,
   gradientMinDefault, gradientMaxDefault, clusterize, maturity, clusterGapHours, setBounds,
-  initial, reportState, onCommit, runToken, trendBendDays, trendMode,
+  initial, reportState, onCommit, runToken, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff,
 }: MatrixSectionProps) {
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(() => normalizeTimeRange(initial?.timeRange));
   const [timeShiftInput, setTimeShiftInput] = useState(() => savedString(initial?.timeShiftInput, "0"));
@@ -117,7 +125,8 @@ function MatrixSection({
   const [gradientMin, setGradientMin] = useState(() => savedNumber(initial?.gradientMin, gradientMinDefault));
   const [gradientMax, setGradientMax] = useState(() => savedNumber(initial?.gradientMax, gradientMaxDefault));
   const [cells, setCells] = useState<Map<string, MatrixCellRef>>(new Map());
-  const [resultTrend, setResultTrend] = useState<{ mode: TrendMode; bend: TrendBendDays } | null>(null);
+  const [resultIdentity, setResultIdentity] = useState<string | null>(null);
+  const modelIdentity = JSON.stringify({ mode: trendMode, ...(trendMode === "mean" ? {} : { bend: trendBendDays, forecast, lambda: trendMode === "blend" ? trendBlendLambda : undefined, cutoff: forecast ? observationCutoff : undefined }) });
   const [metrics, setMetrics] = useState<SelectionMetrics | null>(null);
   const [running, setRunning] = useState(false);
   const [pendingCell, setPendingCell] = useState<string | null>(null);
@@ -144,11 +153,17 @@ function MatrixSection({
     setError(null);
     setPendingCell(null);
     const stale = () => runIdRef.current !== runId;
+    try {
+    const recipe = forecast !== undefined && trendMode !== "mean" ? buildForecastRecipe(forecast) : undefined;
+    const lambda = Number(trendBlendLambda);
+    if (trendMode === "blend" && !isTrendBlendLambda(lambda)) throw new Error("Доля прогноза λ: 0.05–0.95 с шагом 0.01.");
     const baseParams = {
       set: setId,
       direction,
       trendBendDays,
       trendMode,
+      ...(recipe ? { forecast: recipe, observationCutoff } : {}),
+      ...(trendMode === "blend" ? { trendBlendLambda: lambda } : {}),
       ...timeRangeParams(timeRange),
       ...(clusterize ? {
         setupMaturity: maturity,
@@ -158,12 +173,11 @@ function MatrixSection({
       ...(priceChangePct !== null ? { priceChangePct } : {}),
     };
     setProgress({ done: 0, total: totalCells });
-    try {
       const grid = await fetchMatrixGrid(baseParams, tpLevels, slLevels);
       if (stale()) return;
       const nextCells = new Map(grid.items.map((item) => [`${item.tpPct}:${item.slPct}`, item]));
       setCells(nextCells);
-      setResultTrend({ mode: trendMode, bend: trendBendDays });
+      setResultIdentity(modelIdentity);
       setMetrics(grid);
       setProgress({ done: nextCells.size, total: totalCells });
     } catch (cause) {
@@ -174,7 +188,7 @@ function MatrixSection({
         setPendingCell(null);
       }
     }
-  }, [setId, direction, timeRange, clusterize, maturity, clusterGapHours, tpLevels, slLevels, totalCells, trendBendDays, trendMode]);
+  }, [setId, direction, timeRange, clusterize, maturity, clusterGapHours, tpLevels, slLevels, totalCells, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff, modelIdentity]);
 
   const appliedShift = Math.max(0, Math.round(parseNumberInput(timeShiftInput) ?? 0));
   const appliedPriceChange = enablePriceChange && considerPriceChange ? (parseNumberInput(priceChangeInput) ?? 0) : null;
@@ -193,9 +207,9 @@ function MatrixSection({
 
   return <section className="grid min-w-0 gap-4">
       <div className="flex items-center gap-2">
-        <h2 className="text-lg font-semibold">{trendMode === "forecast" ? "Прогноз матожидания по тренду" : "Среднее матожидание сетапов"}</h2>
+        <h2 className="text-lg font-semibold">{trendMode === "blend" ? "Смесь среднего и прогноза" : trendMode === "forecast" ? forecast?.method === "decayed_probability" ? "Прогноз матожидания" : "Прогноз матожидания по тренду" : "Среднее матожидание сетапов"}</h2>
         <InfoNote>{description}</InfoNote>
-        <InfoNote>{trendMode === "forecast" ? "Ячейка — сглаженный уровень МО на последней дате с закрытыми сделками, без экстраполяции. «—» — недостаточно пригодных дней. Подсказка содержит SE и 95% неопределённость уровня, не будущей сделки." : "Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок."} Спорная свеча считается Stop Loss. Цвет жирных значений интерполируется от красного к зелёному между порогами ползунков.</InfoNote>
+        <InfoNote>{trendMode === "mean" ? "Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок." : forecast?.method === "decayed_probability" ? "Матрица показывает decisionR выбранного режима. Подсказка отдельно содержит среднее M, чистый прогноз F, реальные закрытия, prior и cutoff. Prior не выполняет минимум реальных закрытий." : "Прогноз — сглаженный уровень МО на последней дате с закрытыми сделками, без экстраполяции. Подсказка содержит SE и 95% неопределённость уровня, не будущей сделки."} Спорная свеча считается Stop Loss. Цвет жирных значений интерполируется от красного к зелёному между порогами ползунков.</InfoNote>
       </div>
       <div className="flex flex-wrap items-end gap-3">
         <TimeRangeControls setId={setId} setBounds={setBounds} value={timeRange} onChange={setTimeRange} onCommit={onCommit} />
@@ -275,7 +289,7 @@ function MatrixSection({
               <TableRow key={tp}>
                 <TableHead numeric>{tp}%</TableHead>
                 {slLevels.map((sl) => {
-                  const cell = resultTrend?.mode === trendMode && (trendMode === "mean" || resultTrend.bend === trendBendDays) ? cells.get(`${tp}:${sl}`) : undefined;
+                  const cell = resultIdentity === modelIdentity ? cells.get(`${tp}:${sl}`) : undefined;
                   if (cell === undefined) {
                     if (running && pendingCell === `${tp}:${sl}`) {
                       return <TableCell key={sl} numeric className="text-muted-foreground"><Spinner label="Расчёт ячейки" /></TableCell>;
@@ -283,13 +297,13 @@ function MatrixSection({
                     return <TableCell key={sl} numeric className="text-muted-foreground/60">{running ? "…" : "·"}</TableCell>;
                   }
                   if (cell.riskExpectancy === null) {
-                    return <TableCell key={sl} numeric className="text-muted-foreground" title="avg —% · R —">—</TableCell>;
+                    return <TableCell key={sl} numeric className="text-muted-foreground" title={cell.forecastEstimate?.status === "unavailable" ? `Прогноз недоступен: ${cell.forecastEstimate.reason}` : "avg —% · R —"}>—</TableCell>;
                   }
                   return <TableCell
                     key={sl}
                     numeric
                     className={`tabular-nums font-bold analytics-cell-text-${matrixCellTextStep(cell.riskExpectancy, gradientMin, gradientMax)}`}
-                    title={`avg ${cell.avgMovePct?.toFixed(2) ?? "—"}% · R ${cell.riskExpectancy.toFixed(3)}${trendMode === "forecast" ? ` · SE ${cell.endpointSe?.toFixed(3) ?? "—"} R · 95% ±${cell.endpointSe != null ? (1.96 * cell.endpointSe).toFixed(3) : "—"} R` : ""}`}
+                    title={cell.forecast ? `${forecastRecipeLabel(cell.forecast, trendBendDays)} · M ${cell.meanR?.toFixed(3) ?? "—"} R · F ${cell.forecastR?.toFixed(3) ?? "—"} R · decisionR ${cell.decisionR?.toFixed(3) ?? "—"} R · C ${cell.observationCutoff}${cell.forecastEstimate?.status === "available" ? ` · реальные TP ${cell.forecastEstimate.value.tpCount}, SL ${cell.forecastEstimate.value.slCount}, W ${cell.forecastEstimate.value.weightSum.toFixed(3)}` : ""}` : `avg ${cell.avgMovePct?.toFixed(2) ?? "—"}% · R ${cell.riskExpectancy.toFixed(3)}${trendMode === "forecast" ? ` · SE ${cell.endpointSe?.toFixed(3) ?? "—"} R · 95% ±${cell.endpointSe != null ? (1.96 * cell.endpointSe).toFixed(3) : "—"} R` : ""}`}
                   >
                     {cell.riskExpectancy.toFixed(2)}
                   </TableCell>;
@@ -513,6 +527,11 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
 
 interface TradesSectionProps {
   trendBendDays: TrendBendDays;
+  trendMode: TrendMode;
+  forecast: ForecastRecipeDraft | undefined;
+  trendBlendLambda: string;
+  observationCutoff: number;
+  setPeriod: { fromUnix: number; toUnix: number } | null;
   setId: string;
   description: string;
   direction: "short" | "long";
@@ -526,7 +545,7 @@ interface TradesSectionProps {
   onCommit?: (() => void) | undefined;
 }
 
-function TradesSection({ setId, description, direction, enablePriceChange, clusterize, maturity, clusterGapHours, setBounds, initial, reportState, onCommit, trendBendDays }: TradesSectionProps) {
+function TradesSection({ setId, description, direction, enablePriceChange, clusterize, maturity, clusterGapHours, setBounds, initial, reportState, onCommit, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff, setPeriod }: TradesSectionProps) {
   const [tpInput, setTpInput] = useState(() => savedString(initial?.tpInput, "4"));
   const [slInput, setSlInput] = useState(() => savedString(initial?.slInput, "4"));
   const [timeShiftInput, setTimeShiftInput] = useState(() => savedString(initial?.timeShiftInput, "0"));
@@ -535,6 +554,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
   const [priceChangeInput, setPriceChangeInput] = useState(() => savedString(initial?.priceChangeInput, "0"));
   const [riskPctInput, setRiskPctInput] = useState(() => savedString(initial?.riskPctInput, "1"));
   const [rows, setRows] = useState<TradeRowWithSource[]>([]);
+  const [resultParamsKey, setResultParamsKey] = useState<string | null>(null);
   const [filteredCount, setFilteredCount] = useState(0);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
@@ -558,6 +578,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
     } : {}),
     ...(enablePriceChange && considerPriceChange ? { priceChangePct: parseNumberInput(priceChangeInput) ?? 0 } : {}),
   }), [setId, direction, tpInput, slInput, timeShiftInput, timeRange, clusterize, maturity, clusterGapHours, enablePriceChange, considerPriceChange, priceChangeInput]);
+  const paramsKey = JSON.stringify({ ...params, observationCutoff });
 
   const run = useCallback(async () => {
     const runId = runIdRef.current + 1;
@@ -565,6 +586,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
     setRunning(true);
     setError(null);
     setRows([]);
+    setResultParamsKey(paramsKey);
     setFilteredCount(0);
     const stale = () => runIdRef.current !== runId;
     try {
@@ -608,17 +630,18 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
     } finally {
       if (!stale()) setRunning(false);
     }
-  }, [params]);
+  }, [params, paramsKey]);
 
   const effectiveDays = timeRangeBounds(timeRange, setBounds);
   const effectiveFromDay = effectiveDays?.from;
   const effectiveToDay = effectiveDays?.to;
   const visibleRows = useMemo(() => {
+    if (forecast?.method === "decayed_probability" && resultParamsKey !== paramsKey) return [];
     if (effectiveFromDay === undefined || effectiveToDay === undefined) return rows;
     const from = Math.floor(new Date(`${effectiveFromDay}T00:00:00Z`).getTime() / 1000);
     const to = Math.floor(new Date(`${effectiveToDay}T23:59:59Z`).getTime() / 1000);
     return rows.filter((row) => row.setup.closeTimeUnix >= from && row.setup.closeTimeUnix <= to);
-  }, [rows, effectiveFromDay, effectiveToDay]);
+  }, [rows, effectiveFromDay, effectiveToDay, forecast?.method, resultParamsKey, paramsKey]);
 
   const deposit = useMemo(() => {
     const riskPct = parseNumberInput(riskPctInput);
@@ -648,6 +671,21 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
 
   const dailyPoints = useMemo(() => buildDailyExpectancy(visibleRows), [visibleRows]);
   const chartOriginUnix = effectiveDays !== null ? Date.parse(`${effectiveDays.from}T00:00:00Z`) / 1000 : dailyPoints[0]?.dayStartUnix ?? 0;
+  const probabilityChart = useMemo((): { request: ForecastCurveRequest; days: DailyExpectancyPoint[]; error?: never } | { error: string } | null => {
+    if (forecast?.method !== "decayed_probability" || running || visibleRows.length === 0) return null;
+    try {
+      const recipe = buildForecastRecipe(forecast);
+      const q = params.tpPct / params.slPct;
+      if (!Number.isFinite(q) || q <= 0) throw new Error("TP и SL должны быть конечными числами больше 0.");
+      const lambda = Number(trendBlendLambda);
+      if (trendMode === "blend" && !isTrendBlendLambda(lambda)) throw new Error("Доля прогноза λ: 0.05–0.95 с шагом 0.01.");
+      const fromUnix = timeRange.mode === "all" && setPeriod ? setPeriod.fromUnix : chartOriginUnix;
+      const toUnix = timeRange.mode === "all" && setPeriod ? setPeriod.toUnix : effectiveToDay ? Date.parse(`${effectiveToDay}T00:00:00Z`) / 1000 + 86400 : (dailyPoints.at(-1)?.dayStartUnix ?? fromUnix) + 86400;
+      const days = buildObservedForecastDays(visibleRows, fromUnix, toUnix, observationCutoff);
+      return { days, request: { forecast: recipe, trendMode, trendBlendLambda: trendMode === "blend" ? lambda : 0.7, q, fromUnix, toUnix, observationCutoff,
+        atUnix: observationCutoff + 86400, daily: days.map((day) => ({ dayStartUnix: day.dayStartUnix, tpCount: day.tpCount, slCount: day.slCount })) } };
+    } catch (cause) { return { error: cause instanceof Error ? cause.message : "Некорректные входы модели." }; }
+  }, [forecast, running, visibleRows, params.tpPct, params.slPct, trendBlendLambda, trendMode, timeRange.mode, setPeriod, chartOriginUnix, effectiveToDay, dailyPoints, observationCutoff]);
 
   return <section className="grid min-w-0 gap-4">
       <div className="flex items-center gap-2">
@@ -691,7 +729,10 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
         {summary.avgRisk !== null && <Badge>Матожидание: {formatRisk(summary.avgRisk)} по {summary.closed} закрытым</Badge>}
         {filteredCount > 0 && <Badge variant="warning">Отфильтровано смещением цены: {filteredCount}</Badge>}
       </div>
-      {rows.length > 0 && <DailyExpectancyChart items={dailyPoints} originUnix={chartOriginUnix} meanRisk={summary.avgRisk} winRate={summary.winRate} trendBendDays={trendBendDays} />}
+      {forecast?.method === "decayed_probability" ? probabilityChart && ("error" in probabilityChart
+        ? <p role="status" className="text-sm text-danger">Модель недоступна: {probabilityChart.error}</p>
+        : <AnalyticsForecastChart request={probabilityChart.request} days={probabilityChart.days} />)
+        : rows.length > 0 && <DailyExpectancyChart items={dailyPoints} originUnix={chartOriginUnix} meanRisk={summary.avgRisk} winRate={summary.winRate} trendBendDays={forecast?.method === "trend" ? forecast.bendDays : trendBendDays} />}
       {rows.length === 0 && !running && !error && <EmptyState title="Нет рассчитанных сделок" description="Выберите параметры и нажмите «Рассчитать». Сначала загружаются кешированные строки, затем досчитываются остальные." />}
       {rows.length > 0 && (
         <div className="overflow-x-auto">
@@ -812,7 +853,8 @@ type AnalyticsSection = "short" | "long" | "cache";
 export function AnalyticsPage() {
   const [sets, setSets] = useState<AnalyticsSet[]>([]);
   const [setsState, setSetsState] = useState<"loading" | "ready" | "error">("loading");
-  const [settingsState, setSettingsState] = useState<"loading" | "ready">("loading");
+  const [settingsState, setSettingsState] = useState<"loading" | "ready" | "error">("loading");
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [savedSettings, setSavedSettings] = useState<AnalyticsUserSettings | null>(null);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saved" | "error">("idle");
   const [setId, setSetId] = useState("");
@@ -824,6 +866,10 @@ export function AnalyticsPage() {
   const [autoCalc, setAutoCalc] = useState(false);
   const [trendBendDays, setTrendBendDays] = useState<TrendBendDays>("linear");
   const [trendMode, setTrendMode] = useState<TrendMode>("mean");
+  const [forecast, setForecast] = useState<ForecastRecipeDraft | undefined>(initialForecastRecipeDraft);
+  const [trendBlendLambda, setTrendBlendLambda] = useState("0.7");
+  // One frozen cutoff for all matrix cells and the supplied-outcome graph scope.
+  const [observationCutoff, setObservationCutoff] = useState(() => Math.floor(Date.now() / 1000));
   const [runToken, setRunToken] = useState(0);
   const sectionsRef = useRef<Partial<Record<AnalyticsSectionKey, Record<string, unknown>>>>({});
 
@@ -831,9 +877,10 @@ export function AnalyticsPage() {
     let cancelled = false;
     void Promise.all([
       fetchAnalyticsSets().catch(() => null),
-      fetchAnalyticsSettings().catch(() => null),
-    ]).then(([items, settings]) => {
+      fetchAnalyticsSettings().then((settings) => ({ settings, error: null as string | null })).catch((cause: unknown) => ({ settings: null, error: cause instanceof Error ? cause.message : "ошибка загрузки" })),
+    ]).then(([items, settingsResult]) => {
       if (cancelled) return;
+      const { settings } = settingsResult;
       if (items !== null) {
         setSets(items);
         setSetsState("ready");
@@ -852,11 +899,14 @@ export function AnalyticsPage() {
         setMaturity(settings.maturity);
         setClusterGapInput(settings.clusterGapInput);
         setAutoCalc(settings.autoCalc);
-        setTrendBendDays(settings.trendBendDays);
+        setTrendBendDays(settings.forecast?.method === "trend" ? settings.forecast.bendDays : settings.trendBendDays);
         setTrendMode(settings.trendMode);
+        setForecast(settings.forecast);
+        setTrendBlendLambda(settings.trendBlendLambda ?? "0.7");
       }
       setSavedSettings(settings);
-      setSettingsState("ready");
+      setSettingsError(settingsResult.error);
+      setSettingsState(settingsResult.error ? "error" : "ready");
       if (settings?.autoCalc === true) setRunToken(1);
     });
     return () => { cancelled = true; };
@@ -875,8 +925,10 @@ export function AnalyticsPage() {
     autoCalc,
     trendBendDays,
     trendMode,
+    forecast,
+    trendBlendLambda,
     sections: { ...sectionsRef.current },
-  }), [setId, clusterize, maturity, clusterGapInput, autoCalc, trendBendDays, trendMode]);
+  }), [setId, clusterize, maturity, clusterGapInput, autoCalc, trendBendDays, trendMode, forecast, trendBlendLambda]);
   const collectRef = useRef(collectSettings);
   useEffect(() => { collectRef.current = collectSettings; }, [collectSettings]);
 
@@ -904,6 +956,7 @@ export function AnalyticsPage() {
 
   const appliedClusterGapHours = parseNumberInput(clusterGapInput);
   const activeSet = sets.find((set) => set.setId === setId);
+  const setPeriod = useMemo(() => activeSet?.fromUnix != null && activeSet.toUnix != null ? { fromUnix: activeSet.fromUnix, toUnix: activeSet.toUnix } : null, [activeSet]);
   const setBounds = activeSet?.fromUnix != null && activeSet?.toUnix != null
     ? { from: utcDayOf(activeSet.fromUnix), to: utcDayOf(activeSet.toUnix) }
     : null;
@@ -913,7 +966,7 @@ export function AnalyticsPage() {
     <PageSidebar label="Подразделы аналитики" value={section} onValueChange={setSection} items={[
       { id: "short", label: "SHORT" }, { id: "long", label: "LONG" }, { id: "cache", label: "Кеш" },
     ]}>
-    <section className="grid min-w-0 gap-4">
+    <fieldset disabled={settingsState !== "ready"} className="grid min-w-0 gap-4">
         <div className="grid gap-3">
           <h3 className="text-sm font-semibold text-muted-foreground">Набор и параметры запуска</h3>
           <div className="flex flex-wrap items-end gap-3">
@@ -981,15 +1034,23 @@ export function AnalyticsPage() {
         </div>
         <Separator />
         <div className="grid gap-3">
-          <div className="flex items-center gap-2"><h3 className="text-sm font-semibold text-muted-foreground">Тренд матожидания</h3>
-          <InfoNote>Вес дня — число сетапов. «Перегиб» задаёт расстояние между узлами кубического P-spline, ∞ — взвешенная прямая. Прогноз — сглаженный уровень на последней дате с данными, без экстраполяции. Полоса графика — 95% неопределённость уровня (±1.96 SE), не доходности будущей сделки.</InfoNote></div>
+          <div className="flex items-center gap-2"><h3 className="text-sm font-semibold text-muted-foreground">Матожидание и модель прогноза</h3>
+          <InfoNote>Режим mean по умолчанию. Среднее M, чистый прогноз F и decisionR смеси различаются. Probability использует только наблюдавшиеся TP/SL и единый cutoff C; за C продолжение плоское. Прежний trend доступен отдельно для сравнения; его fitted endpoint не является probability-моделью или третьей компонентой смеси. Ретроспективная кривая не доказывает OOS-качество.</InfoNote></div>
           <AnalyticsTrendControls mode={trendMode} bend={trendBendDays}
+            forecast={forecast} onForecastChange={(next) => { setForecast(next); if (next.method === "trend") setTrendBendDays(next.bendDays); onSettingsCommit(); }}
+            onBlendModeChange={() => { setTrendMode("blend"); onSettingsCommit(); }} blendLambda={trendBlendLambda}
+            onBlendLambdaChange={(lambda) => { setTrendBlendLambda(lambda); onSettingsCommit(); }}
             onModeChange={(mode) => { setTrendMode(mode); onSettingsCommit(); }}
             onBendChange={(bend) => { setTrendBendDays(bend); onSettingsCommit(); }} />
+          {forecast && <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+            <span>Cutoff C: {new Date(observationCutoff * 1000).toISOString()} · зафиксирован для матриц и модельного графика, не двигается по часам.</span>
+            <Button type="button" variant="outline" onClick={() => { setObservationCutoff(Math.floor(Date.now() / 1000)); onSettingsCommit(); }}>Новый cutoff C</Button>
+          </div>}
         </div>
         {saveStatus === "error" && <p role="status" className="text-xs text-danger">Не удалось сохранить настройки</p>}
-    </section>
+    </fieldset>
     {(setsState === "loading" || settingsState === "loading") && <Spinner label="Загрузка наборов…" />}
+    {settingsError && <Alert variant="destructive" role="alert">Не удалось восстановить настройки аналитики: {settingsError}. Сохранённый рецепт не заменён default; обновите страницу после исправления.</Alert>}
     {setsState === "error" && <Alert variant="destructive" role="alert">Наборы недоступны: не удалось получить список исторических запусков</Alert>}
     {setsState === "ready" && sets.length === 0 && (
       <EmptyState title="Нет наборов для аналитики" description="Аналитика работает по завершённым историческим запускам. Создайте запуск на странице «Запуски» и дождитесь его завершения." />
@@ -999,6 +1060,7 @@ export function AnalyticsPage() {
       <MatrixSection
         trendBendDays={trendBendDays}
         trendMode={trendMode}
+        forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff}
         setId={setId}
         description="SHORT: TP×SL по сетапам, выбранным из кластеров по зрелости. Период ограничивает исходные сигналы до кластеризации; горизонт сделки концом периода не обрезается."
         direction="short"
@@ -1019,6 +1081,7 @@ export function AnalyticsPage() {
       <Separator />
       <TradesSection
         trendBendDays={trendBendDays}
+        trendMode={trendMode} forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff} setPeriod={setPeriod}
         setId={setId}
         description="SHORT: построчные сделки — вход по close свечи через time-shift, закрытие по TP или SL за 7 дней. Сначала показываются кешированные строки, недостающие досчитываются."
         direction="short"
@@ -1036,6 +1099,7 @@ export function AnalyticsPage() {
       <MatrixSection
         trendBendDays={trendBendDays}
         trendMode={trendMode}
+        forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff}
         setId={setId}
         description="LONG: TP×SL по сетапам набора с общими настройками кластеризации и периода. Гейт смещения цены зеркален: LONG заходит только при падении цены на заданный процент."
         direction="long"
@@ -1056,6 +1120,7 @@ export function AnalyticsPage() {
       <Separator />
       <TradesSection
         trendBendDays={trendBendDays}
+        trendMode={trendMode} forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff} setPeriod={setPeriod}
         setId={setId}
         description="LONG: построчные закрытия по уровням TP/SL с ценой входа, временем касания и результатом в рисках."
         direction="long"

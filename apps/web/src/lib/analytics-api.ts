@@ -1,7 +1,10 @@
 import { apiFetch } from "./platform-api";
+import type { ForecastRecipe } from "./forecast-recipe";
+import type { ProbabilityForecast } from "./forecast-api";
+import { sameForecastRecipe } from "./forecast-api";
 
 export type TrendBendDays = "7" | "14" | "30" | "linear";
-export type TrendMode = "mean" | "forecast";
+export type TrendMode = "mean" | "forecast" | "blend";
 export interface TrendPoint { day: number; value: number; se: number | null }
 export interface TrendSummary {
   method: "linear" | "p_spline";
@@ -57,6 +60,12 @@ export interface SelectionMetrics {
 }
 
 export interface MatrixCellPayload {
+  meanR?: number | null;
+  forecastR?: number | null;
+  decisionR?: number | null;
+  forecast?: ForecastRecipe;
+  observationCutoff?: number;
+  forecastEstimate?: ProbabilityForecast;
   endpointSe?: number | null;
   meanRiskExpectancy?: number | null;
   tpPct: number;
@@ -101,6 +110,12 @@ export interface TradeRow {
 }
 
 export interface MatrixCellRef {
+  meanR?: number | null;
+  forecastR?: number | null;
+  decisionR?: number | null;
+  forecast?: ForecastRecipe;
+  observationCutoff?: number;
+  forecastEstimate?: ProbabilityForecast;
   endpointSe?: number | null;
   meanRiskExpectancy?: number | null;
   tpPct: number;
@@ -110,6 +125,9 @@ export interface MatrixCellRef {
 }
 
 export interface AnalyticsQueryParams {
+  forecast?: ForecastRecipe;
+  observationCutoff?: number;
+  trendBlendLambda?: number;
   trendBendDays?: TrendBendDays;
   trendMode?: TrendMode;
   set: string;
@@ -128,6 +146,9 @@ export interface AnalyticsQueryParams {
 
 function toQuery(params: AnalyticsQueryParams): URLSearchParams {
   const search = new URLSearchParams({ set: params.set });
+  if (params.forecast !== undefined) search.set("forecast", JSON.stringify(params.forecast));
+  if (params.observationCutoff !== undefined) search.set("observationCutoff", String(params.observationCutoff));
+  if (params.trendBlendLambda !== undefined) search.set("trendBlendLambda", String(params.trendBlendLambda));
   if (params.trendBendDays !== undefined) search.set("trendBendDays", params.trendBendDays);
   if (params.trendMode !== undefined) search.set("trendMode", params.trendMode);
   if (params.direction !== undefined) search.set("direction", params.direction);
@@ -183,7 +204,10 @@ export async function fetchMatrixGrid(params: AnalyticsQueryParams, tpPcts: numb
   const search = toQuery(params);
   search.set("tpPct", tpPcts.join(","));
   search.set("slPct", slPcts.join(","));
-  return getJson(`/v1/analytics/matrix-grid?${search.toString()}`);
+  const result = await getJson<{ items: MatrixGridItem[] } & SelectionMetrics>(`/v1/analytics/matrix-grid?${search.toString()}`);
+  if (params.forecast && params.trendMode !== "mean" && !result.items.every((cell) => sameForecastRecipe(cell.forecast, params.forecast!) && cell.observationCutoff === params.observationCutoff
+    && cell.meanR !== undefined && cell.forecastR !== undefined && cell.decisionR !== undefined)) throw new Error("Сервер не подтвердил рецепт, метрики или cutoff рассчитанной матрицы.");
+  return result;
 }
 
 export async function fetchTradeRows(params: AnalyticsQueryParams): Promise<{ items: TradeRow[]; cachedCount: number }> {

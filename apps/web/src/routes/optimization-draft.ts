@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { putOptimizationDraft } from "../lib/optimization-api";
+import { restoreForecastRecipeDraft } from "../lib/forecast-recipe";
 import type { DomainDrafts, ScopeDraft, SearchField } from "./optimization-form";
 
 interface SharedScopeDraft {
@@ -15,6 +16,7 @@ interface SharedScopeDraft {
   trendMode?: NonNullable<ScopeDraft["trendMode"]>;
   trendBendDays?: NonNullable<ScopeDraft["trendBendDays"]>;
   trendBlendLambda?: string; minForecastExpectancy?: string;
+  forecast?: ScopeDraft["forecast"];
 }
 
 export interface OptimizationFormDraft {
@@ -89,6 +91,8 @@ export function restoreOptimizationDraft(
     trendBendDays: storedScope.trendBendDays === "7" || storedScope.trendBendDays === "14" || storedScope.trendBendDays === "30" || storedScope.trendBendDays === "linear" ? storedScope.trendBendDays : fallbackScope.trendBendDays ?? "linear",
     trendBlendLambda: text(storedScope.trendBlendLambda) ?? fallbackScope.trendBlendLambda ?? "0.7",
     minForecastExpectancy: text(storedScope.minForecastExpectancy) ?? fallbackScope.minForecastExpectancy ?? "0",
+    // Deliberately overwrite a new form's probability default with undefined for legacy drafts.
+    forecast: restoreForecastRecipeDraft(storedScope.forecast),
   };
   return {
     version: 1,
@@ -126,6 +130,7 @@ function sharedScope(scope: ScopeDraft): SharedScopeDraft {
     trendBendDays: scope.trendBendDays ?? "linear",
     trendBlendLambda: scope.trendBlendLambda ?? "0.7",
     minForecastExpectancy: scope.minForecastExpectancy ?? "0",
+    ...(scope.forecast ? { forecast: { ...scope.forecast } } : {}),
   };
 }
 
@@ -150,6 +155,7 @@ export function applyOptimizationDraftScope(scope: ScopeDraft, draft: Optimizati
   return {
     ...scope,
     ...draft.shared.scope,
+    forecast: draft.shared.scope.forecast,
     ...(mode === "manual" ? draft.manual : { setupMaturity: "0" }),
   };
 }

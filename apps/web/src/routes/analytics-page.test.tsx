@@ -4,8 +4,10 @@ import userEvent from "@testing-library/user-event";
 import { AnalyticsPage } from "./analytics-page";
 import type { MatrixCellRef, TradeRow, TrendInput, TrendSummary } from "../lib/analytics-api";
 import { applyInterfaceSettings } from "../lib/datetime-format";
+import type { ForecastCurveRequest, ForecastCurveResponse } from "../lib/forecast-api";
+import { forecastFixture } from "../../test/forecast-fixture";
 
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); applyInterfaceSettings({ timezone: "auto" }); });
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); applyInterfaceSettings({ timezone: "auto" }); });
 
 const setFixture = {
   setId: "run-12", kind: "run", numericId: 12, label: "#12 · Утренний прогон",
@@ -36,6 +38,7 @@ interface StubOptions {
   trend?: TrendSummary | null;
   trendError?: boolean;
   interceptTrend?: (signal: AbortSignal | undefined) => Promise<Response>;
+  forecast?: (request: ForecastCurveRequest, signal: AbortSignal | undefined) => Promise<Response>;
 }
 
 // Transport fixture only; spline/SE arithmetic is tested in Rust. This weighted
@@ -60,6 +63,10 @@ function stubFetch(options: StubOptions = {}) {
     const method = init?.method ?? "GET";
     calls.push({ method, path: path.split("?")[0]!, search: path.split("?")[1] ?? "", ...(typeof init?.body === "string" ? { body: init.body } : {}) });
     const json = (body: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(body), { status }));
+    if (path === "/v1/analytics/forecast") {
+      const request = JSON.parse(init?.body as string) as ForecastCurveRequest;
+      return options.forecast ? options.forecast(request, init?.signal ?? undefined) : json(forecastFixture(request));
+    }
     if (path === "/v1/analytics/trend") {
       if (options.interceptTrend) return options.interceptTrend(init?.signal ?? undefined);
       if (options.trendError) return json({ error: "trend unavailable" }, 503);
@@ -68,7 +75,7 @@ function stubFetch(options: StubOptions = {}) {
     }
     if (path.startsWith("/v1/settings/web-analytics")) {
       if (method === "PUT") return json({ settings: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : {} });
-      return json({ settings: options.savedSettings ?? {} });
+      return json({ settings: options.savedSettings ?? { trendMode: "mean" } });
     }
     if (path.startsWith("/v1/analytics/sets")) return json({ sets: options.sets ?? [setFixture] });
     if (path.startsWith("/v1/analytics/months")) return json({ months: ["2024-01", "2024-02"] });
@@ -82,7 +89,8 @@ function stubFetch(options: StubOptions = {}) {
         if (intercepted !== undefined) return intercepted;
       }
       const items = direction === "long" ? options.longBulk ?? [] : options.shortBulk ?? [];
-      return json({ items, ...selectionMetrics });
+      const recipe = query.get("forecast");
+      return json({ items: recipe ? items.map((cell) => ({ ...cell, forecast: JSON.parse(recipe) as unknown, observationCutoff: Number(query.get("observationCutoff")), meanR: 0.8, meanRiskExpectancy: 0.8, forecastR: 0.4, decisionR: cell.riskExpectancy })) : items, ...selectionMetrics });
     }
     if (path.startsWith("/v1/analytics/matrix-cells")) {
       const direction = query.get("direction") ?? "short";
@@ -530,7 +538,7 @@ it("restores trend controls, sends forecast cache dimensions and exposes matrix 
   const calls = stubFetch({ savedSettings: { trendBendDays: "14", trendMode: "forecast" }, shortBulk: [{ ...matrixCell(4, 4, 0.42), endpointSe: 0.15 }] });
   render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
   expect(screen.getByLabelText("Перегиб на N дней")).toHaveValue("14");
-  expect(screen.getByRole("button", { name: "Прогноз по тренду" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("button", { name: "Прогноз" })).toHaveAttribute("aria-pressed", "true");
   expect(screen.getByRole("heading", { name: "Прогноз матожидания по тренду" })).toBeInTheDocument();
   expect(calls.some((call) => call.path === "/v1/analytics/matrix-grid")).toBe(false);
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
@@ -593,4 +601,151 @@ it("reports curve failures and aborts owned curve work on replacement and unmoun
   expect(pending[0]!.aborted).toBe(true);
   await waitFor(() => expect(pending).toHaveLength(2));
   view.unmount(); expect(pending[1]!.aborted).toBe(true);
+});
+
+const probabilityRecipe = { method: "decayed_probability", version: 1, halfLifeDays: 14, kappa: 10, priorPolicy: "gross_break_even" } as const;
+const probabilityCutoff = Date.parse("2026-01-13T00:00:00Z") / 1000;
+function probabilityOptions(): StubOptions {
+  const rows = [utcTrade("2026-01-01T12:00:00Z", 2, 0), utcTrade("2026-01-01T13:00:00Z", 2, 1), utcTrade("2026-01-04T12:00:00Z", -1, 2),
+    utcTrade("2026-01-10T12:00:00Z", 2, 3), utcTrade("2026-01-10T13:00:00Z", -1, 4)].map((row) => ({ ...row, tpPct: 2, slPct: 1 }));
+  return { ...utcChartOptions(rows), savedSettings: { trendMode: "blend", trendBlendLambda: "0.7", forecast: probabilityRecipe,
+    sections: { "short-trades": { tpInput: "2", slInput: "1" } } }, shortBulk: [matrixCell(4, 4, 0.52)] };
+}
+
+it("keeps one seconds cutoff across matrix and graph and renders separate backend M/F/decision and actual model lines", async () => {
+  const clock = vi.spyOn(Date, "now").mockReturnValue(probabilityCutoff * 1000);
+  const calls = stubFetch(probabilityOptions());
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  expect(screen.getByLabelText("Метод прогноза")).toHaveValue("decayed_probability");
+  expect(screen.queryByLabelText("Перегиб на N дней")).not.toBeInTheDocument();
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  const cell = await screen.findByText("0.52");
+  expect(cell).toHaveAttribute("title", expect.stringContaining("M 0.800 R · F 0.400 R · decisionR 0.520 R"));
+  clock.mockReturnValue((probabilityCutoff + 3600) * 1000);
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  const curve = await screen.findByTestId("forecast-model-curve");
+  expect(screen.getByLabelText("Среднее модели за период")).toHaveTextContent("0.8 R");
+  expect(screen.getByLabelText("Чистый прогноз модели")).toHaveTextContent("0.4 R");
+  expect(screen.getByLabelText("Метрика решения")).toHaveTextContent("0.52 R");
+  const mean = screen.getByTestId("period-mean");
+  expect(mean.getAttribute("y1")).toBe(mean.getAttribute("y2"));
+  const flat = screen.getByTestId("forecast-flat-future");
+  expect(flat.getAttribute("y1")).toBe(flat.getAttribute("y2"));
+  expect(flat.getAttribute("x1")).toBe(screen.getByTestId("forecast-cutoff").getAttribute("x1"));
+  expect(screen.getByTestId("forecast-blend-curve").getAttribute("points")).not.toBe(curve.getAttribute("points"));
+  expect(curve.getAttribute("points")!.split(" ")).toHaveLength(3);
+  expect(screen.getByText(/Ретроспективная модельная оценка, не causal\/OOS/)).toBeInTheDocument();
+  expect(screen.getByText(/κ не считается реальными сделками/)).toBeInTheDocument();
+  const matrix = new URLSearchParams(calls.find((call) => call.path === "/v1/analytics/matrix-grid")!.search);
+  const graph = JSON.parse(calls.find((call) => call.path === "/v1/analytics/forecast")!.body!) as ForecastCurveRequest;
+  expect(JSON.parse(matrix.get("forecast")!)).toEqual(graph.forecast);
+  expect(Number(matrix.get("observationCutoff"))).toBe(probabilityCutoff);
+  expect(graph.observationCutoff).toBe(probabilityCutoff);
+  expect(graph.q).toBe(2); expect(graph.atUnix).toBe(probabilityCutoff + 86400);
+  expect(graph.daily.map((day) => [day.dayStartUnix, day.tpCount, day.slCount])).toEqual([
+    [1767225600, 2, 0], [1767484800, 0, 1], [1768003200, 1, 1],
+  ]);
+  expect(calls.some((call) => call.path === "/v1/analytics/trend")).toBe(false);
+  fireEvent.change(screen.getByLabelText("Память модели H, дней"), { target: { value: "28" } });
+  expect(screen.queryByText("0.52")).not.toBeInTheDocument();
+});
+
+it("keeps fresh Analytics in mean mode while an explicit new forecast selection uses probability", async () => {
+  const calls = stubFetch({ savedSettings: {}, shortBulk: fullShortGrid });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  expect(screen.getByRole("button", { name: "Среднее" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.queryByLabelText("Память модели H, дней")).not.toBeInTheDocument();
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await screen.findByText("Ячеек: 196 / 196");
+  expect(new URLSearchParams(calls.find((call) => call.path === "/v1/analytics/matrix-grid")!.search).has("forecast")).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "Прогноз" }));
+  expect(screen.getByLabelText("Метод прогноза")).toHaveValue("decayed_probability");
+  expect(screen.getByLabelText("Память модели H, дней")).toHaveValue(14);
+});
+
+it("shows unavailable probability with its reason, never a prior-only zero or a trend fallback", async () => {
+  vi.spyOn(Date, "now").mockReturnValue(probabilityCutoff * 1000);
+  const calls = stubFetch({ ...probabilityOptions(), forecast: (request) => {
+    const body: ForecastCurveResponse = { ...forecastFixture(request), estimate: { status: "unavailable", reason: "no_weighted_evidence" },
+      meanR: null, forecastR: null, decisionR: null, curve: [], flatFuture: { fromUnix: request.observationCutoff, toUnix: request.atUnix!, forecastR: null, decisionR: null } };
+    delete body.blendCurve;
+    return Promise.resolve(new Response(JSON.stringify(body)));
+  } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  expect(await screen.findByText(/Прогноз недоступен: нет положительного веса наблюдений/)).toBeInTheDocument();
+  expect(screen.getByLabelText("Чистый прогноз модели")).toHaveTextContent("—");
+  expect(screen.queryByTestId("forecast-model-curve")).not.toBeInTheDocument();
+  expect(screen.queryByTestId("forecast-flat-future")).not.toBeInTheDocument();
+  expect(calls.some((call) => call.path === "/v1/analytics/trend")).toBe(false);
+});
+
+it("aborts owned probability requests when recipe changes or chart unmounts, without showing stale curves", async () => {
+  vi.spyOn(Date, "now").mockReturnValue(probabilityCutoff * 1000);
+  const pending: AbortSignal[] = [];
+  stubFetch({ ...probabilityOptions(), forecast: (_request, signal) => {
+    pending.push(signal!); return new Promise<Response>(() => undefined);
+  } });
+  const view = render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await waitFor(() => expect(pending).toHaveLength(1));
+  fireEvent.change(screen.getByLabelText("Память модели H, дней"), { target: { value: "28" } });
+  expect(pending[0]!.aborted).toBe(true);
+  expect(screen.queryByTestId("forecast-model-curve")).not.toBeInTheDocument();
+  await waitFor(() => expect(pending).toHaveLength(2));
+  view.unmount(); expect(pending[1]!.aborted).toBe(true);
+});
+
+it("splits nullable forecast and blend history without zero points or bridges and retains F(C)", async () => {
+  vi.spyOn(Date, "now").mockReturnValue(probabilityCutoff * 1000);
+  stubFetch({ ...probabilityOptions(), forecast: (request) => {
+    const response = forecastFixture(request);
+    response.curve = [
+      { atUnix: request.fromUnix, forecastR: null }, { atUnix: request.fromUnix + 86400, forecastR: -0.2 },
+      { atUnix: request.fromUnix + 2 * 86400, forecastR: 0.15 }, { atUnix: request.fromUnix + 3 * 86400, forecastR: null },
+      { atUnix: request.observationCutoff, forecastR: 0.4 },
+    ];
+    response.blendCurve = response.curve.map((point) => ({ atUnix: point.atUnix, decisionR: point.forecastR === null ? null : 0.52 }));
+    return Promise.resolve(new Response(JSON.stringify(response)));
+  } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  const curve = await screen.findByTestId("forecast-model-curve");
+  expect(curve.getAttribute("points")!.split(" ")).toHaveLength(2);
+  expect(screen.getByTestId("forecast-blend-curve").getAttribute("points")!.split(" ")).toHaveLength(2);
+  const point = screen.getByTestId("forecast-model-point");
+  const flat = screen.getByTestId("forecast-flat-future");
+  expect(point.getAttribute("cx")).toBe(flat.getAttribute("x1"));
+  expect(point.getAttribute("cy")).toBe(flat.getAttribute("y1"));
+  expect(screen.getByLabelText("Чистый прогноз модели")).toHaveTextContent("0.4 R");
+  expect(screen.getByLabelText("Метрика решения")).toHaveTextContent("0.52 R");
+  expect(screen.queryByText(/Модель недоступна:/)).not.toBeInTheDocument();
+});
+
+it("renders all-null historical prefixes as no closed evidence, never a zero forecast or transport error", async () => {
+  vi.spyOn(Date, "now").mockReturnValue(probabilityCutoff * 1000);
+  stubFetch({ ...probabilityOptions(), forecast: (request) => {
+    const response = forecastFixture(request);
+    response.estimate = { status: "unavailable", reason: "no_closed_outcomes" };
+    response.meanR = null; response.forecastR = null; response.decisionR = null;
+    response.curve = response.curve.map((point) => ({ ...point, forecastR: null }));
+    response.blendCurve = response.blendCurve!.map((point) => ({ ...point, decisionR: null }));
+    response.flatFuture.forecastR = null; response.flatFuture.decisionR = null;
+    return Promise.resolve(new Response(JSON.stringify(response)));
+  } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  expect(await screen.findByText(/Прогноз недоступен: нет наблюдавшихся закрытых TP\/SL/)).toBeInTheDocument();
+  for (const id of ["forecast-model-curve", "forecast-model-point", "forecast-blend-curve", "forecast-blend-point", "forecast-flat-future"]) expect(screen.queryByTestId(id)).not.toBeInTheDocument();
+  expect(screen.getByLabelText("Чистый прогноз модели")).toHaveTextContent("—");
+  expect(screen.queryByText(/Модель недоступна:/)).not.toBeInTheDocument();
+});
+
+it("blocks unsupported saved recipe versions rather than replacing them with the new default", async () => {
+  const calls = stubFetch({ savedSettings: { trendMode: "forecast", forecast: { ...probabilityRecipe, version: 2 } } });
+  render(<AnalyticsPage />);
+  expect(await screen.findByRole("alert")).toHaveTextContent(/Сохранённый рецепт не заменён default/);
+  expect(screen.getByRole("button", { name: "Прогноз" })).toBeDisabled();
+  expect(screen.queryAllByRole("button", { name: "Рассчитать" })).toHaveLength(0);
+  expect(calls.every((call) => call.method === "GET")).toBe(true);
 });

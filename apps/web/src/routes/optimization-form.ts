@@ -4,6 +4,7 @@ import type { Algorithm } from "./platform-controls";
 import { replayRange } from "./platform-controls";
 import type { CatalogInstrument } from "./instrument-picker";
 import type { TrendBendDays } from "../lib/analytics-api";
+import { buildForecastRecipe, initialForecastRecipeDraft, type ForecastRecipeDraft } from "../lib/forecast-recipe";
 
 export interface SearchField {
   key: string; label: string; type: "decimal" | "integer" | "boolean" | "nullable";
@@ -106,8 +107,9 @@ export interface ScopeDraft {
   minClosedPerCell: string; minSetupsPerDay: string; seed: string; maxTrials: string; maxSeconds: string;
   trendMode?: StudyTrendMode; trendBendDays?: TrendBendDays;
   trendBlendLambda?: string; minForecastExpectancy?: string;
+  forecast?: ForecastRecipeDraft | undefined;
 }
-export const initialScope = (): ScopeDraft => ({ from: "", to: "", symbols: "", direction: "short", setupMaturity: "0", horizonMinutes: "10080", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, minClosedPerCell: "1", minSetupsPerDay: "4", seed: "42", maxTrials: "256", maxSeconds: "3600", trendMode: "mean", trendBendDays: "linear", trendBlendLambda: "0.7", minForecastExpectancy: "0" });
+export const initialScope = (): ScopeDraft => ({ from: "", to: "", symbols: "", direction: "short", setupMaturity: "0", horizonMinutes: "10080", tpLevels: DEFAULT_AXIS, slLevels: DEFAULT_AXIS, minClosedPerCell: "1", minSetupsPerDay: "4", seed: "42", maxTrials: "256", maxSeconds: "3600", trendMode: "mean", trendBendDays: "linear", trendBlendLambda: "0.7", minForecastExpectancy: "0", forecast: initialForecastRecipeDraft() });
 
 export function restoreDomains(fields: SearchField[], baseline: Record<string, OptimizationValue>, search: Record<string, OptimizationValue[]>): DomainDrafts {
   return Object.fromEntries(fields.map((field) => [field.key, {
@@ -118,8 +120,11 @@ export function restoreDomains(fields: SearchField[], baseline: Record<string, O
 
 function buildStudyParameters(algorithm: Algorithm, scope: ScopeDraft, catalog: CatalogInstrument[], params: DomainDrafts, analytics: DomainDrafts): ContinuousStudySpec {
   const trendMode = scope.trendMode ?? "mean";
-  const trendBendDays = scope.trendBendDays ?? "linear";
+  const trendBendDays = scope.forecast?.method === "trend" ? scope.forecast.bendDays : scope.trendBendDays ?? "linear";
   if (!["mean", "forecast", "blend"].includes(trendMode) || !["7", "14", "30", "linear"].includes(trendBendDays)) throw new Error("Проверьте тип матожидания и перегиб тренда.");
+  // A new explicit recipe is shared with the saved artifact even in mean mode.
+  // It does not activate F scoring; legacy absence must remain absent.
+  const forecast = scope.forecast !== undefined ? buildForecastRecipe(scope.forecast) : undefined;
   const trendBlendLambda = Number(scope.trendBlendLambda ?? "0.7");
   if (trendMode === "blend" && !isTrendBlendLambda(trendBlendLambda)) throw new Error("Доля прогноза λ: 0.05–0.95 с шагом 0.01.");
   const minForecastExpectancy = nonnegativeDecimalInput(scope.minForecastExpectancy ?? "0", "Минимальный прогноз матрицы");
@@ -150,6 +155,7 @@ function buildStudyParameters(algorithm: Algorithm, scope: ScopeDraft, catalog: 
     analyticsParams, analyticsSearch,
     instruments, direction: scope.direction,
     trendMode, trendBendDays,
+    ...(forecast ? { forecast } : {}),
     ...(trendMode === "blend" ? { trendBlendLambda } : {}), minForecastExpectancy,
     horizonMinutes: integerInput(scope.horizonMinutes, "Горизонт", 1, 43200),
     tpLevels: parseAxis(scope.tpLevels, "TP"), slLevels: parseAxis(scope.slLevels, "SL"),

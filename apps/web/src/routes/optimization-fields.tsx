@@ -66,10 +66,11 @@ export function OptimizationFields({ algorithm, scope, onScopeChange, catalog, r
     <h3 className="font-semibold">Параметры аналитики</h3>
     <DomainControls fields={ANALYTICS_SEARCH_FIELDS} value={analyticsDomains} onChange={onAnalyticsDomainsChange} />
     <div className="flex items-center gap-2"><h3 className="font-semibold">Оптимизируемое матожидание</h3>
-    <InfoNote>Фиксированная метрика всего исследования, не поисковый параметр. Прогноз — fitted-уровень на последней дате с закрытыми сделками; вес дня — число сетапов, без экстраполяции. Среднее за период сохраняется отдельно. Если хотя бы одной ячейке не хватает пригодных дней, весь кандидат неоценим.</InfoNote></div>
+    <InfoNote>Фиксированная метрика всего исследования, не поисковый параметр. Среднее за период, чистый прогноз выбранного метода и decisionR смеси различаются. H, κ, prior и λ не подбираются по той же обучающей выборке. Если ячейка неоценима, она не заменяется нулём и не исчезает из матрицы.</InfoNote></div>
     <AnalyticsTrendControls mode={scope.trendMode ?? "mean"} bend={scope.trendBendDays ?? "linear"} disableMeanBend
       onBlendModeChange={() => onScopeChange({ trendMode: "blend" })} blendLambda={scope.trendBlendLambda ?? "0.7"}
       onBlendLambdaChange={(trendBlendLambda) => onScopeChange({ trendBlendLambda })}
+      forecast={scope.forecast} onForecastChange={(forecast) => onScopeChange({ forecast, ...(forecast.method === "trend" ? { trendBendDays: forecast.bendDays } : {}) })}
       onModeChange={(trendMode) => onScopeChange({ trendMode })} onBendChange={(trendBendDays) => onScopeChange({ trendBendDays })} />
     <Field label="Минимальный прогноз матрицы, R" hint="Отдельный порог forecast/blend: score всей матрицы должен быть строго выше него. Default 0. Mean использует прежний mean-гейт.">
       {(control) => <Input {...control} type="number" min={0} max={100} step="any" value={scope.minForecastExpectancy ?? "0"} onChange={(event) => onScopeChange({ minForecastExpectancy: event.target.value })} />}

@@ -248,6 +248,7 @@ it("builds unknown fields from metadata and submits the complete typed scope onl
     ...spec, fromUnix: new Date(2026, 9, 1).getTime() / 1000, toUnix: new Date(2026, 9, 3).getTime() / 1000,
     direction: "long", tpLevels: [4, 25], slLevels: [0.5, 6], minSetupsPerDay: 4,
     trendMode: "mean", trendBendDays: "linear", minForecastExpectancy: 0,
+    forecast: { method: "decayed_probability", version: 1, halfLifeDays: 14, kappa: 10, priorPolicy: "gross_break_even" },
     algorithmSearch: { futureThreshold: ["1.5", "2.5", "4"], futureWindow: [2, 3, 5] },
     analyticsSearch: { clusterEnabled: [false, true], clusterGapMinutes: [240, 480], timeShiftMinutes: [0, 5], priceChangePct: [null, 0, 1] },
   });
@@ -305,19 +306,56 @@ it("submits the selected forecast metric and persists its bend in the shared dra
   render(<AlgorithmsPage />);
   const dialog = within(await openOptimizer());
   await dialog.findByLabelText("Baseline: Новый порог");
+  expect(dialog.getByRole("button", { name: "Среднее" })).toHaveAttribute("aria-pressed", "true");
+  expect(dialog.queryByLabelText("Перегиб на N дней")).not.toBeInTheDocument();
+  fireEvent.click(dialog.getByRole("button", { name: "Прогноз" }));
+  expect(dialog.getByLabelText("Метод прогноза")).toHaveValue("decayed_probability");
+  expect(dialog.getByLabelText("Память модели H, дней")).toHaveValue(14);
+  fireEvent.change(dialog.getByLabelText("Метод прогноза"), { target: { value: "trend" } });
   const bend = dialog.getByLabelText("Перегиб на N дней");
-  expect(bend).toHaveValue("linear"); expect(bend).toBeDisabled();
-  fireEvent.click(dialog.getByRole("button", { name: "Прогноз по тренду" }));
-  expect(bend).toBeEnabled();
+  expect(bend).toHaveValue("linear"); expect(bend).toBeEnabled();
   fireEvent.change(bend, { target: { value: "14" } });
   fireEvent.blur(bend);
-  await waitFor(() => expect(drafts.future_algorithm).toMatchObject({ shared: { scope: { trendMode: "forecast", trendBendDays: "14" } } }));
+  await waitFor(() => expect(drafts.future_algorithm).toMatchObject({ shared: { scope: { trendMode: "forecast", trendBendDays: "14", forecast: { method: "trend", version: 1, bendDays: "14" } } } }));
   enterDates();
   const start = dialog.getByRole("button", { name: "Начать исследование" });
   await waitFor(() => expect(start).toBeEnabled()); fireEvent.click(start);
   await screen.findByText("Исследование #17");
   expect(requests.find((request) => request.path === "/v1/optimization-studies" && request.method === "POST")?.body)
     .toMatchObject({ trendMode: "forecast", trendBendDays: "14" });
+});
+
+it("edits, persists and submits a new probability recipe while keeping mean the initial mode", async () => {
+  render(<AlgorithmsPage />); let dialog = within(await openOptimizer());
+  await dialog.findByLabelText("Baseline: Новый порог");
+  expect(dialog.getByRole("button", { name: "Среднее" })).toHaveAttribute("aria-pressed", "true");
+  expect(dialog.queryByLabelText("Память модели H, дней")).not.toBeInTheDocument();
+  fireEvent.click(dialog.getByRole("button", { name: "Прогноз" }));
+  const halfLife = dialog.getByLabelText("Память модели H, дней");
+  expect(halfLife).toHaveValue(14); expect(halfLife).not.toHaveAttribute("max");
+  expect(dialog.queryByLabelText("Перегиб на N дней")).not.toBeInTheDocument();
+  fireEvent.change(halfLife, { target: { value: "28" } });
+  fireEvent.click(dialog.getByRole("button", { name: "Расширенные настройки модели" }));
+  const kappa = dialog.getByLabelText("Сила prior κ");
+  expect(kappa).toHaveValue(10); expect(kappa).not.toHaveAttribute("max");
+  expect(dialog.getByLabelText("Политика prior")).toHaveValue("gross_break_even");
+  expect(dialog.getByText(/не калиброванный оптимум/)).toBeInTheDocument();
+  expect(dialog.queryByRole("checkbox", { name: /Подбирать:.*(H|κ|prior)/ })).not.toBeInTheDocument();
+  fireEvent.change(kappa, { target: { value: "5" } }); fireEvent.blur(kappa);
+  await waitFor(() => expect(drafts.future_algorithm).toMatchObject({ shared: { scope: { trendMode: "forecast", forecast: {
+    method: "decayed_probability", version: 1, halfLifeDays: "28", kappa: "5", priorPolicy: "gross_break_even",
+  } } } }));
+  await userEvent.click(dialog.getByRole("button", { name: "Закрыть" }));
+  dialog = within(await openOptimizer());
+  expect(await dialog.findByLabelText("Память модели H, дней")).toHaveValue(28);
+  fireEvent.click(dialog.getByRole("button", { name: "Расширенные настройки модели" }));
+  expect(dialog.getByLabelText("Сила prior κ")).toHaveValue(5);
+  enterDates(); fireEvent.click(dialog.getByRole("button", { name: "Начать исследование" }));
+  await screen.findByText("Исследование #17");
+  const submitted = requests.find((request) => request.path === "/v1/optimization-studies" && request.method === "POST")?.body as OptimizationSpec;
+  expect(submitted.forecast).toEqual({ method: "decayed_probability", version: 1, halfLifeDays: 28, kappa: 5, priorPolicy: "gross_break_even" });
+  expect(submitted.algorithmSearch).not.toHaveProperty("forecast");
+  expect(submitted.analyticsSearch).not.toHaveProperty("forecast");
 });
 
 it("labels a forecast winner and keeps its recorded negative period mean separate", async () => {
@@ -342,6 +380,28 @@ it("labels a forecast winner and keeps its recorded negative period mean separat
   expect(pair.getByText("0.50 R")).toBeInTheDocument();
   expect(pair.getByText("-0.30 R")).toBeInTheDocument();
   expect(pair.getByText("4% / 4%")).toBeInTheDocument();
+});
+
+it("shows an immutable mean result recipe and cutoff without fabricating an uncomputed pure forecast", async () => {
+  const saved = record("completed");
+  const forecast = { method: "decayed_probability", version: 1, halfLifeDays: 14, kappa: 10, priorPolicy: "gross_break_even" } as const;
+  const observationCutoff = Date.parse("2026-11-15T00:00:00Z") / 1000;
+  saved.spec = { ...spec, trendMode: "mean", forecast };
+  saved.result = { progress, reason: "trial_budget", best: { score: 0.2, meanScore: 0.2, trendMode: "mean", forecast, observationCutoff,
+    partial: false, params: algorithm.params, analytics: spec.analyticsParams, matrix: [],
+    provenance: { optimizerVersion: "fixture", seed: 42, snapshotHash: "immutable-mean", capturedAt: saved.createdAt }, conclusions: [] } };
+  saved.forecastBest = null;
+  studies = [saved];
+  drafts.future_algorithm = { shared: { scope: { forecast: { ...forecast, halfLifeDays: "999", kappa: "999" } } } };
+  render(<AlgorithmsPage />); await openOptimizer();
+  const fixed = within(await screen.findByRole("region", { name: "Фиксированные требования исследования" }));
+  expect(fixed.getByText("Среднее за период")).toBeInTheDocument();
+  expect(fixed.getByText(/H 14 дней · κ 10/)).toBeInTheDocument();
+  expect(fixed.getByText(/2026-11-15T00:00:00.000Z/)).toBeInTheDocument();
+  expect(fixed.queryByText(/999/)).not.toBeInTheDocument();
+  const pair = within(screen.getByRole("region", { name: "Лучшая forecast-пара" }));
+  expect(pair.getByText("—")).toBeInTheDocument();
+  expect(pair.queryByText("0.00 R")).not.toBeInTheDocument();
 });
 
 it.each([0, -0.126])("opens the exact history ID and shows its server forecast pair (%s), not blend or maximum mean", async (forecastR) => {
