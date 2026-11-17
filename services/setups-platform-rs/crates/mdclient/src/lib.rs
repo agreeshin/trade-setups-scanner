@@ -3,15 +3,21 @@ use serde_json::Value;
 use std::fmt;
 use std::time::Duration;
 
-pub mod source;
 mod preparation;
+pub mod source;
 mod tail;
 
-pub use preparation::{BackfillAdmission, BackfillHistory, BackfillJob, BackfillStatus, CollectionAdmission, HistoryDemand};
+pub use preparation::{
+    BackfillAdmission, BackfillHistory, BackfillJob, BackfillStatus, CollectionAdmission,
+    HistoryDemand,
+};
 
 pub use source::ApiCandleSource;
-pub use tail::{TAIL_MAX_BYTES, TAIL_MAX_INSTRUMENTS, TailBatchQuery, TailBatchResponse, TailCandle, TailInstrument, TailMissingRange,
-    TailReadGuard, TailReadGuardQuery, TailReadGuardStatus, TailReadToken};
+pub use tail::{
+    TAIL_MAX_BYTES, TAIL_MAX_INSTRUMENTS, TailBatchQuery, TailBatchResponse, TailCandle,
+    TailInstrument, TailMissingRange, TailReadGuard, TailReadGuardQuery, TailReadGuardStatus,
+    TailReadToken,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +71,8 @@ pub struct CoverageRangeDto {
     pub expected_minutes: i64,
     pub present_minutes: i64,
     pub missing_minutes: i64,
+    /// Confirmed no-trade minutes; raw candle gaps still include these minutes.
+    pub verified_minutes: i64,
     pub warmup_expected_minutes: i64,
     pub warmup_present_minutes: i64,
     pub signal_expected_minutes: i64,

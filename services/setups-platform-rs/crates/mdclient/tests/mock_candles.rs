@@ -133,3 +133,72 @@ async fn api_candle_source_error_format_matches_ts() {
         "unexpected error text: {error}"
     );
 }
+
+#[tokio::test]
+async fn coverage_range_preserves_verified_no_trade_counts_and_read_only_query() {
+    let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+    let observed = captured.clone();
+    let app = Router::new().route(
+        "/v1/instruments/7/coverage-range",
+        get(
+            move |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| {
+                let observed = observed.clone();
+                async move {
+                    observed.lock().unwrap().push((
+                        headers
+                            .get("x-api-key")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                        params,
+                    ));
+                    Json(json!({
+                        "instrumentId": 7, "fromUnix": 1_792_195_200, "toUnix": 1_794_873_600,
+                        "splitUnix": 1_793_404_800, "expectedMinutes": 44_640,
+                        "presentMinutes": 39_421, "verifiedMinutes": 5_219, "missingMinutes": 0,
+                        "warmupExpectedMinutes": 20_160, "warmupPresentMinutes": 14_941,
+                        "signalExpectedMinutes": 24_480, "signalPresentMinutes": 24_480,
+                        "gaps": [{"fromUnix": 1_792_195_200, "toUnix": 1_792_508_340}],
+                        "gapCount": 1, "offset": 0, "limit": 50, "checkedAt": "2026-11-17T09:48:00Z"
+                    }))
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = setups_mdclient::MarketDataClient::new(
+        format!("http://{}", listener.local_addr().unwrap()),
+        "test-key",
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let coverage = client
+        .coverage_range(7, 1_792_195_200, 1_794_873_600, 1_793_404_800, 0, 50)
+        .await
+        .expect("producer coverage response");
+    assert_eq!(coverage.verified_minutes, 5_219);
+    assert_eq!(coverage.missing_minutes, 0);
+    assert_eq!(
+        coverage.gap_count, 1,
+        "physical candle gaps include verified no-trade minutes"
+    );
+    assert_eq!(
+        serde_json::to_value(coverage).unwrap()["verifiedMinutes"],
+        5_219
+    );
+    let calls = captured.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0.as_deref(), Some("test-key"));
+    for (key, value) in [
+        ("fromUnix", "1792195200"),
+        ("toUnix", "1794873600"),
+        ("splitUnix", "1793404800"),
+        ("offset", "0"),
+        ("limit", "50"),
+    ] {
+        assert_eq!(calls[0].1.get(key).map(String::as_str), Some(value));
+    }
+    drop(calls);
+    server.abort();
+    let _ = server.await;
+}

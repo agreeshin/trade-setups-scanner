@@ -608,7 +608,11 @@ async fn cancel_run(
     let Some(run_id) = parse_id(&id) else {
         return error_response(StatusCode::BAD_REQUEST, "invalid_id");
     };
-    match setups_db::continuous::is_service_run(&state.pool,run_id).await {Ok(true)=>return error_response(StatusCode::CONFLICT,"continuous_owner_stop_required"),Ok(false)=>{},Err(_)=>return internal_error()}
+    match setups_db::continuous::is_service_run(&state.pool, run_id).await {
+        Ok(true) => return error_response(StatusCode::CONFLICT, "continuous_owner_stop_required"),
+        Ok(false) => {}
+        Err(_) => return internal_error(),
+    }
     match cancel_replay_run(&state.pool, run_id).await {
         Ok(None) => error_response(StatusCode::NOT_FOUND, "run not found"),
         Ok(Some(run)) => match get_run_full(&state.pool, run.id).await {
@@ -831,8 +835,8 @@ pub fn replay_router(state: Arc<ReplayState>) -> Router {
         .with_state(state)
 }
 
-fn ceil_to_minute(value: i64) -> i64 {
-    (value + 59) / 60 * 60
+fn ceil_to_minute(value: i64) -> Option<i64> {
+    value.checked_add((60 - value.rem_euclid(60)) % 60)
 }
 
 fn validate_coverage(
@@ -842,43 +846,88 @@ fn validate_coverage(
     to_unix: i64,
     split_unix: i64,
 ) -> bool {
+    if from_unix >= to_unix || !(from_unix..=to_unix).contains(&split_unix) {
+        return false;
+    }
+    let (Some(from), Some(to), Some(split)) = (
+        ceil_to_minute(from_unix),
+        ceil_to_minute(to_unix),
+        ceil_to_minute(split_unix),
+    ) else {
+        return false;
+    };
+    let Some(duration) = to.checked_sub(from) else {
+        return false;
+    };
     let counters = [
         coverage.expected_minutes,
         coverage.present_minutes,
         coverage.missing_minutes,
+        coverage.verified_minutes,
         coverage.warmup_expected_minutes,
         coverage.warmup_present_minutes,
         coverage.signal_expected_minutes,
         coverage.signal_present_minutes,
         coverage.gap_count,
     ];
-    coverage.instrument_id == instrument_id
-        && coverage.from_unix == ceil_to_minute(from_unix)
-        && coverage.to_unix == ceil_to_minute(to_unix)
-        && coverage.split_unix == ceil_to_minute(split_unix)
-        && coverage.gaps.len() <= 50
-        && counters.iter().all(|value| *value >= 0)
-        && coverage.expected_minutes == (coverage.to_unix - coverage.from_unix) / 60
-        && coverage.missing_minutes == coverage.expected_minutes - coverage.present_minutes
-        && coverage.warmup_expected_minutes == (coverage.split_unix - coverage.from_unix) / 60
-        && coverage.signal_expected_minutes == (coverage.to_unix - coverage.split_unix) / 60
-        && coverage.warmup_present_minutes <= coverage.warmup_expected_minutes
-        && coverage.signal_present_minutes <= coverage.signal_expected_minutes
-        && coverage.present_minutes
-            == coverage.warmup_present_minutes + coverage.signal_present_minutes
-        && coverage.offset == 0
-        && coverage.limit == 50
-        && coverage.gaps.len() as i64 == coverage.gap_count.min(50)
-        && (coverage.gap_count == 0) == (coverage.missing_minutes == 0)
-        && chrono::DateTime::parse_from_rfc3339(&coverage.checked_at).is_ok()
-        && coverage.gaps.iter().enumerate().all(|(index, gap)| {
-            gap.from_unix % 60 == 0
-                && gap.to_unix % 60 == 0
-                && gap.from_unix >= coverage.from_unix
-                && gap.to_unix <= coverage.to_unix
-                && gap.from_unix < gap.to_unix
-                && (index == 0 || gap.from_unix >= coverage.gaps[index - 1].to_unix)
-        })
+    if coverage.instrument_id != instrument_id
+        || coverage.from_unix != from
+        || coverage.to_unix != to
+        || coverage.split_unix != split
+        || coverage.gaps.len() > 50
+        || counters.iter().any(|value| *value < 0)
+        || coverage.expected_minutes != duration / 60
+        || coverage.present_minutes > coverage.expected_minutes
+        || coverage.warmup_expected_minutes != (split - from) / 60
+        || coverage.signal_expected_minutes != (to - split) / 60
+        || coverage.warmup_present_minutes > coverage.warmup_expected_minutes
+        || coverage.signal_present_minutes > coverage.signal_expected_minutes
+        || coverage.present_minutes
+            != coverage.warmup_present_minutes + coverage.signal_present_minutes
+        || coverage.offset != 0
+        || coverage.limit != 50
+        || coverage.gaps.len() as i64 != coverage.gap_count.min(50)
+        || chrono::DateTime::parse_from_rfc3339(&coverage.checked_at).is_err()
+    {
+        return false;
+    }
+    // no_trade is not an OHLCV candle. The producer's raw gap page includes
+    // both verified no-trade minutes and still-unknown missing minutes.
+    let raw_missing = coverage.expected_minutes - coverage.present_minutes;
+    let warmup_missing = coverage.warmup_expected_minutes - coverage.warmup_present_minutes;
+    let signal_missing = coverage.signal_expected_minutes - coverage.signal_present_minutes;
+    if coverage.verified_minutes > raw_missing
+        || coverage.missing_minutes != raw_missing - coverage.verified_minutes
+        || (coverage.gap_count == 0) != (raw_missing == 0)
+        || coverage.gap_count > raw_missing
+        || coverage.gap_count > coverage.present_minutes + 1
+    {
+        return false;
+    }
+    let mut page_missing = 0;
+    let mut page_warmup_missing = 0;
+    for (index, gap) in coverage.gaps.iter().enumerate() {
+        if gap.from_unix % 60 != 0
+            || gap.to_unix % 60 != 0
+            || gap.from_unix < from
+            || gap.to_unix > to
+            || gap.from_unix >= gap.to_unix
+            || (index > 0 && gap.from_unix < coverage.gaps[index - 1].to_unix)
+        {
+            return false;
+        }
+        page_missing += (gap.to_unix - gap.from_unix) / 60;
+        page_warmup_missing += (gap.to_unix.min(split) - gap.from_unix.min(split)) / 60;
+    }
+    let page_signal_missing = page_missing - page_warmup_missing;
+    let remaining_gaps = coverage.gap_count - coverage.gaps.len() as i64;
+    page_missing + remaining_gaps <= raw_missing
+        && page_warmup_missing <= warmup_missing
+        && page_signal_missing <= signal_missing
+        && (remaining_gaps > 0
+            || (page_missing == raw_missing
+                && page_warmup_missing == warmup_missing
+                && page_signal_missing == signal_missing))
 }
 
 struct PreflightItem {
@@ -1199,15 +1248,22 @@ mod tests {
             expected_minutes: 10,
             present_minutes: 8,
             missing_minutes: 2,
+            verified_minutes: 0,
             warmup_expected_minutes: 5,
             warmup_present_minutes: 4,
             signal_expected_minutes: 5,
             signal_present_minutes: 4,
-            gaps: vec![setups_mdclient::CoverageGap {
-                from_unix: 120,
-                to_unix: 240,
-            }],
-            gap_count: 1,
+            gaps: vec![
+                setups_mdclient::CoverageGap {
+                    from_unix: 120,
+                    to_unix: 180,
+                },
+                setups_mdclient::CoverageGap {
+                    from_unix: 420,
+                    to_unix: 480,
+                },
+            ],
+            gap_count: 2,
             offset: 0,
             limit: 50,
             checked_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1218,6 +1274,48 @@ mod tests {
     fn coverage_validation_accepts_consistent_response() {
         let coverage = sample_coverage();
         assert!(validate_coverage(&coverage, 7, 0, 600, 300));
+    }
+
+    #[test]
+    fn coverage_validation_accepts_verified_no_trade_incident_aggregates() {
+        // Actual Nov17 preflight counters for 4STOCK/AGI/HAJIMI and DUOL/FISV/FN.
+        // Gap geometry is representative, not a claim about production timestamps.
+        for (present, verified, missing, warmup_present, gap_lengths) in [
+            (39_421, 5_219, 0, 14_941, vec![5_219]),
+            (14_789, 29_460, 391, 0, vec![29_456, 79, 79, 79, 79, 79]),
+        ] {
+            let from = 1_792_195_200;
+            let split = 1_793_404_800;
+            let to = 1_794_873_600;
+            let mut next = from;
+            let gaps: Vec<_> = gap_lengths
+                .into_iter()
+                .map(|minutes| {
+                    let gap = json!({"fromUnix": next, "toUnix": next + minutes * 60});
+                    next += (minutes + 1) * 60;
+                    gap
+                })
+                .collect();
+            let coverage: setups_mdclient::CoverageRangeDto = serde_json::from_value(json!({
+                "instrumentId": 7, "fromUnix": from, "toUnix": to, "splitUnix": split,
+                "expectedMinutes": 44_640, "presentMinutes": present,
+                "verifiedMinutes": verified, "missingMinutes": missing,
+                "warmupExpectedMinutes": 20_160, "warmupPresentMinutes": warmup_present,
+                "signalExpectedMinutes": 24_480, "signalPresentMinutes": present - warmup_present,
+                "gapCount": gaps.len(), "gaps": gaps, "offset": 0, "limit": 50,
+                "checkedAt": "2026-11-17T09:48:00Z"
+            }))
+            .unwrap();
+            assert!(
+                validate_coverage(&coverage, 7, from, to, split),
+                "valid present={present}, verified={verified}, unknown missing={missing}"
+            );
+            assert_eq!(
+                serde_json::to_value(&coverage).unwrap()["verifiedMinutes"],
+                verified,
+                "the preflight response must preserve the producer's separate no-trade count"
+            );
+        }
     }
 
     #[test]
@@ -1256,6 +1354,156 @@ mod tests {
         coverage.warmup_present_minutes = 5;
         coverage.signal_present_minutes = 4;
         assert!(!validate_coverage(&coverage, 7, 0, 600, 300));
+    }
+
+    #[test]
+    fn coverage_validation_keeps_strict_counter_and_raw_gap_accounting() {
+        let payload = serde_json::to_value(sample_coverage()).unwrap();
+        for field in [
+            "expectedMinutes",
+            "presentMinutes",
+            "missingMinutes",
+            "verifiedMinutes",
+            "warmupExpectedMinutes",
+            "warmupPresentMinutes",
+            "signalExpectedMinutes",
+            "signalPresentMinutes",
+            "gapCount",
+        ] {
+            let mut changed = payload.clone();
+            changed[field] = json!(-1);
+            let coverage = serde_json::from_value(changed).unwrap();
+            assert!(
+                !validate_coverage(&coverage, 7, 0, 600, 300),
+                "negative {field}"
+            );
+        }
+        for (field, value) in [
+            ("verifiedMinutes", 3),
+            ("verifiedMinutes", i64::MAX),
+            ("missingMinutes", i64::MAX),
+            ("presentMinutes", i64::MAX),
+            ("warmupPresentMinutes", i64::MAX),
+            ("signalPresentMinutes", i64::MAX),
+            ("gapCount", i64::MAX),
+            ("offset", 1),
+            ("limit", 51),
+        ] {
+            let mut changed = payload.clone();
+            changed[field] = json!(value);
+            let coverage = serde_json::from_value(changed).unwrap();
+            assert!(
+                !validate_coverage(&coverage, 7, 0, 600, 300),
+                "invalid {field}={value}"
+            );
+        }
+        let mut missing_field = payload;
+        missing_field
+            .as_object_mut()
+            .unwrap()
+            .remove("verifiedMinutes");
+        assert!(
+            serde_json::from_value::<setups_mdclient::CoverageRangeDto>(missing_field).is_err(),
+            "a missing producer counter must not silently default to zero"
+        );
+        let mut coverage = sample_coverage();
+        coverage.verified_minutes = 1;
+        coverage.missing_minutes = 1;
+        assert!(validate_coverage(&coverage, 7, 0, 600, 300));
+        coverage.gaps[0].to_unix += 60;
+        assert!(
+            !validate_coverage(&coverage, 7, 0, 600, 300),
+            "raw gap duration overcount"
+        );
+        let mut coverage = sample_coverage();
+        coverage.warmup_present_minutes = 3;
+        coverage.signal_present_minutes = 5;
+        assert!(
+            !validate_coverage(&coverage, 7, 0, 600, 300),
+            "raw gaps contradict warmup/signal partition"
+        );
+        let mut coverage = sample_coverage();
+        coverage.checked_at = "not-a-timestamp".into();
+        assert!(!validate_coverage(&coverage, 7, 0, 600, 300));
+    }
+
+    #[test]
+    fn coverage_validation_accepts_empty_complete_and_paginated_raw_gaps() {
+        let mut coverage = sample_coverage();
+        coverage.present_minutes = 0;
+        coverage.warmup_present_minutes = 0;
+        coverage.signal_present_minutes = 0;
+        coverage.verified_minutes = 10;
+        coverage.missing_minutes = 0;
+        coverage.gaps = vec![setups_mdclient::CoverageGap {
+            from_unix: 0,
+            to_unix: 600,
+        }];
+        coverage.gap_count = 1;
+        assert!(
+            validate_coverage(&coverage, 7, 0, 600, 300),
+            "entirely verified absence is still one raw gap"
+        );
+        coverage.verified_minutes = 0;
+        coverage.missing_minutes = 10;
+        assert!(
+            validate_coverage(&coverage, 7, 0, 600, 300),
+            "unknown history remains a valid partial preflight"
+        );
+        coverage.present_minutes = 10;
+        coverage.warmup_present_minutes = 5;
+        coverage.signal_present_minutes = 5;
+        coverage.missing_minutes = 0;
+        coverage.gaps.clear();
+        coverage.gap_count = 0;
+        assert!(validate_coverage(&coverage, 7, 0, 600, 300));
+        coverage.to_unix = 12_000;
+        coverage.split_unix = 6_000;
+        coverage.expected_minutes = 200;
+        coverage.present_minutes = 140;
+        coverage.verified_minutes = 60;
+        coverage.warmup_expected_minutes = 100;
+        coverage.warmup_present_minutes = 50;
+        coverage.signal_expected_minutes = 100;
+        coverage.signal_present_minutes = 90;
+        coverage.gaps = (0..50)
+            .map(|index| setups_mdclient::CoverageGap {
+                from_unix: index * 120,
+                to_unix: index * 120 + 60,
+            })
+            .collect();
+        coverage.gap_count = 60;
+        assert!(
+            validate_coverage(&coverage, 7, 0, 12_000, 6_000),
+            "a bounded page need not contain every raw gap"
+        );
+        coverage.gap_count = 61;
+        assert!(
+            !validate_coverage(&coverage, 7, 0, 12_000, 6_000),
+            "unseen gaps need at least one minute each"
+        );
+    }
+
+    #[test]
+    fn coverage_validation_normalizes_negative_utc_and_rejects_overflow_without_panicking() {
+        let mut coverage = sample_coverage();
+        coverage.from_unix -= 600;
+        coverage.to_unix -= 600;
+        coverage.split_unix -= 600;
+        for gap in &mut coverage.gaps {
+            gap.from_unix -= 600;
+            gap.to_unix -= 600;
+        }
+        assert!(validate_coverage(&coverage, 7, -601, -1, -301));
+        for (from, to, split) in [
+            (i64::MIN, i64::MAX, 0),
+            (i64::MIN, 0, -300),
+            (0, i64::MAX, 300),
+            (600, 0, 300),
+            (0, 600, 601),
+        ] {
+            assert!(!validate_coverage(&coverage, 7, from, to, split));
+        }
     }
 
     fn params_with(overlay: Value) -> SpikeParams {
