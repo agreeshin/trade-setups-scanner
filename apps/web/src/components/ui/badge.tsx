@@ -26,6 +26,11 @@ export function Badge({ className, variant, ...props }: BadgeProps) {
   return <span data-slot="badge" className={cn(badgeVariants({ variant }), className)} {...props} />;
 }
 
+/** Decorative only: the owning control supplies the status text/description. */
+export function StatusDot({ active = false, className, ...props }: HTMLAttributes<HTMLSpanElement> & { active?: boolean }) {
+  return <span data-slot="status-dot" {...props} aria-hidden="true" className={cn("size-2.5 shrink-0 rounded-full bg-success ring-2 ring-background", active && "motion-safe:animate-live-status", className)} />;
+}
+
 const RUN_STATUS_VARIANTS: Record<string, BadgeVariant> = {
   queued: "neutral",
   running: "info",

@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { Play, RefreshCw, Settings, Square } from "lucide-react";
+import { CircleCheck, Play, RefreshCw, Settings, Square } from "lucide-react";
 import type { AdaptiveProfilesController } from "./use-adaptive-profiles";
 import type { AdaptiveProfile } from "../lib/adaptive-profiles-api";
 import { Alert } from "../components/ui/alert";
@@ -27,7 +27,14 @@ import type { ContinuousController } from "./use-continuous-study";
 import { applyOptimizationDraftScope, createOptimizationDraft, restoreOptimizationDraft, useOptimizationDraftSave, type OptimizationFormDraft } from "./optimization-draft";
 
 const statuses = { stopped: "Остановлено", running: "Непрерывное исследование включено", stopping: "Останавливается", error: "Ошибка непрерывного исследования" };
-const phases: Record<string, string> = { queued: "Ожидание очереди", idle: "Ожидание следующего исследования", research: "Исследование", acquiring: "Подготовка снимка", replay: "Служебный replay", analytics: "Аналитика сохранённого набора", cleanup: "Очистка незавершённых данных" };
+const phases: Record<string, string> = { queued: "Ожидание очереди", idle: "Ожидание следующего исследования", research: "Исследование", searching: "Поиск параметров", acquiring: "Подготовка снимка", replay: "Служебный replay", analytics: "Аналитика сохранённого набора", cleanup: "Очистка незавершённых данных" };
+const phaseVariants: Record<string, BadgeVariant> = { queued: "neutral", idle: "neutral", research: "info", searching: "info", acquiring: "info", replay: "info", analytics: "info", cleanup: "warning" };
+function phaseVariant(process: ContinuousProcess): BadgeVariant {
+  if (process.status === "error") return "danger";
+  if (process.status === "stopping") return "warning";
+  if (process.status === "stopped") return "neutral";
+  return process.phase && Object.hasOwn(phaseVariants, process.phase) ? phaseVariants[process.phase]! : "neutral";
+}
 const pendingStatuses: Record<string, string> = { warming: "Инициализация live по текущим данным", ready: "Готов к переключению · ещё не действует", error: "Ошибка инициализации live" };
 const closedTime = (time: number) => `${formatUnix(time)} (${effectiveTimezone()})`;
 const waitingReasonLabels: Record<string, string> = {
@@ -67,13 +74,26 @@ function SlotReadiness({ slot, invalid }: { slot: ContinuousSlot; invalid: boole
   </div>;
 }
 
+function hasCurrentCandidate(slot: ContinuousSlot): boolean {
+  // The server may retain attempt metadata after promotion; do not revive that candidate.
+  if (slot.activeStatus === "active" && slot.activeGenerationId !== null && slot.pendingGenerationId === slot.activeGenerationId) return false;
+  return slot.pendingGenerationId != null || slot.pendingStatus != null;
+}
+
+function currentCandidateError(slot: ContinuousSlot): string | null {
+  if (!hasCurrentCandidate(slot) || slot.pendingStatus === "ready") return null;
+  return pendingErrorMessage(slot.pendingError) ?? (slot.pendingStatus === "error" ? "Описание ошибки не передано." : null);
+}
+
 function liveStatus(slot: ContinuousSlot): { label: string; variant: BadgeVariant } {
-  if (["error", "failed"].includes(slot.status) || slot.pendingStatus === "error" || slot.pendingError != null || slot.activeStatus === "error") return { label: "Ошибка", variant: "danger" };
+  if (slot.activeStatus === "error") return { label: "Ошибка", variant: "danger" };
   if (slot.activeGenerationId !== null && slot.activeStatus === "active") return { label: "Активно", variant: "success" };
+  if (hasCurrentCandidate(slot) && slot.pendingStatus === "ready") return { label: "Ожидает", variant: "warning" };
+  if (["error", "failed"].includes(slot.status) || currentCandidateError(slot) !== null) return { label: "Ошибка", variant: "danger" };
   if (slot.status === "stopping") return { label: "Останавливается", variant: "warning" };
   if (slot.status === "stopped") return { label: "Остановлен", variant: "warning" };
   if (slot.pendingStatus === "warming" || slot.status === "warming") return { label: "Идёт инициализация", variant: "warning" };
-  if (slot.pendingStatus != null || slot.pendingGenerationId != null) return { label: "Ожидает", variant: "warning" };
+  if (hasCurrentCandidate(slot)) return { label: "Ожидает", variant: "warning" };
   if ((slot.activeGenerationId !== null && slot.activeStatus === "inactive") || ["inactive", "nonpass", "rejected", "no_winner"].includes(slot.status)) return { label: "Неактивно", variant: "warning" };
   if (slot.activeGenerationId !== null) return { label: "Состояние live неизвестно (старый API)", variant: "warning" };
   if (["idle", "pending", "running", "researching", "queued", "research", "acquiring", "replay", "analytics", "cleanup"].includes(slot.status)) return { label: "Ожидает", variant: "warning" };
@@ -84,10 +104,12 @@ function liveProblems(slot: ContinuousSlot, process: Pick<ContinuousProcess, "st
   // Render-local, at most seven bounded descriptions; no diagnostic history is retained.
   const problems: string[] = [];
   if (!available) problems.push("Актуальность снимка не подтверждена. Показано последнее известное состояние live.");
-  if (process && (process.status === "error" || process.error !== null)) problems.push(`Ошибка непрерывного процесса (status=${process.status}): ${pendingErrorMessage(process.error) ?? "Описание ошибки не передано."}`);
-  if (["error", "failed"].includes(slot.status)) problems.push(`Техническая ошибка профиля (status=${slot.status}).`);
+  if (process?.status === "error") problems.push(`Ошибка непрерывного процесса (status=${process.status}): ${pendingErrorMessage(process.error) ?? "Описание ошибки не передано."}`);
+  if (["error", "failed"].includes(slot.status) && !(slot.activeGenerationId !== null && slot.activeStatus === "active")
+    && !(hasCurrentCandidate(slot) && slot.pendingStatus === "ready")) problems.push(`Техническая ошибка профиля (status=${slot.status}).`);
   if (slot.activeStatus === "error") problems.push("Ошибка действующего live (activeStatus=error).");
-  if (slot.pendingStatus === "error" || slot.pendingError != null) problems.push(`Ошибка инициализации live${slot.pendingStatus === "error" ? " (pendingStatus=error)" : ""}: ${pendingErrorMessage(slot.pendingError) ?? "Описание ошибки не передано."}`);
+  const candidateError = currentCandidateError(slot);
+  if (candidateError !== null) problems.push(`Ошибка инициализации live${slot.pendingStatus === "error" ? " (pendingStatus=error)" : ""}: ${candidateError}`);
   const summary = slot.liveReadinessSummary;
   if (summary && slot.activeGenerationId !== null && summary.generationId !== slot.activeGenerationId) problems.push(`Сводка готовности относится к поколению #${summary.generationId} вместо действующего поколения #${slot.activeGenerationId}.`);
   if (summary && invalidCounts) problems.push(`Некорректные числа готовности: всего ${summary.totalInstruments}, готовы ${summary.readyInstruments}, ожидают ${summary.waitingInstruments}; counts или сумма причин ожидания несогласованы.`);
@@ -132,14 +154,17 @@ function pendingErrorMessage(value: unknown): string | null {
 
 function SlotPending({ slot }: { slot: ContinuousSlot }) {
   const legacy = slot.pendingGenerationId === undefined && slot.pendingStatus === undefined;
-  const absent = slot.pendingGenerationId === null && slot.pendingStatus === null;
-  const error = pendingErrorMessage(slot.pendingError) ?? (slot.pendingStatus === "error" ? "Описание ошибки не передано." : null);
+  const current = hasCurrentCandidate(slot);
+  const absent = (slot.pendingGenerationId === null && slot.pendingStatus === null)
+    || (slot.activeGenerationId !== null && slot.activeStatus === "active" && slot.pendingGenerationId === slot.activeGenerationId);
+  const error = currentCandidateError(slot);
   return <div className="grid gap-1 text-xs">
-    {slot.pendingGenerationId != null && <span className="text-sm">Кандидат #{slot.pendingGenerationId}</span>}
-    {slot.pendingStudyId != null && <span>Исследование кандидата #{slot.pendingStudyId}</span>}
-    {absent ? <span>Нет кандидата на замену</span> : <Badge variant={slot.pendingStatus === "error" ? "danger" : "neutral"}>{legacy ? "Статус инициализации live неизвестен (старый API)" : slot.pendingStatus ? pendingStatuses[slot.pendingStatus] ?? `Состояние кандидата: ${slot.pendingStatus.slice(0, 120)}` : "Статус инициализации live неизвестен"}</Badge>}
+    {current && slot.pendingGenerationId != null && <span className="text-sm">Кандидат #{slot.pendingGenerationId}</span>}
+    {current && slot.pendingStudyId != null && <span>Исследование кандидата #{slot.pendingStudyId}</span>}
+    {absent ? <span>Нет кандидата на замену</span> : slot.pendingStatus === "error" ? <span className="text-danger">Ошибка инициализации live</span>
+      : <Badge variant={slot.pendingStatus === "warming" ? "info" : slot.pendingStatus === "ready" ? "success" : "neutral"}>{legacy ? "Статус инициализации live неизвестен (старый API)" : slot.pendingStatus ? Object.hasOwn(pendingStatuses, slot.pendingStatus) ? pendingStatuses[slot.pendingStatus] : `Состояние кандидата: ${slot.pendingStatus.slice(0, 120)}` : "Статус инициализации live неизвестен"}</Badge>}
     {!legacy && !absent && <span>{slot.readinessFrontier === undefined ? "Граница готовности неизвестна" : slot.readinessFrontier === null ? "Граница готовности ещё не подтверждена" : `Граница готовности (закрытие минуты): ${closedTime(slot.readinessFrontier)}`}</span>}
-    {error && <p role="alert" className="text-destructive">Ошибка кандидата: {error}</p>}
+    {error && <p role="alert" className="text-danger">Ошибка кандидата: {error}</p>}
   </div>;
 }
 
@@ -179,7 +204,7 @@ export function AdaptiveLive({ controller }: { controller: AdaptiveProfilesContr
 export function AdaptiveProfiles({ algorithm, controller, research }: { algorithm: Algorithm; controller: AdaptiveProfilesController; research?: ContinuousController }) {
   const profiles = controller.page?.profiles ?? [];
   return <div className="grid min-w-0 gap-3">
-    <div className="flex items-center gap-2"><h5 className="font-semibold">Адаптивные профили</h5><InfoNote label="О настроенных адаптивных профилях">Исследование принято — это готовность рекомендаций, а не live. Кандидат инициализируется независимо, без повторной проверки исторического результата. Сохранённое исследование относится к последнему полностью завершённому поколению после replay, аналитики и gate. Дата ниже — изменение состояния профиля, не дата исследования. Stop исследования и удаление порога из очереди сохраняют самостоятельный профиль.</InfoNote></div>
+    <div className="flex items-center justify-center gap-2 text-center"><h5 className="font-semibold">Адаптивные профили</h5><InfoNote label="О настроенных адаптивных профилях">Исследование принято — это готовность рекомендаций, а не live. Кандидат инициализируется независимо, без повторной проверки исторического результата. Сохранённое исследование относится к последнему полностью завершённому поколению после replay, аналитики и gate. Дата ниже — изменение состояния профиля, не дата исследования. Stop исследования и удаление порога из очереди сохраняют самостоятельный профиль.</InfoNote></div>
     {controller.loading && <Spinner label="Проверка самостоятельных профилей" />}
     {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
     {!controller.available && controller.page && <p className="text-sm">Показан последний подтверждённый снимок профилей; актуальность не подтверждена.</p>}
@@ -210,8 +235,8 @@ function ProfileControl({ profile, controller }: { profile: AdaptiveProfile; con
   const blocked = profile.blockingReason !== null && action === "play";
   const label = `${action === "stop" ? "Остановить" : "Запустить"} адаптивный профиль ${profile.id}`;
   return <div className="grid gap-1" aria-busy={controller.busy[profile.id] !== undefined}>
-    <IconButton label={label} icon={action === "stop" ? Square : Play} disabled={!controller.available || controller.busy[profile.id] !== undefined || profile.status === "stopping" || blocked} onClick={() => { void controller.command(profile, action); }} />
-    {profile.desiredRunning && profile.initializationStatus === "exhausted" && <IconButton label={`Повторить запуск адаптивного профиля ${profile.id}`} icon={Play} disabled={!controller.available || controller.busy[profile.id] !== undefined || profile.status === "stopping" || profile.blockingReason !== null} onClick={() => { void controller.command(profile, "play"); }} />}
+    <IconButton label={label} icon={action === "stop" ? Square : Play} filled disabled={!controller.available || controller.busy[profile.id] !== undefined || profile.status === "stopping" || blocked} onClick={() => { void controller.command(profile, action); }} />
+    {profile.desiredRunning && profile.initializationStatus === "exhausted" && <IconButton label={`Повторить запуск адаптивного профиля ${profile.id}`} icon={Play} filled disabled={!controller.available || controller.busy[profile.id] !== undefined || profile.status === "stopping" || profile.blockingReason !== null} onClick={() => { void controller.command(profile, "play"); }} />}
     {profile.status === "stopping" && <span className="text-xs">Останавливается · ожидаем drain</span>}
     {profile.initializationStatus === "exhausted" && <span className="text-xs">Попытки исчерпаны: {profile.pendingAttempts}/{profile.attemptLimit}. Play выдаст ещё 3.</span>}
     {profile.blockingReason && <span className="text-xs">{profile.blockingReason === "global_live_disabled" ? "Общий live выключен" : profile.blockingReason === "adaptive_permission_disabled" ? "Адаптивный live не разрешён" : profile.blockingReason.slice(0, 120)}</span>}
@@ -298,17 +323,17 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
 export function ContinuousResearch({ controller, children }: { algorithm?: Algorithm; controller: ContinuousController; children?: ReactNode }) {
   const process = controller.process;
   return <section aria-label="Непрерывные исследования" className="grid min-w-0 gap-3">
-    <div className="flex items-center gap-2"><h4 className="font-semibold">Непрерывные исследования</h4>
+    <div className="flex items-center justify-center gap-2 text-center"><h4 className="font-semibold">Непрерывные исследования</h4>
       <InfoNote label="Об остановке и расчёте доходности">Stop отменяет только исследовательскую цепочку и очищает её незавершённые данные после drain. Профили и завершённая история сохраняются. Следующий Start создаёт новое исследование; техническое восстановление — отдельное действие. R рассчитан только по наблюдавшимся закрытым TP/SL-сделкам, без вымышленных нулей или SL на правом краю.</InfoNote></div>
+    {controller.available && <p role="status" className="flex items-center gap-2 text-sm">{process?.status === "running" && <CircleCheck aria-hidden="true" className="size-5 shrink-0 fill-success text-success-foreground" />}{process ? statuses[process.status] : "Процесс не настроен. Исследование не запущено."}</p>}
     {children}
     {controller.loading && <Spinner label="Проверка непрерывного процесса" />}
     {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
     {!controller.available && process && <p className="text-sm">Показан последний подтверждённый снимок; актуальность не подтверждена.</p>}
-    {controller.available && <p role="status" className="text-sm">{process ? statuses[process.status] : "Процесс не настроен. Исследование не запущено."}</p>}
     {process && <>
-      <p className="text-sm">Ревизия конфигурации: {process.configRevision}{process.activeStudyId !== null ? ` · Исследование #${process.activeStudyId}` : ""}{process.phase ? ` · ${phases[process.phase] ?? process.phase}` : ""}</p>
-      {process.error && <Alert variant="destructive">{process.error.code}: {process.error.message}. Технический сбой не означает непрохождение допуска; прежний принятый профиль может сохраняться.</Alert>}
-      {process.config && <p className="text-sm">Очередь порогов: {process.config.minSetupsPerDay.join(", ")} · последние {process.config.lookbackDays} суток. Изменение очереди не удаляет адаптивные профили.</p>}
+      <p className="flex flex-wrap items-center gap-2 text-sm"><span>Ревизия конфигурации: {process.configRevision}{process.activeStudyId !== null ? ` · Исследование #${process.activeStudyId}` : ""}</span>{process.phase && <Badge variant={phaseVariant(process)}>{Object.hasOwn(phases, process.phase) ? phases[process.phase] : process.phase}</Badge>}</p>
+      {process.status === "error" && process.error && <Alert variant="destructive">{process.error.code}: {process.error.message}. Технический сбой не означает непрохождение допуска; прежний принятый профиль может сохраняться.</Alert>}
+      {process.config && <p className="text-sm">Очередь порогов: {process.config.minSetupsPerDay.join(", ")} · последние {process.config.lookbackDays} суток.</p>}
     </>}
   </section>;
 }
@@ -335,12 +360,11 @@ export function ContinuousControls({ algorithm, controller, children }: { algori
     }
   }
   return <section aria-label="Управление непрерывным исследованием" className="grid min-w-0 gap-3">
-    <div className="flex flex-wrap items-center gap-3">
-      <span className="text-sm font-medium">Исследование</span>
+    <div className="flex flex-wrap items-center justify-start gap-3">
       <IconButton label="Обновить статус непрерывного процесса" icon={RefreshCw} onClick={controller.refresh} disabled={controller.busy !== null} />
       <IconButton label="Настроить непрерывное исследование" icon={Settings} onClick={() => setOpen(true)} disabled={!controller.available || controller.busy !== null} />
-      {process && process.status !== "stopped" ? <IconButton id={stopTriggerId} label={process.status === "stopping" ? "Остановка запрошена · ожидаем drain" : "Остановить непрерывное исследование"} icon={Square} disabled={!canStop} onClick={() => setStopOpen(true)} />
-        : <IconButton id={stopTriggerId} label="Запустить непрерывное исследование" icon={Play} disabled={!controller.available || !process?.config || controller.busy !== null} onClick={() => { void controller.start(); }} />}
+      {process && process.status !== "stopped" ? <IconButton id={stopTriggerId} label={process.status === "stopping" ? "Остановка запрошена · ожидаем drain" : "Остановить непрерывное исследование"} icon={Square} filled disabled={!canStop} onClick={() => setStopOpen(true)} />
+        : <IconButton id={stopTriggerId} label="Запустить непрерывное исследование" icon={Play} filled disabled={!controller.available || !process?.config || controller.busy !== null} onClick={() => { void controller.start(); }} />}
       {recoveryExhausted && <Button type="button" variant="outline" disabled={!controller.available || controller.busy !== null} onClick={() => { void controller.retryRecovery(); }}>Повторить восстановление исследования</Button>}
       {children}
     </div>

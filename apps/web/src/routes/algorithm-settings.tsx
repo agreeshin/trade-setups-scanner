@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
+import { StatusDot } from "../components/ui/badge";
 import { Checkbox } from "../components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Field } from "../components/ui/field";
@@ -111,15 +112,15 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     { id: "constant", label: "Live-сканирование с постоянными параметрами", enabled: algorithm.enabled },
   ];
   return <><form onSubmit={(event) => { void save(event); }} className="grid min-w-0 gap-4">
-    <div className="flex items-center gap-2"><h3 className="text-lg font-semibold">{displayName} · {algorithm.version}</h3><InfoNote label="Описание алгоритма">{algorithm.description}</InfoNote></div>
+    <div className="flex min-w-0 items-center justify-center gap-2 text-center"><h3 className="min-w-0 text-lg font-semibold">{displayName} · {algorithm.version}</h3><InfoNote label="Описание алгоритма">{algorithm.description}</InfoNote></div>
     <Field label="Внешнее название алгоритма" hint="До 120 символов. Сохраняется при потере фокуса. Отдельная пользовательская подпись; служебное имя, ID, версия и старые сетапы не меняются.">{(control) => <Input {...control} maxLength={240} disabled={nameBusy} value={externalName} onChange={(event) => { setExternalName(event.target.value); setNameSaved(false); setNameError(null); }} onBlur={() => { void saveName(); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); event.currentTarget.blur(); } }} />}</Field>
     {nameBusy && <p role="status" className="text-sm">Сохранение названия…</p>}
     {nameError && <Alert variant="destructive" role="alert">{nameError}</Alert>}
     {nameSaved && <p role="status" className="text-sm">Название алгоритма сохранено.</p>}
-    <SegmentedList role="tablist" aria-label={`Режим live · ${displayName}`}>
+    <SegmentedList role="tablist" aria-label={`Режим live · ${displayName}`} className="w-full justify-center justify-self-center sm:w-fit">
       {liveTabs.map((tab, index) => <SegmentedTrigger key={tab.id} id={`${optimizerTriggerId}-tab-${tab.id}`} role="tab" aria-label={tab.label}
         aria-selected={liveMode === tab.id} aria-controls={`${optimizerTriggerId}-panel-${tab.id}`} tabIndex={liveMode === tab.id ? 0 : -1}
-        aria-describedby={tab.enabled ? `${optimizerTriggerId}-status-${tab.id}` : undefined} className="h-auto gap-2 whitespace-normal py-2 text-left"
+        aria-describedby={tab.enabled ? `${optimizerTriggerId}-status-${tab.id}` : undefined} className="h-auto min-w-0 flex-1 shrink basis-56 gap-2 whitespace-normal py-2 text-center"
         onClick={() => setLiveMode(tab.id)} onKeyDown={(event) => {
           const next = event.key === "Home" ? 0 : event.key === "End" ? liveTabs.length - 1
             : event.key === "ArrowRight" ? (index + 1) % liveTabs.length : event.key === "ArrowLeft" ? (index + liveTabs.length - 1) % liveTabs.length : null;
@@ -127,12 +128,12 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
           event.preventDefault();
           const target = liveTabs[next]!; setLiveMode(target.id); document.getElementById(`${optimizerTriggerId}-tab-${target.id}`)?.focus();
         }}>
-        {tab.label}{tab.enabled && <><span data-slot="segmented-status-dot" aria-hidden="true" className="size-2 shrink-0 rounded-full bg-success" /><span id={`${optimizerTriggerId}-status-${tab.id}`} className="sr-only">Live-сканирование включено</span></>}
+        {tab.label}{tab.enabled && <><StatusDot active data-slot="segmented-status-dot" /><span id={`${optimizerTriggerId}-status-${tab.id}`} className="sr-only">Live-сканирование включено</span></>}
       </SegmentedTrigger>)}
     </SegmentedList>
     <div role="tabpanel" id={`${optimizerTriggerId}-panel-constant`} aria-labelledby={`${optimizerTriggerId}-tab-constant`} hidden={liveMode !== "constant"} tabIndex={0}>
     <section className="grid min-w-0 gap-4">
-    <div className="flex items-center gap-2"><h4 className="font-semibold">Live-сканирование с постоянными параметрами</h4>
+    <div className="flex items-center justify-center gap-2 text-center"><h4 className="font-semibold">Live-сканирование с постоянными параметрами</h4>
     <InfoNote>Порог цены задаётся в процентах — рост или падение, зависит от алгоритма; окно в минутах. Множитель объёма 3 означает 3× (300% базового объёма). Изменения общие для live и новых исторических запусков; завершённые запуски сохраняют свой снимок параметров.</InfoNote></div>
     <label className="flex items-center gap-2 text-sm"><Checkbox checked={enabled} onCheckedChange={(checked) => { setEnabled(checked === true); setSaved(false); }} />Включён для live-сканирования</label>
     {fieldGroups.map((group) => <fieldset key={group.title} className="grid gap-3 sm:grid-cols-2">
@@ -147,9 +148,10 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     </section></div>
     <div role="tabpanel" id={`${optimizerTriggerId}-panel-flexible`} aria-labelledby={`${optimizerTriggerId}-tab-flexible`} hidden={liveMode !== "flexible"} tabIndex={0} className="grid min-w-0 gap-4">
     <section aria-labelledby={`${optimizerTriggerId}-flexible`} className="grid min-w-0 gap-3">
-      <div className="flex flex-wrap items-center gap-2"><h4 id={`${optimizerTriggerId}-flexible`} className="font-semibold">Live-сканирование с гибкими параметрами</h4>
+      <div className="flex items-center justify-center gap-2 text-center"><h4 id={`${optimizerTriggerId}-flexible`} className="min-w-0 font-semibold">Live-сканирование с гибкими параметрами</h4>
         <InfoNote label="О самостоятельных адаптивных профилях">Профиль появляется только после полного принятого исследования. Stop/Play каждой строки не управляет исследованием. Research Stop и изменение очереди сохраняют профили, их рекомендации и историю. Кандидат инициализируется независимо, без повторной проверки исторического результата. Дата профиля — изменение состояния, не дата исследования.</InfoNote></div>
       <AdaptiveLive controller={profiles} />
+      <Separator />
       <AdaptiveProfiles algorithm={optimizerAlgorithm} controller={profiles} research={continuous} />
     </section>
     <Separator />
@@ -160,7 +162,7 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     </ContinuousResearch>
     <Separator />
     <section aria-labelledby={`${optimizerTriggerId}-optimizations`} className="grid min-w-0 gap-4">
-    <h4 id={`${optimizerTriggerId}-optimizations`} className="font-semibold">Ручные оптимизации</h4>
+    <h4 id={`${optimizerTriggerId}-optimizations`} className="text-center font-semibold">Ручные оптимизации</h4>
     {optimization.error && <Alert variant="destructive" role="alert">{optimization.error}<Button type="button" variant="outline" onClick={optimization.refresh}>Обновить статус оптимизации</Button></Alert>}
     <OptimizationHistory algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} pageSize={5} pagination={false} onSelect={selectHistory} onDelete={requestDelete} actions={<div className="flex flex-wrap gap-2">
       <Button id={optimizerTriggerId} type="button" variant="outline" aria-label={`Запустить новую оптимизацию ${displayName}`} onClick={() => { setHistoryOpen(false); setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setOptimizationOpen(true); }}>Запустить новую оптимизацию</Button>

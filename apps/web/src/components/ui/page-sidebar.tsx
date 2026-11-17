@@ -1,5 +1,6 @@
 import { createContext, useContext, useId, useState, type ReactNode } from "react";
 import { Button } from "./button";
+import { StatusDot } from "./badge";
 
 const SidebarContext = createContext<{ id: string; selected: string; visited: ReadonlySet<string> } | null>(null);
 
@@ -37,7 +38,7 @@ export function PageSidebar<T extends string>({ label, items, value, onValueChan
               onValueChange(target.id); document.getElementById(`${id}-tab-${target.id}`)?.focus();
             }}>
             <span className="min-w-0 flex-1 break-words">{item.label}</span>
-            {item.status && <><span data-slot="sidebar-status-dot" aria-hidden="true" className="h-2 w-2 shrink-0 rounded-full bg-success" /><span id={`${id}-status-${item.id}`} className="sr-only">{item.status}</span></>}
+            {item.status && <><StatusDot active data-slot="sidebar-status-dot" /><span id={`${id}-status-${item.id}`} className="sr-only">{item.status}</span></>}
           </Button>)}
         </div>
       </aside>}

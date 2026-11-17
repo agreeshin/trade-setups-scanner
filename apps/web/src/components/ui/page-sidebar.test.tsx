@@ -20,6 +20,8 @@ it("links a mobile-first/right-desktop sidebar to retained, accessible panels", 
   const draft = screen.getByRole("textbox", { name: "Черновик" });
   fireEvent.change(draft, { target: { value: "Сохранённый черновик" } });
   expect(first).toHaveAccessibleDescription("Live-сканирование включено");
+  expect(first.querySelector('[data-slot="sidebar-status-dot"]')).toHaveClass("size-2.5", "ring-2", "ring-background", "motion-safe:animate-live-status");
+  expect(screen.getByRole("tab", { name: "Второй" }).querySelector('[data-slot="sidebar-status-dot"]')).toBeNull();
   expect(first).toHaveAttribute("type", "button");
   expect(document.getElementById(first.getAttribute("aria-controls")!)).toBe(screen.getByRole("tabpanel", { name: "Первый" }));
   const layout = container.querySelector('[data-slot="page-sidebar-layout"]')!;

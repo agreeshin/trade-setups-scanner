@@ -140,7 +140,7 @@ it("shows retained Segmented live panels and keeps fixed controls independent wh
   expect(first.getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual([
     "Live-сканирование с гибкими параметрами", "Live-сканирование с постоянными параметрами",
   ]);
-  expect(first.getAllByRole("separator")).toHaveLength(2);
+  expect(first.getAllByRole("separator")).toHaveLength(3);
   for (const divider of first.getAllByRole("separator")) expect(divider).toHaveClass("my-4");
   const flexible = within(first.getByRole("region", { name: "Live-сканирование с гибкими параметрами" }));
   expect(flexible.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" })).toBeDisabled();

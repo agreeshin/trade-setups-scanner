@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { Badge, runStatusVariant, serviceStatusVariant } from "./badge";
+import { Badge, StatusDot, runStatusVariant, serviceStatusVariant } from "./badge";
 
 describe("Badge", () => {
   it("renders children with the requested variant classes", () => {
@@ -11,6 +11,18 @@ describe("Badge", () => {
   it("defaults to the neutral variant", () => {
     render(<Badge>нейтрально</Badge>);
     expect(screen.getByText("нейтрально").className).toContain("text-muted-foreground");
+  });
+
+  it("keeps decorative dots high contrast and animates only active dots with reduced-motion protection", () => {
+    const view = render(<StatusDot data-testid="live-dot" />);
+    const dot = screen.getByTestId("live-dot");
+    expect(dot).toHaveAttribute("aria-hidden", "true");
+    expect(dot).toHaveClass("size-2.5", "bg-success", "ring-2", "ring-background");
+    expect(dot).not.toHaveClass("motion-safe:animate-live-status");
+    view.rerender(<StatusDot active data-testid="live-dot" />);
+    expect(dot).toHaveClass("motion-safe:animate-live-status");
+    view.rerender(<StatusDot active={false} data-testid="live-dot" />);
+    expect(dot).not.toHaveClass("motion-safe:animate-live-status");
   });
 
   it("maps run and service statuses to variants", () => {

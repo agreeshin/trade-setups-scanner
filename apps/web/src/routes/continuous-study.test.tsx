@@ -213,6 +213,70 @@ function liveDetails() {
   return within(screen.getByRole("tooltip"));
 }
 
+it("clears candidate errors and obsolete candidate badges after promotion, ready or removal, without masking the next candidate failure", () => {
+  const failed: Partial<ContinuousSlot> = { status: "error", activeStatus: "active", pendingGenerationId: 8, pendingStatus: "error", pendingStudyId: 42,
+    pendingError: { code: "old_init_failed", message: "Прошлая попытка" } };
+  const view = render(profileView(failed));
+  expect(liveButton().querySelector('[data-slot="badge"]')).toHaveTextContent(/^Активно$/);
+  expect(screen.getByRole("alert")).toHaveTextContent("old_init_failed");
+  view.rerender(profileView({ ...failed, activeGenerationId: 8 }));
+  expect(screen.getByText("Нет кандидата на замену")).toBeInTheDocument();
+  expect(screen.queryByText("Исследование кандидата #42")).not.toBeInTheDocument();
+  expect(screen.queryByText(/Ошибка кандидата:/)).not.toBeInTheDocument();
+  expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
+  view.rerender(profileView({ ...failed, status: "active", activeGenerationId: 8, pendingGenerationId: 9, pendingError: "new_init_failed" }));
+  fireEvent.keyDown(document, { key: "Escape" });
+  expect(screen.getByRole("cell", { name: /Кандидат #9/ })).toHaveTextContent("new_init_failed");
+  view.rerender(profileView({ ...failed, status: "active", activeGenerationId: 8, pendingGenerationId: 9, pendingStatus: "ready" }));
+  expect(screen.getByText("Готов к переключению · ещё не действует")).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  view.rerender(profileView({ ...failed, status: "active", activeGenerationId: 8, pendingGenerationId: null, pendingStatus: null }));
+  expect(screen.getByText("Нет кандидата на замену")).toBeInTheDocument();
+  expect(screen.queryByText(/Ошибка кандидата:/)).not.toBeInTheDocument();
+  expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("keeps the enabled research status above left-aligned controls and renders its phase in a semantic badge", () => {
+  render(<ContinuousResearch algorithm={algorithm} controller={profileController({}, { phase: "searching" })} />);
+  const research = within(screen.getByRole("region", { name: "Непрерывные исследования" }));
+  const status = research.getByRole("status");
+  const controls = research.getByRole("region", { name: "Управление непрерывным исследованием" });
+  expect(status.compareDocumentPosition(controls) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  expect(status.querySelector("svg")).toHaveClass("text-success-foreground", "fill-success");
+  expect(research.getByText("Поиск параметров").closest('[data-slot="badge"]')).toHaveClass("text-info");
+  expect(within(controls).queryByText("Исследование")).not.toBeInTheDocument();
+  expect(screen.queryByText("Изменение очереди не удаляет адаптивные профили.", { exact: false })).not.toBeInTheDocument();
+  expect(within(controls).getByRole("button", { name: "Остановить непрерывное исследование" }).querySelector("svg")).toHaveAttribute("fill", "currentColor");
+});
+
+it("clears a failed first-initialization badge on confirmed ready without claiming ACTIVE before promotion", () => {
+  const candidate: Partial<ContinuousSlot> = { status: "error", activeGenerationId: null, activeStatus: "inactive", pendingGenerationId: 8, pendingStatus: "error", pendingError: "old_attempt_failed" };
+  const view = render(profileView(candidate));
+  expect(liveButton().querySelector('[data-slot="badge"]')).toHaveTextContent(/^Ошибка$/);
+  view.rerender(profileView({ ...candidate, pendingStatus: "ready" }));
+  expect(liveButton().querySelector('[data-slot="badge"]')).toHaveTextContent(/^Ожидает$/);
+  expect(screen.queryByText(/Ошибка кандидата:/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/Действующее поколение/)).not.toBeInTheDocument();
+  expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it.each([
+  { status: "running", phase: "queued", label: "Ожидание очереди", color: "muted-foreground" },
+  { status: "running", phase: "acquiring", label: "Подготовка снимка", color: "info" },
+  { status: "running", phase: "replay", label: "Служебный replay", color: "info" },
+  { status: "running", phase: "analytics", label: "Аналитика сохранённого набора", color: "info" },
+  { status: "stopping", phase: "cleanup", label: "Очистка незавершённых данных", color: "warning" },
+  { status: "stopped", phase: "searching", label: "Поиск параметров", color: "muted-foreground" },
+  { status: "error", phase: "searching", label: "Поиск параметров", color: "danger" },
+  { status: "running", phase: "__proto__", label: "__proto__", color: "muted-foreground" },
+] as const)("renders research phase $phase in state $status with $color semantics", ({ status, phase, label, color }) => {
+  render(<ContinuousResearch algorithm={algorithm} controller={profileController({}, { status, phase })} />);
+  const research = within(screen.getByRole("region", { name: "Непрерывные исследования" }));
+  expect(research.getByText(label).closest('[data-slot="badge"]')).toHaveClass(`text-${color}`);
+  expect(research.getByRole("status").querySelector("svg") !== null).toBe(status === "running");
+  if (status === "stopped") expect(research.getByRole("button", { name: "Запустить непрерывное исследование" }).querySelector("svg")).toHaveAttribute("fill", "currentColor");
+});
+
 it.each([100, 95, 94, 50, 49, 0])("keeps only the active status green at readiness %s/100 and reveals counts only on hover", (ready) => {
   render(profileView({ activeStatus: "active", liveReadinessSummary: { ...readinessSummary, totalInstruments: 100, readyInstruments: ready, waitingInstruments: 100 - ready, waitingReasons: [], otherWaitingInstruments: 100 - ready } }));
   const button = screen.getByRole("button", { name: /Действующее поколение #7/ });
@@ -232,11 +296,14 @@ it.each([100, 95, 94, 50, 49, 0])("keeps only the active status green at readine
 });
 
 const liveStatusCases: { patch: Partial<ContinuousSlot>; label: string; color: "success" | "warning" | "danger"; problem?: boolean }[] = [
-  ...["error", "failed"].map((status) => ({ patch: { status, activeStatus: "active" as const }, label: "Ошибка", color: "danger" as const, problem: true })),
+  ...["error", "failed"].map((status) => ({ patch: { status, activeStatus: "active" as const }, label: "Активно", color: "success" as const })),
+  ...["error", "failed"].map((status) => ({ patch: { status, activeGenerationId: null }, label: "Ошибка", color: "danger" as const, problem: true })),
   { patch: { activeStatus: "error" }, label: "Ошибка", color: "danger", problem: true },
-  { patch: { activeStatus: "active", pendingStatus: "error" }, label: "Ошибка", color: "danger", problem: true },
-  { patch: { activeStatus: "active", pendingError: { code: "initialization_error" } }, label: "Ошибка", color: "danger", problem: true },
-  { patch: { activeStatus: "active", pendingError: false }, label: "Ошибка", color: "danger", problem: true },
+  { patch: { activeStatus: "active", pendingStatus: "error" }, label: "Активно", color: "success", problem: true },
+  { patch: { activeStatus: "active", pendingGenerationId: 8, pendingError: { code: "initialization_error" } }, label: "Активно", color: "success", problem: true },
+  { patch: { activeStatus: "active", pendingGenerationId: 8, pendingError: false }, label: "Активно", color: "success", problem: true },
+  { patch: { activeStatus: "active", pendingGenerationId: null, pendingStatus: null, pendingError: { code: "old_error" } }, label: "Активно", color: "success" },
+  { patch: { activeGenerationId: null, pendingGenerationId: 8, pendingStatus: "error" }, label: "Ошибка", color: "danger", problem: true },
   ...["active", "warming", "idle", "pending", "running", "researching", "queued", "research", "acquiring", "replay", "analytics", "cleanup", "inactive", "nonpass", "rejected", "no_winner", "stopped"].map((status) => ({
     patch: { status, activeStatus: "active" as const, pendingStatus: "warming" }, label: "Активно", color: "success" as const,
   })),
@@ -358,12 +425,18 @@ it("serializes research Stop confirmation and keeps a failed command visible wit
   expect(controller.stop).toHaveBeenCalledOnce();
 });
 
-it.each(["running", "error"] as const)("explains a retained process error in state %s without repainting active slots", (status) => {
-  render(<ContinuousResearch algorithm={algorithm} controller={profileController({ activeStatus: "active", liveReadinessSummary: readinessSummary }, { status, error: { code: "source_unavailable", message: "Связь с источником потеряна." } })} />);
+it("clears process errors after recovery without repainting active slots or hiding current errors", () => {
+  const controller = profileController({ activeStatus: "active", liveReadinessSummary: readinessSummary }, { status: "error", error: { code: "source_unavailable", message: "Связь с источником потеряна." } });
+  const view = render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
   expect(screen.getByRole("button", { name: /Действующее поколение #7/ }).querySelector('[data-slot="badge"]')).toHaveClass("text-success");
   const alert = liveDetails().getByRole("alert");
   expect(alert).toHaveClass("bg-danger/10");
-  expect(alert).toHaveTextContent(`Ошибка непрерывного процесса (status=${status}): source_unavailable: Связь с источником потеряна.`);
+  expect(alert).toHaveTextContent("Ошибка непрерывного процесса (status=error): source_unavailable: Связь с источником потеряна.");
+  for (const status of ["running", "stopped", "stopping"] as const) {
+    view.rerender(<ContinuousResearch algorithm={algorithm} controller={profileController({ activeStatus: "active", liveReadinessSummary: readinessSummary }, { status, error: controller.process!.error })} />);
+    expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Технический сбой не означает непрохождение допуска/)).not.toBeInTheDocument();
+  }
 });
 it("explains process error status even without a server error description", () => {
   render(<ContinuousResearch algorithm={algorithm} controller={profileController({ activeStatus: "active" }, { status: "error" })} />);
@@ -374,11 +447,11 @@ it("lists all simultaneous problems with bounded server descriptions and no opaq
   render(<ContinuousResearch algorithm={algorithm} controller={profileController({ status: "failed", activeStatus: "error", pendingStatus: "error",
     pendingError: { code: "init_failed", message: "Инициализация недоступна. " + "y".repeat(1000), debug: "private-init-payload" },
     liveReadinessSummary: { ...readinessSummary, generationId: 8, readyInstruments: -1 } },
-  { status: "running", error: { code: "source_error", message: "Источник недоступен. " + "x".repeat(1000) } }, { available: false })} />);
+  { status: "error", error: { code: "source_error", message: "Источник недоступен. " + "x".repeat(1000) } }, { available: false })} />);
   const alert = liveDetails().getByRole("alert");
   const items = within(alert).getAllByRole("listitem");
   expect(items).toHaveLength(7);
-  for (const problem of ["status=failed", "activeStatus=error", "init_failed", "status=running", "source_error", "поколению #8", "действующего поколения #7", "Некорректные числа готовности", "Актуальность снимка не подтверждена"]) expect(alert).toHaveTextContent(problem);
+  for (const problem of ["status=failed", "activeStatus=error", "init_failed", "status=error", "source_error", "поколению #8", "действующего поколения #7", "Некорректные числа готовности", "Актуальность снимка не подтверждена"]) expect(alert).toHaveTextContent(problem);
   expect(items.every((item) => item.textContent.length < 500)).toBe(true);
   expect(alert).not.toHaveTextContent("private-init-payload");
   expect(alert).not.toHaveTextContent("x".repeat(301));
@@ -597,6 +670,7 @@ it("separates successful research, incumbent live and the warming candidate with
   expect(table.getByText("Сохранённое исследование #42")).toBeInTheDocument();
   expect(incumbent).not.toHaveTextContent("#8"); expect(incumbent).not.toHaveTextContent("#42");
   expect(candidate).toHaveTextContent("Инициализация live по текущим данным");
+  expect(candidate.querySelector('[data-slot="badge"]')).toHaveClass("text-info");
   expect(candidate).not.toHaveTextContent("Готов к переключению");
   fireEvent.mouseEnter(screen.getByRole("button", { name: "О настроенных адаптивных профилях" }));
   expect(screen.getByRole("tooltip")).toHaveTextContent("без повторной проверки исторического результата");
@@ -622,6 +696,9 @@ it("keeps the incumbent during a candidate error and renders only bounded public
   expect(screen.getByRole("cell", { name: /Действующее поколение #7/ })).toBeInTheDocument();
   expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Ошибка инициализации live");
   const error = screen.getByRole("alert");
+  expect(error).toHaveClass("text-danger");
+  expect(error.closest('[data-slot="badge"]')).toBeNull();
+  expect(screen.getByRole("cell", { name: /Кандидат #8/ }).querySelector('[data-slot="badge"]')).toBeNull();
   expect(error).toHaveTextContent("history_missing"); expect(error).toHaveTextContent("Недостаточно истории.");
   expect(error.textContent.length).toBeLessThan(420); expect(error).not.toHaveTextContent("do-not-render-raw-payload");
   expect(screen.getByText("SHORT · TP 14% / SL 4% · 0.32 R")).toBeInTheDocument();
@@ -770,6 +847,12 @@ it("keeps heading/name above Segmented and preserves fixed drafts across keyboar
   render(<AlgorithmsPage />);
   const name = await screen.findByLabelText("Внешнее название алгоритма");
   const tabs = screen.getByRole("tablist", { name: "Режим live · Мой алгоритм" });
+  expect(tabs).toHaveAttribute("data-slot", "segmented-list");
+  expect(tabs).toHaveClass("justify-self-center", "justify-center", "w-full", "sm:w-fit");
+  expect(screen.getByRole("heading", { name: "Мой алгоритм · 1" }).parentElement).toHaveClass("justify-center", "text-center");
+  const profiles = screen.getByRole("heading", { name: "Адаптивные профили" });
+  expect(profiles.parentElement).toHaveClass("justify-center", "text-center");
+  expect(profiles.parentElement!.parentElement!.previousElementSibling).toHaveAttribute("data-slot", "separator");
   expect(name.compareDocumentPosition(tabs) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
   expect(screen.queryByRole("button", { name: "Сохранить название" })).not.toBeInTheDocument();
   const flexible = within(tabs).getByRole("tab", { name: "Live-сканирование с гибкими параметрами" });
@@ -809,6 +892,7 @@ it("maps the adaptive dot to saved permission, never research state, draft or re
   await userEvent.click(screen.getByRole("button", { name: "Сохранить разрешение адаптивного live" }));
   await screen.findByText("Разрешение адаптивного live сохранено.");
   expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toHaveClass("bg-success");
+  expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toHaveClass("size-2.5", "ring-2", "ring-background", "motion-safe:animate-live-status");
   expect(flexible).toHaveAccessibleDescription("Live-сканирование включено");
   expect(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }).querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
 });
