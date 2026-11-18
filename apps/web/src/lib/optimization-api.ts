@@ -67,7 +67,7 @@ export interface OptimizationBest {
   observationCutoff?: number;
   partial: boolean;
   params: Record<string, string | number>;
-  analytics: Omit<OptimizationAnalytics, "clusterGapMinutes"> & { clusterGapMinutes: number | null };
+  analytics: Omit<OptimizationAnalytics, "clusterGapMinutes"> & { clusterGapMinutes: number | null; setupMaturity?: number; horizonMinutes?: number };
   matrix: OptimizationMatrixCell[];
   support?: {
     selectedSetupCount?: number;

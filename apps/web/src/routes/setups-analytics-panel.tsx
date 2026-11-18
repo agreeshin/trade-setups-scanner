@@ -286,7 +286,13 @@ function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectan
   </svg>;
 }
 
-function StudyDetailsDialog({ studyId, algorithmId, meta, onClose }: { studyId: number | null; algorithmId: string; meta: SetupsAnalyticsStudyMeta | undefined; onClose: () => void }) {
+function paramFieldLabel(fields: Algorithm["fields"], key: string): string {
+  const field = fields.find((item) => item.key === key);
+  if (field === undefined) return key;
+  return field.unit === "" ? field.label : `${field.label} (${field.unit})`;
+}
+
+function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { studyId: number | null; algorithmId: string; fields: Algorithm["fields"]; meta: SetupsAnalyticsStudyMeta | undefined; onClose: () => void }) {
   const [study, setStudy] = useState<OptimizationStudy | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [series, setSeries] = useState<StudyExpectancySeries | null>(null);
@@ -349,7 +355,7 @@ function StudyDetailsDialog({ studyId, algorithmId, meta, onClose }: { studyId: 
   const score = best?.score ?? study?.progress.bestScore ?? null;
 
   return <Dialog open={studyId !== null} onOpenChange={(open) => { if (!open) onClose(); }}>
-    {studyId !== null && <DialogContent className="max-w-2xl" aria-label={`Исследование №${studyId}`}>
+    {studyId !== null && <DialogContent className="max-w-5xl" aria-label={`Исследование №${studyId}`}>
       <DialogHeader>
         <DialogTitle>Исследование №{studyId}</DialogTitle>
         <DialogDescription>{meta?.externalName ?? "Подробности исследования и график динамики матожидания."}</DialogDescription>
@@ -365,7 +371,20 @@ function StudyDetailsDialog({ studyId, algorithmId, meta, onClose }: { studyId: 
           <h4 className="font-medium">Полные параметры алгоритма</h4>
           {best === null
             ? <p className="mt-1 text-sm text-muted-foreground">Не сохранено</p>
-            : <dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">{Object.entries(best.params).map(([key, value]) => <div key={key} className="break-words"><dt className="text-muted-foreground">{key}</dt><dd>{String(value)}</dd></div>)}</dl>}
+            : <dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">{Object.entries(best.params).map(([key, value]) => <div key={key} className="break-words"><dt className="text-muted-foreground">{paramFieldLabel(fields, key)}</dt><dd>{String(value)}</dd></div>)}</dl>}
+        </div>
+        <div>
+          <h4 className="font-medium">Аналитические параметры</h4>
+          {best?.analytics === undefined
+            ? <p className="mt-1 text-sm text-muted-foreground">Не сохранено</p>
+            : <dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">
+              <div><dt className="text-muted-foreground">Сдвиг времени, мин</dt><dd className="tabular-nums">{best.analytics.timeShiftMinutes}</dd></div>
+              <div><dt className="text-muted-foreground">Смещение цены, %</dt><dd className="tabular-nums">{best.analytics.priceChangePct === null || best.analytics.priceChangePct === undefined ? "не используется" : String(best.analytics.priceChangePct)}</dd></div>
+              <div><dt className="text-muted-foreground">Кластеризация</dt><dd>{best.analytics.clusterEnabled ? "включена" : "выключена"}</dd></div>
+              <div><dt className="text-muted-foreground">Зрелость сетапа в кластере</dt><dd className="tabular-nums">{best.analytics.setupMaturity === undefined ? "—" : best.analytics.setupMaturity.toFixed(1)}</dd></div>
+              <div><dt className="text-muted-foreground">Разрыв кластера, ч</dt><dd className="tabular-nums">{best.analytics.clusterGapMinutes === null || best.analytics.clusterGapMinutes === undefined ? "—" : String(best.analytics.clusterGapMinutes / 60)}</dd></div>
+              <div><dt className="text-muted-foreground">Горизонт сделки, мин</dt><dd className="tabular-nums">{best.analytics.horizonMinutes === undefined ? "—" : String(best.analytics.horizonMinutes)}</dd></div>
+            </dl>}
         </div>
       </div>}
       <div className="grid gap-2">
@@ -683,6 +702,6 @@ export function SetupsAnalyticsPanel() {
       onClose={() => setPickerOpen(false)}
       onApply={() => { setSelectedStudies(pickerSelection.size === studiesMeta.length ? null : new Set(pickerSelection)); setPickerOpen(false); }}
     />
-    <StudyDetailsDialog key={detailStudyId ?? "none"} studyId={detailStudyId} algorithmId={algorithmId} meta={detailMeta} onClose={() => setDetailStudyId(null)} />
+    <StudyDetailsDialog key={detailStudyId ?? "none"} studyId={detailStudyId} algorithmId={algorithmId} fields={(algorithms ?? []).find((algorithm) => algorithm.id === algorithmId)?.fields ?? []} meta={detailMeta} onClose={() => setDetailStudyId(null)} />
   </section>;
 }

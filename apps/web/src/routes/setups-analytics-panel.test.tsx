@@ -32,7 +32,7 @@ const optimizationStudy40 = {
     best: {
       score: 1.5, meanScore: 0.3, trendMode: "blend", partial: false,
       params: { spike_mult: 2.5, min_quote_vol: 1000 },
-      analytics: { clusterEnabled: true, clusterGapMinutes: 480, timeShiftMinutes: 5, priceChangePct: 2 },
+      analytics: { clusterEnabled: true, clusterGapMinutes: 480, timeShiftMinutes: 5, priceChangePct: 2, setupMaturity: 0.4, horizonMinutes: 10080 },
       matrix: [{ tpPct: 20, slPct: 6, riskExpectancy: 0.9, avgMovePct: 1, closedCount: 3, tpCount: 2, slCount: 1, unclosedCount: 0, noDataCount: 0, priceChangeFilteredCount: 0, meanRiskExpectancy: 0.4, forecastRiskExpectancy: 0.44 }],
       support: null,
       provenance: { optimizerVersion: "v", seed: 1, snapshotHash: "h", capturedAt: "2026-11-01T00:00:00Z" },
@@ -56,7 +56,7 @@ beforeEach(() => {
   Object.defineProperty(URL, "revokeObjectURL", { configurable: true, writable: true, value: vi.fn() });
   vi.stubGlobal("fetch", vi.fn((path: string) => {
     requests.push(path);
-    if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "", enabled: true, params: {}, fields: [] }] }));
+    if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "", enabled: true, params: {}, fields: [{ key: "spike_mult", label: "Множитель объёма", type: "decimal", min: 1, max: 20, unit: "×" }, { key: "min_quote_vol", label: "Мин. объём котировки", type: "decimal", min: 0, max: 1000000000, unit: "USDT" }] }] }));
     if (path.startsWith("/v1/setups/analytics/studies")) return Promise.resolve(json({ studies: [studyMeta1, studyMeta2] }));
     if (path === "/v1/setups/analytics/study-expectancy/40") {
       const horizonDays = Array.from({ length: 13 }, (_, index) => 1793923200 + index * 86400);
@@ -173,8 +173,13 @@ it("shows study details with the past-and-live chart in a modal", async () => {
   expect(within(dialog).getByText("Лучшая blend-пара")).toBeInTheDocument();
   expect(within(dialog).getByText("TP 20% / SL 6% · +0.44 R")).toBeInTheDocument();
   expect(within(dialog).getByText("Полные параметры алгоритма")).toBeInTheDocument();
-  expect(within(dialog).getByText("spike_mult")).toBeInTheDocument();
+  expect(within(dialog).getByText("Множитель объёма (×)")).toBeInTheDocument();
+  expect(within(dialog).getByText("Мин. объём котировки (USDT)")).toBeInTheDocument();
   expect(within(dialog).getAllByText("2.5").length).toBeGreaterThan(0);
+  expect(within(dialog).getByText("Аналитические параметры")).toBeInTheDocument();
+  expect(within(dialog).getByText("Сдвиг времени, мин")).toBeInTheDocument();
+  expect(within(dialog).getByText("Смещение цены, %")).toBeInTheDocument();
+  expect(within(dialog).getByText("включена")).toBeInTheDocument();
   const chart = within(dialog).getByTestId("study-horizon-chart");
   expect(chart.querySelector("[data-divider-day]")).not.toBeNull();
   expect(chart.querySelectorAll(".grid-day").length).toBe(13);
