@@ -302,6 +302,13 @@ fn validate_model_source(
 }
 
 #[cfg(test)]
+fn attr_after(svg: &str, marker: &str) -> f64 {
+    let start = svg.find(marker).expect(marker) + marker.len();
+    let end = svg[start..].find('"').expect("closing quote") + start;
+    svg[start..end].parse().expect("numeric attribute")
+}
+
+#[cfg(test)]
 fn probability_request(
     artifact: &ExpectancyArtifact,
     recipe: ForecastRecipe,
@@ -440,7 +447,7 @@ fn write_grid(svg: &mut BoundedSvg, geometry: Geometry) -> fmt::Result {
     } else {
         (day_count / 250.0).ceil()
     };
-    let mut day = geometry.first_x.floor() + 0.5;
+    let mut day = geometry.first_x.ceil();
     while day < last_x {
         let x = geometry.x(day);
         write!(
@@ -1025,6 +1032,15 @@ fn render_svg_projection(
         svg,
         r#"<circle id="raw-close-marker" data-at-unix="{raw_signal_at}" data-forecast-r="{saved_forecast_r}" cx="{marker_x:.3}" cy="{marker_y:.3}" r="5" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="2"/>"#
     )?;
+    let label_at_left = marker_x > RIGHT - LABEL_WIDTH;
+    let label_x = if label_at_left { marker_x - 10.0 } else { marker_x + 10.0 };
+    write!(
+        svg,
+        r#"<text id="raw-close-label" data-forecast-r="{saved_forecast_r}" x="{label_x:.3}" y="{:.3}" text-anchor="{}" font-size="11" fill="{TREND}">{}</text>"#,
+        (marker_y + 4.0).clamp(TOP, BOTTOM),
+        if label_at_left { "end" } else { "start" },
+        risk_label(saved_forecast_r)
+    )?;
     // Reserve the right edge for the explicit C/raw-close annotation. Calendar
     // labels are spaced in pixels; a very late raw-close never overlaps them.
     let mut previous_x: Option<f64> = None;
@@ -1044,7 +1060,7 @@ fn render_svg_projection(
     }
     write!(
         svg,
-        r#"<text id="raw-close-axis" x="{RIGHT}" y="283" text-anchor="end" font-size="11" fill="{AXIS}">Закрытие сигнала</text><text x="476" y="308" text-anchor="middle" font-size="11" fill="{AXIS}">Дата сетапа (UTC) · TP: {} · SL: {} · Закрыто: {}</text></svg>"#,
+        r#"<text x="476" y="308" text-anchor="middle" font-size="11" fill="{AXIS}">Дата сетапа (UTC) · TP: {} · SL: {} · Закрыто: {}</text></svg>"#,
         model.tp_count,
         model.sl_count,
         model
@@ -1497,6 +1513,11 @@ mod tests {
         assert!(svg.contains(&format!("data-forecast-r=\"{}\"", trend.end.value)));
         assert!(svg.contains("Ретроспективная модельная оценка"));
         assert!(svg.contains("id=\"observation-cutoff\"") && svg.contains("class=\"grid-day\""));
+        assert!(svg.contains("id=\"raw-close-label\""));
+        assert!(!svg.contains("Закрытие сигнала"));
+        let grid_first = attr_after(&svg, r#"<line class="grid-day" x1=""#);
+        let date_first = attr_after(&svg, r#"<text class="date" x=""#);
+        assert!((grid_first - date_first).abs() < 0.05);
         let png = render_png_with_model(&artifact, cutoff + 86400, trend.end.value).unwrap();
         setups_relay_protocol::v2::validate_png(&png).unwrap();
         assert_eq!(
