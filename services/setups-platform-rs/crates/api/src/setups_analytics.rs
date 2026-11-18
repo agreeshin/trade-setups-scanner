@@ -783,8 +783,16 @@ async fn setups_analytics_expectancy_png(
     .bind("admin")
     .fetch_optional(&state.pool)
     .await;
-    match png {
-        Ok(Some(bytes)) => Response::builder()
+    let bytes = match png {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => render_expectancy_png(&state.pool, artifact_id).await,
+        Err(_) => Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "expectancy_png_unavailable",
+        )),
+    };
+    match bytes {
+        Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "image/png")
             .body(Body::from(bytes))
@@ -794,12 +802,45 @@ async fn setups_analytics_expectancy_png(
                     "expectancy_png_unavailable",
                 )
             }),
-        Ok(None) => error_response(StatusCode::NOT_FOUND, "expectancy_png_unavailable"),
-        Err(_) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "expectancy_png_unavailable",
-        ),
+        Err(response) => response,
     }
+}
+
+async fn render_expectancy_png(
+    pool: &sqlx::PgPool,
+    artifact_id: i64,
+) -> Result<Vec<u8>, Response> {
+    let unavailable = |status: StatusCode| error_response(status, "expectancy_png_unavailable");
+    let mut artifact = setups_db::expectancy::get(pool, "admin", artifact_id)
+        .await
+        .map_err(|_| unavailable(StatusCode::INTERNAL_SERVER_ERROR))?
+        .ok_or_else(|| unavailable(StatusCode::NOT_FOUND))?;
+    let numerical: setups_domain::expectancy::ExpectancyArtifact =
+        serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
+            .map_err(|_| unavailable(StatusCode::INTERNAL_SERVER_ERROR))?;
+    let recipe = numerical.source.forecast;
+    let saved = numerical
+        .forecast
+        .as_ref()
+        .and_then(|model| model.trend.as_ref())
+        .map(|trend| trend.end.value);
+    tokio::task::spawn_blocking(move || {
+        if let (Some(_), Some(value)) = (recipe, saved) {
+            setups_analytics::expectancy_chart::render_png_with_model(
+                &numerical,
+                numerical.source.provenance.observation_cutoff,
+                value,
+            )
+        } else {
+            setups_analytics::expectancy_chart::render_png_with_trend(
+                &numerical,
+                setups_analytics::expectancy_chart::StudyTrend::default(),
+            )
+        }
+    })
+    .await
+    .map_err(|_| unavailable(StatusCode::INTERNAL_SERVER_ERROR))?
+    .map_err(|_| unavailable(StatusCode::NOT_FOUND))
 }
 
 pub fn setups_analytics_router(state: Arc<AnalyticsState>) -> Router {
