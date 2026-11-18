@@ -15,7 +15,24 @@ const STUDY_EXPECTANCY: &str = "0020_study_expectancy.sql";
 const TELEGRAM_V2_QUEUE: &str = "0021_telegram_v2_queue.sql";
 const HISTORICAL_EXPECTANCY: &str = "0022_historical_expectancy.sql";
 const STANDALONE_PROFILES: &str = "0023_standalone_adaptive_profiles.sql";
-const MIGRATIONS: &[&str] = &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP, INDEPENDENT_LIVE_INITIALIZATION, CONTINUOUS_RESUME, LIVE_READMISSION, TELEGRAM_RELAY, STUDY_EXPECTANCY, TELEGRAM_V2_QUEUE, HISTORICAL_EXPECTANCY, STANDALONE_PROFILES];
+const CONTINUOUS_PENDING_CONFIG: &str = "0024_continuous_pending_config.sql";
+const MIGRATIONS: &[&str] = &[
+    BASELINE,
+    RUN_NAMES,
+    OPTIMIZATION_STUDIES,
+    CONTINUOUS_STUDIES,
+    ADAPTIVE_LIVE_READINESS,
+    CONTINUOUS_HISTORY_CLEANUP,
+    INDEPENDENT_LIVE_INITIALIZATION,
+    CONTINUOUS_RESUME,
+    LIVE_READMISSION,
+    TELEGRAM_RELAY,
+    STUDY_EXPECTANCY,
+    TELEGRAM_V2_QUEUE,
+    HISTORICAL_EXPECTANCY,
+    STANDALONE_PROFILES,
+    CONTINUOUS_PENDING_CONFIG,
+];
 
 fn migration_source(name: &str) -> &'static str {
     match name {
@@ -24,8 +41,12 @@ fn migration_source(name: &str) -> &'static str {
         OPTIMIZATION_STUDIES => include_str!("../migrations/0012_optimization_studies.sql"),
         CONTINUOUS_STUDIES => include_str!("../migrations/0013_continuous_studies.sql"),
         ADAPTIVE_LIVE_READINESS => include_str!("../migrations/0014_adaptive_live_readiness.sql"),
-        CONTINUOUS_HISTORY_CLEANUP => include_str!("../migrations/0015_continuous_history_cleanup.sql"),
-        INDEPENDENT_LIVE_INITIALIZATION => include_str!("../migrations/0016_independent_live_initialization.sql"),
+        CONTINUOUS_HISTORY_CLEANUP => {
+            include_str!("../migrations/0015_continuous_history_cleanup.sql")
+        }
+        INDEPENDENT_LIVE_INITIALIZATION => {
+            include_str!("../migrations/0016_independent_live_initialization.sql")
+        }
         CONTINUOUS_RESUME => include_str!("../migrations/0017_continuous_resume.sql"),
         LIVE_READMISSION => include_str!("../migrations/0018_live_readmission.sql"),
         TELEGRAM_RELAY => include_str!("../migrations/0019_telegram_relay.sql"),
@@ -33,6 +54,9 @@ fn migration_source(name: &str) -> &'static str {
         TELEGRAM_V2_QUEUE => include_str!("../migrations/0021_telegram_v2_queue.sql"),
         HISTORICAL_EXPECTANCY => include_str!("../migrations/0022_historical_expectancy.sql"),
         STANDALONE_PROFILES => include_str!("../migrations/0023_standalone_adaptive_profiles.sql"),
+        CONTINUOUS_PENDING_CONFIG => {
+            include_str!("../migrations/0024_continuous_pending_config.sql")
+        }
         other => unreachable!("unknown migration {other}"),
     }
 }
@@ -92,7 +116,26 @@ mod tests {
 
     #[test]
     fn run_names_migration_is_registered_after_baseline() {
-        assert_eq!(MIGRATIONS, &[BASELINE, RUN_NAMES, OPTIMIZATION_STUDIES, CONTINUOUS_STUDIES, ADAPTIVE_LIVE_READINESS, CONTINUOUS_HISTORY_CLEANUP, INDEPENDENT_LIVE_INITIALIZATION, CONTINUOUS_RESUME, LIVE_READMISSION, TELEGRAM_RELAY, STUDY_EXPECTANCY, TELEGRAM_V2_QUEUE, HISTORICAL_EXPECTANCY, STANDALONE_PROFILES]);
+        assert_eq!(
+            MIGRATIONS,
+            &[
+                BASELINE,
+                RUN_NAMES,
+                OPTIMIZATION_STUDIES,
+                CONTINUOUS_STUDIES,
+                ADAPTIVE_LIVE_READINESS,
+                CONTINUOUS_HISTORY_CLEANUP,
+                INDEPENDENT_LIVE_INITIALIZATION,
+                CONTINUOUS_RESUME,
+                LIVE_READMISSION,
+                TELEGRAM_RELAY,
+                STUDY_EXPECTANCY,
+                TELEGRAM_V2_QUEUE,
+                HISTORICAL_EXPECTANCY,
+                STANDALONE_PROFILES,
+                CONTINUOUS_PENDING_CONFIG
+            ]
+        );
         let source = migration_source(RUN_NAMES);
         assert!(
             source.contains("ALTER TABLE public.replay_runs ADD COLUMN IF NOT EXISTS name text")

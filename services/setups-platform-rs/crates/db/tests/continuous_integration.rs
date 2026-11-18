@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use setups_db::continuous::scheduler;
 use setups_db::{continuous as db, optimization};
 use setups_domain::{AlgorithmParams, SpikeParams, SpikeSetup};
+use sqlx::Row;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use std::{collections::BTreeSet, future::Future, str::FromStr, time::Duration};
 
@@ -139,7 +140,9 @@ async fn configured(pool: &PgPool, owner: &str, algorithm: &str) -> i64 {
             .unwrap()
     );
     assert!(db::start(pool, owner, algorithm).await.unwrap());
-    db::profiles::set_permission(pool,owner,algorithm,true).await.unwrap();
+    db::profiles::set_permission(pool, owner, algorithm, true)
+        .await
+        .unwrap();
     db::get(pool, owner, algorithm)
         .await
         .unwrap()
@@ -256,7 +259,7 @@ fn adaptive_write(open: i64) -> db::AdaptiveSetupWrite {
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
 async fn n8_migration_preserves_six_incumbents_17_to_22_and_all_durable_links() {
     isolated(|pool|async move {
         for (name,source) in [
@@ -312,7 +315,7 @@ async fn n8_migration_preserves_six_incumbents_17_to_22_and_all_durable_links() 
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
 async fn maintenance_drained_configure_preserves_running_research_and_independent_live() {
     isolated(|pool| async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
@@ -380,83 +383,142 @@ async fn maintenance_live_snapshot(pool: &PgPool) -> Value {
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
-async fn maintenance_configure_rejects_unpaused_owner_chains_stopping_and_stale_heads() {
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
+async fn configure_defers_while_research_may_be_in_flight_and_applies_on_start() {
     isolated(|pool| async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
         let slot = configured(&pool, OWNER, ALGORITHM).await;
         let mut next = config(ALGORITHM);
         next["study"]["trendMode"] = json!("forecast");
-        async fn rejected(pool: &PgPool, next: &Value) {
-            async fn state(pool: &PgPool) -> Value {
-                sqlx::query_scalar("select jsonb_build_object('processes',(select jsonb_agg(to_jsonb(p) order by owner_id,algorithm_id) from continuous_processes p),'slots',(select jsonb_agg(to_jsonb(s) order by id) from continuous_slots s),'generations',(select jsonb_agg(to_jsonb(g) order by id) from continuous_generations g),'maintenance',(select jsonb_agg(to_jsonb(m) order by owner_id) from continuous_maintenance m),'permissions',(select jsonb_agg(to_jsonb(p) order by owner_id,algorithm_id) from adaptive_live_permissions p))")
-                    .fetch_one(pool).await.unwrap()
-            }
-            let before = state(pool).await;
-            assert!(!db::configure(pool, OWNER, ALGORITHM, next, &[4.0]).await.unwrap());
-            assert_eq!(state(pool).await, before, "rejection must leave configuration and state unchanged");
+        next["minSetupsPerDay"] = json!([8.0]);
+        async fn snapshot(pool: &PgPool) -> (Value, i64, Option<Value>, Vec<f64>) {
+            let row = sqlx::query("select config,config_revision,pending_config from continuous_processes where owner_id=$1 and algorithm_id=$2")
+                .bind(OWNER).bind(ALGORITHM).fetch_one(pool).await.unwrap();
+            let enabled: Vec<f64> = sqlx::query_scalar("select s.min_setups_per_day::double precision from continuous_slots s where s.owner_id=$1 and s.algorithm_id=$2 and s.enabled order by s.min_setups_per_day")
+                .bind(OWNER).bind(ALGORITHM).fetch_all(pool).await.unwrap();
+            (row.try_get("config").unwrap(), row.try_get("config_revision").unwrap(), row.try_get("pending_config").unwrap(), enabled)
         }
-        rejected(&pool, &next).await; // No durable maintenance row.
+        let (baseline, revision, pending, enabled) = snapshot(&pool).await;
+        assert_eq!(pending, None);
+        assert_eq!(enabled, vec![4.0]);
+        async fn deferred(pool: &PgPool, next: &Value, baseline: &Value, revision: i64) {
+            assert!(db::configure(pool, OWNER, ALGORITHM, next, &[8.0]).await.unwrap());
+            let (config, revision_now, pending, enabled) = snapshot(pool).await;
+            assert_eq!(pending.as_ref(), Some(next), "save must land in pending_config");
+            assert_eq!(config, *baseline, "active chain keeps its parameters");
+            assert_eq!(revision_now, revision, "revision fences stay untouched");
+            assert_eq!(enabled, vec![4.0], "slot membership is not rebuilt while research runs");
+        }
+        deferred(&pool, &next, &baseline, revision).await; // No durable maintenance row.
         db::maintenance::set_paused(&pool, OWNER, false).await.unwrap();
-        rejected(&pool, &next).await;
+        deferred(&pool, &next, &baseline, revision).await;
         db::maintenance::set_paused(&pool, OWNER, true).await.unwrap();
         let other_slot = configured(&pool, OWNER, OTHER_ALGORITHM).await;
         let other = generation(&pool, OWNER, OTHER_ALGORITHM, other_slot, "running").await;
         assert_eq!(db::maintenance::status(&pool, OWNER).await.unwrap().state, "draining");
-        rejected(&pool, &next).await; // Owner-wide, even when another algorithm owns the chain.
+        deferred(&pool, &next, &baseline, revision).await; // Owner-wide, even when another algorithm owns the chain.
         sqlx::query("update continuous_generations set status='completed' where id=$1").bind(other).execute(&pool).await.unwrap();
         sqlx::query("update continuous_processes set status='stopping' where owner_id=$1 and algorithm_id=$2").bind(OWNER).bind(ALGORITHM).execute(&pool).await.unwrap();
-        rejected(&pool, &next).await;
+        assert!(!db::configure(&pool, OWNER, ALGORITHM, &next, &[8.0]).await.unwrap(), "stopping still rejects");
+        let (config, revision_now, pending_now, enabled_now) = snapshot(&pool).await;
+        assert_eq!((config, revision_now, pending_now, enabled_now), (baseline.clone(), revision, Some(next.clone()), vec![4.0]), "rejection must leave state unchanged");
         sqlx::query("update continuous_processes set status='running' where owner_id=$1 and algorithm_id=$2").bind(OWNER).bind(ALGORITHM).execute(&pool).await.unwrap();
         let terminal = generation(&pool, OWNER, ALGORITHM, slot, "completed").await;
         sqlx::query("update continuous_processes set active_generation_id=$3 where owner_id=$1 and algorithm_id=$2").bind(OWNER).bind(ALGORITHM).bind(terminal).execute(&pool).await.unwrap();
         assert_eq!(db::maintenance::status(&pool, OWNER).await.unwrap().state, "drained");
-        rejected(&pool, &next).await;
+        deferred(&pool, &next, &baseline, revision).await; // Stale active head defers instead of reconfiguring.
         let terminal_study = study(&pool, OWNER, ALGORITHM, "completed", Some(terminal), Some(slot)).await;
         sqlx::query("update continuous_processes set active_generation_id=null,active_study_id=$3 where owner_id=$1 and algorithm_id=$2").bind(OWNER).bind(ALGORITHM).bind(terminal_study).execute(&pool).await.unwrap();
-        rejected(&pool, &next).await;
+        deferred(&pool, &next, &baseline, revision).await;
+        // A stopped process applies the deferred configuration on start: the next
+        // admitted generation runs with the saved parameters.
+        sqlx::query("update continuous_processes set desired_running=false,status='stopped',active_generation_id=null,active_study_id=null where owner_id=$1 and algorithm_id=$2").bind(OWNER).bind(ALGORITHM).execute(&pool).await.unwrap();
+        assert!(db::start(&pool, OWNER, ALGORITHM).await.unwrap());
+        let (config, revision_now, pending, enabled) = snapshot(&pool).await;
+        assert_eq!(config, next, "start applies the deferred configuration");
+        assert_eq!(revision_now, revision + 1);
+        assert_eq!(pending, None);
+        assert_eq!(enabled, vec![8.0], "slot membership is rebuilt from the deferred thresholds");
     }).await;
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
 async fn maintenance_configure_locks_durable_pause_and_serializes_concurrent_resume() {
     isolated(|pool| async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
         configured(&pool, OWNER, ALGORITHM).await;
-        db::maintenance::set_paused(&pool, OWNER, true).await.unwrap();
+        db::maintenance::set_paused(&pool, OWNER, true)
+            .await
+            .unwrap();
         let mut next = config(ALGORITHM);
         next["study"]["trendMode"] = json!("forecast");
         let mut blocker = pool.begin().await.unwrap();
-        sqlx::query("select admission_paused from continuous_maintenance where owner_id=$1 for update")
-            .bind(OWNER).fetch_one(&mut *blocker).await.unwrap();
+        sqlx::query(
+            "select admission_paused from continuous_maintenance where owner_id=$1 for update",
+        )
+        .bind(OWNER)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
         let configured_pool = pool.clone();
-        let configured = tokio::spawn(async move { db::configure(&configured_pool, OWNER, ALGORITHM, &next, &[4.0]).await });
+        let configured = tokio::spawn(async move {
+            db::configure(&configured_pool, OWNER, ALGORITHM, &next, &[4.0]).await
+        });
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let free: bool = sqlx::query_scalar("select pg_try_advisory_xact_lock(hashtextextended($1,72423415))")
-                    .bind(OWNER).fetch_one(&pool).await.unwrap();
-                if !free { break; }
+                let free: bool = sqlx::query_scalar(
+                    "select pg_try_advisory_xact_lock(hashtextextended($1,72423415))",
+                )
+                .bind(OWNER)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if !free {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await.expect("configure must hold the owner mutation lock while waiting for the maintenance row");
-        assert!(!configured.is_finished(), "durable maintenance row must be locked, not read optimistically");
+        })
+        .await
+        .expect(
+            "configure must hold the owner mutation lock while waiting for the maintenance row",
+        );
+        assert!(
+            !configured.is_finished(),
+            "durable maintenance row must be locked, not read optimistically"
+        );
         let resumed_pool = pool.clone();
-        let mut resumed = tokio::spawn(async move { db::maintenance::set_paused(&resumed_pool, OWNER, false).await });
-        assert!(tokio::time::timeout(Duration::from_millis(50), &mut resumed).await.is_err(), "resume must wait behind the same owner mutation fence");
+        let mut resumed =
+            tokio::spawn(
+                async move { db::maintenance::set_paused(&resumed_pool, OWNER, false).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut resumed)
+                .await
+                .is_err(),
+            "resume must wait behind the same owner mutation fence"
+        );
         blocker.commit().await.unwrap();
         assert!(configured.await.unwrap().unwrap());
         assert!(!resumed.await.unwrap().unwrap().admission_paused);
-        let lease = scheduler::claim_owner(&pool, "after-fenced-resume").await.unwrap().unwrap();
-        let job = scheduler::prepare_next(&pool, &lease).await.unwrap().unwrap();
+        let lease = scheduler::claim_owner(&pool, "after-fenced-resume")
+            .await
+            .unwrap()
+            .unwrap();
+        let job = scheduler::prepare_next(&pool, &lease)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(job.config_revision, 2);
         assert_eq!(job.spec["trendMode"], "forecast");
         scheduler::release(&pool, &lease).await.unwrap();
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
 async fn n8_independent_lifecycle_research_stop_new_id_profile_play_grants_and_fences() {
     isolated(|pool|async move {
         use db::profiles::{self,ProfileCommand,CommandOutcome};
@@ -506,7 +568,7 @@ async fn n8_independent_lifecycle_research_stop_new_id_profile_play_grants_and_f
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
 async fn n8_handoff_negative_outcomes_sticky_stop_ordering_and_configured_limits() {
     isolated(|pool|async move {
         use db::profiles::{self,ProfileCommand,CommandOutcome,ProfileLimits};
@@ -556,39 +618,136 @@ async fn n8_handoff_negative_outcomes_sticky_stop_ordering_and_configured_limits
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
 async fn continuous_handoff_lifecycle_records_follow_commit_and_hide_payloads() {
-    const CHILD:&str="SETUPS_HANDOFF_LOG_TEST_CHILD";
+    const CHILD: &str = "SETUPS_HANDOFF_LOG_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
         // Capture the real shared stderr sink without adding a process-global
         // collector/test hook to production logging. The child owns its test DB.
-        let output=tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--ignored","--exact","continuous_handoff_lifecycle_records_follow_commit_and_hide_payloads","--nocapture"])
-            .env(CHILD,"1").env("RUST_LOG","info").output().await.unwrap();
-        assert!(output.status.success(),"log fixture failed: {}",String::from_utf8_lossy(&output.stderr));
-        let stderr=String::from_utf8(output.stderr).unwrap();
-        assert!(!stderr.contains("private-"),"private fixture snapshots, idempotency keys and raw DB errors must not be logged");
-        let records:Vec<Value>=stderr.lines().filter_map(|line|serde_json::from_str(line).ok()).collect();
-        for record in &records {assert!(record.to_string().len()+1<=setups_db::diagnostics::MAX_RECORD_BYTES);}
-        let outcomes=|event:&str|records.iter().filter(|r|r["event"]==event).map(|r|r["outcome"].as_str().unwrap()).collect::<Vec<_>>();
-        assert_eq!(outcomes("continuous_finalization_finished"),["error","finalized","already_completed","finalized","finalized"]);
-        let nonpasses:Vec<_>=records.iter().filter(|r|r["event"]=="continuous_finalization_finished" && r["accepted"]==false).collect();
-        assert_eq!(nonpasses.iter().map(|r|r["reason"].as_str().unwrap()).collect::<Vec<_>>(),["no_winner","quality_gate_nonpass"]);
-        assert!(nonpasses.iter().all(|r|r["handoff_state"]=="not_created"));
-        assert_eq!(outcomes("continuous_profile_handoff_finished"),["error","accepted"],"idle polls must not add INFO records");
-        let failed_handoff=records.iter().find(|r|r["event"]=="continuous_profile_handoff_finished" && r["outcome"]=="error").unwrap();
-        assert_eq!(failed_handoff["admission_state"],"not_confirmed");
-        for field in ["reason","desired_running"] {assert!(failed_handoff.get(field).is_none(),"unconfirmed COMMIT must not retain tentative {field}");}
-        assert!(!failed_handoff.to_string().contains("rolled_back"),"an unconfirmed acknowledgement does not prove rollback");
-        assert_eq!(outcomes("live_initialization_claimed"),["claimed","claimed","claimed"]);
-        assert!(outcomes("live_initialization_claim_finished").is_empty(),"ordinary claim misses are DEBUG only");
-        assert_eq!(outcomes("live_readmission_finished"),["error","granted","already_granted","conflict","not_found"]);
-        for record in records.iter().filter(|r|matches!(r["event"].as_str(),Some("continuous_finalization_finished"|"continuous_profile_handoff_finished"|"live_initialization_claimed"))) {
-            assert!(record["study_id"].is_i64());assert!(record["generation_id"].is_i64());assert!(record["profile_id"].is_i64());
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "continuous_handoff_lifecycle_records_follow_commit_and_hide_payloads",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("RUST_LOG", "info")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "log fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            !stderr.contains("private-"),
+            "private fixture snapshots, idempotency keys and raw DB errors must not be logged"
+        );
+        let records: Vec<Value> = stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        for record in &records {
+            assert!(record.to_string().len() + 1 <= setups_db::diagnostics::MAX_RECORD_BYTES);
+        }
+        let outcomes = |event: &str| {
+            records
+                .iter()
+                .filter(|r| r["event"] == event)
+                .map(|r| r["outcome"].as_str().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            outcomes("continuous_finalization_finished"),
+            [
+                "error",
+                "finalized",
+                "already_completed",
+                "finalized",
+                "finalized"
+            ]
+        );
+        let nonpasses: Vec<_> = records
+            .iter()
+            .filter(|r| r["event"] == "continuous_finalization_finished" && r["accepted"] == false)
+            .collect();
+        assert_eq!(
+            nonpasses
+                .iter()
+                .map(|r| r["reason"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["no_winner", "quality_gate_nonpass"]
+        );
+        assert!(
+            nonpasses
+                .iter()
+                .all(|r| r["handoff_state"] == "not_created")
+        );
+        assert_eq!(
+            outcomes("continuous_profile_handoff_finished"),
+            ["error", "accepted"],
+            "idle polls must not add INFO records"
+        );
+        let failed_handoff = records
+            .iter()
+            .find(|r| {
+                r["event"] == "continuous_profile_handoff_finished" && r["outcome"] == "error"
+            })
+            .unwrap();
+        assert_eq!(failed_handoff["admission_state"], "not_confirmed");
+        for field in ["reason", "desired_running"] {
+            assert!(
+                failed_handoff.get(field).is_none(),
+                "unconfirmed COMMIT must not retain tentative {field}"
+            );
+        }
+        assert!(
+            !failed_handoff.to_string().contains("rolled_back"),
+            "an unconfirmed acknowledgement does not prove rollback"
+        );
+        assert_eq!(
+            outcomes("live_initialization_claimed"),
+            ["claimed", "claimed", "claimed"]
+        );
+        assert!(
+            outcomes("live_initialization_claim_finished").is_empty(),
+            "ordinary claim misses are DEBUG only"
+        );
+        assert_eq!(
+            outcomes("live_readmission_finished"),
+            [
+                "error",
+                "granted",
+                "already_granted",
+                "conflict",
+                "not_found"
+            ]
+        );
+        for record in records.iter().filter(|r| {
+            matches!(
+                r["event"].as_str(),
+                Some(
+                    "continuous_finalization_finished"
+                        | "continuous_profile_handoff_finished"
+                        | "live_initialization_claimed"
+                )
+            )
+        }) {
+            assert!(record["study_id"].is_i64());
+            assert!(record["generation_id"].is_i64());
+            assert!(record["profile_id"].is_i64());
             assert!(record["duration_ms"].is_u64());
         }
-        for record in records.iter().filter(|r|r["event"]=="live_readmission_finished" && matches!(r["outcome"].as_str(),Some("granted"|"already_granted"))) {
-            assert!(record["study_id"].is_i64());assert_eq!(record["attempt"],3);assert_eq!(record["attempt_limit"],6);
+        for record in records.iter().filter(|r| {
+            r["event"] == "live_readmission_finished"
+                && matches!(r["outcome"].as_str(), Some("granted" | "already_granted"))
+        }) {
+            assert!(record["study_id"].is_i64());
+            assert_eq!(record["attempt"], 3);
+            assert_eq!(record["attempt_limit"], 6);
         }
         return;
     }
@@ -656,7 +815,7 @@ async fn continuous_handoff_lifecycle_records_follow_commit_and_hide_payloads() 
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
 async fn telegram_explicit_legacy_v1_keeps_original_utf8_body_and_32k_reservation() {
     isolated(|pool|async move {
         use setups_db::telegram as tg;
@@ -682,7 +841,7 @@ async fn telegram_explicit_legacy_v1_keeps_original_utf8_body_and_32k_reservatio
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
 async fn telegram_fixed_independent_enqueue_raw_bytes_fences_capacity_expiry_and_rollback() {
     isolated(|pool|async move {
         use setups_db::telegram as tg;
@@ -748,8 +907,9 @@ async fn telegram_fixed_independent_enqueue_raw_bytes_fences_capacity_expiry_and
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
-async fn telegram_adaptive_atomic_checkpoint_promotion_stop_and_confirmed_cleanup_preserve_publication() {
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
+async fn telegram_adaptive_atomic_checkpoint_promotion_stop_and_confirmed_cleanup_preserve_publication()
+ {
     isolated(|pool|async move {
         use setups_db::telegram as tg;
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();tg::set_config(&pool,0,true,"https://relay.example").await.unwrap();
@@ -769,7 +929,7 @@ async fn telegram_adaptive_atomic_checkpoint_promotion_stop_and_confirmed_cleanu
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
 async fn telegram_pre_promotion_source_remains_deliverable_but_nonpass_and_stop_block() {
     isolated(|pool|async move {
         use setups_db::telegram as tg;
@@ -792,8 +952,9 @@ async fn telegram_pre_promotion_source_remains_deliverable_but_nonpass_and_stop_
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test"]
-async fn telegram_explicit_test_markers_use_original_expiry_clear_all_results_and_expire_without_rearming() {
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test"]
+async fn telegram_explicit_test_markers_use_original_expiry_clear_all_results_and_expire_without_rearming()
+ {
     isolated(|pool|async move {
         use setups_db::telegram as tg;
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();tg::set_config(&pool,0,true,"https://a.example/").await.unwrap();
@@ -856,50 +1017,118 @@ struct PurgeFixture {
     lease: scheduler::OwnerLease,
 }
 
-async fn purge_fixture(pool:&PgPool)->PurgeFixture {
+async fn purge_fixture(pool: &PgPool) -> PurgeFixture {
     setups_db::migrate::ensure_migrations(pool).await.unwrap();
-    let active=accepted(pool).await;
-    let b=batch(pool,ALGORITHM,Some(active.generation_id)).await;
-    let r=run(pool,b,ALGORITHM,"done",Some(active.generation_id)).await;
-    let standalone=run(pool,b,ALGORITHM,"done",Some(active.generation_id)).await;
-    sqlx::query("update replay_runs set batch_id=null where id=$1").bind(standalone).execute(pool).await.unwrap();
+    let active = accepted(pool).await;
+    let b = batch(pool, ALGORITHM, Some(active.generation_id)).await;
+    let r = run(pool, b, ALGORITHM, "done", Some(active.generation_id)).await;
+    let standalone = run(pool, b, ALGORITHM, "done", Some(active.generation_id)).await;
+    sqlx::query("update replay_runs set batch_id=null where id=$1")
+        .bind(standalone)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query("update continuous_generations set replay_batch_id=$2,replay_manifest=$3,result=result||$4 where id=$1")
         .bind(active.generation_id).bind(b).bind(json!({"provenance":"frozen sentinel","instruments":[{"runId":r}]}))
         .bind(json!({"analytics":{"evaluation":{"matrix":[{"riskExpectancy":0.32}],"summary":{"score":0.32}},"sentinel":"independent post-chain"}})).execute(pool).await.unwrap();
-    let second_slot=configured(pool,OWNER,OTHER_ALGORITHM).await;
-    let second_generation=generation(pool,OWNER,OTHER_ALGORITHM,second_slot,"failed").await;
-    let second_study=study(pool,OWNER,OTHER_ALGORITHM,"failed",Some(second_generation),Some(second_slot)).await;
-    sqlx::query("update continuous_generations set study_id=$2 where id=$1").bind(second_generation).bind(second_study).execute(pool).await.unwrap();
-    study(pool,OWNER,ALGORITHM,"completed",None,None).await;
-    let manual_batch=batch(pool,ALGORITHM,None).await;
-    run(pool,manual_batch,ALGORITHM,"done",None).await;
-    let other_slot=configured(pool,"tenant-two",ALGORITHM).await;
-    let other_generation=generation(pool,"tenant-two",ALGORITHM,other_slot,"completed").await;
-    study(pool,"tenant-two",ALGORITHM,"completed",Some(other_generation),Some(other_slot)).await;
+    let second_slot = configured(pool, OWNER, OTHER_ALGORITHM).await;
+    let second_generation = generation(pool, OWNER, OTHER_ALGORITHM, second_slot, "failed").await;
+    let second_study = study(
+        pool,
+        OWNER,
+        OTHER_ALGORITHM,
+        "failed",
+        Some(second_generation),
+        Some(second_slot),
+    )
+    .await;
+    sqlx::query("update continuous_generations set study_id=$2 where id=$1")
+        .bind(second_generation)
+        .bind(second_study)
+        .execute(pool)
+        .await
+        .unwrap();
+    study(pool, OWNER, ALGORITHM, "completed", None, None).await;
+    let manual_batch = batch(pool, ALGORITHM, None).await;
+    run(pool, manual_batch, ALGORITHM, "done", None).await;
+    let other_slot = configured(pool, "tenant-two", ALGORITHM).await;
+    let other_generation = generation(pool, "tenant-two", ALGORITHM, other_slot, "completed").await;
+    study(
+        pool,
+        "tenant-two",
+        ALGORITHM,
+        "completed",
+        Some(other_generation),
+        Some(other_slot),
+    )
+    .await;
     sqlx::query("insert into adaptive_live_checkpoints(slot_id,instrument_key,generation_id,state) values($1,'other/sentinel',$2,'{}')").bind(other_slot).bind(other_generation).execute(pool).await.unwrap();
     sqlx::query("update adaptive_live_warmup_lane set slot_id=$1,generation_id=$2,lease_token=7,lease_owner='other-worker',lease_until=now()+interval '1 hour'").bind(other_slot).bind(other_generation).execute(pool).await.unwrap();
-    setups_db::settings_set(pool,"notifications",&json!({"maxAgeSeconds":3600})).await.unwrap();
-    setups_db::settings_set(pool,"optimization-draft:price_volume_spike",&json!({"keep":"shared draft"})).await.unwrap();
-    let now=chrono::Utc::now().timestamp().div_euclid(60)*60;
-    let signal=db::commit_adaptive_scan_cas(pool,&active,INSTRUMENT,None,&promotion_state(active.generation_id,now),&[adaptive_write(now-60)]).await.unwrap().inserted[0].id;
-    db::outbox::commit_fixed_setup(pool,"bybit","linear","BTCUSDT",&adaptive_write(now-60).setup).await.unwrap().unwrap();
+    setups_db::settings_set(pool, "notifications", &json!({"maxAgeSeconds":3600}))
+        .await
+        .unwrap();
+    setups_db::settings_set(
+        pool,
+        "optimization-draft:price_volume_spike",
+        &json!({"keep":"shared draft"}),
+    )
+    .await
+    .unwrap();
+    let now = chrono::Utc::now().timestamp().div_euclid(60) * 60;
+    let signal = db::commit_adaptive_scan_cas(
+        pool,
+        &active,
+        INSTRUMENT,
+        None,
+        &promotion_state(active.generation_id, now),
+        &[adaptive_write(now - 60)],
+    )
+    .await
+    .unwrap()
+    .inserted[0]
+        .id;
+    db::outbox::commit_fixed_setup(
+        pool,
+        "bybit",
+        "linear",
+        "BTCUSDT",
+        &adaptive_write(now - 60).setup,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     sqlx::query("insert into replay_quality_intervals(run_id,from_unix,to_unix,reason) values($1,0,60,'sentinel'),($2,0,60,'sentinel')").bind(r).bind(standalone).execute(pool).await.unwrap();
     sqlx::query("insert into replay_cache(cache_key,exchange_code,category,symbol,algorithm_id,algorithm_version,params,from_ts,to_ts,setups,warmup_minutes,processed_minutes,quality_source_run_id) values('shared','bybit','linear','BTCUSDT',$1,'1.1.1','{}',to_timestamp(0),to_timestamp(3600),'[]',1,1,$2)").bind(ALGORITHM).bind(r).execute(pool).await.unwrap();
     sqlx::raw_sql("insert into analytics_selection_cache(scope_key,maturity_tenths,month_key,algorithm_version,result_json) values('batch:sentinel',0,'all',1,'{\"keep\":true}');insert into analytics_matrix_cache(scope_key,direction,maturity_tenths,month_key,tp_pct,sl_pct,horizon_minutes,time_shift_minutes,price_change_ppm,algorithm_version,result_json) values('batch:sentinel','short',0,'all',1,1,1,0,-1,1,'{\"keep\":true}');insert into analytics_trades_cache(scope_key,direction,maturity_tenths,exchange_code,category,symbol,close_time_unix,tp_pct,sl_pct,horizon_minutes,time_shift_minutes,price_change_ppm,algorithm_version,result_json) values('batch:sentinel','short',0,'bybit','linear','BTCUSDT',60,1,1,1,0,-1,1,'{\"keep\":true}')").execute(pool).await.unwrap();
-    for algorithm in [ALGORITHM,OTHER_ALGORITHM] {db::stop(pool,OWNER,algorithm).await.unwrap();}
-    let lease=scheduler::claim_owner(pool,"purge-fixture").await.unwrap().unwrap();
-    assert_eq!(lease.owner_id,OWNER);
-    for algorithm in [ALGORITHM,OTHER_ALGORITHM] {cleanup_owned(pool,&lease,algorithm).await.unwrap();}
-    PurgeFixture {active,batch:b,run:r,standalone,signal,lease}
+    for algorithm in [ALGORITHM, OTHER_ALGORITHM] {
+        db::stop(pool, OWNER, algorithm).await.unwrap();
+    }
+    let lease = scheduler::claim_owner(pool, "purge-fixture")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.owner_id, OWNER);
+    for algorithm in [ALGORITHM, OTHER_ALGORITHM] {
+        cleanup_owned(pool, &lease, algorithm).await.unwrap();
+    }
+    PurgeFixture {
+        active,
+        batch: b,
+        run: r,
+        standalone,
+        signal,
+        lease,
+    }
 }
 
-async fn purge_preserved(pool:&PgPool)->Value {
+async fn purge_preserved(pool: &PgPool) -> Value {
     sqlx::query_scalar("select jsonb_build_object('studies',(select jsonb_agg(to_jsonb(s) order by id) from optimization_studies s where origin='manual' or owner_id<>'admin'),'settings',(select jsonb_agg(to_jsonb(s) order by key) from settings s),'cache',(select jsonb_agg(to_jsonb(c) order by cache_key) from replay_cache c),'selection',(select jsonb_agg(to_jsonb(c)) from analytics_selection_cache c),'matrix',(select jsonb_agg(to_jsonb(c)) from analytics_matrix_cache c),'trades',(select jsonb_agg(to_jsonb(c)) from analytics_trades_cache c),'quality',(select jsonb_agg(to_jsonb(q) order by run_id) from replay_quality_intervals q),'foreignSlots',(select jsonb_agg(to_jsonb(s) order by id) from continuous_slots s where owner_id<>'admin'),'foreignCheckpoints',(select jsonb_agg(to_jsonb(c) order by slot_id) from adaptive_live_checkpoints c join continuous_slots s on s.id=c.slot_id where s.owner_id<>'admin'),'warmup',(select to_jsonb(w) from adaptive_live_warmup_lane w),'fixedOutbox',(select jsonb_agg(to_jsonb(o) order by id) from adaptive_notification_outbox o where slot_id is null or owner_id<>'admin'))").fetch_one(pool).await.unwrap()
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn history_purge_preserves_mixed_outputs_analytics_identity_and_supports_restart_and_row_delete() {
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn history_purge_preserves_mixed_outputs_analytics_identity_and_supports_restart_and_row_delete()
+ {
     use db::cleanup::*;
     isolated(|pool|async move {
         let f=purge_fixture(&pool).await;
@@ -957,7 +1186,7 @@ async fn history_purge_preserves_mixed_outputs_analytics_identity_and_supports_r
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn history_purge_guards_active_work_claimed_delivery_stale_preview_and_rolls_back_failure() {
     use db::cleanup::*;
     isolated(|pool|async move {
@@ -981,8 +1210,9 @@ async fn history_purge_guards_active_work_claimed_delivery_stale_preview_and_rol
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn history_purge_preserves_analytics_null_missing_and_rejects_cross_owner_or_collapsed_results() {
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn history_purge_preserves_analytics_null_missing_and_rejects_cross_owner_or_collapsed_results()
+ {
     use db::cleanup::*;
     isolated(|pool|async move {
         let f=purge_fixture(&pool).await;
@@ -1010,7 +1240,7 @@ async fn history_purge_preserves_analytics_null_missing_and_rejects_cross_owner_
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn history_purge_owner_fence_serializes_new_algorithm_insert() {
     use db::cleanup::*;
     isolated(|pool|async move {
@@ -1041,7 +1271,7 @@ async fn history_purge_owner_fence_serializes_new_algorithm_insert() {
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn history_purge_nonpass_archives_exact_effective_analytics_once_without_live_fallback() {
     use db::cleanup::*;
     isolated(|pool|async move {
@@ -1279,33 +1509,50 @@ async fn adaptive_cas_is_atomic_fenced_and_deduplicates_across_generations() {
     }).await;
 }
 
-async fn adaptive_batch_profile(pool:&PgPool,close:i64)->db::ActiveAdaptiveSlot {
+async fn adaptive_batch_profile(pool: &PgPool, close: i64) -> db::ActiveAdaptiveSlot {
     setups_db::migrate::ensure_migrations(pool).await.unwrap();
-    let profile=accepted(pool).await;
-    let symbols=["BTCUSDT","ETHUSDT","ZZZUSDT","WAITUSDT","UNSEENUSDT"];
-    let instruments:Vec<_>=symbols.iter().map(|symbol|json!({"exchange":"bybit","category":"linear","symbol":symbol})).collect();
+    let profile = accepted(pool).await;
+    let symbols = ["BTCUSDT", "ETHUSDT", "ZZZUSDT", "WAITUSDT", "UNSEENUSDT"];
+    let instruments: Vec<_> = symbols
+        .iter()
+        .map(|symbol| json!({"exchange":"bybit","category":"linear","symbol":symbol}))
+        .collect();
     let readiness:Vec<_>=symbols[..4].iter().map(|symbol|json!({"instrumentKey":format!("bybit/linear/{symbol}"),
         "status":if *symbol=="WAITUSDT" {"waiting"}else{"ready"},"reason":if *symbol=="WAITUSDT" {json!("waiting_tail")}else{Value::Null},
         "publicationFloorCloseUnix":close-180})).collect();
     sqlx::query("update continuous_generations set spec=jsonb_set(spec,'{instruments}',$2),live_readiness=$3 where id=$1")
         .bind(profile.generation_id).bind(json!(instruments)).bind(json!(readiness)).execute(pool).await.unwrap();
-    setups_db::settings_set(pool,"notifications",&json!({"maxAgeSeconds":3600})).await.unwrap();
-    db::active_adaptive_slots(pool,OWNER).await.unwrap().remove(0)
+    setups_db::settings_set(pool, "notifications", &json!({"maxAgeSeconds":3600}))
+        .await
+        .unwrap();
+    db::active_adaptive_slots(pool, OWNER)
+        .await
+        .unwrap()
+        .remove(0)
 }
 
-fn adaptive_batch_scan(profile:&db::ActiveAdaptiveSlot,symbol:&str,close:i64)->db::AdaptiveScanWrite {
-    let mut row=adaptive_write(close-60);row.symbol=symbol.into();
-    db::AdaptiveScanWrite {instrument_key:format!("bybit/linear/{symbol}"),previous:None,
-        checkpoint:promotion_state(profile.generation_id,close),setups:vec![row]}
+fn adaptive_batch_scan(
+    profile: &db::ActiveAdaptiveSlot,
+    symbol: &str,
+    close: i64,
+) -> db::AdaptiveScanWrite {
+    let mut row = adaptive_write(close - 60);
+    row.symbol = symbol.into();
+    db::AdaptiveScanWrite {
+        instrument_key: format!("bybit/linear/{symbol}"),
+        previous: None,
+        checkpoint: promotion_state(profile.generation_id, close),
+        setups: vec![row],
+    }
 }
 
-async fn adaptive_batch_state(pool:&PgPool)->Value {
+async fn adaptive_batch_state(pool: &PgPool) -> Value {
     sqlx::query_scalar("select jsonb_build_object('setups',(select jsonb_agg(to_jsonb(s) order by id) from live_setups s),'checkpoints',(select jsonb_agg(to_jsonb(c) order by slot_id,instrument_key) from adaptive_live_checkpoints c),'outbox',(select jsonb_agg(to_jsonb(o) order by id) from adaptive_notification_outbox o),'budget',(select to_jsonb(b) from adaptive_notification_budget b))")
         .fetch_one(pool).await.unwrap()
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn adaptive_batch_atomic_order_local_indices_exact_ack_and_single_wrapper_parity() {
     isolated(|pool|async move {
         let close=chrono::Utc::now().timestamp().div_euclid(60)*60;
@@ -1342,7 +1589,7 @@ async fn adaptive_batch_atomic_order_local_indices_exact_ack_and_single_wrapper_
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn adaptive_batch_partial_cas_durable_readiness_global_fences_promotion_and_stop() {
     isolated(|pool|async move {
         let close=chrono::Utc::now().timestamp().div_euclid(60)*60;
@@ -1389,8 +1636,9 @@ async fn adaptive_batch_partial_cas_durable_readiness_global_fences_promotion_an
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn adaptive_batch_late_validation_outbox_failure_and_statement_timeout_roll_back_every_item() {
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn adaptive_batch_late_validation_outbox_failure_and_statement_timeout_roll_back_every_item()
+{
     isolated(|pool|async move {
         let close=chrono::Utc::now().timestamp().div_euclid(60)*60;
         let profile=adaptive_batch_profile(&pool,close).await;
@@ -1473,60 +1721,107 @@ async fn saved_matrix_payload_projects_own_mode_for_mean_forecast_and_legacy() {
 async fn new_research_search_completion_and_failure_preserve_finalized_profile_provenance() {
     isolated(|pool| async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
-        let old=accepted(&pool).await;
-        let lease=scheduler::claim_owner(&pool,"provenance-regression").await.unwrap().unwrap();
-        let job=scheduler::prepare_next(&pool,&lease).await.unwrap().unwrap();
-        let projection=|state:db::ContinuousProcess|state.slots.into_iter().find(|s|s.id==old.slot_id).unwrap();
-        let started=projection(db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap());
-        let serialized=serde_json::to_value(&started).unwrap();
-        assert_eq!(serialized["runningStudyId"],job.study_id);
-        assert_eq!(serialized["finalizedGenerationId"],old.generation_id);
-        assert_eq!(serialized["activeStudyId"],old.study_id);
-        assert_eq!(started.study_id,Some(old.study_id));
-        assert_eq!(started.finalized_generation_id,Some(old.generation_id));
-        assert_eq!(started.running_study_id,Some(job.study_id));
-        assert_eq!(started.active_study_id,Some(old.study_id));
-        assert_eq!(started.active_generation_id,Some(old.generation_id));
-        assert_eq!(sqlx::query_scalar::<_,Option<i64>>("select study_id from continuous_slots where id=$1")
-            .bind(old.slot_id).fetch_one(&pool).await.unwrap(),Some(old.study_id),"admission must not overwrite the saved-result binding");
+        let old = accepted(&pool).await;
+        let lease = scheduler::claim_owner(&pool, "provenance-regression")
+            .await
+            .unwrap()
+            .unwrap();
+        let job = scheduler::prepare_next(&pool, &lease)
+            .await
+            .unwrap()
+            .unwrap();
+        let projection = |state: db::ContinuousProcess| {
+            state
+                .slots
+                .into_iter()
+                .find(|s| s.id == old.slot_id)
+                .unwrap()
+        };
+        let started = projection(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap());
+        let serialized = serde_json::to_value(&started).unwrap();
+        assert_eq!(serialized["runningStudyId"], job.study_id);
+        assert_eq!(serialized["finalizedGenerationId"], old.generation_id);
+        assert_eq!(serialized["activeStudyId"], old.study_id);
+        assert_eq!(started.study_id, Some(old.study_id));
+        assert_eq!(started.finalized_generation_id, Some(old.generation_id));
+        assert_eq!(started.running_study_id, Some(job.study_id));
+        assert_eq!(started.active_study_id, Some(old.study_id));
+        assert_eq!(started.active_generation_id, Some(old.generation_id));
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<i64>>(
+                "select study_id from continuous_slots where id=$1"
+            )
+            .bind(old.slot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            Some(old.study_id),
+            "admission must not overwrite the saved-result binding"
+        );
 
         // Repair old deployments' cached reference without mutating history or
         // mistaking search completion for the full post-chain boundary.
         sqlx::query("update continuous_slots set study_id=$2 where id=$1")
-            .bind(old.slot_id).bind(job.study_id).execute(&pool).await.unwrap();
-        scheduler::finish_search(&pool,&job,&json!({"progress":{},"best":null}),true).await.unwrap();
-        scheduler::phase(&pool,&job,"analytics",None).await.unwrap();
-        let post_chain=projection(db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap());
-        assert_eq!(post_chain.study_id,Some(old.study_id));
-        assert_eq!(post_chain.finalized_generation_id,Some(old.generation_id));
-        assert_eq!(post_chain.running_study_id,Some(job.study_id));
-        scheduler::fail(&pool,&job,&json!({"code":"post_chain_mismatch"})).await.unwrap();
-        let failed=projection(db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap());
-        assert_eq!(failed.running_study_id,None);
-        assert_eq!(failed.study_id,Some(old.study_id));
-        assert_eq!(failed.finalized_generation_id,Some(old.generation_id));
-        assert_eq!(failed.active_study_id,Some(old.study_id));
-        assert_eq!(failed.active_generation_id,Some(old.generation_id));
-        assert_eq!(failed.mean_expectancy,started.mean_expectancy);
-        assert_eq!(failed.selected_cell,started.selected_cell);
-        assert_eq!(db::active_adaptive_slots(&pool,OWNER).await.unwrap()[0].params,old.params);
-    }).await;
+            .bind(old.slot_id)
+            .bind(job.study_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        scheduler::finish_search(&pool, &job, &json!({"progress":{},"best":null}), true)
+            .await
+            .unwrap();
+        scheduler::phase(&pool, &job, "analytics", None)
+            .await
+            .unwrap();
+        let post_chain = projection(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap());
+        assert_eq!(post_chain.study_id, Some(old.study_id));
+        assert_eq!(post_chain.finalized_generation_id, Some(old.generation_id));
+        assert_eq!(post_chain.running_study_id, Some(job.study_id));
+        scheduler::fail(&pool, &job, &json!({"code":"post_chain_mismatch"}))
+            .await
+            .unwrap();
+        let failed = projection(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap());
+        assert_eq!(failed.running_study_id, None);
+        assert_eq!(failed.study_id, Some(old.study_id));
+        assert_eq!(failed.finalized_generation_id, Some(old.generation_id));
+        assert_eq!(failed.active_study_id, Some(old.study_id));
+        assert_eq!(failed.active_generation_id, Some(old.generation_id));
+        assert_eq!(failed.mean_expectancy, started.mean_expectancy);
+        assert_eq!(failed.selected_cell, started.selected_cell);
+        assert_eq!(
+            db::active_adaptive_slots(&pool, OWNER).await.unwrap()[0].params,
+            old.params
+        );
+    })
+    .await;
 }
 
-async fn pending_fixture(pool: &PgPool, active: &db::ActiveAdaptiveSlot) -> db::live::PendingAdaptiveSlot {
-    let generation = generation(pool,OWNER,ALGORITHM,active.slot_id,"completed").await;
+async fn pending_fixture(
+    pool: &PgPool,
+    active: &db::ActiveAdaptiveSlot,
+) -> db::live::PendingAdaptiveSlot {
+    let generation = generation(pool, OWNER, ALGORITHM, active.slot_id, "completed").await;
     let mut result = active.result.clone();
-    result["meanExpectancy"]=json!(0.21);
-    result["bootstrap"]=json!({"frozenPrefix":{"version":1}});
+    result["meanExpectancy"] = json!(0.21);
+    result["bootstrap"] = json!({"frozenPrefix":{"version":1}});
     sqlx::query("update continuous_generations g set study_id=$2,accepted=true,result=$3,config_revision=p.config_revision,spec=p.config->'study' from continuous_processes p where g.id=$1 and p.owner_id=g.owner_id and p.algorithm_id=g.algorithm_id")
         .bind(generation).bind(active.study_id).bind(result).execute(pool).await.unwrap();
-    sqlx::query("update continuous_slots set pending_generation_id=$2,pending_status='warming' where id=$1")
-        .bind(active.slot_id).bind(generation).execute(pool).await.unwrap();
-    db::live::pending_adaptive_slots(pool,OWNER).await.unwrap().remove(0)
+    sqlx::query(
+        "update continuous_slots set pending_generation_id=$2,pending_status='warming' where id=$1",
+    )
+    .bind(active.slot_id)
+    .bind(generation)
+    .execute(pool)
+    .await
+    .unwrap();
+    db::live::pending_adaptive_slots(pool, OWNER)
+        .await
+        .unwrap()
+        .remove(0)
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn independent_heartbeat_survives_slow_tick_owner_row_locks_and_saturated_data_pool() {
     use db::live::*;
     isolated(|pool|async move {
@@ -1563,7 +1858,7 @@ async fn independent_heartbeat_survives_slow_tick_owner_row_locks_and_saturated_
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn heartbeat_rechecks_expiry_after_lane_lock_wait_without_resurrecting_the_claim() {
     use db::live::*;
     isolated(|pool|async move {
@@ -1584,8 +1879,9 @@ async fn heartbeat_rechecks_expiry_after_lane_lock_wait_without_resurrecting_the
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn heartbeat_statement_cancels_are_short_retryable_and_do_not_spend_attempts_or_extend_credit() {
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn heartbeat_statement_cancels_are_short_retryable_and_do_not_spend_attempts_or_extend_credit()
+ {
     use db::live::*;
     isolated(|pool|async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
@@ -1614,8 +1910,9 @@ async fn heartbeat_statement_cancels_are_short_retryable_and_do_not_spend_attemp
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn clean_shutdown_refunds_only_current_claim_and_restart_gets_fresh_window_without_incumbent_reset() {
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn clean_shutdown_refunds_only_current_claim_and_restart_gets_fresh_window_without_incumbent_reset()
+ {
     use db::live::*;
     isolated(|pool|async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
@@ -1658,7 +1955,7 @@ async fn clean_shutdown_refunds_only_current_claim_and_restart_gets_fresh_window
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn expired_shutdown_never_refunds_and_heartbeat_never_resurrects_lease_or_fixed_deadline() {
     use db::live::*;
     isolated(|pool|async move {
@@ -1683,31 +1980,102 @@ async fn expired_shutdown_never_refunds_and_heartbeat_never_resurrects_lease_or_
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn supervision_loss_during_promotion_owner_wait_or_final_commit_gate_preserves_incumbent() {
-    use db::live::*;use std::sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}};
-    isolated(|pool|async move {
-        setups_db::migrate::ensure_migrations(&pool).await.unwrap();let old=accepted(&pool).await;let pending=pending_fixture(&pool,&old).await;
-        let fence=claim_pending_warmup_at(&pool,&pending,"guarded-promotion",CUTOFF).await.unwrap().unwrap();
-        assert!(report_warmup(&pool,&fence,"ready",Some(CUTOFF),None).await.unwrap());
-        let expected=[CheckpointExpectation {instrument_key:INSTRUMENT.into(),checkpoint:None}];
-        let initial=[InitialAdaptiveCheckpoint {instrument_key:INSTRUMENT.into(),state:promotion_state(fence.generation_id,CUTOFF)}];
-        let mut held=pool.begin().await.unwrap();sqlx::query("select pg_advisory_xact_lock(hashtextextended($1,72423415))").bind(OWNER).execute(&mut *held).await.unwrap();
-        let permitted=Arc::new(AtomicBool::new(true));let lost=permitted.clone();
-        let (outcome,())=tokio::join!(promote_pending_with_dispositions_guarded(&pool,&fence,Some(old.generation_id),&expected,CUTOFF,&initial,&[],&[],||permitted.load(Ordering::SeqCst)),
-            async move {tokio::time::sleep(Duration::from_millis(30)).await;lost.store(false,Ordering::SeqCst);held.rollback().await.unwrap();});
+    use db::live::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    isolated(|pool| async move {
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        let old = accepted(&pool).await;
+        let pending = pending_fixture(&pool, &old).await;
+        let fence = claim_pending_warmup_at(&pool, &pending, "guarded-promotion", CUTOFF)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            report_warmup(&pool, &fence, "ready", Some(CUTOFF), None)
+                .await
+                .unwrap()
+        );
+        let expected = [CheckpointExpectation {
+            instrument_key: INSTRUMENT.into(),
+            checkpoint: None,
+        }];
+        let initial = [InitialAdaptiveCheckpoint {
+            instrument_key: INSTRUMENT.into(),
+            state: promotion_state(fence.generation_id, CUTOFF),
+        }];
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("select pg_advisory_xact_lock(hashtextextended($1,72423415))")
+            .bind(OWNER)
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let permitted = Arc::new(AtomicBool::new(true));
+        let lost = permitted.clone();
+        let (outcome, ()) = tokio::join!(
+            promote_pending_with_dispositions_guarded(
+                &pool,
+                &fence,
+                Some(old.generation_id),
+                &expected,
+                CUTOFF,
+                &initial,
+                &[],
+                &[],
+                || permitted.load(Ordering::SeqCst)
+            ),
+            async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                lost.store(false, Ordering::SeqCst);
+                held.rollback().await.unwrap();
+            }
+        );
         assert!(!outcome.unwrap());
-        let calls=AtomicUsize::new(0);
-        assert!(!promote_pending_with_dispositions_guarded(&pool,&fence,Some(old.generation_id),&expected,CUTOFF,&initial,&[],&[],||calls.fetch_add(1,Ordering::SeqCst)<2).await.unwrap(),"loss at the last pre-COMMIT gate rolls back staged pointer/cursor changes");
-        assert_eq!(db::active_adaptive_slots(&pool,OWNER).await.unwrap()[0].generation_id,old.generation_id);
-        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_live_checkpoints").fetch_one(&pool).await.unwrap(),0);
-        assert_eq!(renew_pending_warmup(&pool,&fence).await.unwrap(),WarmupRenewal::Renewed,"rolled-back promotion retains the original claim fence");
-    }).await;
+        let calls = AtomicUsize::new(0);
+        assert!(
+            !promote_pending_with_dispositions_guarded(
+                &pool,
+                &fence,
+                Some(old.generation_id),
+                &expected,
+                CUTOFF,
+                &initial,
+                &[],
+                &[],
+                || calls.fetch_add(1, Ordering::SeqCst) < 2
+            )
+            .await
+            .unwrap(),
+            "loss at the last pre-COMMIT gate rolls back staged pointer/cursor changes"
+        );
+        assert_eq!(
+            db::active_adaptive_slots(&pool, OWNER).await.unwrap()[0].generation_id,
+            old.generation_id
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from adaptive_live_checkpoints")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            renew_pending_warmup(&pool, &fence).await.unwrap(),
+            WarmupRenewal::Renewed,
+            "rolled-back promotion retains the original claim fence"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn independent_initialization_retries_keep_anchor_bound_attempts_and_recover_abandoned_final_claim() {
+async fn independent_initialization_retries_keep_anchor_bound_attempts_and_recover_abandoned_final_claim()
+ {
     use db::live::*;
     isolated(|pool| async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
@@ -1771,34 +2139,71 @@ async fn independent_initialization_retries_keep_anchor_bound_attempts_and_recov
     }).await;
 }
 
-async fn exhausted_live_candidate(pool:&PgPool)->(db::ActiveAdaptiveSlot,db::live::PendingAdaptiveSlot,db::live::LiveInitialization) {
+async fn exhausted_live_candidate(
+    pool: &PgPool,
+) -> (
+    db::ActiveAdaptiveSlot,
+    db::live::PendingAdaptiveSlot,
+    db::live::LiveInitialization,
+) {
     setups_db::migrate::ensure_migrations(pool).await.unwrap();
-    let old=accepted(pool).await;let pending=pending_fixture(pool,&old).await;
-    let mut initialization=None;
+    let old = accepted(pool).await;
+    let pending = pending_fixture(pool, &old).await;
+    let mut initialization = None;
     for attempt in 1..=3 {
-        sqlx::query("update continuous_generations set live_init_next_attempt_at=null where id=$1").bind(pending.profile.generation_id).execute(pool).await.unwrap();
-        let fence=db::live::claim_pending_warmup_at(pool,&pending,"exhaust-fixture",CUTOFF).await.unwrap().unwrap();
-        assert_eq!(fence.attempt,attempt);initialization=Some(fence.initialization.clone());
-        assert!(db::live::report_warmup_failure(pool,&fence,&json!({"code":"observed_terminal_error","attempt":attempt}),true).await.unwrap());
+        sqlx::query("update continuous_generations set live_init_next_attempt_at=null where id=$1")
+            .bind(pending.profile.generation_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let fence = db::live::claim_pending_warmup_at(pool, &pending, "exhaust-fixture", CUTOFF)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fence.attempt, attempt);
+        initialization = Some(fence.initialization.clone());
+        assert!(
+            db::live::report_warmup_failure(
+                pool,
+                &fence,
+                &json!({"code":"observed_terminal_error","attempt":attempt}),
+                true
+            )
+            .await
+            .unwrap()
+        );
     }
-    (old,pending,initialization.unwrap())
+    (old, pending, initialization.unwrap())
 }
-fn live_readmission_request(generation:i64,key:&str)->db::readmission::LiveReadmissionRequest {
-    db::readmission::LiveReadmissionRequest {expected_generation_id:generation,expected_config_revision:1,request_id:key.into()}
+fn live_readmission_request(generation: i64, key: &str) -> db::readmission::LiveReadmissionRequest {
+    db::readmission::LiveReadmissionRequest {
+        expected_generation_id: generation,
+        expected_config_revision: 1,
+        request_id: key.into(),
+    }
 }
-async fn readmission_snapshot(pool:&PgPool)->Value {
+async fn readmission_snapshot(pool: &PgPool) -> Value {
     sqlx::query_scalar("select jsonb_build_object('processes',(select jsonb_agg(to_jsonb(p) order by owner_id,algorithm_id) from continuous_processes p),'generations',(select jsonb_agg(to_jsonb(g) order by id) from continuous_generations g),'slots',(select jsonb_agg(to_jsonb(s) order by id) from continuous_slots s),'lane',(select to_jsonb(w) from adaptive_live_warmup_lane w),'grants',(select jsonb_agg(to_jsonb(r) order by id) from continuous_live_readmissions r))")
         .fetch_one(pool).await.unwrap()
 }
-async fn granted_live(pool:&PgPool,slot:i64,request:&db::readmission::LiveReadmissionRequest)->db::readmission::LiveReadmissionReceipt {
-    match db::readmission::grant(pool,OWNER,ALGORITHM,slot,request).await.unwrap() {
-        db::readmission::LiveReadmissionOutcome::Granted(receipt)=>receipt,outcome=>panic!("expected grant: {outcome:?}"),
+async fn granted_live(
+    pool: &PgPool,
+    slot: i64,
+    request: &db::readmission::LiveReadmissionRequest,
+) -> db::readmission::LiveReadmissionReceipt {
+    match db::readmission::grant(pool, OWNER, ALGORITHM, slot, request)
+        .await
+        .unwrap()
+    {
+        db::readmission::LiveReadmissionOutcome::Granted(receipt) => receipt,
+        outcome => panic!("expected grant: {outcome:?}"),
     }
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn live_readmission_preserves_scientific_origin_ongoing_other_slot_research_and_promotes_normally() {
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn live_readmission_preserves_scientific_origin_ongoing_other_slot_research_and_promotes_normally()
+ {
     isolated(|pool|async move {
         let (old,pending,origin)=exhausted_live_candidate(&pool).await;let id=pending.profile.generation_id;
         let other_slot:i64=sqlx::query_scalar("insert into continuous_slots(owner_id,algorithm_id,min_setups_per_day) values($1,$2,5) returning id")
@@ -1837,8 +2242,9 @@ async fn live_readmission_preserves_scientific_origin_ongoing_other_slot_researc
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn live_readmission_idempotency_races_three_attempt_cycle_and_neutral_yield_preserve_charged_budget() {
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn live_readmission_idempotency_races_three_attempt_cycle_and_neutral_yield_preserve_charged_budget()
+ {
     isolated(|pool|async move {
         let (old,pending,origin)=exhausted_live_candidate(&pool).await;let id=pending.profile.generation_id;
         let request=live_readmission_request(id,"readmit-concurrent-key-1");
@@ -1884,7 +2290,7 @@ async fn live_readmission_idempotency_races_three_attempt_cycle_and_neutral_yiel
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn live_readmission_guards_stale_controls_pending_lane_and_slot_scoped_authority() {
     isolated(|pool|async move {
         let (old,pending,_)=exhausted_live_candidate(&pool).await;let id=pending.profile.generation_id;
@@ -1928,8 +2334,9 @@ async fn live_readmission_guards_stale_controls_pending_lane_and_slot_scoped_aut
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn live_readmission_ordinary_claim_and_promotion_reject_newer_same_slot_but_not_other_slot_outcomes() {
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn live_readmission_ordinary_claim_and_promotion_reject_newer_same_slot_but_not_other_slot_outcomes()
+ {
     isolated(|pool|async move {
         let (old,pending,_)=exhausted_live_candidate(&pool).await;let id=pending.profile.generation_id;
         let other_slot:i64=sqlx::query_scalar("insert into continuous_slots(owner_id,algorithm_id,min_setups_per_day) values($1,$2,5) returning id").bind(OWNER).bind(ALGORITHM).fetch_one(&pool).await.unwrap();
@@ -1951,7 +2358,7 @@ async fn live_readmission_ordinary_claim_and_promotion_reject_newer_same_slot_bu
 }
 
 #[tokio::test]
-#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn live_readmission_additive_migration_and_failed_pending_write_preserve_prior_state() {
     isolated(|pool|async move {
         let (old,pending,origin)=exhausted_live_candidate(&pool).await;let id=pending.profile.generation_id;
@@ -2098,7 +2505,8 @@ async fn waiting_subset_promotion_keeps_real_cursor_cas_and_late_join_has_own_pu
 
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn retired_unavailable_old_only_cursor_is_explicit_and_cas_exact_without_candidate_scope_relaxation() {
+async fn retired_unavailable_old_only_cursor_is_explicit_and_cas_exact_without_candidate_scope_relaxation()
+ {
     use db::live::*;
     isolated(|pool| async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
@@ -2137,15 +2545,41 @@ async fn retirement_fixture(pool: &PgPool) -> (db::ActiveAdaptiveSlot, i64) {
     setups_db::migrate::ensure_migrations(pool).await.unwrap();
     let old = accepted(pool).await;
     let frontier = chrono::Utc::now().timestamp().div_euclid(60) * 60;
-    setups_db::settings_set(pool,"notifications",&json!({"maxAgeSeconds":3600})).await.unwrap();
-    assert!(db::commit_adaptive_scan_cas(pool,&old,INSTRUMENT,None,
-        &promotion_state(old.generation_id,frontier),&[adaptive_write(frontier-60)]).await.unwrap().applied);
-    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_notification_outbox").fetch_one(pool).await.unwrap(),1);
-    fixed_setup(pool,frontier-60).await;
-    study(pool,OWNER,OTHER_ALGORITHM,"completed",None,None).await;
-    let historical_batch = batch(pool,ALGORITHM,Some(old.generation_id)).await;
-    run(pool,historical_batch,ALGORITHM,"done",Some(old.generation_id)).await;
-    (old,frontier)
+    setups_db::settings_set(pool, "notifications", &json!({"maxAgeSeconds":3600}))
+        .await
+        .unwrap();
+    assert!(
+        db::commit_adaptive_scan_cas(
+            pool,
+            &old,
+            INSTRUMENT,
+            None,
+            &promotion_state(old.generation_id, frontier),
+            &[adaptive_write(frontier - 60)]
+        )
+        .await
+        .unwrap()
+        .applied
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from adaptive_notification_outbox")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        1
+    );
+    fixed_setup(pool, frontier - 60).await;
+    study(pool, OWNER, OTHER_ALGORITHM, "completed", None, None).await;
+    let historical_batch = batch(pool, ALGORITHM, Some(old.generation_id)).await;
+    run(
+        pool,
+        historical_batch,
+        ALGORITHM,
+        "done",
+        Some(old.generation_id),
+    )
+    .await;
+    (old, frontier)
 }
 
 async fn retained_history(pool: &PgPool, old: &db::ActiveAdaptiveSlot) -> Value {
@@ -2153,51 +2587,120 @@ async fn retained_history(pool: &PgPool, old: &db::ActiveAdaptiveSlot) -> Value 
         .bind(old.generation_id).fetch_one(pool).await.unwrap()
 }
 
-async fn activate_after_retirement(pool: &PgPool, old: &db::ActiveAdaptiveSlot, key: &str, frontier: i64) {
+async fn activate_after_retirement(
+    pool: &PgPool,
+    old: &db::ActiveAdaptiveSlot,
+    key: &str,
+    frontier: i64,
+) {
     use db::live::*;
-    let pending = pending_fixture(pool,old).await;
-    assert_eq!(pending.expected_active_generation_id,None);
-    let fence = claim_pending_warmup(pool,&pending,"fresh-after-retirement").await.unwrap().unwrap();
-    assert!(report_warmup(pool,&fence,"ready",Some(frontier),None).await.unwrap());
+    let pending = pending_fixture(pool, old).await;
+    assert_eq!(pending.expected_active_generation_id, None);
+    let fence = claim_pending_warmup(pool, &pending, "fresh-after-retirement")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        report_warmup(pool, &fence, "ready", Some(frontier), None)
+            .await
+            .unwrap()
+    );
     // Exactly the worker contract: compare every currently declared instrument,
     // including absent cursors. No obsolete/out-of-scope predecessor is invented.
-    let expected = [CheckpointExpectation {instrument_key:key.into(),
-        checkpoint:db::get_adaptive_checkpoint(pool,old.slot_id,key).await.unwrap()}];
-    let initial = [InitialAdaptiveCheckpoint {instrument_key:key.into(),
-        state:promotion_state(pending.profile.generation_id,frontier)}];
-    assert!(promote_pending(pool,&fence,None,&expected,frontier,&initial).await
-        .expect("obsolete inactive cursor must not block the new promotion frontier"),
-        "obsolete cursor outside the new scope must not block fresh activation");
-    let cursor = db::get_adaptive_checkpoint(pool,old.slot_id,key).await.unwrap().unwrap();
-    assert_eq!(cursor.state,initial[0].state);
-    assert_eq!(cursor.generation_id,pending.profile.generation_id);
-    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_live_checkpoints where slot_id=$1")
-        .bind(old.slot_id).fetch_one(pool).await.unwrap(),1);
-    assert!(!db::commit_adaptive_scan_cas(pool,old,INSTRUMENT,None,
-        &promotion_state(old.generation_id,frontier+60),&[adaptive_write(frontier)]).await.unwrap().applied);
+    let expected = [CheckpointExpectation {
+        instrument_key: key.into(),
+        checkpoint: db::get_adaptive_checkpoint(pool, old.slot_id, key)
+            .await
+            .unwrap(),
+    }];
+    let initial = [InitialAdaptiveCheckpoint {
+        instrument_key: key.into(),
+        state: promotion_state(pending.profile.generation_id, frontier),
+    }];
+    assert!(
+        promote_pending(pool, &fence, None, &expected, frontier, &initial)
+            .await
+            .expect("obsolete inactive cursor must not block the new promotion frontier"),
+        "obsolete cursor outside the new scope must not block fresh activation"
+    );
+    let cursor = db::get_adaptive_checkpoint(pool, old.slot_id, key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.state, initial[0].state);
+    assert_eq!(cursor.generation_id, pending.profile.generation_id);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from adaptive_live_checkpoints where slot_id=$1"
+        )
+        .bind(old.slot_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(
+        !db::commit_adaptive_scan_cas(
+            pool,
+            old,
+            INSTRUMENT,
+            None,
+            &promotion_state(old.generation_id, frontier + 60),
+            &[adaptive_write(frontier)]
+        )
+        .await
+        .unwrap()
+        .applied
+    );
 }
 
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn retired_cursors_stop_restart_can_promote_without_rewriting_history() {
     isolated(|pool| async move {
-        let (old,frontier) = retirement_fixture(&pool).await;
-        let history = retained_history(&pool,&old).await;
-        let lease = scheduler::claim_owner(&pool,"retirement-stop").await.unwrap().unwrap();
-        assert!(db::stop(&pool,OWNER,ALGORITHM).await.unwrap());
-        assert!(db::get_adaptive_checkpoint(&pool,old.slot_id,INSTRUMENT).await.unwrap().is_none());
-        assert!(!db::start(&pool,OWNER,ALGORITHM).await.unwrap(),"Stop must drain before restart");
-        cleanup_owned(&pool,&lease,ALGORITHM).await.unwrap();
-        assert!(db::start(&pool,OWNER,ALGORITHM).await.unwrap());
-        activate_after_retirement(&pool,&old,INSTRUMENT,frontier+600).await;
+        let (old, frontier) = retirement_fixture(&pool).await;
+        let history = retained_history(&pool, &old).await;
+        let lease = scheduler::claim_owner(&pool, "retirement-stop")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db::stop(&pool, OWNER, ALGORITHM).await.unwrap());
+        assert!(
+            db::get_adaptive_checkpoint(&pool, old.slot_id, INSTRUMENT)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !db::start(&pool, OWNER, ALGORITHM).await.unwrap(),
+            "Stop must drain before restart"
+        );
+        cleanup_owned(&pool, &lease, ALGORITHM).await.unwrap();
+        assert!(db::start(&pool, OWNER, ALGORITHM).await.unwrap());
+        activate_after_retirement(&pool, &old, INSTRUMENT, frontier + 600).await;
         // Durable slot-level signal dedup survives retirement of detector cursors.
-        let new = db::active_adaptive_slots(&pool,OWNER).await.unwrap().remove(0);
-        let previous = db::get_adaptive_checkpoint(&pool,new.slot_id,INSTRUMENT).await.unwrap().unwrap();
-        let duplicate = db::commit_adaptive_scan_cas(&pool,&new,INSTRUMENT,Some(&previous),
-            &promotion_state(new.generation_id,frontier+660),&[adaptive_write(frontier-60)]).await.unwrap();
+        let new = db::active_adaptive_slots(&pool, OWNER)
+            .await
+            .unwrap()
+            .remove(0);
+        let previous = db::get_adaptive_checkpoint(&pool, new.slot_id, INSTRUMENT)
+            .await
+            .unwrap()
+            .unwrap();
+        let duplicate = db::commit_adaptive_scan_cas(
+            &pool,
+            &new,
+            INSTRUMENT,
+            Some(&previous),
+            &promotion_state(new.generation_id, frontier + 660),
+            &[adaptive_write(frontier - 60)],
+        )
+        .await
+        .unwrap();
         assert!(duplicate.applied && duplicate.inserted.is_empty());
-        assert_eq!(retained_history(&pool,&old).await,history);
-    }).await;
+        assert_eq!(retained_history(&pool, &old).await, history);
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -2258,27 +2761,77 @@ async fn retired_cursors_start_repairs_legacy_inactive_state_without_a_new_confi
 #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn retired_cursors_nonpass_retires_only_after_technical_retry_preserves_incumbent() {
     isolated(|pool| async move {
-        let (old,frontier) = retirement_fixture(&pool).await;
-        let history = retained_history(&pool,&old).await;
-        let previous = db::get_adaptive_checkpoint(&pool,old.slot_id,INSTRUMENT).await.unwrap();
-        let lease = scheduler::claim_owner(&pool,"retirement-nonpass").await.unwrap().unwrap();
-        let failed = scheduler::prepare_next(&pool,&lease).await.unwrap().unwrap();
-        scheduler::fail(&pool,&failed,&json!({"code":"technical_failure"})).await.unwrap();
-        assert!(db::start(&pool,OWNER,ALGORITHM).await.unwrap());
+        let (old, frontier) = retirement_fixture(&pool).await;
+        let history = retained_history(&pool, &old).await;
+        let previous = db::get_adaptive_checkpoint(&pool, old.slot_id, INSTRUMENT)
+            .await
+            .unwrap();
+        let lease = scheduler::claim_owner(&pool, "retirement-nonpass")
+            .await
+            .unwrap()
+            .unwrap();
+        let failed = scheduler::prepare_next(&pool, &lease)
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler::fail(&pool, &failed, &json!({"code":"technical_failure"}))
+            .await
+            .unwrap();
+        assert!(db::start(&pool, OWNER, ALGORITHM).await.unwrap());
         let mut permission = config(ALGORITHM);
         permission["adaptiveEnabled"] = json!(false);
-        assert!(db::configure(&pool,OWNER,ALGORITHM,&permission,&[4.0]).await.unwrap());
-        assert_eq!(db::get_adaptive_checkpoint(&pool,old.slot_id,INSTRUMENT).await.unwrap(),previous);
+        assert!(
+            db::configure(&pool, OWNER, ALGORITHM, &permission, &[4.0])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db::get_adaptive_checkpoint(&pool, old.slot_id, INSTRUMENT)
+                .await
+                .unwrap(),
+            previous
+        );
         permission["adaptiveEnabled"] = json!(true);
-        assert!(db::configure(&pool,OWNER,ALGORITHM,&permission,&[4.0]).await.unwrap());
-        assert_eq!(db::active_adaptive_slots(&pool,OWNER).await.unwrap()[0].generation_id,old.generation_id);
-        let nonpass = scheduler::prepare_next(&pool,&lease).await.unwrap().unwrap();
-        scheduler::finish_search(&pool,&nonpass,&json!({"best":null,"progress":{}}),true).await.unwrap();
-        assert!(scheduler::finalize(&pool,&nonpass,&json!({"best":null,"reason":"no winner"}),false,None,None).await.unwrap());
-        activate_after_retirement(&pool,&old,INSTRUMENT,frontier+600).await;
-        assert_eq!(retained_history(&pool,&old).await,history);
-        assert_eq!(optimization::get(&pool,nonpass.study_id).await.unwrap().unwrap().status,"completed");
-    }).await;
+        assert!(
+            db::configure(&pool, OWNER, ALGORITHM, &permission, &[4.0])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db::active_adaptive_slots(&pool, OWNER).await.unwrap()[0].generation_id,
+            old.generation_id
+        );
+        let nonpass = scheduler::prepare_next(&pool, &lease)
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler::finish_search(&pool, &nonpass, &json!({"best":null,"progress":{}}), true)
+            .await
+            .unwrap();
+        assert!(
+            scheduler::finalize(
+                &pool,
+                &nonpass,
+                &json!({"best":null,"reason":"no winner"}),
+                false,
+                None,
+                None
+            )
+            .await
+            .unwrap()
+        );
+        activate_after_retirement(&pool, &old, INSTRUMENT, frontier + 600).await;
+        assert_eq!(retained_history(&pool, &old).await, history);
+        assert_eq!(
+            optimization::get(&pool, nonpass.study_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -2355,33 +2908,140 @@ async fn pending_promotion_cas_compares_absent_and_all_old_cursors_and_survives_
     isolated(|pool| async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
         let old = accepted(&pool).await;
-        let pending = pending_fixture(&pool,&old).await;
-        assert_eq!(db::active_adaptive_slots(&pool,OWNER).await.unwrap()[0].generation_id,old.generation_id);
-        let fence = claim_pending_warmup(&pool,&pending,"warmup-a").await.unwrap().unwrap();
-        assert!(claim_pending_warmup(&pool,&pending,"warmup-b").await.unwrap().is_none());
-        let initial = vec![InitialAdaptiveCheckpoint {instrument_key:INSTRUMENT.into(),state:promotion_state(pending.profile.generation_id,CUTOFF)}];
-        assert!(report_warmup(&pool,&fence,"ready",Some(CUTOFF),None).await.unwrap());
-        assert!(promote_pending(&pool,&fence,Some(old.generation_id),&[],CUTOFF,&initial).await.is_err(),"absent scoped cursor must be explicitly included");
-        let absent = vec![CheckpointExpectation {instrument_key:INSTRUMENT.into(),checkpoint:None}];
+        let pending = pending_fixture(&pool, &old).await;
+        assert_eq!(
+            db::active_adaptive_slots(&pool, OWNER).await.unwrap()[0].generation_id,
+            old.generation_id
+        );
+        let fence = claim_pending_warmup(&pool, &pending, "warmup-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            claim_pending_warmup(&pool, &pending, "warmup-b")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let initial = vec![InitialAdaptiveCheckpoint {
+            instrument_key: INSTRUMENT.into(),
+            state: promotion_state(pending.profile.generation_id, CUTOFF),
+        }];
+        assert!(
+            report_warmup(&pool, &fence, "ready", Some(CUTOFF), None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            promote_pending(
+                &pool,
+                &fence,
+                Some(old.generation_id),
+                &[],
+                CUTOFF,
+                &initial
+            )
+            .await
+            .is_err(),
+            "absent scoped cursor must be explicitly included"
+        );
+        let absent = vec![CheckpointExpectation {
+            instrument_key: INSTRUMENT.into(),
+            checkpoint: None,
+        }];
         // Old commit wins while the candidate warms. A captured absent cursor is now stale.
-        let old_state = promotion_state(old.generation_id,CUTOFF);
-        assert!(db::commit_adaptive_scan_cas(&pool,&old,INSTRUMENT,None,&old_state,&[]).await.unwrap().applied);
-        assert!(!promote_pending(&pool,&fence,Some(old.generation_id),&absent,CUTOFF,&initial).await.unwrap());
-        let previous = db::get_adaptive_checkpoint(&pool,old.slot_id,INSTRUMENT).await.unwrap().unwrap();
-        let expected = vec![CheckpointExpectation {instrument_key:INSTRUMENT.into(),checkpoint:Some(previous.clone())}];
-        assert!(promote_pending(&pool,&fence,Some(old.generation_id),&expected,CUTOFF,&initial).await.unwrap());
-        let restored = db::active_adaptive_slots(&pool,OWNER).await.unwrap().remove(0);
-        assert_eq!(restored.generation_id,pending.profile.generation_id);
-        assert!(db::live::pending_adaptive_slots(&pool,OWNER).await.unwrap().is_empty());
-        let cursor = db::get_adaptive_checkpoint(&pool,old.slot_id,INSTRUMENT).await.unwrap().unwrap();
-        assert_eq!(cursor.generation_id,restored.generation_id);
-        assert_eq!(cursor.state,initial[0].state);
+        let old_state = promotion_state(old.generation_id, CUTOFF);
+        assert!(
+            db::commit_adaptive_scan_cas(&pool, &old, INSTRUMENT, None, &old_state, &[])
+                .await
+                .unwrap()
+                .applied
+        );
+        assert!(
+            !promote_pending(
+                &pool,
+                &fence,
+                Some(old.generation_id),
+                &absent,
+                CUTOFF,
+                &initial
+            )
+            .await
+            .unwrap()
+        );
+        let previous = db::get_adaptive_checkpoint(&pool, old.slot_id, INSTRUMENT)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = vec![CheckpointExpectation {
+            instrument_key: INSTRUMENT.into(),
+            checkpoint: Some(previous.clone()),
+        }];
+        assert!(
+            promote_pending(
+                &pool,
+                &fence,
+                Some(old.generation_id),
+                &expected,
+                CUTOFF,
+                &initial
+            )
+            .await
+            .unwrap()
+        );
+        let restored = db::active_adaptive_slots(&pool, OWNER)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(restored.generation_id, pending.profile.generation_id);
+        assert!(
+            db::live::pending_adaptive_slots(&pool, OWNER)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let cursor = db::get_adaptive_checkpoint(&pool, old.slot_id, INSTRUMENT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.generation_id, restored.generation_id);
+        assert_eq!(cursor.state, initial[0].state);
         // Promotion wins first: the old detector cannot commit after it, nor can a
         // retry after a lost response overwrite the new durable cursor.
-        assert!(!db::commit_adaptive_scan_cas(&pool,&old,INSTRUMENT,Some(&previous),&promotion_state(old.generation_id,CUTOFF+60),&[]).await.unwrap().applied);
-        assert!(!promote_pending(&pool,&fence,Some(old.generation_id),&expected,CUTOFF,&initial).await.unwrap());
-        assert_eq!(db::get_adaptive_checkpoint(&pool,old.slot_id,INSTRUMENT).await.unwrap().unwrap(),cursor);
-    }).await;
+        assert!(
+            !db::commit_adaptive_scan_cas(
+                &pool,
+                &old,
+                INSTRUMENT,
+                Some(&previous),
+                &promotion_state(old.generation_id, CUTOFF + 60),
+                &[]
+            )
+            .await
+            .unwrap()
+            .applied
+        );
+        assert!(
+            !promote_pending(
+                &pool,
+                &fence,
+                Some(old.generation_id),
+                &expected,
+                CUTOFF,
+                &initial
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            db::get_adaptive_checkpoint(&pool, old.slot_id, INSTRUMENT)
+                .await
+                .unwrap()
+                .unwrap(),
+            cursor
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -2469,26 +3129,104 @@ async fn fixed_setup_and_outbox_use_config_and_global_fences_without_breaking_re
     isolated(|pool| async move {
         setups_db::migrate::ensure_migrations(&pool).await.unwrap();
         let _active = accepted(&pool).await;
-        setups_db::settings_set(&pool,"notifications",&json!({"maxAgeSeconds":3600})).await.unwrap();
-        let now = chrono::Utc::now().timestamp().div_euclid(60)*60;
-        let setup = adaptive_write(now-60).setup;
-        assert!(commit_fixed_setup(&pool,"bybit","linear","BTCUSDT",&setup).await.unwrap().is_some());
-        assert!(commit_fixed_setup(&pool,"bybit","linear","BTCUSDT",&setup).await.unwrap().is_none());
-        let job = claim_notifications(&pool,"fixed-delivery",1).await.unwrap().remove(0);
+        setups_db::settings_set(&pool, "notifications", &json!({"maxAgeSeconds":3600}))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp().div_euclid(60) * 60;
+        let setup = adaptive_write(now - 60).setup;
+        assert!(
+            commit_fixed_setup(&pool, "bybit", "linear", "BTCUSDT", &setup)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            commit_fixed_setup(&pool, "bybit", "linear", "BTCUSDT", &setup)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let job = claim_notifications(&pool, "fixed-delivery", 1)
+            .await
+            .unwrap()
+            .remove(0);
         assert!(job.slot_id.is_none() && job.fixed_config.is_some());
-        assert_eq!(job.payload["externalName"],"accepted external");
-        assert!(notification_permitted(&pool,"fixed-delivery",&job).await.unwrap());
-        setups_db::settings_set(&pool,&format!("algorithm:{ALGORITHM}"),&json!({"enabled":true,"params":{"windowMinutes":10},"externalName":"changed"})).await.unwrap();
-        assert!(!notification_permitted(&pool,"fixed-delivery",&job).await.unwrap());
-        assert!(commit_fixed_setup(&pool,"bybit","linear","BTCUSDT",&adaptive_write(now-120).setup).await.unwrap().is_none());
-        setups_db::settings_set(&pool,&format!("algorithm:{ALGORITHM}"),&json!({"enabled":true,"externalName":"changed"})).await.unwrap();
-        assert!(notification_permitted(&pool,"fixed-delivery",&job).await.unwrap());
-        setups_db::settings_set(&pool,"live",&json!({"enabled":false})).await.unwrap();
-        assert!(!notification_permitted(&pool,"fixed-delivery",&job).await.unwrap());
-        assert!(finish_notification(&pool,"fixed-delivery",&job,NotificationOutcome::Skipped).await.unwrap());
-        assert!(setups_db::runs::insert_live_setup(&pool,"bybit","linear","BTCUSDT",&adaptive_write(now-180).setup).await.unwrap().is_some());
-        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_notification_outbox").fetch_one(&pool).await.unwrap(),0);
-    }).await;
+        assert_eq!(job.payload["externalName"], "accepted external");
+        assert!(
+            notification_permitted(&pool, "fixed-delivery", &job)
+                .await
+                .unwrap()
+        );
+        setups_db::settings_set(
+            &pool,
+            &format!("algorithm:{ALGORITHM}"),
+            &json!({"enabled":true,"params":{"windowMinutes":10},"externalName":"changed"}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !notification_permitted(&pool, "fixed-delivery", &job)
+                .await
+                .unwrap()
+        );
+        assert!(
+            commit_fixed_setup(
+                &pool,
+                "bybit",
+                "linear",
+                "BTCUSDT",
+                &adaptive_write(now - 120).setup
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        setups_db::settings_set(
+            &pool,
+            &format!("algorithm:{ALGORITHM}"),
+            &json!({"enabled":true,"externalName":"changed"}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            notification_permitted(&pool, "fixed-delivery", &job)
+                .await
+                .unwrap()
+        );
+        setups_db::settings_set(&pool, "live", &json!({"enabled":false}))
+            .await
+            .unwrap();
+        assert!(
+            !notification_permitted(&pool, "fixed-delivery", &job)
+                .await
+                .unwrap()
+        );
+        assert!(
+            finish_notification(&pool, "fixed-delivery", &job, NotificationOutcome::Skipped)
+                .await
+                .unwrap()
+        );
+        assert!(
+            setups_db::runs::insert_live_setup(
+                &pool,
+                "bybit",
+                "linear",
+                "BTCUSDT",
+                &adaptive_write(now - 180).setup
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from adaptive_notification_outbox")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    })
+    .await;
 }
 
 #[tokio::test]

@@ -74,6 +74,7 @@ export interface ContinuousProcess {
   status: "stopped" | "running" | "stopping" | "error";
   configRevision: number;
   config: ContinuousConfig | null;
+  pendingConfig?: ContinuousConfig | null;
   activeStudyId: number | null;
   phase: string | null;
   error: { code: string; message: string } | null;

@@ -100,7 +100,7 @@ async function configure() {
   await waitFor(() => expect(button).toBeEnabled());
   await userEvent.click(button);
   const dialog = within(await screen.findByRole("dialog", { name: "Непрерывное исследование · Мой алгоритм" }));
-  await waitFor(() => expect(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" })).toBeEnabled());
+  await waitFor(() => expect(dialog.getByRole("button", { name: "Сохранить параметры" })).toBeEnabled());
   return dialog;
 }
 
@@ -117,7 +117,7 @@ it("saves and restores forecast settings and separates the forward gate from the
   expect(dialog.getByLabelText("Минимальное среднее матожидание, R")).toBeDisabled();
   expect(dialog.getByLabelText("Минимальное среднее матожидание, R")).toHaveAccessibleDescription(/score > minForecastExpectancy/);
   expect(dialog.getByLabelText("Минимальный прогноз матрицы, R")).toHaveValue(0);
-  fireEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  fireEvent.click(dialog.getByRole("button", { name: "Сохранить параметры" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   expect(process?.config?.study).toMatchObject({ trendMode: "forecast", trendBendDays: "30" });
   dialog = await configure();
@@ -138,7 +138,7 @@ it("persists a probability recipe and restores it from saved continuous config w
   fireEvent.change(dialog.getByLabelText("Память модели H, дней"), { target: { value: "7.5" } });
   fireEvent.click(dialog.getByRole("button", { name: "Расширенные настройки модели" }));
   fireEvent.change(dialog.getByLabelText("Сила prior κ"), { target: { value: "20" } });
-  fireEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  fireEvent.click(dialog.getByRole("button", { name: "Сохранить параметры" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   const forecast = { method: "decayed_probability", version: 1, halfLifeDays: 7.5, kappa: 20, priorPolicy: "gross_break_even" };
   expect(process?.config?.study).toMatchObject({ trendMode: "blend", trendBlendLambda: 0.7, forecast });
@@ -149,7 +149,7 @@ it("persists a probability recipe and restores it from saved continuous config w
   expect(dialog.getByLabelText("Сила prior κ")).toHaveValue(20);
   expect(dialog.getByLabelText("Метод прогноза")).toHaveValue("decayed_probability");
   expect(dialog.queryByLabelText("Перегиб на N дней")).not.toBeInTheDocument();
-  fireEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  fireEvent.click(dialog.getByRole("button", { name: "Сохранить параметры" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   expect(process?.config?.study.forecast).toEqual(forecast);
   expect(requests.some((request) => request.path.endsWith("/start"))).toBe(false);
@@ -171,7 +171,7 @@ it("reopens saved continuous blend settings without a draft and restores the non
   dialog = await configure();
   expect(dialog.getByLabelText("Доля прогноза λ")).toHaveValue(0.6);
   expect(dialog.getByLabelText("Минимальный прогноз матрицы, R")).toHaveValue(0.25);
-  await userEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  await userEvent.click(dialog.getByRole("button", { name: "Сохранить параметры" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   expect(process?.config?.study).toMatchObject({ trendMode: "blend", trendBlendLambda: 0.6, minForecastExpectancy: 0.25 });
   expect(requests.some((request) => request.path.endsWith("/start"))).toBe(false);
@@ -755,7 +755,7 @@ it("saves actual metadata controls, date-free list/gate config and locked maturi
   fireEvent.change(dialog.getByLabelText("Последние N дней"), { target: { value: "10" } });
   fireEvent.change(dialog.getByLabelText("Минимум сетапов в день — список профилей"), { target: { value: "0, 0.6, 4" } });
   fireEvent.change(dialog.getByLabelText("Baseline: Новый порог"), { target: { value: "3.75" } });
-  await userEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  await userEvent.click(dialog.getByRole("button", { name: "Сохранить параметры" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   const put = requests.find((request) => request.path === "/v1/continuous-studies/future" && request.method === "PUT")!;
   const config = put.body as ContinuousConfig;
@@ -807,7 +807,7 @@ it("shares common draft fields in both directions while preserving mode-specific
 it("keeps adaptive permission independent and drains only through the common algorithm stop", async () => {
   render(<AlgorithmsPage />);
   const dialog = await configure();
-  await userEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  await userEvent.click(dialog.getByRole("button", { name: "Сохранить параметры" }));
   await screen.findByRole("button", { name: "Запустить непрерывное исследование" });
   await userEvent.click(screen.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" }));
   await userEvent.click(screen.getByRole("button", { name: "Сохранить разрешение адаптивного live" }));
@@ -980,7 +980,7 @@ it("observes without creating work and releases every polling timer on unmount",
 it("keeps an accepted profile visible through technical failure, allows common Stop and preserves completed history", async () => {
   render(<AlgorithmsPage />);
   const dialog = await configure();
-  await userEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  await userEvent.click(dialog.getByRole("button", { name: "Сохранить параметры" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   if (!process?.config) throw new Error("Expected saved continuous config");
   process = { ...process, status: "error", config: { ...process.config, adaptiveEnabled: true }, phase: "analytics", error: { code: "source_unavailable", message: "Повторная попытка" },
@@ -1006,7 +1006,7 @@ it("changes only live permission during running research without revision change
   render(<AlgorithmsPage />);
   const dialog = await configure();
   fireEvent.change(dialog.getByLabelText("Последние N дней"), { target: { value: "0.5" } });
-  await userEvent.click(dialog.getByRole("button", { name: "Сохранить непрерывное исследование" }));
+  await userEvent.click(dialog.getByRole("button", { name: "Сохранить параметры" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   await userEvent.click(screen.getByRole("button", { name: "Запустить непрерывное исследование" }));
   await screen.findByText("Непрерывное исследование включено");

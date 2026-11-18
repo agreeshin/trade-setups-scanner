@@ -245,7 +245,7 @@ function ProfileControl({ profile, controller }: { profile: AdaptiveProfile; con
 }
 
 function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorithm; controller: ContinuousController; onSaved: () => void }) {
-  const saved = controller.process?.config;
+  const saved = controller.process?.pendingConfig ?? controller.process?.config;
   const baseline = saved ? { ...algorithm, params: saved.study.algorithmParams } : algorithm;
   const [scope, setScope] = useState<ScopeDraft>(() => saved ? { ...initialScope(), symbols: saved.study.instruments.map((item) => item.symbol).join("\n"), direction: saved.study.direction,
     horizonMinutes: String(saved.study.horizonMinutes), tpLevels: saved.study.tpLevels.join(", "), slLevels: saved.study.slLevels.join(", "), minClosedPerCell: String(saved.study.minClosedPerCell), seed: String(saved.study.seed), maxTrials: String(saved.study.maxTrials), maxSeconds: String(saved.study.maxSeconds), trendMode: saved.study.trendMode ?? "mean", trendBendDays: saved.study.trendBendDays ?? "linear",
@@ -273,7 +273,7 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
       const restored = restoreOptimizationDraft(rawDraft, algorithm.fields, ANALYTICS_SEARCH_FIELDS, fallbackScope, initial.algorithmDomains, initial.analyticsDomains);
       storedDraft.current = restored;
       setCatalog(items);
-      if (restored && !locked) {
+      if (restored) {
         setScope(applyOptimizationDraftScope(fallbackScope, restored, "continuous"));
         setDraft((previous) => ({ ...previous, ...restored.continuous }));
         setAlgorithmDomains(restored.shared.algorithmDomains);
@@ -289,7 +289,7 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
     event.preventDefault();
     // Radix portals retain React ancestry: never bubble this submit into the fixed-settings form.
     event.stopPropagation();
-    if (!ready || locked || controller.busy !== null || !controller.available) return;
+    if (!ready || controller.busy !== null || !controller.available) return;
     setError(null);
     try {
       const config = buildContinuousConfig(baseline, scope, catalog, algorithmDomains, analyticsDomains, { ...draft, adaptiveEnabled: controller.process?.config?.adaptiveEnabled ?? draft.adaptiveEnabled });
@@ -297,7 +297,7 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
     } catch (cause) { setError(errorText(cause)); }
   }
   function saveDraft(): void {
-    if (!ready || locked || controller.busy !== null) return;
+    if (!ready || controller.busy !== null) return;
     const next = createOptimizationDraft(scope, algorithmDomains, analyticsDomains, storedDraft.current, {
       continuous: { lookbackDays: draft.lookbackDays, minSetupsPerDay: draft.minSetupsPerDay, minMeanExpectancy: draft.minMeanExpectancy },
     });
@@ -305,8 +305,8 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
     draftSave.save(next);
   }
   return <form noValidate onSubmit={(event) => { void submit(event); }} onBlur={saveDraft} className="grid min-w-0 gap-5">
-    {locked && <Alert>Параметры исследования доступны для чтения. Чтобы изменить период, пороги или домены, остановите процесс и дождитесь drain. Разрешение adaptive live сохраняется отдельно.</Alert>}
-    <fieldset disabled={locked || controller.busy !== null} className="grid gap-3 sm:grid-cols-2">
+    {locked && <Alert>Идёт непрерывное исследование. Параметры доступны для редактирования и сохранения, но сохранённые параметры будут применены только к следующему запущенному исследованию. Текущее завершится с параметрами, заданными до его запуска.</Alert>}
+    <fieldset disabled={controller.busy !== null} className="grid gap-3 sm:grid-cols-2">
       <legend className="mb-2 font-semibold">Период и отдельные пороговые профили</legend>
       <Field label="Последние N дней" hint="От 1 минуты до 3660 суток, в целых секундах; дробные сутки разрешены. Окно фиксируется сервером при старте.">{(control) => <Input {...control} type="number" min={MIN_CONTINUOUS_LOOKBACK_DAYS} max={MAX_CONTINUOUS_LOOKBACK_DAYS} step="any" value={draft.lookbackDays} onChange={(event) => setDraft({ ...draft, lookbackDays: event.target.value })} />}</Field>
       <Field label="Минимум сетапов в день — список профилей" hint="До 64 уникальных значений через запятую; 0 отключает частотный допуск. Не поисковый домен и не обещание числа live-сообщений.">{(control) => <Input {...control} maxLength={8192} value={draft.minSetupsPerDay} onChange={(event) => setDraft({ ...draft, minSetupsPerDay: event.target.value })} />}</Field>
@@ -314,9 +314,9 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
     </fieldset>
     {!ready && !error && <Spinner label="Загрузка historical-списка" />}
     {(error ?? draftSave.saveError) && <Alert variant="destructive" role="alert">{error ?? draftSave.saveError}{!ready && <Button type="button" variant="outline" onClick={() => setRetry((value) => value + 1)}>Повторить загрузку</Button>}</Alert>}
-    <OptimizationFields algorithm={baseline} scope={scope} onScopeChange={(patch) => { setScope((previous) => ({ ...previous, ...patch })); setError(null); }} catalog={catalog} ready={ready} disabled={locked || controller.busy !== null} algorithmDomains={algorithmDomains} onAlgorithmDomainsChange={setAlgorithmDomains} analyticsDomains={analyticsDomains} onAnalyticsDomainsChange={setAnalyticsDomains} continuous />
+    <OptimizationFields algorithm={baseline} scope={scope} onScopeChange={(patch) => { setScope((previous) => ({ ...previous, ...patch })); setError(null); }} catalog={catalog} ready={ready} disabled={controller.busy !== null} algorithmDomains={algorithmDomains} onAlgorithmDomainsChange={setAlgorithmDomains} analyticsDomains={analyticsDomains} onAnalyticsDomainsChange={setAnalyticsDomains} continuous />
     {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
-    <div><Button type="submit" disabled={!ready || locked || !controller.available || controller.busy !== null}>{controller.busy === "save" ? "Сохранение…" : "Сохранить непрерывное исследование"}</Button></div>
+    <div><Button type="submit" disabled={!ready || !controller.available || controller.busy !== null}>{controller.busy === "save" ? "Сохранение…" : "Сохранить параметры"}</Button></div>
   </form>;
 }
 
