@@ -14,6 +14,7 @@ pub mod replay;
 pub mod restore;
 pub mod resources;
 pub mod historical_expectancy;
+pub mod setups_analytics;
 pub mod telegram;
 
 use axum::extract::State;

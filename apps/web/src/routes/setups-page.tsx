@@ -3,13 +3,16 @@ import { Alert, AlertDescription } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
 import { Card, CardContent } from "../components/ui/card";
 import { Field } from "../components/ui/field";
+import { InfoNote } from "../components/ui/info-note";
 import { Input } from "../components/ui/input";
 import { PageHeader } from "../components/ui/page-header";
+import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
 import { Pagination } from "../components/ui/pagination";
 import { Spinner } from "../components/ui/spinner";
 import { PLATFORM_URL, fetchPlatform } from "../lib/platform-api";
 import { errorText, localTime, savePreference, type SetupRow } from "./platform-controls";
 import { useRouteActive } from "./route-active";
+import { SetupsAnalyticsPanel } from "./setups-analytics-panel";
 import { SetupTable } from "./setup-table";
 
 interface SetupPage { setups: SetupRow[]; offset: number; limit: number; total: number; snapshotId: number }
@@ -18,6 +21,7 @@ interface FeedState { page: SetupPage | null; dataQuery: FeedQuery | null; respo
 
 export function SetupsPage() {
   const active = useRouteActive();
+  const [section, setSection] = useState<"feed" | "analytics">("feed");
   // One replaceable page and one table-owned selected recommendation; no growing live history.
   const [state, setState] = useState<FeedState>({ page: null, dataQuery: null, responseQuery: null, readAt: null, error: null });
   const [query, setQuery] = useState<FeedQuery>({ filter: "", offset: 0, mode: "live" });
@@ -91,41 +95,50 @@ export function SetupsPage() {
   const changingPage = state.dataQuery !== query;
   return <section aria-labelledby="setups-heading" className="grid gap-4">
     <PageHeader id="setups-heading" title="Сетапы" description="Поиск по всей сохранённой live-ленте. Первая страница follow-live обновляется каждые 3 секунды в активной видимой вкладке. Исторические страницы сохраняют снимок." />
-    <Card>
-      <CardContent className="flex flex-wrap items-end gap-3">
-        <Field label="Инструмент, биржа или алгоритм" className="w-full max-w-sm">
-          {(control) => <Input {...control} disabled={!preferencesReady} value={query.filter} maxLength={200} onChange={(event) => { setQuery({ filter: event.target.value, offset: 0, mode: query.mode === "paused" ? "paused" : "live" }); setMessage(null); }} />}
-        </Field>
-        <div className="flex flex-wrap gap-2">
-          <Button variant="outline" disabled={busy || !preferencesReady} onClick={() => { void saveFilter(); }}>Сохранить фильтр</Button>
-          <Button variant="outline" disabled={!preferencesReady} onClick={() => setQuery({ filter: query.filter, offset: 0, mode: query.mode === "paused" ? "paused" : "live" })}>Обновить</Button>
-          {query.mode === "live" ? <Button variant="outline" disabled={!page || changingPage} onClick={() => { if (page) setQuery({ ...query, snapshotId: page.snapshotId, mode: "paused" }); }}>Приостановить обновление</Button>
-            : <Button variant="outline" disabled={!preferencesReady} onClick={() => setQuery({ filter: query.filter, offset: 0, mode: "live" })}>Следить за live-лентой</Button>}
-          <Button asChild variant="outline"><a href={`${PLATFORM_URL}/v1/export/setups.csv`}>Экспорт CSV (без фильтра)</a></Button>
-        </div>
-        <p className="w-full text-xs text-muted-foreground" aria-live="polite">{query.mode === "live" ? "Live-лента · обновление каждые 3 с в активной видимой вкладке." : query.mode === "history" ? "Исторический снимок · автообновление приостановлено." : "Обновление ленты приостановлено."}</p>
-        <InfoNote label="О выгрузке CSV">CSV содержит всю сохранённую live-ленту на начало выгрузки, без фильтра экрана и лимита строк. Статус и отмена доступны в загрузках браузера.</InfoNote>
-      </CardContent>
-    </Card>
-    {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
-    {message && <Alert variant="success" role="status"><AlertDescription>{message}</AlertDescription></Alert>}
-    {state.readAt !== null && <p className="text-xs text-muted-foreground">Последнее успешное чтение: {localTime(state.readAt)}</p>}
-    {state.error && <Alert variant="destructive" role="alert">{page ? `Ошибка обновления (${state.error}). Показан последний подтверждённый список; данные могли устареть.` : `Лента недоступна (${state.error})`}</Alert>}
-    {preferencesReady && state.responseQuery !== query && <Spinner label={page ? "Загрузка выбранной страницы; пока показан предыдущий список…" : "Загрузка…"} />}
-    {!preferencesReady && <Spinner label="Загрузка…" />}
-    {page && <>
-      <SetupTable setups={page.setups} />
-      <Pagination
-        label="Страницы сетапов"
-        page={currentPage + 1}
-        pages={pages}
-        prevDisabled={changingPage || currentPage === 0}
-        nextDisabled={changingPage || currentPage + 1 >= pages}
-        onPrev={() => loadPage(page.offset - page.limit)}
-        onNext={() => loadPage(page.offset + page.limit)}
-        summary={`Страница ${currentPage + 1} из ${pages} · Найдено: ${page.total}`}
-      />
-    </>}
+    <PageSidebar label="Подразделы сетапов" value={section} onValueChange={setSection} items={[
+      { id: "feed", label: "Лента" },
+      { id: "analytics", label: "Аналитика" },
+    ]}>
+      <PageSidebarPanel value="feed">
+        <Card>
+          <CardContent className="flex flex-wrap items-end gap-3">
+            <Field label="Инструмент, биржа или алгоритм" className="w-full max-w-sm">
+              {(control) => <Input {...control} disabled={!preferencesReady} value={query.filter} maxLength={200} onChange={(event) => { setQuery({ filter: event.target.value, offset: 0, mode: query.mode === "paused" ? "paused" : "live" }); setMessage(null); }} />}
+            </Field>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" disabled={busy || !preferencesReady} onClick={() => { void saveFilter(); }}>Сохранить фильтр</Button>
+              <Button variant="outline" disabled={!preferencesReady} onClick={() => setQuery({ filter: query.filter, offset: 0, mode: query.mode === "paused" ? "paused" : "live" })}>Обновить</Button>
+              {query.mode === "live" ? <Button variant="outline" disabled={!page || changingPage} onClick={() => { if (page) setQuery({ ...query, snapshotId: page.snapshotId, mode: "paused" }); }}>Приостановить обновление</Button>
+                : <Button variant="outline" disabled={!preferencesReady} onClick={() => setQuery({ filter: query.filter, offset: 0, mode: "live" })}>Следить за live-лентой</Button>}
+              <Button asChild variant="outline"><a href={`${PLATFORM_URL}/v1/export/setups.csv`}>Экспорт CSV (без фильтра)</a></Button>
+            </div>
+            <p className="w-full text-xs text-muted-foreground" aria-live="polite">{query.mode === "live" ? "Live-лента · обновление каждые 3 с в активной видимой вкладке." : query.mode === "history" ? "Исторический снимок · автообновление приостановлено." : "Обновление ленты приостановлено."}</p>
+            <InfoNote label="О выгрузке CSV">CSV содержит всю сохранённую live-ленту на начало выгрузки, без фильтра экрана и лимита строк. Статус и отмена доступны в загрузках браузера.</InfoNote>
+          </CardContent>
+        </Card>
+        {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
+        {message && <Alert variant="success" role="status"><AlertDescription>{message}</AlertDescription></Alert>}
+        {state.readAt !== null && <p className="text-xs text-muted-foreground">Последнее успешное чтение: {localTime(state.readAt)}</p>}
+        {state.error && <Alert variant="destructive" role="alert">{page ? `Ошибка обновления (${state.error}). Показан последний подтверждённый список; данные могли устареть.` : `Лента недоступна (${state.error})`}</Alert>}
+        {preferencesReady && state.responseQuery !== query && <Spinner label={page ? "Загрузка выбранной страницы; пока показан предыдущий список…" : "Загрузка…"} />}
+        {!preferencesReady && <Spinner label="Загрузка…" />}
+        {page && <>
+          <SetupTable setups={page.setups} />
+          <Pagination
+            label="Страницы сетапов"
+            page={currentPage + 1}
+            pages={pages}
+            prevDisabled={changingPage || currentPage === 0}
+            nextDisabled={changingPage || currentPage + 1 >= pages}
+            onPrev={() => loadPage(page.offset - page.limit)}
+            onNext={() => loadPage(page.offset + page.limit)}
+            summary={`Страница ${currentPage + 1} из ${pages} · Найдено: ${page.total}`}
+          />
+        </>}
+      </PageSidebarPanel>
+      <PageSidebarPanel value="analytics" lazy>
+        <SetupsAnalyticsPanel />
+      </PageSidebarPanel>
+    </PageSidebar>
   </section>;
 }
-import { InfoNote } from "../components/ui/info-note";

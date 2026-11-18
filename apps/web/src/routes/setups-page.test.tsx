@@ -26,6 +26,7 @@ beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     requests.push({ path, signal: init?.signal });
     if (path === "/v1/settings/ui") return Promise.resolve(json({ value: { setupFilter: "BTC" } }));
+    if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [] }));
     return Promise.resolve(respond(new URL(path, "http://localhost").searchParams));
   }));
 });
@@ -115,4 +116,22 @@ it("does not show a successful empty feed when the first read fails", async () =
   expect(screen.getByRole("alert")).toHaveTextContent("Лента недоступна");
   expect(screen.queryByText("Сетапы не найдены.")).not.toBeInTheDocument();
   respond = page; await tick(); expect(screen.getByText("bybit · BTC60")).toBeInTheDocument();
+});
+
+it("keeps the feed panel alive behind the analytics sidebar section", async () => {
+  render(<SetupsPage />); await settle();
+  expect(screen.getByRole("tab", { name: "Лента" })).toHaveAttribute("aria-selected", "true");
+  expect(screen.getByRole("tabpanel", { name: "Лента" })).toBeVisible();
+  fireEvent.click(screen.getByRole("tab", { name: "Аналитика" })); await settle(); await tick(400);
+  expect(requests.some((request) => request.path === "/v1/algorithms")).toBe(true);
+  expect(screen.queryByRole("tabpanel", { name: "Лента" })).not.toBeInTheDocument();
+  expect(screen.getByRole("tabpanel", { name: "Аналитика" })).toBeVisible();
+  expect(screen.getByText("bybit · BTC60")).toBeInTheDocument();
+  const feedCallsBefore = calls().length;
+  fireEvent.click(screen.getByRole("tab", { name: "Лента" })); await settle();
+  expect(screen.queryByRole("tabpanel", { name: "Аналитика" })).not.toBeInTheDocument();
+  expect(screen.getByRole("tabpanel", { name: "Лента" })).toBeVisible();
+  expect(screen.getByText("bybit · BTC60")).toBeInTheDocument();
+  await tick(3000);
+  expect(calls().length).toBeGreaterThan(feedCallsBefore);
 });

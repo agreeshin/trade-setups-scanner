@@ -167,7 +167,8 @@ async fn main() {
         .merge(replay_router(replay_state.clone()))
         .merge(controls_router(controls_state))
         .merge(batches_router(replay_state))
-        .merge(setups_api::analytics::analytics_router(analytics_state))
+        .merge(setups_api::analytics::analytics_router(analytics_state.clone()))
+        .merge(setups_api::setups_analytics::setups_analytics_router(analytics_state))
         .merge(setups_api::optimization::optimization_router(
             optimization_state,
         ))
