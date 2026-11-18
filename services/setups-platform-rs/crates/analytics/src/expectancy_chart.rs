@@ -301,6 +301,28 @@ fn validate_model_source(
     Ok(())
 }
 
+pub struct StudySeries {
+    pub mean_r: f64,
+    pub trend_method: Option<&'static str>,
+    pub trend_points: Vec<(f64, f64)>,
+}
+
+pub fn study_series(
+    artifact: &ExpectancyArtifact,
+    study: StudyTrend,
+) -> Result<StudySeries, RenderError> {
+    artifact.validate().map_err(RenderError::InvalidArtifact)?;
+    let points = daily_points(artifact)?;
+    Geometry::from_points(points, None)?;
+    let mean = period_mean_r(artifact, points);
+    let trend = display_trend(points, mean, study)?;
+    Ok(StudySeries {
+        mean_r: mean,
+        trend_method: trend.as_ref().map(|trend| trend.method),
+        trend_points: trend.map(|trend| trend.points).unwrap_or_default(),
+    })
+}
+
 #[cfg(test)]
 fn attr_after(svg: &str, marker: &str) -> f64 {
     let start = svg.find(marker).expect(marker) + marker.len();
@@ -1795,6 +1817,18 @@ mod tests {
         );
         assert!(svg.contains(&line));
         assert_eq!(artifact, fixture()); // renderer did not mutate a sealed artifact
+    }
+
+    #[test]
+    fn study_series_exposes_period_mean_and_fitted_trend() {
+        let artifact = fixture();
+        let series = study_series(&artifact, StudyTrend::default()).unwrap();
+        assert!(series.mean_r.is_finite());
+        assert!(series.trend_method.is_some());
+        assert!(series.trend_points.len() >= 2);
+        let rerendered = study_series(&artifact, StudyTrend::default()).unwrap();
+        assert_eq!(series.mean_r, rerendered.mean_r);
+        assert_eq!(series.trend_points, rerendered.trend_points);
     }
 
     #[test]

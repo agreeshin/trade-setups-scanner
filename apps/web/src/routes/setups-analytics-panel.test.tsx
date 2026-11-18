@@ -58,7 +58,7 @@ beforeEach(() => {
     requests.push(path);
     if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "", enabled: true, params: {}, fields: [] }] }));
     if (path.startsWith("/v1/setups/analytics/studies")) return Promise.resolve(json({ studies: [studyMeta1, studyMeta2] }));
-    if (path.startsWith("/v1/setups/analytics/expectancy-png/")) return Promise.resolve(new Response(new Blob(["png-bytes"]), { status: 200 }));
+    if (path === "/v1/setups/analytics/study-expectancy/40") return Promise.resolve(json({ studyId: 40, observationCutoff: 1793923200, meanR: 0.2, daily: [{ dayUnix: 1793923200, meanR: 0.3, tpCount: 2, slCount: 1 }, { dayUnix: 1794009600, meanR: -0.1, tpCount: 1, slCount: 1 }], trend: { method: "mean", points: [{ dayUnix: 1793923200, value: 0.2 }, { dayUnix: 1794009600, value: 0.2 }] } }));
     if (path === "/v1/optimization-studies/40") return Promise.resolve(json(optimizationStudy40));
     if (path.startsWith("/v1/setups/analytics?")) return Promise.resolve(analyticsResponse());
     return Promise.resolve(json({}));
@@ -156,7 +156,7 @@ it("restores persisted filters and selection from local storage", async () => {
   expect(query.get("studies")).toBe("40");
 });
 
-it("shows study details with the generation PNG in a modal", async () => {
+it("shows study details with the past-and-live chart in a modal", async () => {
   await rendered();
   fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
   await settle();
@@ -172,10 +172,12 @@ it("shows study details with the generation PNG in a modal", async () => {
   expect(within(dialog).getByText("Полные параметры алгоритма")).toBeInTheDocument();
   expect(within(dialog).getByText("spike_mult")).toBeInTheDocument();
   expect(within(dialog).getAllByText("2.5").length).toBeGreaterThan(0);
-  const image = within(dialog).getByAltText("Динамика матожидания исследования №40");
-  expect(image.getAttribute("src")).toBe("blob:expectancy-png");
+  const chart = within(dialog).getByTestId("study-horizon-chart");
+  expect(chart.querySelector("[data-divider-day]")).not.toBeNull();
+  expect(chart.querySelectorAll('[data-phase="past"]').length).toBe(2);
+  expect(dialog.querySelector("img")).toBeNull();
   expect(requests).toContain("/v1/optimization-studies/40");
-  expect(requests.some((path) => path.startsWith("/v1/setups/analytics/expectancy-png/900"))).toBe(true);
+  expect(requests.some((path) => path === "/v1/setups/analytics/study-expectancy/40")).toBe(true);
 });
 
 it("disables calculation and hints when the range is invalid", async () => {

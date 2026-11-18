@@ -843,6 +843,112 @@ async fn render_expectancy_png(
     .map_err(|_| unavailable(StatusCode::NOT_FOUND))
 }
 
+async fn setups_analytics_study_expectancy(
+    State(state): State<Arc<AnalyticsState>>,
+    headers: HeaderMap,
+    Path(study_id): Path<i64>,
+) -> Response {
+    if let Err(response) = guard_auth(&state.auth, &headers, false) {
+        return response;
+    }
+    let row = match sqlx::query(
+        "select numerical_snapshot from study_expectancy_artifacts where source_study_id=$1 and owner_id='admin' order by id desc limit 1",
+    )
+    .bind(study_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return error_response(StatusCode::NOT_FOUND, "study_expectancy_unavailable")
+        }
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "study_expectancy_unavailable",
+            )
+        }
+    };
+    let snapshot: Value = match row.try_get("numerical_snapshot") {
+        Ok(value) => value,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "study_expectancy_unavailable",
+            )
+        }
+    };
+    let artifact: setups_domain::expectancy::ExpectancyArtifact =
+        match serde_json::from_value(snapshot) {
+            Ok(value) => value,
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "study_expectancy_unavailable",
+                )
+            }
+        };
+    let trend = match sqlx::query("select spec from optimization_studies where id=$1 and owner_id='admin'")
+        .bind(study_id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(row)) => row
+            .try_get::<Value, _>("spec")
+            .ok()
+            .and_then(|spec| {
+                serde_json::from_value::<setups_analytics::expectancy_chart::StudyTrend>(spec)
+                    .ok()
+            })
+            .unwrap_or_default(),
+        _ => setups_analytics::expectancy_chart::StudyTrend::default(),
+    };
+    let cutoff = artifact.source.provenance.observation_cutoff;
+    let origin_unix = artifact.origin_unix;
+    let daily = match &artifact.daily {
+        setups_domain::expectancy::MetricAvailability::Available { value } => value
+            .iter()
+            .map(|point| {
+                json!({
+                    "dayUnix": point.day_start_unix,
+                    "meanR": point.mean_r,
+                    "tpCount": point.tp_count,
+                    "slCount": point.sl_count,
+                })
+            })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let series = match tokio::task::spawn_blocking(move || {
+        setups_analytics::expectancy_chart::study_series(&artifact, trend)
+    })
+    .await
+    {
+        Ok(Ok(series)) => series,
+        _ => {
+            return error_response(StatusCode::NOT_FOUND, "study_expectancy_unavailable")
+        }
+    };
+    let trend_points = series
+        .trend_points
+        .iter()
+        .map(|&(day, value)| {
+            json!({
+                "dayUnix": origin_unix + (day * 86400.0).round() as i64,
+                "value": value,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "studyId": study_id,
+        "observationCutoff": cutoff,
+        "meanR": series.mean_r,
+        "daily": daily,
+        "trend": { "method": series.trend_method, "points": trend_points },
+    }))
+    .into_response()
+}
+
 pub fn setups_analytics_router(state: Arc<AnalyticsState>) -> Router {
     Router::new()
         .route("/v1/setups/analytics", get(setups_analytics))
@@ -853,6 +959,10 @@ pub fn setups_analytics_router(state: Arc<AnalyticsState>) -> Router {
         .route(
             "/v1/setups/analytics/expectancy-png/{artifactId}",
             get(setups_analytics_expectancy_png),
+        )
+        .route(
+            "/v1/setups/analytics/study-expectancy/{studyId}",
+            get(setups_analytics_study_expectancy),
         )
         .with_state(state)
 }

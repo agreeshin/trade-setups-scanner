@@ -168,3 +168,58 @@ export async function fetchExpectancyPngUrl(artifactId: number, signal?: AbortSi
   }
   return URL.createObjectURL(await response.blob());
 }
+
+export interface StudyExpectancyPoint {
+  dayUnix: number;
+  meanR: number | null;
+  tpCount: number;
+  slCount: number;
+}
+
+export interface StudyTrendPoint {
+  dayUnix: number;
+  value: number;
+}
+
+export interface StudyExpectancySeries {
+  studyId: number;
+  observationCutoff: number;
+  meanR: number;
+  daily: StudyExpectancyPoint[];
+  trend: { method: string | null; points: StudyTrendPoint[] };
+}
+
+function isStudyExpectancyPoint(value: unknown): value is StudyExpectancyPoint {
+  return isRecord(value)
+    && isUnix(value.dayUnix)
+    && (value.meanR === null || isFiniteNumber(value.meanR))
+    && Number.isInteger(value.tpCount)
+    && Number.isInteger(value.slCount);
+}
+
+function isStudyTrendPoint(value: unknown): value is StudyTrendPoint {
+  return isRecord(value) && isUnix(value.dayUnix) && isFiniteNumber(value.value);
+}
+
+export async function fetchStudyExpectancy(studyId: number, signal?: AbortSignal): Promise<StudyExpectancySeries> {
+  const response = await apiFetch(`/v1/setups/analytics/study-expectancy/${studyId}`, signal === undefined ? {} : { signal });
+  const body: unknown = await readBody(response);
+  if (!isRecord(body)
+    || typeof body.studyId !== "number"
+    || !Number.isInteger(body.studyId)
+    || !isUnix(body.observationCutoff)
+    || !isFiniteNumber(body.meanR)) {
+    throw new SetupsAnalyticsApiError("Некорректный ответ: серия матожидания исследования");
+  }
+  const trend = isRecord(body.trend) ? body.trend : null;
+  return {
+    studyId: body.studyId,
+    observationCutoff: body.observationCutoff,
+    meanR: body.meanR,
+    daily: Array.isArray(body.daily) ? expectArray(body.daily, isStudyExpectancyPoint, "daily") : [],
+    trend: {
+      method: trend !== null && typeof trend.method === "string" ? trend.method : null,
+      points: trend !== null && Array.isArray(trend.points) ? expectArray(trend.points, isStudyTrendPoint, "trend.points") : [],
+    },
+  };
+}

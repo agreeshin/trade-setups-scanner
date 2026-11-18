@@ -15,13 +15,15 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from ".
 import { fetchPlatform } from "../lib/platform-api";
 import { getOptimizationStudy, type OptimizationMatrixCell, type OptimizationStudy } from "../lib/optimization-api";
 import {
-  fetchExpectancyPngUrl,
   fetchSetupsAnalytics,
   fetchSetupsAnalyticsStudies,
+  fetchStudyExpectancy,
   type SetupsAnalyticsResult,
   type SetupsAnalyticsSetup,
   type SetupsAnalyticsStatus,
   type SetupsAnalyticsStudyMeta,
+  type StudyExpectancyPoint,
+  type StudyExpectancySeries,
 } from "../lib/setups-analytics-api";
 import {
   algorithmDisplayName,
@@ -118,6 +120,7 @@ const CHART_STYLE = {
   negative: "#f08a7f",
   axis: "#a5a8af",
   grid: "#2e3238",
+  trend: "#f5b041",
 };
 
 interface DailyOutcome {
@@ -214,11 +217,71 @@ function bestMeanPair(matrix: OptimizationMatrixCell[]): { tpPct: number; slPct:
   return best;
 }
 
-function StudyDetailsDialog({ studyId, meta, onClose }: { studyId: number | null; meta: SetupsAnalyticsStudyMeta | undefined; onClose: () => void }) {
+function studyPointWithMean(point: StudyExpectancyPoint): point is StudyExpectancyPoint & { meanR: number } {
+  return point.meanR !== null;
+}
+
+function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectancySeries; live: readonly DailyOutcome[]; dividerDay: number | null }) {
+  const past = series.daily.filter(studyPointWithMean);
+  if (past.length === 0 && live.length === 0) {
+    return <p className="text-sm text-muted-foreground">Нет данных для графика.</p>;
+  }
+  const trendValues = series.trend.points.map((point) => point.value);
+  const dayNumbers = [...past.map((point) => point.dayUnix), ...live.map((point) => point.dayUnix)];
+  if (dividerDay !== null) dayNumbers.push(dividerDay);
+  const firstDay = Math.min(...dayNumbers);
+  const lastDay = Math.max(...dayNumbers);
+  const daySpan = Math.max(1, Math.round((lastDay - firstDay) / DAY_SECONDS));
+  const xOf = (dayUnix: number) => CHART_STYLE.left + ((dayUnix - firstDay) / DAY_SECONDS / daySpan) * (CHART_STYLE.right - CHART_STYLE.left);
+  const values = [...past.map((point) => point.meanR), ...live.map((point) => point.meanR), ...trendValues];
+  const rawMin = Math.min(0, ...values);
+  const rawMax = Math.max(0, ...values);
+  const pad = rawMax - rawMin < 1e-9 ? 0.5 : (rawMax - rawMin) * 0.08;
+  const yMin = rawMin - pad;
+  const yMax = rawMax + pad;
+  const yOf = (value: number) => CHART_STYLE.bottom - ((value - yMin) / (yMax - yMin)) * (CHART_STYLE.bottom - CHART_STYLE.top);
+  const labelStep = Math.max(1, Math.ceil(daySpan / 8));
+  const gridDays = Array.from({ length: daySpan + 1 }, (_, index) => firstDay + index * DAY_SECONDS).filter((_, index) => index % labelStep === 0);
+  const gridLevels: number[] = [];
+  for (let level = Math.ceil(yMin); level <= Math.floor(yMax); level += 1) {
+    if (level !== 0) gridLevels.push(level);
+  }
+  const dividerX = dividerDay === null ? null : Math.min(Math.max(xOf(dividerDay), CHART_STYLE.left), CHART_STYLE.right);
+  return <svg data-testid="study-horizon-chart" viewBox={`0 0 ${CHART_STYLE.width} ${CHART_STYLE.height}`} role="img" aria-label="Матожидание: ретроспектива исследования и live-сетапы" className="w-full rounded-md border border-input/60">
+    <rect width={CHART_STYLE.width} height={CHART_STYLE.height} fill={CHART_STYLE.background} />
+    <text x={CHART_STYLE.width / 2} y={28} textAnchor="middle" fontSize={14} fill={CHART_STYLE.foreground}>Динамика матожидания: ретроспектива и live</text>
+    {gridDays.map((dayUnix) => <g key={`day-${dayUnix}`}>
+      <line x1={xOf(dayUnix)} y1={CHART_STYLE.top} x2={xOf(dayUnix)} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.grid} strokeWidth={1} />
+      <text x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{dayLabel(dayUnix)}</text>
+    </g>)}
+    {gridLevels.map((level) => <g key={`level-${level}`}>
+      <line x1={CHART_STYLE.left} y1={yOf(level)} x2={CHART_STYLE.right} y2={yOf(level)} stroke={CHART_STYLE.grid} strokeWidth={1} />
+      <text x={CHART_STYLE.left - 8} y={yOf(level) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>{level} R</text>
+    </g>)}
+    <line x1={CHART_STYLE.left} y1={yOf(0)} x2={CHART_STYLE.right} y2={yOf(0)} stroke={CHART_STYLE.axis} strokeWidth={1.5} />
+    <text x={CHART_STYLE.left - 8} y={yOf(0) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>0 R</text>
+    {series.trend.points.length > 1 && <polyline fill="none" stroke={CHART_STYLE.trend} strokeWidth={2} strokeDasharray="4 4" data-method={series.trend.method ?? undefined} points={series.trend.points.map((point) => `${xOf(point.dayUnix)},${yOf(point.value)}`).join(" ")} />}
+    {past.length > 1 && <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={past.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
+    {live.length > 1 && <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={live.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
+    {past.map((point) => <circle key={`past-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={CHART_STYLE.line} data-day={dayLabel(point.dayUnix)} data-phase="past">
+      <title>{`${dayLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · ретроспектива`}</title>
+    </circle>)}
+    {live.map((point) => <circle key={`live-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={dayLabel(point.dayUnix)} data-phase="live" data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)}>
+      <title>{`${dayLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title>
+    </circle>)}
+    {dividerX !== null && <g data-divider-day={dividerDay}>
+      <line x1={dividerX} y1={CHART_STYLE.top} x2={dividerX} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.axis} strokeWidth={1.5} strokeDasharray="3 4" />
+      <text x={dividerX > CHART_STYLE.width / 2 ? dividerX - 6 : dividerX + 6} y={45} textAnchor={dividerX > CHART_STYLE.width / 2 ? "end" : "start"} fontSize={11} fill={CHART_STYLE.axis}>Старт исследования</text>
+    </g>}
+  </svg>;
+}
+
+function StudyDetailsDialog({ studyId, algorithmId, meta, onClose }: { studyId: number | null; algorithmId: string; meta: SetupsAnalyticsStudyMeta | undefined; onClose: () => void }) {
   const [study, setStudy] = useState<OptimizationStudy | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [pngUrl, setPngUrl] = useState<string | null>(null);
-  const [pngError, setPngError] = useState<string | null>(null);
+  const [series, setSeries] = useState<StudyExpectancySeries | null>(null);
+  const [chartError, setChartError] = useState<string | null>(null);
+  const [live, setLive] = useState<DailyOutcome[] | null>(null);
 
   useEffect(() => {
     if (studyId === null) return;
@@ -226,16 +289,32 @@ function StudyDetailsDialog({ studyId, meta, onClose }: { studyId: number | null
     void getOptimizationStudy(studyId, controller.signal)
       .then((value) => { if (!controller.signal.aborted) setStudy(value); })
       .catch((cause) => { if (!controller.signal.aborted) setLoadError(errorText(cause)); });
-    const artifactId = meta?.artifactId;
-    if (artifactId !== undefined && artifactId !== null) {
-      void fetchExpectancyPngUrl(artifactId, controller.signal)
-        .then((url) => { if (!controller.signal.aborted) setPngUrl(url); })
-        .catch((cause) => { if (!controller.signal.aborted) setPngError(errorText(cause)); });
-    }
+    void fetchStudyExpectancy(studyId, controller.signal)
+      .then((value) => { if (!controller.signal.aborted) setSeries(value); })
+      .catch((cause) => { if (!controller.signal.aborted) setChartError(errorText(cause)); });
     return () => controller.abort();
-  }, [studyId, meta]);
+  }, [studyId]);
 
-  useEffect(() => () => { if (pngUrl !== null) URL.revokeObjectURL(pngUrl); }, [pngUrl]);
+  useEffect(() => {
+    if (studyId === null || study === null) return;
+    const controller = new AbortController();
+    const startedUnix = Math.floor(Date.parse(study.createdAt) / 1000);
+    const fromUnix = Number.isFinite(startedUnix) && startedUnix > 0
+      ? Math.floor(startedUnix / DAY_SECONDS) * DAY_SECONDS
+      : Math.floor(Date.now() / 1000 / DAY_SECONDS) * DAY_SECONDS - 30 * DAY_SECONDS;
+    void fetchSetupsAnalytics(algorithmId, fromUnix, Math.floor(Date.now() / 1000), [studyId], controller.signal)
+      .then((value) => { if (!controller.signal.aborted) setLive(dailyOutcomes(value.setups)); })
+      .catch(() => { if (!controller.signal.aborted) setLive([]); });
+    return () => controller.abort();
+  }, [studyId, study, algorithmId]);
+
+  const dividerDay = useMemo(() => {
+    if (study !== null) {
+      const startedUnix = Math.floor(Date.parse(study.createdAt) / 1000);
+      if (Number.isFinite(startedUnix) && startedUnix > 0) return Math.floor(startedUnix / DAY_SECONDS) * DAY_SECONDS;
+    }
+    return series !== null ? Math.floor(series.observationCutoff / DAY_SECONDS) * DAY_SECONDS : null;
+  }, [study, series]);
 
   const best = study?.result?.best ?? null;
   const trendMode = best?.trendMode ?? study?.spec.trendMode;
@@ -270,11 +349,10 @@ function StudyDetailsDialog({ studyId, meta, onClose }: { studyId: number | null
         </div>
       </div>}
       <div className="grid gap-2">
-        <h4 className="font-medium">Динамика матожидания</h4>
-        {pngUrl !== null && <img src={pngUrl} alt={`Динамика матожидания исследования №${studyId}`} className="w-full rounded-md border border-input/60" />}
-        {pngUrl === null && pngError !== null && <p className="text-sm text-muted-foreground">{pngError}</p>}
-        {pngUrl === null && pngError === null && (meta?.artifactId === undefined || meta.artifactId === null) && <p className="text-sm text-muted-foreground">PNG недоступен: у сетапов этого исследования нет сохранённого графика.</p>}
-        {pngUrl === null && pngError === null && meta?.artifactId != null && <p className="text-sm text-muted-foreground">Загрузка графика…</p>}
+        <h4 className="font-medium">Динамика матожидания: ретроспектива и live</h4>
+        {chartError !== null && <p className="text-sm text-muted-foreground">{chartError}</p>}
+        {chartError === null && series === null && <p className="text-sm text-muted-foreground">Загрузка графика…</p>}
+        {series !== null && chartError === null && <StudyHorizonChart series={series} live={live ?? []} dividerDay={dividerDay} />}
       </div>
     </DialogContent>}
   </Dialog>;
@@ -585,6 +663,6 @@ export function SetupsAnalyticsPanel() {
       onClose={() => setPickerOpen(false)}
       onApply={() => { setSelectedStudies(pickerSelection.size === studiesMeta.length ? null : new Set(pickerSelection)); setPickerOpen(false); }}
     />
-    <StudyDetailsDialog key={detailStudyId ?? "none"} studyId={detailStudyId} meta={detailMeta} onClose={() => setDetailStudyId(null)} />
+    <StudyDetailsDialog key={detailStudyId ?? "none"} studyId={detailStudyId} algorithmId={algorithmId} meta={detailMeta} onClose={() => setDetailStudyId(null)} />
   </section>;
 }
