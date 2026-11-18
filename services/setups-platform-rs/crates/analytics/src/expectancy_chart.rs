@@ -1055,7 +1055,11 @@ fn render_svg_projection(
         r#"<circle id="raw-close-marker" data-at-unix="{raw_signal_at}" data-forecast-r="{saved_forecast_r}" cx="{marker_x:.3}" cy="{marker_y:.3}" r="5" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="2"/>"#
     )?;
     let label_at_left = marker_x > RIGHT - LABEL_WIDTH;
-    let label_x = if label_at_left { marker_x - 10.0 } else { marker_x + 10.0 };
+    let label_x = if label_at_left {
+        marker_x - 10.0
+    } else {
+        marker_x + 10.0
+    };
     write!(
         svg,
         r#"<text id="raw-close-label" data-forecast-r="{saved_forecast_r}" x="{label_x:.3}" y="{:.3}" text-anchor="{}" font-size="11" fill="{TREND}">{}</text>"#,

@@ -806,10 +806,7 @@ async fn setups_analytics_expectancy_png(
     }
 }
 
-async fn render_expectancy_png(
-    pool: &sqlx::PgPool,
-    artifact_id: i64,
-) -> Result<Vec<u8>, Response> {
+async fn render_expectancy_png(pool: &sqlx::PgPool, artifact_id: i64) -> Result<Vec<u8>, Response> {
     let unavailable = |status: StatusCode| error_response(status, "expectancy_png_unavailable");
     let mut artifact = setups_db::expectancy::get(pool, "admin", artifact_id)
         .await
@@ -875,7 +872,7 @@ async fn setups_analytics_study_expectancy(
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "study_expectancy_unavailable",
-            )
+            );
         }
     };
     let artifact: setups_domain::expectancy::ExpectancyArtifact =
@@ -885,24 +882,25 @@ async fn setups_analytics_study_expectancy(
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "study_expectancy_unavailable",
-                )
+                );
             }
         };
-    let trend = match sqlx::query("select spec from optimization_studies where id=$1 and owner_id='admin'")
-        .bind(study_id)
-        .fetch_optional(&state.pool)
-        .await
-    {
-        Ok(Some(row)) => row
-            .try_get::<Value, _>("spec")
-            .ok()
-            .and_then(|spec| {
-                serde_json::from_value::<setups_analytics::expectancy_chart::StudyTrend>(spec)
-                    .ok()
-            })
-            .unwrap_or_default(),
-        _ => setups_analytics::expectancy_chart::StudyTrend::default(),
-    };
+    let trend =
+        match sqlx::query("select spec from optimization_studies where id=$1 and owner_id='admin'")
+            .bind(study_id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(Some(row)) => row
+                .try_get::<Value, _>("spec")
+                .ok()
+                .and_then(|spec| {
+                    serde_json::from_value::<setups_analytics::expectancy_chart::StudyTrend>(spec)
+                        .ok()
+                })
+                .unwrap_or_default(),
+            _ => setups_analytics::expectancy_chart::StudyTrend::default(),
+        };
     let cutoff = artifact.source.provenance.observation_cutoff;
     let origin_unix = artifact.origin_unix;
     let daily = match &artifact.daily {
@@ -925,9 +923,7 @@ async fn setups_analytics_study_expectancy(
     .await
     {
         Ok(Ok(series)) => series,
-        _ => {
-            return error_response(StatusCode::NOT_FOUND, "study_expectancy_unavailable")
-        }
+        _ => return error_response(StatusCode::NOT_FOUND, "study_expectancy_unavailable"),
     };
     let trend_points = series
         .trend_points
