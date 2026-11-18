@@ -20,7 +20,7 @@ const MAX_ANALYTICS_SLOTS: usize = 64;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SnapshotDto {
+struct RecommendationDto {
     direction: String,
     tp_pct: f64,
     sl_pct: f64,
@@ -28,12 +28,6 @@ struct SnapshotDto {
     time_shift_minutes: i64,
     #[serde(default)]
     price_change_pct: Option<f64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct EnvelopeDto {
-    snapshot: SnapshotDto,
     #[serde(default)]
     study_id: Option<Value>,
     #[serde(default)]
@@ -70,16 +64,15 @@ struct ParsedRecommendation {
 }
 
 fn parse_recommendation(value: &Value) -> Result<ParsedRecommendation, String> {
-    let envelope: EnvelopeDto = serde_json::from_value(value.clone())
+    let item: RecommendationDto = serde_json::from_value(value.clone())
         .map_err(|_| "setups_analytics_invalid_recommendation".to_string())?;
-    let snapshot = envelope.snapshot;
-    let direction = direction_of(&snapshot.direction)
+    let direction = direction_of(&item.direction)
         .ok_or_else(|| "setups_analytics_invalid_recommendation".to_string())?;
-    if !(0.0 < snapshot.tp_pct && snapshot.tp_pct <= 100.0)
-        || !(0.0 < snapshot.sl_pct && snapshot.sl_pct <= 100.0)
-        || !snapshot.mean_r.is_finite()
-        || !(0..=43200).contains(&snapshot.time_shift_minutes)
-        || snapshot
+    if !(0.0 < item.tp_pct && item.tp_pct <= 100.0)
+        || !(0.0 < item.sl_pct && item.sl_pct <= 100.0)
+        || !item.mean_r.is_finite()
+        || !(0..=43200).contains(&item.time_shift_minutes)
+        || item
             .price_change_pct
             .is_some_and(|pct| !pct.is_finite() || !(-100.0..=1000.0).contains(&pct))
     {
@@ -92,13 +85,13 @@ fn parse_recommendation(value: &Value) -> Result<ParsedRecommendation, String> {
             "long"
         },
         direction,
-        tp_pct: snapshot.tp_pct,
-        sl_pct: snapshot.sl_pct,
-        mean_r: snapshot.mean_r,
-        time_shift_minutes: snapshot.time_shift_minutes,
-        price_change_pct: snapshot.price_change_pct,
-        envelope_study_id: id_of(&envelope.study_id),
-        external_name: envelope.external_name,
+        tp_pct: item.tp_pct,
+        sl_pct: item.sl_pct,
+        mean_r: item.mean_r,
+        time_shift_minutes: item.time_shift_minutes,
+        price_change_pct: item.price_change_pct,
+        envelope_study_id: id_of(&item.study_id),
+        external_name: item.external_name,
     })
 }
 
@@ -783,33 +776,33 @@ mod tests {
     use super::*;
     use setups_analytics::OhlcCandle;
 
-    fn envelope_json() -> Value {
+    fn recommendation_json() -> Value {
         json!({
-            "snapshot": {
-                "direction": "short",
-                "tpPct": 20.0,
-                "slPct": 6.0,
-                "rawR": 0.1,
-                "meanR": 0.32,
-                "robustScore": 0.5,
-                "timeShiftMinutes": 5,
-                "priceChangePct": 2.0,
-                "clusterEnabled": true,
-                "clusterGapMinutes": 30,
-                "provenance": { "algorithmId": "price_volume_spike" }
-            },
+            "direction": "short",
+            "tpPct": 20.0,
+            "slPct": 6.0,
+            "rawR": 0.1,
+            "meanR": 0.32,
+            "robustScore": 0.5,
+            "timeShiftMinutes": 5,
+            "priceChangePct": 2.0,
+            "clusterEnabled": true,
+            "clusterGapMinutes": 30,
+            "provenance": { "algorithmId": "price_volume_spike" },
             "studyId": 40,
             "generationId": 36,
             "slotId": 1,
+            "ownerId": "admin",
             "externalName": "Всплеск цены и оборота",
             "rawSignalAt": 1794000000,
-            "expectancy": { "meanR": 0.32 }
+            "expectancy": { "meanR": 0.32 },
+            "recommendedEntryAt": 1794000300
         })
     }
 
     #[test]
-    fn parses_envelope_with_extra_keys_and_ids() {
-        let parsed = parse_recommendation(&envelope_json()).unwrap();
+    fn parses_flat_recommendation_with_extra_keys_and_ids() {
+        let parsed = parse_recommendation(&recommendation_json()).unwrap();
         assert!(matches!(parsed.direction, TradeDirection::Short));
         assert_eq!(parsed.envelope_study_id, Some(40));
         assert_eq!(parsed.price_change_pct, Some(2.0));
@@ -819,10 +812,9 @@ mod tests {
 
     #[test]
     fn parses_string_ids_and_missing_price_change() {
-        let mut value = envelope_json();
+        let mut value = recommendation_json();
         value["studyId"] = json!("41");
-        value["generationId"] = json!("37");
-        value["snapshot"]["priceChangePct"] = Value::Null;
+        value["priceChangePct"] = Value::Null;
         let parsed = parse_recommendation(&value).unwrap();
         assert_eq!(parsed.envelope_study_id, Some(41));
         assert_eq!(parsed.price_change_pct, None);
@@ -830,16 +822,16 @@ mod tests {
 
     #[test]
     fn rejects_invalid_direction_and_ranges() {
-        let mut value = envelope_json();
-        value["snapshot"]["direction"] = json!("side");
+        let mut value = recommendation_json();
+        value["direction"] = json!("side");
         assert!(parse_recommendation(&value).is_err());
-        let mut value = envelope_json();
-        value["snapshot"]["tpPct"] = json!(0.0);
+        let mut value = recommendation_json();
+        value["tpPct"] = json!(0.0);
         assert!(parse_recommendation(&value).is_err());
-        let mut value = envelope_json();
-        value["snapshot"]["timeShiftMinutes"] = json!(43201);
+        let mut value = recommendation_json();
+        value["timeShiftMinutes"] = json!(43201);
         assert!(parse_recommendation(&value).is_err());
-        assert!(parse_recommendation(&json!({ "snapshot": {} })).is_err());
+        assert!(parse_recommendation(&json!({})).is_err());
     }
 
     #[test]
