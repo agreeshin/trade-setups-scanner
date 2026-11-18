@@ -103,6 +103,92 @@ function GateBadge({ passed, selected }: { passed: number; selected: number }) {
   return <Badge className="bg-ambient-violet/15 text-ambient-violet" aria-label={`Прошли гейт: ${passed} из ${selected}`}>{passed}/{selected}</Badge>;
 }
 
+const DAY_SECONDS = 86400;
+const CHART_STYLE = {
+  width: 900,
+  height: 320,
+  left: 80,
+  right: 872,
+  top: 66,
+  bottom: 258,
+  background: "#121314",
+  foreground: "#eceef0",
+  line: "#b9bec6",
+  positive: "#18cf98",
+  negative: "#f08a7f",
+  axis: "#a5a8af",
+  grid: "#2e3238",
+};
+
+interface DailyOutcome {
+  dayUnix: number;
+  closedCount: number;
+  meanR: number;
+}
+
+function dailyOutcomes(setups: readonly SetupsAnalyticsSetup[]): DailyOutcome[] {
+  const byDay = new Map<number, { sum: number; count: number }>();
+  for (const setup of setups) {
+    if ((setup.status !== "tp" && setup.status !== "sl") || setup.entryTimeUnix === null || setup.riskReturn === null) continue;
+    const day = Math.floor(setup.entryTimeUnix / DAY_SECONDS) * DAY_SECONDS;
+    const bucket = byDay.get(day) ?? { sum: 0, count: 0 };
+    bucket.sum += setup.riskReturn;
+    bucket.count += 1;
+    byDay.set(day, bucket);
+  }
+  return [...byDay.entries()]
+    .map(([dayUnix, bucket]) => ({ dayUnix, closedCount: bucket.count, meanR: bucket.sum / bucket.count }))
+    .sort((left, right) => left.dayUnix - right.dayUnix);
+}
+
+function dayLabel(dayUnix: number): string {
+  const date = new Date(dayUnix * 1000);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(date.getUTCDate())}.${pad(date.getUTCMonth() + 1)}`;
+}
+
+function DailyOutcomesChart({ setups }: { setups: readonly SetupsAnalyticsSetup[] }) {
+  const outcomes = dailyOutcomes(setups);
+  if (outcomes.length === 0) {
+    return <p className="text-sm text-muted-foreground">Нет закрытых сделок для графика по дням.</p>;
+  }
+  const firstDay = outcomes[0]!.dayUnix;
+  const lastDay = outcomes.at(-1)!.dayUnix;
+  const daySpan = Math.max(1, Math.round((lastDay - firstDay) / DAY_SECONDS));
+  const xOf = (dayUnix: number) => CHART_STYLE.left + ((dayUnix - firstDay) / DAY_SECONDS / daySpan) * (CHART_STYLE.right - CHART_STYLE.left);
+  const values = outcomes.map((point) => point.meanR);
+  const rawMin = Math.min(0, ...values);
+  const rawMax = Math.max(0, ...values);
+  const pad = rawMax - rawMin < 1e-9 ? 0.5 : (rawMax - rawMin) * 0.08;
+  const yMin = rawMin - pad;
+  const yMax = rawMax + pad;
+  const yOf = (value: number) => CHART_STYLE.bottom - ((value - yMin) / (yMax - yMin)) * (CHART_STYLE.bottom - CHART_STYLE.top);
+  const labelStep = Math.max(1, Math.ceil(daySpan / 8));
+  const gridDays = Array.from({ length: daySpan + 1 }, (_, index) => firstDay + index * DAY_SECONDS).filter((_, index) => index % labelStep === 0);
+  const gridLevels: number[] = [];
+  for (let level = Math.ceil(yMin); level <= Math.floor(yMax); level += 1) {
+    if (level !== 0) gridLevels.push(level);
+  }
+  return <svg data-testid="setups-daily-outcomes" viewBox={`0 0 ${CHART_STYLE.width} ${CHART_STYLE.height}`} role="img" aria-label="Средний результат закрытых сделок по дням входа" className="w-full rounded-md border border-input/60">
+    <rect width={CHART_STYLE.width} height={CHART_STYLE.height} fill={CHART_STYLE.background} />
+    <text x={CHART_STYLE.width / 2} y={28} textAnchor="middle" fontSize={14} fill={CHART_STYLE.foreground}>Результаты торговли по дням</text>
+    {gridDays.map((dayUnix) => <g key={`day-${dayUnix}`}>
+      <line x1={xOf(dayUnix)} y1={CHART_STYLE.top} x2={xOf(dayUnix)} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.grid} strokeWidth={1} />
+      <text x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{dayLabel(dayUnix)}</text>
+    </g>)}
+    {gridLevels.map((level) => <g key={`level-${level}`}>
+      <line x1={CHART_STYLE.left} y1={yOf(level)} x2={CHART_STYLE.right} y2={yOf(level)} stroke={CHART_STYLE.grid} strokeWidth={1} />
+      <text x={CHART_STYLE.left - 8} y={yOf(level) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>{level} R</text>
+    </g>)}
+    <line x1={CHART_STYLE.left} y1={yOf(0)} x2={CHART_STYLE.right} y2={yOf(0)} stroke={CHART_STYLE.axis} strokeWidth={1.5} />
+    <text x={CHART_STYLE.left - 8} y={yOf(0) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>0 R</text>
+    <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={outcomes.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />
+    {outcomes.map((point) => <circle key={`point-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={dayLabel(point.dayUnix)} data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)}>
+      <title>{`${dayLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title>
+    </circle>)}
+  </svg>;
+}
+
 function SetupOutcomeRow({ setup }: { setup: SetupsAnalyticsSetup }) {
   const status = STATUS_BADGES[setup.status];
   return <TableRow>
@@ -437,6 +523,7 @@ export function SetupsAnalyticsPanel() {
             <GateBadge passed={result.totals.gatePassed} selected={result.totals.selected} />
           </div>
         </div>
+        <DailyOutcomesChart setups={result.setups} />
         {result.studies.length > 0 && <div className="grid gap-2">
           <h3 className="text-sm font-semibold text-muted-foreground">Исследования-основы</h3>
           <div className="overflow-x-auto rounded-md border border-input/60">
