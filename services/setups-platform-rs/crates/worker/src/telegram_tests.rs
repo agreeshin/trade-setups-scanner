@@ -712,7 +712,7 @@ fn saved_fixed_and_adaptive_rendering_use_immutable_names_params_and_expiry() {
             .text
             .contains("🎯 TP = 14%, SL = 4% (от фактической цены входа)")
     );
-    assert!(!message.text.contains("Исследование") && !message.text.contains("Прогноз"));
+    assert!(!message.text.contains("Прогноз"));
     assert!(message.text.contains("Алгоритм: Captured name"));
     job.payload["externalName"] = "Renamed after persistence".into();
     assert_eq!(

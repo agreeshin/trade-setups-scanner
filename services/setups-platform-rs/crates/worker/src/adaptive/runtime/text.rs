@@ -189,15 +189,14 @@ mod tests {
         let message = recommendation_message(&instrument, &raw, &snapshot).unwrap();
         assert!(message.contains("BTCUSDT · SHORT · Bybit"));
         assert!(message.contains("⏳ Рекомендуемое время входа: 00:03:00 UTC"));
-        assert!(message.contains("не опустится ниже 101.00 USDT"));
+        assert!(message.contains("будет выше 101.00 USDT"));
         assert!(message.contains("🎯 TP = 14%, SL = 4% (от фактической цены входа)"));
         assert!(!message.contains("Прогноз") && !message.contains("матрица"));
         assert!(message.contains("Алгоритм: <b>*plain name*"));
-        assert!(!message.contains("Исследование") && !message.contains("1970-"));
+        assert!(!message.contains("1970-"));
 
         let envelope = serde_json::from_value(snapshot.clone()).unwrap();
-        let fresh =
-            super::super::enrichment::freeze(&envelope, raw.close_time_unix, None).unwrap();
+        let fresh = super::super::enrichment::freeze(&envelope, raw.close_time_unix, None).unwrap();
         // A mean-objective recommendation always shows its own M; a stale saved
         // forecast scalar never leaks into the push or Telegram text.
         for forecast in [Some(0.13), Some(-0.13), Some(0.0), Some(-0.001), None] {
@@ -216,9 +215,8 @@ mod tests {
             .unwrap();
             assert_eq!(snapshot, before);
             assert_eq!(text, rich.text);
-            assert!(text
-                .contains("USDT\n\n📈 Матожидание торговли · среднее: +0.32 R\n\nУсловия сделки:"));
-            assert_eq!(text.matches("Матожидание торговли · среднее:").count(), 1);
+            assert!(text.contains("USDT\n\n📈 Матожидание торговли: +0.32 R\n\nУсловия сделки:"));
+            assert_eq!(text.matches("Матожидание торговли:").count(), 1);
             assert!(!text.contains("Прогноз матожидание торговли"));
             for forbidden in [
                 "Среднее МО",
@@ -248,13 +246,13 @@ mod tests {
         snapshot["priceChangePct"] = json!(-1);
         snapshot["timeShiftMinutes"] = json!(0);
         let message = recommendation_message(&instrument, &raw, &snapshot).unwrap();
-        assert!(message.contains("не поднимется выше 101.00 USDT"));
+        assert!(message.contains("будет ниже 101.00 USDT"));
         assert!(!message.contains("Рекомендуемое время входа"));
         snapshot["priceChangePct"] = json!(0);
         assert!(
             recommendation_message(&instrument, &raw, &snapshot)
                 .unwrap()
-                .contains("не поднимется выше 100.00 USDT")
+                .contains("будет ниже 100.00 USDT")
         );
         snapshot["priceChangePct"] = Value::Null;
         assert!(

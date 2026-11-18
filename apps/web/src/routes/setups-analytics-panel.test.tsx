@@ -3,14 +3,8 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { SetupsAnalyticsPanel } from "./setups-analytics-panel";
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
-const profile1 = {
-  slotId: 1, studyId: 40, generationId: 36, setupCount: 3, direction: "short", meanR: 0.32,
-  tpPct: 20, slPct: 6, timeShiftMinutes: 5, priceChangePct: 2, externalName: "Всплеск цены и оборота",
-};
-const profile2 = {
-  slotId: 3, studyId: 41, generationId: 37, setupCount: 2, direction: "long", meanR: -0.1,
-  tpPct: 15, slPct: 5, timeShiftMinutes: 10, priceChangePct: null, externalName: "Всплеск цены и оборота",
-};
+const studyMeta1 = { studyId: 40, externalName: "Всплеск цены и оборота", setupCount: 3, generationId: 36, artifactId: 900 };
+const studyMeta2 = { studyId: 41, externalName: "Всплеск цены и оборота", setupCount: 2, generationId: 37, artifactId: null };
 const setupRow = (id: number, slotId: number, status: string, riskReturn: number | null) => ({
   id, symbol: `SYM${id}`, exchange: "bybit", slotId, studyId: 40, direction: "short",
   setupTimeUnix: 1794000000, entryTimeUnix: 1794000300, entryPrice: 98.5, gateThreshold: 98,
@@ -24,6 +18,32 @@ const analyticsResult = {
     setupRow(4, 1, "no_data", null), setupRow(5, 3, "gate_failed", null),
   ],
 };
+const optimizationStudy40 = {
+  id: 40, status: "completed",
+  spec: {
+    algorithmId: "price_volume_spike", algorithmVersion: "1", algorithmParams: {}, algorithmSearch: {},
+    analyticsParams: { clusterEnabled: true, clusterGapMinutes: 480, timeShiftMinutes: 5, priceChangePct: 2 }, analyticsSearch: {},
+    instruments: [], fromUnix: 0, toUnix: 86400, direction: "short", setupMaturity: 0, horizonMinutes: 10080,
+    tpLevels: [20], slLevels: [6], minClosedPerCell: 1, seed: 1, maxTrials: 10, maxSeconds: 60, trendMode: "blend",
+  },
+  progress: { phase: "done", evaluatedCandidates: 5, scorableCandidates: 3, maxTrials: 10, elapsedSeconds: 10, bestScore: 1.5 },
+  result: {
+    progress: { phase: "done", evaluatedCandidates: 5, scorableCandidates: 3, maxTrials: 10, elapsedSeconds: 10, bestScore: 1.5 },
+    best: {
+      score: 1.5, meanScore: 0.3, trendMode: "blend", partial: false,
+      params: { spike_mult: 2.5, min_quote_vol: 1000 },
+      analytics: { clusterEnabled: true, clusterGapMinutes: 480, timeShiftMinutes: 5, priceChangePct: 2 },
+      matrix: [{ tpPct: 20, slPct: 6, riskExpectancy: 0.9, avgMovePct: 1, closedCount: 3, tpCount: 2, slCount: 1, unclosedCount: 0, noDataCount: 0, priceChangeFilteredCount: 0, meanRiskExpectancy: 0.4, forecastRiskExpectancy: 0.44 }],
+      support: null,
+      provenance: { optimizerVersion: "v", seed: 1, snapshotHash: "h", capturedAt: "2026-11-01T00:00:00Z" },
+      conclusions: [],
+    },
+    reason: "trial_budget",
+  },
+  error: null,
+  forecastBest: { forecastR: 0.44, meanR: 0.3, tpPct: 20, slPct: 6 },
+  createdAt: "2026-11-01T00:00:00Z", updatedAt: "2026-11-02T00:00:00Z", events: [],
+};
 
 const requests: string[] = [];
 let analyticsResponse: () => Response = () => json(analyticsResult);
@@ -31,10 +51,15 @@ let analyticsResponse: () => Response = () => json(analyticsResult);
 beforeEach(() => {
   vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-13T12:00:00Z")); requests.length = 0;
   analyticsResponse = () => json(analyticsResult);
+  window.localStorage.clear();
+  Object.defineProperty(URL, "createObjectURL", { configurable: true, writable: true, value: vi.fn(() => "blob:expectancy-png") });
+  Object.defineProperty(URL, "revokeObjectURL", { configurable: true, writable: true, value: vi.fn() });
   vi.stubGlobal("fetch", vi.fn((path: string) => {
     requests.push(path);
     if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "", enabled: true, params: {}, fields: [] }] }));
-    if (path.startsWith("/v1/setups/analytics/profiles")) return Promise.resolve(json({ profiles: [profile1, profile2] }));
+    if (path.startsWith("/v1/setups/analytics/studies")) return Promise.resolve(json({ studies: [studyMeta1, studyMeta2] }));
+    if (path.startsWith("/v1/setups/analytics/expectancy-png/")) return Promise.resolve(new Response(new Blob(["png-bytes"]), { status: 200 }));
+    if (path === "/v1/optimization-studies/40") return Promise.resolve(json(optimizationStudy40));
     if (path.startsWith("/v1/setups/analytics?")) return Promise.resolve(analyticsResponse());
     return Promise.resolve(json({}));
   }));
@@ -42,68 +67,109 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 const settle = async () => { await act(async () => { await vi.advanceTimersByTimeAsync(0); }); };
-const tick = async (ms = 400) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
 const analyticsCalls = () => requests.filter((path) => path.startsWith("/v1/setups/analytics?"));
+const studiesCalls = () => requests.filter((path) => path.startsWith("/v1/setups/analytics/studies"));
 
 async function rendered() {
   render(<SetupsAnalyticsPanel />);
   await settle();
-  await tick();
+  await settle();
   return null;
 }
 
-it("loads algorithms and releaser profiles, then renders the calculated result", async () => {
+it("loads studies for the committed range and renders the calculated result", async () => {
   await rendered();
   expect(requests).toContain("/v1/algorithms");
-  expect(requests.some((path) => path.startsWith("/v1/setups/analytics/profiles"))).toBe(true);
-  expect(screen.getByRole("button", { name: "Профили: Все (2)" })).toBeInTheDocument();
+  expect(studiesCalls()).toHaveLength(1);
+  expect(screen.getByRole("button", { name: "Исследования: Все (2)" })).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
   await settle();
   expect(analyticsCalls()).toHaveLength(1);
   const mean = screen.getByTestId("setups-analytics-mean");
   expect(mean.className).toContain("text-success");
   expect(screen.getAllByText("3/5")).toHaveLength(2);
-  expect(screen.getByText("Исследование №40")).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Исследования-основы" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Подробности исследования 40" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Сетапы" })).toBeInTheDocument();
   expect(screen.getByText("SYM1")).toBeInTheDocument();
   expect(screen.getAllByText("TP")).toHaveLength(2);
   expect(screen.getAllByText("SL")).toHaveLength(2);
   expect(screen.getByText("не закрылась")).toBeInTheDocument();
   expect(screen.getByText("нет данных")).toBeInTheDocument();
   expect(screen.getByText("гейт не пройден")).toBeInTheDocument();
-  expect(screen.getAllByRole("button", { name: "№1" }).length).toBeGreaterThan(0);
+  expect(screen.getAllByText("№1").length).toBeGreaterThan(0);
 });
 
-it("opens the picker, edits the profile selection and passes slots to the calculation", async () => {
+it("opens the picker, edits the study selection and passes studies to the calculation", async () => {
   await rendered();
-  fireEvent.click(screen.getByRole("button", { name: "Профили: Все (2)" }));
+  fireEvent.click(screen.getByRole("button", { name: "Исследования: Все (2)" }));
   await settle();
   const dialog = screen.getByRole("dialog");
-  expect(within(dialog).getByText("Профили, выпустившие сетапы")).toBeInTheDocument();
+  expect(within(dialog).getByText("Исследования-основы, выпустившие сетапы")).toBeInTheDocument();
   expect(within(dialog).getByText("Выбрано: 2 из 2")).toBeInTheDocument();
-  fireEvent.click(within(dialog).getByLabelText("Профиль 3"));
+  fireEvent.click(within(dialog).getByLabelText("Исследование 41"));
   expect(within(dialog).getByText("Выбрано: 1 из 2")).toBeInTheDocument();
   fireEvent.click(within(dialog).getByRole("button", { name: "Готово" }));
   await settle();
-  expect(screen.getByRole("button", { name: "Профили: 1 из 2" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Исследования: 1 из 2" })).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
   await settle();
   const query = new URL(analyticsCalls().at(-1)!, "http://localhost").searchParams;
-  expect(query.get("slots")).toBe("1");
+  expect(query.get("studies")).toBe("40");
   expect(query.get("algorithmId")).toBe("price_volume_spike");
 });
 
-it("shows profile details from a calculated row", async () => {
+it("reloads the study list on date blur and resets the selection to all", async () => {
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Исследования: Все (2)" }));
+  await settle();
+  const dialog = screen.getByRole("dialog");
+  fireEvent.click(within(dialog).getByLabelText("Исследование 41"));
+  fireEvent.click(within(dialog).getByRole("button", { name: "Готово" }));
+  await settle();
+  expect(screen.getByRole("button", { name: "Исследования: 1 из 2" })).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Начало (момент выхода сетапа)"), { target: { value: "2026-11-07T00:00" } });
+  await settle();
+  fireEvent.blur(screen.getByLabelText("Начало (момент выхода сетапа)"));
+  await settle();
+  await settle();
+  expect(studiesCalls()).toHaveLength(2);
+  expect(screen.getByRole("button", { name: "Исследования: Все (2)" })).toBeInTheDocument();
+});
+
+it("restores persisted filters and selection from local storage", async () => {
+  window.localStorage.setItem("setups-analytics-filter-v1", JSON.stringify({
+    algorithmId: "price_volume_spike", from: "2026-11-06T12:00", to: "2026-11-13T12:00", studies: [40],
+  }));
+  await rendered();
+  expect(screen.getByRole("button", { name: "Исследования: 1 из 2" })).toBeInTheDocument();
+  expect(screen.getByLabelText("Начало (момент выхода сетапа)")).toHaveValue("2026-11-06T12:00");
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  const query = new URL(analyticsCalls().at(-1)!, "http://localhost").searchParams;
+  expect(query.get("studies")).toBe("40");
+});
+
+it("shows study details with the generation PNG in a modal", async () => {
   await rendered();
   fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
   await settle();
-  fireEvent.click(screen.getAllByRole("button", { name: "№1" })[0]!);
+  fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" }));
+  await settle();
   await settle();
   const dialog = screen.getByRole("dialog");
-  expect(within(dialog).getByText("Профиль №1")).toBeInTheDocument();
-  expect(within(dialog).getByText("Исследование-основа")).toBeInTheDocument();
-  expect(within(dialog).getByText("+0.32R")).toBeInTheDocument();
-  expect(within(dialog).getByText(/5 мин/)).toBeInTheDocument();
-  expect(within(dialog).getByText("2%")).toBeInTheDocument();
+  expect(within(dialog).getByText("Исследование №40")).toBeInTheDocument();
+  expect(within(dialog).getByText("Лучший score")).toBeInTheDocument();
+  expect(within(dialog).getByText("+1.50 R")).toBeInTheDocument();
+  expect(within(dialog).getByText("Лучшая blend-пара")).toBeInTheDocument();
+  expect(within(dialog).getByText("TP 20% / SL 6% · +0.44 R")).toBeInTheDocument();
+  expect(within(dialog).getByText("Полные параметры алгоритма")).toBeInTheDocument();
+  expect(within(dialog).getByText("spike_mult")).toBeInTheDocument();
+  expect(within(dialog).getAllByText("2.5").length).toBeGreaterThan(0);
+  const image = within(dialog).getByAltText("Динамика матожидания исследования №40");
+  expect(image.getAttribute("src")).toBe("blob:expectancy-png");
+  expect(requests).toContain("/v1/optimization-studies/40");
+  expect(requests.some((path) => path.startsWith("/v1/setups/analytics/expectancy-png/900"))).toBe(true);
 });
 
 it("disables calculation and hints when the range is invalid", async () => {

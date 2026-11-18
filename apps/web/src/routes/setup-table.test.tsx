@@ -62,7 +62,7 @@ it("exposes the immutable recommendation on hover/focus and tap dialog without r
   const trigger = screen.getByRole("button", { name: /Условия сетапа BTCUSDT.*исследование 42/ });
   expect(container.querySelector("b")).toBeNull();
   await userEvent.hover(trigger);
-  expect(screen.getByRole("tooltip")).toHaveTextContent("ниже 101.00 USDT");
+  expect(screen.getByRole("tooltip")).toHaveTextContent("выше 101.00 USDT");
   expect(screen.getByRole("tooltip")).toHaveTextContent("Среднее МО за последние 1 суток: +0.32 R");
   expect(screen.getByRole("tooltip")).toHaveTextContent("В среднем для других уровней TP и SL: +0.21 R");
   expect(screen.getByRole("tooltip")).toHaveTextContent("Прогноз МО торговли: недоступно");
@@ -96,7 +96,7 @@ it("marks an elapsed recommendation and keeps two profile events instead of coll
   await userEvent.click(screen.getByRole("button", { name: /Условия сетапа BTCUSDT.*исследование 43/ }));
   const dialog = screen.getByRole("dialog");
   expect(dialog).toHaveTextContent("рекомендуемое время уже прошло");
-  expect(dialog).toHaveTextContent("не поднимется выше 99.00 USDT");
+  expect(dialog).toHaveTextContent("будет ниже 99.00 USDT");
   expect(dialog).not.toHaveTextContent("через 3 мин");
 });
 it("retains an open recommendation when refreshed rows change, disappear or become empty", async () => {
@@ -190,6 +190,6 @@ it("shows malformed enrichment as unavailable but preserves WATCH, direction and
   await userEvent.click(screen.getByRole("button", { name: /Условия сетапа BTCUSDT.*исследование 42/ }));
   const dialog = screen.getByRole("dialog");
   expect(dialog).toHaveTextContent("Прогноз МО торговли: недоступно (снимок метрик некорректен или не относится к этому сетапу)");
-  expect(dialog).toHaveTextContent("ниже 101.00 USDT"); expect(dialog).toHaveTextContent("+0.32 R"); expect(dialog).toHaveTextContent("+0.21 R");
+  expect(dialog).toHaveTextContent("выше 101.00 USDT"); expect(dialog).toHaveTextContent("+0.32 R"); expect(dialog).toHaveTextContent("+0.21 R");
   expect(dialog).not.toHaveTextContent("+0.44 R"); expect(dialog).not.toHaveTextContent("62.5%");
 });

@@ -1,17 +1,11 @@
 import { apiFetch } from "./platform-api";
 
-export interface SetupsAnalyticsProfile {
-  slotId: number;
-  studyId: number | null;
-  generationId: number | null;
-  setupCount: number;
-  direction: "short" | "long";
-  meanR: number;
-  tpPct: number;
-  slPct: number;
-  timeShiftMinutes: number;
-  priceChangePct: number | null;
+export interface SetupsAnalyticsStudyMeta {
+  studyId: number;
   externalName: string;
+  setupCount: number;
+  generationId: number | null;
+  artifactId: number | null;
 }
 
 export interface SetupsAnalyticsTotals {
@@ -77,19 +71,13 @@ function hasAggregateFields(item: Record<string, unknown>): boolean {
     && (item.meanR === null || isFiniteNumber(item.meanR));
 }
 
-function isProfile(value: unknown): value is SetupsAnalyticsProfile {
+function isStudyMeta(value: unknown): value is SetupsAnalyticsStudyMeta {
   if (!isRecord(value)) return false;
-  return isId(value.slotId)
-    && (value.studyId === null || isId(value.studyId))
-    && (value.generationId === null || isId(value.generationId))
+  return isId(value.studyId)
+    && typeof value.externalName === "string"
     && isCount(value.setupCount)
-    && isDirection(value.direction)
-    && isFiniteNumber(value.meanR)
-    && isFiniteNumber(value.tpPct)
-    && isFiniteNumber(value.slPct)
-    && isUnix(value.timeShiftMinutes) && value.timeShiftMinutes >= 0
-    && (value.priceChangePct === null || isFiniteNumber(value.priceChangePct))
-    && typeof value.externalName === "string";
+    && (value.generationId === null || isId(value.generationId))
+    && (value.artifactId === null || isId(value.artifactId));
 }
 
 function isTotals(value: unknown): value is SetupsAnalyticsTotals {
@@ -137,30 +125,30 @@ async function readBody(response: Response): Promise<unknown> {
   return body;
 }
 
-export async function fetchSetupsAnalyticsProfiles(
+export async function fetchSetupsAnalyticsStudies(
   algorithmId: string,
   fromUnix: number,
   toUnix: number,
   signal?: AbortSignal,
-): Promise<SetupsAnalyticsProfile[]> {
+): Promise<SetupsAnalyticsStudyMeta[]> {
   const params = new URLSearchParams({ algorithmId, fromUnix: String(fromUnix), toUnix: String(toUnix) });
-  const response = await apiFetch(`/v1/setups/analytics/profiles?${params}`, signal === undefined ? {} : { signal });
+  const response = await apiFetch(`/v1/setups/analytics/studies?${params}`, signal === undefined ? {} : { signal });
   const body = await readBody(response);
-  if (!isRecord(body) || !Array.isArray(body.profiles)) {
-    throw new SetupsAnalyticsApiError("Некорректный ответ расчёта: список профилей");
+  if (!isRecord(body) || !Array.isArray(body.studies)) {
+    throw new SetupsAnalyticsApiError("Некорректный ответ расчёта: список исследований");
   }
-  return expectArray(body.profiles, isProfile, "profiles");
+  return expectArray(body.studies, isStudyMeta, "studies");
 }
 
 export async function fetchSetupsAnalytics(
   algorithmId: string,
   fromUnix: number,
   toUnix: number,
-  slots: readonly number[] | null,
+  studies: readonly number[] | null,
   signal?: AbortSignal,
 ): Promise<SetupsAnalyticsResult> {
   const params = new URLSearchParams({ algorithmId, fromUnix: String(fromUnix), toUnix: String(toUnix) });
-  if (slots !== null) params.set("slots", slots.join(","));
+  if (studies !== null) params.set("studies", studies.join(","));
   const response = await apiFetch(`/v1/setups/analytics?${params}`, signal === undefined ? {} : { signal });
   const body = await readBody(response);
   if (!isRecord(body) || !isTotals(body.totals) || !Array.isArray(body.studies) || !Array.isArray(body.setups)) {
@@ -171,4 +159,12 @@ export async function fetchSetupsAnalytics(
     studies: expectArray(body.studies, isStudy, "studies"),
     setups: expectArray(body.setups, isSetup, "setups"),
   };
+}
+
+export async function fetchExpectancyPngUrl(artifactId: number, signal?: AbortSignal): Promise<string> {
+  const response = await apiFetch(`/v1/setups/analytics/expectancy-png/${artifactId}`, signal === undefined ? {} : { signal });
+  if (!response.ok) {
+    throw new SetupsAnalyticsApiError(`PNG исследования недоступен: HTTP ${response.status}`, response.status);
+  }
+  return URL.createObjectURL(await response.blob());
 }

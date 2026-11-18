@@ -3,8 +3,8 @@
 use super::*;
 use setups_domain::expectancy::{
     EXPECTANCY_CALCULATION_VERSION, EXPECTANCY_MODEL_CALCULATION_VERSION, ExpectancyArtifact,
-    ExpectancyImageKey, ExpectancyTimezone, ExpectancyUnavailableReason, MetricAvailability,
-    ExpectancyObjective, FrozenExpectancyObjective,
+    ExpectancyImageKey, ExpectancyObjective, ExpectancyTimezone, ExpectancyUnavailableReason,
+    FrozenExpectancyObjective, MetricAvailability,
 };
 use setups_domain::forecast::ForecastRecipe;
 use sha2::{Digest, Sha256};
@@ -40,17 +40,31 @@ pub struct ExpectancyOverlayKey {
 }
 
 impl ExpectancyOverlayKey {
-    pub(crate) fn for_objective(base: &ExpectancyImageKey, raw_signal_at: i64, value: f64,
-        objective: ExpectancyObjective, cutoff: i64) -> Result<Self, WorkerError> {
-        objective.validate().map_err(|_| invalid("invalid objective overlay settings"))?;
-        if !value.is_finite() || raw_signal_at < cutoff || base.forecast != objective.forecast
-            || base.render_version != setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION {
+    pub(crate) fn for_objective(
+        base: &ExpectancyImageKey,
+        raw_signal_at: i64,
+        value: f64,
+        objective: ExpectancyObjective,
+        cutoff: i64,
+    ) -> Result<Self, WorkerError> {
+        objective
+            .validate()
+            .map_err(|_| invalid("invalid objective overlay settings"))?;
+        if !value.is_finite()
+            || raw_signal_at < cutoff
+            || base.forecast != objective.forecast
+            || base.render_version != setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION
+        {
             return Err(invalid("invalid objective overlay inputs"));
         }
         let mut digest = Sha256::new();
         digest.update(b"expectancy-objective-overlay-v1\0");
         digest.update(serde_json::to_vec(&(base, objective, cutoff))?);
-        Ok(Self { base_image_key_sha256: format!("{:x}", digest.finalize()), raw_signal_at, forecast_r: value })
+        Ok(Self {
+            base_image_key_sha256: format!("{:x}", digest.finalize()),
+            raw_signal_at,
+            forecast_r: value,
+        })
     }
 
     pub(crate) fn new(
@@ -169,11 +183,18 @@ impl AdaptiveExpectancySnapshot {
     ) -> Result<(), WorkerError> {
         let p = &envelope.snapshot.provenance;
         if let Some(objective) = &self.objective {
-            if objective.settings != ExpectancyObjective::from_recommendation(&envelope.snapshot)
-                .map_err(|_| invalid("invalid saved objective settings"))?
-                || objective.decision_r != objective.settings.decision(&self.selected_mean_r, &objective.forecast_r)
-                    .map_err(|_| invalid("invalid saved objective scalar"))? {
-                return Err(invalid("saved objective differs from immutable recommendation"));
+            if objective.settings
+                != ExpectancyObjective::from_recommendation(&envelope.snapshot)
+                    .map_err(|_| invalid("invalid saved objective settings"))?
+                || objective.decision_r
+                    != objective
+                        .settings
+                        .decision(&self.selected_mean_r, &objective.forecast_r)
+                        .map_err(|_| invalid("invalid saved objective scalar"))?
+            {
+                return Err(invalid(
+                    "saved objective differs from immutable recommendation",
+                ));
             }
         }
         if let Some(recipe) = self.forecast {
@@ -246,7 +267,12 @@ impl AdaptiveExpectancySnapshot {
                 || key.sl_pct != envelope.snapshot.sl_pct
                 || key.calculation_version != self.calculation_version
                 || key.timezone != self.timezone
-                || key.render_version != if self.objective.is_some() { setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION } else { image_render_version(self.forecast) }
+                || key.render_version
+                    != if self.objective.is_some() {
+                        setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION
+                    } else {
+                        image_render_version(self.forecast)
+                    }
                 || key.forecast != self.forecast
                 || key.observation_cutoff != self.forecast.map(|_| self.source_cutoff)
             {
@@ -254,10 +280,21 @@ impl AdaptiveExpectancySnapshot {
             }
         }
         if let Some(objective) = &self.objective {
-            match (&self.image_key, objective.decision_r.as_ref(), &self.overlay_key) {
-                (Some(base), Some(value), Some(overlay)) if *overlay == ExpectancyOverlayKey::for_objective(
-                    base, raw, *value, objective.settings, self.source_cutoff)? => {},
-                (None, _, None) => {},
+            match (
+                &self.image_key,
+                objective.decision_r.as_ref(),
+                &self.overlay_key,
+            ) {
+                (Some(base), Some(value), Some(overlay))
+                    if *overlay
+                        == ExpectancyOverlayKey::for_objective(
+                            base,
+                            raw,
+                            *value,
+                            objective.settings,
+                            self.source_cutoff,
+                        )? => {}
+                (None, _, None) => {}
                 _ => return Err(invalid("saved objective overlay identity mismatch")),
             }
             return Ok(());
@@ -331,9 +368,15 @@ fn freeze_with_forecast(
         forecast: snapshot.forecast,
         overlay_key: None,
         objective: Some(FrozenExpectancyObjective {
-            settings, forecast_r: unavailable(ExpectancyUnavailableReason::MissingFrozenOutcomes),
-            decision_r: settings.decision(&MetricAvailability::Available { value: snapshot.raw_r },
-                &unavailable(ExpectancyUnavailableReason::MissingFrozenOutcomes))
+            settings,
+            forecast_r: unavailable(ExpectancyUnavailableReason::MissingFrozenOutcomes),
+            decision_r: settings
+                .decision(
+                    &MetricAvailability::Available {
+                        value: snapshot.raw_r,
+                    },
+                    &unavailable(ExpectancyUnavailableReason::MissingFrozenOutcomes),
+                )
                 .map_err(|_| invalid("invalid objective fallback"))?,
         }),
     };
@@ -393,20 +436,38 @@ fn freeze_with_forecast(
         } else if settings.forecast.is_some() {
             saved.forecast_r.clone()
         } else {
-            artifact.objective_series(settings).map_err(|error| invalid(&error.to_string()))?.forecast_r
+            artifact
+                .objective_series(settings)
+                .map_err(|error| invalid(&error.to_string()))?
+                .forecast_r
         };
-        let decision_r = settings.decision(&saved.selected_mean_r, &objective_forecast)
+        let decision_r = settings
+            .decision(&saved.selected_mean_r, &objective_forecast)
             .map_err(|_| invalid("invalid objective projection"))?;
-        saved.objective = Some(FrozenExpectancyObjective { settings, forecast_r: objective_forecast, decision_r });
+        saved.objective = Some(FrozenExpectancyObjective {
+            settings,
+            forecast_r: objective_forecast,
+            decision_r,
+        });
         if artifact
             .daily
             .as_ref()
             .is_some_and(|days| days.iter().any(|day| day.mean_r.is_some()))
         {
-            if let Some(value) = saved.objective.as_ref().and_then(|objective| objective.decision_r.as_ref()) {
-                let key = artifact.image_key(setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION);
-                saved.overlay_key = Some(ExpectancyOverlayKey::for_objective(&key, raw_signal_at,
-                    *value, settings, p.observation_cutoff)?);
+            if let Some(value) = saved
+                .objective
+                .as_ref()
+                .and_then(|objective| objective.decision_r.as_ref())
+            {
+                let key = artifact
+                    .image_key(setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION);
+                saved.overlay_key = Some(ExpectancyOverlayKey::for_objective(
+                    &key,
+                    raw_signal_at,
+                    *value,
+                    settings,
+                    p.observation_cutoff,
+                )?);
                 saved.image_key = Some(key);
             }
         }
@@ -1236,9 +1297,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             saved.image_key,
-            Some(
-                artifact.image_key(setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION)
-            )
+            Some(artifact.image_key(setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION))
         );
         let later = freeze(&envelope, at + 30 * 86400, Some(&artifact)).unwrap();
         assert_eq!(later.forecast_r, saved.forecast_r);
@@ -1250,9 +1309,11 @@ pub(super) mod tests {
             &setup.recommendation,
         )
         .unwrap();
-        assert!(caption
-            .text
-            .contains(&format!("Прогноз матожидание торговли: {pure:+.2} R · вероятностный")));
+        assert!(
+            caption
+                .text
+                .contains(&format!("Матожидание торговли: {pure:+.2} R"))
+        );
         let mut tampered = saved.clone();
         tampered.overlay_key.as_mut().unwrap().raw_signal_at += 60;
         assert!(tampered.validate_for(&envelope, at).is_err());
@@ -1437,11 +1498,7 @@ pub(super) mod tests {
             &setup.recommendation,
         )
         .unwrap();
-        assert!(
-            caption
-                .text
-                .contains("📈 Матожидание торговли · среднее: +1.84 R")
-        );
+        assert!(caption.text.contains("📈 Матожидание торговли: +1.84 R"));
         // A mean objective never borrows the forecast number or label.
         assert!(!caption.text.contains("Прогноз матожидание торговли"));
         assert!(!caption.text.contains("винрейт"));
@@ -1732,11 +1789,7 @@ pub(super) mod tests {
             &setup.recommendation,
         )
         .unwrap();
-        assert!(
-            caption
-                .text
-                .contains("📈 Матожидание торговли · среднее: +1.84 R")
-        );
+        assert!(caption.text.contains("📈 Матожидание торговли: +1.84 R"));
         assert!(serde_json::to_vec(&saved).unwrap().len() < MAX_EXPECTANCY_SNAPSHOT_BYTES);
     }
 

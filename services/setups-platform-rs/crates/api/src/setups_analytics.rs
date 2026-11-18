@@ -1,6 +1,7 @@
 use crate::analytics::AnalyticsState;
 use crate::replay::guard_auth;
-use axum::extract::{Query, State};
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -57,7 +58,6 @@ struct ParsedRecommendation {
     direction_raw: &'static str,
     tp_pct: f64,
     sl_pct: f64,
-    mean_r: f64,
     time_shift_minutes: i64,
     price_change_pct: Option<f64>,
     envelope_study_id: Option<i64>,
@@ -88,7 +88,6 @@ fn parse_recommendation(value: &Value) -> Result<ParsedRecommendation, String> {
         direction,
         tp_pct: item.tp_pct,
         sl_pct: item.sl_pct,
-        mean_r: item.mean_r,
         time_shift_minutes: item.time_shift_minutes,
         price_change_pct: item.price_change_pct,
         envelope_study_id: id_of(&item.study_id),
@@ -257,6 +256,7 @@ struct AnalyticsSetupRow {
     slot_id: i64,
     generation_id: Option<i64>,
     recommendation: Value,
+    artifact_id: Option<i64>,
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -278,7 +278,7 @@ async fn load_setup_rows(
     algorithm_id: &str,
     from_unix: Option<i64>,
     to_unix: Option<i64>,
-    slots: Option<&[i64]>,
+    studies: Option<&[i64]>,
     with_bounds: bool,
 ) -> Result<Vec<AnalyticsSetupRow>, Response> {
     let mut filter = String::from(
@@ -289,15 +289,18 @@ async fn load_setup_rows(
     } else if from_unix.is_some() {
         filter.push_str(" and close_time >= to_timestamp($2) and close_time < to_timestamp($3)");
     }
-    let slots_active = slots.is_some();
-    if slots_active {
+    let studies_active = studies.is_some();
+    if studies_active {
         let index = if filter.contains("$3") { 4 } else { 2 };
-        filter.push_str(&format!(" and adaptive_slot_id::bigint = any(${index})"));
+        filter.push_str(&format!(
+            " and (recommendation->>'studyId') ~ '^[0-9]+$' and (recommendation->>'studyId')::bigint = any(${index})"
+        ));
     }
     let sql = format!(
         "select id, exchange_code, category, symbol, algorithm_id, (extract(epoch from close_time))::bigint as close_unix, \
          close_price, adaptive_slot_id::bigint as slot_id, \
          coalesce(adaptive_generation_id, (adaptive_generation_archive->>'generationId')::bigint) as generation_id, \
+         expectancy_artifact_id as artifact_id, \
          recommendation from live_setups where {filter} order by close_time desc, id desc limit {}",
         MAX_ANALYTICS_SETUPS + 1
     );
@@ -307,8 +310,8 @@ async fn load_setup_rows(
             .bind(from_unix.unwrap_or(i64::MIN))
             .bind(to_unix.unwrap_or(i64::MAX));
     }
-    if slots_active {
-        query = query.bind(slots.expect("checked"));
+    if studies_active {
+        query = query.bind(studies.expect("checked"));
     }
     let rows = query.fetch_all(pool).await.map_err(|_| {
         error_response(
@@ -385,6 +388,12 @@ async fn load_setup_rows(
                         "setups_analytics_read_failed",
                     )
                 })?,
+                artifact_id: row.try_get("artifact_id").map_err(|_| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "setups_analytics_read_failed",
+                    )
+                })?,
             })
         })
         .collect()
@@ -417,11 +426,11 @@ async fn study_map(
         .collect())
 }
 
-fn parse_slots(raw: Option<&str>) -> Result<Option<Vec<i64>>, Response> {
+fn parse_studies(raw: Option<&str>) -> Result<Option<Vec<i64>>, Response> {
     let Some(raw) = raw else {
         return Ok(None);
     };
-    let mut slots = Vec::new();
+    let mut studies = Vec::new();
     for part in raw.split(',') {
         let value = part
             .trim()
@@ -430,12 +439,12 @@ fn parse_slots(raw: Option<&str>) -> Result<Option<Vec<i64>>, Response> {
         if value <= 0 {
             return Err(error_response(StatusCode::BAD_REQUEST, "invalid_query"));
         }
-        slots.push(value);
+        studies.push(value);
     }
-    if slots.is_empty() || slots.len() > MAX_ANALYTICS_SLOTS {
+    if studies.is_empty() || studies.len() > MAX_ANALYTICS_SLOTS {
         return Err(error_response(StatusCode::BAD_REQUEST, "invalid_query"));
     }
-    Ok(Some(slots))
+    Ok(Some(studies))
 }
 
 async fn setups_analytics(
@@ -464,7 +473,7 @@ async fn setups_analytics(
     if from_unix >= to_unix {
         return error_response(StatusCode::BAD_REQUEST, "invalid_query");
     }
-    let slots = match parse_slots(params.get("slots").map(String::as_str)) {
+    let studies = match parse_studies(params.get("studies").map(String::as_str)) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -473,7 +482,7 @@ async fn setups_analytics(
         &algorithm_id,
         Some(from_unix),
         Some(to_unix),
-        slots.as_deref(),
+        studies.as_deref(),
         true,
     )
     .await
@@ -658,7 +667,7 @@ async fn setups_analytics(
     .into_response()
 }
 
-async fn setups_analytics_profiles(
+async fn setups_analytics_studies(
     State(state): State<Arc<AnalyticsState>>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
@@ -692,7 +701,7 @@ async fn setups_analytics_profiles(
             Ok(value) => value,
             Err(response) => return response,
         };
-    let studies = match study_map(
+    let generation_studies = match study_map(
         &state.pool,
         &rows
             .iter()
@@ -704,61 +713,105 @@ async fn setups_analytics_profiles(
         Ok(value) => value,
         Err(response) => return response,
     };
+    Json(json!({ "studies": studies_list(&rows, &generation_studies) })).into_response()
+}
+
+fn row_study_id(row: &AnalyticsSetupRow, generation_studies: &HashMap<i64, i64>) -> Option<i64> {
+    row.generation_id
+        .and_then(|generation| generation_studies.get(&generation).copied())
+        .or_else(|| {
+            parse_recommendation(&row.recommendation)
+                .ok()
+                .and_then(|recommendation| recommendation.envelope_study_id)
+        })
+}
+
+fn studies_list(rows: &[AnalyticsSetupRow], generation_studies: &HashMap<i64, i64>) -> Vec<Value> {
     let mut counts: BTreeMap<i64, i64> = BTreeMap::new();
-    let mut latest: BTreeMap<i64, (&AnalyticsSetupRow, ParsedRecommendation)> = BTreeMap::new();
-    for row in &rows {
-        *counts.entry(row.slot_id).or_default() += 1;
-        let recommendation = match parse_recommendation(&row.recommendation) {
-            Ok(value) => value,
-            Err(message) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &message),
+    let mut latest: BTreeMap<i64, &AnalyticsSetupRow> = BTreeMap::new();
+    for row in rows {
+        let Some(study_id) = row_study_id(row, generation_studies) else {
+            continue;
         };
-        let replace = match latest.get(&row.slot_id) {
-            Some((existing, _)) => {
+        *counts.entry(study_id).or_default() += 1;
+        let replace = match latest.get(&study_id) {
+            Some(existing) => {
                 row.close_unix > existing.close_unix
                     || (row.close_unix == existing.close_unix && row.id > existing.id)
             }
             None => true,
         };
         if replace {
-            latest.insert(row.slot_id, (row, recommendation));
+            latest.insert(study_id, row);
         }
     }
-    let profiles: Vec<Value> = latest
+    latest
         .into_iter()
-        .map(|(slot_id, (row, recommendation))| {
-            let study_id = row
-                .generation_id
-                .and_then(|generation| studies.get(&generation).copied())
-                .or(recommendation.envelope_study_id);
-            let external_name = recommendation
-                .external_name
-                .clone()
-                .filter(|name| !name.trim().is_empty())
+        .map(|(study_id, row)| {
+            let external_name = parse_recommendation(&row.recommendation)
+                .ok()
+                .and_then(|recommendation| {
+                    recommendation
+                        .external_name
+                        .filter(|name| !name.trim().is_empty())
+                })
                 .unwrap_or_else(|| setups_db::algorithm_name(&row.algorithm_id));
             json!({
-                "slotId": slot_id,
                 "studyId": study_id,
-                "generationId": row.generation_id,
-                "setupCount": counts.get(&slot_id).copied().unwrap_or(0),
-                "direction": recommendation.direction_raw,
-                "meanR": recommendation.mean_r,
-                "tpPct": recommendation.tp_pct,
-                "slPct": recommendation.sl_pct,
-                "timeShiftMinutes": recommendation.time_shift_minutes,
-                "priceChangePct": recommendation.price_change_pct,
                 "externalName": external_name,
+                "setupCount": counts.get(&study_id).copied().unwrap_or(0),
+                "generationId": row.generation_id,
+                "artifactId": row.artifact_id,
             })
         })
-        .collect();
-    Json(json!({ "profiles": profiles })).into_response()
+        .collect()
+}
+
+async fn setups_analytics_expectancy_png(
+    State(state): State<Arc<AnalyticsState>>,
+    headers: HeaderMap,
+    Path(artifact_id): Path<i64>,
+) -> Response {
+    if let Err(response) = guard_auth(&state.auth, &headers, false) {
+        return response;
+    }
+    let png = sqlx::query_scalar::<_, Vec<u8>>(
+        "select p.png from study_expectancy_pngs p join study_expectancy_artifacts a on a.id = p.artifact_id \
+         where a.id = $1 and a.owner_id = $2 order by p.rendering_version desc limit 1",
+    )
+    .bind(artifact_id)
+    .bind("admin")
+    .fetch_optional(&state.pool)
+    .await;
+    match png {
+        Ok(Some(bytes)) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "image/png")
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "expectancy_png_unavailable",
+                )
+            }),
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "expectancy_png_unavailable"),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "expectancy_png_unavailable",
+        ),
+    }
 }
 
 pub fn setups_analytics_router(state: Arc<AnalyticsState>) -> Router {
     Router::new()
         .route("/v1/setups/analytics", get(setups_analytics))
         .route(
-            "/v1/setups/analytics/profiles",
-            get(setups_analytics_profiles),
+            "/v1/setups/analytics/studies",
+            get(setups_analytics_studies),
+        )
+        .route(
+            "/v1/setups/analytics/expectancy-png/{artifactId}",
+            get(setups_analytics_expectancy_png),
         )
         .with_state(state)
 }
@@ -887,7 +940,6 @@ mod tests {
             direction_raw: "short",
             tp_pct: 20.0,
             sl_pct: 6.0,
-            mean_r: 0.0,
             time_shift_minutes: 5,
             price_change_pct,
             envelope_study_id: Some(40),
@@ -1044,14 +1096,76 @@ mod tests {
         assert_eq!(Agg::default().mean_r(), None);
     }
 
+    fn analytics_setup_row(
+        id: i64,
+        close_unix: i64,
+        recommendation: Value,
+        generation_id: Option<i64>,
+        artifact_id: Option<i64>,
+    ) -> AnalyticsSetupRow {
+        AnalyticsSetupRow {
+            id,
+            exchange_code: "bybit".into(),
+            category: "linear".into(),
+            symbol: "TESTUSDT".into(),
+            algorithm_id: "price_volume_spike".into(),
+            close_unix,
+            close_price: "100".into(),
+            slot_id: 1,
+            generation_id,
+            recommendation,
+            artifact_id,
+        }
+    }
+
     #[test]
-    fn slots_parser_validates_input() {
-        assert!(parse_slots(None).unwrap().is_none());
-        let slots = parse_slots(Some("1, 3")).unwrap().unwrap();
-        assert_eq!(slots, vec![1, 3]);
-        assert!(parse_slots(Some("")).is_err());
-        assert!(parse_slots(Some("0")).is_err());
-        assert!(parse_slots(Some("a")).is_err());
-        assert!(parse_slots(Some("1,,2")).is_err());
+    fn studies_list_groups_counts_and_latest_per_study() {
+        let other = {
+            let mut value = recommendation_json();
+            value["studyId"] = json!("41");
+            value
+        };
+        let rows = vec![
+            analytics_setup_row(2, 200, recommendation_json(), Some(10), Some(7)),
+            analytics_setup_row(1, 100, recommendation_json(), Some(10), Some(5)),
+            analytics_setup_row(3, 300, other, Some(11), None),
+        ];
+        let studies = studies_list(&rows, &HashMap::new());
+        assert_eq!(studies.len(), 2);
+        assert_eq!(studies[0]["studyId"], 40);
+        assert_eq!(studies[0]["setupCount"], 2);
+        assert_eq!(studies[0]["generationId"], 10);
+        assert_eq!(studies[0]["artifactId"], 7);
+        assert!(studies[0]["externalName"].is_string());
+        assert_eq!(studies[1]["studyId"], 41);
+        assert_eq!(studies[1]["setupCount"], 1);
+        assert!(studies[1]["artifactId"].is_null());
+    }
+
+    #[test]
+    fn studies_list_resolves_study_via_generation_map_and_skips_unresolvable() {
+        let mut legacy = recommendation_json();
+        legacy.as_object_mut().unwrap().remove("studyId");
+        let rows = vec![
+            analytics_setup_row(1, 100, legacy.clone(), Some(10), Some(9)),
+            analytics_setup_row(2, 200, legacy, None, None),
+        ];
+        let mut generation_studies = HashMap::new();
+        generation_studies.insert(10, 55);
+        let studies = studies_list(&rows, &generation_studies);
+        assert_eq!(studies.len(), 1);
+        assert_eq!(studies[0]["studyId"], 55);
+        assert_eq!(studies[0]["artifactId"], 9);
+    }
+
+    #[test]
+    fn studies_parser_validates_input() {
+        assert!(parse_studies(None).unwrap().is_none());
+        let studies = parse_studies(Some("1, 3")).unwrap().unwrap();
+        assert_eq!(studies, vec![1, 3]);
+        assert!(parse_studies(Some("")).is_err());
+        assert!(parse_studies(Some("0")).is_err());
+        assert!(parse_studies(Some("a")).is_err());
+        assert!(parse_studies(Some("1,,2")).is_err());
     }
 }

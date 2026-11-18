@@ -170,7 +170,7 @@ export function formatSetupRecommendation(setup: RecommendationSetup, nowUnix = 
   if (recommendation.priceChangePct !== null) {
     const bound = threshold(price, recommendation.priceChangePct, recommendation.direction);
     if (!bound) return invalid;
-    line(`⚠️ Заходить в сделку, только если цена не ${recommendation.direction === "short" ? "опустится ниже" : "поднимется выше"} `, code(amount(bound)), " USDT на момент входа");
+    line(`⚠️ Заходить в сделку, если цена будет ${recommendation.direction === "short" ? "выше" : "ниже"} `, code(amount(bound)), " USDT на момент входа");
   }
   line(); line(bold("Матожидание торговли:"));
   line("Прогноз МО торговли: ", metricSegment(enrichment?.forecastR));

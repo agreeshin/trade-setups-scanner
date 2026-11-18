@@ -86,7 +86,6 @@ impl CaptionBuilder {
 #[derive(Default)]
 struct Metrics {
     forecast_r: Option<f64>,
-    objective: Option<setups_domain::expectancy::ExpectancyObjective>,
 }
 
 fn signed_r(value: f64) -> Result<String, WorkerError> {
@@ -130,8 +129,10 @@ pub fn recommendation_telegram_caption(
             ) {
                 Ok(saved) if saved.validate_for(&envelope, raw.close_time_unix).is_ok() => (
                     Metrics {
-                        forecast_r: saved.objective.as_ref().map_or_else(|| saved.forecast_r.as_ref().copied(), |objective| objective.decision_r.as_ref().copied()),
-                        objective: saved.objective.as_ref().map(|objective| objective.settings),
+                        forecast_r: saved.objective.as_ref().map_or_else(
+                            || saved.forecast_r.as_ref().copied(),
+                            |objective| objective.decision_r.as_ref().copied(),
+                        ),
                     },
                     if saved.image_key.is_none() {
                         Some("saved_chart_unavailable")
@@ -202,22 +203,8 @@ fn format_caption(
     out.plain(" USDT\n\n")?;
     if let Some(forecast) = metrics.forecast_r {
         out.plain(if forecast < 0.0 { "📉 " } else { "📈 " })?;
-        match metrics.objective.map(|objective| objective.trend_mode) {
-            Some(setups_domain::trend::TrendMode::Mean) => out.plain("Матожидание торговли · среднее: ")?,
-            Some(setups_domain::trend::TrendMode::Blend) => {
-                let forecast_weight = metrics.objective.expect("matched objective").trend_blend_lambda.percent();
-                out.plain("Матожидание торговли · смесь ")?;
-                out.code(&format!("{}/{forecast_weight}", 100 - forecast_weight))?;
-                out.plain(": ")?;
-            }
-            _ => out.plain("Прогноз матожидание торговли: ")?,
-        }
+        out.plain("Матожидание торговли: ")?;
         out.code(&signed_r(forecast)?)?;
-        if let Some(objective) = metrics.objective.filter(|objective| !objective.trend_mode.is_mean()) {
-            out.plain(if matches!(objective.forecast, Some(setups_domain::forecast::ForecastRecipe::DecayedProbability { .. })) {
-                " · вероятностный"
-            } else { " · по тренду" })?;
-        }
         out.plain("\n\n")?;
     }
     out.plain("Условия сделки:")?;
@@ -236,9 +223,9 @@ fn format_caption(
         let threshold = super::text::price_threshold(&raw.close_price, pct, snapshot.direction)?
             .replace(',', ".");
         out.plain(if short {
-            "\n⚠️ Заходить в сделку, если цена не опустится ниже "
+            "\n⚠️ Заходить в сделку, если цена будет выше "
         } else {
-            "\n⚠️ Заходить в сделку, только если цена не поднимется выше "
+            "\n⚠️ Заходить в сделку, если цена будет ниже "
         })?;
         out.code(&threshold)?;
         out.plain(" USDT на момент входа")?;
@@ -247,6 +234,8 @@ fn format_caption(
     out.bold("Алгоритм")?;
     out.plain(": ")?;
     out.label(&envelope.external_name)?;
+    out.plain("\n\nИсследование №")?;
+    out.code(&envelope.study_id.to_string())?;
     out.finish()
 }
 
@@ -335,7 +324,7 @@ mod tests {
         assert!(
             caption
                 .text
-                .contains("⚠️ Заходить в сделку, если цена не опустится ниже 101.00 USDT")
+                .contains("⚠️ Заходить в сделку, если цена будет выше 101.00 USDT")
         );
         assert!(
             caption
@@ -343,9 +332,14 @@ mod tests {
                 .contains("Цена: 100.00 USDT\n\nУсловия сделки:")
         );
         assert!(!caption.text.contains("Прогноз"));
+        assert!(!caption.text.contains("Матожидание торговли"));
         assert_no_other_metrics(&caption.text);
-        assert!(caption.text.ends_with("Алгоритм: <b>*plain name*😀"));
-        assert!(!caption.text.contains("1970-") && !caption.text.contains("Исследование"));
+        assert!(
+            caption
+                .text
+                .ends_with("Алгоритм: <b>*plain name*😀\n\nИсследование №42")
+        );
+        assert!(!caption.text.contains("1970-"));
         let headings: Vec<_> = caption
             .entities
             .iter()
@@ -364,10 +358,10 @@ mod tests {
         let (instrument, raw, value) = fixture();
         let envelope: RecommendationEnvelope = serde_json::from_value(value).unwrap();
         for (forecast, expected) in [
-            (Some(0.4), "📈 Прогноз матожидание торговли: +0.40 R"),
-            (Some(-0.4), "📉 Прогноз матожидание торговли: -0.40 R"),
-            (Some(0.0), "📈 Прогноз матожидание торговли: +0.00 R"),
-            (Some(-0.001), "📉 Прогноз матожидание торговли: -0.00 R"),
+            (Some(0.4), "📈 Матожидание торговли: +0.40 R"),
+            (Some(-0.4), "📉 Матожидание торговли: -0.40 R"),
+            (Some(0.0), "📈 Матожидание торговли: +0.00 R"),
+            (Some(-0.001), "📉 Матожидание торговли: -0.00 R"),
             (None, "Цена: 100.00 USDT\n\nУсловия сделки:"),
         ] {
             let caption = format_caption(
@@ -384,16 +378,10 @@ mod tests {
             assert_no_other_metrics(&caption.text);
             assert!(!caption.text.contains("\n\n\n"));
             assert!(!caption.text.contains("мин после сетапа"));
-            assert!(!caption.text.contains("только если цена не опустится ниже"));
+            assert!(!caption.text.contains("только если"));
             v2::validate_entities(&caption.text, &caption.entities).unwrap();
             if let Some(value) = forecast {
-                assert_eq!(
-                    caption
-                        .text
-                        .matches("Прогноз матожидание торговли:")
-                        .count(),
-                    1
-                );
+                assert_eq!(caption.text.matches("Матожидание торговли:").count(), 1);
                 assert!(
                     caption
                         .text
@@ -482,13 +470,13 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(caption.text.contains("📈 Матожидание торговли: +0.40 R"));
+        assert_no_other_metrics(&caption.text);
         assert!(
             caption
                 .text
-                .contains("📈 Прогноз матожидание торговли: +0.40 R")
+                .ends_with(&format!("{}\n\nИсследование №42", "😀".repeat(120)))
         );
-        assert_no_other_metrics(&caption.text);
-        assert!(caption.text.ends_with(&"😀".repeat(120)));
         v2::validate_entities(&caption.text, &caption.entities).unwrap();
         let mut builder = CaptionBuilder::default();
         builder
@@ -516,8 +504,9 @@ mod tests {
             Some("invalid_saved_enrichment")
         );
         assert!(!caption.text.contains("Прогноз"));
+        assert!(!caption.text.contains("Матожидание торговли"));
         assert_no_other_metrics(&caption.text);
-        let name = caption.entities.last().unwrap();
+        let name = caption.entities.iter().rev().nth(1).unwrap();
         assert_eq!(name.kind, EntityKind::Code);
         assert_eq!(entity_text(&caption, name), "😀<b>algo42</b>*literal*");
         value["rawSignalAt"] = json!(raw.close_time_unix + 60);
@@ -526,7 +515,6 @@ mod tests {
 
     fn assert_no_other_metrics(text: &str) {
         for forbidden in [
-            "Матожидание торговли:",
             "Планируемое",
             "Среднее МО",
             "Динамика МО",
@@ -534,7 +522,6 @@ mod tests {
             "В среднем",
             "матриц",
             "Выбор по",
-            "Исследование",
             "🔖",
         ] {
             assert!(!text.contains(forbidden), "unexpected {forbidden}: {text}");
@@ -566,11 +553,11 @@ mod tests {
             caption.text,
             concat!(
                 "🔴 SPACEUSDT · SHORT · Bybit\nЦена: 0.004156 USDT\n\n",
-                "📈 Матожидание торговли · среднее: +0.32 R\n\n",
+                "📈 Матожидание торговли: +0.32 R\n\n",
                 "Условия сделки:\n⏳ Рекомендуемое время входа: 18:27:00 UTC\n",
                 "🎯 TP = 20%, SL = 6% (от фактической цены входа)\n",
-                "⚠️ Заходить в сделку, если цена не опустится ниже 0.004156 USDT на момент входа\n\n",
-                "Алгоритм: Всплеск цены и оборота"
+                "⚠️ Заходить в сделку, если цена будет выше 0.004156 USDT на момент входа\n\n",
+                "Алгоритм: Всплеск цены и оборота\n\nИсследование №42"
             )
         );
         assert!(caption.fits_photo_caption());

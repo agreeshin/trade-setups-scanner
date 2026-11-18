@@ -13,13 +13,15 @@ import { Select } from "../components/ui/select";
 import { Spinner } from "../components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { fetchPlatform } from "../lib/platform-api";
+import { getOptimizationStudy, type OptimizationMatrixCell, type OptimizationStudy } from "../lib/optimization-api";
 import {
+  fetchExpectancyPngUrl,
   fetchSetupsAnalytics,
-  fetchSetupsAnalyticsProfiles,
-  type SetupsAnalyticsProfile,
+  fetchSetupsAnalyticsStudies,
   type SetupsAnalyticsResult,
   type SetupsAnalyticsSetup,
   type SetupsAnalyticsStatus,
+  type SetupsAnalyticsStudyMeta,
 } from "../lib/setups-analytics-api";
 import {
   algorithmDisplayName,
@@ -32,7 +34,38 @@ import {
   type Algorithm,
 } from "./platform-controls";
 
-const PROFILES_DEBOUNCE_MS = 400;
+const FILTER_STORAGE_KEY = "setups-analytics-filter-v1";
+
+interface StoredFilter {
+  algorithmId: string;
+  from: string;
+  to: string;
+  studies: number[] | null;
+}
+
+function loadStoredFilter(): StoredFilter | null {
+  try {
+    const raw = window.localStorage.getItem(FILTER_STORAGE_KEY);
+    if (raw === null) return null;
+    const value: unknown = JSON.parse(raw);
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (typeof record.algorithmId !== "string" || typeof record.from !== "string" || typeof record.to !== "string") return null;
+    const studies: unknown = record.studies;
+    if (studies !== null && (!Array.isArray(studies) || !studies.every((item) => typeof item === "number" && Number.isSafeInteger(item)))) return null;
+    return { algorithmId: record.algorithmId, from: record.from, to: record.to, studies: studies as number[] | null };
+  } catch {
+    return null;
+  }
+}
+
+function storeFilter(filter: StoredFilter): void {
+  try {
+    window.localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(filter));
+  } catch {
+    return;
+  }
+}
 
 function formatPrice(value: number | null): string {
   if (value === null) return "—";
@@ -42,6 +75,10 @@ function formatPrice(value: number | null): string {
 function formatRisk(value: number | null): string {
   if (value === null) return "—";
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}R`;
+}
+
+function formatSignedR(value: number): string {
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)} R`;
 }
 
 function formatTime(unix: number | null): string {
@@ -66,7 +103,7 @@ function GateBadge({ passed, selected }: { passed: number; selected: number }) {
   return <Badge className="bg-ambient-violet/15 text-ambient-violet" aria-label={`Прошли гейт: ${passed} из ${selected}`}>{passed}/{selected}</Badge>;
 }
 
-function SetupOutcomeRow({ setup, onOpenProfile }: { setup: SetupsAnalyticsSetup; onOpenProfile: (slotId: number) => void }) {
+function SetupOutcomeRow({ setup }: { setup: SetupsAnalyticsSetup }) {
   const status = STATUS_BADGES[setup.status];
   return <TableRow>
     <TableCell className="font-medium">{setup.symbol}</TableCell>
@@ -77,74 +114,124 @@ function SetupOutcomeRow({ setup, onOpenProfile }: { setup: SetupsAnalyticsSetup
     <TableCell className="whitespace-nowrap tabular-nums">{formatTime(setup.closeTimeUnix)}</TableCell>
     <TableCell numeric className={(setup.riskReturn ?? 0) >= 0 ? "text-success" : "text-danger"}>{formatRisk(setup.riskReturn)}</TableCell>
     <TableCell><Badge variant={status.variant}>{status.label}</Badge></TableCell>
-    <TableCell numeric>
-      <button type="button" className="font-medium text-primary underline-offset-4 hover:underline" onClick={() => onOpenProfile(setup.slotId)}>№{setup.slotId}</button>
-    </TableCell>
+    <TableCell numeric>№{setup.slotId}</TableCell>
   </TableRow>;
 }
 
-function ProfileDetailsDialog({ profile, onClose }: { profile: SetupsAnalyticsProfile | null; onClose: () => void }) {
-  return <Dialog open={profile !== null} onOpenChange={(open) => { if (!open) onClose(); }}>
-    {profile && <DialogContent aria-label={`Профиль №${profile.slotId}`}>
+function bestMeanPair(matrix: OptimizationMatrixCell[]): { tpPct: number; slPct: number; meanR: number } | null {
+  let best: { tpPct: number; slPct: number; meanR: number } | null = null;
+  for (const cell of matrix) {
+    const value = cell.meanRiskExpectancy;
+    if (value === null || value === undefined || !Number.isFinite(value)) continue;
+    if (best === null || value > best.meanR) best = { tpPct: cell.tpPct, slPct: cell.slPct, meanR: value };
+  }
+  return best;
+}
+
+function StudyDetailsDialog({ studyId, meta, onClose }: { studyId: number | null; meta: SetupsAnalyticsStudyMeta | undefined; onClose: () => void }) {
+  const [study, setStudy] = useState<OptimizationStudy | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [pngUrl, setPngUrl] = useState<string | null>(null);
+  const [pngError, setPngError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (studyId === null) return;
+    const controller = new AbortController();
+    void getOptimizationStudy(studyId, controller.signal)
+      .then((value) => { if (!controller.signal.aborted) setStudy(value); })
+      .catch((cause) => { if (!controller.signal.aborted) setLoadError(errorText(cause)); });
+    const artifactId = meta?.artifactId;
+    if (artifactId !== undefined && artifactId !== null) {
+      void fetchExpectancyPngUrl(artifactId, controller.signal)
+        .then((url) => { if (!controller.signal.aborted) setPngUrl(url); })
+        .catch((cause) => { if (!controller.signal.aborted) setPngError(errorText(cause)); });
+    }
+    return () => controller.abort();
+  }, [studyId, meta]);
+
+  useEffect(() => () => { if (pngUrl !== null) URL.revokeObjectURL(pngUrl); }, [pngUrl]);
+
+  const best = study?.result?.best ?? null;
+  const trendMode = best?.trendMode ?? study?.spec.trendMode;
+  const forecastPair = study?.forecastBest ?? null;
+  const meanPair = best === null ? null : bestMeanPair(best.matrix);
+  const pairKindLabel = trendMode === "blend" ? "Лучшая blend-пара" : trendMode === undefined || trendMode === "mean" ? "Лучшая mean-пара" : "Лучшая forecast-пара";
+  const pair = trendMode === "blend" || trendMode === "forecast"
+    ? forecastPair !== null
+      ? { text: `TP ${forecastPair.tpPct}% / SL ${forecastPair.slPct}% · ${formatSignedR(forecastPair.forecastR)}` }
+      : meanPair !== null ? { text: `TP ${meanPair.tpPct}% / SL ${meanPair.slPct}% · ${formatSignedR(meanPair.meanR)}` } : null
+    : meanPair !== null ? { text: `TP ${meanPair.tpPct}% / SL ${meanPair.slPct}% · ${formatSignedR(meanPair.meanR)}` } : null;
+  const score = best?.score ?? study?.progress.bestScore ?? null;
+
+  return <Dialog open={studyId !== null} onOpenChange={(open) => { if (!open) onClose(); }}>
+    {studyId !== null && <DialogContent className="max-w-2xl" aria-label={`Исследование №${studyId}`}>
       <DialogHeader>
-        <DialogTitle>Профиль №{profile.slotId}</DialogTitle>
-        <DialogDescription>{profile.externalName}</DialogDescription>
+        <DialogTitle>Исследование №{studyId}</DialogTitle>
+        <DialogDescription>{meta?.externalName ?? "Подробности исследования и график динамики матожидания."}</DialogDescription>
       </DialogHeader>
-      <dl className="grid gap-2 text-sm sm:grid-cols-2">
-        <div><dt className="text-muted-foreground">Исследование-основа</dt><dd>№{profile.studyId ?? "—"}</dd></div>
-        <div><dt className="text-muted-foreground">Поколение выпуска</dt><dd>{profile.generationId ?? "—"}</dd></div>
-        <div><dt className="text-muted-foreground">Среднее матрицы mean R</dt><dd className={`tabular-nums ${meanColorClass(profile.meanR)}`}>{formatRisk(profile.meanR)}</dd></div>
-        <div><dt className="text-muted-foreground">Направление</dt><dd><Badge variant={profile.direction === "short" ? "danger" : "success"}>{profile.direction.toUpperCase()}</Badge></dd></div>
-        <div><dt className="text-muted-foreground">TP / SL</dt><dd className="tabular-nums">{profile.tpPct}% / {profile.slPct}%</dd></div>
-        <div><dt className="text-muted-foreground">Time-shift</dt><dd className="tabular-nums">{profile.timeShiftMinutes} мин</dd></div>
-        <div><dt className="text-muted-foreground">Порог смещения цены</dt><dd className="tabular-nums">{profile.priceChangePct === null ? "не задан" : `${profile.priceChangePct}%`}</dd></div>
-        <div><dt className="text-muted-foreground">Сетапов в диапазоне</dt><dd className="tabular-nums">{profile.setupCount}</dd></div>
-      </dl>
+      {loadError !== null && <p role="alert" className="text-sm text-danger">{loadError}</p>}
+      {study === null && loadError === null && <p className="text-sm text-muted-foreground">Загрузка подробностей…</p>}
+      {study !== null && <div className="grid gap-4">
+        <dl className="grid gap-2 text-sm sm:grid-cols-2">
+          <div><dt className="text-muted-foreground">Лучший score</dt><dd className="tabular-nums">{score === null ? "—" : formatSignedR(score)}</dd></div>
+          <div><dt className="text-muted-foreground">{pairKindLabel}</dt><dd className="tabular-nums">{pair === null ? "Не сохранено" : pair.text}</dd></div>
+        </dl>
+        <div>
+          <h4 className="font-medium">Полные параметры алгоритма</h4>
+          {best === null
+            ? <p className="mt-1 text-sm text-muted-foreground">Не сохранено</p>
+            : <dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">{Object.entries(best.params).map(([key, value]) => <div key={key} className="break-words"><dt className="text-muted-foreground">{key}</dt><dd>{String(value)}</dd></div>)}</dl>}
+        </div>
+      </div>}
+      <div className="grid gap-2">
+        <h4 className="font-medium">Динамика матожидания</h4>
+        {pngUrl !== null && <img src={pngUrl} alt={`Динамика матожидания исследования №${studyId}`} className="w-full rounded-md border border-input/60" />}
+        {pngUrl === null && pngError !== null && <p className="text-sm text-muted-foreground">{pngError}</p>}
+        {pngUrl === null && pngError === null && (meta?.artifactId === undefined || meta.artifactId === null) && <p className="text-sm text-muted-foreground">PNG недоступен: у сетапов этого исследования нет сохранённого графика.</p>}
+        {pngUrl === null && pngError === null && meta?.artifactId != null && <p className="text-sm text-muted-foreground">Загрузка графика…</p>}
+      </div>
     </DialogContent>}
   </Dialog>;
 }
 
-function ProfilePickerDialog({ open, profiles, selection, onSelectionChange, onClose, onApply, onOpenDetails }: {
+function StudyPickerDialog({ open, studies, selection, onSelectionChange, onClose, onApply }: {
   open: boolean;
-  profiles: SetupsAnalyticsProfile[];
+  studies: SetupsAnalyticsStudyMeta[];
   selection: ReadonlySet<number>;
-  onSelectionChange: (slotId: number, checked: boolean) => void;
+  onSelectionChange: (studyId: number, checked: boolean) => void;
   onClose: () => void;
   onApply: () => void;
-  onOpenDetails: (profile: SetupsAnalyticsProfile) => void;
 }) {
   return <Dialog open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
-    {open && <DialogContent className="max-w-xl" aria-label="Профили, выпустившие сетапы">
+    {open && <DialogContent className="max-w-xl" aria-label="Исследования-основы, выпустившие сетапы">
       <DialogHeader>
-        <DialogTitle>Профили, выпустившие сетапы</DialogTitle>
-        <DialogDescription>Список зависит от алгоритма и диапазона выпуска. Нажмите ID профиля для подробностей.</DialogDescription>
+        <DialogTitle>Исследования-основы, выпустившие сетапы</DialogTitle>
+        <DialogDescription>Список зависит от диапазона выпуска сетапов и обновляется при смене дат.</DialogDescription>
       </DialogHeader>
       <div className="flex flex-wrap gap-2">
-        <Button variant="outline" onClick={() => { for (const profile of profiles) onSelectionChange(profile.slotId, true); }}>Выбрать все</Button>
-        <Button variant="outline" onClick={() => { for (const profile of profiles) onSelectionChange(profile.slotId, false); }}>Снять все</Button>
+        <Button variant="outline" onClick={() => { for (const study of studies) onSelectionChange(study.studyId, true); }}>Выбрать все</Button>
+        <Button variant="outline" onClick={() => { for (const study of studies) onSelectionChange(study.studyId, false); }}>Снять все</Button>
       </div>
       <div className="max-h-96 overflow-y-auto">
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>Выбран</TableHead>
-              <TableHead>Профиль</TableHead>
-              <TableHead>Направление</TableHead>
+              <TableHead>Исследование</TableHead>
               <TableHead numeric>Сетапов</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {profiles.map((profile) => <TableRow key={profile.slotId}>
-              <TableCell><Checkbox checked={selection.has(profile.slotId)} aria-label={`Профиль ${profile.slotId}`} onCheckedChange={(checked) => onSelectionChange(profile.slotId, checked === true)} /></TableCell>
-              <TableCell><button type="button" className="font-medium text-primary underline-offset-4 hover:underline" onClick={() => onOpenDetails(profile)}>№{profile.slotId}</button></TableCell>
-              <TableCell><Badge variant={profile.direction === "short" ? "danger" : "success"}>{profile.direction.toUpperCase()}</Badge></TableCell>
-              <TableCell numeric>{profile.setupCount}</TableCell>
+            {studies.map((study) => <TableRow key={study.studyId}>
+              <TableCell><Checkbox checked={selection.has(study.studyId)} aria-label={`Исследование ${study.studyId}`} onCheckedChange={(checked) => onSelectionChange(study.studyId, checked === true)} /></TableCell>
+              <TableCell className="font-medium">№{study.studyId}</TableCell>
+              <TableCell numeric>{study.setupCount}</TableCell>
             </TableRow>)}
           </TableBody>
         </Table>
       </div>
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="text-xs text-muted-foreground">Выбрано: {selection.size} из {profiles.length}</p>
+        <p className="text-xs text-muted-foreground">Выбрано: {selection.size} из {studies.length}</p>
         <div className="flex gap-2">
           <Button variant="outline" onClick={onClose}>Отмена</Button>
           <Button onClick={onApply}>Готово</Button>
@@ -154,21 +241,41 @@ function ProfilePickerDialog({ open, profiles, selection, onSelectionChange, onC
   </Dialog>;
 }
 
+function initialAlgorithmId(): string {
+  return loadStoredFilter()?.algorithmId ?? "";
+}
+
+function initialRangeInputs(): { from: string; to: string } {
+  const stored = loadStoredFilter();
+  return {
+    from: stored?.from ?? localDateInput(Math.floor(Date.now() / 1000) - 7 * 86400),
+    to: stored?.to ?? localDateInput(Math.floor(Date.now() / 1000)),
+  };
+}
+
+function initialSelectedStudies(): ReadonlySet<number> | null {
+  const studies = loadStoredFilter()?.studies;
+  return studies ? new Set(studies) : null;
+}
+
 export function SetupsAnalyticsPanel() {
   const [algorithms, setAlgorithms] = useState<Algorithm[] | null>(null);
-  const [algorithmId, setAlgorithmId] = useState("");
-  const [fromInput, setFromInput] = useState(() => localDateInput(Math.floor(Date.now() / 1000) - 7 * 86400));
-  const [toInput, setToInput] = useState(() => localDateInput(Math.floor(Date.now() / 1000)));
-  const [profiles, setProfiles] = useState<SetupsAnalyticsProfile[]>([]);
-  const [profilesState, setProfilesState] = useState<"idle" | "loading" | "ready" | "error">("idle");  const [profilesError, setProfilesError] = useState<string | null>(null);
-  const [selectedSlots, setSelectedSlots] = useState<ReadonlySet<number> | null>(null);
+  const [algorithmId, setAlgorithmId] = useState(initialAlgorithmId);
+  const [fromInput, setFromInput] = useState(() => initialRangeInputs().from);
+  const [toInput, setToInput] = useState(() => initialRangeInputs().to);
+  const [committed, setCommitted] = useState(initialRangeInputs);
+  const [studiesMeta, setStudiesMeta] = useState<SetupsAnalyticsStudyMeta[]>([]);
+  const [studiesState, setStudiesState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [studiesError, setStudiesError] = useState<string | null>(null);
+  const [selectedStudies, setSelectedStudies] = useState<ReadonlySet<number> | null>(initialSelectedStudies);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerSelection, setPickerSelection] = useState<ReadonlySet<number>>(new Set());
-  const [detailProfile, setDetailProfile] = useState<SetupsAnalyticsProfile | null>(null);
+  const [detailStudyId, setDetailStudyId] = useState<number | null>(null);
   const [result, setResult] = useState<SetupsAnalyticsResult | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const calculateRef = useRef<AbortController | null>(null);
+  const restoredSelection = useRef<ReadonlySet<number> | null>(initialSelectedStudies());
 
   const range = useMemo(() => {
     try {
@@ -177,9 +284,16 @@ export function SetupsAnalyticsPanel() {
       return { value: null, error: errorText(cause) };
     }
   }, [fromInput, toInput]);
-  const rangeFrom = range.value?.fromUnix ?? null;
-  const rangeTo = range.value?.toUnix ?? null;
-  const profilesStatus = algorithmId === "" || rangeFrom === null || rangeTo === null ? "idle" : profilesState;
+  const committedRange = useMemo(() => {
+    try {
+      return replayRange(committed.from, committed.to);
+    } catch {
+      return null;
+    }
+  }, [committed]);
+  const committedFrom = committedRange?.fromUnix ?? null;
+  const committedTo = committedRange?.toUnix ?? null;
+  const studiesStatus = algorithmId === "" || committedFrom === null || committedTo === null ? "idle" : studiesState;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -187,53 +301,73 @@ export function SetupsAnalyticsPanel() {
       if (controller.signal.aborted) return;
       const list = state.kind === "ready" && Array.isArray(state.data.algorithms) ? state.data.algorithms : [];
       setAlgorithms(list);
-      setAlgorithmId((current) => current === "" && list[0] !== undefined ? list[0].id : current);
-      if (state.kind === "unreachable") setProfilesError(`Список алгоритмов недоступен (${state.detail})`);
+      setAlgorithmId((current) => list.some((algorithm) => algorithm.id === current) ? current : (list[0]?.id ?? ""));
+      if (state.kind === "unreachable") setStudiesError(`Список алгоритмов недоступен (${state.detail})`);
     });
     return () => controller.abort();
   }, []);
 
   useEffect(() => {
-    if (algorithmId === "" || rangeFrom === null || rangeTo === null) return;
+    if (algorithmId === "" || committedFrom === null || committedTo === null) return;
     const controller = new AbortController();
-    const timer = window.setTimeout(() => {
-      setProfilesState("loading");
-      void fetchSetupsAnalyticsProfiles(algorithmId, rangeFrom, rangeTo, controller.signal)
-        .then((items) => {
-          if (controller.signal.aborted) return;
-          setProfiles(items);
-          setProfilesState("ready");
-          setProfilesError(null);
-          setSelectedSlots((current) => current === null ? null : new Set(items.filter((profile) => current.has(profile.slotId)).map((profile) => profile.slotId)));
-        })
-        .catch((cause) => {
-          if (controller.signal.aborted) return;
-          setProfiles([]);
-          setProfilesState("error");
-          setProfilesError(errorText(cause));
-        });
-    }, PROFILES_DEBOUNCE_MS);
-    return () => { controller.abort(); window.clearTimeout(timer); };
-  }, [algorithmId, rangeFrom, rangeTo]);
+    const from = committedFrom;
+    const to = committedTo;
+    async function load() {
+      setStudiesState("loading");
+      try {
+        const items = await fetchSetupsAnalyticsStudies(algorithmId, from, to, controller.signal);
+        if (controller.signal.aborted) return;
+        setStudiesMeta(items);
+        setStudiesState("ready");
+        setStudiesError(null);
+        const restored = restoredSelection.current;
+        if (restored === null) {
+          setSelectedStudies(null);
+        } else {
+          const intersection = new Set(items.filter((item) => restored.has(item.studyId)).map((item) => item.studyId));
+          setSelectedStudies(intersection.size === 0 ? null : intersection);
+          restoredSelection.current = null;
+        }
+      } catch (cause) {
+        if (controller.signal.aborted) return;
+        setStudiesMeta([]);
+        setStudiesState("error");
+        setStudiesError(errorText(cause));
+        setSelectedStudies(null);
+        restoredSelection.current = null;
+      }
+    }
+    void load();
+    return () => controller.abort();
+  }, [algorithmId, committedFrom, committedTo]);
+
+  useEffect(() => {
+    storeFilter({
+      algorithmId,
+      from: fromInput,
+      to: toInput,
+      studies: selectedStudies === null ? null : [...selectedStudies].sort((left, right) => left - right),
+    });
+  }, [algorithmId, fromInput, toInput, selectedStudies]);
 
   useEffect(() => () => calculateRef.current?.abort(), []);
 
+  function commitDates() {
+    setCommitted({ from: fromInput, to: toInput });
+  }
+
   function openPicker() {
-    setPickerSelection(selectedSlots === null ? new Set(profiles.map((profile) => profile.slotId)) : new Set(selectedSlots));
+    setPickerSelection(selectedStudies === null ? new Set(studiesMeta.map((study) => study.studyId)) : new Set(selectedStudies));
     setPickerOpen(true);
   }
 
-  function togglePickerSlot(slotId: number, checked: boolean) {
+  function togglePickerStudy(studyId: number, checked: boolean) {
     setPickerSelection((current) => {
       const next = new Set(current);
-      if (checked) next.add(slotId);
-      else next.delete(slotId);
+      if (checked) next.add(studyId);
+      else next.delete(studyId);
       return next;
     });
-  }
-
-  function openProfileDetails(slotId: number) {
-    setDetailProfile(profiles.find((profile) => profile.slotId === slotId) ?? null);
   }
 
   async function run() {
@@ -244,8 +378,8 @@ export function SetupsAnalyticsPanel() {
     setRunning(true);
     setError(null);
     try {
-      const slots = selectedSlots === null ? null : [...selectedSlots].sort((left, right) => left - right);
-      const data = await fetchSetupsAnalytics(algorithmId, range.value.fromUnix, range.value.toUnix, slots, controller.signal);
+      const studies = selectedStudies === null ? null : [...selectedStudies].sort((left, right) => left - right);
+      const data = await fetchSetupsAnalytics(algorithmId, range.value.fromUnix, range.value.toUnix, studies, controller.signal);
       if (!controller.signal.aborted) setResult(data);
     } catch (cause) {
       if (!controller.signal.aborted) setError(errorText(cause));
@@ -257,14 +391,15 @@ export function SetupsAnalyticsPanel() {
     }
   }
 
-  const profilesLabel = selectedSlots === null
-    ? `Все (${profiles.length})`
-    : `${selectedSlots.size} из ${profiles.length}`;
+  const studiesLabel = selectedStudies === null
+    ? `Все (${studiesMeta.length})`
+    : `${selectedStudies.size} из ${studiesMeta.length}`;
+  const detailMeta = detailStudyId === null ? undefined : studiesMeta.find((study) => study.studyId === detailStudyId);
 
   return <section aria-label="Аналитика выпущенных сетапов" className="grid min-w-0 gap-4">
     <div className="flex items-center gap-2">
       <h2 className="text-lg font-semibold">Аналитика выпущенных сетапов</h2>
-      <InfoNote>Разовый расчёт по сохранённым рекомендациям адаптивных профилей: вход по рекомендованному времени и гейту смещения цены, исход TP/SL по реальным минутным свечам за 7 суток. Результаты не кешируются.</InfoNote>
+      <InfoNote>Разовый расчёт по сохранённым рекомендациям исследований: вход по рекомендованному времени и гейту смещения цены, исход TP/SL по реальным минутным свечам за 7 суток. Результаты не кешируются.</InfoNote>
     </div>
     <Card>
       <CardContent className="flex flex-wrap items-end gap-3">
@@ -274,19 +409,19 @@ export function SetupsAnalyticsPanel() {
           </Select>}
         </Field>
         <Field label="Начало (момент выхода сетапа)" className="w-60">
-          {(control) => <DateInput {...control} type="datetime-local" value={fromInput} onChange={(event) => { setFromInput(utcMidnightOnDateChange(fromInput, event.target.value)); setResult(null); }} />}
+          {(control) => <DateInput {...control} type="datetime-local" value={fromInput} onBlur={commitDates} onChange={(event) => { setFromInput(utcMidnightOnDateChange(fromInput, event.target.value)); setResult(null); }} />}
         </Field>
         <Field label="Конец" className="w-60">
-          {(control) => <DateInput {...control} type="datetime-local" value={toInput} onChange={(event) => { setToInput(utcMidnightOnDateChange(toInput, event.target.value)); setResult(null); }} />}
+          {(control) => <DateInput {...control} type="datetime-local" value={toInput} onBlur={commitDates} onChange={(event) => { setToInput(utcMidnightOnDateChange(toInput, event.target.value)); setResult(null); }} />}
         </Field>
-        <Button variant="outline" disabled={profiles.length === 0} onClick={openPicker}>Профили: {profilesLabel}</Button>
+        <Button variant="outline" disabled={studiesMeta.length === 0} onClick={openPicker}>Исследования: {studiesLabel}</Button>
         <Button disabled={running || algorithmId === "" || range.value === null} onClick={() => { void run(); }}>{running ? "Расчёт…" : "Рассчитать"}</Button>
-        {profilesStatus === "loading" && <Spinner label="Загрузка профилей…" />}
-        <p className="w-full text-xs text-muted-foreground">Время: {localTimezoneLabel()}. Смена даты сбрасывает время к 00:00 UTC. Расчёт выполняется по нажатию кнопки, без кеша.</p>
+        {studiesStatus === "loading" && <Spinner label="Загрузка исследований…" />}
+        <p className="w-full text-xs text-muted-foreground">Время: {localTimezoneLabel()}. Смена даты сбрасывает время к 00:00 UTC; список исследований обновляется при потере фокуса полей дат, после обновления выбраны все. Расчёт выполняется по нажатию кнопки, без кеша.</p>
         {range.error !== null && <p role="alert" className="w-full text-xs text-danger">{range.error}</p>}
       </CardContent>
     </Card>
-    {profilesError && <Alert variant="destructive" role="alert"><AlertDescription>{profilesError}</AlertDescription></Alert>}
+    {studiesError && <Alert variant="destructive" role="alert"><AlertDescription>{studiesError}</AlertDescription></Alert>}
     {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
     {running && <Spinner label="Выполняется расчёт исходов сетапов…" />}
     {result && <Card>
@@ -302,49 +437,67 @@ export function SetupsAnalyticsPanel() {
             <GateBadge passed={result.totals.gatePassed} selected={result.totals.selected} />
           </div>
         </div>
-        {result.studies.length > 0 && <div>
-          <h3 className="mb-2 text-sm font-semibold text-muted-foreground">Исследования-основы</h3>
-          <ul className="grid gap-2">
-            {result.studies.map((study) => <li key={study.studyId} className="flex flex-wrap items-center gap-2 text-sm">
-              <GateBadge passed={study.gatePassed} selected={study.selected} />
-              <span>Исследование №{study.studyId}</span>
-              <span className={`font-medium tabular-nums ${meanColorClass(study.meanR)}`}>{formatRisk(study.meanR)}</span>
-              <span className="text-xs text-muted-foreground">закрытых: {study.closed}</span>
-            </li>)}
-          </ul>
+        {result.studies.length > 0 && <div className="grid gap-2">
+          <h3 className="text-sm font-semibold text-muted-foreground">Исследования-основы</h3>
+          <div className="overflow-x-auto rounded-md border border-input/60">
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead>Исследование</TableHead>
+                  <TableHead>Прошли гейт / выбрано</TableHead>
+                  <TableHead numeric>Матожидание</TableHead>
+                  <TableHead numeric>Закрытых</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {result.studies.map((study) => <TableRow key={study.studyId}>
+                  <TableCell>
+                    <button type="button" className="font-medium text-primary underline-offset-4 hover:underline" aria-label={`Подробности исследования ${study.studyId}`} onClick={() => setDetailStudyId(study.studyId)}>№{study.studyId}</button>
+                  </TableCell>
+                  <TableCell><GateBadge passed={study.gatePassed} selected={study.selected} /></TableCell>
+                  <TableCell numeric className={`font-medium ${meanColorClass(study.meanR)}`}>{formatRisk(study.meanR)}</TableCell>
+                  <TableCell numeric>{study.closed}</TableCell>
+                </TableRow>)}
+              </TableBody>
+            </Table>
+          </div>
         </div>}
-        {result.setups.length === 0 ? <EmptyState title="Нет сетапов по выбранным фильтрам" description="Измените диапазон, алгоритм или набор профилей." /> : <div className="overflow-x-auto rounded-md border border-input/60">
-          <Table>
-            <caption className="px-3 py-2 text-left text-xs text-muted-foreground">Время: {localTimezoneLabel()}</caption>
-            <TableHeader>
-              <TableRow className="hover:bg-transparent">
-                <TableHead>Инструмент</TableHead>
-                <TableHead>Время сетапа</TableHead>
-                <TableHead numeric>Вход</TableHead>
-                <TableHead numeric className="text-success">TP</TableHead>
-                <TableHead numeric className="text-danger">SL</TableHead>
-                <TableHead>Закрытие</TableHead>
-                <TableHead numeric>Результат</TableHead>
-                <TableHead>Статус</TableHead>
-                <TableHead numeric>Профиль</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {result.setups.map((setup) => <SetupOutcomeRow key={setup.id} setup={setup} onOpenProfile={openProfileDetails} />)}
-            </TableBody>
-          </Table>
-        </div>}
+        {result.setups.length === 0
+          ? <EmptyState title="Нет сетапов по выбранным фильтрам" description="Измените диапазон, алгоритм или набор исследований." />
+          : <div className="grid gap-2">
+            <h3 className="text-sm font-semibold text-muted-foreground">Сетапы</h3>
+            <div className="overflow-x-auto rounded-md border border-input/60">
+              <Table>
+                <caption className="px-3 py-2 text-left text-xs text-muted-foreground">Время: {localTimezoneLabel()}</caption>
+                <TableHeader>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead>Инструмент</TableHead>
+                    <TableHead>Время сетапа</TableHead>
+                    <TableHead numeric>Вход</TableHead>
+                    <TableHead numeric className="text-success">TP</TableHead>
+                    <TableHead numeric className="text-danger">SL</TableHead>
+                    <TableHead>Закрытие</TableHead>
+                    <TableHead numeric>Результат</TableHead>
+                    <TableHead>Статус</TableHead>
+                    <TableHead numeric>Профиль</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {result.setups.map((setup) => <SetupOutcomeRow key={setup.id} setup={setup} />)}
+                </TableBody>
+              </Table>
+            </div>
+          </div>}
       </CardContent>
     </Card>}
-    <ProfilePickerDialog
+    <StudyPickerDialog
       open={pickerOpen}
-      profiles={profiles}
+      studies={studiesMeta}
       selection={pickerSelection}
-      onSelectionChange={togglePickerSlot}
+      onSelectionChange={togglePickerStudy}
       onClose={() => setPickerOpen(false)}
-      onApply={() => { setSelectedSlots(pickerSelection.size === profiles.length ? null : new Set(pickerSelection)); setPickerOpen(false); }}
-      onOpenDetails={setDetailProfile}
+      onApply={() => { setSelectedStudies(pickerSelection.size === studiesMeta.length ? null : new Set(pickerSelection)); setPickerOpen(false); }}
     />
-    <ProfileDetailsDialog profile={detailProfile} onClose={() => setDetailProfile(null)} />
+    <StudyDetailsDialog key={detailStudyId ?? "none"} studyId={detailStudyId} meta={detailMeta} onClose={() => setDetailStudyId(null)} />
   </section>;
 }
