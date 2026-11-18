@@ -554,6 +554,86 @@ pub fn evaluate_limit(options: EvaluateLimitOptions<'_>) -> LimitEvaluation {
     }
 }
 
+pub fn evaluate_limit_at_open(options: EvaluateLimitOptions<'_>) -> LimitEvaluation {
+    let EvaluateLimitOptions {
+        candles,
+        setup,
+        direction,
+        tp_pct,
+        sl_pct,
+        time_shift_minutes,
+        horizon_minutes,
+    } = options;
+    let no_data = LimitEvaluation {
+        status: LimitStatus::NoData,
+        entry_price: None,
+        entry_time_unix: None,
+        tp_price: None,
+        sl_price: None,
+        close_time_unix: None,
+        move_pct: None,
+        close_minutes: None,
+    };
+    let entry_time_unix = setup.open_time_unix + time_shift_minutes * MINUTE_SECONDS;
+    let Some(entry_candle) = find_candle_by_open_time(candles, entry_time_unix) else {
+        return no_data;
+    };
+    let entry_price = entry_candle.open;
+    let scan_end_unix = entry_time_unix + horizon_minutes * MINUTE_SECONDS;
+    let tp_price = match direction {
+        TradeDirection::Short => entry_price * (1.0 - tp_pct / 100.0),
+        TradeDirection::Long => entry_price * (1.0 + tp_pct / 100.0),
+    };
+    let sl_price = match direction {
+        TradeDirection::Short => entry_price * (1.0 + sl_pct / 100.0),
+        TradeDirection::Long => entry_price * (1.0 - sl_pct / 100.0),
+    };
+    let touches_tp = |candle: &OhlcCandle| match direction {
+        TradeDirection::Short => candle.low <= tp_price,
+        TradeDirection::Long => candle.high >= tp_price,
+    };
+    let touches_sl = |candle: &OhlcCandle| match direction {
+        TradeDirection::Short => candle.high >= sl_price,
+        TradeDirection::Long => candle.low <= sl_price,
+    };
+    let mut index = lower_bound(candles, entry_time_unix);
+    while index < candles.len() {
+        let candle = &candles[index];
+        if candle.open_time_unix >= scan_end_unix {
+            break;
+        }
+        let hit_sl = touches_sl(candle);
+        if hit_sl || touches_tp(candle) {
+            let close_time_unix = candle.open_time_unix;
+            return LimitEvaluation {
+                status: if hit_sl {
+                    LimitStatus::Sl
+                } else {
+                    LimitStatus::Tp
+                },
+                entry_price: Some(entry_price),
+                entry_time_unix: Some(entry_time_unix),
+                tp_price: if hit_sl { None } else { Some(tp_price) },
+                sl_price: if hit_sl { Some(sl_price) } else { None },
+                close_time_unix: Some(close_time_unix),
+                move_pct: Some(if hit_sl { -sl_pct } else { tp_pct }),
+                close_minutes: Some((close_time_unix - entry_time_unix) as f64 / 60.0),
+            };
+        }
+        index += 1;
+    }
+    LimitEvaluation {
+        status: LimitStatus::Unclosed,
+        entry_price: Some(entry_price),
+        entry_time_unix: Some(entry_time_unix),
+        tp_price: None,
+        sl_price: None,
+        close_time_unix: None,
+        move_pct: None,
+        close_minutes: None,
+    }
+}
+
 pub struct EvaluateLimitOptions<'a> {
     pub candles: &'a [OhlcCandle],
     pub setup: &'a AnalyticsSetup,
@@ -609,6 +689,99 @@ pub fn aggregate_limit_outcomes(evaluations: &[LimitEvaluation], sl_pct: f64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at_open_candle(
+        open_time_unix: i64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+    ) -> OhlcCandle {
+        OhlcCandle {
+            open_time_unix,
+            open,
+            high,
+            low,
+            close,
+        }
+    }
+
+    fn at_open_setup() -> AnalyticsSetup {
+        AnalyticsSetup {
+            exchange_code: "bybit".into(),
+            category: "linear".into(),
+            symbol: "IRYSUSDT".into(),
+            open_time_unix: 1_794_996_300,
+            close_time_unix: 1_794_996_300,
+            close_price: "0.017465".into(),
+        }
+    }
+
+    fn at_open_options<'a>(
+        candles: &'a [OhlcCandle],
+        setup: &'a AnalyticsSetup,
+    ) -> EvaluateLimitOptions<'a> {
+        EvaluateLimitOptions {
+            candles,
+            setup,
+            direction: TradeDirection::Short,
+            tp_pct: 20.0,
+            sl_pct: 6.0,
+            time_shift_minutes: 14,
+            horizon_minutes: 10_080,
+        }
+    }
+
+    #[test]
+    fn evaluate_limit_at_open_uses_open_of_entry_candle() {
+        let candles = vec![
+            at_open_candle(1_794_997_080, 0.0176, 0.0177, 0.0175, 0.01755),
+            at_open_candle(1_794_997_140, 0.017442, 0.0175, 0.0172, 0.017248),
+            at_open_candle(1_794_997_200, 0.0172, 0.01725, 0.0139, 0.014),
+        ];
+        let setup = at_open_setup();
+        let evaluation = evaluate_limit_at_open(at_open_options(&candles, &setup));
+        assert_eq!(evaluation.status, LimitStatus::Tp);
+        assert_eq!(evaluation.entry_price, Some(0.017442));
+        assert_eq!(evaluation.entry_time_unix, Some(1_794_997_140));
+        assert!((evaluation.tp_price.unwrap() - 0.017442 * 0.8).abs() < 1e-12);
+        assert_eq!(evaluation.close_time_unix, Some(1_794_997_200));
+    }
+
+    #[test]
+    fn evaluate_limit_at_open_counts_entry_candle_touch() {
+        let candles = vec![at_open_candle(
+            1_794_997_140,
+            0.017442,
+            0.0186,
+            0.0174,
+            0.0185,
+        )];
+        let setup = at_open_setup();
+        let evaluation = evaluate_limit_at_open(at_open_options(&candles, &setup));
+        assert_eq!(evaluation.status, LimitStatus::Sl);
+        assert_eq!(evaluation.entry_price, Some(0.017442));
+        assert_eq!(evaluation.close_time_unix, Some(1_794_997_140));
+    }
+
+    #[test]
+    fn evaluate_limit_at_open_reports_no_data_and_unclosed() {
+        let setup = at_open_setup();
+        assert_eq!(
+            evaluate_limit_at_open(at_open_options(&[], &setup)).status,
+            LimitStatus::NoData
+        );
+        let candles = vec![at_open_candle(
+            1_794_997_140,
+            0.017442,
+            0.0176,
+            0.0173,
+            0.0175,
+        )];
+        let evaluation = evaluate_limit_at_open(at_open_options(&candles, &setup));
+        assert_eq!(evaluation.status, LimitStatus::Unclosed);
+        assert_eq!(evaluation.entry_price, Some(0.017442));
+    }
 
     #[test]
     fn month_key_matches_utc_calendar() {

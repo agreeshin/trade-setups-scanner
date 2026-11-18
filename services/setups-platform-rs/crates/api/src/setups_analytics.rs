@@ -8,7 +8,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use setups_analytics::{
-    AnalyticsSetup, EvaluateLimitOptions, LimitStatus, TradeDirection, evaluate_limit, risk_return,
+    AnalyticsSetup, EvaluateLimitOptions, LimitStatus, TradeDirection, evaluate_limit_at_open,
+    passes_price_change, risk_return,
 };
 use sqlx::Row;
 use std::collections::{BTreeMap, HashMap};
@@ -96,18 +97,9 @@ fn parse_recommendation(value: &Value) -> Result<ParsedRecommendation, String> {
 }
 
 fn gate_threshold(close_price: f64, pct: f64, direction: TradeDirection) -> f64 {
-    let delta = pct.abs() / 100.0;
     match direction {
-        TradeDirection::Short => close_price * (1.0 - delta),
-        TradeDirection::Long => close_price * (1.0 + delta),
-    }
-}
-
-fn gate_pass(entry_price: f64, close_price: f64, pct: f64, direction: TradeDirection) -> bool {
-    let threshold = gate_threshold(close_price, pct, direction);
-    match direction {
-        TradeDirection::Short => entry_price >= threshold,
-        TradeDirection::Long => entry_price <= threshold,
+        TradeDirection::Short => close_price * (1.0 + pct / 100.0),
+        TradeDirection::Long => close_price * (1.0 - pct / 100.0),
     }
 }
 
@@ -182,7 +174,7 @@ fn classify(
         risk_return: None,
     };
     if let Some(pct) = recommendation.price_change_pct
-        && !gate_pass(entry_price, close_price, pct, recommendation.direction)
+        && !passes_price_change(close_price, entry_price, recommendation.direction, pct)
     {
         return SetupOutcome {
             status: "gate_failed",
@@ -579,7 +571,7 @@ async fn setups_analytics(
                 close_time_unix: row.close_unix,
                 close_price: row.close_price.clone(),
             };
-            let evaluation = evaluate_limit(EvaluateLimitOptions {
+            let evaluation = evaluate_limit_at_open(EvaluateLimitOptions {
                 candles: &candles,
                 setup: &fabric,
                 direction: recommendation.direction,
@@ -836,20 +828,42 @@ mod tests {
 
     #[test]
     fn caption_gate_matches_direction_semantics() {
-        assert_eq!(gate_threshold(100.0, 2.0, TradeDirection::Short), 98.0);
-        assert!(!gate_pass(97.9, 100.0, 2.0, TradeDirection::Short));
-        assert!(gate_pass(98.0, 100.0, 2.0, TradeDirection::Short));
-        assert!(gate_pass(120.0, 100.0, 2.0, TradeDirection::Short));
-        assert_eq!(gate_threshold(100.0, 2.0, TradeDirection::Long), 102.0);
-        assert!(gate_pass(102.0, 100.0, 2.0, TradeDirection::Long));
-        assert!(!gate_pass(102.1, 100.0, 2.0, TradeDirection::Long));
+        assert_eq!(gate_threshold(100.0, 7.0, TradeDirection::Short), 107.0);
+        assert!(!passes_price_change(
+            100.0,
+            106.9,
+            TradeDirection::Short,
+            7.0
+        ));
+        assert!(passes_price_change(
+            100.0,
+            107.0,
+            TradeDirection::Short,
+            7.0
+        ));
+        assert!(passes_price_change(
+            100.0,
+            120.0,
+            TradeDirection::Short,
+            7.0
+        ));
+        assert_eq!(gate_threshold(100.0, 7.0, TradeDirection::Long), 93.0);
+        assert!(passes_price_change(100.0, 93.0, TradeDirection::Long, 7.0));
+        assert!(passes_price_change(100.0, 90.0, TradeDirection::Long, 7.0));
+        assert!(!passes_price_change(100.0, 93.1, TradeDirection::Long, 7.0));
         assert_eq!(gate_threshold(100.0, -2.0, TradeDirection::Short), 98.0);
+        assert!(passes_price_change(
+            100.0,
+            98.0,
+            TradeDirection::Short,
+            -2.0
+        ));
     }
 
-    fn candle(open_time_unix: i64, high: f64, low: f64, close: f64) -> OhlcCandle {
+    fn candle(open_time_unix: i64, open: f64, high: f64, low: f64, close: f64) -> OhlcCandle {
         OhlcCandle {
             open_time_unix,
-            open: close,
+            open,
             high,
             low,
             close,
@@ -899,7 +913,7 @@ mod tests {
         );
         assert_eq!(outcome.status, "no_data");
         assert_eq!(outcome.entry_price, None);
-        assert_eq!(outcome.gate_threshold, Some(98.0));
+        assert_eq!(outcome.gate_threshold, Some(102.0));
     }
 
     #[test]
@@ -928,11 +942,11 @@ mod tests {
     #[test]
     fn evaluate_fixture_produces_sl_and_display_levels_match() {
         let candles = vec![
-            candle(1_794_000_300, 99.0, 98.0, 98.5),
-            candle(1_794_000_360, 107.0, 100.0, 106.0),
+            candle(1_794_000_300, 98.5, 99.0, 98.0, 98.2),
+            candle(1_794_000_360, 99.0, 107.0, 100.0, 106.0),
         ];
         let setup = fabric();
-        let evaluation = evaluate_limit(EvaluateLimitOptions {
+        let evaluation = evaluate_limit_at_open(EvaluateLimitOptions {
             candles: &candles,
             setup: &setup,
             direction: TradeDirection::Short,
@@ -943,6 +957,7 @@ mod tests {
         });
         assert_eq!(evaluation.status, LimitStatus::Sl);
         assert_eq!(evaluation.entry_price, Some(98.5));
+        assert_eq!(evaluation.entry_time_unix, Some(1_794_000_300));
         let outcome = classify(&recommendation(None), evaluation, 100.0);
         assert_eq!(outcome.status, "sl");
         assert_eq!(outcome.risk_return, Some(-1.0));
@@ -957,10 +972,10 @@ mod tests {
     #[test]
     fn evaluate_fixture_produces_tp_risk_ratio() {
         let candles = vec![
-            candle(1_794_000_300, 99.0, 98.0, 98.5),
-            candle(1_794_000_360, 99.0, 78.0, 79.0),
+            candle(1_794_000_300, 98.5, 99.0, 98.0, 98.2),
+            candle(1_794_000_360, 98.0, 99.0, 78.0, 79.0),
         ];
-        let evaluation = evaluate_limit(EvaluateLimitOptions {
+        let evaluation = evaluate_limit_at_open(EvaluateLimitOptions {
             candles: &candles,
             setup: &fabric(),
             direction: TradeDirection::Short,
@@ -974,6 +989,43 @@ mod tests {
         assert_eq!(outcome.status, "tp");
         let risk = outcome.risk_return.expect("closed");
         assert!((risk - 20.0 / 6.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn irys_regression_rejects_gate_and_uses_open_entry() {
+        let parsed = recommendation(Some(7.0));
+        assert!((gate_threshold(0.017465, 7.0, TradeDirection::Short) - 0.01868755).abs() < 1e-9);
+        assert!(!passes_price_change(
+            0.017465,
+            0.017442,
+            TradeDirection::Short,
+            7.0
+        ));
+        let setup = AnalyticsSetup {
+            exchange_code: "bybit".into(),
+            category: "linear".into(),
+            symbol: "IRYSUSDT".into(),
+            open_time_unix: 1_794_996_300,
+            close_time_unix: 1_794_996_300,
+            close_price: "0.017465".into(),
+        };
+        let candles = vec![candle(1_794_997_140, 0.017442, 0.0175, 0.0172, 0.017248)];
+        let evaluation = evaluate_limit_at_open(EvaluateLimitOptions {
+            candles: &candles,
+            setup: &setup,
+            direction: TradeDirection::Short,
+            tp_pct: 8.0,
+            sl_pct: 4.0,
+            time_shift_minutes: 14,
+            horizon_minutes: ANALYTICS_HORIZON_MINUTES,
+        });
+        assert_eq!(evaluation.entry_price, Some(0.017442));
+        assert_eq!(evaluation.entry_time_unix, Some(1_794_997_140));
+        let outcome = classify(&parsed, evaluation, 0.017465);
+        assert_eq!(outcome.status, "gate_failed");
+        assert_eq!(outcome.entry_price, Some(0.017442));
+        assert!((outcome.gate_threshold.unwrap() - 0.01868755).abs() < 1e-9);
+        assert_eq!(outcome.tp_price, None);
     }
 
     #[test]
