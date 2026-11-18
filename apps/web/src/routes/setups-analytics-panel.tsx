@@ -452,7 +452,7 @@ export function SetupsAnalyticsPanel() {
               <TableBody>
                 {result.studies.map((study) => <TableRow key={study.studyId}>
                   <TableCell>
-                    <button type="button" className="font-medium text-primary underline-offset-4 hover:underline" aria-label={`Подробности исследования ${study.studyId}`} onClick={() => setDetailStudyId(study.studyId)}>№{study.studyId}</button>
+                    <Button type="button" variant="outline" size="sm" aria-label={`Подробности исследования ${study.studyId}`} onClick={() => setDetailStudyId(study.studyId)}>#{study.studyId}</Button>
                   </TableCell>
                   <TableCell><GateBadge passed={study.gatePassed} selected={study.selected} /></TableCell>
                   <TableCell numeric className={`font-medium ${meanColorClass(study.meanR)}`}>{formatRisk(study.meanR)}</TableCell>
