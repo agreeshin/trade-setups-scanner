@@ -12,7 +12,7 @@ import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
 import { Select } from "../components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
-import { errorText, localTime, localTimezoneLabel, replayRange, utcMidnightOnDateChange, writePlatform } from "./platform-controls";
+import { endOfRangeDateChange, errorText, localTime, localTimezoneLabel, replayRange, utcMidnightOnDateChange, writePlatform } from "./platform-controls";
 import { usePlatformPoll } from "./use-platform-poll";
 
 interface Coverage { instrumentId: number; firstMinuteUnix: number | null; lastMinuteUnix: number | null; totalCandles: number; intervals: { startUnix: number; endUnix: number }[]; gaps: { startUnix: number; endUnix: number }[] }
@@ -232,7 +232,7 @@ export function HistoryPage() {
       <form className="grid gap-3" onSubmit={(event) => { void enqueue(event); }}>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="Начало загрузки">{(control) => <Input type="datetime-local" required value={from} onChange={(event) => setFrom(utcMidnightOnDateChange(from, event.target.value))} {...control} />}</Field>
-          <Field label="Конец загрузки">{(control) => <Input type="datetime-local" required value={to} onChange={(event) => setTo(utcMidnightOnDateChange(to, event.target.value))} {...control} />}</Field>
+          <Field label="Конец загрузки">{(control) => <Input type="datetime-local" required value={to} onChange={(event) => setTo(endOfRangeDateChange(to, event.target.value))} {...control} />}</Field>
         </div>
         <p className="text-sm text-muted-foreground">Выбрано инструментов: {pickedInstruments.length}.</p>
         <div><Button type="submit" disabled={busy || pickedInstruments.length === 0}>Создать план загрузки ({pickedInstruments.length})</Button></div>

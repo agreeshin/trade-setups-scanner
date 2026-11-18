@@ -7,6 +7,7 @@ import { RunsPage } from "./runs-page";
 import { SettingsPage } from "./settings-page";
 import { SetupsPage } from "./setups-page";
 import { previewSymbols } from "./instrument-picker";
+import { endOfRangeDateChange, nowOnTodayDateChange, utcMidnightOnDateChange } from "./platform-controls";
 import { HistoryPage } from "./history-page";
 import { LiveInstruments } from "./live-instruments";
 
@@ -704,5 +705,20 @@ describe("platform screens", () => {
     await userEvent.click(screen.getByRole("button", { name: "Отменить запуск 7" }));
     await waitFor(() => expect(requests.some((request) => request.path === "/v1/replay-batches/7/cancel" && request.method === "POST")).toBe(true));
     await screen.findByText(/Отмена запуска #7 запрошена для всех инструментов/);
+  });
+});
+
+describe("end-of-range date change helpers", () => {
+  afterEach(() => { vi.useRealTimers(); });
+  it("substitutes the current time when today is picked in an end field", () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-19T15:42:00"));
+    expect(nowOnTodayDateChange("2026-11-10T00:00", "2026-11-19T00:00")).toBe("2026-11-19T15:42");
+    expect(endOfRangeDateChange("2026-11-10T00:00", "2026-11-19T00:00")).toBe("2026-11-19T15:42");
+  });
+  it("keeps midnight reset for other dates in end fields and leaves plain fields untouched", () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-19T15:42:00"));
+    expect(endOfRangeDateChange("2026-11-10T00:00", "2026-11-18T00:00")).toBe(utcMidnightOnDateChange("2026-11-10T00:00", "2026-11-18T00:00"));
+    expect(nowOnTodayDateChange("2026-11-10T00:00", "2026-11-18T00:00")).toBe("2026-11-18T00:00");
+    expect(nowOnTodayDateChange("2026-11-19T09:00", "2026-11-19T12:00")).toBe("2026-11-19T12:00");
   });
 });

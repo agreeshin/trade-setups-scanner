@@ -61,6 +61,30 @@ export function utcMidnightOnDateChange(previous: string, next: string): string 
   return `${midnight.getFullYear()}-${pad(midnight.getMonth() + 1)}-${pad(midnight.getDate())}T${pad(midnight.getHours())}:${pad(midnight.getMinutes())}`;
 }
 
+function localNowInput(): string {
+  const now = new Date();
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${pad(now.getFullYear())}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
+
+/** Today picked in a date field: substitute the current local time; any other change stays untouched. */
+export function nowOnTodayDateChange(previous: string, next: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(next) || previous.slice(0, 10) === next.slice(0, 10)) return next;
+  const now = new Date();
+  const [year, month, day] = next.slice(0, 10).split("-").map(Number);
+  if (year !== now.getFullYear() || month !== now.getMonth() + 1 || day !== now.getDate()) return next;
+  return localNowInput();
+}
+
+/** End-of-range date change: today keeps the current local time, other dates reset to 00:00 UTC. */
+export function endOfRangeDateChange(previous: string, next: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(next) || previous.slice(0, 10) === next.slice(0, 10)) return next;
+  const now = new Date();
+  const [year, month, day] = next.slice(0, 10).split("-").map(Number);
+  if (year === now.getFullYear() && month === now.getMonth() + 1 && day === now.getDate()) return localNowInput();
+  return utcMidnightOnDateChange(previous, next);
+}
+
 export function replayRange(from: string, to: string): { fromUnix: number; toUnix: number } {
   const parse = (value: string): number => {
     if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) return NaN;

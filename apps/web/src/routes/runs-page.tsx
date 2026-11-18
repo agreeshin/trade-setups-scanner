@@ -13,7 +13,7 @@ import { Select } from "../components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { apiFetch, fetchPlatform, type PlatformState } from "../lib/platform-api";
 import { parameterLabels } from "../lib/parameter-labels";
-import { errorText, localDateInput, localTime, localTimezoneLabel, replayRange, savePreference, utcMidnightOnDateChange, writePlatform, type Algorithm, type SetupRow } from "./platform-controls";
+import { endOfRangeDateChange, errorText, localDateInput, localTime, localTimezoneLabel, replayRange, savePreference, utcMidnightOnDateChange, writePlatform, type Algorithm, type SetupRow } from "./platform-controls";
 import { SetupTable } from "./setup-table";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
 import { usePlatformPoll } from "./use-platform-poll";
@@ -338,7 +338,7 @@ export function RunsPage() {
         {catalog.kind === "ready" && <InstrumentPicker catalog={catalog.data.instruments} symbols={form.symbols} onChange={(symbols) => changeForm({ ...form, symbols })} disabled={!ready || busy} limit={null} />}
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="Начало">{(control) => <Input type="datetime-local" required disabled={!ready || busy} value={form.from} onChange={(event) => changeForm({ ...form, from: utcMidnightOnDateChange(form.from, event.target.value) })} {...control} />}</Field>
-          <Field label="Конец">{(control) => <Input type="datetime-local" required disabled={!ready || busy} value={form.to} onChange={(event) => changeForm({ ...form, to: utcMidnightOnDateChange(form.to, event.target.value) })} {...control} />}</Field>
+          <Field label="Конец">{(control) => <Input type="datetime-local" required disabled={!ready || busy} value={form.to} onChange={(event) => changeForm({ ...form, to: endOfRangeDateChange(form.to, event.target.value) })} {...control} />}</Field>
         </div>
         <InfoNote>Локальное время: {localTimezoneLabel()}. В API передаются Unix-секунды.</InfoNote>
         {error && <Alert variant="destructive" role="alert">{error}</Alert>}

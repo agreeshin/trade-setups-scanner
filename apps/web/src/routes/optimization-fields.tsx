@@ -5,7 +5,7 @@ import { Input } from "../components/ui/input";
 import { Select } from "../components/ui/select";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
 import { ANALYTICS_SEARCH_FIELDS, type DomainDrafts, type ScopeDraft, type SearchField } from "./optimization-form";
-import type { Algorithm } from "./platform-controls";
+import { nowOnTodayDateChange, type Algorithm } from "./platform-controls";
 
 function DomainControls({ fields, value, onChange }: { fields: SearchField[]; value: DomainDrafts; onChange: (next: DomainDrafts) => void }) {
   return <div className="grid gap-3">{fields.map((field) => {
@@ -49,7 +49,7 @@ export function OptimizationFields({ algorithm, scope, onScopeChange, catalog, r
     <div className="grid gap-3 sm:grid-cols-2">
       {!continuous && <>
         <Field label="Начало периода сигналов">{(control) => <Input {...control} type="datetime-local" step={60} value={scope.from} onChange={(event) => onScopeChange({ from: event.target.value })} />}</Field>
-        <Field label="Конец периода сигналов">{(control) => <Input {...control} type="datetime-local" step={60} value={scope.to} onChange={(event) => onScopeChange({ to: event.target.value })} />}</Field>
+        <Field label="Конец периода сигналов">{(control) => <Input {...control} type="datetime-local" step={60} value={scope.to} onChange={(event) => onScopeChange({ to: nowOnTodayDateChange(scope.to, event.target.value) })} />}</Field>
       </>}
       <Field label="Направление сделки">{(control) => <Select {...control} value={scope.direction} onChange={(event) => onScopeChange({ direction: event.target.value === "long" ? "long" : "short" })}><option value="short">SHORT</option><option value="long">LONG</option></Select>}</Field>
     </div>

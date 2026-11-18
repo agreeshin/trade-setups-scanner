@@ -27,6 +27,7 @@ import {
 } from "../lib/setups-analytics-api";
 import {
   algorithmDisplayName,
+  endOfRangeDateChange,
   errorText,
   localDateInput,
   localTime,
@@ -615,12 +616,12 @@ export function SetupsAnalyticsPanel() {
           {(control) => <DateInput {...control} type="datetime-local" value={fromInput} onBlur={commitDates} onChange={(event) => { setFromInput(utcMidnightOnDateChange(fromInput, event.target.value)); setResult(null); }} />}
         </Field>
         <Field label="Конец" className="w-60">
-          {(control) => <DateInput {...control} type="datetime-local" value={toInput} onBlur={commitDates} onChange={(event) => { setToInput(utcMidnightOnDateChange(toInput, event.target.value)); setResult(null); }} />}
+          {(control) => <DateInput {...control} type="datetime-local" value={toInput} onBlur={commitDates} onChange={(event) => { setToInput(endOfRangeDateChange(toInput, event.target.value)); setResult(null); }} />}
         </Field>
         <Button variant="outline" disabled={studiesMeta.length === 0} onClick={openPicker}>Исследования: {studiesLabel}</Button>
         <Button disabled={running || algorithmId === "" || range.value === null} onClick={() => { void run(); }}>{running ? "Расчёт…" : "Рассчитать"}</Button>
         {studiesStatus === "loading" && <Spinner label="Загрузка исследований…" />}
-        <p className="w-full text-xs text-muted-foreground">Время: {localTimezoneLabel()}. Смена даты сбрасывает время к 00:00 UTC; список исследований обновляется при потере фокуса полей дат, после обновления выбраны все. Расчёт выполняется по нажатию кнопки, без кеша.</p>
+        <p className="w-full text-xs text-muted-foreground">Время: {localTimezoneLabel()}. Смена даты сбрасывает время к 00:00 UTC (для «Конец» сегодняшняя дата подставляет текущее время); список исследований обновляется при потере фокуса полей дат, после обновления выбраны все. Расчёт выполняется по нажатию кнопки, без кеша.</p>
         {range.error !== null && <p role="alert" className="w-full text-xs text-danger">{range.error}</p>}
       </CardContent>
     </Card>
