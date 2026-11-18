@@ -4,11 +4,11 @@ import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent } from "../components/ui/card";
 import { Checkbox } from "../components/ui/checkbox";
-import { DateInput } from "../components/ui/date-input";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { EmptyState } from "../components/ui/empty-state";
 import { Field } from "../components/ui/field";
 import { InfoNote } from "../components/ui/info-note";
+import { Input } from "../components/ui/input";
 import { Select } from "../components/ui/select";
 import { Spinner } from "../components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
@@ -204,7 +204,7 @@ function SetupOutcomeRow({ setup }: { setup: SetupsAnalyticsSetup }) {
     <TableCell className="whitespace-nowrap tabular-nums">{formatTime(setup.closeTimeUnix)}</TableCell>
     <TableCell numeric className={(setup.riskReturn ?? 0) >= 0 ? "text-success" : "text-danger"}>{formatRisk(setup.riskReturn)}</TableCell>
     <TableCell><Badge variant={status.variant}>{status.label}</Badge></TableCell>
-    <TableCell numeric>№{setup.slotId}</TableCell>
+    <TableCell numeric>{setup.studyId === null ? "—" : `№${setup.studyId}`}</TableCell>
   </TableRow>;
 }
 
@@ -477,6 +477,7 @@ export function SetupsAnalyticsPanel() {
   const [detailStudyId, setDetailStudyId] = useState<number | null>(null);
   const [result, setResult] = useState<SetupsAnalyticsResult | null>(null);
   const [running, setRunning] = useState(false);
+  const [hideGateFailed, setHideGateFailed] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const calculateRef = useRef<AbortController | null>(null);
   const restoredSelection = useRef<ReadonlySet<number> | null>(initialSelectedStudies());
@@ -613,10 +614,10 @@ export function SetupsAnalyticsPanel() {
           </Select>}
         </Field>
         <Field label="Начало (момент выхода сетапа)" className="w-60">
-          {(control) => <DateInput {...control} type="datetime-local" value={fromInput} onBlur={commitDates} onChange={(event) => { setFromInput(utcMidnightOnDateChange(fromInput, event.target.value)); setResult(null); }} />}
+          {(control) => <Input {...control} type="datetime-local" value={fromInput} onBlur={commitDates} onChange={(event) => { setFromInput(utcMidnightOnDateChange(fromInput, event.target.value)); setResult(null); }} />}
         </Field>
         <Field label="Конец" className="w-60">
-          {(control) => <DateInput {...control} type="datetime-local" value={toInput} onBlur={commitDates} onChange={(event) => { setToInput(endOfRangeDateChange(toInput, event.target.value)); setResult(null); }} />}
+          {(control) => <Input {...control} type="datetime-local" value={toInput} onBlur={commitDates} onChange={(event) => { setToInput(endOfRangeDateChange(toInput, event.target.value)); setResult(null); }} />}
         </Field>
         <Button variant="outline" disabled={studiesMeta.length === 0} onClick={openPicker}>Исследования: {studiesLabel}</Button>
         <Button disabled={running || algorithmId === "" || range.value === null} onClick={() => { void run(); }}>{running ? "Расчёт…" : "Рассчитать"}</Button>
@@ -661,7 +662,7 @@ export function SetupsAnalyticsPanel() {
                   </TableCell>
                   <TableCell><GateBadge passed={study.gatePassed} selected={study.selected} /></TableCell>
                   <TableCell numeric className={`font-medium ${meanColorClass(study.meanR)}`}>{formatRisk(study.meanR)}</TableCell>
-                  <TableCell numeric>{study.closed}/{studiesMeta.find((meta) => meta.studyId === study.studyId)?.setupCount ?? study.selected}</TableCell>
+                  <TableCell numeric><Badge variant="warning">{study.closed}/{study.gatePassed}</Badge></TableCell>
                 </TableRow>)}
               </TableBody>
             </Table>
@@ -670,7 +671,10 @@ export function SetupsAnalyticsPanel() {
         {result.setups.length === 0
           ? <EmptyState title="Нет сетапов по выбранным фильтрам" description="Измените диапазон, алгоритм или набор исследований." />
           : <div className="grid gap-2">
-            <h3 className="text-sm font-semibold text-muted-foreground">Сетапы</h3>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-sm font-semibold text-muted-foreground">Сетапы <span className="font-normal text-muted-foreground/80">{hideGateFailed ? result.setups.filter((setup) => setup.status !== "gate_failed").length : result.setups.length}/{result.setups.length}</span></h3>
+              <label className="flex items-center gap-2 text-sm text-muted-foreground"><Checkbox checked={hideGateFailed} onCheckedChange={(checked) => setHideGateFailed(checked === true)} /> Скрыть сетапы, которые не прошли гейт</label>
+            </div>
             <div className="overflow-x-auto rounded-md border border-input/60">
               <Table>
                 <caption className="px-3 py-2 text-left text-xs text-muted-foreground">Время: {localTimezoneLabel()}</caption>
@@ -684,11 +688,11 @@ export function SetupsAnalyticsPanel() {
                     <TableHead>Закрытие</TableHead>
                     <TableHead numeric>Результат</TableHead>
                     <TableHead>Статус</TableHead>
-                    <TableHead numeric>Профиль</TableHead>
+                    <TableHead numeric>Исследование</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {result.setups.map((setup) => <SetupOutcomeRow key={setup.id} setup={setup} />)}
+                  {(hideGateFailed ? result.setups.filter((setup) => setup.status !== "gate_failed") : result.setups).map((setup) => <SetupOutcomeRow key={setup.id} setup={setup} />)}
                 </TableBody>
               </Table>
             </div>

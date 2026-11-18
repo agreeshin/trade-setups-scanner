@@ -99,14 +99,20 @@ it("loads studies for the committed range and renders the calculated result", as
   expect(dayPoint).not.toBeNull();
   expect(Number(dayPoint!.getAttribute("data-mean-r"))).toBeCloseTo(1.17, 1);
   expect(dayPoint!.getAttribute("data-day")).not.toBe("");
-  expect(screen.getByRole("heading", { name: "Сетапы" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: /Сетапы/ })).toBeInTheDocument();
   expect(screen.getByText("SYM1")).toBeInTheDocument();
   expect(screen.getAllByText("TP")).toHaveLength(2);
   expect(screen.getAllByText("SL")).toHaveLength(2);
   expect(screen.getByText("не закрылась")).toBeInTheDocument();
   expect(screen.getByText("нет данных")).toBeInTheDocument();
+  expect(screen.getByText("4/5")).toBeInTheDocument();
+  expect(screen.queryByText("гейт не пройден")).toBeNull();
+  expect(screen.queryByText("SYM5")).toBeNull();
+  expect(screen.getAllByText("№40").length).toBe(4);
+  fireEvent.click(screen.getByLabelText("Скрыть сетапы, которые не прошли гейт"));
   expect(screen.getByText("гейт не пройден")).toBeInTheDocument();
-  expect(screen.getAllByText("№1").length).toBeGreaterThan(0);
+  expect(screen.getByText("SYM5")).toBeInTheDocument();
+  expect(screen.getByText("5/5")).toBeInTheDocument();
 });
 
 it("opens the picker, edits the study selection and passes studies to the calculation", async () => {
