@@ -178,6 +178,8 @@ export function formatSetupRecommendation(setup: RecommendationSetup, nowUnix = 
   line("Динамика МО за последние ", period, " суток: ", metricSegment(enrichment?.trendDeltaR));
   line("Средний винрейт: ", metricSegment(enrichment?.winRatePct, (value) => `${winRateFormat.format(value)}%`));
   line("В среднем для других уровней TP и SL: ", code(risk(recommendation.meanR)));
-  line(); line("Алгоритм: ", recommendation.externalName); line("Исследование №", code(String(recommendation.studyId)));
+  const studyIsoDay = new Date(recommendation.provenance.observationCutoff * 1000).toISOString().slice(0, 10);
+  const [studyYear, studyMonth, studyDay] = studyIsoDay.split("-");
+  line(); line("Алгоритм: ", recommendation.externalName); line(`Исследование №${recommendation.studyId} от ${studyDay}.${studyMonth}.${studyYear}`);
   return { kind: "ready", text: segments.map((part) => part.text).join(""), segments, targetAt, entryState };
 }

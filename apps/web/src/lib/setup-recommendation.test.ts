@@ -29,14 +29,14 @@ it("formats the exact approved template order, saved scalar meanings, two headin
     "🔖 TP = 14%, SL = 4% (от фактической цены входа)",
     "⚠️ Заходить в сделку, если цена будет выше 101.00 USDT на момент входа", "",
     "Матожидание торговли:", "Прогноз МО торговли: +0.44 R", "Среднее МО за последние 1 суток: +0.32 R", "Динамика МО за последние 1 суток: -0.12 R",
-    "Средний винрейт: 62.5%", "В среднем для других уровней TP и SL: +0.21 R", "", "Алгоритм: Пользовательское имя", "Исследование №42",
+    "Средний винрейт: 62.5%", "В среднем для других уровней TP и SL: +0.21 R", "", "Алгоритм: Пользовательское имя", "Исследование №42 от 12.11.2026",
   ].join("\n"));
   expect(result.segments.filter((part) => part.style === "bold").map((part) => part.text)).toEqual(["Условия сделки:", "Матожидание торговли:"]);
   expect(result.segments.find((part) => part.text === "Прогноз МО торговли: ")?.style).toBe("plain");
-  expect(result.segments.filter((part) => part.style === "code").map((part) => part.text)).toEqual(["COINUSDT", "100.00", "19:46:00 UTC", "3", "14%", "4%", "101.00", "+0.44 R", "1", "+0.32 R", "1", "-0.12 R", "62.5%", "+0.21 R", "42"]);
-  expect(result.segments.filter((part) => part.style !== "code").some((part) => /\d/.test(part.text))).toBe(false);
+  expect(result.segments.filter((part) => part.style === "code").map((part) => part.text)).toEqual(["COINUSDT", "100.00", "19:46:00 UTC", "3", "14%", "4%", "101.00", "+0.44 R", "1", "+0.32 R", "1", "-0.12 R", "62.5%", "+0.21 R"]);
+  expect(result.segments.filter((part) => part.style !== "code" && !part.text.includes("Исследование №")).some((part) => /\d/.test(part.text))).toBe(false);
   expect(result.segments.map((part) => part.text).join("")).toBe(result.text);
-  expect(result.text).not.toMatch(/🧠|🔬|✅|сетапов в день|Цена входа:|2026|0,32/);
+  expect(result.text).not.toMatch(/🧠|🔬|✅|сетапов в день|Цена входа:|0,32/);
   expect(result.targetAt).toBe(at + 180);
 });
 
@@ -59,14 +59,15 @@ it("uses a stable time-only target and explicit configured timezone without re-e
   expect(before.text).toContain("22:46:00 Europe/Moscow");
   expect(after.entryState).toBe("elapsed"); expect(after.text).toContain("рекомендуемое время уже прошло");
   expect(after.text).not.toContain("через 3 мин");
-  expect(before.text).not.toContain("12.11.2026"); expect(before.text).not.toContain("AM");
+  expect(before.text.split("\n").find((line) => line.includes("Рекомендуемое время входа")) ?? "").not.toContain("2026"); expect(before.text).not.toContain("AM");
   expect(before.text).toContain("Прогноз МО торговли: +0.44 R"); expect(after.text).toContain("Прогноз МО торговли: +0.44 R");
 });
-it("omits the date even when the recommended target crosses UTC midnight", () => {
+it("omits the date in the entry time even when the recommended target crosses UTC midnight", () => {
   const midnightSignal = Date.parse("2026-11-12T23:59:00Z") / 1000;
   const result = formatSetupRecommendation({ ...setup, closeTimeUnix: midnightSignal }, midnightSignal);
-  expect(result?.kind === "ready" && result.text).toContain("00:02:00 UTC");
-  expect(result?.kind === "ready" && result.text).not.toMatch(/2026|13\.11|12\.11/);
+  const entryLine = result?.kind === "ready" ? result.text.split("\n").find((line) => line.includes("Рекомендуемое время входа")) ?? "" : "";
+  expect(entryLine).toContain("00:02:00 UTC");
+  expect(entryLine).not.toMatch(/2026|13\.11|12\.11/);
 });
 it("does not round decimal signal prices through binary floating point for the known threshold", () => {
   const result = formatSetupRecommendation({ ...setup, closePrice: "10000000000000000.01", recommendation: { ...recommendation, priceChangePct: 1 } }, at);

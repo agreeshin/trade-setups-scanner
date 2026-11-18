@@ -234,8 +234,16 @@ fn format_caption(
     out.bold("Алгоритм")?;
     out.plain(": ")?;
     out.label(&envelope.external_name)?;
-    out.plain("\n\nИсследование №")?;
-    out.code(&envelope.study_id.to_string())?;
+    let study_day = chrono::DateTime::<chrono::Utc>::from_timestamp(
+        envelope.snapshot.provenance.observation_cutoff,
+        0,
+    )
+    .map(|at| at.format("%d.%m.%Y").to_string())
+    .unwrap_or_default();
+    out.plain(&format!(
+        "\nИсследование №{} от {study_day}",
+        envelope.study_id
+    ))?;
     out.finish()
 }
 
@@ -337,7 +345,7 @@ mod tests {
         assert!(
             caption
                 .text
-                .ends_with("Алгоритм: <b>*plain name*😀\n\nИсследование №42")
+                .ends_with("Алгоритм: <b>*plain name*😀\nИсследование №42 от 01.01.1970")
         );
         assert!(!caption.text.contains("1970-"));
         let headings: Vec<_> = caption
@@ -475,7 +483,7 @@ mod tests {
         assert!(
             caption
                 .text
-                .ends_with(&format!("{}\n\nИсследование №42", "😀".repeat(120)))
+                .ends_with(&format!("{}\nИсследование №42 от 01.01.1970", "😀".repeat(120)))
         );
         v2::validate_entities(&caption.text, &caption.entities).unwrap();
         let mut builder = CaptionBuilder::default();
@@ -506,7 +514,7 @@ mod tests {
         assert!(!caption.text.contains("Прогноз"));
         assert!(!caption.text.contains("Матожидание торговли"));
         assert_no_other_metrics(&caption.text);
-        let name = caption.entities.iter().rev().nth(1).unwrap();
+        let name = caption.entities.iter().rev().next().unwrap();
         assert_eq!(name.kind, EntityKind::Code);
         assert_eq!(entity_text(&caption, name), "😀<b>algo42</b>*literal*");
         value["rawSignalAt"] = json!(raw.close_time_unix + 60);
@@ -557,7 +565,7 @@ mod tests {
                 "Условия сделки:\n⏳ Рекомендуемое время входа: 18:27:00 UTC\n",
                 "🎯 TP = 20%, SL = 6% (от фактической цены входа)\n",
                 "⚠️ Заходить в сделку, если цена будет выше 0.004156 USDT на момент входа\n\n",
-                "Алгоритм: Всплеск цены и оборота\n\nИсследование №42"
+                "Алгоритм: Всплеск цены и оборота\nИсследование №42 от 01.01.1970"
             )
         );
         assert!(caption.fits_photo_caption());

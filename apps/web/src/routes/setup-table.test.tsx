@@ -152,8 +152,8 @@ it("renders semantic bold/code snapshot text on keyboard and touch without any c
   const tooltip = screen.getByRole("tooltip");
   expect([...tooltip.querySelectorAll("strong")].map((node) => node.textContent)).toEqual(["Условия сделки:", "Матожидание торговли:"]);
   const codeValues = [...tooltip.querySelectorAll("code")].map((node) => node.textContent);
-  expect(codeValues).toEqual(["BTCUSDT", "100.00", "19:46:00 UTC", "3", "14%", "4%", "101.00", "+0.44 R", "1", "+0.32 R", "1", "-0.12 R", "62.5%", "+0.21 R", "42"]);
-  expect(tooltip).toHaveTextContent("Исследование №42"); expect(tooltip).not.toHaveTextContent("2026");
+  expect(codeValues).toEqual(["BTCUSDT", "100.00", "19:46:00 UTC", "3", "14%", "4%", "101.00", "+0.44 R", "1", "+0.32 R", "1", "-0.12 R", "62.5%", "+0.21 R"]);
+  expect(tooltip).toHaveTextContent("Исследование №42 от 12.11.2026"); expect(tooltip).not.toHaveTextContent("2026-11-12");
   expect(tooltip.querySelector("b")).toBeNull(); expect(tooltip).toHaveTextContent("<b>Сохранённое имя</b>");
   await userEvent.keyboard("{Enter}");
   const dialog = screen.getByRole("dialog", { name: "Условия сетапа BTCUSDT" });
