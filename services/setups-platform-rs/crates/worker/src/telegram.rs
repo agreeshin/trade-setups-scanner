@@ -479,6 +479,7 @@ fn render_v2_message(
         "png_identity_mismatch" => "png_identity_mismatch",
         "png_hash_mismatch" => "png_hash_mismatch",
         "png_lookup_unavailable" => "png_lookup_unavailable",
+        "png_objective_unavailable" => "png_objective_unavailable",
         _ => "png_unavailable",
     };
     Ok(RenderedV2 {
@@ -593,6 +594,29 @@ async fn saved_chart_png(
     let snapshot: AdaptiveRecommendationSnapshot =
         serde_json::from_value(recommendation.clone()).map_err(|_| "png_identity_mismatch")?;
     let fence = ChartSourceFence::from_job(job)?;
+    if saved.get("objective").is_some_and(|objective| !objective.is_null()) {
+        let charts = charts.ok_or("png_objective_unavailable")?;
+        let saved: crate::adaptive::AdaptiveExpectancySnapshot = serde_json::from_value(saved.clone()).map_err(|_| "png_identity_mismatch")?;
+        let objective = saved.objective.as_ref().ok_or("png_identity_mismatch")?;
+        let expected = setups_domain::expectancy::ExpectancyObjective::from_recommendation(&snapshot).map_err(|_| "png_identity_mismatch")?;
+        let value = objective.decision_r.as_ref().copied().ok_or("png_objective_unavailable")?;
+        let overlay = crate::adaptive::ExpectancyOverlayKey::for_objective(&key, job.raw_close_unix, value, expected, snapshot.provenance.observation_cutoff)
+            .map_err(|_| "png_identity_mismatch")?;
+        if objective.settings != expected || saved.image_key.as_ref() != Some(&key)
+            || saved.overlay_key.as_ref() != Some(&overlay) || saved.forecast_at_unix != job.raw_close_unix
+            || saved.artifact_id != Some(id) { return Err("png_identity_mismatch"); }
+        let raw = job.raw_close_unix;
+        let pool = pool.clone();
+        return charts.render(move || {
+            let mut artifact = tokio::runtime::Handle::current().block_on(setups_db::expectancy::get(&pool, &fence.owner_id, id))
+                .map_err(|_| "png_lookup_unavailable")?.ok_or("png_objective_unavailable")?;
+            let numerical: ExpectancyArtifact = serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
+                .map_err(|_| "png_identity_mismatch")?;
+            validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
+            setups_analytics::expectancy_chart::render_png_with_objective(&numerical, expected, raw, value)
+                .map(Some).map_err(|_| "png_objective_unavailable")
+        }).await;
+    }
     if let Some(recipe) = snapshot.forecast {
         let charts = charts.ok_or("png_unavailable")?;
         let saved: crate::adaptive::AdaptiveExpectancySnapshot =
@@ -725,12 +749,12 @@ fn validate_chart_source(
             != artifact.key
         || key.derived_snapshot_id != artifact.key
         || numerical.image_key(key.render_version) != *key
-        || key.render_version
+        || (key.render_version != setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION && key.render_version
             != if snapshot.forecast.is_some() {
                 setups_analytics::expectancy_chart::PROBABILITY_RENDER_VERSION
             } else {
                 1
-            }
+            })
         || source.forecast != snapshot.forecast
         || identity.forecast != snapshot.forecast
         || numerical.calculation_version

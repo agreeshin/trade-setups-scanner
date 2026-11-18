@@ -44,6 +44,17 @@ it("accepts nullable historical prefixes and gaps while retaining an available s
     curve: [{ atUnix: day, forecastR: null }, { atUnix: day + 86400 * 2, forecastR: 0.15 }, { atUnix: request.observationCutoff, forecastR: 0.4 }] });
 });
 
+it.each(["missing", "lambda", "endpoint", "timestamp"])("rejects an available blend scalar with %s objective-specific graph data, not showing a generic F chart", async (change) => {
+  const response = forecastFixture(request);
+  Object.assign(response, { trendBlendLambda: request.trendBlendLambda });
+  if (change === "missing") delete response.blendCurve;
+  if (change === "lambda") Object.assign(response, { trendBlendLambda: 0.6 });
+  if (change === "endpoint") response.blendCurve!.at(-1)!.decisionR = 0.4;
+  if (change === "timestamp") response.blendCurve!.at(-1)!.atUnix -= 1;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(response))));
+  await expect(fetchForecastCurve(request, new AbortController().signal)).rejects.toThrow("несовместимую");
+});
+
 it("accepts all-null model curves as unavailable evidence, not as a broken response or prior-only zero", async () => {
   const response = forecastFixture(request);
   response.estimate = { status: "unavailable", reason: "no_closed_outcomes" };

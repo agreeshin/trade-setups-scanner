@@ -4,7 +4,7 @@
 use crate::{RecommendationDirection, RecommendationProvenance};
 use crate::forecast::{ForecastMethod, ForecastRecipe, ProbabilityCurve, ProbabilityCurveRequest,
     ProbabilityDay, ProbabilityForecast, ForecastUnavailableReason, probability_curve};
-use crate::trend::{TrendInput, TrendSummary, fit_weighted_trend};
+use crate::trend::{TrendBendDays, TrendBlendLambda, TrendInput, TrendMode, TrendSummary, fit_weighted_trend};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{fmt, io};
@@ -207,6 +207,84 @@ pub struct ExpectancyForecast {
     pub probability: Option<ProbabilityCurve>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trend: Option<TrendSummary>,
+}
+
+/// Prospective presentation contract, separate from immutable artifact science.
+/// Mode and forecast method are independent. Missing legacy method stays trend.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExpectancyObjective {
+    pub version: u32,
+    pub trend_mode: TrendMode,
+    pub trend_bend_days: TrendBendDays,
+    pub trend_blend_lambda: TrendBlendLambda,
+    pub forecast: Option<ForecastRecipe>,
+}
+
+impl ExpectancyObjective {
+    pub fn from_recommendation(snapshot: &crate::AdaptiveRecommendationSnapshot) -> Result<Self, ExpectancyError> {
+        let (mode, bend, lambda) = match snapshot.search_forecast {
+            None => (TrendMode::Mean, TrendBendDays::Linear, TrendBlendLambda::default()),
+            Some(search) => {
+                if !search.cell_r.is_finite() || !search.matrix_r.is_finite()
+                    || search.blend.is_some_and(|b| !b.cell_r.is_finite() || !b.matrix_r.is_finite()) {
+                    return Err(ExpectancyError::InvalidForecast);
+                }
+                (if search.blend.is_some() { TrendMode::Blend } else { TrendMode::Forecast },
+                    search.bend_days, search.blend.map_or_else(TrendBlendLambda::default, |b| b.lambda))
+            }
+        };
+        let objective = Self { version: 1, trend_mode: mode, trend_bend_days: bend,
+            trend_blend_lambda: lambda, forecast: snapshot.forecast };
+        objective.validate()?;
+        Ok(objective)
+    }
+
+    pub fn validate(self) -> Result<(), ExpectancyError> {
+        if self.version != 1 { return Err(ExpectancyError::UnsupportedVersion); }
+        if let Some(recipe) = self.forecast {
+            recipe.validate().map_err(|_| ExpectancyError::InvalidForecast)?;
+            if !self.trend_mode.is_mean() && self.trend_bend_days != match recipe {
+                ForecastRecipe::Trend { bend_days, .. } => bend_days,
+                ForecastRecipe::DecayedProbability { .. } => TrendBendDays::Linear,
+            } { return Err(ExpectancyError::InvalidForecast); }
+        }
+        Ok(())
+    }
+
+    pub fn decision(self, mean: &MetricAvailability<f64>, forecast: &MetricAvailability<f64>) -> Result<MetricAvailability<f64>, ExpectancyError> {
+        self.validate()?;
+        let value = crate::forecast::decision_r(self.trend_mode, mean.as_ref().copied(),
+            forecast.as_ref().copied(), self.trend_blend_lambda).map_err(|_| ExpectancyError::InvalidForecast)?;
+        Ok(match value {
+            Some(value) => MetricAvailability::Available { value },
+            None => MetricAvailability::Unavailable { reason: match (mean, forecast) {
+                (MetricAvailability::Unavailable { reason }, _) if self.trend_mode != TrendMode::Forecast => *reason,
+                (_, MetricAvailability::Unavailable { reason }) => *reason,
+                _ => ExpectancyUnavailableReason::MissingFrozenOutcomes,
+            } },
+        })
+    }
+}
+
+/// At most 3662 probability samples / 258 trend samples. One render owns this
+/// vector; timestamps are display Unix seconds (trend samples can be fractional).
+#[derive(Debug, PartialEq)]
+pub struct ExpectancyObjectiveSeries {
+    pub mean_r: MetricAvailability<f64>,
+    pub forecast_r: MetricAvailability<f64>,
+    pub decision_r: MetricAvailability<f64>,
+    pub curve: Vec<(f64, Option<f64>)>,
+    pub method: &'static str,
+}
+
+/// Compact prospective scalar copy; the daily curve remains in its artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FrozenExpectancyObjective {
+    pub settings: ExpectancyObjective,
+    pub forecast_r: MetricAvailability<f64>,
+    pub decision_r: MetricAvailability<f64>,
 }
 
 /// A study asset identity, not PNG bytes copied into each recommendation. The
@@ -597,6 +675,63 @@ fn fit_daily(points: &[UtcDailyPoint]) -> Result<Option<UtcLinearTrend>, Expecta
 }
 
 impl ExpectancyArtifact {
+    /// Shared objective-specific projection of sealed data, not another solver.
+    /// Used for new Telegram scalar/PNG; probability and weighted trend are the
+    /// very same core models used by Analytics. Never use the legacy OLS here.
+    pub fn objective_series(&self, objective: ExpectancyObjective) -> Result<ExpectancyObjectiveSeries, ExpectancyError> {
+        self.validate()?;
+        objective.validate()?;
+        if objective.forecast != self.source.forecast { return Err(ExpectancyError::InvalidForecast); }
+        let mean_r = self.selected_cell.as_ref().map(|cell| cell.raw_r.clone()).unwrap_or(
+            MetricAvailability::Unavailable { reason: ExpectancyUnavailableReason::MissingSelectedMean });
+        let points = match &self.daily {
+            MetricAvailability::Available { value } => value,
+            MetricAvailability::Unavailable { reason } => return Ok(ExpectancyObjectiveSeries {
+                decision_r: objective.decision(&mean_r, &MetricAvailability::Unavailable { reason: *reason })?,
+                mean_r, forecast_r: MetricAvailability::Unavailable { reason: *reason }, curve: vec![], method: "unavailable",
+            }),
+        };
+        let cutoff = self.source.provenance.observation_cutoff;
+        let (forecast_r, raw_curve, method) = if objective.trend_mode.is_mean() {
+            (MetricAvailability::Unavailable { reason: ExpectancyUnavailableReason::InsufficientFiniteDays },
+                points.first().map(|first| vec![(first.day_start_unix as f64, None), (cutoff as f64, None)]).unwrap_or_default(), "mean")
+        } else if matches!(objective.forecast, Some(ForecastRecipe::DecayedProbability { .. })) {
+            let model = self.forecast.as_ref().and_then(|model| model.probability.as_ref()).ok_or(ExpectancyError::InvalidForecast)?;
+            let value = match model.estimate {
+                ProbabilityForecast::Available { value } => MetricAvailability::Available { value: value.forecast_r },
+                ProbabilityForecast::Unavailable { reason } => MetricAvailability::Unavailable { reason: match reason {
+                    ForecastUnavailableReason::NoClosedOutcomes => ExpectancyUnavailableReason::NoClosedOutcomes,
+                    ForecastUnavailableReason::NoWeightedEvidence => ExpectancyUnavailableReason::NoWeightedEvidence,
+                } },
+            };
+            (value, model.curve.iter().map(|p| (p.at_unix as f64, p.forecast_r)).collect(), "decayed_probability")
+        } else {
+            let trend = if self.source.forecast.is_some() {
+                self.forecast.as_ref().and_then(|model| model.trend.clone())
+            } else {
+                fit_weighted_trend(&points.iter().map(|p| Ok(TrendInput {
+                    day: p.day_start_unix as f64 / UTC_DAY_SECONDS as f64, value: p.mean_r,
+                    weight: p.row_count.try_into().map_err(|_| ExpectancyError::InvalidCounts)?,
+                })).collect::<Result<Vec<_>, ExpectancyError>>()?, objective.trend_bend_days)
+                    .map_err(|_| ExpectancyError::InvalidForecast)?.map(|fit| fit.summary())
+            };
+            match trend {
+                Some(trend) => {
+                    let mut curve: Vec<_> = trend.curve.iter().map(|p| (p.day * UTC_DAY_SECONDS as f64, Some(p.value))).collect();
+                    curve.push((cutoff as f64, Some(trend.end.value)));
+                    (MetricAvailability::Available { value: trend.end.value }, curve, trend.method)
+                }
+                None => (MetricAvailability::Unavailable { reason: ExpectancyUnavailableReason::InsufficientFiniteDays }, vec![], "trend"),
+            }
+        };
+        let decision_r = objective.decision(&mean_r, &forecast_r)?;
+        let curve = raw_curve.into_iter().map(|(at, forecast)| {
+            crate::forecast::decision_r(objective.trend_mode, mean_r.as_ref().copied(), forecast, objective.trend_blend_lambda)
+                .map(|value| (at, value)).map_err(|_| ExpectancyError::InvalidForecast)
+        }).collect::<Result<Vec<_>, _>>()?;
+        Ok(ExpectancyObjectiveSeries { mean_r, forecast_r, decision_r, curve, method })
+    }
+
     /// Validate persisted/untrusted structs before use; no silent upgrading of
     /// browser-local/indexed v1 or modified coefficients in an immutable copy.
     pub fn validate(&self) -> Result<(), ExpectancyError> {
@@ -745,6 +880,72 @@ mod tests {
     }
     fn close(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-12, "{a} != {b}");
+    }
+    #[test]
+    fn objective_projection_keeps_every_probability_trend_and_legacy_curve_mode_specific() {
+        use crate::forecast::decision_r;
+        for recipe in [None, Some(ForecastRecipe::engineering_baseline()),
+            Some(ForecastRecipe::Trend { version: 1, bend_days: TrendBendDays::Linear }),
+            Some(ForecastRecipe::Trend { version: 1, bend_days: TrendBendDays::Seven })] {
+            let (mut input, _) = fixture();
+            input.source.forecast = recipe;
+            let artifact = build_expectancy_artifact(input).unwrap();
+            let sealed = artifact.to_json().unwrap();
+            let points = artifact.daily.as_ref().unwrap();
+            let mean = *artifact.selected_cell.as_ref().unwrap().raw_r.as_ref().unwrap();
+            let bend = match recipe { Some(ForecastRecipe::Trend { bend_days, .. }) => bend_days, _ => TrendBendDays::Linear };
+            let (pure, raw_curve) = match recipe {
+                Some(ForecastRecipe::DecayedProbability { .. }) => {
+                    let model = artifact.forecast.as_ref().unwrap().probability.as_ref().unwrap();
+                    (model.estimate.as_ref().unwrap().forecast_r,
+                        model.curve.iter().map(|p| (p.at_unix as f64, p.forecast_r)).collect::<Vec<_>>())
+                }
+                _ => {
+                    let fit = fit_weighted_trend(&points.iter().map(|p| TrendInput {
+                        day: p.day_start_unix as f64 / 86400.0, value: p.mean_r, weight: p.row_count as u32,
+                    }).collect::<Vec<_>>(), bend).unwrap().unwrap().summary();
+                    let mut curve: Vec<_> = fit.curve.iter().map(|p| (p.day * 86400.0, Some(p.value))).collect();
+                    curve.push((artifact.source.provenance.observation_cutoff as f64, Some(fit.end.value)));
+                    (fit.end.value, curve)
+                }
+            };
+            assert_ne!(pure, mean, "fixture must expose M/F substitution");
+            for mode in [TrendMode::Mean, TrendMode::Forecast, TrendMode::Blend] {
+                let objective = ExpectancyObjective { version: 1, trend_mode: mode, trend_bend_days: bend,
+                    trend_blend_lambda: TrendBlendLambda::default(), forecast: recipe };
+                let model = artifact.objective_series(objective).unwrap();
+                let value = decision_r(mode, Some(mean), Some(pure), objective.trend_blend_lambda).unwrap();
+                assert_eq!(model.decision_r.as_ref().copied(), value);
+                assert_eq!(model.curve.last().unwrap().1, value);
+                if mode == TrendMode::Mean {
+                    assert!(model.curve.iter().all(|point| point.1 == Some(mean)));
+                } else {
+                    assert_eq!(model.curve, raw_curve.iter().map(|&(at, f)| (at,
+                        decision_r(mode, Some(mean), f, objective.trend_blend_lambda).unwrap())).collect::<Vec<_>>());
+                    assert_eq!(model.forecast_r.as_ref(), Some(&pure));
+                }
+                assert_eq!(artifact.to_json().unwrap(), sealed, "projection never rewrites old science");
+            }
+        }
+    }
+
+    #[test]
+    fn objective_unknown_recipe_or_missing_weighted_evidence_never_becomes_generic_mean_or_ols() {
+        let (mut input, _) = fixture();
+        input.daily = MetricAvailability::Unavailable { reason: ExpectancyUnavailableReason::MissingFrozenOutcomes };
+        let artifact = build_expectancy_artifact(input).unwrap();
+        let mut objective = ExpectancyObjective { version: 1, trend_mode: TrendMode::Blend,
+            trend_bend_days: TrendBendDays::Seven, trend_blend_lambda: TrendBlendLambda::default(), forecast: None };
+        let model = artifact.objective_series(objective).unwrap();
+        assert!(model.decision_r.as_ref().is_none() && model.curve.is_empty());
+        objective.trend_mode = TrendMode::Mean;
+        assert!(artifact.objective_series(objective).unwrap().decision_r.as_ref().is_some());
+        objective.forecast = Some(ForecastRecipe::engineering_baseline());
+        assert_eq!(artifact.objective_series(objective), Err(ExpectancyError::InvalidForecast));
+        objective.forecast = None;
+        objective.version = 99;
+        assert_eq!(artifact.objective_series(objective), Err(ExpectancyError::UnsupportedVersion));
+        assert!(serde_json::from_value::<ExpectancyObjective>(serde_json::json!({"version":1,"trendMode":"other"})).is_err());
     }
     #[test]
     fn explicit_probability_v3_is_typed_frozen_and_does_not_rewrite_legacy_v2() {

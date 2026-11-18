@@ -12,7 +12,7 @@ export function forecastFixture(request: ForecastCurveRequest): ForecastCurveRes
     estimate: { status: "available", value: { observationCutoff: request.observationCutoff, meanR: 0.8, forecastR: 0.4,
       tpProbability: 0.6, priorProbability: 0.5, tpCount: 3, slCount: 2, weightedTp: 2.5, weightedSl: 1.5, weightSum: 4 } },
     meanR: 0.8, forecastR: 0.4, decisionR: request.trendMode === "blend" ? 0.52 : request.trendMode === "mean" ? 0.8 : 0.4,
-    curve, ...(request.trendMode === "blend" ? { blendCurve: curve.map((point, index) => ({ atUnix: point.atUnix, decisionR: [0.1, 0.3, 0.52][index]! })) } : {}),
+    curve, ...(request.trendMode === "blend" ? { trendBlendLambda: request.trendBlendLambda, blendCurve: curve.map((point, index) => ({ atUnix: point.atUnix, decisionR: [0.1, 0.3, 0.52][index]! })) } : {}),
     flatFuture: { fromUnix: request.observationCutoff, toUnix: request.atUnix ?? request.observationCutoff,
       forecastR: 0.4, decisionR: request.trendMode === "blend" ? 0.52 : request.trendMode === "mean" ? 0.8 : 0.4 },
     provenance: { kind: "supplied_closed_outcomes", availability: "asserted_at_cutoff" } };

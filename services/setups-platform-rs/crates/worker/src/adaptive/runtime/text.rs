@@ -196,26 +196,14 @@ mod tests {
         assert!(!message.contains("Исследование") && !message.contains("1970-"));
 
         let envelope = serde_json::from_value(snapshot.clone()).unwrap();
-        let mut saved =
+        let fresh =
             super::super::enrichment::freeze(&envelope, raw.close_time_unix, None).unwrap();
-        for (forecast, expected) in [
-            (Some(0.13), Some("📈 Прогноз матожидание торговли: +0.13 R")),
-            (
-                Some(-0.13),
-                Some("📉 Прогноз матожидание торговли: -0.13 R"),
-            ),
-            (Some(0.0), Some("📈 Прогноз матожидание торговли: +0.00 R")),
-            (
-                Some(-0.001),
-                Some("📉 Прогноз матожидание торговли: -0.00 R"),
-            ),
-            (None, None),
-        ] {
+        // A mean-objective recommendation always shows its own M; a stale saved
+        // forecast scalar never leaks into the push or Telegram text.
+        for forecast in [Some(0.13), Some(-0.13), Some(0.0), Some(-0.001), None] {
+            let mut saved = fresh.clone();
             if let Some(value) = forecast {
                 saved.forecast_r = MetricAvailability::Available { value };
-            } else {
-                saved =
-                    super::super::enrichment::freeze(&envelope, raw.close_time_unix, None).unwrap();
             }
             snapshot["expectancy"] = serde_json::to_value(&saved).unwrap();
             let before = snapshot.clone();
@@ -228,13 +216,10 @@ mod tests {
             .unwrap();
             assert_eq!(snapshot, before);
             assert_eq!(text, rich.text);
-            if let Some(expected) = expected {
-                assert!(text.contains(&format!("USDT\n\n{expected}\n\nУсловия сделки:")));
-                assert_eq!(text.matches("Прогноз матожидание торговли:").count(), 1);
-            } else {
-                assert!(!text.contains("Прогноз") && !text.contains('📈') && !text.contains('📉'));
-                assert!(text.contains("USDT\n\nУсловия сделки:"));
-            }
+            assert!(text
+                .contains("USDT\n\n📈 Матожидание торговли · среднее: +0.32 R\n\nУсловия сделки:"));
+            assert_eq!(text.matches("Матожидание торговли · среднее:").count(), 1);
+            assert!(!text.contains("Прогноз матожидание торговли"));
             for forbidden in [
                 "Среднее МО",
                 "Планируемое",

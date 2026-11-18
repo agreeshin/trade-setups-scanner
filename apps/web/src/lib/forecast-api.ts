@@ -24,6 +24,7 @@ export interface ForecastCurveRequest {
 export interface ForecastCurveResponse {
   forecast: ForecastRecipe;
   trendMode: TrendMode;
+  trendBlendLambda?: number;
   q: number;
   fromUnix: number;
   toUnix: number;
@@ -71,6 +72,14 @@ function validResponse(value: unknown, request: ForecastCurveRequest): value is 
     && response.curve.every((point, index, all) => point !== null && Number.isSafeInteger(point.atUnix) && point.atUnix <= request.observationCutoff && metric(point.forecastR) && (index === 0 || point.atUnix >= all[index - 1]!.atUnix))
     && (response.blendCurve === undefined || (Array.isArray(response.blendCurve) && response.blendCurve.length <= 3662
       && response.blendCurve.every((point, index, all) => point !== null && Number.isSafeInteger(point.atUnix) && point.atUnix <= request.observationCutoff && metric(point.decisionR) && (index === 0 || point.atUnix >= all[index - 1]!.atUnix))))
+    // A blend scalar is not evidence of its chart. Never show only generic F
+    // when the requested B curve, lambda or its cutoff endpoint is missing.
+    && (request.trendMode !== "blend" || response.decisionR === null || (
+      response.trendBlendLambda === request.trendBlendLambda && Array.isArray(response.blendCurve)
+      && response.blendCurve.length === response.curve.length && response.blendCurve.length > 0
+      && response.blendCurve.every((point, index) => point.atUnix === response.curve![index]!.atUnix)
+      && response.blendCurve.at(-1)!.atUnix === request.observationCutoff
+      && response.blendCurve.at(-1)!.decisionR === response.decisionR))
     && flat !== null && typeof flat === "object" && flat.fromUnix === request.observationCutoff && flat.toUnix === (request.atUnix ?? request.observationCutoff)
     && flat.forecastR === response.forecastR && flat.decisionR === response.decisionR;
 }

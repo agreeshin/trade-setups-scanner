@@ -10,7 +10,7 @@
 //! asynchronous scheduling and the immutable per-artifact image cache.
 use resvg::{tiny_skia, usvg};
 use setups_domain::expectancy::{
-    ExpectancyArtifact, ExpectancyError, ExpectancyUnavailableReason, UtcDailyPoint,
+    ExpectancyArtifact, ExpectancyError, ExpectancyObjective, ExpectancyUnavailableReason, UtcDailyPoint,
 };
 use setups_domain::forecast::{
     ForecastError, ForecastRecipe, ForecastUnavailableReason, ProbabilityForecast,
@@ -32,6 +32,8 @@ pub const RENDER_VERSION: u32 = 1;
 /// Explicit opt-in only. Never pass this to the legacy missing-asset scanner:
 /// existing study PNGs and queued delivery bodies retain their original bytes.
 pub const PROBABILITY_RENDER_VERSION: u32 = 2;
+/// New objective-specific overlays only, never the legacy asset scanner.
+pub const OBJECTIVE_RENDER_VERSION: u32 = 3;
 pub const WIDTH: u32 = 900;
 pub const HEIGHT: u32 = 320;
 pub const MAX_PNG_BYTES: usize = 256 * 1024;
@@ -193,6 +195,35 @@ pub fn render_png_with_model(
         raw_signal_at,
         saved_forecast_r,
     )?)
+}
+
+pub fn render_png_with_objective(artifact: &ExpectancyArtifact, objective: ExpectancyObjective,
+    raw_signal_at: i64, saved_decision_r: f64) -> Result<Vec<u8>, RenderError> {
+    rasterize_svg(&render_svg_with_objective(artifact, objective, raw_signal_at, saved_decision_r)?)
+}
+
+fn render_svg_with_objective(artifact: &ExpectancyArtifact, objective: ExpectancyObjective,
+    raw_signal_at: i64, saved_decision_r: f64) -> Result<String, RenderError> {
+    let series = artifact.objective_series(objective).map_err(RenderError::InvalidArtifact)?;
+    let decision = series.decision_r.as_ref().copied().ok_or_else(|| match series.decision_r {
+        setups_domain::expectancy::MetricAvailability::Unavailable { reason } => RenderError::SeriesUnavailable(reason),
+        _ => RenderError::ForecastMismatch,
+    })?;
+    let mean_r = series.mean_r.as_ref().copied().ok_or(RenderError::SeriesUnavailable(ExpectancyUnavailableReason::MissingSelectedMean))?;
+    let points = daily_points(artifact)?;
+    let (tp_count, sl_count) = points.iter().try_fold((0u64, 0u64), |(tp, sl), p|
+        Ok::<_, RenderError>((tp.checked_add(p.tp_count).ok_or(RenderError::InvalidGeometry)?,
+            sl.checked_add(p.sl_count).ok_or(RenderError::InvalidGeometry)?)))?;
+    let model = PlotForecast { mean_r, forecast_r: decision, tp_count, sl_count, method: series.method,
+        curve: series.curve.into_iter().map(|(at, value)| ((at - artifact.origin_unix as f64) / 86400.0, value)).collect() };
+    let method = if matches!(objective.forecast, Some(ForecastRecipe::DecayedProbability { .. })) { "вероятностный" } else { "по тренду" };
+    let label = match objective.trend_mode {
+        TrendMode::Mean => "Среднее M".to_string(),
+        TrendMode::Forecast => format!("Прогноз F · {method}"),
+        TrendMode::Blend => format!("Смесь B · {}/{} · {method}", 100 - objective.trend_blend_lambda.percent(), objective.trend_blend_lambda.percent()),
+    };
+    render_svg_projection(artifact, raw_signal_at, saved_decision_r, model, OBJECTIVE_RENDER_VERSION,
+        &format!("{label} · ретроспективная оценка"), "МО на закрытие сигнала")
 }
 
 fn validate_model_source(
@@ -810,11 +841,17 @@ fn render_svg_with_model(
     raw_signal_at: i64,
     saved_forecast_r: f64,
 ) -> Result<String, RenderError> {
+    let model = plot_forecast(artifact, recipe)?;
+    render_svg_projection(artifact, raw_signal_at, saved_forecast_r, model, PROBABILITY_RENDER_VERSION,
+        "Ретроспективная модельная оценка", "Прогноз на закрытие сигнала")
+}
+
+fn render_svg_projection(artifact: &ExpectancyArtifact, raw_signal_at: i64, saved_forecast_r: f64,
+    model: PlotForecast, render_version: u32, series_label: &str, marker_kind: &str) -> Result<String, RenderError> {
     let cutoff = artifact.source.provenance.observation_cutoff;
     if raw_signal_at < cutoff {
         return Err(RenderError::InvalidForecast(ForecastError::BeforeCutoff));
     }
-    let model = plot_forecast(artifact, recipe)?;
     if !saved_forecast_r.is_finite() || model.forecast_r != saved_forecast_r {
         return Err(RenderError::ForecastMismatch);
     }
@@ -843,7 +880,7 @@ fn render_svg_with_model(
     ));
     write!(
         svg,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="320" viewBox="0 0 900 320" font-family="{FONT_FAMILY}" data-render-version="{PROBABILITY_RENDER_VERSION}"><rect width="900" height="320" fill="{BACKGROUND}"/><text id="title" x="450" y="28" text-anchor="middle" font-size="18" fill="{title_color}">{TITLE} · Среднее МО: {} · Win rate: {win_rate:.1}%</text><text id="retrospective-label" x="80" y="49" font-size="11" fill="{TREND}">Ретроспективная модельная оценка</text>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="320" viewBox="0 0 900 320" font-family="{FONT_FAMILY}" data-render-version="{render_version}"><rect width="900" height="320" fill="{BACKGROUND}"/><text id="title" x="450" y="28" text-anchor="middle" font-size="18" fill="{title_color}">{TITLE} · Среднее МО: {} · Win rate: {win_rate:.1}%</text><text id="retrospective-label" x="80" y="49" font-size="11" fill="{TREND}">{series_label}</text>"#,
         risk_label(model.mean_r)
     )?;
     write_axes(&mut svg, geometry)?;
@@ -888,7 +925,7 @@ fn render_svg_with_model(
     write_daily_points(&mut svg, points, geometry)?;
     write!(
         svg,
-        r#"<circle id="raw-close-marker" data-at-unix="{raw_signal_at}" data-forecast-r="{saved_forecast_r}" cx="{marker_x:.3}" cy="{marker_y:.3}" r="5" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="2"/><text id="raw-close-label" x="{RIGHT}" y="{:.3}" text-anchor="end" font-size="11" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="3" paint-order="stroke fill">Прогноз на закрытие сигнала: {marker_label}</text>"#,
+        r#"<circle id="raw-close-marker" data-at-unix="{raw_signal_at}" data-forecast-r="{saved_forecast_r}" cx="{marker_x:.3}" cy="{marker_y:.3}" r="5" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="2"/><text id="raw-close-label" x="{RIGHT}" y="{:.3}" text-anchor="end" font-size="11" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="3" paint-order="stroke fill">{marker_kind}: {marker_label}</text>"#,
         (marker_y - 13.0).clamp(TOP + 14.0, BOTTOM - 6.0)
     )?;
     // Reserve the right edge for the explicit C/raw-close annotation. Calendar
@@ -1098,6 +1135,41 @@ mod tests {
             daily,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn objective_png_uses_the_entire_matching_core_series_and_exact_scalar_in_all_modes() {
+        for recipe in [None, Some(ForecastRecipe::engineering_baseline()),
+            Some(ForecastRecipe::Trend { version: 1, bend_days: TrendBendDays::Seven })] {
+            let artifact = recipe.map_or_else(fixture, |recipe| explicit_fixture(fixture(), recipe));
+            let sealed = artifact.to_json().unwrap();
+            for mode in [TrendMode::Mean, TrendMode::Forecast, TrendMode::Blend] {
+                let objective = ExpectancyObjective { version: 1, trend_mode: mode,
+                    trend_bend_days: match recipe { Some(ForecastRecipe::Trend { bend_days, .. }) => bend_days, _ => TrendBendDays::Linear },
+                    trend_blend_lambda: TrendBlendLambda::default(), forecast: recipe };
+                let series = artifact.objective_series(objective).unwrap();
+                let value = *series.decision_r.as_ref().unwrap();
+                let raw = artifact.source.provenance.observation_cutoff + 86400;
+                let svg = render_svg_with_objective(&artifact, objective, raw, value).unwrap();
+                assert!(svg.contains("data-render-version=\"3\""));
+                assert!(svg.contains(&format!("data-forecast-r=\"{value}\"")));
+                assert!(svg.contains(&format!("МО на закрытие сигнала: {value:+.2} R")));
+                let plot = PlotForecast { mean_r: *series.mean_r.as_ref().unwrap(), forecast_r: value,
+                    tp_count: 0, sl_count: 0, method: series.method,
+                    curve: series.curve.iter().map(|&(at, v)| ((at - artifact.origin_unix as f64) / 86400.0, v)).collect() };
+                let geometry = probability_geometry(daily_points(&artifact).unwrap(), &plot, artifact.origin_unix, raw).unwrap();
+                for &(at, value) in &series.curve {
+                    if let Some(value) = value {
+                        assert!(svg.contains(&format!("{:.3},{:.3} ", geometry.x((at - artifact.origin_unix as f64) / 86400.0), geometry.y(value))), "entire objective curve, not only endpoint");
+                    }
+                }
+                assert_eq!(render_png_with_objective(&artifact, objective, raw, value + 0.01), Err(RenderError::ForecastMismatch));
+                let png = render_png_with_objective(&artifact, objective, raw, value).unwrap();
+                assert!(png.len() < MAX_PNG_BYTES);
+                assert_eq!(png, render_png_with_objective(&artifact, objective, raw, value).unwrap());
+                assert_eq!(artifact.to_json().unwrap(), sealed);
+            }
+        }
     }
 
     #[test]

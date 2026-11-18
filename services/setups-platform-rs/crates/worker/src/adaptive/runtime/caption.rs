@@ -86,6 +86,7 @@ impl CaptionBuilder {
 #[derive(Default)]
 struct Metrics {
     forecast_r: Option<f64>,
+    objective: Option<setups_domain::expectancy::ExpectancyObjective>,
 }
 
 fn signed_r(value: f64) -> Result<String, WorkerError> {
@@ -129,7 +130,8 @@ pub fn recommendation_telegram_caption(
             ) {
                 Ok(saved) if saved.validate_for(&envelope, raw.close_time_unix).is_ok() => (
                     Metrics {
-                        forecast_r: saved.forecast_r.as_ref().copied(),
+                        forecast_r: saved.objective.as_ref().map_or_else(|| saved.forecast_r.as_ref().copied(), |objective| objective.decision_r.as_ref().copied()),
+                        objective: saved.objective.as_ref().map(|objective| objective.settings),
                     },
                     if saved.image_key.is_none() {
                         Some("saved_chart_unavailable")
@@ -199,12 +201,23 @@ fn format_caption(
     out.code(&super::text::display_decimal(&raw.close_price)?.replace(',', "."))?;
     out.plain(" USDT\n\n")?;
     if let Some(forecast) = metrics.forecast_r {
-        out.plain(if forecast < 0.0 {
-            "📉 Прогноз матожидание торговли: "
-        } else {
-            "📈 Прогноз матожидание торговли: "
-        })?;
+        out.plain(if forecast < 0.0 { "📉 " } else { "📈 " })?;
+        match metrics.objective.map(|objective| objective.trend_mode) {
+            Some(setups_domain::trend::TrendMode::Mean) => out.plain("Матожидание торговли · среднее: ")?,
+            Some(setups_domain::trend::TrendMode::Blend) => {
+                let forecast_weight = metrics.objective.expect("matched objective").trend_blend_lambda.percent();
+                out.plain("Матожидание торговли · смесь ")?;
+                out.code(&format!("{}/{forecast_weight}", 100 - forecast_weight))?;
+                out.plain(": ")?;
+            }
+            _ => out.plain("Прогноз матожидание торговли: ")?,
+        }
         out.code(&signed_r(forecast)?)?;
+        if let Some(objective) = metrics.objective.filter(|objective| !objective.trend_mode.is_mean()) {
+            out.plain(if matches!(objective.forecast, Some(setups_domain::forecast::ForecastRecipe::DecayedProbability { .. })) {
+                " · вероятностный"
+            } else { " · по тренду" })?;
+        }
         out.plain("\n\n")?;
     }
     out.plain("Условия сделки:")?;
@@ -363,6 +376,7 @@ mod tests {
                 &envelope,
                 Metrics {
                     forecast_r: forecast,
+                    ..Metrics::default()
                 },
             )
             .unwrap();
@@ -464,6 +478,7 @@ mod tests {
             &envelope,
             Metrics {
                 forecast_r: Some(0.4),
+                ..Metrics::default()
             },
         )
         .unwrap();
@@ -527,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_snapshot_forecast_is_the_only_metric_and_target_template_is_exact() {
+    fn saved_objective_mean_is_the_only_metric_and_target_template_is_exact() {
         let (mut instrument, mut raw, mut value) = fixture();
         instrument.symbol = "SPACEUSDT".into();
         raw.close_price = "0.004156".into();
@@ -551,7 +566,7 @@ mod tests {
             caption.text,
             concat!(
                 "🔴 SPACEUSDT · SHORT · Bybit\nЦена: 0.004156 USDT\n\n",
-                "📈 Прогноз матожидание торговли: +0.13 R\n\n",
+                "📈 Матожидание торговли · среднее: +0.32 R\n\n",
                 "Условия сделки:\n⏳ Рекомендуемое время входа: 18:27:00 UTC\n",
                 "🎯 TP = 20%, SL = 6% (от фактической цены входа)\n",
                 "⚠️ Заходить в сделку, если цена не опустится ниже 0.004156 USDT на момент входа\n\n",

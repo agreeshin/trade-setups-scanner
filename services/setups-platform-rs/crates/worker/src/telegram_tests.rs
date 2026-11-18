@@ -1440,6 +1440,7 @@ async fn saved_png_regression(pool: &PgPool, relay: &LocalRelay) {
         historical_recalculation: None,
         forecast: None,
         overlay_key: None,
+        objective: None,
     };
     job.payload["recommendation"]["expectancy"] = serde_json::to_value(saved).unwrap();
     let setup:i32=sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,adaptive_slot_id,adaptive_generation_id,recommendation,external_name,expectancy_artifact_id) values('bybit','linear','TESTUSDT','price_volume_spike','1.1.1',$1,to_timestamp($2),to_timestamp($3),'100',$4,$5,$6,'Captured name',$7) returning id")
