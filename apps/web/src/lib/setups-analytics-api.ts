@@ -201,8 +201,19 @@ function isStudyTrendPoint(value: unknown): value is StudyTrendPoint {
   return isRecord(value) && isUnix(value.dayUnix) && isFiniteNumber(value.value);
 }
 
-export async function fetchStudyExpectancy(studyId: number, signal?: AbortSignal): Promise<StudyExpectancySeries> {
-  const response = await apiFetch(`/v1/setups/analytics/study-expectancy/${studyId}`, signal === undefined ? {} : { signal });
+export interface StudyLivePoint {
+  dayUnix: number;
+  meanR: number;
+  closedCount: number;
+}
+
+export async function fetchStudyExpectancy(studyId: number, live: readonly StudyLivePoint[], signal?: AbortSignal): Promise<StudyExpectancySeries> {
+  const response = await apiFetch(`/v1/setups/analytics/study-expectancy/${studyId}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ live }),
+    ...(signal === undefined ? {} : { signal }),
+  });
   const body: unknown = await readBody(response);
   if (!isRecord(body)
     || typeof body.studyId !== "number"

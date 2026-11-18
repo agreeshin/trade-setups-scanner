@@ -301,6 +301,12 @@ fn validate_model_source(
     Ok(())
 }
 
+pub struct LiveDailyPoint {
+    pub day_unix: i64,
+    pub mean_r: f64,
+    pub closed: u32,
+}
+
 pub struct StudySeries {
     pub mean_r: f64,
     pub trend_method: Option<&'static str>,
@@ -310,17 +316,101 @@ pub struct StudySeries {
 pub fn study_series(
     artifact: &ExpectancyArtifact,
     study: StudyTrend,
+    live: &[LiveDailyPoint],
 ) -> Result<StudySeries, RenderError> {
     artifact.validate().map_err(RenderError::InvalidArtifact)?;
     let points = daily_points(artifact)?;
     Geometry::from_points(points, None)?;
     let mean = period_mean_r(artifact, points);
-    let trend = display_trend(points, mean, study)?;
+    let trend = if live.is_empty() {
+        display_trend(points, mean, study)?
+    } else {
+        match combined_trend(points, study, artifact.origin_unix, live)? {
+            Some(trend) => Some(trend),
+            None => display_trend(points, mean, study)?,
+        }
+    };
     Ok(StudySeries {
         mean_r: mean,
         trend_method: trend.as_ref().map(|trend| trend.method),
         trend_points: trend.map(|trend| trend.points).unwrap_or_default(),
     })
+}
+
+fn combined_trend(
+    points: &[UtcDailyPoint],
+    study: StudyTrend,
+    origin_unix: i64,
+    live: &[LiveDailyPoint],
+) -> Result<Option<DisplayTrend>, RenderError> {
+    let mut input: Vec<TrendInput> = points
+        .iter()
+        .map(|point| {
+            let weight = u32::try_from(point.row_count)
+                .map_err(|_| RenderError::InvalidTrend(TrendError::InvalidDayOrValue))?;
+            Ok(TrendInput {
+                day: point.x_utc_days,
+                value: point.mean_r,
+                weight,
+            })
+        })
+        .collect::<Result<_, RenderError>>()?;
+    for point in live {
+        if !point.mean_r.is_finite() || point.closed == 0 {
+            continue;
+        }
+        input.push(TrendInput {
+            day: (i128::from(point.day_unix) - i128::from(origin_unix)) as f64 / 86400.0,
+            value: Some(point.mean_r),
+            weight: point.closed,
+        });
+    }
+    input.sort_by(|left, right| left.day.total_cmp(&right.day));
+    let weighted: Vec<(f64, f64)> = input
+        .iter()
+        .filter_map(|point| point.value.map(|value| (value, f64::from(point.weight))))
+        .collect();
+    let total = weighted.iter().map(|(_, weight)| weight).sum::<f64>();
+    if total <= 0.0 {
+        return Ok(None);
+    }
+    let combined_mean = weighted.iter().map(|(value, weight)| value * weight).sum::<f64>()
+        / total;
+    let Some(first) = input.first().map(|point| point.day) else {
+        return Ok(None);
+    };
+    let last = input
+        .last()
+        .expect("non-empty input has a last day")
+        .day
+        .max(first);
+    if study.trend_mode == TrendMode::Mean {
+        return Ok(Some(DisplayTrend {
+            method: "mean",
+            points: vec![(first, combined_mean), (last, combined_mean)],
+        }));
+    }
+    let Some(fit) =
+        fit_weighted_trend(&input, study.trend_bend_days).map_err(RenderError::InvalidTrend)?
+    else {
+        return Ok(None);
+    };
+    let summary = fit.summary();
+    Ok(Some(DisplayTrend {
+        method: summary.method,
+        points: summary
+            .curve
+            .iter()
+            .map(|point| {
+                let value = if study.trend_mode == TrendMode::Blend {
+                    study.trend_blend_lambda.combine(combined_mean, point.value)
+                } else {
+                    point.value
+                };
+                (point.day, value)
+            })
+            .collect(),
+    }))
 }
 
 #[cfg(test)]
@@ -1826,13 +1916,85 @@ mod tests {
     #[test]
     fn study_series_exposes_period_mean_and_fitted_trend() {
         let artifact = fixture();
-        let series = study_series(&artifact, StudyTrend::default()).unwrap();
+        let series = study_series(&artifact, StudyTrend::default(), &[]).unwrap();
         assert!(series.mean_r.is_finite());
         assert!(series.trend_method.is_some());
         assert!(series.trend_points.len() >= 2);
-        let rerendered = study_series(&artifact, StudyTrend::default()).unwrap();
+        let rerendered = study_series(&artifact, StudyTrend::default(), &[]).unwrap();
         assert_eq!(series.mean_r, rerendered.mean_r);
         assert_eq!(series.trend_points, rerendered.trend_points);
+    }
+
+    #[test]
+    fn study_series_with_live_extends_mean_line_over_combined_window() {
+        let artifact = fixture();
+        let points = daily_points(&artifact).unwrap();
+        let past_last_unix = points
+            .iter()
+            .filter(|point| point.mean_r.is_some())
+            .next_back()
+            .expect("fixture has finite days")
+            .day_start_unix;
+        let live_unix = past_last_unix + 3 * 86400;
+        let live = vec![LiveDailyPoint {
+            day_unix: live_unix,
+            mean_r: 0.4,
+            closed: 5,
+        }];
+        let series = study_series(&artifact, StudyTrend::default(), &live).unwrap();
+        assert_eq!(series.trend_method, Some("mean"));
+        let origin = artifact.origin_unix;
+        let live_x = (live_unix - origin) as f64 / 86400.0;
+        let last_x = series.trend_points.last().expect("two points").0;
+        assert!((last_x - live_x).abs() < 1e-6);
+        let total_past: f64 = points
+            .iter()
+            .filter_map(|point| point.mean_r.map(|_| point.row_count as f64))
+            .sum();
+        let sum_past: f64 = points
+            .iter()
+            .filter_map(|point| {
+                point
+                    .mean_r
+                    .map(|value| value * (point.row_count as f64))
+            })
+            .sum();
+        let expected = (sum_past + 0.4 * 5.0) / (total_past + 5.0);
+        let value = series.trend_points.last().expect("two points").1;
+        assert!((value - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn study_series_with_live_forecast_fit_spans_combined_days() {
+        let artifact = fixture();
+        let points = daily_points(&artifact).unwrap();
+        let past_last_unix = points
+            .iter()
+            .filter(|point| point.mean_r.is_some())
+            .next_back()
+            .expect("fixture has finite days")
+            .day_start_unix;
+        let live = vec![
+            LiveDailyPoint {
+                day_unix: past_last_unix + 86400,
+                mean_r: 0.2,
+                closed: 3,
+            },
+            LiveDailyPoint {
+                day_unix: past_last_unix + 2 * 86400,
+                mean_r: -0.1,
+                closed: 2,
+            },
+        ];
+        let study = StudyTrend {
+            trend_mode: TrendMode::Forecast,
+            ..StudyTrend::default()
+        };
+        let series = study_series(&artifact, study, &live).unwrap();
+        let origin = artifact.origin_unix;
+        let live_x = (past_last_unix + 2 * 86400 - origin) as f64 / 86400.0;
+        let last_x = series.trend_points.last().expect("fitted curve").0;
+        assert!(last_x >= live_x - 1e-6, "curve spans through live days");
     }
 
     #[test]

@@ -42,7 +42,7 @@ const optimizationStudy40 = {
   },
   error: null,
   forecastBest: { forecastR: 0.44, meanR: 0.3, tpPct: 20, slPct: 6 },
-  createdAt: "2026-11-01T00:00:00Z", updatedAt: "2026-11-02T00:00:00Z", events: [],
+  createdAt: "2026-11-06T00:00:00Z", updatedAt: "2026-11-07T00:00:00Z", events: [],
 };
 
 const requests: string[] = [];
@@ -58,7 +58,10 @@ beforeEach(() => {
     requests.push(path);
     if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "", enabled: true, params: {}, fields: [] }] }));
     if (path.startsWith("/v1/setups/analytics/studies")) return Promise.resolve(json({ studies: [studyMeta1, studyMeta2] }));
-    if (path === "/v1/setups/analytics/study-expectancy/40") return Promise.resolve(json({ studyId: 40, observationCutoff: 1793923200, meanR: 0.2, daily: [{ dayUnix: 1793923200, meanR: 0.3, tpCount: 2, slCount: 1 }, { dayUnix: 1794009600, meanR: -0.1, tpCount: 1, slCount: 1 }], trend: { method: "mean", points: [{ dayUnix: 1793923200, value: 0.2 }, { dayUnix: 1794009600, value: 0.2 }] } }));
+    if (path === "/v1/setups/analytics/study-expectancy/40") {
+      const horizonDays = Array.from({ length: 13 }, (_, index) => 1793923200 + index * 86400);
+      return Promise.resolve(json({ studyId: 40, observationCutoff: 1794009600, meanR: 0.2, daily: horizonDays.map((dayUnix, index) => ({ dayUnix, meanR: index % 2 === 0 ? 0.3 : -0.1, tpCount: 1, slCount: 1 })), trend: { method: "mean", points: [{ dayUnix: horizonDays[0]!, value: 0.2 }, { dayUnix: horizonDays.at(-1)!, value: 0.2 }] } }));
+    }
     if (path === "/v1/optimization-studies/40") return Promise.resolve(json(optimizationStudy40));
     if (path.startsWith("/v1/setups/analytics?")) return Promise.resolve(analyticsResponse());
     return Promise.resolve(json({}));
@@ -174,7 +177,16 @@ it("shows study details with the past-and-live chart in a modal", async () => {
   expect(within(dialog).getAllByText("2.5").length).toBeGreaterThan(0);
   const chart = within(dialog).getByTestId("study-horizon-chart");
   expect(chart.querySelector("[data-divider-day]")).not.toBeNull();
-  expect(chart.querySelectorAll('[data-phase="past"]').length).toBe(2);
+  expect(chart.querySelectorAll(".grid-day").length).toBe(13);
+  expect(chart.querySelectorAll(".date").length).toBeGreaterThanOrEqual(2);
+  expect(chart.querySelectorAll('[data-phase="past"]').length).toBe(12);
+  expect(chart.querySelectorAll('[data-phase="release"]').length).toBe(1);
+  expect(chart.querySelectorAll('[data-phase="live"]').length).toBe(0);
+  const releasePoint = chart.querySelector('[data-phase="release"]');
+  expect(releasePoint!.getAttribute("fill")).toBe("#18cf98");
+  expect(releasePoint!.getAttribute("data-mean-r")).toBe("0.73");
+  const pastPoint = chart.querySelector('[data-phase="past"]');
+  expect(pastPoint!.getAttribute("fill")).toMatch(/#18cf98|#f08a7f/);
   expect(dialog.querySelector("img")).toBeNull();
   expect(requests).toContain("/v1/optimization-studies/40");
   expect(requests.some((path) => path === "/v1/setups/analytics/study-expectancy/40")).toBe(true);

@@ -222,18 +222,26 @@ function studyPointWithMean(point: StudyExpectancyPoint): point is StudyExpectan
 }
 
 function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectancySeries; live: readonly DailyOutcome[]; dividerDay: number | null }) {
-  const past = series.daily.filter(studyPointWithMean);
-  if (past.length === 0 && live.length === 0) {
+  const allPast = series.daily.filter(studyPointWithMean);
+  const releasePast = dividerDay === null ? null : allPast.find((point) => point.dayUnix === dividerDay) ?? null;
+  const releaseLive = dividerDay === null ? null : live.find((point) => point.dayUnix === dividerDay) ?? null;
+  const releaseClosed = (releasePast !== null ? releasePast.tpCount + releasePast.slCount : 0) + (releaseLive !== null ? releaseLive.closedCount : 0);
+  const releaseMean = releaseClosed > 0
+    ? ((releasePast !== null ? releasePast.meanR * (releasePast.tpCount + releasePast.slCount) : 0) + (releaseLive !== null ? releaseLive.meanR * releaseLive.closedCount : 0)) / releaseClosed
+    : null;
+  const past = dividerDay === null || releasePast === null ? allPast : allPast.filter((point) => point.dayUnix !== dividerDay);
+  const livePoints = dividerDay === null || releaseLive === null ? live : live.filter((point) => point.dayUnix !== dividerDay);
+  if (past.length === 0 && livePoints.length === 0 && releaseMean === null) {
     return <p className="text-sm text-muted-foreground">Нет данных для графика.</p>;
   }
   const trendValues = series.trend.points.map((point) => point.value);
-  const dayNumbers = [...past.map((point) => point.dayUnix), ...live.map((point) => point.dayUnix)];
+  const dayNumbers = [...past.map((point) => point.dayUnix), ...livePoints.map((point) => point.dayUnix)];
   if (dividerDay !== null) dayNumbers.push(dividerDay);
   const firstDay = Math.min(...dayNumbers);
   const lastDay = Math.max(...dayNumbers);
   const daySpan = Math.max(1, Math.round((lastDay - firstDay) / DAY_SECONDS));
   const xOf = (dayUnix: number) => CHART_STYLE.left + ((dayUnix - firstDay) / DAY_SECONDS / daySpan) * (CHART_STYLE.right - CHART_STYLE.left);
-  const values = [...past.map((point) => point.meanR), ...live.map((point) => point.meanR), ...trendValues];
+  const values = [...past.map((point) => point.meanR), ...livePoints.map((point) => point.meanR), ...(releaseMean !== null ? [releaseMean] : []), ...trendValues];
   const rawMin = Math.min(0, ...values);
   const rawMax = Math.max(0, ...values);
   const pad = rawMax - rawMin < 1e-9 ? 0.5 : (rawMax - rawMin) * 0.08;
@@ -241,7 +249,8 @@ function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectan
   const yMax = rawMax + pad;
   const yOf = (value: number) => CHART_STYLE.bottom - ((value - yMin) / (yMax - yMin)) * (CHART_STYLE.bottom - CHART_STYLE.top);
   const labelStep = Math.max(1, Math.ceil(daySpan / 8));
-  const gridDays = Array.from({ length: daySpan + 1 }, (_, index) => firstDay + index * DAY_SECONDS).filter((_, index) => index % labelStep === 0);
+  const allDays = Array.from({ length: daySpan + 1 }, (_, index) => firstDay + index * DAY_SECONDS);
+  const labeledDays = allDays.filter((_, index) => index % labelStep === 0);
   const gridLevels: number[] = [];
   for (let level = Math.ceil(yMin); level <= Math.floor(yMax); level += 1) {
     if (level !== 0) gridLevels.push(level);
@@ -250,10 +259,8 @@ function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectan
   return <svg data-testid="study-horizon-chart" viewBox={`0 0 ${CHART_STYLE.width} ${CHART_STYLE.height}`} role="img" aria-label="Матожидание: ретроспектива исследования и live-сетапы" className="w-full rounded-md border border-input/60">
     <rect width={CHART_STYLE.width} height={CHART_STYLE.height} fill={CHART_STYLE.background} />
     <text x={CHART_STYLE.width / 2} y={28} textAnchor="middle" fontSize={14} fill={CHART_STYLE.foreground}>Динамика матожидания: ретроспектива и live</text>
-    {gridDays.map((dayUnix) => <g key={`day-${dayUnix}`}>
-      <line x1={xOf(dayUnix)} y1={CHART_STYLE.top} x2={xOf(dayUnix)} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.grid} strokeWidth={1} />
-      <text x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{dayLabel(dayUnix)}</text>
-    </g>)}
+    {allDays.map((dayUnix) => <line key={`grid-${dayUnix}`} className="grid-day" x1={xOf(dayUnix)} y1={CHART_STYLE.top} x2={xOf(dayUnix)} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.grid} strokeWidth={1} />)}
+    {labeledDays.map((dayUnix) => <text key={`date-${dayUnix}`} className="date" x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{dayLabel(dayUnix)}</text>)}
     {gridLevels.map((level) => <g key={`level-${level}`}>
       <line x1={CHART_STYLE.left} y1={yOf(level)} x2={CHART_STYLE.right} y2={yOf(level)} stroke={CHART_STYLE.grid} strokeWidth={1} />
       <text x={CHART_STYLE.left - 8} y={yOf(level) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>{level} R</text>
@@ -262,13 +269,16 @@ function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectan
     <text x={CHART_STYLE.left - 8} y={yOf(0) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>0 R</text>
     {series.trend.points.length > 1 && <polyline fill="none" stroke={CHART_STYLE.trend} strokeWidth={2} strokeDasharray="4 4" data-method={series.trend.method ?? undefined} points={series.trend.points.map((point) => `${xOf(point.dayUnix)},${yOf(point.value)}`).join(" ")} />}
     {past.length > 1 && <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={past.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
-    {live.length > 1 && <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={live.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
-    {past.map((point) => <circle key={`past-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={CHART_STYLE.line} data-day={dayLabel(point.dayUnix)} data-phase="past">
+    {livePoints.length > 1 && <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={livePoints.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
+    {past.map((point) => <circle key={`past-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={dayLabel(point.dayUnix)} data-phase="past">
       <title>{`${dayLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · ретроспектива`}</title>
     </circle>)}
-    {live.map((point) => <circle key={`live-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={dayLabel(point.dayUnix)} data-phase="live" data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)}>
+    {livePoints.map((point) => <circle key={`live-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={dayLabel(point.dayUnix)} data-phase="live" data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)}>
       <title>{`${dayLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title>
     </circle>)}
+    {dividerDay !== null && releaseMean !== null && <circle key="release" cx={xOf(dividerDay)} cy={yOf(releaseMean)} r={4} fill={releaseMean >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-phase="release" data-closed={releaseClosed} data-mean-r={releaseMean.toFixed(2)}>
+      <title>{`День выпуска исследования: ${formatRisk(releaseMean)} · закрытых ${releaseClosed}`}</title>
+    </circle>}
     {dividerX !== null && <g data-divider-day={dividerDay}>
       <line x1={dividerX} y1={CHART_STYLE.top} x2={dividerX} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.axis} strokeWidth={1.5} strokeDasharray="3 4" />
       <text x={dividerX > CHART_STYLE.width / 2 ? dividerX - 6 : dividerX + 6} y={45} textAnchor={dividerX > CHART_STYLE.width / 2 ? "end" : "start"} fontSize={11} fill={CHART_STYLE.axis}>Старт исследования</text>
@@ -289,9 +299,6 @@ function StudyDetailsDialog({ studyId, algorithmId, meta, onClose }: { studyId: 
     void getOptimizationStudy(studyId, controller.signal)
       .then((value) => { if (!controller.signal.aborted) setStudy(value); })
       .catch((cause) => { if (!controller.signal.aborted) setLoadError(errorText(cause)); });
-    void fetchStudyExpectancy(studyId, controller.signal)
-      .then((value) => { if (!controller.signal.aborted) setSeries(value); })
-      .catch((cause) => { if (!controller.signal.aborted) setChartError(errorText(cause)); });
     return () => controller.abort();
   }, [studyId]);
 
@@ -302,9 +309,22 @@ function StudyDetailsDialog({ studyId, algorithmId, meta, onClose }: { studyId: 
     const fromUnix = Number.isFinite(startedUnix) && startedUnix > 0
       ? Math.floor(startedUnix / DAY_SECONDS) * DAY_SECONDS
       : Math.floor(Date.now() / 1000 / DAY_SECONDS) * DAY_SECONDS - 30 * DAY_SECONDS;
-    void fetchSetupsAnalytics(algorithmId, fromUnix, Math.floor(Date.now() / 1000), [studyId], controller.signal)
-      .then((value) => { if (!controller.signal.aborted) setLive(dailyOutcomes(value.setups)); })
-      .catch(() => { if (!controller.signal.aborted) setLive([]); });
+    void (async () => {
+      let outcomes: DailyOutcome[] = [];
+      try {
+        const value = await fetchSetupsAnalytics(algorithmId, fromUnix, Math.floor(Date.now() / 1000), [studyId], controller.signal);
+        outcomes = dailyOutcomes(value.setups);
+        if (!controller.signal.aborted) setLive(outcomes);
+      } catch {
+        if (!controller.signal.aborted) setLive([]);
+      }
+      try {
+        const series = await fetchStudyExpectancy(studyId, outcomes.map((point) => ({ dayUnix: point.dayUnix, meanR: point.meanR, closedCount: point.closedCount })), controller.signal);
+        if (!controller.signal.aborted) setSeries(series);
+      } catch (cause) {
+        if (!controller.signal.aborted) setChartError(errorText(cause));
+      }
+    })();
     return () => controller.abort();
   }, [studyId, study, algorithmId]);
 

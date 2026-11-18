@@ -4,7 +4,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -844,9 +844,26 @@ async fn setups_analytics_study_expectancy(
     State(state): State<Arc<AnalyticsState>>,
     headers: HeaderMap,
     Path(study_id): Path<i64>,
+    Json(body): Json<Value>,
 ) -> Response {
     if let Err(response) = guard_auth(&state.auth, &headers, false) {
         return response;
+    }
+    let mut live: Vec<setups_analytics::expectancy_chart::LiveDailyPoint> = Vec::new();
+    if let Some(items) = body.get("live").and_then(Value::as_array) {
+        for item in items.iter().take(1000) {
+            if let (Some(day_unix), Some(mean_r), Some(closed)) = (
+                item.get("dayUnix").and_then(Value::as_i64),
+                item.get("meanR").and_then(Value::as_f64),
+                item.get("closedCount").and_then(Value::as_u64),
+            ) {
+                live.push(setups_analytics::expectancy_chart::LiveDailyPoint {
+                    day_unix,
+                    mean_r,
+                    closed: u32::try_from(closed).unwrap_or(u32::MAX),
+                });
+            }
+        }
     }
     let row = match sqlx::query(
         "select numerical_snapshot from study_expectancy_artifacts where source_study_id=$1 and owner_id='admin' order by id desc limit 1",
@@ -918,12 +935,14 @@ async fn setups_analytics_study_expectancy(
         _ => Vec::new(),
     };
     let series = match tokio::task::spawn_blocking(move || {
-        setups_analytics::expectancy_chart::study_series(&artifact, trend)
+        setups_analytics::expectancy_chart::study_series(&artifact, trend, &live)
     })
     .await
     {
         Ok(Ok(series)) => series,
-        _ => return error_response(StatusCode::NOT_FOUND, "study_expectancy_unavailable"),
+        _ => {
+            return error_response(StatusCode::NOT_FOUND, "study_expectancy_unavailable")
+        }
     };
     let trend_points = series
         .trend_points
@@ -958,7 +977,7 @@ pub fn setups_analytics_router(state: Arc<AnalyticsState>) -> Router {
         )
         .route(
             "/v1/setups/analytics/study-expectancy/{studyId}",
-            get(setups_analytics_study_expectancy),
+            post(setups_analytics_study_expectancy),
         )
         .with_state(state)
 }
