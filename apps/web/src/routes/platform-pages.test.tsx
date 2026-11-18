@@ -525,6 +525,10 @@ describe("platform screens", () => {
   it("previews CSV exclusions and duplicates before replacing the catalog selection", async () => {
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
     await screen.findByRole("checkbox", { name: "BTCUSDT (Trading)" });
+    expect(screen.queryByLabelText("CSV: один символ на строку")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Проверить импорт" })).toBeNull();
+    fireEvent.change(screen.getByLabelText("Импорт CSV без заголовка"), { target: { files: [new File(["BTCUSDT\n"], "list.csv", { type: "text/csv" })] } });
+    await screen.findByLabelText("CSV: один символ на строку");
     fireEvent.change(screen.getByLabelText("CSV: один символ на строку"), { target: { value: "symbol\nbtcusdt\nBTCUSDT\nUNKNOWN\nBTCUSDT,ETHUSDT" } });
     await userEvent.click(screen.getByRole("button", { name: "Проверить импорт" }));
     expect(screen.getByRole("status")).toHaveTextContent("Принято: 1. Дубли: 1. Исключено: 3.");

@@ -28,6 +28,7 @@ export function previewSymbols(text: string, catalog: CatalogInstrument[]): Impo
 export function InstrumentPicker({ catalog, symbols, onChange, disabled, live = false, limit = 100 }: { catalog: CatalogInstrument[]; symbols: string; onChange: (symbols: string) => void; disabled: boolean; live?: boolean; limit?: number | null }) {
   const [search, setSearch] = useState("");
   const [csv, setCsv] = useState("");
+  const [csvChosen, setCsvChosen] = useState(false);
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const selected = new Set(symbols.split(/[\s,;]+/).filter(Boolean));
@@ -40,6 +41,7 @@ export function InstrumentPicker({ catalog, symbols, onChange, disabled, live = 
   async function readFile(file: File | undefined) {
     setError(null); setPreview(null);
     if (!file) return;
+    setCsvChosen(true);
     if (file.size > 262144) { setError("CSV должен быть не больше 256 КиБ."); return; }
     try {
       const text = await file.text();
@@ -59,8 +61,8 @@ export function InstrumentPicker({ catalog, symbols, onChange, disabled, live = 
     {!live && limit !== null && selected.size > limit && <Alert variant="warning" role="alert">Уменьшите список до {limit} инструментов перед запуском. Список не усечён.</Alert>}
     {unavailable.length > 0 && <div className="grid gap-2"><Alert variant="warning" role="alert">Сохранённые символы отсутствуют в текущем каталоге: {unavailable.join(", ")}</Alert><div><Button type="button" variant="outline" size="sm" onClick={() => onChange([...selected].filter((symbol) => !unavailable.includes(symbol)).join("\n"))}>Убрать отсутствующие</Button></div></div>}
     <Field label="Импорт CSV без заголовка">{(control) => <Input type="file" accept=".csv,text/csv,text/plain" onChange={(event) => { void readFile(event.target.files?.[0]); }} {...control} />}</Field>
-    <Field label="CSV: один символ на строку">{(control) => <Textarea maxLength={262144} value={csv} placeholder={"BTCUSDT\nETHUSDT"} onChange={(event) => { setCsv(event.target.value); setPreview(null); }} {...control} />}</Field>
-    <div><Button type="button" variant="outline" size="sm" onClick={() => { setError(null); setPreview(previewSymbols(csv, catalog)); }}>Проверить импорт</Button></div>
+    {csvChosen && <Field label="CSV: один символ на строку">{(control) => <Textarea maxLength={262144} value={csv} placeholder={"BTCUSDT\nETHUSDT"} onChange={(event) => { setCsv(event.target.value); setPreview(null); }} {...control} />}</Field>}
+    {csvChosen && <div><Button type="button" variant="outline" size="sm" onClick={() => { setError(null); setPreview(previewSymbols(csv, catalog)); }}>Проверить импорт</Button></div>}
     {error && <Alert variant="destructive" role="alert">{error}</Alert>}
     {preview && <div className="grid gap-2 rounded-md bg-muted/40 p-3 text-sm"><p role="status">Принято: {preview.accepted.length}. Дубли: {preview.duplicates}. Исключено: {preview.excluded.length}.</p>
       <p>Будет выбран список: {preview.accepted.slice(0, 100).join(", ") || "пусто"}{preview.accepted.length > 100 ? "… (показаны первые 100)" : ""}</p>
