@@ -456,7 +456,7 @@ export function SetupsAnalyticsPanel() {
                   </TableCell>
                   <TableCell><GateBadge passed={study.gatePassed} selected={study.selected} /></TableCell>
                   <TableCell numeric className={`font-medium ${meanColorClass(study.meanR)}`}>{formatRisk(study.meanR)}</TableCell>
-                  <TableCell numeric>{study.closed}</TableCell>
+                  <TableCell numeric>{study.closed}/{studiesMeta.find((meta) => meta.studyId === study.studyId)?.setupCount ?? study.selected}</TableCell>
                 </TableRow>)}
               </TableBody>
             </Table>

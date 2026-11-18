@@ -90,6 +90,7 @@ it("loads studies for the committed range and renders the calculated result", as
   expect(screen.getAllByText("3/5")).toHaveLength(2);
   expect(screen.getByRole("heading", { name: "Исследования-основы" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Подробности исследования 40" })).toBeInTheDocument();
+  expect(screen.getByText("2/3")).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "Сетапы" })).toBeInTheDocument();
   expect(screen.getByText("SYM1")).toBeInTheDocument();
   expect(screen.getAllByText("TP")).toHaveLength(2);
