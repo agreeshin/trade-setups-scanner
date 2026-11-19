@@ -71,14 +71,14 @@ pub async fn ensure_migrations(pool: &PgPool) -> Result<String, sqlx::Error> {
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        r#"create table if not exists kysely_migration (
+        r#"create table if not exists public.kysely_migration (
             name varchar(255) primary key,
             "timestamp" varchar(255) not null
         )"#,
     )
     .execute(&mut *tx)
     .await?;
-    let applied: HashSet<String> = sqlx::query_scalar("select name from kysely_migration")
+    let applied: HashSet<String> = sqlx::query_scalar("select name from public.kysely_migration")
         .fetch_all(&mut *tx)
         .await?
         .into_iter()
@@ -95,8 +95,11 @@ pub async fn ensure_migrations(pool: &PgPool) -> Result<String, sqlx::Error> {
             sqlx::raw_sql(migration_source(name))
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query("select pg_catalog.set_config('search_path', 'public', false)")
+                .execute(&mut *tx)
+                .await?;
         }
-        sqlx::query(r#"insert into kysely_migration (name, "timestamp") values ($1, $2)"#)
+        sqlx::query(r#"insert into public.kysely_migration (name, "timestamp") values ($1, $2)"#)
             .bind(name)
             .bind(chrono::Utc::now().to_rfc3339())
             .execute(&mut *tx)
@@ -151,5 +154,52 @@ mod tests {
         // фиксироваться; правило проверяется на живой БД в деплой-верификации.
         assert_eq!(BASELINE, "0010_baseline.sql");
         assert!(migration_source(BASELINE).contains("CREATE TABLE"));
+    }
+
+    #[tokio::test]
+    async fn ensure_migrations_bootstraps_fresh_database() {
+        use sqlx::Connection as _;
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("TEST_DATABASE_URL absent; fresh-database migration test skipped");
+            return;
+        };
+        let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        assert!(options.get_database().unwrap_or("").ends_with("_test"));
+        assert!(matches!(
+            options.get_host(),
+            "localhost" | "127.0.0.1" | "::1"
+        ));
+        let name = format!("migrate_fresh_{}_test", std::process::id());
+        let mut admin = sqlx::PgConnection::connect_with(&options).await.unwrap();
+        sqlx::query(&format!("drop database if exists {name}"))
+            .execute(&mut admin)
+            .await
+            .unwrap();
+        sqlx::query(&format!("create database {name}"))
+            .execute(&mut admin)
+            .await
+            .unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options.database(&name))
+            .await
+            .unwrap();
+        let summary = ensure_migrations(&pool).await.unwrap();
+        assert_eq!(
+            summary,
+            format!("{} applied, 0 up to date", MIGRATIONS.len())
+        );
+        let runs: i64 = sqlx::query_scalar("select count(*) from replay_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+        let again = ensure_migrations(&pool).await.unwrap();
+        assert_eq!(again, format!("0 applied, {} up to date", MIGRATIONS.len()));
+        pool.close().await;
+        sqlx::query(&format!("drop database {name} with (force)"))
+            .execute(&mut admin)
+            .await
+            .unwrap();
     }
 }
