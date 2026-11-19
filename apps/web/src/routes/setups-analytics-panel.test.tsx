@@ -219,6 +219,17 @@ it("shows study details with the past-and-live chart in a modal", async () => {
   expect(releasePoint!.getAttribute("data-mean-r")).toBe("0.73");
   const pastPoint = chart.querySelector('[data-phase="past"]');
   expect(pastPoint!.getAttribute("fill")).toMatch(/#18cf98|#f08a7f/);
+  const line = chart.querySelector('[data-testid="expectancy-line"]');
+  expect(line).not.toBeNull();
+  const releaseCx = chart.querySelector('[data-phase="release"]')!.getAttribute("cx");
+  expect(line!.getAttribute("points")).toContain(`${releaseCx},`);
+  const forecast = chart.querySelector('[data-testid="forecast-line"]');
+  expect(forecast).not.toBeNull();
+  expect(forecast!.getAttribute("stroke-dasharray")).toBeNull();
+  const nowValue = chart.querySelector('[data-testid="forecast-now-value"]');
+  expect(nowValue).not.toBeNull();
+  expect(nowValue!.getAttribute("fill")).toBe("#f5b041");
+  expect(nowValue!.textContent).toBe("+0.20R");
   expect(dialog.querySelector("img")).toBeNull();
   expect(requests).toContain("/v1/optimization-studies/40");
   expect(requests.some((path) => path === "/v1/setups/analytics/study-expectancy/40")).toBe(true);

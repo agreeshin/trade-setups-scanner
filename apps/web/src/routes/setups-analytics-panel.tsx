@@ -24,6 +24,7 @@ import {
   type SetupsAnalyticsStudyMeta,
   type StudyExpectancyPoint,
   type StudyExpectancySeries,
+  type StudyTrendPoint,
 } from "../lib/setups-analytics-api";
 import {
   algorithmDisplayName,
@@ -222,6 +223,23 @@ function studyPointWithMean(point: StudyExpectancyPoint): point is StudyExpectan
   return point.meanR !== null;
 }
 
+function trendValueAt(points: readonly StudyTrendPoint[], unix: number): number | null {
+  if (points.length === 0) return null;
+  const first = points[0]!;
+  if (unix <= first.dayUnix) return first.value;
+  const last = points.at(-1)!;
+  if (unix >= last.dayUnix) return last.value;
+  for (let index = 1; index < points.length; index += 1) {
+    const point = points[index]!;
+    if (point.dayUnix >= unix) {
+      const previous = points[index - 1]!;
+      const share = (unix - previous.dayUnix) / (point.dayUnix - previous.dayUnix);
+      return previous.value + (point.value - previous.value) * share;
+    }
+  }
+  return last.value;
+}
+
 function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectancySeries; live: readonly DailyOutcome[]; dividerDay: number | null }) {
   const allPast = series.daily.filter(studyPointWithMean);
   const releasePast = dividerDay === null ? null : allPast.find((point) => point.dayUnix === dividerDay) ?? null;
@@ -235,14 +253,20 @@ function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectan
   if (past.length === 0 && livePoints.length === 0 && releaseMean === null) {
     return <p className="text-sm text-muted-foreground">Нет данных для графика.</p>;
   }
-  const trendValues = series.trend.points.map((point) => point.value);
-  const dayNumbers = [...past.map((point) => point.dayUnix), ...livePoints.map((point) => point.dayUnix)];
+  const nowUnix = Math.floor(Date.now() / 1000);
+  const releaseLineValue = releaseMean !== null ? releaseMean : releasePast !== null ? releasePast.meanR : releaseLive !== null ? releaseLive.meanR : null;
+  const linePoints = [...past, ...(dividerDay !== null && releaseLineValue !== null ? [{ dayUnix: dividerDay, meanR: releaseLineValue }] : []), ...livePoints].sort((a, b) => a.dayUnix - b.dayUnix);
+  const trendVisible = series.trend.points.filter((point) => point.dayUnix <= nowUnix);
+  const trendEndValue = trendValueAt(series.trend.points, nowUnix);
+  const trendLine = trendVisible.length > 0 && trendEndValue !== null ? [...trendVisible, { dayUnix: nowUnix, value: trendEndValue }] : [];
+  const dayNumbers = linePoints.map((point) => point.dayUnix);
   if (dividerDay !== null) dayNumbers.push(dividerDay);
+  dayNumbers.push(nowUnix);
   const firstDay = Math.min(...dayNumbers);
   const lastDay = Math.max(...dayNumbers);
   const daySpan = Math.max(1, Math.round((lastDay - firstDay) / DAY_SECONDS));
   const xOf = (dayUnix: number) => CHART_STYLE.left + ((dayUnix - firstDay) / DAY_SECONDS / daySpan) * (CHART_STYLE.right - CHART_STYLE.left);
-  const values = [...past.map((point) => point.meanR), ...livePoints.map((point) => point.meanR), ...(releaseMean !== null ? [releaseMean] : []), ...trendValues];
+  const values = [...linePoints.map((point) => point.meanR), ...trendLine.map((point) => point.value)];
   const rawMin = Math.min(0, ...values);
   const rawMax = Math.max(0, ...values);
   const pad = rawMax - rawMin < 1e-9 ? 0.5 : (rawMax - rawMin) * 0.08;
@@ -268,9 +292,14 @@ function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectan
     </g>)}
     <line x1={CHART_STYLE.left} y1={yOf(0)} x2={CHART_STYLE.right} y2={yOf(0)} stroke={CHART_STYLE.axis} strokeWidth={1.5} />
     <text x={CHART_STYLE.left - 8} y={yOf(0) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>0 R</text>
-    {series.trend.points.length > 1 && <polyline fill="none" stroke={CHART_STYLE.trend} strokeWidth={2} strokeDasharray="4 4" data-method={series.trend.method ?? undefined} points={series.trend.points.map((point) => `${xOf(point.dayUnix)},${yOf(point.value)}`).join(" ")} />}
-    {past.length > 1 && <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={past.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
-    {livePoints.length > 1 && <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={livePoints.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
+    {trendLine.length > 1 && <polyline data-testid="forecast-line" fill="none" stroke={CHART_STYLE.trend} strokeWidth={2} data-method={series.trend.method ?? undefined} points={trendLine.map((point) => `${xOf(point.dayUnix)},${yOf(point.value)}`).join(" ")} />}
+    {trendLine.length > 1 && (() => {
+      const endX = xOf(nowUnix);
+      const endY = yOf(trendLine.at(-1)!.value);
+      const anchor = endX > CHART_STYLE.right - 60 ? "end" : endX < CHART_STYLE.left + 60 ? "start" : "middle";
+      return <text data-testid="forecast-now-value" x={endX} y={Math.max(endY - 8, CHART_STYLE.top + 12)} textAnchor={anchor} fontSize={11} fontWeight={600} fill={CHART_STYLE.trend}>{formatRisk(trendLine.at(-1)!.value)}</text>;
+    })()}
+    {linePoints.length > 1 && <polyline data-testid="expectancy-line" fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={linePoints.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
     {past.map((point) => <circle key={`past-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={dayLabel(point.dayUnix)} data-phase="past">
       <title>{`${dayLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · ретроспектива`}</title>
     </circle>)}
