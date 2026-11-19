@@ -44,6 +44,22 @@ const optimizationStudy40 = {
   forecastBest: { forecastR: 0.44, meanR: 0.3, tpPct: 20, slPct: 6 },
   createdAt: "2026-11-06T00:00:00Z", updatedAt: "2026-11-07T00:00:00Z", events: [],
 };
+const optimizationStudy35 = {
+  ...optimizationStudy40,
+  id: 35,
+  result: {
+    ...optimizationStudy40.result,
+    best: {
+      ...optimizationStudy40.result.best,
+      analytics: { clusterEnabled: false, clusterGapMinutes: null, timeShiftMinutes: 14, priceChangePct: 9, setupMaturity: null, horizonMinutes: 10080 },
+    },
+  },
+};
+const legacyAnalyticsResult = {
+  ...analyticsResult,
+  studies: [{ studyId: 35, selected: 5, gatePassed: 3, closed: 2, meanR: 1.25 }],
+  setups: analyticsResult.setups.map((row) => ({ ...row, studyId: 35 })),
+};
 
 const requests: string[] = [];
 let analyticsResponse: () => Response = () => json(analyticsResult);
@@ -63,6 +79,11 @@ beforeEach(() => {
       return Promise.resolve(json({ studyId: 40, observationCutoff: 1794009600, meanR: 0.2, daily: horizonDays.map((dayUnix, index) => ({ dayUnix, meanR: index % 2 === 0 ? 0.3 : -0.1, tpCount: 1, slCount: 1 })), trend: { method: "mean", points: [{ dayUnix: horizonDays[0]!, value: 0.2 }, { dayUnix: horizonDays.at(-1)!, value: 0.2 }] } }));
     }
     if (path === "/v1/optimization-studies/40") return Promise.resolve(json(optimizationStudy40));
+    if (path === "/v1/optimization-studies/35") return Promise.resolve(json(optimizationStudy35));
+    if (path === "/v1/setups/analytics/study-expectancy/35") {
+      const horizonDays = Array.from({ length: 13 }, (_, index) => 1793923200 + index * 86400);
+      return Promise.resolve(json({ studyId: 35, observationCutoff: 1794009600, meanR: 0.2, daily: horizonDays.map((dayUnix, index) => ({ dayUnix, meanR: index % 2 === 0 ? 0.3 : -0.1, tpCount: 1, slCount: 1 })), trend: { method: "mean", points: [{ dayUnix: horizonDays[0]!, value: 0.2 }, { dayUnix: horizonDays.at(-1)!, value: 0.2 }] } }));
+    }
     if (path.startsWith("/v1/setups/analytics?")) return Promise.resolve(analyticsResponse());
     return Promise.resolve(json({}));
   }));
@@ -201,6 +222,21 @@ it("shows study details with the past-and-live chart in a modal", async () => {
   expect(dialog.querySelector("img")).toBeNull();
   expect(requests).toContain("/v1/optimization-studies/40");
   expect(requests.some((path) => path === "/v1/setups/analytics/study-expectancy/40")).toBe(true);
+});
+
+it("opens legacy study details with null analytics without white screen", async () => {
+  analyticsResponse = () => json(legacyAnalyticsResult);
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 35" }));
+  await settle();
+  await settle();
+  const dialog = screen.getByRole("dialog");
+  expect(within(dialog).getByText("Исследование №35")).toBeInTheDocument();
+  expect(within(dialog).getByText("выключена")).toBeInTheDocument();
+  expect(within(dialog).getAllByText("—").length).toBeGreaterThanOrEqual(2);
+  expect(within(dialog).getByTestId("study-horizon-chart")).toBeInTheDocument();
 });
 
 it("disables calculation and hints when the range is invalid", async () => {

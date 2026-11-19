@@ -382,7 +382,7 @@ function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { s
               <div><dt className="text-muted-foreground">Сдвиг времени, мин</dt><dd className="tabular-nums">{best.analytics.timeShiftMinutes}</dd></div>
               <div><dt className="text-muted-foreground">Смещение цены, %</dt><dd className="tabular-nums">{best.analytics.priceChangePct === null || best.analytics.priceChangePct === undefined ? "не используется" : String(best.analytics.priceChangePct)}</dd></div>
               <div><dt className="text-muted-foreground">Кластеризация</dt><dd>{best.analytics.clusterEnabled ? "включена" : "выключена"}</dd></div>
-              <div><dt className="text-muted-foreground">Зрелость сетапа в кластере</dt><dd className="tabular-nums">{best.analytics.setupMaturity === undefined ? "—" : best.analytics.setupMaturity.toFixed(1)}</dd></div>
+              <div><dt className="text-muted-foreground">Зрелость сетапа в кластере</dt><dd className="tabular-nums">{best.analytics.setupMaturity === null || best.analytics.setupMaturity === undefined ? "—" : best.analytics.setupMaturity.toFixed(1)}</dd></div>
               <div><dt className="text-muted-foreground">Разрыв кластера, ч</dt><dd className="tabular-nums">{best.analytics.clusterGapMinutes === null || best.analytics.clusterGapMinutes === undefined ? "—" : String(best.analytics.clusterGapMinutes / 60)}</dd></div>
               <div><dt className="text-muted-foreground">Горизонт сделки, мин</dt><dd className="tabular-nums">{best.analytics.horizonMinutes === undefined ? "—" : String(best.analytics.horizonMinutes)}</dd></div>
             </dl>}
