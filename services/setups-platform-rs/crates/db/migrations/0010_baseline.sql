@@ -2,8 +2,6 @@
 -- PostgreSQL database dump
 --
 
-\restrict mU2MAGKOddTmzwYzeNRkdIVK83MVdQT84uQF52P8idugdWugUBEgX7mi7gAlzTY
-
 -- Dumped from database version 17.11
 -- Dumped by pg_dump version 17.11
 
@@ -453,6 +451,4 @@ ALTER TABLE ONLY public.replay_runs
 --
 -- PostgreSQL database dump complete
 --
-
-\unrestrict mU2MAGKOddTmzwYzeNRkdIVK83MVdQT84uQF52P8idugdWugUBEgX7mi7gAlzTY
 
