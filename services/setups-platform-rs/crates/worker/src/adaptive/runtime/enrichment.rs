@@ -723,22 +723,13 @@ pub(super) async fn load(pool: &PgPool, slot: &ActiveAdaptiveSlot) -> CapturedEx
     // capture validates once without monopolizing an async executor thread or
     // detaching a validation job that could outlive its commit admission.
     let capture = async {
-        let row = async {
-            if recipe.is_some() {
-                // The chain's immutable committed reference owns the exact
-                // outcome hash. Do not guess it from means, choose any v3 row,
-                // or fall back to an old generation's version-only lookup.
-                let id: Option<Option<i64>> = sqlx::query_scalar("select expectancy_artifact_id from continuous_generations where id=$1 and owner_id=$2 and slot_id=$3 and study_id=$4")
-                    .bind(slot.generation_id).bind(&slot.owner_id).bind(slot.slot_id).bind(slot.study_id)
-                    .fetch_optional(pool).await?;
-                match id.flatten() {
-                    Some(id) => setups_db::expectancy::get(pool, &slot.owner_id, id).await,
-                    None => Ok(None),
-                }
-            } else {
-                setups_db::expectancy::get_for_generation(pool, &slot.owner_id, slot.generation_id, &version).await
+        let row = match read_artifact_row(pool, slot, recipe, &version).await {
+            Err(error) => {
+                report_read_failed(slot, &error);
+                read_artifact_row(pool, slot, recipe, &version).await
             }
-        }.await;
+            ok => ok,
+        };
         match row {
             // Both DB readers validate numerical JSON before returning it.
             // Carry that private proof through source/identity checks rather
@@ -771,6 +762,38 @@ pub(super) async fn load(pool: &PgPool, slot: &ActiveAdaptiveSlot) -> CapturedEx
     captured
 }
 
+async fn read_artifact_row(
+    pool: &PgPool,
+    slot: &ActiveAdaptiveSlot,
+    recipe: Option<ForecastRecipe>,
+    version: &str,
+) -> Result<Option<setups_db::expectancy::Artifact>, setups_db::DbError> {
+    if recipe.is_some() {
+        // The chain's immutable committed reference owns the exact
+        // outcome hash. Do not guess it from means, choose any v3 row,
+        // or fall back to an old generation's version-only lookup.
+        let id: Option<Option<i64>> = sqlx::query_scalar("select expectancy_artifact_id from continuous_generations where id=$1 and owner_id=$2 and slot_id=$3 and study_id=$4")
+            .bind(slot.generation_id).bind(&slot.owner_id).bind(slot.slot_id).bind(slot.study_id)
+            .fetch_optional(pool).await?;
+        match id.flatten() {
+            Some(id) => setups_db::expectancy::get(pool, &slot.owner_id, id).await,
+            None => Ok(None),
+        }
+    } else {
+        setups_db::expectancy::get_for_generation(pool, &slot.owner_id, slot.generation_id, version)
+            .await
+    }
+}
+
+fn report_read_failed(slot: &ActiveAdaptiveSlot, error: &setups_db::DbError) {
+    eprintln!(
+        "[adaptive-expectancy] read_failed generation={} slot={} error={}",
+        slot.generation_id,
+        slot.slot_id,
+        error.to_string().chars().take(200).collect::<String>()
+    );
+}
+
 fn saved_recipe(slot: &ActiveAdaptiveSlot) -> Result<Option<ForecastRecipe>, WorkerError> {
     let snapshot: setups_domain::AdaptiveRecommendationSnapshot =
         serde_json::from_value(slot.result["recommendation"].clone())?;
@@ -788,7 +811,8 @@ fn capture_result(
 ) -> CapturedExpectancy {
     let row = match result {
         Ok(row) => row,
-        Err(_) => {
+        Err(error) => {
+            report_read_failed(slot, &error);
             return CapturedExpectancy {
                 artifact: None,
                 artifact_id: None,
