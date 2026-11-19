@@ -203,6 +203,12 @@ it("labels the accepted winner from saved forecast fields even when the edited c
   expect(screen.getByText("Выбор по прогнозу: 0.50 R · score матрицы 0.60 R")).toBeInTheDocument();
   expect(screen.getByText(/TP 14% \/ SL 4% · -0.30 R/)).toBeInTheDocument();
 });
+
+it("shows the deferred threshold queue alongside the active one while research runs", () => {
+  render(<ContinuousResearch algorithm={algorithm} controller={profileController({}, { pendingConfig: { lookbackDays: 45, minSetupsPerDay: [1, 3, 4, 5, 6], minMeanExpectancy: 0.15, adaptiveEnabled: true, study: spec } })} />);
+  expect(screen.getByText(/Очередь порогов: 4 · последние 30 суток\./)).toBeInTheDocument();
+  expect(screen.getByText(/Сохранено на следующее исследование: 1, 3, 4, 5, 6 · последние 45 суток\./)).toBeInTheDocument();
+});
 function liveButton() {
   const row = within(screen.getByRole("table", { name: "Адаптивные профили · Мой алгоритм" })).getAllByRole("row")[1]!;
   return within(within(row).getAllByRole("cell")[2]!).getByRole("button");

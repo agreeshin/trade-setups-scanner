@@ -333,7 +333,7 @@ export function ContinuousResearch({ controller, children }: { algorithm?: Algor
     {process && <>
       <p className="flex flex-wrap items-center gap-2 text-sm"><span>Ревизия конфигурации: {process.configRevision}{process.activeStudyId !== null ? ` · Исследование #${process.activeStudyId}` : ""}</span>{process.phase && <Badge variant={phaseVariant(process)}>{Object.hasOwn(phases, process.phase) ? phases[process.phase] : process.phase}</Badge>}</p>
       {process.status === "error" && process.error && <Alert variant="destructive">{process.error.code}: {process.error.message}. Технический сбой не означает непрохождение допуска; прежний принятый профиль может сохраняться.</Alert>}
-      {process.config && <p className="text-sm">Очередь порогов: {process.config.minSetupsPerDay.join(", ")} · последние {process.config.lookbackDays} суток.</p>}
+      {process.config && <p className="text-sm">Очередь порогов: {process.config.minSetupsPerDay.join(", ")} · последние {process.config.lookbackDays} суток.{process.pendingConfig && <> Сохранено на следующее исследование: {process.pendingConfig.minSetupsPerDay.join(", ")} · последние {process.pendingConfig.lookbackDays} суток.</>}</p>}
     </>}
   </section>;
 }
