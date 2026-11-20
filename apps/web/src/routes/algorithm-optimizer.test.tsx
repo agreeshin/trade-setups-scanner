@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { summarizeOptimizationStudy, type OptimizationSpec, type OptimizationStudy } from "../lib/optimization-api";
-import { formatUnix } from "../lib/datetime-format";
+import { applyInterfaceSettings, formatUnix, interfaceSettings } from "../lib/datetime-format";
 import { AlgorithmsPage } from "./algorithms-page";
 import type { Algorithm } from "./platform-controls";
 
@@ -64,6 +64,7 @@ const cleanupFixture = { eligible: true, blockers: [] as string[], fingerprint: 
 let cleanupPreview = cleanupFixture;
 let cleanupStatus = 200;
 const requests: { path: string; method: string; body: unknown; signal?: AbortSignal | null }[] = [];
+const initialInterfaceSettings = interfaceSettings();
 beforeEach(() => {
   studies = []; createStatus = 202; deleteStatus = 200; deleteErrorCode = "delete_failed"; cancelStatus = 202; draftStatus = 200; drafts = {}; requests.length = 0;
   listedAlgorithms = [algorithm, { ...algorithm, id: "second_algorithm", name: "Второй алгоритм" }];
@@ -121,7 +122,7 @@ beforeEach(() => {
     return json({});
   }));
 });
-afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); applyInterfaceSettings(initialInterfaceSettings); });
 
 async function openOptimizer() {
   const flexible = await screen.findByRole("tab", { name: "Live-сканирование с гибкими параметрами" });
@@ -383,6 +384,7 @@ it("labels a forecast winner and keeps its recorded negative period mean separat
 });
 
 it("shows an immutable mean result recipe and cutoff without fabricating an uncomputed pure forecast", async () => {
+  applyInterfaceSettings({ timezone: "America/New_York" });
   const saved = record("completed");
   const forecast = { method: "decayed_probability", version: 1, halfLifeDays: 14, kappa: 10, priorPolicy: "gross_break_even" } as const;
   const observationCutoff = Date.parse("2026-11-15T00:00:00Z") / 1000;
@@ -397,7 +399,7 @@ it("shows an immutable mean result recipe and cutoff without fabricating an unco
   const fixed = within(await screen.findByRole("region", { name: "Фиксированные требования исследования" }));
   expect(fixed.getByText("Среднее за период")).toBeInTheDocument();
   expect(fixed.getByText(/H 14 дней · κ 10/)).toBeInTheDocument();
-  expect(fixed.getByText(/2026-11-15T00:00:00.000Z/)).toBeInTheDocument();
+  expect(fixed.getByText("Cutoff C результата").nextElementSibling).toHaveTextContent("14.11.2026, 19:00:00 (America/New_York) · из сохранённого результата, не текущей формы");
   expect(fixed.queryByText(/999/)).not.toBeInTheDocument();
   const pair = within(screen.getByRole("region", { name: "Лучшая forecast-пара" }));
   expect(pair.getByText("—")).toBeInTheDocument();
