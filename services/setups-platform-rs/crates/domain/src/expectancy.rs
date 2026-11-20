@@ -732,6 +732,19 @@ impl ExpectancyArtifact {
         Ok(ExpectancyObjectiveSeries { mean_r, forecast_r, decision_r, curve, method })
     }
 
+    /// Extend only the display window: keep the sealed prefix and carry its
+    /// available objective endpoint forward, without new outcomes or refitting.
+    pub fn objective_series_through(&self, objective: ExpectancyObjective, observed_through_unix: i64) -> Result<ExpectancyObjectiveSeries, ExpectancyError> {
+        let cutoff = self.source.provenance.observation_cutoff;
+        if observed_through_unix < cutoff { return Err(ExpectancyError::InvalidPeriod); }
+        let mut series = self.objective_series(objective)?;
+        if let (true, Some(value)) = (observed_through_unix > cutoff, series.decision_r.as_ref().copied()) {
+            if series.curve.is_empty() { series.curve.push((cutoff as f64, Some(value))); }
+            series.curve.push((observed_through_unix as f64, Some(value)));
+        }
+        Ok(series)
+    }
+
     /// Validate persisted/untrusted structs before use; no silent upgrading of
     /// browser-local/indexed v1 or modified coefficients in an immutable copy.
     pub fn validate(&self) -> Result<(), ExpectancyError> {
@@ -927,6 +940,96 @@ mod tests {
                 assert_eq!(artifact.to_json().unwrap(), sealed, "projection never rewrites old science");
             }
         }
+    }
+
+    #[test]
+    fn objective_series_through_preserves_sealed_prefix_and_flat_future_for_every_mode() {
+        for recipe in [None, Some(ForecastRecipe::engineering_baseline()),
+            Some(ForecastRecipe::Trend { version: 1, bend_days: TrendBendDays::Linear }),
+            Some(ForecastRecipe::Trend { version: 1, bend_days: TrendBendDays::Seven })] {
+            let (mut input, _) = fixture();
+            input.source.forecast = recipe;
+            let artifact = build_expectancy_artifact(input).unwrap();
+            let sealed = artifact.to_json().unwrap();
+            let cutoff = artifact.source.provenance.observation_cutoff;
+            let through = cutoff + 7 * UTC_DAY_SECONDS + 17;
+            let bend = match recipe { Some(ForecastRecipe::Trend { bend_days, .. }) => bend_days, _ => TrendBendDays::Linear };
+            for mode in [TrendMode::Mean, TrendMode::Forecast, TrendMode::Blend] {
+                for lambda in [0.05, 0.35, 0.7, 0.95] {
+                    let objective = ExpectancyObjective { version: 1, trend_mode: mode, trend_bend_days: bend,
+                        trend_blend_lambda: TrendBlendLambda::try_from(lambda).unwrap(), forecast: recipe };
+                    let original = artifact.objective_series(objective).unwrap();
+                    let extended = artifact.objective_series_through(objective, through).unwrap();
+                    assert_eq!(extended.mean_r, original.mean_r);
+                    assert_eq!(extended.forecast_r, original.forecast_r);
+                    assert_eq!(extended.decision_r, original.decision_r);
+                    assert_eq!(extended.method, original.method);
+                    assert_eq!(&extended.curve[..original.curve.len()], original.curve.as_slice());
+                    assert_eq!(extended.curve.len(), original.curve.len() + 1);
+                    assert_eq!(extended.curve.last(), Some(&(through as f64, original.decision_r.as_ref().copied())));
+                    assert_eq!(artifact.objective_series_through(objective, cutoff).unwrap(), original,
+                        "equal cutoff must not append or rewrite an endpoint");
+                    // The API accepts no post-start outcomes: changing only the
+                    // display horizon cannot decay evidence or refit any model.
+                    let later = artifact.objective_series_through(objective, through + 30 * UTC_DAY_SECONDS).unwrap();
+                    assert_eq!(&later.curve[..original.curve.len()], original.curve.as_slice());
+                    assert_eq!(later.curve.len(), original.curve.len() + 1);
+                    assert_eq!(later.curve.last().unwrap().1, extended.curve.last().unwrap().1);
+                    if recipe.is_none() && mode == TrendMode::Forecast {
+                        assert_ne!(extended.curve.last().unwrap().1,
+                            artifact.forecast_at_raw_signal(through).unwrap().as_ref().copied(),
+                            "legacy display projection must not use extrapolated legacy OLS");
+                    }
+                    assert_eq!(artifact.to_json().unwrap(), sealed, "display extension never mutates the artifact");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn objective_series_through_preserves_unavailable_instead_of_inventing_zero() {
+        let (mut input, _) = fixture();
+        input.daily = MetricAvailability::Unavailable { reason: ExpectancyUnavailableReason::MissingFrozenOutcomes };
+        let artifact = build_expectancy_artifact(input).unwrap();
+        let cutoff = artifact.source.provenance.observation_cutoff;
+        for mode in [TrendMode::Forecast, TrendMode::Blend] {
+            let objective = ExpectancyObjective { version: 1, trend_mode: mode, trend_bend_days: TrendBendDays::Linear,
+                trend_blend_lambda: TrendBlendLambda::default(), forecast: None };
+            let original = artifact.objective_series(objective).unwrap();
+            let extended = artifact.objective_series_through(objective, cutoff + UTC_DAY_SECONDS).unwrap();
+            assert_eq!(extended, original);
+            assert_eq!(extended.decision_r, MetricAvailability::Unavailable { reason: ExpectancyUnavailableReason::MissingFrozenOutcomes });
+            assert!(extended.curve.is_empty());
+        }
+        let mean = ExpectancyObjective { version: 1, trend_mode: TrendMode::Mean, trend_bend_days: TrendBendDays::Linear,
+            trend_blend_lambda: TrendBlendLambda::default(), forecast: None };
+        let original = artifact.objective_series(mean).unwrap();
+        let sealed = artifact.to_json().unwrap();
+        let extended = artifact.objective_series_through(mean, cutoff + UTC_DAY_SECONDS).unwrap();
+        assert!(original.curve.is_empty());
+        assert_eq!(extended.decision_r, original.decision_r);
+        assert_eq!(extended.curve, vec![(cutoff as f64, original.decision_r.as_ref().copied()),
+            ((cutoff + UTC_DAY_SECONDS) as f64, original.decision_r.as_ref().copied())]);
+        assert!(extended.curve.iter().all(|point| point.0 >= cutoff as f64), "no historical daily observations are invented");
+        assert_eq!(artifact.objective_series_through(mean, cutoff).unwrap(), original);
+        assert_eq!(artifact.to_json().unwrap(), sealed);
+    }
+
+    #[test]
+    fn objective_series_through_rejects_backward_windows_and_invalid_objectives() {
+        let (input, _) = fixture();
+        let artifact = build_expectancy_artifact(input).unwrap();
+        let cutoff = artifact.source.provenance.observation_cutoff;
+        let mut objective = ExpectancyObjective { version: 1, trend_mode: TrendMode::Forecast, trend_bend_days: TrendBendDays::Linear,
+            trend_blend_lambda: TrendBlendLambda::default(), forecast: None };
+        for through in [cutoff - 1, i64::MIN] {
+            assert_eq!(artifact.objective_series_through(objective, through), Err(ExpectancyError::InvalidPeriod));
+        }
+        objective.forecast = Some(ForecastRecipe::engineering_baseline());
+        assert_eq!(artifact.objective_series_through(objective, cutoff), Err(ExpectancyError::InvalidForecast));
+        objective.forecast = None;
+        objective.version = 99;
+        assert_eq!(artifact.objective_series_through(objective, cutoff + UTC_DAY_SECONDS), Err(ExpectancyError::UnsupportedVersion));
     }
 
     #[test]
