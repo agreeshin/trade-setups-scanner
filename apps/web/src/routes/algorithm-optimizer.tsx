@@ -13,6 +13,7 @@ import { OptimizationFields } from "./optimization-fields";
 import { OptimizationResults } from "./optimization-results";
 import { OptimizationTrashIcon } from "./optimization-history";
 import { useOptimizationDetail } from "./use-optimization-detail";
+import { StudyActualSection } from "./study-actual-section";
 import type { OptimizationController } from "./use-optimization-studies";
 import { applyOptimizationDraftScope, createOptimizationDraft, restoreOptimizationDraft, useOptimizationDraftSave, type OptimizationFormDraft } from "./optimization-draft";
 
@@ -111,6 +112,7 @@ export function OptimizationStudyDialog({ id, algorithm, controller, open, onOpe
   return <Dialog open={open} onOpenChange={onOpenChange}>
     <DialogContent className="max-w-4xl" onCloseAutoFocus={(event) => { event.preventDefault(); (document.getElementById(returnFocusId) ?? document.getElementById(fallbackFocusId))?.focus(); }}>
       <DialogHeader><DialogTitle>Исследование #{id} · {algorithmDisplayName(algorithm)}</DialogTitle><DialogDescription>Сохранённое исследование. Просмотр и закрытие окна не меняют серверную работу или настройки.</DialogDescription></DialogHeader>
+      {open && id !== undefined && <StudyActualSection key={id} studyId={id} revisionTrigger={controller.revision} />}
       <div className="grid min-w-0 gap-4">
         {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
         <StudyDetail detail={detail} algorithm={algorithm} controller={controller} onDelete={onDelete} />

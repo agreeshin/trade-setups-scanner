@@ -1,4 +1,7 @@
 import { apiFetch } from "./platform-api";
+import { buildForecastRecipe, isTrendBendDays, restoreForecastRecipeDraft, type ForecastRecipe } from "./forecast-recipe";
+import type { TrendBendDays } from "./analytics-api";
+import type { SetupsAnalyticsSetup, SetupsAnalyticsStatus } from "./setups-analytics-api";
 
 export type StudyActualStatus = "not_calculated" | "queued" | "running" | "completed" | "failed";
 export type StudyActualStage = "queued" | "acquiring" | "replaying" | "evaluating" | "publishing" | "completed" | "failed";
@@ -18,6 +21,30 @@ export interface StudyActualSummary {
   meanR: number | null;
   error: { code: string; stage: string; message: string } | null;
 }
+export type StudyActualAvailability = { status: "available" } | { status: "unavailable"; reason: string };
+export type StudyActualNumber = { status: "available"; value: number } | { status: "unavailable"; reason: string };
+export interface OriginalObjectiveDTO {
+  version: 1; trendMode: "mean" | "forecast" | "blend"; trendBendDays: TrendBendDays;
+  trendBlendLambda: number; forecast: ForecastRecipe | null;
+}
+export interface StudyActualDailyPoint {
+  dayUnix: number; plotAtUnix: number; meanR: number | null; closedCount: number; tpCount: number; slCount: number;
+}
+export interface StudyActualReport {
+  sourceArtifactId: number | null; retrospective: true; executionStartedAt: string; observedThroughUnix: number;
+  historical: { availability: StudyActualAvailability; daily: StudyActualDailyPoint[] };
+  actual: { daily: StudyActualDailyPoint[] };
+  originalObjective: OriginalObjectiveDTO | null;
+  projection: { availability: StudyActualAvailability; method: string | null; points: { atUnix: number; value: number | null }[]; fittedOnPostStudyData: false };
+  originalEndpoint: { meanR: StudyActualNumber; forecastR: StudyActualNumber; decisionR: StudyActualNumber; atUnix: number | null };
+}
+export interface StudyActualDetail extends StudyActualSummary { report: StudyActualReport | null }
+export type StudyActualSetup = Omit<SetupsAnalyticsSetup, "slotId"> & { slotId: number | null };
+export interface StudyActualSetupPage {
+  studyId: number; jobId: string; revision: number; retrospective: true; total: number; limit: number; offset: number; setups: StudyActualSetup[];
+}
+export const STUDY_ACTUAL_CHANGED = "study-actual-changed";
+export const STUDY_ACTUAL_PAGE_SIZE = 50;
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -57,8 +84,8 @@ export function parseStudyActualSummary(value: unknown, studyId: number): StudyA
     observedThroughUnix: value.observedThroughUnix, counts, meanR: value.meanR, error };
 }
 
-async function requestSummary(studyId: number, init: RequestInit, refresh: boolean): Promise<StudyActualSummary> {
-  const response = await apiFetch(`/v1/optimization-studies/${studyId}/actual${refresh ? "/refresh" : ""}`, init);
+async function requestBody(studyId: number, init: RequestInit, suffix = ""): Promise<unknown> {
+  const response = await apiFetch(`/v1/optimization-studies/${studyId}/actual${suffix}`, init);
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok) {
     const code = record(body) && typeof body.error === "string" ? body.error : "";
@@ -74,13 +101,99 @@ async function requestSummary(studyId: number, init: RequestInit, refresh: boole
       : `Расчёт после исследования недоступен: HTTP ${response.status}`;
     throw new StudyActualApiError(message, response.status, code, current);
   }
-  return parseStudyActualSummary(body, studyId);
+  return body;
 }
 
-export function getStudyActualSummary(studyId: number, signal: AbortSignal): Promise<StudyActualSummary> {
-  return requestSummary(studyId, { signal }, false);
+export async function getStudyActualSummary(studyId: number, signal: AbortSignal): Promise<StudyActualSummary> {
+  return parseStudyActualSummary(await requestBody(studyId, { signal }), studyId);
 }
-export function refreshStudyActual(studyId: number, signal: AbortSignal): Promise<StudyActualSummary> {
-  return requestSummary(studyId, { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal }, true);
+export async function refreshStudyActual(studyId: number, signal: AbortSignal): Promise<StudyActualSummary> {
+  const actual = parseStudyActualSummary(await requestBody(studyId, { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal }, "/refresh"), studyId);
+  // Ephemeral invalidation only, never a browser report cache. Open views then read persisted state.
+  window.dispatchEvent(new CustomEvent(STUDY_ACTUAL_CHANGED, { detail: actual }));
+  return actual;
 }
 export const isStudyActualPending = (actual: Pick<StudyActualSummary, "status"> | null | undefined): boolean => actual?.status === "queued" || actual?.status === "running";
+
+function invalidReport(): StudyActualApiError { return new StudyActualApiError("Некорректный сохранённый отчёт после исследования."); }
+function availability(value: unknown): StudyActualAvailability {
+  if (!record(value)) throw invalidReport();
+  if (value.status === "available") return { status: "available" };
+  if (value.status === "unavailable" && typeof value.reason === "string") return { status: "unavailable", reason: value.reason };
+  throw invalidReport();
+}
+function availableNumber(value: unknown): StudyActualNumber {
+  const state = availability(value);
+  if (state.status === "unavailable") return state;
+  if (!record(value) || !finite(value.value)) throw invalidReport();
+  return { status: "available", value: value.value };
+}
+function dailyPoints(value: unknown): StudyActualDailyPoint[] {
+  if (!Array.isArray(value) || value.length > 10_000) throw invalidReport();
+  return value.map((point: unknown) => {
+    if (!record(point) || !count(point.dayUnix) || !finite(point.plotAtUnix) || !(point.meanR === null || finite(point.meanR))
+      || !count(point.closedCount) || !count(point.tpCount) || !count(point.slCount)) throw invalidReport();
+    return { dayUnix: point.dayUnix, plotAtUnix: point.plotAtUnix, meanR: point.meanR, closedCount: point.closedCount, tpCount: point.tpCount, slCount: point.slCount };
+  });
+}
+/** ExpectancyObjective has serde(rename_all="camelCase"); no frontend recipe defaults or model fit. */
+export function parseOriginalObjective(value: unknown): OriginalObjectiveDTO | null {
+  if (value === null) return null;
+  if (!record(value) || value.version !== 1 || !["mean", "forecast", "blend"].includes(String(value.trendMode))
+    || !isTrendBendDays(value.trendBendDays) || !finite(value.trendBlendLambda)
+    || value.trendBlendLambda < 0.05 || value.trendBlendLambda > 0.95) throw invalidReport();
+  let forecast: ForecastRecipe | null = null;
+  if (value.forecast !== null) {
+    const draft = restoreForecastRecipeDraft(value.forecast);
+    if (draft === undefined) throw invalidReport();
+    forecast = buildForecastRecipe(draft);
+  }
+  return { version: 1, trendMode: value.trendMode as OriginalObjectiveDTO["trendMode"], trendBendDays: value.trendBendDays,
+    trendBlendLambda: value.trendBlendLambda, forecast };
+}
+function parseReport(value: unknown): StudyActualReport {
+  if (!record(value) || !(value.sourceArtifactId === null || (count(value.sourceArtifactId) && value.sourceArtifactId > 0))
+    || value.retrospective !== true || typeof value.executionStartedAt !== "string" || !Number.isFinite(Date.parse(value.executionStartedAt))
+    || !count(value.observedThroughUnix) || !record(value.historical) || !record(value.actual) || !record(value.projection)
+    || value.projection.fittedOnPostStudyData !== false || !(value.projection.method === null || typeof value.projection.method === "string")
+    || !Array.isArray(value.projection.points) || value.projection.points.length > 10_000 || !record(value.originalEndpoint)
+    || !(value.originalEndpoint.atUnix === null || finite(value.originalEndpoint.atUnix))) throw invalidReport();
+  const points = value.projection.points.map((point: unknown) => {
+    if (!record(point) || !finite(point.atUnix) || !(point.value === null || finite(point.value))) throw invalidReport();
+    return { atUnix: point.atUnix, value: point.value };
+  });
+  return { sourceArtifactId: value.sourceArtifactId, retrospective: true, executionStartedAt: value.executionStartedAt, observedThroughUnix: value.observedThroughUnix,
+    historical: { availability: availability(value.historical.availability), daily: dailyPoints(value.historical.daily) },
+    actual: { daily: dailyPoints(value.actual.daily) }, originalObjective: parseOriginalObjective(value.originalObjective),
+    projection: { availability: availability(value.projection.availability), method: value.projection.method, points, fittedOnPostStudyData: false },
+    originalEndpoint: { meanR: availableNumber(value.originalEndpoint.meanR), forecastR: availableNumber(value.originalEndpoint.forecastR), decisionR: availableNumber(value.originalEndpoint.decisionR), atUnix: value.originalEndpoint.atUnix } };
+}
+export async function getStudyActual(studyId: number, signal: AbortSignal): Promise<StudyActualDetail> {
+  const body = await requestBody(studyId, { signal });
+  const summary = parseStudyActualSummary(body, studyId);
+  if (!record(body) || (summary.status === "completed" && (body.report == null || summary.jobId === null || summary.revision < 1 || summary.counts === null))) throw invalidReport();
+  return { ...summary, report: summary.status === "completed" ? parseReport(body.report) : null };
+}
+
+function parseSetup(value: unknown, studyId: number): StudyActualSetup {
+  const statuses: readonly unknown[] = ["tp", "sl", "unclosed", "no_data", "gate_failed"];
+  if (!record(value) || !count(value.id) || value.id < 1 || value.studyId !== studyId || typeof value.symbol !== "string"
+    || typeof value.exchange !== "string" || !(value.slotId === null || (count(value.slotId) && value.slotId > 0))
+    || !(value.direction === "short" || value.direction === "long") || !count(value.setupTimeUnix) || !statuses.includes(value.status)
+    || ![value.entryTimeUnix, value.entryPrice, value.gateThreshold, value.tpPrice, value.slPrice, value.closeTimeUnix, value.closePrice, value.riskReturn].every((field) => field === null || finite(field))) throw invalidReport();
+  return { id: value.id, studyId, symbol: value.symbol, exchange: value.exchange, slotId: value.slotId, direction: value.direction,
+    setupTimeUnix: value.setupTimeUnix, entryTimeUnix: value.entryTimeUnix as number | null, entryPrice: value.entryPrice as number | null,
+    gateThreshold: value.gateThreshold as number | null, tpPrice: value.tpPrice as number | null, slPrice: value.slPrice as number | null,
+    closeTimeUnix: value.closeTimeUnix as number | null, closePrice: value.closePrice as number | null,
+    riskReturn: value.riskReturn as number | null, status: value.status as SetupsAnalyticsStatus };
+}
+export async function getStudyActualSetups(studyId: number, revision: number, jobId: string, offset: number, signal: AbortSignal): Promise<StudyActualSetupPage> {
+  const query = new URLSearchParams({ revision: String(revision), offset: String(offset), limit: String(STUDY_ACTUAL_PAGE_SIZE) });
+  const body = await requestBody(studyId, { signal }, `/setups?${query}`);
+  if (!record(body) || body.studyId !== studyId || body.revision !== revision || body.jobId !== jobId) {
+    throw new StudyActualApiError("Результат исследования обновился. Загрузите текущую ревизию.", 409, "study_actual_revision_changed");
+  }
+  if (body.retrospective !== true || !count(body.total) || body.limit !== STUDY_ACTUAL_PAGE_SIZE || body.offset !== offset
+    || !Array.isArray(body.setups) || body.setups.length > STUDY_ACTUAL_PAGE_SIZE || body.setups.length > body.total) throw invalidReport();
+  return { studyId, jobId, revision, retrospective: true, total: body.total, limit: STUDY_ACTUAL_PAGE_SIZE, offset, setups: body.setups.map((setup: unknown) => parseSetup(setup, studyId)) };
+}

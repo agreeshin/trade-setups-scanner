@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { summarizeOptimizationStudy, type OptimizationSpec, type OptimizationStudy } from "../lib/optimization-api";
+import { notCalculatedActualResponse } from "../../test/study-actual-fixture";
 import { applyInterfaceSettings, formatUnix, interfaceSettings } from "../lib/datetime-format";
 import { AlgorithmsPage } from "./algorithms-page";
 import type { Algorithm } from "./platform-controls";
@@ -109,6 +110,8 @@ beforeEach(() => {
       if (cancelStatus !== 202) return json({ error: "cancel_failed" }, cancelStatus);
       studies = studies.map((study) => study.id === Number(cancel[1]) ? { ...study, status: "cancel_requested" } : study); return json(studies.find((study) => study.id === Number(cancel[1])), 202);
     }
+    const actual = /^\/v1\/optimization-studies\/(\d+)\/actual$/.exec(path);
+    if (actual) return json(notCalculatedActualResponse(Number(actual[1])));
     const detail = /^\/v1\/optimization-studies\/(\d+)$/.exec(path);
     if (detail) {
       const id = Number(detail[1]);
@@ -687,10 +690,10 @@ it("shows five inline summaries without pagination and all history in an open pa
   const table = within(await screen.findByRole("table", { name: "Исследования · Новый алгоритм" }));
   await table.findByRole("button", { name: "Результат исследования 30" });
   expect(screen.queryByText("Загрузка истории исследований…")).not.toBeInTheDocument();
-  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучший Score", "Лучший прогноз матожидания", "Действия"]);
+  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучший Score", "Лучший прогноз матожидания", "Матожидание факт", "Действия"]);
   expect(table.getAllByRole("row")).toHaveLength(6);
   const first = within(table.getAllByRole("row")[1]!);
-  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#30", "Ручное", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "Менее 1 мин", "0", "0.00 R", "0.00 R", ""]);
+  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#30", "Ручное", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "Менее 1 мин", "0", "0.00 R", "0.00 R", "Не рассчитано", ""]);
   expect(table.getAllByRole("row")[2]).toHaveTextContent("Гейт не применялся");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("—");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("1 дн 1 ч 1 мин");

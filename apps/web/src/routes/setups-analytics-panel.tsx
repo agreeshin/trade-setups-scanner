@@ -38,6 +38,7 @@ import {
 } from "./platform-controls";
 
 import { formatOutcomeRisk as formatRisk, outcomeMeanClass as meanColorClass, SetupOutcomesTable } from "./setup-outcomes-table";
+import { calendarDays, CHART_STYLE } from "./study-chart-style";
 
 const FILTER_STORAGE_KEY = "setups-analytics-filter-v1";
 
@@ -81,22 +82,6 @@ function GateBadge({ passed, selected }: { passed: number; selected: number }) {
 }
 
 const DAY_SECONDS = 86400;
-const CHART_STYLE = {
-  width: 900,
-  height: 320,
-  left: 80,
-  right: 872,
-  top: 66,
-  bottom: 258,
-  background: "#121314",
-  foreground: "#eceef0",
-  line: "#b9bec6",
-  positive: "#18cf98",
-  negative: "#f08a7f",
-  axis: "#a5a8af",
-  grid: "#2e3238",
-  trend: "#f5b041",
-};
 
 interface DailyOutcome {
   dayUnix: number;
@@ -126,19 +111,6 @@ function dailyOutcomes(setups: readonly SetupsAnalyticsSetup[], dayStart: (unix:
   return [...byDay.entries()]
     .map(([dayUnix, bucket]) => ({ dayUnix, closedCount: bucket.count, meanR: bucket.sum / bucket.count }))
     .sort((left, right) => left.dayUnix - right.dayUnix);
-}
-
-function calendarDays(firstDay: number, lastDay: number): number[] {
-  const days: number[] = [];
-  if (!Number.isFinite(firstDay) || !Number.isFinite(lastDay)) return days;
-  for (let day = firstDay; day <= lastDay;) {
-    days.push(day);
-    const nextDay = nextZonedDay(day);
-    // A skipped/unsupported civil midnight must not trap rendering in a non-progressing loop.
-    if (!Number.isFinite(nextDay) || nextDay <= day) break;
-    day = nextDay;
-  }
-  return days;
 }
 
 function DailyOutcomesChart({ setups, range }: { setups: readonly SetupsAnalyticsSetup[]; range: AnalyticsRange }) {
