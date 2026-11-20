@@ -158,7 +158,9 @@ async fn insert_artifact(pool: &PgPool, identity: &artifacts::ArtifactIdentity) 
 }
 
 async fn fixture(pool: &PgPool) -> Fixture {
-    db::profiles::set_permission(pool,"admin","price_volume_spike",true).await.unwrap();
+    db::profiles::set_permission(pool, "admin", "price_volume_spike", true)
+        .await
+        .unwrap();
     db::configure(
         pool,
         "admin",

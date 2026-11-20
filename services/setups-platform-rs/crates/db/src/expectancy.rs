@@ -120,12 +120,24 @@ fn identity_value(identity: &ArtifactIdentity) -> Result<Value, DbError> {
         || (identity.forecast.is_none() && identity.observation_cutoff > identity.to_unix)
         || !identity.provenance.is_object()
         || !identity.effective_analytics.is_object()
-        || identity.historical_input_hash.as_ref().is_some_and(|hash| !historical::valid_hash(hash))
-        || identity.outcome_hash.as_ref().is_some_and(|hash| !historical::valid_hash(hash))
-        || (identity.calculation_version == setups_domain::expectancy::EXPECTANCY_MODEL_CALCULATION_VERSION.to_string()
+        || identity
+            .historical_input_hash
+            .as_ref()
+            .is_some_and(|hash| !historical::valid_hash(hash))
+        || identity
+            .outcome_hash
+            .as_ref()
+            .is_some_and(|hash| !historical::valid_hash(hash))
+        || (identity.calculation_version
+            == setups_domain::expectancy::EXPECTANCY_MODEL_CALCULATION_VERSION.to_string()
             && (identity.forecast.is_none() || identity.outcome_hash.is_none()))
-        || (identity.forecast.is_some() && (identity.calculation_version != setups_domain::expectancy::EXPECTANCY_MODEL_CALCULATION_VERSION.to_string()
-            || identity.outcome_hash.is_none() || identity.forecast.is_some_and(|recipe| recipe.identity_key().is_err())))
+        || (identity.forecast.is_some()
+            && (identity.calculation_version
+                != setups_domain::expectancy::EXPECTANCY_MODEL_CALCULATION_VERSION.to_string()
+                || identity.outcome_hash.is_none()
+                || identity
+                    .forecast
+                    .is_some_and(|recipe| recipe.identity_key().is_err())))
         || (identity.forecast.is_none() && identity.outcome_hash.is_some())
     {
         return Err(invalid("identity_invalid"));
@@ -160,12 +172,19 @@ pub fn artifact_key(identity: &ArtifactIdentity) -> Result<String, DbError> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-pub fn captured_outcome_hash(daily: &[setups_domain::expectancy::UtcDailyInput]) -> Result<String, DbError> {
-    if daily.len() > setups_domain::expectancy::EXPECTANCY_MAX_POINTS { return Err(invalid("outcome_resource_limit")); }
+pub fn captured_outcome_hash(
+    daily: &[setups_domain::expectancy::UtcDailyInput],
+) -> Result<String, DbError> {
+    if daily.len() > setups_domain::expectancy::EXPECTANCY_MAX_POINTS {
+        return Err(invalid("outcome_resource_limit"));
+    }
     let bytes = serde_json::to_vec(daily).map_err(crate::json_error)?;
-    if bytes.len() > MAX_NUMERICAL_BYTES { return Err(invalid("outcome_resource_limit")); }
+    if bytes.len() > MAX_NUMERICAL_BYTES {
+        return Err(invalid("outcome_resource_limit"));
+    }
     let mut hash = Sha256::new();
-    hash.update(b"study-expectancy-outcomes-v1\0"); hash.update(bytes);
+    hash.update(b"study-expectancy-outcomes-v1\0");
+    hash.update(bytes);
     Ok(format!("{:x}", hash.finalize()))
 }
 
@@ -223,12 +242,20 @@ pub async fn get_for_generation(
 }
 
 /// Exact recipe + cutoff + outcome identity. No mutable/latest selection.
-pub async fn get_by_identity(pool: &PgPool, identity: &ArtifactIdentity) -> Result<Option<Artifact>, DbError> {
+pub async fn get_by_identity(
+    pool: &PgPool,
+    identity: &ArtifactIdentity,
+) -> Result<Option<Artifact>, DbError> {
     let row = sqlx::query("select id,artifact_key,identity,numerical_snapshot from study_expectancy_artifacts where artifact_key=$1 and owner_id=$2 and source_generation_id=$3 and calculation_version=$4")
         .bind(artifact_key(identity)?).bind(&identity.owner_id).bind(identity.generation_id).bind(&identity.calculation_version)
         .fetch_optional(pool).await?;
     let record = row.map(decode).transpose()?;
-    if record.as_ref().is_some_and(|record| record.identity != *identity) { return Err(invalid("exact_identity_mismatch")); }
+    if record
+        .as_ref()
+        .is_some_and(|record| record.identity != *identity)
+    {
+        return Err(invalid("exact_identity_mismatch"));
+    }
     Ok(record)
 }
 
@@ -245,10 +272,22 @@ pub async fn active_enrichment_high_water(pool: &PgPool) -> Result<i64, DbError>
     Ok(sqlx::query_scalar("select coalesce(max(s.id),0) from continuous_slots s join adaptive_profiles p on p.id=s.id where p.desired_running and s.active_generation_id is not null").fetch_one(pool).await?)
 }
 
-pub async fn active_enrichment_page(pool: &PgPool, after_slot: i64, through_slot: i64) -> Result<Vec<ActiveEnrichmentBinding>, DbError> {
+pub async fn active_enrichment_page(
+    pool: &PgPool,
+    after_slot: i64,
+    through_slot: i64,
+) -> Result<Vec<ActiveEnrichmentBinding>, DbError> {
     let rows=sqlx::query("select s.id,s.owner_id,s.active_generation_id from continuous_slots s join adaptive_profiles p on p.id=s.id join continuous_generations g on g.id=s.active_generation_id and g.owner_id=s.owner_id and g.slot_id=s.id where p.desired_running and s.id>$1 and s.id<=$2 and (g.spec->'forecast' is null or g.spec->'forecast'='null'::jsonb) and not exists(select 1 from study_expectancy_artifacts a where a.owner_id=s.owner_id and a.source_generation_id=s.active_generation_id and a.calculation_version=$3) order by s.id limit 16")
         .bind(after_slot).bind(through_slot).bind(setups_domain::expectancy::EXPECTANCY_CALCULATION_VERSION.to_string()).fetch_all(pool).await?;
-    rows.into_iter().map(|row|Ok(ActiveEnrichmentBinding {slot_id:row.try_get("id")?,owner_id:row.try_get("owner_id")?,generation_id:row.try_get("active_generation_id")?})).collect()
+    rows.into_iter()
+        .map(|row| {
+            Ok(ActiveEnrichmentBinding {
+                slot_id: row.try_get("id")?,
+                owner_id: row.try_get("owner_id")?,
+                generation_id: row.try_get("active_generation_id")?,
+            })
+        })
+        .collect()
 }
 
 pub async fn saved_source(
@@ -289,7 +328,13 @@ pub async fn enrich_saved_generation(
     let Some(saved) = saved_source(pool, owner, generation).await? else {
         return Ok(None);
     };
-    if saved.spec.get("forecast").is_some_and(|recipe| !recipe.is_null()) { return Ok(None); }
+    if saved
+        .spec
+        .get("forecast")
+        .is_some_and(|recipe| !recipe.is_null())
+    {
+        return Ok(None);
+    }
     let selected = &saved.result["selectedCell"];
     if !selected.is_object() {
         return Ok(None);
@@ -313,7 +358,9 @@ pub async fn enrich_saved_generation(
         return Err(invalid("selected_cell_ambiguous"));
     }
     let best = &saved.result["best"];
-    let trend_mode = best.get("trendMode").or_else(|| saved.spec.get("trendMode"));
+    let trend_mode = best
+        .get("trendMode")
+        .or_else(|| saved.spec.get("trendMode"));
     let analytics = &best["analytics"];
     let from_unix = saved.spec["fromUnix"]
         .as_i64()
@@ -405,18 +452,32 @@ async fn insert_in(
         return Err(invalid("numerical_identity_mismatch"));
     }
     if let Some(expected) = &identity.outcome_hash {
-        let points = artifact.daily.as_ref().ok_or_else(|| invalid("model_outcomes_missing"))?;
-        let daily: Vec<_> = points.iter().map(|point| setups_domain::expectancy::UtcDailyInput {
-            day_start_unix: point.day_start_unix, row_count: point.row_count,
-            tp_count: point.tp_count, sl_count: point.sl_count, mean_r: point.mean_r,
-        }).collect();
-        if captured_outcome_hash(&daily)? != *expected { return Err(invalid("outcome_identity_mismatch")); }
+        let points = artifact
+            .daily
+            .as_ref()
+            .ok_or_else(|| invalid("model_outcomes_missing"))?;
+        let daily: Vec<_> = points
+            .iter()
+            .map(|point| setups_domain::expectancy::UtcDailyInput {
+                day_start_unix: point.day_start_unix,
+                row_count: point.row_count,
+                tp_count: point.tp_count,
+                sl_count: point.sl_count,
+                mean_r: point.mean_r,
+            })
+            .collect();
+        if captured_outcome_hash(&daily)? != *expected {
+            return Err(invalid("outcome_identity_mismatch"));
+        }
     }
     sqlx::query("select pg_advisory_xact_lock($1)")
         .bind(STORAGE_LOCK)
         .execute(&mut **tx)
         .await?;
-    let revision = identity.historical_input_hash.as_deref().unwrap_or("original");
+    let revision = identity
+        .historical_input_hash
+        .as_deref()
+        .unwrap_or("original");
     if let Some(row) = sqlx::query("select id,identity,numerical_snapshot from study_expectancy_artifacts where owner_id=$1 and source_generation_id=$2 and source_study_id=$3 and source_slot_id=$4 and tp_pct=$5 and sl_pct=$6 and calculation_version=$7 and revision_key=$8")
         .bind(&identity.owner_id).bind(identity.generation_id).bind(identity.study_id).bind(identity.slot_id)
         .bind(identity.tp_pct).bind(identity.sl_pct).bind(&identity.calculation_version).bind(revision).fetch_optional(&mut **tx).await? {
@@ -478,30 +539,53 @@ async fn validate_source_in(
         })
         .ok_or_else(|| invalid("selected_cell_missing"))?;
     let artifact = decode_numerical(numerical)?;
-    let frozen_recipe = |value: &Value| -> Result<Option<setups_domain::forecast::ForecastRecipe>, DbError> {
-        value.get("forecast").filter(|recipe| !recipe.is_null()).cloned()
-            .map(serde_json::from_value).transpose().map_err(crate::json_error)
-    };
-    if frozen_recipe(&spec)? != identity.forecast || frozen_recipe(&search["best"])? != identity.forecast
-        || (identity.forecast.is_some() && search["best"]["observationCutoff"].as_i64() != Some(identity.observation_cutoff)) {
+    let frozen_recipe =
+        |value: &Value| -> Result<Option<setups_domain::forecast::ForecastRecipe>, DbError> {
+            value
+                .get("forecast")
+                .filter(|recipe| !recipe.is_null())
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(crate::json_error)
+        };
+    if frozen_recipe(&spec)? != identity.forecast
+        || frozen_recipe(&search["best"])? != identity.forecast
+        || (identity.forecast.is_some()
+            && search["best"]["observationCutoff"].as_i64() != Some(identity.observation_cutoff))
+    {
         return Err(invalid("original_recipe_cutoff_mismatch"));
     }
     let metrics = artifact
         .selected_cell
         .as_ref()
         .ok_or_else(|| invalid("selected_metrics_missing"))?;
-    let trend_mode = search["best"].get("trendMode").or_else(|| spec.get("trendMode"));
-    if identity.forecast.is_some() && trend_mode.is_some_and(|mode| matches!(mode.as_str(), Some("forecast" | "blend"))) {
+    let trend_mode = search["best"]
+        .get("trendMode")
+        .or_else(|| spec.get("trendMode"));
+    if identity.forecast.is_some()
+        && trend_mode.is_some_and(|mode| matches!(mode.as_str(), Some("forecast" | "blend")))
+    {
         let forecast = artifact.forecast.as_ref().and_then(|model| {
-            model.probability.as_ref().and_then(|model| model.estimate.as_ref().map(|estimate| estimate.forecast_r))
+            model
+                .probability
+                .as_ref()
+                .and_then(|model| model.estimate.as_ref().map(|estimate| estimate.forecast_r))
                 .or_else(|| model.trend.as_ref().map(|model| model.end.value))
         });
-        if forecast != original_cell["forecastRiskExpectancy"].as_f64() { return Err(invalid("original_forecast_mismatch")); }
+        if forecast != original_cell["forecastRiskExpectancy"].as_f64() {
+            return Err(invalid("original_forecast_mismatch"));
+        }
     }
     if Some(metrics.tp_count) != original_cell["tpCount"].as_u64()
         || Some(metrics.sl_count) != original_cell["slCount"].as_u64()
         || metrics.raw_r.as_ref().copied()
-            != period_mean(original_cell, "meanRiskExpectancy", "riskExpectancy", trend_mode)
+            != period_mean(
+                original_cell,
+                "meanRiskExpectancy",
+                "riskExpectancy",
+                trend_mode,
+            )
         || artifact.matrix_mean_r.as_ref().copied()
             != period_mean(&search["best"], "meanScore", "score", trend_mode)
         || serde_json::to_value(&artifact.source.provenance.algorithm_id)
@@ -585,7 +669,9 @@ pub(crate) async fn seal_for_chain_in(
     identity: &ArtifactIdentity,
     numerical: &Value,
 ) -> Result<i64, DbError> {
-    if identity.historical_input_hash.is_some() {return Err(invalid("historical_requires_explicit_staging"));}
+    if identity.historical_input_hash.is_some() {
+        return Err(invalid("historical_requires_explicit_staging"));
+    }
     if identity.owner_id != job.lease.owner_id
         || identity.generation_id != job.generation_id
         || identity.study_id != job.study_id
@@ -606,7 +692,9 @@ pub async fn seal_existing(
     identity: &ArtifactIdentity,
     numerical: &Value,
 ) -> Result<i64, DbError> {
-    if identity.historical_input_hash.is_some() {return Err(invalid("historical_requires_explicit_staging"));}
+    if identity.historical_input_hash.is_some() {
+        return Err(invalid("historical_requires_explicit_staging"));
+    }
     let mut tx = pool.begin().await?;
     super::continuous::owner_lock(&mut tx, &identity.owner_id).await?;
     let completed: bool = sqlx::query_scalar("select exists(select 1 from continuous_generations where id=$1 and owner_id=$2 and status='completed')")
@@ -651,7 +739,8 @@ pub async fn store_png(
         .filter(|version| *version > 0)
         .ok_or_else(|| invalid("render_version_invalid"))?;
     if (record.identity.forecast.is_some() && render_version != 2)
-        || (record.identity.forecast.is_none() && render_version == 2) {
+        || (record.identity.forecast.is_none() && render_version == 2)
+    {
         return Err(invalid("render_recipe_version_mismatch"));
     }
     let image_key = serde_json::to_value(
@@ -840,22 +929,47 @@ mod tests {
             ("meanRiskExpectancy", "riskExpectancy"),
             ("meanScore", "score"),
         ] {
-            for mode in [None, Some(json!("mean")), Some(json!("forecast")), Some(json!("blend"))] {
+            for mode in [
+                None,
+                Some(json!("mean")),
+                Some(json!("forecast")),
+                Some(json!("blend")),
+            ] {
                 let mut value = json!({});
                 value[objective_field] = json!(1.7);
                 value[mean_field] = json!(-0.25);
-                assert_eq!(period_mean(&value, mean_field, objective_field, mode.as_ref()), Some(-0.25));
+                assert_eq!(
+                    period_mean(&value, mean_field, objective_field, mode.as_ref()),
+                    Some(-0.25)
+                );
                 for invalid in [Value::Null, json!("invalid")] {
                     value[mean_field] = invalid;
-                    assert_eq!(period_mean(&value, mean_field, objective_field, mode.as_ref()), None);
+                    assert_eq!(
+                        period_mean(&value, mean_field, objective_field, mode.as_ref()),
+                        None
+                    );
                 }
             }
             let mut legacy = json!({});
             legacy[objective_field] = json!(1.0);
-            assert_eq!(period_mean(&legacy, mean_field, objective_field, None), Some(1.0));
-            assert_eq!(period_mean(&legacy, mean_field, objective_field, Some(&json!("mean"))), Some(1.0));
-            for mode in [json!("forecast"), json!("blend"), json!("invalid"), Value::Null] {
-                assert_eq!(period_mean(&legacy, mean_field, objective_field, Some(&mode)), None);
+            assert_eq!(
+                period_mean(&legacy, mean_field, objective_field, None),
+                Some(1.0)
+            );
+            assert_eq!(
+                period_mean(&legacy, mean_field, objective_field, Some(&json!("mean"))),
+                Some(1.0)
+            );
+            for mode in [
+                json!("forecast"),
+                json!("blend"),
+                json!("invalid"),
+                Value::Null,
+            ] {
+                assert_eq!(
+                    period_mean(&legacy, mean_field, objective_field, Some(&mode)),
+                    None
+                );
             }
         }
     }

@@ -66,10 +66,16 @@ async fn chain(pool: &PgPool) -> (scheduler::ChainJob, db::ArtifactIdentity, Val
     chain_with_trend(pool, &json!({})).await
 }
 
-async fn chain_with_trend(pool: &PgPool, trend: &Value) -> (scheduler::ChainJob, db::ArtifactIdentity, Value) {
+async fn chain_with_trend(
+    pool: &PgPool,
+    trend: &Value,
+) -> (scheduler::ChainJob, db::ArtifactIdentity, Value) {
     let mut config = json!({"adaptiveEnabled":true,"lookbackDays":3,"minSetupsPerDay":[0],"minMeanExpectancy":0.15,
         "study":{"algorithmId":"price_volume_spike","algorithmVersion":"1.1.1","direction":"short","horizonMinutes":60,"maxSeconds":3600,"maxTrials":8,"seed":42}});
-    config["study"].as_object_mut().unwrap().extend(trend.as_object().unwrap().clone());
+    config["study"]
+        .as_object_mut()
+        .unwrap()
+        .extend(trend.as_object().unwrap().clone());
     continuous::configure(pool, "admin", "price_volume_spike", &config, &[0.0])
         .await
         .unwrap();
@@ -108,23 +114,46 @@ async fn chain_with_trend(pool: &PgPool, trend: &Value) -> (scheduler::ChainJob,
             }
         }
     }
-    let forecast = trend.get("forecast").cloned().map(serde_json::from_value::<setups_domain::forecast::ForecastRecipe>).transpose().unwrap();
+    let forecast = trend
+        .get("forecast")
+        .cloned()
+        .map(serde_json::from_value::<setups_domain::forecast::ForecastRecipe>)
+        .transpose()
+        .unwrap();
     if let Some(recipe) = forecast {
         original["best"]["forecast"] = json!(recipe);
         original["best"]["observationCutoff"] = json!(job.observation_cutoff);
         if matches!(trend["trendMode"].as_str(), Some("forecast" | "blend")) {
             let first = utc_midnight_unix(job.spec["fromUnix"].as_i64().unwrap()).unwrap();
-            let days = [setups_domain::forecast::ProbabilityDay {day_start_unix:first,tp_count:1,sl_count:0},
-                setups_domain::forecast::ProbabilityDay {day_start_unix:first+2*86400,tp_count:1,sl_count:1}];
+            let days = [
+                setups_domain::forecast::ProbabilityDay {
+                    day_start_unix: first,
+                    tp_count: 1,
+                    sl_count: 0,
+                },
+                setups_domain::forecast::ProbabilityDay {
+                    day_start_unix: first + 2 * 86400,
+                    tp_count: 1,
+                    sl_count: 1,
+                },
+            ];
             for cell in original["best"]["matrix"].as_array_mut().unwrap() {
                 let mean = cell["meanRiskExpectancy"].as_f64().unwrap();
-                let estimate = setups_domain::forecast::evaluate_probability(recipe,
-                    cell["tpPct"].as_f64().unwrap()/cell["slPct"].as_f64().unwrap(),job.observation_cutoff,&days).unwrap();
+                let estimate = setups_domain::forecast::evaluate_probability(
+                    recipe,
+                    cell["tpPct"].as_f64().unwrap() / cell["slPct"].as_f64().unwrap(),
+                    job.observation_cutoff,
+                    &days,
+                )
+                .unwrap();
                 let f = estimate.as_ref().unwrap().forecast_r;
                 cell["forecastRiskExpectancy"] = json!(f);
                 cell["riskExpectancy"] = json!(if trend["trendMode"] == "blend" {
-                    let lambda = trend["trendBlendLambda"].as_f64().unwrap_or(0.7); (1.0-lambda)*mean+lambda*f
-                } else {f});
+                    let lambda = trend["trendBlendLambda"].as_f64().unwrap_or(0.7);
+                    (1.0 - lambda) * mean + lambda * f
+                } else {
+                    f
+                });
             }
         }
     }
@@ -153,10 +182,18 @@ async fn chain_with_trend(pool: &PgPool, trend: &Value) -> (scheduler::ChainJob,
         generation_id: job.generation_id,
         study_id: job.study_id,
         slot_id: job.slot_id,
-        calculation_version: if forecast.is_some(){EXPECTANCY_MODEL_CALCULATION_VERSION}else{EXPECTANCY_CALCULATION_VERSION}.to_string(),
+        calculation_version: if forecast.is_some() {
+            EXPECTANCY_MODEL_CALCULATION_VERSION
+        } else {
+            EXPECTANCY_CALCULATION_VERSION
+        }
+        .to_string(),
         historical_input_hash: None,
         forecast,
-        outcome_hash: forecast.map(|_|db::captured_outcome_hash(&daily_fixture(job.spec["fromUnix"].as_i64().unwrap())).unwrap()),
+        outcome_hash: forecast.map(|_| {
+            db::captured_outcome_hash(&daily_fixture(job.spec["fromUnix"].as_i64().unwrap()))
+                .unwrap()
+        }),
         tp_pct: 2.0,
         sl_pct: 1.0,
         from_unix: job.spec["fromUnix"].as_i64().unwrap(),
@@ -169,9 +206,23 @@ async fn chain_with_trend(pool: &PgPool, trend: &Value) -> (scheduler::ChainJob,
 }
 
 fn daily_fixture(from: i64) -> Vec<UtcDailyInput> {
-    let first=utc_midnight_unix(from).unwrap();
-    vec![UtcDailyInput {day_start_unix:first,row_count:1,tp_count:1,sl_count:0,mean_r:Some(2.0)},
-        UtcDailyInput {day_start_unix:first+2*86400,row_count:2,tp_count:1,sl_count:1,mean_r:Some(0.5)}]
+    let first = utc_midnight_unix(from).unwrap();
+    vec![
+        UtcDailyInput {
+            day_start_unix: first,
+            row_count: 1,
+            tp_count: 1,
+            sl_count: 0,
+            mean_r: Some(2.0),
+        },
+        UtcDailyInput {
+            day_start_unix: first + 2 * 86400,
+            row_count: 2,
+            tp_count: 1,
+            sl_count: 1,
+            mean_r: Some(0.5),
+        },
+    ]
 }
 
 fn artifact(identity: &db::ArtifactIdentity, legacy: bool) -> Value {
@@ -263,7 +314,9 @@ async fn finish(pool: &PgPool, job: &scheduler::ChainJob, original: &Value) {
 
 async fn bind_historical_profile(pool: &PgPool, job: &scheduler::ChainJob) {
     // Research Start no longer creates an independently controlled live profile.
-    continuous::profiles::set_permission(pool,"admin","price_volume_spike",true).await.unwrap();
+    continuous::profiles::set_permission(pool, "admin", "price_volume_spike", true)
+        .await
+        .unwrap();
     sqlx::query("insert into adaptive_profiles(id,owner_id,algorithm_id,min_setups_per_day,accepted_generation_id) select id,owner_id,algorithm_id,min_setups_per_day,$2 from continuous_slots where id=$1")
         .bind(job.slot_id).bind(job.generation_id).execute(pool).await.unwrap();
 }
@@ -415,51 +468,134 @@ async fn explicit_mean_enrichment_falls_back_only_when_additive_fields_are_absen
     isolated(|pool| async move {
         let (job, identity, original) = chain_with_trend(&pool, &json!({"trendMode":"mean"})).await;
         assert!(original["best"].get("meanScore").is_none());
-        assert!(original["best"]["matrix"].as_array().unwrap().iter().all(|cell| cell.get("meanRiskExpectancy").is_none()));
+        assert!(
+            original["best"]["matrix"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|cell| cell.get("meanRiskExpectancy").is_none())
+        );
         finish(&pool, &job, &original).await;
-        let id = db::enrich_saved_generation(&pool, "admin", job.generation_id).await.unwrap().unwrap();
-        assert_eq!(db::get(&pool, "admin", id).await.unwrap().unwrap().numerical_snapshot, artifact(&identity, true));
-    }).await;
+        let id = db::enrich_saved_generation(&pool, "admin", job.generation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db::get(&pool, "admin", id)
+                .await
+                .unwrap()
+                .unwrap()
+                .numerical_snapshot,
+            artifact(&identity, true)
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
 async fn forward_period_seal_still_rejects_tampered_metrics_counts_provenance_and_analytics() {
     isolated(|pool| async move {
-        let (job, identity, original) = chain_with_trend(&pool, &json!({"trendMode":"blend"})).await;
-        let canonical: ExpectancyArtifact = serde_json::from_value(artifact(&identity, true)).unwrap();
-        for (raw, mean, tp, sl) in [(1.7, 1.0, 2, 1), (1.0, 1.7, 2, 1), (1.0, 1.0, 3, 1), (1.0, 1.0, 2, 2)] {
+        let (job, identity, original) =
+            chain_with_trend(&pool, &json!({"trendMode":"blend"})).await;
+        let canonical: ExpectancyArtifact =
+            serde_json::from_value(artifact(&identity, true)).unwrap();
+        for (raw, mean, tp, sl) in [
+            (1.7, 1.0, 2, 1),
+            (1.0, 1.7, 2, 1),
+            (1.0, 1.0, 3, 1),
+            (1.0, 1.0, 2, 2),
+        ] {
             let tampered = build_expectancy_artifact(ExpectancyInput {
                 source: canonical.source.clone(),
-                selected_cell: Some(SelectedCellInput {raw_r:Some(raw), tp_count:tp, sl_count:sl}),
+                selected_cell: Some(SelectedCellInput {
+                    raw_r: Some(raw),
+                    tp_count: tp,
+                    sl_count: sl,
+                }),
                 matrix_mean_r: Some(mean),
-                daily: MetricAvailability::Unavailable {reason:ExpectancyUnavailableReason::MissingFrozenOutcomes},
-            }).unwrap();
-            let error = db::seal_for_chain(&pool, &job, &identity, &db::encode_artifact(&tampered).unwrap()).await.unwrap_err();
-            assert!(error.to_string().contains("original_metrics_mismatch"), "{error}");
+                daily: MetricAvailability::Unavailable {
+                    reason: ExpectancyUnavailableReason::MissingFrozenOutcomes,
+                },
+            })
+            .unwrap();
+            let error = db::seal_for_chain(
+                &pool,
+                &job,
+                &identity,
+                &db::encode_artifact(&tampered).unwrap(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("original_metrics_mismatch"),
+                "{error}"
+            );
         }
         let mut wrong_provenance = identity.clone();
         wrong_provenance.provenance["snapshotHash"] = json!("tampered");
-        assert!(db::seal_for_chain(&pool, &job, &wrong_provenance, &artifact(&wrong_provenance, true))
-            .await.unwrap_err().to_string().contains("provenance_mismatch"));
+        assert!(
+            db::seal_for_chain(
+                &pool,
+                &job,
+                &wrong_provenance,
+                &artifact(&wrong_provenance, true)
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("provenance_mismatch")
+        );
         let mut wrong_analytics = identity.clone();
         wrong_analytics.effective_analytics["timeShiftMinutes"] = json!(1);
-        assert!(db::seal_for_chain(&pool, &job, &wrong_analytics, &artifact(&wrong_analytics, true))
-            .await.unwrap_err().to_string().contains("provenance_mismatch"));
+        assert!(
+            db::seal_for_chain(
+                &pool,
+                &job,
+                &wrong_analytics,
+                &artifact(&wrong_analytics, true)
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("provenance_mismatch")
+        );
         let mut wrong_source = canonical.clone();
         wrong_source.source.analytics.time_shift_minutes = 1;
-        assert!(db::seal_for_chain(&pool, &job, &identity, &db::encode_artifact(&wrong_source).unwrap())
-            .await.unwrap_err().to_string().contains("original_analytics_mismatch"));
-        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from study_expectancy_artifacts").fetch_one(&pool).await.unwrap(), 0);
-        db::seal_for_chain(&pool, &job, &identity, &artifact(&identity, false)).await.unwrap().unwrap();
+        assert!(
+            db::seal_for_chain(
+                &pool,
+                &job,
+                &identity,
+                &db::encode_artifact(&wrong_source).unwrap()
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("original_analytics_mismatch")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from study_expectancy_artifacts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        db::seal_for_chain(&pool, &job, &identity, &artifact(&identity, false))
+            .await
+            .unwrap()
+            .unwrap();
         finish(&pool, &job, &original).await;
-    }).await;
+    })
+    .await;
 }
 
 fn png_fixture() -> Vec<u8> {
     fn hex(text: &str) -> Vec<u8> {
         text.as_bytes()
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
     }
@@ -542,22 +678,46 @@ async fn render_claim_uses_original_study_trend_not_current_research_config() {
         isolated(move |pool| async move {
             let (job, identity, original) = chain_with_trend(&pool, &trend).await;
             let numerical = artifact(&identity, false);
-            let id = db::seal_for_chain(&pool, &job, &identity, &numerical).await.unwrap().unwrap();
+            let id = db::seal_for_chain(&pool, &job, &identity, &numerical)
+                .await
+                .unwrap()
+                .unwrap();
             finish(&pool, &job, &original).await;
             sqlx::query("update continuous_processes set config=jsonb_set(config,'{study}', $1)")
                 .bind(json!({"trendMode":"blend","trendBendDays":"linear","trendBlendLambda":0.95}))
-                .execute(&pool).await.unwrap();
-            let claim = db::claim_render(&pool, "original-study-renderer", 1).await.unwrap().unwrap();
+                .execute(&pool)
+                .await
+                .unwrap();
+            let claim = db::claim_render(&pool, "original-study-renderer", 1)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(claim.study_trend, trend);
             assert_eq!(claim.artifact.id, id);
             assert_eq!(claim.artifact.numerical_snapshot, numerical);
             assert!(claim.study_trend.as_object().unwrap().len() <= 3);
             let png = png_fixture();
-            db::finish_render(&pool, &claim, Some(&png), None).await.unwrap();
-            assert!(db::claim_render(&pool, "reuse-cached", 1).await.unwrap().is_none());
-            assert_eq!(sqlx::query_scalar::<_,Value>("select numerical_snapshot from study_expectancy_artifacts where id=$1")
-                .bind(id).fetch_one(&pool).await.unwrap(), numerical);
-        }).await;
+            db::finish_render(&pool, &claim, Some(&png), None)
+                .await
+                .unwrap();
+            assert!(
+                db::claim_render(&pool, "reuse-cached", 1)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, Value>(
+                    "select numerical_snapshot from study_expectancy_artifacts where id=$1"
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                numerical
+            );
+        })
+        .await;
     }
 }
 
@@ -565,7 +725,7 @@ async fn render_claim_uses_original_study_trend_not_current_research_config() {
 #[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
 async fn model_recipe_exact_identity_cutoff_capture_and_bounded_claims_preserve_saved_science() {
     for mode in ["mean", "forecast", "blend"] {
-        let trend=json!({"forecast":setups_domain::forecast::ForecastRecipe::engineering_baseline(),
+        let trend = json!({"forecast":setups_domain::forecast::ForecastRecipe::engineering_baseline(),
             "trendMode":mode,"trendBlendLambda":0.7});
         isolated(move |pool| async move {
             let (job,identity,original)=chain_with_trend(&pool,&trend).await;
@@ -715,10 +875,13 @@ fn identity_key_is_order_independent_and_bounded() {
         effective_analytics: json!({}),
     };
     let key = db::artifact_key(&identity).unwrap();
-    let old_json=serde_json::to_value(&identity).unwrap();
-    assert!(old_json.get("historicalInputHash").is_none(),"new None must not alter old identity bytes/hash");
-    let old_identity:db::ArtifactIdentity=serde_json::from_value(old_json).unwrap();
-    assert_eq!(db::artifact_key(&old_identity).unwrap(),key);
+    let old_json = serde_json::to_value(&identity).unwrap();
+    assert!(
+        old_json.get("historicalInputHash").is_none(),
+        "new None must not alter old identity bytes/hash"
+    );
+    let old_identity: db::ArtifactIdentity = serde_json::from_value(old_json).unwrap();
+    assert_eq!(db::artifact_key(&old_identity).unwrap(), key);
     identity.provenance = serde_json::from_str("{\"b\":2,\"a\":1}").unwrap();
     assert_eq!(db::artifact_key(&identity).unwrap(), key);
     identity.provenance = json!({"huge":"x".repeat(db::MAX_IDENTITY_BYTES)});
@@ -727,7 +890,8 @@ fn identity_key_is_order_independent_and_bounded() {
 
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
-async fn historical_revision_stages_without_rewriting_history_then_publishes_cas_and_is_idempotent() {
+async fn historical_revision_stages_without_rewriting_history_then_publishes_cas_and_is_idempotent()
+{
     isolated(|pool|async move {
         let (job,identity,original)=chain(&pool).await;finish(&pool,&job,&original).await;
         let original_id=db::seal_existing(&pool,&identity,&artifact(&identity,true)).await.unwrap();
@@ -770,24 +934,87 @@ async fn historical_revision_stages_without_rewriting_history_then_publishes_cas
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
 async fn historical_mismatch_is_immutable_evidence_not_a_publishable_artifact() {
-    isolated(|pool|async move {
-        let (job,identity,original)=chain(&pool).await;finish(&pool,&job,&original).await;
-        db::seal_existing(&pool,&identity,&artifact(&identity,true)).await.unwrap();
-        sqlx::query("update continuous_slots set active_generation_id=$2,status='active' where id=$1").bind(job.slot_id).bind(job.generation_id).execute(&pool).await.unwrap();
-        bind_historical_profile(&pool,&job).await;
-        let admission=db::admit_historical_recalculation(&pool,"admin",job.generation_id).await.unwrap().unwrap();
-        let provenance=db::HistoricalRecalculationProvenance {revision:1,input_hash:"c".repeat(64),raw_setups_hash:"d".repeat(64),
-            recalculated_at_unix:chrono::Utc::now().timestamp(),data_source:"existing_market_data_history".into(),
-            read_from_unix:identity.from_unix,read_to_unix:identity.observation_cutoff,candle_count:2,missing_minutes:1};
-        let expected=db::historical_expected_comparison(&admission.source,2.0,1.0).unwrap();
-        let mut actual=expected.clone();actual["selectedCell"]["tpCount"]=json!(1);
-        let comparison=json!({"expected":expected,"actual":actual});
-        let stage=db::stage_historical_recalculation(&pool,&admission,&provenance,&comparison,None).await.unwrap().unwrap();
+    isolated(|pool| async move {
+        let (job, identity, original) = chain(&pool).await;
+        finish(&pool, &job, &original).await;
+        db::seal_existing(&pool, &identity, &artifact(&identity, true))
+            .await
+            .unwrap();
+        sqlx::query(
+            "update continuous_slots set active_generation_id=$2,status='active' where id=$1",
+        )
+        .bind(job.slot_id)
+        .bind(job.generation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        bind_historical_profile(&pool, &job).await;
+        let admission = db::admit_historical_recalculation(&pool, "admin", job.generation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let provenance = db::HistoricalRecalculationProvenance {
+            revision: 1,
+            input_hash: "c".repeat(64),
+            raw_setups_hash: "d".repeat(64),
+            recalculated_at_unix: chrono::Utc::now().timestamp(),
+            data_source: "existing_market_data_history".into(),
+            read_from_unix: identity.from_unix,
+            read_to_unix: identity.observation_cutoff,
+            candle_count: 2,
+            missing_minutes: 1,
+        };
+        let expected = db::historical_expected_comparison(&admission.source, 2.0, 1.0).unwrap();
+        let mut actual = expected.clone();
+        actual["selectedCell"]["tpCount"] = json!(1);
+        let comparison = json!({"expected":expected,"actual":actual});
+        let stage =
+            db::stage_historical_recalculation(&pool, &admission, &provenance, &comparison, None)
+                .await
+                .unwrap()
+                .unwrap();
         assert!(!stage.matched && stage.artifact_id.is_none());
-        assert!(db::publish_historical_recalculation(&pool,"admin",job.generation_id,&provenance.input_hash).await.is_err());
-        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_expectancy_artifacts").fetch_one(&pool).await.unwrap(),1);
-        assert_eq!(db::get_historical_stage(&pool,"admin",job.generation_id,&provenance.input_hash).await.unwrap().unwrap().comparison,comparison);
-        sqlx::query("update continuous_slots set active_generation_id=null where id=$1").bind(job.slot_id).execute(&pool).await.unwrap();
-        assert!(db::publish_historical_recalculation(&pool,"admin",job.generation_id,&provenance.input_hash).await.unwrap().is_none());
-    }).await;
+        assert!(
+            db::publish_historical_recalculation(
+                &pool,
+                "admin",
+                job.generation_id,
+                &provenance.input_hash
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from study_expectancy_artifacts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db::get_historical_stage(&pool, "admin", job.generation_id, &provenance.input_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .comparison,
+            comparison
+        );
+        sqlx::query("update continuous_slots set active_generation_id=null where id=$1")
+            .bind(job.slot_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            db::publish_historical_recalculation(
+                &pool,
+                "admin",
+                job.generation_id,
+                &provenance.input_hash
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    })
+    .await;
 }
