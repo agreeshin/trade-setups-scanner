@@ -23,6 +23,15 @@ export const DEFAULT_GATE_LIMITS: GateLimits = {
 };
 
 export type RequestPriority = "fresh" | "history";
+type PauseReason = "throttle" | "http_429" | "api_10006" | "ip_ban" | "restored";
+export interface GateDiagnostic {
+  reason: PauseReason;
+  atUnixMs: number;
+  notBeforeUnixMs: number;
+  intervalMs: number;
+  repeats: number;
+  logFailures: number;
+}
 export interface GatePersistence {
   loadCooldown(): Promise<number | null>;
   saveCooldown(untilMs: number): Promise<void>;
@@ -47,11 +56,15 @@ export class AdaptiveGate {
   private pumping = false;
   private active = 0;
   private freshGrants = 0;
+  // One coalesced lifecycle record per gate, not a retained history of responses.
+  private pauseDiagnostic: { reason: PauseReason; repeats: number } | undefined;
+  private diagnosticFailures = 0;
 
   constructor(
     private readonly limits: GateLimits,
     private readonly clock: Clock,
     private readonly persistence?: GatePersistence,
+    private readonly onEvent: (event: string, detail: GateDiagnostic) => void = (event, detail) => console.info(JSON.stringify({ event, ...detail })),
   ) {
     this.intervalMs = limits.initialIntervalMs;
     this.initialized = this.restoreCooldown();
@@ -59,7 +72,13 @@ export class AdaptiveGate {
 
   private async restoreCooldown(): Promise<void> {
     const saved = await this.persistence?.loadCooldown();
-    if (saved !== undefined && saved !== null) this.cooldownUntilMs = Math.max(this.cooldownUntilMs, saved);
+    if (saved !== undefined && saved !== null) {
+      this.cooldownUntilMs = Math.max(this.cooldownUntilMs, saved);
+      if (this.cooldownUntilMs > this.clock.nowMs() && !this.pauseDiagnostic) {
+        this.pauseDiagnostic = { reason: "restored", repeats: 0 };
+        this.logPause("bybit_cooldown_started");
+      }
+    }
   }
 
   // Compatibility for callers needing only a pacing token.
@@ -107,6 +126,10 @@ export class AdaptiveGate {
           await this.clock.sleep(next - now, this.lifetime.signal);
           continue; // Recheck cooldown and priorities after waiting.
         }
+        if (this.pauseDiagnostic) {
+          this.logPause("bybit_cooldown_ended");
+          this.pauseDiagnostic = undefined;
+        }
         const fresh = this.queue.findIndex((item) => item.priority === "fresh");
         const history = this.queue.findIndex((item) => item.priority === "history");
         const index = fresh !== -1 && (history === -1 || this.freshGrants < (this.limits.freshBurst ?? 4)) ? fresh : history;
@@ -143,6 +166,8 @@ export class AdaptiveGate {
   stop(): void {
     this.lifetime.abort();
     this.rejectQueued(new Error("Bybit gate stopped"));
+    if (this.pauseDiagnostic) this.logPause("bybit_cooldown_stopped");
+    this.pauseDiagnostic = undefined;
   }
 
   reportSuccess(): void {
@@ -152,19 +177,44 @@ export class AdaptiveGate {
     this.intervalMs = Math.max(this.limits.minIntervalMs, this.intervalMs - step);
   }
 
-  async reportThrottle(explicitWaitMs = 1000): Promise<void> {
+  async reportThrottle(explicitWaitMs = 1000, reason: "throttle" | "http_429" | "api_10006" = "throttle"): Promise<void> {
     this.intervalMs = Math.min(this.limits.maxIntervalMs, Math.round(this.intervalMs * this.limits.throttleFactor));
-    await this.pause(explicitWaitMs);
+    await this.pause(explicitWaitMs, reason);
   }
 
-  private async pause(waitMs: number): Promise<void> {
+  private logPause(event: string): void {
+    if (!this.pauseDiagnostic) return;
+    try {
+      this.onEvent(event, { ...this.pauseDiagnostic, atUnixMs: this.clock.nowMs(), notBeforeUnixMs: this.cooldownUntilMs,
+        intervalMs: this.intervalMs, logFailures: this.diagnosticFailures });
+    } catch {
+      // Logger failure cannot bypass exchange admission or recursively log itself.
+      this.diagnosticFailures = Math.min(1_000_000, this.diagnosticFailures + 1);
+    }
+  }
+
+  private async pause(waitMs: number, reason: PauseReason): Promise<void> {
+    if (this.pauseDiagnostic && this.clock.nowMs() >= this.cooldownUntilMs) {
+      this.logPause("bybit_cooldown_ended");
+      this.pauseDiagnostic = undefined;
+    }
     this.cooldownUntilMs = Math.max(this.cooldownUntilMs, this.clock.nowMs() + waitMs);
+    if (!this.pauseDiagnostic) {
+      this.pauseDiagnostic = { reason, repeats: 0 };
+      this.logPause("bybit_cooldown_started");
+    } else {
+      this.pauseDiagnostic.repeats++;
+      if (reason === "ip_ban" && this.pauseDiagnostic.reason !== "ip_ban") {
+        this.pauseDiagnostic.reason = reason;
+        this.logPause("bybit_cooldown_escalated");
+      }
+    }
     await this.persistence?.saveCooldown(this.cooldownUntilMs);
   }
 
   async reportIpBan(serverWaitMs = 0): Promise<void> {
     this.intervalMs = this.limits.maxIntervalMs;
-    await this.pause(Math.max(this.limits.ipBanMinMs, serverWaitMs));
+    await this.pause(Math.max(this.limits.ipBanMinMs, serverWaitMs), "ip_ban");
   }
 
   get currentIntervalMs(): number { return this.intervalMs; }

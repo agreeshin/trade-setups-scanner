@@ -224,6 +224,32 @@ describe.skipIf(!TEST_DATABASE_URL)("backfill jobs", () => {
     expect(transport.calls.length).toBeLessThanOrEqual(2);
   });
 
+  it("repairs an exponent-encoded missing bar and advances the existing checkpoint/tail without replacing canonical candles", async () => {
+    const canonical = (offset: number) => ({ openTime: minute(offset), open: "1", high: "1", low: "1", close: "1", volume: "1", quoteTurnover: "1" });
+    await insertCandles(db, instrumentId, [canonical(0), canonical(2)]);
+    await db.insertInto("collection_targets").values({ instrument_id: instrumentId, enabled: true,
+      tail_initialized: true, tail_next_ts: minute(1), last_collected_ts: minute(2) }).execute();
+    const job = await db.insertInto("backfill_jobs").values({ instrument_id: instrumentId, from_ts: minute(0), to_ts: minute(2),
+      checkpoint_ts: minute(0), status: "queued", requested_by: ["continuous"] }).returning("id").executeTakeFirstOrThrow();
+    // The financial values are the captured Nov 17 20:25 10000SATSUSDT bar;
+    // only its timestamp is moved into this test's isolated partition.
+    const transport = new RecordingTransport(() => ({ status: 200, headers: new Map(), bodyText: JSON.stringify({ retCode: 0,
+      result: { list: [[String(minute(1).getTime()), "7.594e-05", "7.614e-05", "7.594e-05", "7.614e-05", "7400", "0.563066"]] } }) }));
+    const client = makeClient(transport, new FakeClock(T0 + 4 * MINUTE));
+    expect(await runBackfillJobOnce({ db, client })).toBe(true);
+    expect(transport.calls).toHaveLength(1);
+    expect(new URL(transport.calls[0]!).searchParams.get("start")).toBe(String(minute(1).getTime()));
+    const result = await db.selectFrom("backfill_jobs").selectAll().where("id", "=", job.id).executeTakeFirstOrThrow();
+    expect(result.status).toBe("done");
+    expect(result.checkpoint_ts).toEqual(minute(2));
+    const target = await db.selectFrom("collection_targets").selectAll().where("instrument_id", "=", instrumentId).executeTakeFirstOrThrow();
+    expect(target.tail_next_ts).toEqual(minute(3));
+    const page = await readCandles(db, { instrumentId, from: minute(0), to: minute(3), limit: 10 });
+    expect(page.candles.map((row) => row.close)).toEqual(["1", "0.00007614", "1"]);
+    expect(await db.selectFrom("candle_conflicts").selectAll().execute()).toEqual([]);
+    client.close();
+  });
+
   it("keeps a job alive when only one of two clients cancels", async () => {
     const clock = new FakeClock(T0 + 2 * DAY + MINUTE);
     const client = makeClient(fullHistoryTransport(), clock);

@@ -3,6 +3,47 @@ import { AdaptiveGate, DEFAULT_GATE_LIMITS, type GatePersistence } from "../../s
 import { FakeClock } from "../../src/ingest/clock.js";
 
 describe("AdaptiveGate", () => {
+  it("coalesces repeated throttles into one lifecycle without retaining a response history", async () => {
+    const clock = new FakeClock(0);
+    const onEvent = vi.fn<(event: string, detail: unknown) => void>();
+    const gate = new AdaptiveGate(DEFAULT_GATE_LIMITS, clock, undefined, onEvent);
+    await gate.acquire();
+    for (let n = 0; n < 100; n++) await gate.reportThrottle(1000, "api_10006");
+    expect(onEvent).toHaveBeenCalledTimes(1);
+    await gate.acquire("history");
+    expect(onEvent.mock.calls.map(([event]) => event)).toEqual(["bybit_cooldown_started", "bybit_cooldown_ended"]);
+    expect(onEvent.mock.calls[1]![1]).toMatchObject({ reason: "api_10006", repeats: 99, notBeforeUnixMs: 1000 });
+    gate.stop();
+    expect(onEvent).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports an IP-ban escalation immediately and clears lifecycle ownership on stop", async () => {
+    const clock = new FakeClock();
+    const onEvent = vi.fn<(event: string, detail: unknown) => void>();
+    const gate = new AdaptiveGate(DEFAULT_GATE_LIMITS, clock, undefined, onEvent);
+    await gate.acquire();
+    await gate.reportThrottle(1000, "http_429");
+    await gate.reportIpBan();
+    await gate.reportThrottle(1000, "api_10006");
+    gate.stop(); gate.stop();
+    expect(onEvent.mock.calls.map(([event]) => event)).toEqual([
+      "bybit_cooldown_started", "bybit_cooldown_escalated", "bybit_cooldown_stopped",
+    ]);
+    expect(onEvent.mock.calls[2]![1]).toMatchObject({ reason: "ip_ban", repeats: 2, notBeforeUnixMs: 600_000 });
+  });
+
+  it("does not let logger failures bypass admission and exposes a bounded loss counter", async () => {
+    const clock = new FakeClock();
+    const onEvent = vi.fn<(event: string, detail: unknown) => void>().mockImplementationOnce(() => { throw new Error("logger unavailable"); });
+    const gate = new AdaptiveGate(DEFAULT_GATE_LIMITS, clock, undefined, onEvent);
+    await gate.acquire();
+    await gate.reportThrottle(5000, "api_10006");
+    await gate.acquire("fresh");
+    expect(clock.nowMs()).toBeGreaterThanOrEqual(5000);
+    expect(onEvent.mock.calls[1]![1]).toMatchObject({ logFailures: 1 });
+    gate.stop();
+  });
+
   it("enforces pacing interval between acquisitions", async () => {
     const clock = new FakeClock(0);
     const gate = new AdaptiveGate(DEFAULT_GATE_LIMITS, clock);

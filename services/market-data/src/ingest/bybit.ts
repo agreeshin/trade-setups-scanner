@@ -36,6 +36,35 @@ const MAX_LIMIT = 1000;
 const MINUTE_MS = 60_000;
 const MAX_ATTEMPTS_PER_PAGE = 6;
 
+type DecimalFailure = "non_string" | "size_limit" | "invalid_syntax" | "expansion_limit";
+
+/** Scoped diagnostics without copying the upstream value/payload into logs. */
+export class KlineDecimalError extends Error {
+  constructor(readonly field: string, readonly symbol: string, readonly atUnix: number, readonly kind: DecimalFailure) {
+    super(`invalid kline decimal: symbol=${symbol.slice(0, 64).replace(/[^A-Z0-9_]/g, "?")} field=${field} atUnix=${atUnix} kind=${kind}`);
+    this.name = "KlineDecimalError";
+  }
+}
+
+/** Expand Bybit scientific notation using digit strings, never binary-float money. */
+function normalizeDecimal(value: unknown, field: string, symbol: string, atUnix: number): string {
+  const invalid = (kind: DecimalFailure): never => { throw new KlineDecimalError(field, symbol, atUnix, kind); };
+  if (typeof value !== "string") return invalid("non_string");
+  if (value.length > 128) return invalid("size_limit");
+  const match = /^(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(value);
+  if (match?.[0] !== value) return invalid("invalid_syntax");
+  if (match[3] === undefined) return value;
+  const exponent = Number(match[3]); // Only the bounded exponent, not the financial value.
+  if (!Number.isSafeInteger(exponent)) return invalid("expansion_limit");
+  const digits = match[1]! + (match[2] ?? "");
+  const point = match[1]!.length + exponent;
+  const length = point <= 0 ? 2 - point + digits.length : point >= digits.length ? point : digits.length + 1;
+  if (length > 128) return invalid("expansion_limit");
+  if (point <= 0) return `0.${"0".repeat(-point)}${digits}`;
+  if (point >= digits.length) return digits + "0".repeat(point - digits.length);
+  return `${digits.slice(0, point)}.${digits.slice(point)}`;
+}
+
 function parseRetryAfterMs(headers: Map<string, string>, nowMs: number): number | undefined {
   const value = headers.get("retry-after");
   if (value === undefined) {
@@ -122,14 +151,16 @@ export class BybitClient {
     if (list.length > MAX_LIMIT) throw new Error("Bybit kline page exceeds item limit");
     return list.map((row) => {
       if (!Array.isArray(row) || row.length !== 7) throw new Error("invalid Bybit kline row");
+      const openTimeMs = Number(row[0]);
+      const decimal = (value: unknown, field: string) => normalizeDecimal(value, field, symbol, openTimeMs / 1000);
       const bar = {
-      openTimeMs: Number(row[0]),
-      open: row[1],
-      high: row[2],
-      low: row[3],
-      close: row[4],
-      volume: row[5],
-      quoteTurnover: row[6],
+      openTimeMs,
+      open: decimal(row[1], "open"),
+      high: decimal(row[2], "high"),
+      low: decimal(row[3], "low"),
+      close: decimal(row[4], "close"),
+      volume: decimal(row[5], "volume"),
+      quoteTurnover: decimal(row[6], "quoteTurnover"),
       };
       validateBar({ ...bar, openTime: new Date(bar.openTimeMs) });
       return bar;
@@ -179,7 +210,7 @@ export class BybitClient {
         const retryAfter = parseRetryAfterMs(response.headers, this.clock.nowMs());
 
         if (response.status === 429) {
-          await this.gate.reportThrottle(Math.max(1000, retryAfter ?? 0));
+          await this.gate.reportThrottle(Math.max(1000, retryAfter ?? 0), "http_429");
           throw new BybitApiError("http-429", "HTTP 429 frequency protection");
         }
 
@@ -210,7 +241,7 @@ export class BybitClient {
 
         if (payload.retCode === 10006) {
           const reset = Number(response.headers.get("x-bapi-limit-reset-timestamp"));
-          await this.gate.reportThrottle(Math.max(1000, retryAfter ?? 0, Number.isFinite(reset) ? reset - this.clock.nowMs() : 0));
+          await this.gate.reportThrottle(Math.max(1000, retryAfter ?? 0, Number.isFinite(reset) ? reset - this.clock.nowMs() : 0), "api_10006");
           throw new BybitApiError("rate-limit", "retCode 10006 API rate limit");
         }
 
