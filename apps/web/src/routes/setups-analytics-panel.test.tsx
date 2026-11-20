@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
 import { SetupsAnalyticsPanel } from "./setups-analytics-panel";
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
@@ -62,12 +63,21 @@ const legacyAnalyticsResult = {
 };
 
 const requests: string[] = [];
-let analyticsResponse: () => Response = () => json(analyticsResult);
+let analyticsResponse: () => Response | Promise<Response> = () => json(analyticsResult);
+let studyResponse = () => json(optimizationStudy40);
+let expectancyResponse = () => {
+  const horizonDays = Array.from({ length: 13 }, (_, index) => 1793923200 + index * 86400);
+  return json({ studyId: 40, observationCutoff: 1794009600, meanR: 0.2, daily: horizonDays.map((dayUnix, index) => ({ dayUnix, meanR: index % 2 === 0 ? 0.3 : -0.1, tpCount: 1, slCount: 1 })), trend: { method: "mean", points: [{ dayUnix: horizonDays[0]!, value: 0.2 }, { dayUnix: horizonDays.at(-1)!, value: 0.2 }] } });
+};
+const defaultExpectancyResponse = expectancyResponse;
 
 beforeEach(() => {
   vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-13T12:00:00Z")); requests.length = 0;
   analyticsResponse = () => json(analyticsResult);
+  studyResponse = () => json(optimizationStudy40);
+  expectancyResponse = defaultExpectancyResponse;
   window.localStorage.clear();
+  applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "UTC" });
   Object.defineProperty(URL, "createObjectURL", { configurable: true, writable: true, value: vi.fn(() => "blob:expectancy-png") });
   Object.defineProperty(URL, "revokeObjectURL", { configurable: true, writable: true, value: vi.fn() });
   vi.stubGlobal("fetch", vi.fn((path: string) => {
@@ -75,10 +85,9 @@ beforeEach(() => {
     if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "", enabled: true, params: {}, fields: [{ key: "spike_mult", label: "Множитель объёма", type: "decimal", min: 1, max: 20, unit: "×" }, { key: "min_quote_vol", label: "Мин. объём котировки", type: "decimal", min: 0, max: 1000000000, unit: "USDT" }] }] }));
     if (path.startsWith("/v1/setups/analytics/studies")) return Promise.resolve(json({ studies: [studyMeta1, studyMeta2] }));
     if (path === "/v1/setups/analytics/study-expectancy/40") {
-      const horizonDays = Array.from({ length: 13 }, (_, index) => 1793923200 + index * 86400);
-      return Promise.resolve(json({ studyId: 40, observationCutoff: 1794009600, meanR: 0.2, daily: horizonDays.map((dayUnix, index) => ({ dayUnix, meanR: index % 2 === 0 ? 0.3 : -0.1, tpCount: 1, slCount: 1 })), trend: { method: "mean", points: [{ dayUnix: horizonDays[0]!, value: 0.2 }, { dayUnix: horizonDays.at(-1)!, value: 0.2 }] } }));
+      return Promise.resolve(expectancyResponse());
     }
-    if (path === "/v1/optimization-studies/40") return Promise.resolve(json(optimizationStudy40));
+    if (path === "/v1/optimization-studies/40") return Promise.resolve(studyResponse());
     if (path === "/v1/optimization-studies/35") return Promise.resolve(json(optimizationStudy35));
     if (path === "/v1/setups/analytics/study-expectancy/35") {
       const horizonDays = Array.from({ length: 13 }, (_, index) => 1793923200 + index * 86400);
@@ -88,11 +97,15 @@ beforeEach(() => {
     return Promise.resolve(json({}));
   }));
 });
-afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 const settle = async () => { await act(async () => { await vi.advanceTimersByTimeAsync(0); }); };
 const analyticsCalls = () => requests.filter((path) => path.startsWith("/v1/setups/analytics?"));
 const studiesCalls = () => requests.filter((path) => path.startsWith("/v1/setups/analytics/studies"));
+const unix = (iso: string) => Date.parse(iso) / 1000;
+const storeRange = (from: string, to: string) => window.localStorage.setItem("setups-analytics-filter-v1", JSON.stringify({ algorithmId: "price_volume_spike", from, to, studies: null }));
+const rowAt = (id: number, iso: string, status: string, riskReturn: number | null) => ({ ...setupRow(id, 1, status, riskReturn), setupTimeUnix: unix(iso), entryTimeUnix: unix(iso) });
+const gridDays = (chart: HTMLElement) => [...chart.querySelectorAll("[data-grid-day]")].map((tick) => Number(tick.getAttribute("data-grid-day")));
 
 async function rendered() {
   render(<SetupsAnalyticsPanel />);
@@ -265,4 +278,189 @@ it("shows the limit error with a range hint", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
   await settle();
   expect(screen.getByRole("alert")).toHaveTextContent("Сузьте диапазон");
+});
+
+it("groups the 19th at 22Z into the configured UTC+5 day and includes the last partial day without a zero outcome", async () => {
+  // Make the browser's reported zone different from the explicitly configured interface zone.
+  const browserOptions = new Intl.DateTimeFormat().resolvedOptions();
+  vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({ ...browserOptions, timeZone: "UTC" });
+  applyInterfaceSettings({ timezone: "Asia/Yekaterinburg" });
+  vi.setSystemTime(new Date("2026-11-21T05:00:00Z"));
+  storeRange("2026-11-19T00:00", "2026-11-21T10:00");
+  analyticsResponse = () => json({ ...analyticsResult, setups: [
+    rowAt(1, "2026-11-19T22:00:00Z", "tp", 3),
+    rowAt(2, "2026-11-20T01:00:00Z", "sl", -1),
+    rowAt(3, "2026-11-19T18:00:00Z", "tp", 0.5),
+    rowAt(4, "2026-11-21T02:00:00Z", "unclosed", null),
+  ] });
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  const query = new URL(analyticsCalls()[0]!, "http://localhost").searchParams;
+  expect(Number(query.get("fromUnix"))).toBe(unix("2026-11-18T19:00:00Z"));
+  expect(Number(query.get("toUnix"))).toBe(unix("2026-11-21T05:00:00Z"));
+  const chart = screen.getByTestId("setups-daily-outcomes");
+  expect(gridDays(chart)).toEqual(["2026-11-18T19:00:00Z", "2026-11-19T19:00:00Z", "2026-11-20T19:00:00Z"].map(unix));
+  const local20 = chart.querySelector('circle[data-closed="2"]');
+  expect(local20).toHaveAttribute("data-day", "20.11.2026");
+  expect(local20).toHaveAttribute("data-mean-r", "1.00");
+  expect(chart.querySelectorAll("circle")).toHaveLength(2);
+  expect(chart.querySelector('circle[data-day="21.11.2026"]')).toBeNull();
+  expect(within(chart).getByText("21.11.2026")).toBeInTheDocument();
+  expect(screen.queryByText(/00:00 UTC/)).toBeNull();
+});
+
+it("keeps the selected calendar axis when there are no closed trades at all", async () => {
+  applyInterfaceSettings({ timezone: "Asia/Yekaterinburg" });
+  storeRange("2026-11-19T00:00", "2026-11-21T10:00");
+  analyticsResponse = () => json({ ...analyticsResult, setups: [rowAt(1, "2026-11-19T22:00:00Z", "unclosed", null)] });
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  const chart = screen.getByTestId("setups-daily-outcomes");
+  expect(gridDays(chart)).toHaveLength(3);
+  expect(within(chart).getByText("21.11.2026")).toBeInTheDocument();
+  expect(within(chart).getByText("Нет закрытых сделок для графика по дням.")).toBeInTheDocument();
+  expect(chart.querySelectorAll("circle, polyline")).toHaveLength(0);
+});
+
+it("does not add an extra calendar day for an exclusive midnight range end", async () => {
+  applyInterfaceSettings({ timezone: "Asia/Yekaterinburg" });
+  storeRange("2026-11-19T00:00", "2026-11-21T00:00");
+  analyticsResponse = () => json({ ...analyticsResult, setups: [rowAt(1, "2026-11-19T22:00:00Z", "tp", 1)] });
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  expect(gridDays(screen.getByTestId("setups-daily-outcomes"))).toEqual(["2026-11-18T19:00:00Z", "2026-11-19T19:00:00Z"].map(unix));
+});
+
+it("extends the selected axis to a shifted entry on the following local day without drawing outside the SVG", async () => {
+  applyInterfaceSettings({ timezone: "Asia/Yekaterinburg" });
+  storeRange("2026-11-19T00:00", "2026-11-20T23:58");
+  analyticsResponse = () => json({ ...analyticsResult, setups: [
+    { ...rowAt(1, "2026-11-20T19:08:00Z", "tp", 1), setupTimeUnix: unix("2026-11-20T18:58:00Z") },
+  ] });
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  const chart = screen.getByTestId("setups-daily-outcomes");
+  expect(gridDays(chart)).toEqual(["2026-11-18T19:00:00Z", "2026-11-19T19:00:00Z", "2026-11-20T19:00:00Z"].map(unix));
+  expect(within(chart).getByText("20.11.2026")).toBeInTheDocument();
+  const shiftedEntry = chart.querySelector('circle[data-day="21.11.2026"]');
+  expect(shiftedEntry).toHaveAttribute("cx", "872");
+  expect(shiftedEntry).toHaveAttribute("data-mean-r", "1.00");
+});
+
+it("uses the calculated range snapshot if the input changes while calculation is running", async () => {
+  applyInterfaceSettings({ timezone: "Asia/Yekaterinburg" });
+  storeRange("2026-11-19T00:00", "2026-11-21T10:00");
+  let resolveResponse: ((value: Response) => void) | undefined;
+  analyticsResponse = () => new Promise<Response>((resolve) => { resolveResponse = resolve; });
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  fireEvent.change(screen.getByLabelText("Конец"), { target: { value: "2026-11-22T00:00" } });
+  act(() => { resolveResponse!(json({ ...analyticsResult, setups: [rowAt(1, "2026-11-19T22:00:00Z", "tp", 1)] })); });
+  await settle();
+  const chart = screen.getByTestId("setups-daily-outcomes");
+  expect(chart).toHaveAttribute("data-to-unix", String(unix("2026-11-21T05:00:00Z")));
+  expect(gridDays(chart)).toHaveLength(3);
+  expect(within(chart).queryByText("22.11.2026")).toBeNull();
+  expect(screen.getByLabelText("Конец")).toHaveValue("2026-11-22T00:00");
+});
+
+it("iterates local calendar midnights through DST instead of adding 86400 seconds", async () => {
+  applyInterfaceSettings({ timezone: "America/New_York" });
+  storeRange("2026-03-07T00:00", "2026-03-10T12:00");
+  analyticsResponse = () => json({ ...analyticsResult, setups: [rowAt(1, "2026-03-08T18:00:00Z", "tp", 1)] });
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  const chart = screen.getByTestId("setups-daily-outcomes");
+  expect(gridDays(chart)).toEqual(["2026-03-07T05:00:00Z", "2026-03-08T05:00:00Z", "2026-03-09T04:00:00Z", "2026-03-10T04:00:00Z"].map(unix));
+  expect([...chart.querySelectorAll("[data-grid-day] text")].map((label) => label.textContent)).toEqual(["07.03.2026", "08.03.2026", "09.03.2026", "10.03.2026"]);
+});
+
+it("redraws mounted daily outcomes on interface timezone changes without recalculating", async () => {
+  applyInterfaceSettings({ timezone: "Asia/Yekaterinburg" });
+  storeRange("2026-11-19T00:00", "2026-11-21T10:00");
+  analyticsResponse = () => json({ ...analyticsResult, setups: [rowAt(1, "2026-11-19T22:00:00Z", "tp", 3), rowAt(2, "2026-11-20T01:00:00Z", "sl", -1)] });
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  const chart = screen.getByTestId("setups-daily-outcomes");
+  expect(chart.querySelector('circle[data-closed="2"]')).toHaveAttribute("data-day", "20.11.2026");
+  act(() => { applyInterfaceSettings({ timezone: "UTC" }); });
+  await settle();
+  expect(screen.getByTestId("setups-daily-outcomes")).toBe(chart);
+  expect(chart.querySelector('circle[data-day="19.11.2026"]')).toHaveAttribute("data-mean-r", "3.00");
+  expect(chart.querySelector('circle[data-day="20.11.2026"]')).toHaveAttribute("data-mean-r", "-1.00");
+  expect(chart).toHaveAttribute("data-from-unix", String(unix("2026-11-18T19:00:00Z")));
+  expect(analyticsCalls()).toHaveLength(1);
+});
+
+it("maps modal buckets and release continuity to the configured day but preserves exact forecast instants and UTC model inputs", async () => {
+  applyInterfaceSettings({ timezone: "Asia/Yekaterinburg" });
+  vi.setSystemTime(new Date("2026-11-21T12:00:00Z"));
+  storeRange("2026-11-19T00:00", "2026-11-21T17:00");
+  analyticsResponse = () => json({ ...analyticsResult, setups: [rowAt(1, "2026-11-19T22:00:00Z", "tp", 3), rowAt(2, "2026-11-20T01:00:00Z", "sl", -1)] });
+  studyResponse = () => json({ ...optimizationStudy40, createdAt: "2026-11-19T22:00:00Z" });
+  const trend = [
+    { dayUnix: unix("2026-11-19T02:30:00Z"), value: 0.1 },
+    { dayUnix: unix("2026-11-19T22:15:00Z"), value: 0.4 },
+    { dayUnix: unix("2026-11-20T12:45:00Z"), value: 0.6 },
+    { dayUnix: unix("2026-11-21T13:00:00Z"), value: 0.8 },
+  ];
+  expectancyResponse = () => json({ studyId: 40, observationCutoff: unix("2026-11-20T00:00:00Z"), meanR: 0.3, daily: [
+    { dayUnix: unix("2026-11-19T00:00:00Z"), meanR: 0.4, tpCount: 1, slCount: 1 },
+    { dayUnix: unix("2026-11-20T00:00:00Z"), meanR: 0.2, tpCount: 1, slCount: 1 },
+  ], trend: { method: "probability", points: trend } });
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" }));
+  await settle();
+  await settle();
+  const chart = within(screen.getByRole("dialog")).getByTestId("study-horizon-chart");
+  expect(chart.querySelector("[data-divider-day]")).toHaveAttribute("data-divider-day", String(unix("2026-11-19T19:00:00Z")));
+  expect(chart.querySelector('[data-phase="past"]')).toHaveAttribute("data-day", "19.11.2026");
+  expect(chart.querySelector('[data-phase="past"]')).toHaveAttribute("data-mean-r", "0.40");
+  expect(chart.querySelector('[data-phase="release"]')).toHaveAttribute("data-day", "20.11.2026");
+  expect(chart.querySelector('[data-phase="release"]')).toHaveAttribute("data-closed", "4");
+  expect(chart.querySelector('[data-phase="release"]')).toHaveAttribute("data-mean-r", "0.60");
+  const releaseX = chart.querySelector('[data-phase="release"]')!.getAttribute("cx");
+  expect(chart.querySelector('[data-testid="expectancy-line"]')!.getAttribute("points")).toContain(`${releaseX},`);
+  const firstDay = unix("2026-11-18T19:00:00Z");
+  const now = unix("2026-11-21T12:00:00Z");
+  const expectedX = (instant: number) => 80 + (instant - firstDay) / (now - firstDay) * (872 - 80);
+  const forecast = chart.querySelector('[data-testid="forecast-line"]')!;
+  const forecastX = forecast.getAttribute("points")!.split(" ").map((point) => Number(point.split(",")[0]));
+  expect(forecastX).toHaveLength(4);
+  [...trend.slice(0, 3).map((point) => point.dayUnix), now].forEach((instant, index) => expect(forecastX[index]).toBeCloseTo(expectedX(instant), 7));
+  expect(forecast).not.toHaveAttribute("stroke-dasharray");
+  expect(forecast).toHaveAttribute("stroke", "#f5b041");
+  expect(chart.querySelector('[data-testid="forecast-now-value"]')).toHaveAttribute("x", "872");
+  expect(chart.querySelector('[data-testid="forecast-now-value"]')).toHaveTextContent("+0.79R");
+  const modelCalls = vi.mocked(fetch).mock.calls.filter(([path]) => path === "/v1/setups/analytics/study-expectancy/40");
+  expect(modelCalls).toHaveLength(1);
+  expect(JSON.parse(modelCalls[0]![1]!.body as string)).toEqual({ live: [
+    { dayUnix: unix("2026-11-19T00:00:00Z"), meanR: 3, closedCount: 1 },
+    { dayUnix: unix("2026-11-20T00:00:00Z"), meanR: -1, closedCount: 1 },
+  ] });
+  const callsBeforeChange = analyticsCalls().length;
+  vi.setSystemTime(new Date("2026-11-22T12:00:00Z"));
+  act(() => { applyInterfaceSettings({ timezone: "America/Los_Angeles" }); });
+  await settle();
+  expect(within(screen.getByRole("dialog")).getByTestId("study-horizon-chart")).toBe(chart);
+  // Original UTC midnight on the 19th maps to the 18th, not to local midnight of the 19th.
+  expect(chart.querySelector('[data-phase="past"]')).toHaveAttribute("data-day", "18.11.2026");
+  expect(chart.querySelector('[data-phase="past"]')).toHaveAttribute("data-mean-r", "0.40");
+  expect(chart.querySelector('[data-phase="past"]')).toHaveAttribute("data-closed", "2");
+  expect(chart.querySelector("[data-divider-day]")).toHaveAttribute("data-divider-day", String(unix("2026-11-19T08:00:00Z")));
+  expect(chart.querySelector('[data-phase="release"]')).toHaveAttribute("data-day", "19.11.2026");
+  expect(chart.querySelector('[data-phase="release"]')).toHaveAttribute("data-mean-r", "0.60");
+  expect(chart.querySelector('[data-testid="forecast-now-value"]')).toHaveTextContent("+0.79R");
+  expect(gridDays(chart).at(-1)).toBe(unix("2026-11-21T08:00:00Z"));
+  expect(analyticsCalls()).toHaveLength(callsBeforeChange);
+  expect(vi.mocked(fetch).mock.calls.filter(([path]) => path === "/v1/setups/analytics/study-expectancy/40")).toHaveLength(1);
 });

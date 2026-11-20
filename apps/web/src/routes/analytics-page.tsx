@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AnalyticsTrendControls } from "../components/analytics-trend-controls";
 import { AnalyticsForecastChart } from "../components/analytics-forecast-chart";
 import { Alert, AlertDescription } from "../components/ui/alert";
@@ -40,7 +40,7 @@ import {
   type AnalyticsSectionKey,
   type AnalyticsUserSettings,
 } from "../lib/analytics-settings";
-import { formatUnix } from "../lib/datetime-format";
+import { effectiveTimezone, formatUnix, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
 import { buildDailyExpectancy, buildDailyExpectancyModel, type DailyExpectancyPoint } from "../lib/daily-expectancy";
 import { buildForecastRecipe, forecastRecipeLabel, initialForecastRecipeDraft, type ForecastRecipeDraft } from "../lib/forecast-recipe";
 import { buildObservedForecastDays } from "../lib/forecast-observations";
@@ -427,12 +427,7 @@ interface TradeRowWithSource extends TradeRow {
   fromCache: boolean;
 }
 
-function dayLabel(day: string): string {
-  const [, month, dayNumber] = day.split("-");
-  return `${dayNumber}.${month}`;
-}
-
-/** Daily UTC geometry with the shared weighted Rust curve. */
+/** Interface calendar presentation of unchanged UTC aggregates and the shared Rust curve. */
 function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendDays }: { items: DailyExpectancyPoint[]; originUnix: number; meanRisk: number | null; winRate: number | null; trendBendDays: TrendBendDays }) {
   const [result, setResult] = useState<{ items: DailyExpectancyPoint[]; bend: TrendBendDays; trend: TrendSummary | null; error: string | null } | null>(null);
   useEffect(() => {
@@ -472,7 +467,10 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
   const firstX = model.points[0]!.x;
   const xRange = model.points[model.points.length - 1]!.x - firstX;
   const xForDay = (x: number) => left + (xRange === 0 ? plotWidth / 2 : ((x - firstX) / xRange) * plotWidth);
+  // Map only the displayed calendar date of each original bucket instant. Neither
+  // daily aggregates nor fine server-curve coordinates are shifted or refitted.
   const xForTrend = (day: number) => xForDay(day - model.originUnix / 86400);
+  const timezone = effectiveTimezone();
   const yForValue = (value: number) => top + ((yMax - value) / yRange) * plotHeight;
   const zeroY = yForValue(0);
   const labelStep = Math.max(1, Math.ceil(items.length / 8));
@@ -484,7 +482,7 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
     <h3 className="text-sm font-medium">Дневное матожидание в рисках · Среднее МО: <span aria-label="Среднее МО за период" className={meanRisk !== null && meanRisk > 0 ? "text-success" : meanRisk !== null && meanRisk < 0 ? "text-danger" : "text-muted-foreground"}>{meanRisk === null ? "—" : fittedLabel(meanRisk)}</span> · Винрейт: <span aria-label="Винрейт за период">{winRate === null ? "—" : `${winRate.toFixed(1)}%`}</span></h3>
     {current?.error && <p role="status" className="text-xs text-danger">Не удалось рассчитать тренд: {current.error}</p>}
     <svg className="w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание в рисках">
-      <desc>Среднее закрытых сделок по UTC-дням сигнала. Расстояния по оси X соответствуют календарным суткам; дни без закрытых сделок не равны нулю.</desc>
+      <desc>Серверные дневные агрегаты показаны по календарным суткам {timezone} без пересчёта исходных значений. Расстояния по оси X соответствуют календарным суткам; дни без закрытых сделок не равны нулю.</desc>
       <line className="stroke-muted-foreground/40" x1={left} y1={top} x2={left} y2={height - bottom} />
       <line className="stroke-muted-foreground/40" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
       <line className="stroke-muted-foreground/50" x1={left} y1={zeroY} x2={width - right} y2={zeroY} />
@@ -512,14 +510,14 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
           <g key={item.day}>
             {item.riskExpectancy !== null && Number.isFinite(item.riskExpectancy) ? (
               <circle className={item.riskExpectancy >= 0 ? "fill-success" : "fill-danger"} cx={x} cy={yForValue(item.riskExpectancy)} r={4}>
-                <title>{`${dayLabel(item.day)} UTC: ${formatRisk(item.riskExpectancy)}, закрыто ${item.closedCount}, TP ${item.tpCount}, SL ${item.slCount}, из кеша ${item.cachedCount}/${item.computedCount}`}</title>
+                <title>{`${formatUnix(item.dayStartUnix, { time: false })} (${timezone}): ${formatRisk(item.riskExpectancy)}, закрыто ${item.closedCount}, TP ${item.tpCount}, SL ${item.slCount}, из кеша ${item.cachedCount}/${item.computedCount}`}</title>
               </circle>
             ) : null}
-            {showLabel ? <text className="fill-muted-foreground text-[10px]" x={x} y={height - 26} textAnchor="middle">{dayLabel(item.day)}</text> : null}
+            {showLabel ? <text className="fill-muted-foreground text-[10px]" x={x} y={height - 26} textAnchor="middle">{formatUnix(item.dayStartUnix, { time: false })}</text> : null}
           </g>
         );
       })}
-      <text className="fill-muted-foreground text-[10px]" x={left + plotWidth / 2} y={height - 8} textAnchor="middle">Дата сетапа (UTC)</text>
+      <text className="fill-muted-foreground text-[10px]" x={left + plotWidth / 2} y={height - 8} textAnchor="middle">Дата сетапа ({timezone})</text>
     </svg>
     </div>
   );
@@ -851,6 +849,7 @@ function AnalyticsCacheCard() {
 type AnalyticsSection = "short" | "long" | "cache";
 
 export function AnalyticsPage() {
+  useSyncExternalStore(subscribeInterfaceSettings, interfaceSettings, interfaceSettings);
   const [sets, setSets] = useState<AnalyticsSet[]>([]);
   const [setsState, setSetsState] = useState<"loading" | "ready" | "error">("loading");
   const [settingsState, setSettingsState] = useState<"loading" | "ready" | "error">("loading");
@@ -1043,7 +1042,7 @@ export function AnalyticsPage() {
             onModeChange={(mode) => { setTrendMode(mode); onSettingsCommit(); }}
             onBendChange={(bend) => { setTrendBendDays(bend); onSettingsCommit(); }} />
           {forecast && <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-            <span>Cutoff C: {new Date(observationCutoff * 1000).toISOString()} · зафиксирован для матриц и модельного графика, не двигается по часам.</span>
+            <span>Cutoff C: {formatUnix(observationCutoff)} ({effectiveTimezone()}) · зафиксирован для матриц и модельного графика, не двигается по часам.</span>
             <Button type="button" variant="outline" onClick={() => { setObservationCutoff(Math.floor(Date.now() / 1000)); onSettingsCommit(); }}>Новый cutoff C</Button>
           </div>}
         </div>

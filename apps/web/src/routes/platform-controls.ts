@@ -1,4 +1,4 @@
-import { effectiveTimezone, formatUnix } from "../lib/datetime-format";
+import { effectiveTimezone, formatUnix, parseZonedDateTimeInput, zonedDateTimeInput, zonedDayStart } from "../lib/datetime-format";
 import { apiFetch } from "../lib/platform-api";
 import type { AdaptiveRecommendation } from "../lib/setup-recommendation";
 
@@ -45,56 +45,33 @@ export const localTimezoneLabel = (): string => effectiveTimezone();
 export const localTime = (unix: number): string => formatUnix(unix);
 
 export function localDateInput(unix: number): string {
-  const date = new Date(unix * 1000);
-  if (!Number.isFinite(date.getTime())) return "";
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return zonedDateTimeInput(unix);
 }
 
-/** When the picked date changes, reset the time to 00:00 UTC of that date, shown in the user's local time. */
+/** Legacy export name: a changed date now resets to midnight in the configured timezone. */
 export function utcMidnightOnDateChange(previous: string, next: string): string {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(next) || previous.slice(0, 10) === next.slice(0, 10)) return next;
-  const [year, month, day] = next.slice(0, 10).split("-").map(Number);
-  if (year === undefined || month === undefined || day === undefined) return next;
-  const midnight = new Date(Date.UTC(year, month - 1, day));
-  const pad = (part: number) => String(part).padStart(2, "0");
-  return `${midnight.getFullYear()}-${pad(midnight.getMonth() + 1)}-${pad(midnight.getDate())}T${pad(midnight.getHours())}:${pad(midnight.getMinutes())}`;
+  const picked = parseZonedDateTimeInput(`${next.slice(0, 10)}T12:00`);
+  return Number.isFinite(picked) ? zonedDateTimeInput(zonedDayStart(picked)) : next;
 }
 
-function localNowInput(): string {
-  const now = new Date();
-  const pad = (part: number) => String(part).padStart(2, "0");
-  return `${pad(now.getFullYear())}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
-}
-
-/** Today picked in a date field: substitute the current local time; any other change stays untouched. */
+/** Optimizer end date: today uses current configured-zone time; other date changes keep their time. */
 export function nowOnTodayDateChange(previous: string, next: string): string {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(next) || previous.slice(0, 10) === next.slice(0, 10)) return next;
-  const now = new Date();
-  const [year, month, day] = next.slice(0, 10).split("-").map(Number);
-  if (year !== now.getFullYear() || month !== now.getMonth() + 1 || day !== now.getDate()) return next;
-  return localNowInput();
+  const now = localDateInput(Date.now() / 1000);
+  return next.slice(0, 10) === now.slice(0, 10) ? now : next;
 }
 
-/** End-of-range date change: today keeps the current local time, other dates reset to 00:00 UTC. */
+/** End date change: today uses current configured-zone time; other dates use local midnight. */
 export function endOfRangeDateChange(previous: string, next: string): string {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(next) || previous.slice(0, 10) === next.slice(0, 10)) return next;
-  const now = new Date();
-  const [year, month, day] = next.slice(0, 10).split("-").map(Number);
-  if (year === now.getFullYear() && month === now.getMonth() + 1 && day === now.getDate()) return localNowInput();
-  return utcMidnightOnDateChange(previous, next);
+  const now = localDateInput(Date.now() / 1000);
+  return next.slice(0, 10) === now.slice(0, 10) ? now : utcMidnightOnDateChange(previous, next);
 }
 
 export function replayRange(from: string, to: string): { fromUnix: number; toUnix: number } {
-  const parse = (value: string): number => {
-    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) return NaN;
-    const date = new Date(value);
-    const parts = [date.getFullYear(), date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes()];
-    const supplied = value.split(/[-T:]/).map(Number);
-    return parts.every((part, index) => part === supplied[index]) ? date.getTime() / 1000 : NaN;
-  };
-  const fromUnix = parse(from);
-  const toUnix = parse(to);
+  const fromUnix = parseZonedDateTimeInput(from);
+  const toUnix = parseZonedDateTimeInput(to);
   if (!Number.isFinite(fromUnix) || !Number.isFinite(toUnix) || toUnix <= fromUnix) {
     throw new Error("Укажите корректные даты: конец диапазона должен быть позже начала.");
   }

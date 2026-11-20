@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -13,6 +13,7 @@ import { Select } from "../components/ui/select";
 import { Spinner } from "../components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { fetchPlatform } from "../lib/platform-api";
+import { interfaceSettings, nextZonedDay, subscribeInterfaceSettings, zonedDateLabel, zonedDayStart } from "../lib/datetime-format";
 import { getOptimizationStudy, type OptimizationMatrixCell, type OptimizationStudy } from "../lib/optimization-api";
 import {
   fetchSetupsAnalytics,
@@ -131,11 +132,20 @@ interface DailyOutcome {
   meanR: number;
 }
 
-function dailyOutcomes(setups: readonly SetupsAnalyticsSetup[]): DailyOutcome[] {
+interface AnalyticsRange {
+  fromUnix: number;
+  toUnix: number;
+}
+
+interface CalculatedResult extends SetupsAnalyticsResult {
+  range: AnalyticsRange;
+}
+
+function dailyOutcomes(setups: readonly SetupsAnalyticsSetup[], dayStart: (unix: number) => number = zonedDayStart): DailyOutcome[] {
   const byDay = new Map<number, { sum: number; count: number }>();
   for (const setup of setups) {
     if ((setup.status !== "tp" && setup.status !== "sl") || setup.entryTimeUnix === null || setup.riskReturn === null) continue;
-    const day = Math.floor(setup.entryTimeUnix / DAY_SECONDS) * DAY_SECONDS;
+    const day = dayStart(setup.entryTimeUnix);
     const bucket = byDay.get(day) ?? { sum: 0, count: 0 };
     bucket.sum += setup.riskReturn;
     bucket.count += 1;
@@ -146,21 +156,28 @@ function dailyOutcomes(setups: readonly SetupsAnalyticsSetup[]): DailyOutcome[] 
     .sort((left, right) => left.dayUnix - right.dayUnix);
 }
 
-function dayLabel(dayUnix: number): string {
-  const date = new Date(dayUnix * 1000);
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${pad(date.getUTCDate())}.${pad(date.getUTCMonth() + 1)}`;
+function calendarDays(firstDay: number, lastDay: number): number[] {
+  const days: number[] = [];
+  if (!Number.isFinite(firstDay) || !Number.isFinite(lastDay)) return days;
+  for (let day = firstDay; day <= lastDay;) {
+    days.push(day);
+    const nextDay = nextZonedDay(day);
+    // A skipped/unsupported civil midnight must not trap rendering in a non-progressing loop.
+    if (!Number.isFinite(nextDay) || nextDay <= day) break;
+    day = nextDay;
+  }
+  return days;
 }
 
-function DailyOutcomesChart({ setups }: { setups: readonly SetupsAnalyticsSetup[] }) {
+function DailyOutcomesChart({ setups, range }: { setups: readonly SetupsAnalyticsSetup[]; range: AnalyticsRange }) {
   const outcomes = dailyOutcomes(setups);
-  if (outcomes.length === 0) {
-    return <p className="text-sm text-muted-foreground">Нет закрытых сделок для графика по дням.</p>;
-  }
-  const firstDay = outcomes[0]!.dayUnix;
-  const lastDay = outcomes.at(-1)!.dayUnix;
-  const daySpan = Math.max(1, Math.round((lastDay - firstDay) / DAY_SECONDS));
-  const xOf = (dayUnix: number) => CHART_STYLE.left + ((dayUnix - firstDay) / DAY_SECONDS / daySpan) * (CHART_STYLE.right - CHART_STYLE.left);
+  const firstDay = Math.min(zonedDayStart(range.fromUnix), outcomes[0]?.dayUnix ?? Infinity);
+  // The API interval is [from, to): an exact midnight end does not add an empty next day.
+  // Selection is by raw signal, so a shifted entry can also extend beyond the selected interval.
+  const lastDay = Math.max(zonedDayStart(range.toUnix - 1), outcomes.at(-1)?.dayUnix ?? -Infinity);
+  const timeSpan = Math.max(nextZonedDay(firstDay) - firstDay, lastDay - firstDay);
+  const xOf = (dayUnix: number) => CHART_STYLE.left + ((dayUnix - firstDay) / timeSpan) * (CHART_STYLE.right - CHART_STYLE.left);
+  const allDays = calendarDays(firstDay, lastDay);
   const values = outcomes.map((point) => point.meanR);
   const rawMin = Math.min(0, ...values);
   const rawMax = Math.max(0, ...values);
@@ -168,18 +185,18 @@ function DailyOutcomesChart({ setups }: { setups: readonly SetupsAnalyticsSetup[
   const yMin = rawMin - pad;
   const yMax = rawMax + pad;
   const yOf = (value: number) => CHART_STYLE.bottom - ((value - yMin) / (yMax - yMin)) * (CHART_STYLE.bottom - CHART_STYLE.top);
-  const labelStep = Math.max(1, Math.ceil(daySpan / 8));
-  const gridDays = Array.from({ length: daySpan + 1 }, (_, index) => firstDay + index * DAY_SECONDS).filter((_, index) => index % labelStep === 0);
+  const labelStep = Math.max(1, Math.ceil((allDays.length - 1) / 8));
+  const gridDays = allDays.filter((_, index) => index % labelStep === 0 || index === allDays.length - 1);
   const gridLevels: number[] = [];
   for (let level = Math.ceil(yMin); level <= Math.floor(yMax); level += 1) {
     if (level !== 0) gridLevels.push(level);
   }
-  return <svg data-testid="setups-daily-outcomes" viewBox={`0 0 ${CHART_STYLE.width} ${CHART_STYLE.height}`} role="img" aria-label="Средний результат закрытых сделок по дням входа" className="w-full rounded-md border border-input/60">
+  return <svg data-testid="setups-daily-outcomes" data-from-unix={range.fromUnix} data-to-unix={range.toUnix} viewBox={`0 0 ${CHART_STYLE.width} ${CHART_STYLE.height}`} role="img" aria-label="Средний результат закрытых сделок по дням входа" className="w-full rounded-md border border-input/60">
     <rect width={CHART_STYLE.width} height={CHART_STYLE.height} fill={CHART_STYLE.background} />
     <text x={CHART_STYLE.width / 2} y={28} textAnchor="middle" fontSize={14} fill={CHART_STYLE.foreground}>Результаты торговли по дням</text>
-    {gridDays.map((dayUnix) => <g key={`day-${dayUnix}`}>
+    {gridDays.map((dayUnix) => <g key={`day-${dayUnix}`} data-grid-day={dayUnix}>
       <line x1={xOf(dayUnix)} y1={CHART_STYLE.top} x2={xOf(dayUnix)} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.grid} strokeWidth={1} />
-      <text x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{dayLabel(dayUnix)}</text>
+      <text x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{zonedDateLabel(dayUnix)}</text>
     </g>)}
     {gridLevels.map((level) => <g key={`level-${level}`}>
       <line x1={CHART_STYLE.left} y1={yOf(level)} x2={CHART_STYLE.right} y2={yOf(level)} stroke={CHART_STYLE.grid} strokeWidth={1} />
@@ -187,9 +204,10 @@ function DailyOutcomesChart({ setups }: { setups: readonly SetupsAnalyticsSetup[
     </g>)}
     <line x1={CHART_STYLE.left} y1={yOf(0)} x2={CHART_STYLE.right} y2={yOf(0)} stroke={CHART_STYLE.axis} strokeWidth={1.5} />
     <text x={CHART_STYLE.left - 8} y={yOf(0) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>0 R</text>
-    <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={outcomes.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />
-    {outcomes.map((point) => <circle key={`point-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={dayLabel(point.dayUnix)} data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)}>
-      <title>{`${dayLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title>
+    {outcomes.length > 1 && <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={outcomes.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
+    {outcomes.length === 0 && <text x={CHART_STYLE.width / 2} y={CHART_STYLE.top + 20} textAnchor="middle" fontSize={12} fill={CHART_STYLE.axis}>Нет закрытых сделок для графика по дням.</text>}
+    {outcomes.map((point) => <circle key={`point-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={zonedDateLabel(point.dayUnix)} data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)}>
+      <title>{`${zonedDateLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title>
     </circle>)}
   </svg>;
 }
@@ -240,8 +258,9 @@ function trendValueAt(points: readonly StudyTrendPoint[], unix: number): number 
   return last.value;
 }
 
-function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectancySeries; live: readonly DailyOutcome[]; dividerDay: number | null }) {
-  const allPast = series.daily.filter(studyPointWithMean);
+function StudyHorizonChart({ series, live, dividerDay, nowUnix }: { series: StudyExpectancySeries; live: readonly DailyOutcome[]; dividerDay: number | null; nowUnix: number }) {
+  // Legacy daily means/counts stay frozen: map each original bucket instant to its display day only.
+  const allPast = series.daily.filter(studyPointWithMean).map((point) => ({ ...point, dayUnix: zonedDayStart(point.dayUnix) }));
   const releasePast = dividerDay === null ? null : allPast.find((point) => point.dayUnix === dividerDay) ?? null;
   const releaseLive = dividerDay === null ? null : live.find((point) => point.dayUnix === dividerDay) ?? null;
   const releaseClosed = (releasePast !== null ? releasePast.tpCount + releasePast.slCount : 0) + (releaseLive !== null ? releaseLive.closedCount : 0);
@@ -253,8 +272,7 @@ function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectan
   if (past.length === 0 && livePoints.length === 0 && releaseMean === null) {
     return <p className="text-sm text-muted-foreground">Нет данных для графика.</p>;
   }
-  const nowUnix = Math.floor(Date.now() / 1000);
-  const releaseLineValue = releaseMean !== null ? releaseMean : releasePast !== null ? releasePast.meanR : releaseLive !== null ? releaseLive.meanR : null;
+  const releaseLineValue = releaseMean ?? releasePast?.meanR ?? releaseLive?.meanR ?? null;
   const linePoints = [...past, ...(dividerDay !== null && releaseLineValue !== null ? [{ dayUnix: dividerDay, meanR: releaseLineValue }] : []), ...livePoints].sort((a, b) => a.dayUnix - b.dayUnix);
   const trendVisible = series.trend.points.filter((point) => point.dayUnix <= nowUnix);
   const trendEndValue = trendValueAt(series.trend.points, nowUnix);
@@ -262,10 +280,11 @@ function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectan
   const dayNumbers = linePoints.map((point) => point.dayUnix);
   if (dividerDay !== null) dayNumbers.push(dividerDay);
   dayNumbers.push(nowUnix);
-  const firstDay = Math.min(...dayNumbers);
-  const lastDay = Math.max(...dayNumbers);
-  const daySpan = Math.max(1, Math.round((lastDay - firstDay) / DAY_SECONDS));
-  const xOf = (dayUnix: number) => CHART_STYLE.left + ((dayUnix - firstDay) / DAY_SECONDS / daySpan) * (CHART_STYLE.right - CHART_STYLE.left);
+  const firstDay = zonedDayStart(Math.min(...dayNumbers));
+  const lastUnix = Math.max(...dayNumbers);
+  const timeSpan = Math.max(nextZonedDay(firstDay) - firstDay, lastUnix - firstDay);
+  // Model points and forecast-now are exact instants, unlike the calendar-day observation buckets.
+  const xOf = (unix: number) => CHART_STYLE.left + ((unix - firstDay) / timeSpan) * (CHART_STYLE.right - CHART_STYLE.left);
   const values = [...linePoints.map((point) => point.meanR), ...trendLine.map((point) => point.value)];
   const rawMin = Math.min(0, ...values);
   const rawMax = Math.max(0, ...values);
@@ -273,9 +292,9 @@ function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectan
   const yMin = rawMin - pad;
   const yMax = rawMax + pad;
   const yOf = (value: number) => CHART_STYLE.bottom - ((value - yMin) / (yMax - yMin)) * (CHART_STYLE.bottom - CHART_STYLE.top);
-  const labelStep = Math.max(1, Math.ceil(daySpan / 8));
-  const allDays = Array.from({ length: daySpan + 1 }, (_, index) => firstDay + index * DAY_SECONDS);
-  const labeledDays = allDays.filter((_, index) => index % labelStep === 0);
+  const allDays = calendarDays(firstDay, zonedDayStart(lastUnix));
+  const labelStep = Math.max(1, Math.ceil((allDays.length - 1) / 8));
+  const labeledDays = allDays.filter((_, index) => index % labelStep === 0 || index === allDays.length - 1);
   const gridLevels: number[] = [];
   for (let level = Math.ceil(yMin); level <= Math.floor(yMax); level += 1) {
     if (level !== 0) gridLevels.push(level);
@@ -284,8 +303,8 @@ function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectan
   return <svg data-testid="study-horizon-chart" viewBox={`0 0 ${CHART_STYLE.width} ${CHART_STYLE.height}`} role="img" aria-label="Матожидание: ретроспектива исследования и live-сетапы" className="w-full rounded-md border border-input/60">
     <rect width={CHART_STYLE.width} height={CHART_STYLE.height} fill={CHART_STYLE.background} />
     <text x={CHART_STYLE.width / 2} y={28} textAnchor="middle" fontSize={14} fill={CHART_STYLE.foreground}>Динамика матожидания: ретроспектива и live</text>
-    {allDays.map((dayUnix) => <line key={`grid-${dayUnix}`} className="grid-day" x1={xOf(dayUnix)} y1={CHART_STYLE.top} x2={xOf(dayUnix)} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.grid} strokeWidth={1} />)}
-    {labeledDays.map((dayUnix) => <text key={`date-${dayUnix}`} className="date" x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{dayLabel(dayUnix)}</text>)}
+    {allDays.map((dayUnix) => <line key={`grid-${dayUnix}`} className="grid-day" data-grid-day={dayUnix} x1={xOf(dayUnix)} y1={CHART_STYLE.top} x2={xOf(dayUnix)} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.grid} strokeWidth={1} />)}
+    {labeledDays.map((dayUnix) => <text key={`date-${dayUnix}`} className="date" x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{zonedDateLabel(dayUnix)}</text>)}
     {gridLevels.map((level) => <g key={`level-${level}`}>
       <line x1={CHART_STYLE.left} y1={yOf(level)} x2={CHART_STYLE.right} y2={yOf(level)} stroke={CHART_STYLE.grid} strokeWidth={1} />
       <text x={CHART_STYLE.left - 8} y={yOf(level) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>{level} R</text>
@@ -300,13 +319,13 @@ function StudyHorizonChart({ series, live, dividerDay }: { series: StudyExpectan
       return <text data-testid="forecast-now-value" x={endX} y={Math.max(endY - 8, CHART_STYLE.top + 12)} textAnchor={anchor} fontSize={11} fontWeight={600} fill={CHART_STYLE.trend}>{formatRisk(trendLine.at(-1)!.value)}</text>;
     })()}
     {linePoints.length > 1 && <polyline data-testid="expectancy-line" fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={linePoints.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
-    {past.map((point) => <circle key={`past-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={dayLabel(point.dayUnix)} data-phase="past">
-      <title>{`${dayLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · ретроспектива`}</title>
+    {past.map((point) => <circle key={`past-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={zonedDateLabel(point.dayUnix)} data-phase="past" data-closed={point.tpCount + point.slCount} data-mean-r={point.meanR.toFixed(2)}>
+      <title>{`${zonedDateLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · ретроспектива`}</title>
     </circle>)}
-    {livePoints.map((point) => <circle key={`live-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={dayLabel(point.dayUnix)} data-phase="live" data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)}>
-      <title>{`${dayLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title>
+    {livePoints.map((point) => <circle key={`live-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={zonedDateLabel(point.dayUnix)} data-phase="live" data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)}>
+      <title>{`${zonedDateLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title>
     </circle>)}
-    {dividerDay !== null && releaseMean !== null && <circle key="release" cx={xOf(dividerDay)} cy={yOf(releaseMean)} r={4} fill={releaseMean >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-phase="release" data-closed={releaseClosed} data-mean-r={releaseMean.toFixed(2)}>
+    {dividerDay !== null && releaseMean !== null && <circle key="release" cx={xOf(dividerDay)} cy={yOf(releaseMean)} r={4} fill={releaseMean >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={zonedDateLabel(dividerDay)} data-phase="release" data-closed={releaseClosed} data-mean-r={releaseMean.toFixed(2)}>
       <title>{`День выпуска исследования: ${formatRisk(releaseMean)} · закрытых ${releaseClosed}`}</title>
     </circle>}
     {dividerX !== null && <g data-divider-day={dividerDay}>
@@ -323,11 +342,14 @@ function paramFieldLabel(fields: Algorithm["fields"], key: string): string {
 }
 
 function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { studyId: number | null; algorithmId: string; fields: Algorithm["fields"]; meta: SetupsAnalyticsStudyMeta | undefined; onClose: () => void }) {
+  // The dialog is keyed by study ID: preserve its opening-time endpoint through display-setting changes.
+  const [nowUnix] = useState(() => Math.floor(Date.now() / 1000));
   const [study, setStudy] = useState<OptimizationStudy | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [series, setSeries] = useState<StudyExpectancySeries | null>(null);
   const [chartError, setChartError] = useState<string | null>(null);
-  const [live, setLive] = useState<DailyOutcome[] | null>(null);
+  // Keep the bounded raw response so a timezone change can regroup a mounted chart without refitting.
+  const [live, setLive] = useState<SetupsAnalyticsSetup[] | null>(null);
 
   useEffect(() => {
     if (studyId === null) return;
@@ -349,8 +371,9 @@ function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { s
       let outcomes: DailyOutcome[] = [];
       try {
         const value = await fetchSetupsAnalytics(algorithmId, fromUnix, Math.floor(Date.now() / 1000), [studyId], controller.signal);
-        outcomes = dailyOutcomes(value.setups);
-        if (!controller.signal.aborted) setLive(outcomes);
+        // The server model still consumes UTC-day aggregates; only the displayed raw trades regroup.
+        outcomes = dailyOutcomes(value.setups, (unix) => Math.floor(unix / DAY_SECONDS) * DAY_SECONDS);
+        if (!controller.signal.aborted) setLive(value.setups);
       } catch {
         if (!controller.signal.aborted) setLive([]);
       }
@@ -364,13 +387,13 @@ function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { s
     return () => controller.abort();
   }, [studyId, study, algorithmId]);
 
-  const dividerDay = useMemo(() => {
+  const dividerDay = (() => {
     if (study !== null) {
       const startedUnix = Math.floor(Date.parse(study.createdAt) / 1000);
-      if (Number.isFinite(startedUnix) && startedUnix > 0) return Math.floor(startedUnix / DAY_SECONDS) * DAY_SECONDS;
+      if (Number.isFinite(startedUnix) && startedUnix > 0) return zonedDayStart(startedUnix);
     }
-    return series !== null ? Math.floor(series.observationCutoff / DAY_SECONDS) * DAY_SECONDS : null;
-  }, [study, series]);
+    return series !== null ? zonedDayStart(series.observationCutoff) : null;
+  })();
 
   const best = study?.result?.best ?? null;
   const trendMode = best?.trendMode ?? study?.spec.trendMode;
@@ -421,7 +444,7 @@ function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { s
         <h4 className="font-medium">Динамика матожидания: ретроспектива и live</h4>
         {chartError !== null && <p className="text-sm text-muted-foreground">{chartError}</p>}
         {chartError === null && series === null && <p className="text-sm text-muted-foreground">Загрузка графика…</p>}
-        {series !== null && chartError === null && <StudyHorizonChart series={series} live={live ?? []} dividerDay={dividerDay} />}
+        {series !== null && chartError === null && <StudyHorizonChart series={series} live={dailyOutcomes(live ?? [])} dividerDay={dividerDay} nowUnix={nowUnix} />}
       </div>
     </DialogContent>}
   </Dialog>;
@@ -492,6 +515,7 @@ function initialSelectedStudies(): ReadonlySet<number> | null {
 }
 
 export function SetupsAnalyticsPanel() {
+  useSyncExternalStore(subscribeInterfaceSettings, interfaceSettings, interfaceSettings);
   const [algorithms, setAlgorithms] = useState<Algorithm[] | null>(null);
   const [algorithmId, setAlgorithmId] = useState(initialAlgorithmId);
   const [fromInput, setFromInput] = useState(() => initialRangeInputs().from);
@@ -504,27 +528,27 @@ export function SetupsAnalyticsPanel() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerSelection, setPickerSelection] = useState<ReadonlySet<number>>(new Set());
   const [detailStudyId, setDetailStudyId] = useState<number | null>(null);
-  const [result, setResult] = useState<SetupsAnalyticsResult | null>(null);
+  const [result, setResult] = useState<CalculatedResult | null>(null);
   const [running, setRunning] = useState(false);
   const [hideGateFailed, setHideGateFailed] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const calculateRef = useRef<AbortController | null>(null);
   const restoredSelection = useRef<ReadonlySet<number> | null>(initialSelectedStudies());
 
-  const range = useMemo(() => {
+  const range = (() => {
     try {
       return { value: replayRange(fromInput, toInput), error: null as string | null };
     } catch (cause) {
       return { value: null, error: errorText(cause) };
     }
-  }, [fromInput, toInput]);
-  const committedRange = useMemo(() => {
+  })();
+  const committedRange = (() => {
     try {
       return replayRange(committed.from, committed.to);
     } catch {
       return null;
     }
-  }, [committed]);
+  })();
   const committedFrom = committedRange?.fromUnix ?? null;
   const committedTo = committedRange?.toUnix ?? null;
   const studiesStatus = algorithmId === "" || committedFrom === null || committedTo === null ? "idle" : studiesState;
@@ -613,8 +637,9 @@ export function SetupsAnalyticsPanel() {
     setError(null);
     try {
       const studies = selectedStudies === null ? null : [...selectedStudies].sort((left, right) => left - right);
-      const data = await fetchSetupsAnalytics(algorithmId, range.value.fromUnix, range.value.toUnix, studies, controller.signal);
-      if (!controller.signal.aborted) setResult(data);
+      const requestedRange = { ...range.value };
+      const data = await fetchSetupsAnalytics(algorithmId, requestedRange.fromUnix, requestedRange.toUnix, studies, controller.signal);
+      if (!controller.signal.aborted) setResult({ ...data, range: requestedRange });
     } catch (cause) {
       if (!controller.signal.aborted) setError(errorText(cause));
     } finally {
@@ -651,7 +676,7 @@ export function SetupsAnalyticsPanel() {
         <Button variant="outline" disabled={studiesMeta.length === 0} onClick={openPicker}>Исследования: {studiesLabel}</Button>
         <Button disabled={running || algorithmId === "" || range.value === null} onClick={() => { void run(); }}>{running ? "Расчёт…" : "Рассчитать"}</Button>
         {studiesStatus === "loading" && <Spinner label="Загрузка исследований…" />}
-        <p className="w-full text-xs text-muted-foreground">Время: {localTimezoneLabel()}. Смена даты сбрасывает время к 00:00 UTC (для «Конец» сегодняшняя дата подставляет текущее время); список исследований обновляется при потере фокуса полей дат, после обновления выбраны все. Расчёт выполняется по нажатию кнопки, без кеша.</p>
+        <p className="w-full text-xs text-muted-foreground">Время: {localTimezoneLabel()}. Смена даты сбрасывает время к полуночи в выбранном часовом поясе (для «Конец» сегодняшняя дата подставляет текущее время); список исследований обновляется при потере фокуса полей дат, после обновления выбраны все. Расчёт выполняется по нажатию кнопки, без кеша.</p>
         {range.error !== null && <p role="alert" className="w-full text-xs text-danger">{range.error}</p>}
       </CardContent>
     </Card>
@@ -671,7 +696,7 @@ export function SetupsAnalyticsPanel() {
             <GateBadge passed={result.totals.gatePassed} selected={result.totals.selected} />
           </div>
         </div>
-        <DailyOutcomesChart setups={result.setups} />
+        <DailyOutcomesChart setups={result.setups} range={result.range} />
         {result.studies.length > 0 && <div className="grid gap-2">
           <h3 className="text-sm font-semibold text-muted-foreground">Исследования-основы</h3>
           <div className="overflow-x-auto rounded-md border border-input/60">

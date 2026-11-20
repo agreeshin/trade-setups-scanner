@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { fetchForecastCurve, type ForecastCurveRequest, type ForecastCurveResponse } from "../lib/forecast-api";
 import { forecastRecipeLabel } from "../lib/forecast-recipe";
 import { buildDailyExpectancyModel, type DailyExpectancyPoint } from "../lib/daily-expectancy";
+import { effectiveTimezone, formatUnix, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
 
 const risk = (value: number | null) => value === null ? "—" : `${Number(value.toFixed(3))} R`;
-const utc = (value: number) => new Date(value * 1000).toISOString().replace("T", " ").replace(".000Z", " UTC");
 
 /** Null model prefixes/gaps are unavailable, not zeros and not interpolated bridges. */
 function finiteSegments<T>(points: readonly T[], value: (point: T) => number | null): T[][] {
@@ -21,6 +21,8 @@ function finiteSegments<T>(points: readonly T[], value: (point: T) => number | n
 
 /** Geometry only: F, B, period mean and flat continuation are all server values. */
 export function AnalyticsForecastChart({ request, days }: { request: ForecastCurveRequest; days: DailyExpectancyPoint[] }) {
+  useSyncExternalStore(subscribeInterfaceSettings, interfaceSettings, interfaceSettings);
+  const timezone = effectiveTimezone();
   const [result, setResult] = useState<{ request: ForecastCurveRequest; response: ForecastCurveResponse | null; error: string | null } | null>(null);
   useEffect(() => {
     const controller = new AbortController();
@@ -53,8 +55,8 @@ export function AnalyticsForecastChart({ request, days }: { request: ForecastCur
   const blendSegments = finiteSegments(response?.blendCurve ?? [], (point) => point.decisionR);
   return <section className="grid gap-2" aria-label="Вероятностный прогноз матожидания">
     <h3 className="text-sm font-medium">Дневное матожидание · Среднее за период M: <span aria-label="Среднее модели за период">{risk(response?.meanR ?? null)}</span> · Чистый прогноз F: <span aria-label="Чистый прогноз модели">{risk(response?.forecastR ?? null)}</span> · decisionR: <span aria-label="Метрика решения">{risk(response?.decisionR ?? null)}</span></h3>
-    <p className="text-xs text-muted-foreground">{forecastRecipeLabel(request.forecast, "linear")} · q {request.q}. Cutoff C: {utc(request.observationCutoff)}. Ретроспективная модельная оценка, не causal/OOS-прогноз.</p>
-    <p className="text-xs text-muted-foreground">Происхождение: переданные закрытые TP/SL; доступность исходов утверждена на cutoff C. UTC-когорты исходных сигналов. Новая ручная выборка может отличаться от frozen-рекомендации Telegram.</p>
+    <p className="text-xs text-muted-foreground">{forecastRecipeLabel(request.forecast, "linear")} · q {request.q}. Cutoff C: {formatUnix(request.observationCutoff)} ({timezone}). Ретроспективная модельная оценка, не causal/OOS-прогноз.</p>
+    <p className="text-xs text-muted-foreground">Происхождение: переданные закрытые TP/SL; доступность исходов утверждена на cutoff C. UTC-когорты исходных сигналов показаны в календаре {timezone} без пересчёта агрегатов. Новая ручная выборка может отличаться от frozen-рекомендации Telegram.</p>
     {!current && <p role="status" className="text-xs text-muted-foreground">Расчёт общей серверной модели…</p>}
     {current?.error && <p role="status" className="text-xs text-danger">Модель недоступна: {current.error}. Подстановка тренда или среднего не выполняется.</p>}
     {response?.estimate.status === "unavailable" && <p role="status" className="text-xs text-muted-foreground">Прогноз недоступен: {response.estimate.reason === "no_closed_outcomes" ? "нет наблюдавшихся закрытых TP/SL" : "нет положительного веса наблюдений"}. Prior не заменяет реальные закрытия.</p>}
@@ -67,7 +69,7 @@ export function AnalyticsForecastChart({ request, days }: { request: ForecastCur
     <p className="text-xs text-muted-foreground sm:hidden">На узком экране график прокручивается по горизонтали.</p>
     <div data-testid="forecast-plot-viewport" role="region" aria-label="Область графика с горизонтальной прокруткой" tabIndex={0} className="min-w-0 overflow-x-auto">
     <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание и вероятностная модель" className="w-full min-w-[640px]">
-      <desc>Фактические дневные средние по UTC-дням исходного сигнала, серверная модель F, горизонталь периодного среднего M, отдельная смесь B при её наличии и cutoff C. После C модель постоянна без новых исходов. История ретроспективна.</desc>
+      <desc>Фактические серверные дневные средние с календарными подписями {timezone} без пересчёта агрегатов, серверная модель F, горизонталь периодного среднего M, отдельная смесь B при её наличии и cutoff C. Моменты модельной кривой не смещены. После C модель постоянна без новых исходов. История ретроспективна.</desc>
       <line className="stroke-muted-foreground/40" x1={left} y1={top} x2={left} y2={height - bottom} />
       <line className="stroke-muted-foreground/40" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
       {[low, 0, high].filter((value, index, all) => all.indexOf(value) === index).map((value) => <g key={value}>
@@ -87,10 +89,10 @@ export function AnalyticsForecastChart({ request, days }: { request: ForecastCur
       <line data-testid="forecast-cutoff" className="stroke-muted-foreground" strokeDasharray="3 3" x1={x(request.observationCutoff)} x2={x(request.observationCutoff)} y1={top} y2={height - bottom} />
       <text className="fill-muted-foreground text-[10px]" x={Math.min(width - right, x(request.observationCutoff))} y={top - 10} textAnchor="end">C · cutoff</text>
       {model.points.map((point, index) => <g key={point.day}>
-        {point.riskExpectancy !== null && <circle className={point.riskExpectancy >= 0 ? "fill-success" : "fill-danger"} cx={x(point.dayStartUnix)} cy={y(point.riskExpectancy)} r={4}><title>{point.day} UTC: {risk(point.riskExpectancy)}, TP {point.tpCount}, SL {point.slCount}</title></circle>}
-        {(index % labelStep === 0 || index === model.points.length - 1) && <text className="fill-muted-foreground text-[10px]" x={x(point.dayStartUnix)} y={height - 27} textAnchor="middle">{point.day.slice(5)}</text>}
+        {point.riskExpectancy !== null && <circle className={point.riskExpectancy >= 0 ? "fill-success" : "fill-danger"} cx={x(point.dayStartUnix)} cy={y(point.riskExpectancy)} r={4}><title>{formatUnix(point.dayStartUnix, { time: false })} ({timezone}): {risk(point.riskExpectancy)}, TP {point.tpCount}, SL {point.slCount}</title></circle>}
+        {(index % labelStep === 0 || index === model.points.length - 1) && <text className="fill-muted-foreground text-[10px]" x={x(point.dayStartUnix)} y={height - 27} textAnchor="middle">{formatUnix(point.dayStartUnix, { time: false })}</text>}
       </g>)}
-      <text className="fill-muted-foreground text-[10px]" x={(left + width - right) / 2} y={height - 8} textAnchor="middle">Дата исходного сигнала (UTC); пунктир за C — без новых исходов</text>
+      <text className="fill-muted-foreground text-[10px]" x={(left + width - right) / 2} y={height - 8} textAnchor="middle">Дата исходного сигнала ({timezone}); пунктир за C — без новых исходов</text>
     </svg>
     </div>
   </section>;

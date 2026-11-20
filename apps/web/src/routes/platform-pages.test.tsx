@@ -10,6 +10,7 @@ import { previewSymbols } from "./instrument-picker";
 import { endOfRangeDateChange, nowOnTodayDateChange, utcMidnightOnDateChange } from "./platform-controls";
 import { HistoryPage } from "./history-page";
 import { LiveInstruments } from "./live-instruments";
+import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
 
 const instruments = [
   { id: 1, exchange: "bybit", category: "linear", symbol: "BTCUSDT", status: "Trading" },
@@ -99,7 +100,7 @@ beforeEach(() => {
     return Promise.resolve(new Response(JSON.stringify(data), { status: 200 }));
   }));
 });
-afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS); });
 
 describe("platform screens", () => {
   it.each([
@@ -278,6 +279,9 @@ describe("platform screens", () => {
   }, 20000);
 
   it("submits algorithm and local dates without overriding saved algorithm params", async () => {
+    applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "Asia/Yekaterinburg" });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-19T10:42:00Z"));
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
     await waitFor(() => expect(screen.getByRole("button", { name: "Проверить данные" })).toBeEnabled());
     expect(screen.getByRole("checkbox", { name: "BTCUSDT (Trading)" })).toBeChecked();
@@ -288,7 +292,7 @@ describe("platform screens", () => {
     expect(requests.some((request) => request.path === "/v1/replay-runs" && request.method === "POST")).toBe(false);
     await userEvent.click(await screen.findByRole("button", { name: "Запустить проверенный расчёт" }));
     await screen.findByText(/Запрос запуска принят/);
-    expect(requests.find((request) => request.path === "/v1/replay-runs" && request.method === "POST")?.body).toEqual({ async: true, algorithmVersion: "snapshot-v2", params: { priceGrowthPct: "17", windowMinutes: 9 }, algorithmId: "price_volume_spike", instruments: [{ exchange: "bybit", category: "linear", symbol: "BTCUSDT" }, { exchange: "bybit", category: "linear", symbol: "ETHUSDT" }], fromUnix: Date.UTC(2026, 9, 10) / 1000, toUnix: Date.UTC(2026, 9, 11) / 1000 });
+    expect(requests.find((request) => request.path === "/v1/replay-runs" && request.method === "POST")?.body).toEqual({ async: true, algorithmVersion: "snapshot-v2", params: { priceGrowthPct: "17", windowMinutes: 9 }, algorithmId: "price_volume_spike", instruments: [{ exchange: "bybit", category: "linear", symbol: "BTCUSDT" }, { exchange: "bybit", category: "linear", symbol: "ETHUSDT" }], fromUnix: Date.parse("2026-10-09T19:00:00Z") / 1000, toUnix: Date.parse("2026-10-10T19:00:00Z") / 1000 });
     expect(requests.some((request) => request.method === "PUT")).toBe(false);
     await userEvent.click(screen.getByRole("button", { name: "Сохранить форму" }));
     await screen.findByText("Форма сохранена в базе сигналов.");
@@ -561,6 +565,9 @@ describe("platform screens", () => {
     expect(screen.getByRole("link", { name: "Bybit" })).toHaveAttribute("rel", "noopener noreferrer");
   });
   it("loads history without enqueuing and only mutates on explicit actions", async () => {
+    applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "Asia/Yekaterinburg" });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-19T10:42:00Z"));
     render(<HistoryPage />);
     await userEvent.click(screen.getByRole("tab", { name: "Задания загрузки" }));
     await screen.findByRole("button", { name: "Отменить загрузку 9" });
@@ -575,7 +582,7 @@ describe("platform screens", () => {
     expect(screen.getByLabelText("Начало загрузки").closest("form")?.className).not.toMatch(/max-w-/);
     await userEvent.click(screen.getByRole("button", { name: "Создать план загрузки (1)" }));
     await screen.findByText(/Создан план загрузки #3: 1 инструментов/);
-    expect(requests.find((request) => request.path === "/v1/history/backfill-plans" && request.method === "POST")?.body).toMatchObject({ instrumentIds: [1], fromUnix: Date.UTC(2026, 9, 10) / 1000 });
+    expect(requests.find((request) => request.path === "/v1/history/backfill-plans" && request.method === "POST")?.body).toEqual({ instrumentIds: [1], fromUnix: Date.parse("2026-10-09T19:00:00Z") / 1000, toUnix: Date.parse("2026-10-10T19:00:00Z") / 1000 });
     await userEvent.click(screen.getByRole("tab", { name: "Задания загрузки" }));
     await userEvent.click(screen.getByRole("button", { name: "Отменить загрузку 9" }));
     await screen.findByText("Отмена задания #9 запрошена.");
@@ -711,14 +718,17 @@ describe("platform screens", () => {
 describe("end-of-range date change helpers", () => {
   afterEach(() => { vi.useRealTimers(); });
   it("substitutes the current time when today is picked in an end field", () => {
-    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-19T15:42:00"));
+    applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "Asia/Yekaterinburg" });
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-19T10:42:00Z"));
     expect(nowOnTodayDateChange("2026-11-10T00:00", "2026-11-19T00:00")).toBe("2026-11-19T15:42");
     expect(endOfRangeDateChange("2026-11-10T00:00", "2026-11-19T00:00")).toBe("2026-11-19T15:42");
   });
   it("keeps midnight reset for other dates in end fields and leaves plain fields untouched", () => {
-    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-19T15:42:00"));
-    expect(endOfRangeDateChange("2026-11-10T00:00", "2026-11-18T00:00")).toBe(utcMidnightOnDateChange("2026-11-10T00:00", "2026-11-18T00:00"));
-    expect(nowOnTodayDateChange("2026-11-10T00:00", "2026-11-18T00:00")).toBe("2026-11-18T00:00");
+    applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "Asia/Yekaterinburg" });
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-19T10:42:00Z"));
+    expect(endOfRangeDateChange("2026-11-10T00:00", "2026-11-18T09:15")).toBe("2026-11-18T00:00");
+    expect(utcMidnightOnDateChange("2026-11-10T00:00", "2026-11-18T09:15")).toBe("2026-11-18T00:00");
+    expect(nowOnTodayDateChange("2026-11-10T00:00", "2026-11-18T09:15")).toBe("2026-11-18T09:15");
     expect(nowOnTodayDateChange("2026-11-19T09:00", "2026-11-19T12:00")).toBe("2026-11-19T12:00");
   });
 });

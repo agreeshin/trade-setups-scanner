@@ -1,9 +1,10 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
 import { HistoryPage } from "./history-page";
 
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS); });
 
 const catalog = {
   instruments: [
@@ -63,6 +64,9 @@ it("reports absence of user bulk loads separately from routine collection", asyn
 });
 
 it("imports the bybit listing, keeps the list editable and submits one confirmed batch", async () => {
+  applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "Asia/Yekaterinburg" });
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-11-20T12:00:00Z"));
   const posts = stubFetch();
   render(<HistoryPage />);
   await screen.findByText(/Выбрано инструментов: 0/);
@@ -77,6 +81,8 @@ it("imports the bybit listing, keeps the list editable and submits one confirmed
   const plan = posts[0] as { url: string; body: { instrumentIds: number[]; fromUnix: number; toUnix: number } };
   expect(plan.url).toBe("/v1/history/backfill-plans");
   expect(plan.body.instrumentIds).toEqual([1, 2]);
+  expect(plan.body.fromUnix).toBe(Date.parse("2025-12-31T19:00:00Z") / 1000);
+  expect(plan.body.toUnix).toBe(Date.parse("2026-01-01T19:00:00Z") / 1000);
 });
 
 it("shows the coverage overview table with data-only default and symbol filter", async () => {
@@ -96,20 +102,36 @@ it("shows the coverage overview table with data-only default and symbol filter",
   expect(await screen.findByText("Нет инструментов по текущему фильтру.")).toBeInTheDocument();
 });
 
-it("resets the time to UTC midnight of the newly picked date", () => {
+it.each(["UTC", "Asia/Yekaterinburg", "America/New_York"])("resets a newly picked date to LOCAL midnight in configured %s", (timezone) => {
+  applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone });
   stubFetch();
   render(<HistoryPage />);
   const from = screen.getByLabelText("Начало загрузки");
-  const local = (date: Date) => {
-    const pad = (part: number) => String(part).padStart(2, "0");
-    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
-  };
   fireEvent.change(from, { target: { value: "2026-01-30T14:30" } });
-  expect(from).toHaveValue(local(new Date(Date.UTC(2026, 0, 30))));
+  expect(from).toHaveValue("2026-01-30T00:00");
   fireEvent.change(from, { target: { value: "2026-01-30T09:15" } });
   expect(from).toHaveValue("2026-01-30T09:15");
   fireEvent.change(from, { target: { value: "2026-02-01T09:15" } });
-  expect(from).toHaveValue(local(new Date(Date.UTC(2026, 1, 1))));
+  expect(from).toHaveValue("2026-02-01T00:00");
+});
+
+it.each([
+  ["Asia/Yekaterinburg", "2026-01-09T22:35:49Z", "2026-01-10T03:35", "2026-01-09T09:20"],
+  ["America/New_York", "2026-01-10T02:35:49Z", "2026-01-09T21:35", "2026-01-10T09:20"],
+])("sets today's end to the current wall time in configured %s", (timezone, now, today, other) => {
+  applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone });
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date(now));
+  stubFetch();
+  render(<HistoryPage />);
+  const to = screen.getByLabelText("Конец загрузки");
+  fireEvent.change(to, { target: { value: `${today.slice(0, 10)}T09:20` } });
+  expect(to).toHaveValue(today);
+  const edited = `${today.slice(0, 10)}T12:10`;
+  fireEvent.change(to, { target: { value: edited } });
+  expect(to).toHaveValue(edited);
+  fireEvent.change(to, { target: { value: other } });
+  expect(to).toHaveValue(`${other.slice(0, 10)}T00:00`);
 });
 
 it("lists active plans with pending items and cancels a plan", async () => {

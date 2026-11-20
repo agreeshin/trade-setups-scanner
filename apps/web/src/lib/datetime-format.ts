@@ -87,6 +87,10 @@ function splitParts(date: Date, withTime: boolean): DateParts {
     day: "2-digit",
     ...(withTime ? { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: current.time24 ? "h23" : "h12" } : {}),
   });
+  return readParts(date, formatter);
+}
+
+function readParts(date: Date, formatter: Intl.DateTimeFormat): DateParts {
   const parts: Record<string, string> = {};
   for (const part of formatter.formatToParts(date)) parts[part.type] = part.value;
   return {
@@ -147,4 +151,95 @@ export function formatIsoDateTime(iso: string, options: { time?: boolean } = {})
 export function dayKeyOf(unix: number): string {
   const parts = splitParts(new Date(unix * 1000), false);
   return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+/** Each conversion owns one formatter; settings/zone changes retain no formatter cache. */
+function wallTimeFormatter(): Intl.DateTimeFormat {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: effectiveTimezone(),
+    calendar: "gregory",
+    numberingSystem: "latn",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  });
+}
+
+/** Encode civil fields on a UTC calendar for arithmetic, not as their actual instant. */
+function civilMilliseconds(parts: DateParts): number {
+  const date = new Date(0);
+  date.setUTCFullYear(Number(parts.year), Number(parts.month) - 1, Number(parts.day));
+  date.setUTCHours(Number(parts.hour), Number(parts.minute), Number(parts.second), 0);
+  return date.getTime();
+}
+
+function wallTimeToUnix(wallMilliseconds: number, formatter: Intl.DateTimeFormat, dayBoundary = false): number {
+  let earliest = Infinity;
+  let before = -Infinity;
+  let after = Infinity;
+  // Offsets on either side of an ordinary DST transition supply both candidates.
+  // Round-tripping rejects gaps; a repeated wall time deterministically uses the first occurrence.
+  for (const hours of [-36, 0, 36]) {
+    const sample = wallMilliseconds + hours * 3_600_000;
+    const offset = civilMilliseconds(readParts(new Date(sample), formatter)) - sample;
+    const candidate = wallMilliseconds - offset;
+    const candidateWall = civilMilliseconds(readParts(new Date(candidate), formatter));
+    if (candidateWall === wallMilliseconds) {
+      earliest = Math.min(earliest, candidate);
+    } else if (candidateWall < wallMilliseconds) {
+      before = Math.max(before, candidate);
+    } else {
+      after = Math.min(after, candidate);
+    }
+  }
+  if (Number.isFinite(earliest)) return earliest / 1000;
+  if (!dayBoundary || !Number.isFinite(before) || !Number.isFinite(after)) return NaN;
+  // Some zones jump over midnight. Calendar boundaries use the first real instant of that day,
+  // but explicitly entered nonexistent wall times must still be rejected by the parser.
+  while (after - before > 1000) {
+    const middle = before + Math.floor((after - before) / 2000) * 1000;
+    if (civilMilliseconds(readParts(new Date(middle), formatter)) < wallMilliseconds) before = middle;
+    else after = middle;
+  }
+  return after / 1000;
+}
+
+/** Configured-zone wall time for datetime-local controls, independent of display/clock style. */
+export function zonedDateTimeInput(unix: number): string {
+  const date = new Date(unix * 1000);
+  if (!Number.isFinite(date.getTime())) return "";
+  const parts = readParts(date, wallTimeFormatter());
+  return `${parts.year.padStart(4, "0")}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
+}
+
+/** Wall time in the configured zone -> UTC seconds. Invalid/nonexistent times return NaN. */
+export function parseZonedDateTimeInput(value: string): number {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value) || Number(value.slice(0, 4)) < 1) return NaN;
+  const wall = new Date(`${value}:00.000Z`);
+  if (!Number.isFinite(wall.getTime()) || wall.toISOString() !== `${value}:00.000Z`) return NaN;
+  return wallTimeToUnix(wall.getTime(), wallTimeFormatter());
+}
+
+function zonedDayBoundary(unix: number, days: number): number {
+  const date = new Date(unix * 1000);
+  if (!Number.isFinite(date.getTime())) return NaN;
+  const formatter = wallTimeFormatter();
+  const parts = readParts(date, formatter);
+  const wall = new Date(civilMilliseconds({ ...parts, hour: "0", minute: "0", second: "0" }));
+  wall.setUTCDate(wall.getUTCDate() + days);
+  return wallTimeToUnix(wall.getTime(), formatter, true);
+}
+
+/** UTC seconds at local midnight (or the day's first instant if a DST gap skips midnight). */
+export function zonedDayStart(unix: number): number {
+  return zonedDayBoundary(unix, 0);
+}
+
+/** Next civil midnight, not a fixed 24-hour step (DST days may have 23 or 25 hours). */
+export function nextZonedDay(unix: number): number {
+  return zonedDayBoundary(unix, 1);
+}
+
+/** Calendar date in the configured timezone, using the configured date layout. */
+export function zonedDateLabel(unix: number): string {
+  return formatUnix(unix, { time: false });
 }

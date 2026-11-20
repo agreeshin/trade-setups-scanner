@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AnalyticsPage } from "./analytics-page";
 import type { MatrixCellRef, TradeRow, TrendInput, TrendSummary } from "../lib/analytics-api";
@@ -410,7 +410,13 @@ function utcChartOptions(rows: TradeRow[]): StubOptions {
   return { sets: [{ ...setFixture, fromUnix: Date.parse("2026-01-01T00:00:00Z") / 1000, toUnix: Date.parse("2026-01-12T00:00:00Z") / 1000 }], tradeRows: rows };
 }
 
-it.each(["America/New_York", "Pacific/Auckland"])("renders calendar UTC spacing, null gaps and both fitted labels independently of browser interface zone %s", async (timezone) => {
+it.each([
+  { timezone: "America/New_York", dates: ["31.12.2025", "03.01.2026", "09.01.2026"] },
+  { timezone: "Pacific/Auckland", dates: ["01.01.2026", "04.01.2026", "10.01.2026"] },
+])("maps unchanged UTC buckets to the configured calendar, not the browser zone ($timezone)", async ({ timezone, dates }) => {
+  const DateTimeFormat = Intl.DateTimeFormat;
+  vi.spyOn(Intl, "DateTimeFormat").mockImplementation(function (locales, options) { return new DateTimeFormat(locales, { ...options, timeZone: options?.timeZone ?? "Asia/Tokyo" }); });
+  expect(Intl.DateTimeFormat().resolvedOptions().timeZone).toBe("Asia/Tokyo");
   applyInterfaceSettings({ timezone });
   const rows = [utcTrade("2026-01-01T00:00:00Z", 2, 0), utcTrade("2026-01-01T12:00:00Z", 2, 1), utcTrade("2026-01-01T23:59:00Z", -1, 2),
     utcTrade("2026-01-03T12:00:00Z", null, 3), utcTrade("2026-01-04T12:00:00Z", -1, 4), utcTrade("2026-01-10T12:00:00Z", 2, 5)]
@@ -422,17 +428,22 @@ it.each(["America/New_York", "Pacific/Auckland"])("renders calendar UTC spacing,
   await screen.findByText("Сделок: 6 / 6");
   const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
   const circles = [...chart.querySelectorAll("circle")];
-  expect(circles.map((circle) => Number(circle.getAttribute("cx")))).toEqual([64, 288, 736]); // 0, 3, 9 UTC days.
+  expect(circles.map((circle) => Number(circle.getAttribute("cx")))).toEqual([64, 288, 736]); // The projected calendar preserves the 0, 3, 9 day gaps.
   expect(circles.map((circle) => circle.querySelector("title")?.textContent)).toEqual([
-    "01.01 UTC: +1.00R, закрыто 3, TP 2, SL 1, из кеша 3/3",
-    "04.01 UTC: -1.00R, закрыто 1, TP 0, SL 1, из кеша 1/1",
-    "10.01 UTC: +2.00R, закрыто 1, TP 1, SL 0, из кеша 1/1",
+    `${dates[0]} (${timezone}): +1.00R, закрыто 3, TP 2, SL 1, из кеша 3/3`,
+    `${dates[1]} (${timezone}): -1.00R, закрыто 1, TP 0, SL 1, из кеша 1/1`,
+    `${dates[2]} (${timezone}): +2.00R, закрыто 1, TP 1, SL 0, из кеша 1/1`,
   ]);
+  expect([...chart.querySelectorAll('text[y="254"]')].map((label) => label.textContent)).toEqual(timezone === "America/New_York"
+    ? ["31.12.2025", "02.01.2026", "03.01.2026", "09.01.2026"]
+    : ["01.01.2026", "03.01.2026", "04.01.2026", "10.01.2026"]);
   expect(chart.querySelector('polyline:not([data-testid])')?.getAttribute("points")?.split(" ")).toHaveLength(2); // Null day breaks the observed series, not the fitted curve.
   expect(await screen.findByLabelText("Начало тренда: +0.59R")).toHaveTextContent("+0.59R");
   expect(screen.getByLabelText("Конец тренда: +1.38R")).toHaveTextContent("+1.38R");
   expect(chart.querySelector('[data-testid="trend-curve"] title')).toHaveTextContent("Взвешенная прямая: изменение +0.79R");
-  expect(chart).toHaveTextContent("Дата сетапа (UTC)");
+  expect(chart).toHaveTextContent(`Дата сетапа (${timezone})`);
+  expect(chart.querySelector("desc")).toHaveTextContent(`календарным суткам ${timezone} без пересчёта исходных значений`);
+  expect([...chart.querySelectorAll("title")].some((title) => title.textContent?.includes(" UTC:"))).toBe(false);
   expect(chart).not.toHaveTextContent("Дата сигнала");
   expect(screen.getByRole("heading", { name: /^Дневное матожидание в рисках/ })).toHaveTextContent("Среднее МО: +0.80R");
   expect(screen.getByLabelText("Среднее МО за период")).toHaveClass("text-success");
@@ -448,7 +459,20 @@ it.each(["America/New_York", "Pacific/Auckland"])("renders calendar UTC spacing,
   expect(calls.some((call) => call.path.startsWith("/v1/analytics/trades/"))).toBe(false);
   expect(calls.filter((call) => call.method !== "GET").map((call) => call.path)).toEqual(["/v1/analytics/trend"]);
   const trendRequest = JSON.parse(calls.find((call) => call.path === "/v1/analytics/trend")!.body!) as { points: TrendInput[] };
-  expect(trendRequest.points.map((p) => p.weight)).toEqual([3, 1, 1, 1]);
+  expect(trendRequest.points).toEqual([
+    { day: Date.parse("2026-01-01T00:00:00Z") / 86400000, value: 1, weight: 3 },
+    { day: Date.parse("2026-01-03T00:00:00Z") / 86400000, value: null, weight: 1 },
+    { day: Date.parse("2026-01-04T00:00:00Z") / 86400000, value: -1, weight: 1 },
+    { day: Date.parse("2026-01-10T00:00:00Z") / 86400000, value: 2, weight: 1 },
+  ]);
+  const curveBefore = screen.getByTestId("trend-curve").getAttribute("points");
+  act(() => { applyInterfaceSettings({ timezone: "UTC", dateOrder: "ymd", dateSeparator: "-" }); });
+  expect(screen.getByRole("img", { name: "Дневное матожидание в рисках" })).toBe(chart);
+  expect(chart).toHaveTextContent("Дата сетапа (UTC)");
+  expect(circles[0]?.querySelector("title")).toHaveTextContent("2026-01-01 (UTC): +1.00R, закрыто 3");
+  expect(screen.getByTestId("trend-curve")).toHaveAttribute("points", curveBefore);
+  expect(calls.filter((call) => call.path === "/v1/analytics/trend")).toHaveLength(1);
+  expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(1);
 });
 
 it.each([

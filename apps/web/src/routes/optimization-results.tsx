@@ -2,7 +2,7 @@ import { Alert } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
-import { formatIsoDateTime, formatUnix } from "../lib/datetime-format";
+import { effectiveTimezone, formatIsoDateTime, formatUnix } from "../lib/datetime-format";
 import { isActiveStudy, isContinuousStudy, type OptimizationStudy } from "../lib/optimization-api";
 import { parameterLabels } from "../lib/parameter-labels";
 import { forecastRecipeLabel } from "../lib/forecast-recipe";
@@ -61,7 +61,7 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
         <div><dt className="text-muted-foreground">Минимум сетапов в день</dt><dd>{frequencyThreshold}</dd></div>
         <div><dt className="text-muted-foreground">Метрика поиска</dt><dd>{forecast ? `${blend ? `${blendLabel} · ` : ""}${recipeLabel}` : "Среднее за период"}</dd></div>
         {recipe && <div><dt className="text-muted-foreground">Сохранённый рецепт прогноза</dt><dd>{recipeLabel}</dd></div>}
-        {best?.observationCutoff !== undefined && <div><dt className="text-muted-foreground">Cutoff C результата</dt><dd>{new Date(best.observationCutoff * 1000).toISOString()} · из сохранённого результата, не текущей формы</dd></div>}
+        {best?.observationCutoff !== undefined && <div><dt className="text-muted-foreground">Cutoff C результата</dt><dd>{formatUnix(best.observationCutoff)} ({effectiveTimezone()}) · из сохранённого результата, не текущей формы</dd></div>}
         {forecast && <div><dt className="text-muted-foreground">Forward-гейт матрицы</dt><dd>score &gt; {spec.minForecastExpectancy ?? 0} R</dd></div>}
       </dl>
     </section>

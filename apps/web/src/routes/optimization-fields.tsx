@@ -5,7 +5,7 @@ import { Input } from "../components/ui/input";
 import { Select } from "../components/ui/select";
 import { InstrumentPicker, type CatalogInstrument } from "./instrument-picker";
 import { ANALYTICS_SEARCH_FIELDS, type DomainDrafts, type ScopeDraft, type SearchField } from "./optimization-form";
-import { nowOnTodayDateChange, type Algorithm } from "./platform-controls";
+import { localTimezoneLabel, nowOnTodayDateChange, type Algorithm } from "./platform-controls";
 
 function DomainControls({ fields, value, onChange }: { fields: SearchField[]; value: DomainDrafts; onChange: (next: DomainDrafts) => void }) {
   return <div className="grid gap-3">{fields.map((field) => {
@@ -44,7 +44,7 @@ export function OptimizationFields({ algorithm, scope, onScopeChange, catalog, r
   ];
   return <fieldset disabled={disabled} className="grid min-w-0 gap-4">
     <legend className="mb-2 font-semibold"><span className="inline-flex items-center gap-2">Фиксированный scope
-    {!continuous && <InfoNote>Часовой пояс ввода: {Intl.DateTimeFormat().resolvedOptions().timeZone} (часовой пояс браузера). Период по времени закрытия сигнала [начало, конец), границы кратны минуте. Горизонт сделки не обрезается концом периода.</InfoNote>}
+    {!continuous && <InfoNote>Часовой пояс ввода: {localTimezoneLabel()} (настройки интерфейса). Период по времени закрытия сигнала [начало, конец), границы кратны минуте. Горизонт сделки не обрезается концом периода.</InfoNote>}
     <InfoNote>Выбрано ячеек TP×SL: {scope.tpLevels.split(",").filter((item) => item.trim()).length} × {scope.slLevels.split(",").filter((item) => item.trim()).length}. Зрелость не подбирается; без кластеризации не применяется. Гейт null отличается от порога 0.</InfoNote></span></legend>
     <div className="grid gap-3 sm:grid-cols-2">
       {!continuous && <>
