@@ -2714,6 +2714,7 @@ dependencies = [
  "setups-domain",
  "setups-mdclient",
  "setups-optimizer",
+ "setups-replay",
  "setups-worker",
  "sha2",
  "sqlx",

@@ -17,6 +17,7 @@ pub mod migrate;
 pub mod optimization;
 pub mod push;
 pub mod runs;
+pub mod study_actual;
 pub mod telegram;
 
 #[derive(Debug)]
@@ -283,7 +284,14 @@ pub(crate) fn replay_run_from_row(row: &sqlx::postgres::PgRow) -> Result<ReplayR
 }
 
 pub async fn claim_next_queued_run(pool: &PgPool) -> Result<Option<ReplayRun>, DbError> {
+    claim_next_queued_run_with_capacity(pool,i64::MAX).await
+}
+
+pub async fn claim_next_queued_run_with_capacity(pool:&PgPool,capacity:i64)->Result<Option<ReplayRun>,DbError> {
     let mut tx = pool.begin().await?;
+    sqlx::query("select pg_advisory_xact_lock(72423412)").execute(&mut *tx).await?;
+    let active:i64=sqlx::query_scalar("select (select count(*) from replay_runs where origin='manual' and status in ('running','cancel_requested'))+(select count(*) from study_actualizations where status='running')").fetch_one(&mut *tx).await?;
+    if active>=capacity {return Ok(None);}
     let row = sqlx::query(
         "select id, batch_id, exchange_code, category, symbol, from_ts, to_ts, algorithm_id, algorithm_version, params, status, cache_hit \
          from replay_runs where origin='manual' and status = 'queued' order by id for update skip locked limit 1",

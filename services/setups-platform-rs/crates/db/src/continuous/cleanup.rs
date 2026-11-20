@@ -92,41 +92,83 @@ async fn snapshot(tx: &mut Transaction<'_, Postgres>, owner: &str) -> Result<Pre
         'notifications',coalesce((select md5(string_agg(concat_ws(':',id,lease_token,attempts),',' order by id)) from adaptive_notification_outbox where owner_id=$1 and slot_id is not null),''))
     "#)).bind(owner).fetch_one(&mut **tx).await?;
     let fingerprint: String = sqlx::query_scalar("select md5($1::jsonb::text)")
-        .bind(&state).fetch_one(&mut **tx).await?;
+        .bind(&state)
+        .fetch_one(&mut **tx)
+        .await?;
     let mut blockers = Vec::new();
     let referenced:bool=sqlx::query_scalar("select exists(select 1 from adaptive_profiles where owner_id=$1) or exists(select 1 from adaptive_profile_handoffs where owner_id=$1 and status='pending')")
         .bind(owner).fetch_one(&mut **tx).await?;
-    if referenced {blockers.push("accepted_profile_references".into());}
-    if state["busy"] == true { blockers.push("continuous_not_stopped".into()); }
-    if state["ownershipConflict"] == true { blockers.push("ownership_conflict".into()); }
-    Ok(Preview { eligible: blockers.is_empty(), blockers, fingerprint,
+    if referenced {
+        blockers.push("accepted_profile_references".into());
+    }
+    // TODO: retain/attach an archive for published study_actual before allowing
+    // its source science cleanup. Until then block explicitly; never purge its
+    // valuable outputs as if they were terminal manual-study scratch.
+    let actual_referenced:bool=sqlx::query_scalar("select exists(select 1 from study_actualizations a join optimization_studies s on s.id=a.study_id where a.owner_id=$1 and s.owner_id=$1 and s.origin='continuous' and (a.status<>'failed' or a.batch_id is not null or exists(select 1 from study_actual_setups d where d.owner_id=a.owner_id and d.study_id=a.study_id)))")
+        .bind(owner).fetch_one(&mut **tx).await?;
+    if actual_referenced {blockers.push("study_actual_references".into());}
+    if state["busy"] == true {
+        blockers.push("continuous_not_stopped".into());
+    }
+    if state["ownershipConflict"] == true {
+        blockers.push("ownership_conflict".into());
+    }
+    Ok(Preview {
+        eligible: blockers.is_empty(),
+        blockers,
+        fingerprint,
         counts: serde_json::from_value(state["counts"].clone()).map_err(crate::json_error)?,
-        retained: serde_json::from_value(state["retained"].clone()).map_err(crate::json_error)? })
+        retained: serde_json::from_value(state["retained"].clone()).map_err(crate::json_error)?,
+    })
 }
 
 pub async fn preview(pool: &PgPool, owner: &str) -> Result<Preview, DbError> {
-    let mut tx=pool.begin().await?;
-    sqlx::query("set transaction isolation level repeatable read, read only").execute(&mut *tx).await?;
-    let result=snapshot(&mut tx,owner).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("set transaction isolation level repeatable read, read only")
+        .execute(&mut *tx)
+        .await?;
+    let result = snapshot(&mut tx, owner).await?;
     tx.commit().await?;
     Ok(result)
 }
 
 pub async fn purge(pool: &PgPool, owner: &str, fingerprint: &str) -> Result<Outcome, DbError> {
-    let mut tx=pool.begin().await?;
-    owner_lock(&mut tx,owner).await?;
+    let mut tx = pool.begin().await?;
+    owner_lock(&mut tx, owner).await?;
+    // Same lock as actual admission, acquired before source/head row locks.
+    sqlx::query("select pg_advisory_xact_lock($1)").bind(crate::study_actual::QUEUE_LOCK).execute(&mut *tx).await?;
     sqlx::query("select owner_id from continuous_processes where owner_id=$1 order by algorithm_id for update").bind(owner).execute(&mut *tx).await?;
-    sqlx::query("select id from continuous_slots where owner_id=$1 order by id for update").bind(owner).execute(&mut *tx).await?;
+    sqlx::query("select id from continuous_slots where owner_id=$1 order by id for update")
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?;
     // Lock before job rows, matching claim/finish and trigger accounting. Fixed
     // delivery can continue before/after this short mutation transaction.
-    sqlx::query("select id from adaptive_notification_budget where id=1 for update").execute(&mut *tx).await?;
-    sqlx::query("select id from telegram_delivery_budget where id=1 for update").execute(&mut *tx).await?;
-    let before=snapshot(&mut tx,owner).await?;
-    if !before.eligible { return Ok(Outcome::Blocked(before)); }
-    if before.fingerprint!=fingerprint { return Ok(Outcome::Stale(before)); }
-    if before.counts==Counts::default() {
+    sqlx::query("select id from adaptive_notification_budget where id=1 for update")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("select id from telegram_delivery_budget where id=1 for update")
+        .execute(&mut *tx)
+        .await?;
+    let before = snapshot(&mut tx, owner).await?;
+    if !before.eligible {
+        return Ok(Outcome::Blocked(before));
+    }
+    if before.fingerprint != fingerprint {
+        return Ok(Outcome::Stale(before));
+    }
+    // An explicit science cleanup may discard only failed, artifact-free job
+    // metadata. Admission cannot replace the head while QUEUE_LOCK is held.
+    sqlx::query("select s.id from optimization_studies s join study_actualizations a on a.study_id=s.id and a.owner_id=s.owner_id where s.owner_id=$1 and s.origin='continuous' and a.status='failed' and a.batch_id is null for update of s,a")
+        .bind(owner).execute(&mut *tx).await?;
+    sqlx::query("delete from study_actualizations a using optimization_studies s where a.study_id=s.id and a.owner_id=$1 and s.owner_id=$1 and s.origin='continuous' and a.status='failed' and a.batch_id is null and not exists(select 1 from study_actual_setups d where d.owner_id=a.owner_id and d.study_id=a.study_id)")
+        .bind(owner).execute(&mut *tx).await?;
+    if before.counts == Counts::default() {
         tx.commit().await?;
-        return Ok(Outcome::Deleted(Completed {deleted:before.counts,retained:before.retained}));
+        return Ok(Outcome::Deleted(Completed {
+            deleted: before.counts,
+            retained: before.retained,
+        }));
     }
     // Monotone fences survive purge; do not delete/recreate identities or reset sequences.
     sqlx::query("update continuous_owner_lanes set lease_token=lease_token+1,lease_owner=null,lease_until=null where owner_id=$1").bind(owner).execute(&mut *tx).await?;
@@ -137,15 +179,24 @@ pub async fn purge(pool: &PgPool, owner: &str, fingerprint: &str) -> Result<Outc
     sqlx::query("with removed as(delete from adaptive_notification_outbox where owner_id=$1 and slot_id is not null returning setup_id) update live_setups l set notification_delivery_status='skipped',notification_delivery_error='continuous_history_purged',notification_delivery_updated_at=clock_timestamp() from removed r where l.id=r.setup_id and l.notification_delivery_status='pending'").bind(owner).execute(&mut *tx).await?;
     sqlx::query("with removed as(delete from telegram_delivery_outbox where owner_id=$1 and slot_id is not null returning setup_id) update live_setups l set telegram_delivery_status='disabled',telegram_delivery_error='{\"code\":\"continuous_history_purged\",\"message\":\"Continuous delivery was cancelled by confirmed history cleanup.\"}'::jsonb,telegram_delivery_updated_at=clock_timestamp() from removed r where l.id=r.setup_id and l.telegram_delivery_status='pending'").bind(owner).execute(&mut *tx).await?;
     // Snapshot only protected output metadata. No research spec/best/bootstrap copy.
-    let metadata="jsonb_build_object('generationId',g.id,'studyId',g.study_id,'slotId',g.slot_id,'ownerId',g.owner_id,'algorithmId',g.algorithm_id,'minSetupsPerDay',s.min_setups_per_day,'configRevision',g.config_revision,'executionStartedAt',g.execution_started_at,'observationCutoff',g.observation_cutoff)";
+    let metadata = "jsonb_build_object('generationId',g.id,'studyId',g.study_id,'slotId',g.slot_id,'ownerId',g.owner_id,'algorithmId',g.algorithm_id,'minSetupsPerDay',s.min_setups_per_day,'configRevision',g.config_revision,'executionStartedAt',g.execution_started_at,'observationCutoff',g.observation_cutoff)";
     sqlx::query(&format!("update replay_batches b set continuous_archive={metadata},continuous_analytics_archive=case when b.id=g.replay_batch_id then g.result->'analytics' end,continuous_analytics_context_archive=case when b.id=g.replay_batch_id then jsonb_build_object('effectiveAnalytics',g.result#>'{{best,analytics}}','direction',g.spec->'direction') end,continuous_replay_archive=case when b.id=g.replay_batch_id then g.replay_manifest end,continuous_generation_id=null from continuous_generations g join continuous_slots s on s.id=g.slot_id where b.continuous_generation_id=g.id and g.owner_id=$1 and b.owner_id=$1 and b.origin='continuous'"))
         .bind(owner).execute(&mut *tx).await?;
     sqlx::query(&format!("update replay_runs r set continuous_archive={metadata},continuous_generation_id=null from continuous_generations g join continuous_slots s on s.id=g.slot_id where r.continuous_generation_id=g.id and g.owner_id=$1 and r.owner_id=$1 and r.origin='continuous'"))
         .bind(owner).execute(&mut *tx).await?;
     sqlx::query(&format!("update live_setups l set adaptive_generation_archive={metadata},adaptive_generation_id=null from continuous_generations g join continuous_slots s on s.id=g.slot_id where l.adaptive_generation_id=g.id and g.owner_id=$1 and l.adaptive_slot_id in(select id from continuous_slots where owner_id=$1)"))
         .bind(owner).execute(&mut *tx).await?;
-    sqlx::query("delete from optimization_studies where owner_id=$1 and origin='continuous'").bind(owner).execute(&mut *tx).await?;
-    sqlx::query("delete from continuous_generations where owner_id=$1").bind(owner).execute(&mut *tx).await?;
+    sqlx::query("delete from optimization_studies where owner_id=$1 and origin='continuous'")
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from continuous_generations where owner_id=$1")
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
-    Ok(Outcome::Deleted(Completed {deleted:before.counts,retained:before.retained}))
+    Ok(Outcome::Deleted(Completed {
+        deleted: before.counts,
+        retained: before.retained,
+    }))
 }

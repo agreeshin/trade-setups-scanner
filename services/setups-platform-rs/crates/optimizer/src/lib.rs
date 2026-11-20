@@ -28,6 +28,7 @@ pub use search::search_continuous_resumable;
 pub use setups_replay::CancelToken;
 pub use types::*;
 pub use validation::{default_parameter_descriptors, required_input_bounds, validate_request};
+pub use validation::parse_params as saved_algorithm_params;
 
 pub const OPTIMIZER_VERSION: &str = "plan-a-3";
 pub const CONTINUOUS_OPTIMIZER_VERSION: &str = "plan-a-continuous-1";

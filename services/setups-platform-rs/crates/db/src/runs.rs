@@ -6,6 +6,9 @@ use sqlx::Row;
 use sqlx::postgres::{PgPool, PgRow};
 
 const CACHE_LOCK_KEY: i64 = 72_423_411;
+// Instrument children are durable but private until the complete pair is published.
+pub(crate) const RUN_VISIBLE:&str="(replay_runs.origin<>'study_actual' or exists(select 1 from study_actualizations a where a.owner_id=replay_runs.owner_id and a.study_id=replay_runs.actual_study_id and a.revision=replay_runs.actual_revision and a.job_id=replay_runs.actual_job_id and a.batch_id=replay_runs.batch_id and a.status='completed'))";
+const BATCH_VISIBLE:&str="(b.origin<>'study_actual' or exists(select 1 from study_actualizations a where a.owner_id=b.owner_id and a.study_id=b.actual_study_id and a.revision=b.actual_revision and a.job_id=b.actual_job_id and a.batch_id=b.id and a.status='completed'))";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplayRunFull {
@@ -34,12 +37,13 @@ pub struct ReplayRunFull {
     pub origin: String,
     pub continuous_generation_id: Option<i64>,
     pub continuous_study_id: Option<i64>,
+    pub actual_study_id: Option<i64>,pub actual_revision:Option<i64>,pub actual_job_id:Option<String>,
 }
 
 const RUN_COLUMNS: &str = "id, name, batch_id, exchange_code, category, symbol, status, cache_hit, setups, warmup_minutes, \
      processed_minutes, error, algorithm_id, algorithm_version, from_ts, to_ts, created_at, params, \
      quality, quality_source_run_id, quality_computed_at, origin, coalesce(continuous_generation_id,(continuous_archive->>'generationId')::bigint) as continuous_generation_id, \
-     coalesce((select study_id from continuous_generations where id=replay_runs.continuous_generation_id),(continuous_archive->>'studyId')::bigint) as continuous_study_id";
+     coalesce((select study_id from continuous_generations where id=replay_runs.continuous_generation_id),(continuous_archive->>'studyId')::bigint) as continuous_study_id,actual_study_id,actual_revision,actual_job_id";
 
 fn run_full_from_row(row: &PgRow) -> Result<ReplayRunFull, DbError> {
     let algorithm_id: String = row.try_get("algorithm_id")?;
@@ -78,13 +82,14 @@ fn run_full_from_row(row: &PgRow) -> Result<ReplayRunFull, DbError> {
         origin: row.try_get("origin")?,
         continuous_generation_id: row.try_get("continuous_generation_id")?,
         continuous_study_id: row.try_get("continuous_study_id")?,
+        actual_study_id:row.try_get("actual_study_id")?,actual_revision:row.try_get("actual_revision")?,actual_job_id:row.try_get("actual_job_id")?,
     })
 }
 
 pub async fn list_recent_runs(pool: &PgPool, limit: i64) -> Result<Vec<ReplayRunFull>, DbError> {
     let rows = sqlx::query(&format!(
         "select {RUN_COLUMNS}, coalesce(jsonb_array_length(setups), 0) as setup_count \
-         from replay_runs where batch_id is null order by id desc limit $1"
+         from replay_runs where batch_id is null and {RUN_VISIBLE} order by id desc limit $1"
     ))
     .bind(limit as i32)
     .fetch_all(pool)
@@ -97,7 +102,7 @@ pub async fn list_recent_runs(pool: &PgPool, limit: i64) -> Result<Vec<ReplayRun
 pub async fn get_run_full(pool: &PgPool, run_id: i64) -> Result<Option<ReplayRunFull>, DbError> {
     let row = sqlx::query(&format!(
         "select {RUN_COLUMNS}, coalesce(jsonb_array_length(setups), 0) as setup_count \
-         from replay_runs where id = $1"
+         from replay_runs where id = $1 and {RUN_VISIBLE}"
     ))
     .bind(run_id as i32)
     .fetch_optional(pool)
@@ -158,13 +163,13 @@ pub async fn get_run_page(
     let path = format!("$[{offset} to {}]", (offset + limit - 1).min(2_147_483_647));
     let query = if offset > 2_147_483_647 {
         format!(
-            "select {RUN_COLUMNS}, coalesce(jsonb_array_length(setups), 0) as setup_count, '[]'::jsonb as setups_page from replay_runs where id = $1"
+            "select {RUN_COLUMNS}, coalesce(jsonb_array_length(setups), 0) as setup_count, '[]'::jsonb as setups_page from replay_runs where id = $1 and {RUN_VISIBLE}"
         )
     } else {
         format!(
             "select {RUN_COLUMNS}, coalesce(jsonb_array_length(setups), 0) as setup_count, \
              jsonb_path_query_array(coalesce(setups, '[]'::jsonb), $2::jsonpath) as setups_page \
-             from replay_runs where id = $1"
+             from replay_runs where id = $1 and {RUN_VISIBLE}"
         )
     };
     let mut statement = sqlx::query(&query).bind(run_id as i32);
@@ -205,9 +210,10 @@ pub struct BatchSummary {
     pub origin: String,
     pub continuous_generation_id: Option<i64>,
     pub continuous_study_id: Option<i64>,
+    pub actual_study_id:Option<i64>,pub actual_revision:Option<i64>,pub actual_job_id:Option<String>,
 }
 
-const BATCH_SELECT: &str = "select b.id, b.name, b.exchange_code, b.category, b.algorithm_id, b.algorithm_version, b.params, b.from_ts, b.to_ts, b.instrument_count, b.created_at, b.origin,coalesce(b.continuous_generation_id,(b.continuous_archive->>'generationId')::bigint) as continuous_generation_id, \
+const BATCH_SELECT: &str = "select b.id, b.name, b.exchange_code, b.category, b.algorithm_id, b.algorithm_version, b.params, b.from_ts, b.to_ts, b.instrument_count, b.created_at, b.origin,b.actual_study_id,b.actual_revision,b.actual_job_id,coalesce(b.continuous_generation_id,(b.continuous_archive->>'generationId')::bigint) as continuous_generation_id, \
      coalesce((select study_id from continuous_generations where id=b.continuous_generation_id),(b.continuous_archive->>'studyId')::bigint) as continuous_study_id, \
      count(*) filter (where r.status in ('queued','running','cancel_requested')) as active_instruments, \
      count(*) filter (where r.status = 'done') as done_instruments, \
@@ -253,13 +259,14 @@ fn batch_from_row(row: &PgRow) -> Result<BatchSummary, DbError> {
         origin: row.try_get("origin")?,
         continuous_generation_id: row.try_get("continuous_generation_id")?,
         continuous_study_id: row.try_get("continuous_study_id")?,
+        actual_study_id:row.try_get("actual_study_id")?,actual_revision:row.try_get("actual_revision")?,actual_job_id:row.try_get("actual_job_id")?,
     })
 }
 
 pub async fn list_replay_batches(pool: &PgPool, limit: i64) -> Result<Vec<BatchSummary>, DbError> {
     let rows = sqlx::query(&format!(
         "{BATCH_SELECT} from replay_batches b join replay_runs r on r.batch_id = b.id \
-         group by b.id order by b.id desc limit $1"
+         where {BATCH_VISIBLE} group by b.id order by b.id desc limit $1"
     ))
     .bind(limit as i32)
     .fetch_all(pool)
@@ -286,7 +293,7 @@ pub async fn get_run_intervals(
     sqlx::query("set transaction isolation level repeatable read")
         .execute(&mut *tx)
         .await?;
-    let run = sqlx::query("select quality, quality_source_run_id from replay_runs where id = $1")
+    let run = sqlx::query(&format!("select quality, quality_source_run_id from replay_runs where id = $1 and {RUN_VISIBLE}"))
         .bind(run_id as i32)
         .fetch_optional(&mut *tx)
         .await?;
@@ -535,7 +542,7 @@ pub async fn get_replay_batch(
 ) -> Result<Option<BatchSummary>, DbError> {
     let rows = sqlx::query(&format!(
         "{BATCH_SELECT} from replay_batches b join replay_runs r on r.batch_id = b.id \
-         where b.id = $1 group by b.id"
+         where b.id = $1 and {BATCH_VISIBLE} group by b.id"
     ))
     .bind(batch_id as i32)
     .fetch_optional(pool)
@@ -613,7 +620,7 @@ pub async fn delete_replay_batch(
         return Ok(None);
     }
     if sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from continuous_generations where replay_batch_id=$1)",
+        "select exists(select 1 from continuous_generations where replay_batch_id=$1) or exists(select 1 from replay_batches where id=$1 and origin='study_actual')",
     )
     .bind(batch_id as i32)
     .fetch_one(&mut *tx)
@@ -685,7 +692,7 @@ pub async fn replay_batch_result_page(
     offset: i64,
     limit: i64,
 ) -> Result<Option<(Vec<BatchSetupRow>, i64)>, DbError> {
-    let batch = sqlx::query("select id from replay_batches where id = $1")
+    let batch = sqlx::query(&format!("select b.id from replay_batches b where b.id = $1 and {BATCH_VISIBLE}"))
         .bind(batch_id as i32)
         .fetch_optional(pool)
         .await?;

@@ -108,7 +108,9 @@ pub struct ForecastBestPair {
 
 fn forecast_mode<'a>(best: &'a Value, spec: &'a Value) -> Option<&'a str> {
     // Only persisted inputs belong to this result; never use a current config.
-    best.get("trendMode").or_else(|| spec.get("trendMode"))?.as_str()
+    best.get("trendMode")
+        .or_else(|| spec.get("trendMode"))?
+        .as_str()
 }
 
 fn forecast_pair(cell: &Value, mode: Option<&str>) -> Option<ForecastBestPair> {
@@ -133,7 +135,10 @@ fn forecast_pair(cell: &Value, mode: Option<&str>) -> Option<ForecastBestPair> {
 pub fn forecast_best_pair(result: Option<&Value>, spec: &Value) -> Option<ForecastBestPair> {
     let best = result?.get("best")?;
     let mode = forecast_mode(best, spec);
-    best.get("matrix")?.as_array()?.iter().filter_map(|cell| forecast_pair(cell, mode))
+    best.get("matrix")?
+        .as_array()?
+        .iter()
+        .filter_map(|cell| forecast_pair(cell, mode))
         .fold(None::<ForecastBestPair>, |winner, pair| match winner {
             Some(current) if current.forecast_r >= pair.forecast_r => Some(current),
             _ => Some(pair),
@@ -156,6 +161,7 @@ pub struct StudySummary {
     pub owner_id: String,
     pub continuous_generation_id: Option<i64>,
     pub continuous_slot_id: Option<i64>,
+    pub actual: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -187,13 +193,28 @@ pub async fn list(
     .await?;
     // Page BEFORE inspecting matrices. PostgreSQL returns at most one cell per
     // row, never full result matrices/events to API memory (at most 100 rows).
+    // TODO(study_actual): remove the redundant idle-eligibility CASE/version
+    // binds below during integration cleanup. The API bulk summary projection
+    // is authoritative and replaces this bounded metadata; keeping it for the
+    // current handoff does not change client eligibility or add SQL round-trips.
     let rows = sqlx::query(
         "select page.id,page.status,page.spec,page.progress,page.error,page.created_at,page.updated_at, \
          page.origin,page.owner_id,page.continuous_generation_id,page.continuous_slot_id, \
          (case when page.status in ('queued','running','cancel_requested') \
           then page.progress->>'bestScore' else page.result#>>'{best,score}' end)::double precision as best_score, \
          coalesce(page.result#>'{best,trendMode}',page.spec->'trendMode') as forecast_mode, \
-         winner.cell as best_forecast_cell \
+         winner.cell as best_forecast_cell, \
+         coalesce((select jsonb_build_object('study_id',page.id,'job_id',a.job_id,'revision',a.revision,'status',a.status,'stage',a.stage,'totals',a.totals,'observed_through_unix',a.observed_through_unix,'error',a.error) from study_actualizations a where a.owner_id=page.owner_id and a.study_id=page.id), \
+          jsonb_build_object('study_id',page.id,'status','not_calculated','eligibility_reason',case \
+           when page.status not in ('completed','cancelled','failed') then 'study_active' \
+           when jsonb_typeof(page.result->'best') is distinct from 'object' then 'winner_missing' \
+           when not coalesce(((page.algorithm_id=$4 and page.spec->>'algorithmVersion'=$5) or (page.algorithm_id=$6 and page.spec->>'algorithmVersion'=$7)),false) then 'algorithm_version_unavailable' \
+           when page.execution_started_at is null and not exists(select 1 from continuous_generations g where g.id=page.continuous_generation_id and g.owner_id=page.owner_id) \
+            and not exists(select 1 from jsonb_array_elements(case when jsonb_typeof(page.events)='array' then page.events else '[]'::jsonb end) e where e->>'kind'='started' and jsonb_typeof(e->'at')='string') then 'execution_start_unavailable' \
+           when not coalesce((jsonb_typeof(page.result#>'{best,params}')='object' and jsonb_typeof(page.result#>'{best,analytics}')='object' \
+            and jsonb_typeof(page.result#>'{best,matrix}')='array' and page.spec->>'direction' in ('short','long') \
+            and jsonb_typeof(page.spec->'instruments')='array' and page.spec->'instruments'<>'[]'::jsonb),false) then 'trade_conditions_unavailable' \
+           else null end)) as actual \
          from (select * from optimization_studies where ($1::text is null or algorithm_id=$1) \
           order by (status in ('queued','running','cancel_requested')) desc, id desc limit $2 offset $3) page \
          left join lateral ( \
@@ -216,6 +237,8 @@ pub async fn list(
     .bind(algorithm)
     .bind(limit)
     .bind(offset)
+    .bind(setups_domain::SPIKE_ALGORITHM_ID).bind(setups_domain::SPIKE_ALGORITHM_VERSION)
+    .bind(setups_domain::SPIKE_DROP_ALGORITHM_ID).bind(setups_domain::SPIKE_DROP_ALGORITHM_VERSION)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -233,11 +256,14 @@ pub async fn list(
                 created_at: row.try_get("created_at")?,
                 updated_at: row.try_get("updated_at")?,
                 best_score: row.try_get("best_score")?,
-                forecast_best: cell.as_ref().and_then(|cell| forecast_pair(cell, mode.as_ref().and_then(Value::as_str))),
+                forecast_best: cell
+                    .as_ref()
+                    .and_then(|cell| forecast_pair(cell, mode.as_ref().and_then(Value::as_str))),
                 origin: row.try_get("origin")?,
                 owner_id: row.try_get("owner_id")?,
                 continuous_generation_id: row.try_get("continuous_generation_id")?,
                 continuous_slot_id: row.try_get("continuous_slot_id")?,
+                actual:Some(crate::study_actual::compact_summary(&row.try_get::<Value,_>("actual")?)),
             })
         })
         .collect::<Result<_, DbError>>()?;
@@ -258,21 +284,33 @@ pub enum DeleteStudyOutcome {
 
 pub async fn delete(pool: &PgPool, id: i64) -> Result<Option<DeleteStudyOutcome>, DbError> {
     let mut tx = pool.begin().await?;
-    let status: Option<String> =
-        sqlx::query_scalar("select status from optimization_studies where id=$1 for update")
+    let head =
+        sqlx::query("select status,owner_id from optimization_studies where id=$1 for no key update")
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?;
-    let Some(status) = status else {
+    let Some(head) = head else {
         tx.commit().await?;
         return Ok(None);
     };
+    let status:String=head.try_get("status")?;
+    let owner:String=head.try_get("owner_id")?;
     if !matches!(status.as_str(), "completed" | "cancelled" | "failed") {
         tx.commit().await?;
         return Ok(Some(DeleteStudyOutcome::Active));
     }
-    if sqlx::query_scalar::<_,bool>("select exists(select 1 from continuous_generations where study_id=$1)")
-        .bind(id).fetch_one(&mut *tx).await? { return Ok(Some(DeleteStudyOutcome::Referenced)); }
+    if sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from continuous_generations where study_id=$1)",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?
+    {
+        return Ok(Some(DeleteStudyOutcome::Referenced));
+    }
+    if !crate::study_actual::cleanup_for_study_delete(&mut tx,&owner,id).await? {
+        return Ok(Some(DeleteStudyOutcome::Referenced));
+    }
     sqlx::query("delete from optimization_studies where id=$1")
         .bind(id)
         .execute(&mut *tx)
@@ -283,7 +321,7 @@ pub async fn delete(pool: &PgPool, id: i64) -> Result<Option<DeleteStudyOutcome>
 
 pub async fn claim(pool: &PgPool) -> Result<Option<StudyRecord>, DbError> {
     sqlx::query(
-        "update optimization_studies set status='running',updated_at=now() \
+        "update optimization_studies set status='running',execution_started_at=clock_timestamp(),updated_at=now() \
          where id=(select id from optimization_studies where origin='manual' and status='queued' order by id \
          for update skip locked limit 1) and status='queued' returning *",
     )
@@ -297,8 +335,14 @@ pub async fn cancel(pool: &PgPool, id: i64) -> Result<Option<(StudyRecord, bool)
     // Queued work has no retained input or admitted CPU work. Running work keeps
     // its active slot until its owner drains and calls finish.
     let mut tx = pool.begin().await?;
-    if let Some(row)=sqlx::query("select * from optimization_studies where id=$1 and origin='continuous' for update").bind(id).fetch_optional(&mut *tx).await? {
-        return Ok(Some((record(row)?,false)));
+    if let Some(row) = sqlx::query(
+        "select * from optimization_studies where id=$1 and origin='continuous' for update",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        return Ok(Some((record(row)?, false)));
     }
     let previous: Option<String> =
         sqlx::query_scalar("select status from optimization_studies where id=$1 for update")
@@ -441,9 +485,15 @@ mod forecast_tests {
             cell(0.2, 5.0, 4.0),cell(0.30001, -0.7, 6.0),cell(0.3, 9.0, 8.0)
         ]}});
         let before = result.clone();
-        assert_eq!(forecast_best_pair(Some(&result), &json!({})), Some(ForecastBestPair {
-            forecast_r: 0.30001, mean_r: -0.7, tp_pct: 6.0, sl_pct: 4.0,
-        }));
+        assert_eq!(
+            forecast_best_pair(Some(&result), &json!({})),
+            Some(ForecastBestPair {
+                forecast_r: 0.30001,
+                mean_r: -0.7,
+                tp_pct: 6.0,
+                sl_pct: 4.0,
+            })
+        );
         assert_eq!(result, before, "projection must not rewrite saved results");
     }
 
@@ -454,7 +504,8 @@ mod forecast_tests {
             (vec![cell(-0.1, 1.0, 4.0), cell(0.0, -3.0, 6.0)], 0.0, 6.0),
             (vec![cell(0.5, 1.0, 4.0), cell(0.5, -3.0, 6.0)], 0.5, 4.0),
         ] {
-            let pair = forecast_best_pair(Some(&json!({"best":{"matrix":values}})), &json!({})).unwrap();
+            let pair =
+                forecast_best_pair(Some(&json!({"best":{"matrix":values}})), &json!({})).unwrap();
             assert_eq!((pair.forecast_r, pair.tp_pct), (expected, tp));
         }
     }
@@ -465,27 +516,53 @@ mod forecast_tests {
             "meanRiskExpectancy":-0.3,"tpPct":4,"slPct":6}]}});
         assert!(forecast_best_pair(Some(&result), &json!({})).is_none());
         assert!(forecast_best_pair(Some(&result), &json!({"trendMode":"blend"})).is_none());
-        assert_eq!(forecast_best_pair(Some(&result), &json!({"trendMode":"forecast"})).unwrap().forecast_r, 0.5);
+        assert_eq!(
+            forecast_best_pair(Some(&result), &json!({"trendMode":"forecast"}))
+                .unwrap()
+                .forecast_r,
+            0.5
+        );
         result["best"]["trendMode"] = json!("mean");
         assert!(forecast_best_pair(Some(&result), &json!({"trendMode":"forecast"})).is_none());
         result["best"]["trendMode"] = json!("forecast");
-        assert_eq!(forecast_best_pair(Some(&result), &json!({"trendMode":"mean"})).unwrap().mean_r, -0.3);
+        assert_eq!(
+            forecast_best_pair(Some(&result), &json!({"trendMode":"mean"}))
+                .unwrap()
+                .mean_r,
+            -0.3
+        );
         result["best"]["matrix"][0]["forecastRiskExpectancy"] = Value::Null;
-        assert!(forecast_best_pair(Some(&result), &json!({})).is_none(), "explicit null is not an absent field");
+        assert!(
+            forecast_best_pair(Some(&result), &json!({})).is_none(),
+            "explicit null is not an absent field"
+        );
     }
 
     #[test]
     fn legacy_empty_missing_and_incomplete_results_have_no_invented_forecast() {
         assert!(forecast_best_pair(None, &json!({})).is_none());
-        for result in [Value::Null, json!({"best":null}), json!({"best":{"matrix":[]}}),
-            json!({"best":{"matrix":{}}}), json!({"best":{"matrix":[{"tpPct":4,"slPct":4,"riskExpectancy":9}]}})] {
+        for result in [
+            Value::Null,
+            json!({"best":null}),
+            json!({"best":{"matrix":[]}}),
+            json!({"best":{"matrix":{}}}),
+            json!({"best":{"matrix":[{"tpPct":4,"slPct":4,"riskExpectancy":9}]}}),
+        ] {
             assert!(forecast_best_pair(Some(&result), &json!({})).is_none());
         }
-        for (field, value) in [("forecastRiskExpectancy", json!("NaN")), ("meanRiskExpectancy", Value::Null),
-            ("meanRiskExpectancy", json!("Infinity")), ("tpPct", json!(0)), ("slPct", json!(101))] {
+        for (field, value) in [
+            ("forecastRiskExpectancy", json!("NaN")),
+            ("meanRiskExpectancy", Value::Null),
+            ("meanRiskExpectancy", json!("Infinity")),
+            ("tpPct", json!(0)),
+            ("slPct", json!(101)),
+        ] {
             let mut invalid = cell(2.0, 3.0, 4.0);
             invalid[field] = value;
-            assert!(forecast_best_pair(Some(&json!({"best":{"matrix":[invalid]}})), &json!({})).is_none());
+            assert!(
+                forecast_best_pair(Some(&json!({"best":{"matrix":[invalid]}})), &json!({}))
+                    .is_none()
+            );
         }
     }
 }

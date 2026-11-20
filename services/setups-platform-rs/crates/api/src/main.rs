@@ -115,7 +115,7 @@ async fn main() {
         config.market_data_api_key.clone(),
     );
     let optimization_runtime = match setups_api::optimization::start_optimization_runtime(
-        manual_pool,
+        manual_pool.clone(),
         config.market_data_url.clone(),
         config.market_data_api_key.clone(),
         config.optimization.clone(),
@@ -128,6 +128,9 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let actual_runtime=setups_api::study_actual::start_actual_runtime(Arc::new(ReplayState {
+        pool:manual_pool,auth:auth.clone(),market_url:config.market_data_url.clone(),market_key:config.market_data_api_key.clone(),limits:config.replay_limits,
+    }),config.replay_workers).await.unwrap_or_else(|error|{eprintln!("study actual runtime failed: {error}");std::process::exit(1)});
     let optimization_state = Arc::new(setups_api::optimization::OptimizationState {
         pool: pool.clone(),
         auth: auth.clone(),
@@ -166,6 +169,7 @@ async fn main() {
     let app = axum::Router::new()
         .merge(setups_api::session_router(auth.clone()))
         .merge(replay_router(replay_state.clone()))
+        .merge(setups_api::study_actual::study_actual_router(replay_state.clone()))
         .merge(controls_router(controls_state))
         .merge(batches_router(replay_state))
         .merge(setups_api::analytics::analytics_router(analytics_state.clone()))
@@ -188,7 +192,7 @@ async fn main() {
         config.host, config.port
     );
     if let Err(error) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(jobs, live_runtime, optimization_runtime,continuous_runtime))
+        .with_graceful_shutdown(shutdown_signal(jobs, live_runtime, optimization_runtime,continuous_runtime,actual_runtime))
         .await
     {
         eprintln!("server error: {error}");
@@ -206,6 +210,7 @@ async fn shutdown_signal(
     live: setups_worker::live::LiveHandle,
     optimization: setups_api::optimization::OptimizationHandle,
     continuous: setups_api::continuous::runtime::ContinuousHandle,
+    actual: setups_api::study_actual::ActualHandle,
 ) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -225,7 +230,7 @@ async fn shutdown_signal(
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-    tokio::join!(live.stop(), jobs.stop(), optimization.stop(),continuous.stop());
+    tokio::join!(live.stop(), jobs.stop(), optimization.stop(),continuous.stop(),actual.stop());
 }
 
 #[cfg(test)]

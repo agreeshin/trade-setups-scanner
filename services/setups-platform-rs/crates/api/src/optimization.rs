@@ -336,7 +336,12 @@ async fn list_studies(
         return response(StatusCode::BAD_REQUEST, json!({"error":"invalid_query"}));
     }
     match db::list(&state.pool, query.algorithm_id.as_deref(), limit, offset).await {
-        Ok(page) => ([("cache-control", "no-store")], Json(page)).into_response(),
+        Ok(mut page) => {
+            if let Err(error) = crate::study_actual_summary::enrich(&state.pool, "admin", &mut page).await {
+                return internal_error("list_actual_summary", error);
+            }
+            ([("cache-control", "no-store")], Json(page)).into_response()
+        }
         Err(error) => internal_error("list", error),
     }
 }

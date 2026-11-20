@@ -465,9 +465,9 @@ pub async fn load_analytics_setups(
 ) -> Result<Option<Vec<AnalyticsSetupRow>>, DbError> {
     match set_ref.kind {
         SetKind::Run => {
-            let row = sqlx::query(
-                "select setups, exchange_code, category, symbol from replay_runs where id = $1",
-            )
+            let row = sqlx::query(&format!(
+                "select setups, exchange_code, category, symbol from replay_runs where id = $1 and {}",crate::runs::RUN_VISIBLE,
+            ))
             .bind(set_ref.id as i32)
             .fetch_optional(pool)
             .await?;

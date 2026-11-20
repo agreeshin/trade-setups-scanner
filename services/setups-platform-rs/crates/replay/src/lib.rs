@@ -124,6 +124,7 @@ pub enum ReplayRunError {
     Source(String),
     PageLimitExceeded(usize),
     Detector(DecimalError),
+    OutputBudgetExceeded,
 }
 
 impl std::fmt::Display for ReplayRunError {
@@ -134,6 +135,7 @@ impl std::fmt::Display for ReplayRunError {
                 write!(f, "replay source exceeded page limit: {size}")
             }
             ReplayRunError::Detector(error) => write!(f, "detector error: {error}"),
+            ReplayRunError::OutputBudgetExceeded => write!(f, "replay output budget exceeded"),
         }
     }
 }
@@ -171,6 +173,13 @@ pub struct ReplayRunOptions<'a, S> {
 pub async fn replay_run<S: CandleSource>(
     options: ReplayRunOptions<'_, S>,
 ) -> Result<ReplayRunResult, ReplayRunError> {
+    replay_run_bounded(options,usize::MAX,usize::MAX).await
+}
+
+/// Same detector/replay, with operation-owned output budgets before retention.
+pub async fn replay_run_bounded<S: CandleSource>(
+    options: ReplayRunOptions<'_, S>, max_setups: usize, max_output_bytes: usize,
+) -> Result<ReplayRunResult, ReplayRunError> {
     let params = options.params.unwrap_or_default();
     let required_minutes = params.baseline_long_days() as u64 * 1440;
     let mut detector = PriceVolumeSpikeDetector::with_params(params, options.last_setup_unix)
@@ -183,6 +192,9 @@ pub async fn replay_run<S: CandleSource>(
         .unwrap_or(options.from_unix - required_minutes as i64 * MINUTE_SECONDS);
 
     let mut setups: Vec<SpikeSetup> = Vec::new();
+    let mut output_bytes=0usize;
+    let cooperative=max_setups!=usize::MAX || max_output_bytes!=usize::MAX;
+    let mut chunk=0u16;
     let mut processed_minutes: u64 = 0;
     let mut warmup_minutes: u64 = 0;
     let mut last_processed_unix: Option<i64> = None;
@@ -218,6 +230,12 @@ pub async fn replay_run<S: CandleSource>(
             return Err(ReplayRunError::PageLimitExceeded(page.bars.len()));
         }
         for bar in &page.bars {
+            // Only the new explicitly bounded path yields. The ordinary replay
+            // retains its existing synchronous iteration and cancellation rules.
+            if cooperative {
+                chunk+=1;
+                if chunk==128 {chunk=0;tokio::task::yield_now().await;}
+            }
             if cancelled() {
                 break 'outer;
             }
@@ -238,6 +256,10 @@ pub async fn replay_run<S: CandleSource>(
             if let Some(setup) = &result.setup
                 && bar.open_time_unix >= options.from_unix
             {
+                if max_output_bytes!=usize::MAX {
+                    output_bytes=output_bytes.saturating_add(serde_json::to_vec(setup).map_err(|_|ReplayRunError::OutputBudgetExceeded)?.len());
+                }
+                if setups.len()>=max_setups || output_bytes>max_output_bytes {return Err(ReplayRunError::OutputBudgetExceeded);}
                 setups.push(setup.clone());
             }
             last_processed_unix = Some(bar.open_time_unix);
@@ -263,4 +285,19 @@ pub async fn replay_run<S: CandleSource>(
         cancelled: cancelled(),
         last_status,
     })
+}
+
+#[cfg(test)] mod bounded_tests {
+    use super::*;
+    #[tokio::test(flavor="current_thread")]
+    async fn bounded_replay_yields_to_cancellation_without_changing_unbounded_output() {
+        let source=ArrayCandleSource::new((0..10_000).map(|i|CandleBarDto{open_time_unix:i*60,close:"100".into(),volume:"1".into(),quote_turnover:"100".into()}).collect());
+        let cancel=std::sync::Arc::new(CancelToken::new());let trigger=cancel.clone();
+        let task=tokio::spawn(async move{tokio::task::yield_now().await;trigger.cancel();});let started=std::time::Instant::now();
+        let result=replay_run_bounded(ReplayRunOptions{source:&source,from_unix:0,to_unix:600_000,params:None,last_setup_unix:None,warmup_unix:Some(0),cancel:Some(&cancel)},50_000,8*1024*1024).await.unwrap();
+        task.await.unwrap();assert!(result.cancelled);assert!(result.warmup_minutes+result.processed_minutes<=512);assert!(started.elapsed()<std::time::Duration::from_secs(2));
+        let ordinary=replay_run(ReplayRunOptions{source:&source,from_unix:0,to_unix:600_000,params:None,last_setup_unix:None,warmup_unix:Some(0),cancel:None}).await.unwrap();
+        let bounded=replay_run_bounded(ReplayRunOptions{source:&source,from_unix:0,to_unix:600_000,params:None,last_setup_unix:None,warmup_unix:Some(0),cancel:None},50_000,8*1024*1024).await.unwrap();
+        assert_eq!(serde_json::to_value(ordinary).unwrap(),serde_json::to_value(bounded).unwrap());
+    }
 }

@@ -172,8 +172,9 @@ pub(crate) async fn active_reservation_bytes(
         total = total
             .saturating_add(work_minutes_of(&row)? * limits.estimated_bytes_per_work_minute + 4096);
     }
-    let continuous:i64=sqlx::query_scalar("select coalesce(sum(g.reserved_bytes),0)::bigint + coalesce(sum(greatest(coalesce(a.reserved_bytes,0)-coalesce(a.snapshot_bytes,0)-coalesce(octet_length(a.checkpoint),0),0)),0)::bigint from continuous_generations g left join continuous_runtime_artifacts a on a.generation_id=g.id where g.status='running'").fetch_one(tx).await?;
-    total=total.saturating_add(continuous);
+    let continuous:i64=sqlx::query_scalar("select coalesce(sum(g.reserved_bytes),0)::bigint + coalesce(sum(greatest(coalesce(a.reserved_bytes,0)-coalesce(a.snapshot_bytes,0)-coalesce(octet_length(a.checkpoint),0),0)),0)::bigint from continuous_generations g left join continuous_runtime_artifacts a on a.generation_id=g.id where g.status='running'").fetch_one(&mut *tx).await?;
+    let actual:i64=sqlx::query_scalar("select coalesce(sum(reserved_bytes),0)::bigint from study_actualizations where status in ('queued','running')").fetch_one(&mut *tx).await?;
+    total = total.saturating_add(continuous).saturating_add(actual);
     Ok(total)
 }
 
@@ -195,11 +196,12 @@ pub async fn reserve_replay_runs(
         .bind(QUEUE_LOCK_KEY)
         .execute(&mut *tx)
         .await?;
-    let count_row =
-        sqlx::query("select count(*)::bigint as n from replay_runs where origin='manual' and status = any($1)")
-            .bind(PENDING.as_slice())
-            .fetch_one(&mut *tx)
-            .await?;
+    let count_row = sqlx::query(
+        "select ((select count(*) from replay_runs where origin='manual' and status = any($1))+(select count(*) from study_actualizations where status in ('queued','running')))::bigint as n",
+    )
+    .bind(PENDING.as_slice())
+    .fetch_one(&mut *tx)
+    .await?;
     let pending_count: i64 = count_row.try_get("n")?;
     let requested_runs = pending_count + input.instruments.len() as i64;
     if requested_runs > limits.max_pending_runs {
@@ -385,7 +387,9 @@ pub async fn cancel_replay_run(
         return Ok(None);
     };
     let run = replay_run_from_row(&row)?;
-    if row.try_get::<String,_>("origin")?=="continuous" {return Ok(Some(run));}
+    if row.try_get::<String, _>("origin")? == "continuous" {
+        return Ok(Some(run));
+    }
     if !PENDING.contains(&run.status.as_str()) {
         tx.commit().await?;
         return Ok(Some(run));
@@ -429,11 +433,12 @@ pub async fn purge_replay_runs(pool: &PgPool) -> Result<PurgeOutcome, QueueError
         .bind(QUEUE_LOCK_KEY)
         .execute(&mut *tx)
         .await?;
-    let count_row =
-        sqlx::query("select count(*)::bigint as n from replay_runs where origin='manual' and status = any($1)")
-            .bind(["running", "cancel_requested"].as_slice())
-            .fetch_one(&mut *tx)
-            .await?;
+    let count_row = sqlx::query(
+        "select count(*)::bigint as n from replay_runs where origin='manual' and status = any($1)",
+    )
+    .bind(["running", "cancel_requested"].as_slice())
+    .fetch_one(&mut *tx)
+    .await?;
     let active: i64 = count_row.try_get("n")?;
     if active > 0 {
         let queued = sqlx::query(
@@ -496,7 +501,7 @@ pub async fn delete_replay_run(
         .bind(QUEUE_LOCK_KEY)
         .execute(&mut *tx)
         .await?;
-    let row = sqlx::query("select status,continuous_generation_id from replay_runs where id = $1")
+    let row = sqlx::query("select status,continuous_generation_id,origin from replay_runs where id = $1")
         .bind(run_id as i32)
         .fetch_optional(&mut *tx)
         .await?;
@@ -505,7 +510,12 @@ pub async fn delete_replay_run(
         return Ok(None);
     };
     let status: String = row.try_get("status")?;
-    if row.try_get::<Option<i64>,_>("continuous_generation_id")?.is_some() {return Ok(Some(DeleteRunOutcome::Referenced));}
+    if row.try_get::<String,_>("origin")? == "study_actual" || row
+        .try_get::<Option<i64>, _>("continuous_generation_id")?
+        .is_some()
+    {
+        return Ok(Some(DeleteRunOutcome::Referenced));
+    }
     if PENDING.contains(&status.as_str()) {
         tx.commit().await?;
         return Ok(Some(DeleteRunOutcome::Active));

@@ -145,7 +145,7 @@ fn validate_field(key: &str, value: &Value, field: &ParameterDescriptor) -> Resu
     Ok(())
 }
 
-pub(crate) fn parse_params(id: &str, params: &ParamMap) -> Result<AlgorithmParams, StudyError> {
+pub fn parse_params(id: &str, params: &ParamMap) -> Result<AlgorithmParams, StudyError> {
     let fields = default_parameter_descriptors(id)?;
     if params.len() != fields.len() {
         return Err(invalid(

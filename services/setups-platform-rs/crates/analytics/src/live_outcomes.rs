@@ -107,6 +107,14 @@ pub fn evaluate(
     observed_through_unix: i64,
     evaluated_at_unix: i64,
 ) -> TradeOutcome {
+    evaluate_with_horizon(setup,terms,candles,observed_through_unix,evaluated_at_unix,HORIZON_MINUTES)
+}
+
+/// A proven saved retrospective horizon; ordinary released calls retain the default.
+pub fn evaluate_with_horizon(
+    setup: &AnalyticsSetup, terms: TradeTerms, candles: &[OhlcCandle],
+    observed_through_unix: i64, evaluated_at_unix: i64, horizon_minutes: i64,
+) -> TradeOutcome {
     let evaluation = evaluate_limit_at_open(EvaluateLimitOptions {
         candles,
         setup,
@@ -114,7 +122,7 @@ pub fn evaluate(
         tp_pct: terms.tp_pct,
         sl_pct: terms.sl_pct,
         time_shift_minutes: terms.time_shift_minutes,
-        horizon_minutes: HORIZON_MINUTES,
+        horizon_minutes,
     });
     let mut result = classify(
         terms,

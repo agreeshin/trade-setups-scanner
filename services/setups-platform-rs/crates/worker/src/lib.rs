@@ -2,7 +2,7 @@ use serde_json::Value;
 use setups_db::admission::{ReplayAdmissionLimits, admit_replay_cache_miss, interrupt_queued_runs};
 use setups_db::runs::complete_run_from_cache_by_key;
 use setups_db::{DbError, ReplayRun, settings_get};
-use setups_db::{canonical_cache_key, claim_next_queued_run, fail_interrupted_runs, run_query};
+use setups_db::{canonical_cache_key, claim_next_queued_run_with_capacity, fail_interrupted_runs, run_query};
 use setups_detector::PriceVolumeSpikeDetector;
 use setups_detector::quality::{QualityInterval, ReplayQuality, ReplayQualityTracker};
 use setups_domain::decimal::DecimalError;
@@ -504,6 +504,7 @@ pub async fn start_replay_jobs(
                 worker_stopped,
                 worker_notify,
                 poll,
+                workers,
             )
             .await;
         }));
@@ -522,6 +523,7 @@ async fn worker_loop(
     stopped: Arc<AtomicBool>,
     notify: Arc<Notify>,
     poll: Duration,
+    capacity: usize,
 ) {
     loop {
         if stopped.load(Ordering::SeqCst) {
@@ -531,7 +533,7 @@ async fn worker_loop(
         let claimed = if paused {
             None
         } else {
-            claim_next_queued_run(&pool).await.ok().flatten()
+            claim_next_queued_run_with_capacity(&pool,capacity as i64).await.ok().flatten()
         };
         if let Some(run) = claimed {
             execute_queued_run(&pool, &run, &market_url, &market_key, &stopped).await;
