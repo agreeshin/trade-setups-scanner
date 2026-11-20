@@ -1213,7 +1213,13 @@ async fn mixed_scope_fifth_ready_activates_and_waiting_listing_joins_without_bac
         let mut journal=market.journal.lock().unwrap();journal.starts.insert(9,now-2*86400);
         journal.ends.insert(9,now+60);journal.available_through=Some(now+60);
     }
-    runtime.tick_at(&db.pool,&client,&AtomicBool::new(false),now+65).await.unwrap();
+    // Cold recovery is time-sliced; retry at the same observation until this
+    // waiting instrument joins, without advancing its publication frontier.
+    for _ in 0..12 {
+        runtime.tick_at(&db.pool,&client,&AtomicBool::new(false),now+65).await.unwrap();
+        let active=continuous::active_adaptive_slots(&db.pool,"admin").await.unwrap().remove(0);
+        if active.live_readiness.iter().any(|entry|entry.instrument_key=="bybit/linear/EXTRA9USDT" && entry.status=="ready") {break;}
+    }
     let active=continuous::active_adaptive_slots(&db.pool,"admin").await.unwrap().remove(0);
     assert_eq!(active.live_initialization.as_ref(),Some(&initialization),"restart must not move the live origin");
     let joined=active.live_readiness.iter().find(|entry|entry.instrument_key=="bybit/linear/EXTRA9USDT").unwrap();
