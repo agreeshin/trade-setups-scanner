@@ -47,3 +47,14 @@ it("keeps an icon action named without visible text", async () => {
   await userEvent.hover(button);
   expect(screen.getByRole("tooltip")).toHaveTextContent("Обновить статус");
 });
+
+it("animates only explicitly pending icon actions without leaking the option into DOM attributes", () => {
+  const view = render(<IconButton label="Обновить" icon={RefreshCw} />);
+  const button = screen.getByRole("button", { name: "Обновить" });
+  expect(button.querySelector("svg")).toHaveClass("size-4");
+  expect(button.querySelector("svg")).not.toHaveClass("motion-safe:animate-spin");
+  view.rerender(<IconButton label="Обновить" icon={RefreshCw} spinning disabled aria-busy />);
+  expect(button).toBeDisabled(); expect(button).toHaveAttribute("aria-busy", "true");
+  expect(button.querySelector("svg")).toHaveClass("size-4", "motion-safe:animate-spin");
+  expect(button).not.toHaveAttribute("spinning");
+});

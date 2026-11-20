@@ -21,7 +21,6 @@ import {
   fetchStudyExpectancy,
   type SetupsAnalyticsResult,
   type SetupsAnalyticsSetup,
-  type SetupsAnalyticsStatus,
   type SetupsAnalyticsStudyMeta,
   type StudyExpectancyPoint,
   type StudyExpectancySeries,
@@ -32,12 +31,13 @@ import {
   endOfRangeDateChange,
   errorText,
   localDateInput,
-  localTime,
   localTimezoneLabel,
   replayRange,
   utcMidnightOnDateChange,
   type Algorithm,
 } from "./platform-controls";
+
+import { formatOutcomeRisk as formatRisk, outcomeMeanClass as meanColorClass, SetupOutcomesTable } from "./setup-outcomes-table";
 
 const FILTER_STORAGE_KEY = "setups-analytics-filter-v1";
 
@@ -72,37 +72,9 @@ function storeFilter(filter: StoredFilter): void {
   }
 }
 
-function formatPrice(value: number | null): string {
-  if (value === null) return "—";
-  return String(Number(value.toPrecision(6)));
-}
-
-function formatRisk(value: number | null): string {
-  if (value === null) return "—";
-  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}R`;
-}
-
 function formatSignedR(value: number): string {
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)} R`;
 }
-
-function formatTime(unix: number | null): string {
-  if (unix === null) return "—";
-  return localTime(unix);
-}
-
-function meanColorClass(value: number | null): string {
-  if (value === null || value === 0) return "text-muted-foreground";
-  return value > 0 ? "text-success" : "text-danger";
-}
-
-const STATUS_BADGES: Record<SetupsAnalyticsStatus, { label: string; variant: "success" | "danger" | "neutral" | "warning" }> = {
-  tp: { label: "TP", variant: "success" },
-  sl: { label: "SL", variant: "danger" },
-  unclosed: { label: "не закрылась", variant: "neutral" },
-  no_data: { label: "нет данных", variant: "neutral" },
-  gate_failed: { label: "гейт не пройден", variant: "warning" },
-};
 
 function GateBadge({ passed, selected }: { passed: number; selected: number }) {
   return <Badge className="bg-ambient-violet/15 text-ambient-violet" aria-label={`Прошли гейт: ${passed} из ${selected}`}>{passed}/{selected}</Badge>;
@@ -210,22 +182,6 @@ function DailyOutcomesChart({ setups, range }: { setups: readonly SetupsAnalytic
       <title>{`${zonedDateLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title>
     </circle>)}
   </svg>;
-}
-
-function SetupOutcomeRow({ setup }: { setup: SetupsAnalyticsSetup }) {
-  const status = STATUS_BADGES[setup.status];
-  return <TableRow>
-    <TableCell className="font-medium">{setup.symbol}</TableCell>
-    <TableCell className="whitespace-nowrap tabular-nums">{formatTime(setup.setupTimeUnix)}</TableCell>
-    <TableCell numeric>{formatPrice(setup.entryPrice)}</TableCell>
-    <TableCell numeric className="text-success">{formatPrice(setup.tpPrice)}</TableCell>
-    <TableCell numeric className="text-danger">{formatPrice(setup.slPrice)}</TableCell>
-    <TableCell className="whitespace-nowrap tabular-nums">{formatTime(setup.closeTimeUnix)}</TableCell>
-    <TableCell numeric>{formatPrice(setup.closePrice ?? null)}</TableCell>
-    <TableCell numeric className={(setup.riskReturn ?? 0) >= 0 ? "text-success" : "text-danger"}>{formatRisk(setup.riskReturn)}</TableCell>
-    <TableCell><Badge variant={status.variant}>{status.label}</Badge></TableCell>
-    <TableCell numeric>{setup.studyId === null ? "—" : `№${setup.studyId}`}</TableCell>
-  </TableRow>;
 }
 
 function bestMeanPair(matrix: OptimizationMatrixCell[]): { tpPct: number; slPct: number; meanR: number } | null {
@@ -731,28 +687,7 @@ export function SetupsAnalyticsPanel() {
               <h3 className="text-sm font-semibold text-muted-foreground">Сетапы <span className="font-normal text-muted-foreground/80">{hideGateFailed ? result.setups.filter((setup) => setup.status !== "gate_failed").length : result.setups.length}/{result.setups.length}</span></h3>
               <label className="flex items-center gap-2 text-sm text-muted-foreground"><Checkbox checked={hideGateFailed} onCheckedChange={(checked) => setHideGateFailed(checked === true)} /> Скрыть сетапы, которые не прошли гейт</label>
             </div>
-            <div className="overflow-x-auto rounded-md border border-input/60">
-              <Table>
-                <caption className="px-3 py-2 text-left text-xs text-muted-foreground">Время: {localTimezoneLabel()}</caption>
-                <TableHeader>
-                  <TableRow className="hover:bg-transparent">
-                    <TableHead>Инструмент</TableHead>
-                    <TableHead>Время сетапа</TableHead>
-                    <TableHead numeric>Вход</TableHead>
-                    <TableHead numeric className="text-success">TP</TableHead>
-                    <TableHead numeric className="text-danger">SL</TableHead>
-                    <TableHead>Закрытие</TableHead>
-                    <TableHead numeric>Цена закрытия</TableHead>
-                    <TableHead numeric>Результат</TableHead>
-                    <TableHead>Статус</TableHead>
-                    <TableHead numeric>Исследование</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {(hideGateFailed ? result.setups.filter((setup) => setup.status !== "gate_failed") : result.setups).map((setup) => <SetupOutcomeRow key={setup.id} setup={setup} />)}
-                </TableBody>
-              </Table>
-            </div>
+            <SetupOutcomesTable setups={hideGateFailed ? result.setups.filter((setup) => setup.status !== "gate_failed") : result.setups} />
           </div>}
       </CardContent>
     </Card>}

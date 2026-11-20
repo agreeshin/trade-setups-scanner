@@ -1,4 +1,5 @@
 import { apiFetch } from "./platform-api";
+import { parseStudyActualSummary, type StudyActualSummary } from "./study-actual-api";
 import type { ForecastRecipe } from "./forecast-recipe";
 import type { TrendBendDays, TrendMode as AnalyticsTrendMode } from "./analytics-api";
 export type StudyTrendMode = AnalyticsTrendMode | "blend";
@@ -95,6 +96,8 @@ export interface OptimizationStudy {
   error: { code: string; message: string } | null;
   /** Read-only server projection; absent on old APIs, null without saved forecast data. */
   forecastBest?: OptimizationForecastBestPair | null;
+  /** Joined compact post-study job state; absent only on older servers. */
+  actual?: StudyActualSummary | null;
   createdAt: string;
   updatedAt: string;
   events: { at: string; kind: string; message: string }[];
@@ -116,7 +119,8 @@ export function summarizeOptimizationStudy(study: OptimizationStudy): Optimizati
     ...(study.continuousGenerationId !== undefined ? { continuousGenerationId: study.continuousGenerationId } : {}),
     ...(study.continuousSlotId !== undefined ? { continuousSlotId: study.continuousSlotId } : {}),
     createdAt: study.createdAt, updatedAt: study.updatedAt, bestScore: study.result?.best?.score ?? study.progress.bestScore ?? null,
-    forecastBest: study.forecastBest ?? null };
+    forecastBest: study.forecastBest ?? null,
+    ...(study.actual !== undefined ? { actual: study.actual === null ? null : parseStudyActualSummary(study.actual, study.id) } : {}) };
 }
 
 export const isActiveStudy = (study: Pick<OptimizationStudy, "status">): boolean =>
@@ -150,7 +154,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 export async function listOptimizationStudies(algorithmId: string | undefined, signal: AbortSignal, limit = 1, offset = 0): Promise<OptimizationStudyPage> {
   const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
   if (algorithmId !== undefined) query.set("algorithmId", algorithmId);
-  return request(`/v1/optimization-studies?${query}`, { signal });
+  const page = await request<OptimizationStudyPage>(`/v1/optimization-studies?${query}`, { signal });
+  return { ...page, studies: page.studies.map((study) => study.actual == null ? study : { ...study, actual: parseStudyActualSummary(study.actual, study.id) }) };
 }
 export const getOptimizationStudy = (id: number, signal: AbortSignal): Promise<OptimizationStudy> =>
   request(`/v1/optimization-studies/${id}`, { signal });
