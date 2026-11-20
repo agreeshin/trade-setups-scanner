@@ -43,8 +43,7 @@ pub async fn source(pool:&PgPool,study:i64,owner:&str,cutoff:i64)->Result<Source
     let selected=if spec.forecast.is_some() {setups_optimizer::select_robust_cell_for_mode(&best.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell,spec.trend_mode)}
         else {setups_optimizer::select_robust_cell(&best.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell)}
         .map_err(|_|"recommended_pair_unavailable")?.ok_or("recommended_pair_unavailable")?;
-    let objective=ExpectancyObjective{version:1,trend_mode:spec.trend_mode,trend_bend_days:spec.trend_bend_days,trend_blend_lambda:spec.trend_blend_lambda,forecast:spec.forecast};
-    objective.validate().map_err(|_|"objective_recipe_invalid")?;
+    let objective=source_objective(&spec)?;
     let cell=best.matrix.iter().find(|c|c.tp_pct==selected.tp_pct&&c.sl_pct==selected.sl_pct).ok_or("recommended_pair_unavailable")?;
     let available=|v:Option<f64>| match v.filter(|v|v.is_finite()) {Some(value)=>json!({"status":"available","value":value}),None=>json!({"status":"unavailable","reason":"saved_metric_unavailable"})};
     let endpoint=json!({"meanR":available(cell.mean_risk_expectancy.or(cell.risk_expectancy.filter(|_|spec.trend_mode.is_mean()))),"forecastR":available(cell.forecast_risk_expectancy.or(cell.risk_expectancy.filter(|_|spec.trend_mode==setups_domain::trend::TrendMode::Forecast))),"decisionR":available(cell.risk_expectancy),"atUnix":best.observation_cutoff});
@@ -64,6 +63,19 @@ pub async fn source(pool:&PgPool,study:i64,owner:&str,cutoff:i64)->Result<Source
     if cutoff<0||input_minutes>MAX_CANDLES||cutoff-start.timestamp()>3660*86400 {return Err("study_actual_period_budget_exceeded");}
     if serde_json::to_vec(&value).map_err(|_|"source_invalid")?.len()>1024*1024 {return Err("study_actual_source_budget_exceeded");}
     Ok(value)
+}
+
+fn source_objective(spec:&StudyRequest)->Result<ExpectancyObjective,&'static str> {
+    // Same method dispatch as optimizer::trend::effective_bend: the legacy
+    // spec bend is inactive for explicit recipes. Never rewrite the saved spec.
+    let bend=match spec.forecast {
+        Some(setups_domain::forecast::ForecastRecipe::Trend{bend_days,..})=>bend_days,
+        Some(setups_domain::forecast::ForecastRecipe::DecayedProbability{..})=>setups_domain::trend::TrendBendDays::Linear,
+        None=>spec.trend_bend_days,
+    };
+    let objective=ExpectancyObjective{version:1,trend_mode:spec.trend_mode,trend_bend_days:bend,trend_blend_lambda:spec.trend_blend_lambda,forecast:spec.forecast};
+    objective.validate().map_err(|_|"objective_recipe_invalid")?;
+    Ok(objective)
 }
 
 pub fn first_signal_open(start:DateTime<Utc>)->i64 {
@@ -95,6 +107,85 @@ pub fn chart(source:&Source,cutoff:i64,actual:Vec<Value>)->Value {
 
 #[cfg(test)] mod tests {
     use super::*;
+    use setups_domain::{forecast::ForecastRecipe,trend::{TrendBendDays,TrendBlendLambda,TrendMode}};
+
+    fn objective_spec(mode:TrendMode,forecast:Option<ForecastRecipe>)->StudyRequest {
+        serde_json::from_value(json!({
+            "algorithmId":"price_volume_spike","algorithmVersion":"1.1.1",
+            "algorithmParams":setups_domain::SpikeParams::default(),
+            "analyticsParams":setups_optimizer::AnalyticsParams::default(),
+            "instruments":[{"exchange":"fixture","category":"linear","symbol":"FIX"}],
+            "fromUnix":0,"toUnix":30*86400,"direction":"short","seed":42,
+            "trendMode":mode,"trendBendDays":"30","trendBlendLambda":0.6,"forecast":forecast
+        })).unwrap()
+    }
+
+    #[test] fn source_objective_probability_ignores_retained_trend_bend_without_mutating_spec() {
+        for mode in [TrendMode::Forecast,TrendMode::Blend,TrendMode::Mean] {
+            let spec=objective_spec(mode,Some(ForecastRecipe::engineering_baseline()));
+            let before=serde_json::to_vec(&spec).unwrap();
+            let objective=source_objective(&spec).expect("valid saved probability recipe must stay eligible");
+            assert_eq!(objective.trend_bend_days,TrendBendDays::Linear);
+            assert_eq!(objective.trend_mode,mode);
+            assert_eq!(objective.trend_blend_lambda,spec.trend_blend_lambda);
+            assert_eq!(objective.forecast,spec.forecast);
+            assert_eq!(objective.version,1);
+            assert_eq!(serde_json::to_vec(&spec).unwrap(),before);
+            let mean=MetricAvailability::Available{value:0.25};
+            let forecast=MetricAvailability::Available{value:0.75};
+            let expected=match mode {TrendMode::Mean=>0.25,TrendMode::Forecast=>0.75,TrendMode::Blend=>spec.trend_blend_lambda.combine(0.25,0.75)};
+            assert_eq!(objective.decision(&mean,&forecast).unwrap().as_ref(),Some(&expected));
+        }
+    }
+
+    #[test] fn source_objective_explicit_trend_uses_its_own_bend_not_retained_legacy_bend() {
+        for mode in [TrendMode::Forecast,TrendMode::Blend] {
+            let recipe=ForecastRecipe::Trend{version:1,bend_days:TrendBendDays::Seven};
+            let spec=objective_spec(mode,Some(recipe));
+            let before=serde_json::to_vec(&spec).unwrap();
+            let objective=source_objective(&spec).unwrap();
+            assert_eq!(objective.trend_bend_days,TrendBendDays::Seven);
+            assert_eq!(objective.trend_mode,mode);
+            assert_eq!(objective.forecast,Some(recipe));
+            assert_eq!(serde_json::to_vec(&spec).unwrap(),before);
+        }
+    }
+
+    #[test] fn source_objective_preserves_legacy_bends_modes_lambda_and_missing_defaults() {
+        for mode in [TrendMode::Mean,TrendMode::Forecast,TrendMode::Blend] {
+            let spec=objective_spec(mode,None);
+            let objective=source_objective(&spec).unwrap();
+            assert_eq!(objective.trend_bend_days,TrendBendDays::Thirty);
+            assert_eq!(objective.trend_mode,mode);
+            assert_eq!(objective.trend_blend_lambda,spec.trend_blend_lambda);
+            assert_eq!(objective.forecast,None);
+        }
+        let mut value=serde_json::to_value(objective_spec(TrendMode::Mean,None)).unwrap();
+        for key in ["trendMode","trendBendDays","trendBlendLambda","forecast"] {value.as_object_mut().unwrap().remove(key);}
+        let spec:StudyRequest=serde_json::from_value(value).unwrap();
+        let objective=source_objective(&spec).unwrap();
+        assert_eq!(objective.trend_mode,TrendMode::Mean);
+        assert_eq!(objective.trend_bend_days,TrendBendDays::Linear);
+        assert_eq!(objective.trend_blend_lambda,TrendBlendLambda::default());
+        assert_eq!(objective.forecast,None);
+    }
+
+    #[test] fn source_objective_still_rejects_invalid_or_unsupported_explicit_recipes() {
+        let mut invalid=ForecastRecipe::engineering_baseline();
+        if let ForecastRecipe::DecayedProbability{version,..}=&mut invalid {*version=2;}
+        let mut invalid_parameters=ForecastRecipe::engineering_baseline();
+        if let ForecastRecipe::DecayedProbability{half_life_days,..}=&mut invalid_parameters {*half_life_days=0.0;}
+        for recipe in [invalid,invalid_parameters,ForecastRecipe::Trend{version:2,bend_days:TrendBendDays::Seven}] {
+            for mode in [TrendMode::Mean,TrendMode::Forecast,TrendMode::Blend] {
+                let mut spec=objective_spec(mode,None);spec.forecast=Some(recipe);
+                assert_eq!(source_objective(&spec),Err("objective_recipe_invalid"));
+            }
+        }
+        let mut unknown=serde_json::to_value(objective_spec(TrendMode::Forecast,Some(ForecastRecipe::engineering_baseline()))).unwrap();
+        unknown["forecast"]["method"]=json!("unknown_method");
+        assert!(serde_json::from_value::<StudyRequest>(unknown).is_err());
+    }
+
     #[test] fn fractional_start_keeps_first_legal_signal_and_exact_boundary() {
         let start=DateTime::from_timestamp(600,500_000_000).unwrap();assert_eq!(first_signal_open(start),600);
         assert_eq!(first_signal_open(DateTime::from_timestamp(600,0).unwrap()),540);
