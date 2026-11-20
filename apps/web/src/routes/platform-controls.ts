@@ -1,6 +1,7 @@
 import { effectiveTimezone, formatUnix, parseZonedDateTimeInput, zonedDateTimeInput, zonedDayStart } from "../lib/datetime-format";
 import { apiFetch } from "../lib/platform-api";
 import type { AdaptiveRecommendation } from "../lib/setup-recommendation";
+import type { SetupTradeOutcome } from "../lib/setup-outcomes-api";
 
 export interface Algorithm {
   id: string;
@@ -26,6 +27,7 @@ export interface SetupRow {
   adaptiveSlotId?: number | null;
   adaptiveGenerationId?: number | null;
   recommendation?: AdaptiveRecommendation | null;
+  tradeOutcome?: SetupTradeOutcome | null;
   algorithmVersion?: string;
   params?: Record<string, string | number>;
   details?: {

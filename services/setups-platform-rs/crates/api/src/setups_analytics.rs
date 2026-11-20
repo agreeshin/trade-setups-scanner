@@ -8,17 +8,25 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use setups_analytics::live_outcomes::{self, TradeOutcome as SetupOutcome, TradeTerms};
+#[cfg(test)]
+use setups_analytics::live_outcomes::{display_levels, gate_threshold};
+use setups_analytics::{AnalyticsSetup, TradeDirection};
+#[cfg(test)]
 use setups_analytics::{
-    AnalyticsSetup, EvaluateLimitOptions, LimitStatus, TradeDirection, evaluate_limit_at_open,
-    passes_price_change, risk_return,
+    EvaluateLimitOptions, LimitStatus, evaluate_limit_at_open, passes_price_change,
 };
 use sqlx::Row;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const MAX_ANALYTICS_SETUPS: i64 = 5000;
 const ANALYTICS_HORIZON_MINUTES: i64 = 10_080;
 const MAX_ANALYTICS_SLOTS: usize = 64;
+const MAX_WINDOW_SECONDS: i64 = 2 * ANALYTICS_HORIZON_MINUTES * 60;
+const MAX_OUTCOME_CANDLES: usize = 1_100_000;
+const MAX_OUTCOME_PAGES: usize = 512;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,113 +103,25 @@ fn parse_recommendation(value: &Value) -> Result<ParsedRecommendation, String> {
     })
 }
 
-fn gate_threshold(close_price: f64, pct: f64, direction: TradeDirection) -> f64 {
-    match direction {
-        TradeDirection::Short => close_price * (1.0 + pct / 100.0),
-        TradeDirection::Long => close_price * (1.0 - pct / 100.0),
+impl ParsedRecommendation {
+    fn terms(&self) -> TradeTerms {
+        TradeTerms {
+            direction: self.direction,
+            tp_pct: self.tp_pct,
+            sl_pct: self.sl_pct,
+            time_shift_minutes: self.time_shift_minutes,
+            price_change_pct: self.price_change_pct,
+        }
     }
 }
 
-fn display_levels(
-    entry_price: f64,
-    tp_pct: f64,
-    sl_pct: f64,
-    direction: TradeDirection,
-) -> (f64, f64) {
-    match direction {
-        TradeDirection::Short => (
-            entry_price * (1.0 - tp_pct / 100.0),
-            entry_price * (1.0 + sl_pct / 100.0),
-        ),
-        TradeDirection::Long => (
-            entry_price * (1.0 + tp_pct / 100.0),
-            entry_price * (1.0 - sl_pct / 100.0),
-        ),
-    }
-}
-
-#[derive(Clone)]
-struct SetupOutcome {
-    status: &'static str,
-    entry_time_unix: Option<i64>,
-    entry_price: Option<f64>,
-    gate_threshold: Option<f64>,
-    tp_price: Option<f64>,
-    sl_price: Option<f64>,
-    close_time_unix: Option<i64>,
-    risk_return: Option<f64>,
-}
-
-fn status_str(status: LimitStatus) -> &'static str {
-    match status {
-        LimitStatus::Tp => "tp",
-        LimitStatus::Sl => "sl",
-        LimitStatus::Unclosed => "unclosed",
-        LimitStatus::NoData => "no_data",
-        LimitStatus::PriceChangeFiltered => "gate_failed",
-    }
-}
-
+#[cfg(test)]
 fn classify(
     recommendation: &ParsedRecommendation,
     evaluation: setups_analytics::LimitEvaluation,
     close_price: f64,
 ) -> SetupOutcome {
-    let threshold = recommendation
-        .price_change_pct
-        .map(|pct| gate_threshold(close_price, pct, recommendation.direction));
-    let Some(entry_price) = evaluation.entry_price else {
-        return SetupOutcome {
-            status: "no_data",
-            entry_time_unix: None,
-            entry_price: None,
-            gate_threshold: threshold,
-            tp_price: None,
-            sl_price: None,
-            close_time_unix: None,
-            risk_return: None,
-        };
-    };
-    let base = SetupOutcome {
-        status: status_str(evaluation.status),
-        entry_time_unix: evaluation.entry_time_unix,
-        entry_price: Some(entry_price),
-        gate_threshold: threshold,
-        tp_price: None,
-        sl_price: None,
-        close_time_unix: evaluation.close_time_unix,
-        risk_return: None,
-    };
-    if let Some(pct) = recommendation.price_change_pct
-        && !passes_price_change(close_price, entry_price, recommendation.direction, pct)
-    {
-        return SetupOutcome {
-            status: "gate_failed",
-            close_time_unix: None,
-            ..base
-        };
-    }
-    match evaluation.status {
-        LimitStatus::Tp | LimitStatus::Sl | LimitStatus::Unclosed => {
-            let (tp_price, sl_price) = display_levels(
-                entry_price,
-                recommendation.tp_pct,
-                recommendation.sl_pct,
-                recommendation.direction,
-            );
-            SetupOutcome {
-                tp_price: Some(tp_price),
-                sl_price: Some(sl_price),
-                risk_return: risk_return(
-                    evaluation.status,
-                    recommendation.tp_pct,
-                    recommendation.sl_pct,
-                ),
-                ..base
-            }
-        }
-        _ => base,
-    }
+    live_outcomes::classify(recommendation.terms(), evaluation, close_price)
 }
 
 #[derive(Default, Clone, Copy)]
@@ -245,6 +165,7 @@ fn agg_json(agg: &Agg) -> Value {
     })
 }
 
+#[derive(Clone)]
 struct AnalyticsSetupRow {
     id: i64,
     exchange_code: String,
@@ -257,10 +178,22 @@ struct AnalyticsSetupRow {
     generation_id: Option<i64>,
     recommendation: Value,
     artifact_id: Option<i64>,
+    trade_outcome: Option<Value>,
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
+}
+
+fn read_error() -> Response {
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "setups_analytics_read_failed",
+    )
+}
+
+fn outcome_read_limit() -> Response {
+    error_response(StatusCode::BAD_REQUEST, "setups_outcomes_read_budget_exceeded")
 }
 
 fn query_i64(params: &HashMap<String, String>, key: &str) -> Result<Option<i64>, Response> {
@@ -282,7 +215,8 @@ async fn load_setup_rows(
     with_bounds: bool,
 ) -> Result<Vec<AnalyticsSetupRow>, Response> {
     let mut filter = String::from(
-        "algorithm_id = $1 and adaptive_slot_id is not null and recommendation is not null",
+        "algorithm_id = $1 and adaptive_slot_id is not null and recommendation is not null \
+         and exists(select 1 from adaptive_profiles p where p.id=adaptive_slot_id and p.owner_id='admin')",
     );
     if with_bounds {
         filter.push_str(" and close_time >= to_timestamp($2) and close_time < to_timestamp($3)");
@@ -301,7 +235,7 @@ async fn load_setup_rows(
          close_price, adaptive_slot_id::bigint as slot_id, \
          coalesce(adaptive_generation_id, (adaptive_generation_archive->>'generationId')::bigint) as generation_id, \
          expectancy_artifact_id as artifact_id, \
-         recommendation from live_setups where {filter} order by close_time desc, id desc limit {}",
+         recommendation, trade_outcome from live_setups where {filter} order by close_time desc, id desc limit {}",
         MAX_ANALYTICS_SETUPS + 1
     );
     let mut query = sqlx::query(&sql).bind(algorithm_id);
@@ -394,6 +328,7 @@ async fn load_setup_rows(
                         "setups_analytics_read_failed",
                     )
                 })?,
+                trade_outcome: row.try_get("trade_outcome").map_err(|_| read_error())?,
             })
         })
         .collect()
@@ -452,7 +387,24 @@ async fn setups_analytics(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(response) = guard_auth(&state.auth, &headers, false) {
+    analytics_request(state, headers, params, true).await
+}
+
+async fn saved_setups_analytics(
+    State(state): State<Arc<AnalyticsState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    analytics_request(state, headers, params, false).await
+}
+
+async fn analytics_request(
+    state: Arc<AnalyticsState>,
+    headers: HeaderMap,
+    params: HashMap<String, String>,
+    fill_missing: bool,
+) -> Response {
+    if let Err(response) = guard_auth(&state.auth, &headers, fill_missing) {
         return response;
     }
     let algorithm_id = match params.get("algorithmId") {
@@ -510,6 +462,88 @@ async fn setups_analytics(
         Ok(value) => value,
         Err(response) => return response,
     };
+    if !fill_missing && parsed.iter().any(|(row, _)| row.trade_outcome.is_none()) {
+        return error_response(StatusCode::CONFLICT, "setups_analytics_outcomes_missing");
+    }
+    let cutoff = chrono::Utc::now().timestamp().div_euclid(60) * 60;
+    let outcomes = match persisted_outcomes(&state, &parsed, false, cutoff).await {
+        Ok(outcomes) => outcomes,
+        Err(response) => return response,
+    };
+    analytics_result(&parsed, &studies, &outcomes)
+}
+
+fn market_read_error(symbol: &str, cause: &str) -> Response {
+    let safe_symbol: String = symbol
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        .take(64)
+        .collect();
+    // Cause is an allowlisted class/status, never the upstream body, URL or credentials.
+    eprintln!(
+        "setups_analytics outcome=error code=market_data_read_failed symbol={safe_symbol} cause={cause}"
+    );
+    error_response(
+        StatusCode::BAD_GATEWAY,
+        "setups_analytics_market_data_unavailable",
+    )
+}
+
+fn window_error_cause(error: &str) -> &'static str {
+    if error.starts_with("market data api ") {
+        "candles_http_error"
+    } else if error.starts_with("market data decode error:") {
+        "candles_decode_error"
+    } else if error.starts_with("market data network error:") {
+        "candles_network_error"
+    } else {
+        "candles_read_error"
+    }
+}
+
+#[cfg(test)]
+async fn calculate_outcomes(
+    state: &AnalyticsState,
+    parsed: &[(AnalyticsSetupRow, ParsedRecommendation)],
+) -> Result<Vec<Option<SetupOutcome>>, Response> {
+    calculate_at(
+        state,
+        parsed,
+        chrono::Utc::now().timestamp().div_euclid(60) * 60,
+    )
+    .await
+}
+
+async fn calculate_at(
+    state: &AnalyticsState,
+    parsed: &[(AnalyticsSetupRow, ParsedRecommendation)],
+    cutoff: i64,
+) -> Result<Vec<Option<SetupOutcome>>, Response> {
+    if parsed.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Fresh, operation-owned input only. Never reuse the ordinary analytics reader's stale tails.
+    let market = setups_mdclient::MarketDataClient::new(&state.market_url, &state.market_key);
+    let catalog = market.instruments().await.map_err(|error| {
+        let cause = match error {
+            setups_mdclient::MdClientError::Http { .. } => "catalog_http_error",
+            setups_mdclient::MdClientError::Network(_) => "catalog_network_error",
+            setups_mdclient::MdClientError::Decode(_) => "catalog_decode_error",
+        };
+        market_read_error("catalog", cause)
+    })?;
+    if catalog.len() > 10_000 {
+        return Err(outcome_read_limit());
+    }
+    let instruments: HashMap<_, _> = catalog
+        .into_iter()
+        .map(|instrument| {
+            (
+                (instrument.exchange, instrument.category, instrument.symbol),
+                instrument.id,
+            )
+        })
+        .collect();
     let mut indexes: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
     for (index, (row, _)) in parsed.iter().enumerate() {
         indexes
@@ -522,81 +556,409 @@ async fn setups_analytics(
             .push(index);
     }
     let mut outcomes: Vec<Option<SetupOutcome>> = vec![None; parsed.len()];
+    let mut budget = ReadBudget {
+        candles: 0,
+        pages: 0,
+        deadline: Instant::now() + Duration::from_secs(60),
+    };
     for ((exchange, category, symbol), group) in indexes {
-        let entry_times: Vec<i64> = group
-            .iter()
-            .map(|index| {
-                let (row, recommendation) = &parsed[*index];
-                row.close_unix + recommendation.time_shift_minutes * 60
-            })
-            .collect();
-        let window_from = entry_times.iter().min().copied().unwrap_or(0) - 60;
-        let window_to =
-            entry_times.iter().max().copied().unwrap_or(0) + ANALYTICS_HORIZON_MINUTES * 60 + 60;
-        let instrument = state
-            .reader
-            .instrument_id(&exchange, &category, &symbol)
-            .await;
-        let candles = match instrument {
-            Some(id) => state
-                .reader
-                .read_window(id, window_from, window_to)
-                .await
-                .ok(),
-            None => None,
-        };
-        let Some(candles) = candles else {
-            for index in group {
+        let instrument = instruments
+            .get(&(exchange, category, symbol.clone()))
+            .copied();
+        for window in outcome_windows(parsed, &group, cutoff)? {
+            let candles = match instrument {
+                Some(id) if window.from < window.to => {
+                    read_outcome_window(&market, id, window.from, window.to, &symbol, &mut budget)
+                        .await?
+                }
+                _ => Vec::new(),
+            };
+            for index in window.indexes {
                 let (row, recommendation) = &parsed[index];
-                let close_price: f64 = if let Ok(value) = row.close_price.parse() {
-                    value
-                } else {
-                    f64::NAN
+                let fabric = AnalyticsSetup {
+                    exchange_code: row.exchange_code.clone(),
+                    category: row.category.clone(),
+                    symbol: row.symbol.clone(),
+                    open_time_unix: row.close_unix,
+                    close_time_unix: row.close_unix,
+                    close_price: row.close_price.clone(),
                 };
-                outcomes[index] = Some(classify(
-                    recommendation,
-                    setups_analytics::LimitEvaluation {
-                        status: LimitStatus::NoData,
-                        entry_price: None,
-                        entry_time_unix: None,
-                        tp_price: None,
-                        sl_price: None,
-                        close_time_unix: None,
-                        move_pct: None,
-                        close_minutes: None,
-                    },
-                    close_price,
-                ));
+                let outcome = live_outcomes::evaluate(
+                    &fabric,
+                    recommendation.terms(),
+                    &candles,
+                    cutoff,
+                    chrono::Utc::now().timestamp(),
+                );
+                if [
+                    &outcome.entry_price,
+                    &outcome.gate_threshold,
+                    &outcome.tp_price,
+                    &outcome.sl_price,
+                    &outcome.close_price,
+                    &outcome.risk_return,
+                ]
+                .iter()
+                .any(|value| value.is_some_and(|n| !n.is_finite()))
+                {
+                    return Err(market_read_error(&symbol, "invalid_outcome_number"));
+                }
+                outcomes[index] = Some(outcome);
             }
-            continue;
-        };
-        for index in group {
-            let (row, recommendation) = &parsed[index];
-            let fabric = AnalyticsSetup {
-                exchange_code: row.exchange_code.clone(),
-                category: row.category.clone(),
-                symbol: row.symbol.clone(),
-                open_time_unix: row.close_unix,
-                close_time_unix: row.close_unix,
-                close_price: row.close_price.clone(),
-            };
-            let evaluation = evaluate_limit_at_open(EvaluateLimitOptions {
-                candles: &candles,
-                setup: &fabric,
-                direction: recommendation.direction,
-                tp_pct: recommendation.tp_pct,
-                sl_pct: recommendation.sl_pct,
-                time_shift_minutes: recommendation.time_shift_minutes,
-                horizon_minutes: ANALYTICS_HORIZON_MINUTES,
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(outcomes)
+}
+
+struct OutcomeWindow {
+    from: i64,
+    to: i64,
+    indexes: Vec<usize>,
+}
+
+fn outcome_windows(
+    parsed: &[(AnalyticsSetupRow, ParsedRecommendation)],
+    group: &[usize],
+    cutoff: i64,
+) -> Result<Vec<OutcomeWindow>, Response> {
+    let mut entries = Vec::with_capacity(group.len());
+    for &index in group {
+        let (row, rec) = &parsed[index];
+        let close = row
+            .close_price
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite() && *n > 0.0);
+        let from = row
+            .close_unix
+            .checked_add(rec.time_shift_minutes * 60)
+            .filter(|n| *n >= 0 && *n % 60 == 0)
+            .ok_or_else(read_error)?;
+        let to = from
+            .checked_add(ANALYTICS_HORIZON_MINUTES * 60)
+            .ok_or_else(read_error)?
+            .min(cutoff);
+        if close.is_none() {
+            return Err(read_error());
+        }
+        entries.push((from, to.max(from), index));
+    }
+    entries.sort_unstable();
+    let mut windows: Vec<OutcomeWindow> = Vec::new();
+    for (from, to, index) in entries {
+        if let Some(last) = windows.last_mut()
+            && from <= last.to
+            && to.max(last.to) - last.from <= MAX_WINDOW_SECONDS
+        {
+            last.to = last.to.max(to);
+            last.indexes.push(index);
+        } else {
+            windows.push(OutcomeWindow {
+                from,
+                to,
+                indexes: vec![index],
             });
-            let close_price: f64 = if let Ok(value) = row.close_price.parse() {
-                value
-            } else {
-                f64::NAN
-            };
-            outcomes[index] = Some(classify(recommendation, evaluation, close_price));
         }
     }
+    Ok(windows)
+}
+
+struct ReadBudget {
+    candles: usize,
+    pages: usize,
+    deadline: Instant,
+}
+
+async fn read_outcome_window(
+    market: &setups_mdclient::MarketDataClient,
+    id: i64,
+    from: i64,
+    to: i64,
+    symbol: &str,
+    budget: &mut ReadBudget,
+) -> Result<Vec<setups_analytics::OhlcCandle>, Response> {
+    let mut candles = Vec::new();
+    let mut after = None;
+    loop {
+        budget.pages += 1;
+        if budget.pages > MAX_OUTCOME_PAGES || Instant::now() >= budget.deadline {
+            return Err(outcome_read_limit());
+        }
+        let page = market
+            .candles(
+                &setups_mdclient::CandlesQuery {
+                    instrument_id: id,
+                    from_unix: from,
+                    to_unix: to,
+                    after_unix: after,
+                    limit: Some(5000),
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|error| market_read_error(symbol, window_error_cause(&error.to_string())))?;
+        if page.candles.len() > 5000 {
+            return Err(market_read_error(symbol, "candles_page_size"));
+        }
+        let mut previous = after;
+        for candle in &page.candles {
+            let at = candle.open_time_unix;
+            if at < from || at >= to || at % 60 != 0 || previous.is_some_and(|last| at <= last) {
+                return Err(market_read_error(symbol, "candles_scope_or_order"));
+            }
+            let number = |raw: &str| -> Result<f64, Response> {
+                raw.parse::<f64>()
+                    .ok()
+                    .filter(|n| raw.len() <= 128 && n.is_finite() && *n > 0.0)
+                    .ok_or_else(|| market_read_error(symbol, "candles_invalid_number"))
+            };
+            candles.push(setups_analytics::OhlcCandle {
+                open_time_unix: at,
+                open: number(&candle.open)?,
+                high: number(&candle.high)?,
+                low: number(&candle.low)?,
+                close: number(&candle.close)?,
+            });
+            previous = Some(at);
+            budget.candles += 1;
+            if budget.candles > MAX_OUTCOME_CANDLES || candles.len() > 25_000 {
+                return Err(outcome_read_limit());
+            }
+        }
+        match page.next_cursor_unix {
+            None => break,
+            Some(cursor)
+                if previous == Some(cursor)
+                    && after.is_none_or(|old| cursor > old)
+                    && !page.candles.is_empty() =>
+            {
+                after = Some(cursor)
+            }
+            _ => {
+                return Err(market_read_error(
+                    symbol,
+                    "candles_pagination_incomplete_or_nonforward",
+                ));
+            }
+        }
+    }
+    Ok(candles)
+}
+
+async fn persisted_outcomes(
+    state: &AnalyticsState,
+    parsed: &[(AnalyticsSetupRow, ParsedRecommendation)],
+    refresh: bool,
+    cutoff: i64,
+) -> Result<Vec<Option<SetupOutcome>>, Response> {
+    materialize_outcomes(state, parsed, refresh, cutoff)
+        .await
+        .map(|result| result.0)
+}
+
+async fn materialize_outcomes(
+    state: &AnalyticsState,
+    parsed: &[(AnalyticsSetupRow, ParsedRecommendation)],
+    refresh: bool,
+    cutoff: i64,
+) -> Result<(Vec<Option<SetupOutcome>>, usize, usize), Response> {
+    let mut result = Vec::with_capacity(parsed.len());
+    let mut missing = Vec::new();
+    let mut positions = Vec::new();
+    for (index, (row, rec)) in parsed.iter().enumerate() {
+        let saved = row
+            .trade_outcome
+            .as_ref()
+            .map(|value| serde_json::from_value::<SetupOutcome>(value.clone()))
+            .transpose()
+            .map_err(|_| read_error())?;
+        if saved.is_none()
+            || (refresh
+                && saved.as_ref().is_some_and(|outcome| {
+                    matches!(outcome.status.as_str(), "unclosed" | "no_data")
+                }))
+        {
+            missing.push((row.clone(), rec.clone()));
+            positions.push(index);
+        }
+        result.push(saved);
+    }
+    if missing.is_empty() {
+        return Ok((result, 0, 0));
+    }
+    let _permit = state
+        .outcome_compute
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| error_response(StatusCode::CONFLICT, "setups_outcomes_busy"))?;
+    // Finish all bounded reads before writing: a transport/parse/pagination failure writes no result.
+    let computed = calculate_at(state, &missing, cutoff).await?;
+    let computed_count = missing.len();
+    let mut updated_count = 0;
+    for ((row, _), (position, outcome)) in missing.iter().zip(positions.into_iter().zip(computed)) {
+        let outcome = outcome.ok_or_else(read_error)?;
+        let value = serde_json::to_value(&outcome).map_err(|_| read_error())?;
+        let (winner, updated) = setups_db::live_outcomes::save(
+            &state.pool,
+            "admin",
+            row.id,
+            &value,
+            refresh,
+            row.trade_outcome.as_ref(),
+        )
+        .await
+        .map_err(|_| read_error())?;
+        updated_count += usize::from(updated);
+        result[position] = Some(serde_json::from_value(winner).map_err(|_| read_error())?);
+    }
+    Ok((result, computed_count, updated_count))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RefreshRequest {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RefreshCursor {
+    snapshot: i64,
+    after: i64,
+    cutoff: i64,
+}
+
+impl RefreshCursor {
+    fn encode(self) -> String {
+        format!("v1:{}:{}:{}", self.snapshot, self.after, self.cutoff)
+    }
+    fn parse(raw: &str, now: i64) -> Option<Self> {
+        if raw.len() > 128 {
+            return None;
+        }
+        let mut parts = raw.split(':');
+        if parts.next()? != "v1" {
+            return None;
+        }
+        let value = Self {
+            snapshot: parts.next()?.parse().ok()?,
+            after: parts.next()?.parse().ok()?,
+            cutoff: parts.next()?.parse().ok()?,
+        };
+        (parts.next().is_none()
+            && (0..=i64::from(i32::MAX)).contains(&value.snapshot)
+            && (0..=value.snapshot).contains(&value.after)
+            && value.cutoff >= 0
+            && value.cutoff % 60 == 0
+            && value.cutoff <= now)
+            .then_some(value)
+    }
+}
+
+async fn refresh_outcomes(
+    State(state): State<Arc<AnalyticsState>>,
+    headers: HeaderMap,
+    Json(request): Json<RefreshRequest>,
+) -> Response {
+    if let Err(response) = guard_auth(&state.auth, &headers, true) {
+        return response;
+    }
+    let limit = request.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_body");
+    }
+    let now = chrono::Utc::now().timestamp().div_euclid(60) * 60;
+    let cursor = match request.cursor {
+        Some(raw) => match RefreshCursor::parse(&raw, now) {
+            Some(cursor) => cursor,
+            None => return error_response(StatusCode::BAD_REQUEST, "invalid_cursor"),
+        },
+        None => {
+            let snapshot = sqlx::query_scalar::<_, i32>("select coalesce(max(l.id),0) from live_setups l \
+                where l.adaptive_slot_id is not null and l.recommendation is not null \
+                and exists(select 1 from adaptive_profiles p where p.id=l.adaptive_slot_id and p.owner_id='admin')")
+                .fetch_one(&state.pool).await;
+            match snapshot {
+                Ok(snapshot) => RefreshCursor {
+                    snapshot: i64::from(snapshot),
+                    after: 0,
+                    cutoff: now,
+                },
+                Err(_) => return read_error(),
+            }
+        }
+    };
+    let rows = sqlx::query("select id,exchange_code,category,symbol,algorithm_id, \
+        extract(epoch from close_time)::bigint close_unix,close_price,adaptive_slot_id::bigint slot_id, \
+        coalesce(adaptive_generation_id,(adaptive_generation_archive->>'generationId')::bigint) generation_id, \
+        expectancy_artifact_id artifact_id,recommendation,trade_outcome from live_setups l \
+        where id>$1 and id<=$2 and adaptive_slot_id is not null and recommendation is not null \
+        and exists(select 1 from adaptive_profiles p where p.id=l.adaptive_slot_id and p.owner_id='admin') \
+        and (trade_outcome is null or trade_outcome->>'status' in ('unclosed','no_data')) order by id limit $3")
+        .bind(cursor.after as i32).bind(cursor.snapshot as i32).bind((limit + 1) as i64)
+        .fetch_all(&state.pool).await;
+    let mut rows = match rows {
+        Ok(rows) => rows,
+        Err(_) => return read_error(),
+    };
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    let parsed = rows
+        .into_iter()
+        .map(|row| -> Result<_, Response> {
+            let row = AnalyticsSetupRow {
+                id: i64::from(row.try_get::<i32, _>("id").map_err(|_| read_error())?),
+                exchange_code: row.try_get("exchange_code").map_err(|_| read_error())?,
+                category: row.try_get("category").map_err(|_| read_error())?,
+                symbol: row.try_get("symbol").map_err(|_| read_error())?,
+                algorithm_id: row.try_get("algorithm_id").map_err(|_| read_error())?,
+                close_unix: row.try_get("close_unix").map_err(|_| read_error())?,
+                close_price: row.try_get("close_price").map_err(|_| read_error())?,
+                slot_id: row.try_get("slot_id").map_err(|_| read_error())?,
+                generation_id: row.try_get("generation_id").map_err(|_| read_error())?,
+                artifact_id: row.try_get("artifact_id").map_err(|_| read_error())?,
+                recommendation: row.try_get("recommendation").map_err(|_| read_error())?,
+                trade_outcome: row.try_get("trade_outcome").map_err(|_| read_error())?,
+            };
+            let recommendation = parse_recommendation(&row.recommendation).map_err(|_| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "setups_analytics_invalid_recommendation",
+                )
+            })?;
+            Ok((row, recommendation))
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let parsed = match parsed {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let next = if more {
+        parsed.last().map(|(row, _)| {
+            RefreshCursor {
+                after: row.id,
+                ..cursor
+            }
+            .encode()
+        })
+    } else {
+        None
+    };
+    match materialize_outcomes(&state, &parsed, true, cursor.cutoff).await {
+        Ok((_, computed, updated)) => Json(json!({"snapshotId":cursor.snapshot,
+            "observedThroughUnix":cursor.cutoff,"processed":parsed.len(),"computed":computed,
+            "updated":updated,"nextCursor":next}))
+        .into_response(),
+        Err(response) => response,
+    }
+}
+
+fn analytics_result(
+    parsed: &[(AnalyticsSetupRow, ParsedRecommendation)],
+    studies: &HashMap<i64, i64>,
+    outcomes: &[Option<SetupOutcome>],
+) -> Response {
     let mut order: Vec<usize> = (0..parsed.len()).collect();
     order.sort_by(|left, right| {
         parsed[*right]
@@ -617,12 +979,12 @@ async fn setups_analytics(
     let mut per_study: BTreeMap<i64, Agg> = BTreeMap::new();
     for index in 0..parsed.len() {
         let outcome = outcomes[index].clone().expect("outcome computed");
-        totals.observe(outcome.status, outcome.risk_return);
+        totals.observe(&outcome.status, outcome.risk_return);
         if let Some(study) = study_ids[index] {
             per_study
                 .entry(study)
                 .or_default()
-                .observe(outcome.status, outcome.risk_return);
+                .observe(&outcome.status, outcome.risk_return);
         }
     }
     let setup_json: Vec<Value> = order
@@ -645,8 +1007,12 @@ async fn setups_analytics(
                 "tpPrice": outcome.tp_price,
                 "slPrice": outcome.sl_price,
                 "closeTimeUnix": outcome.close_time_unix,
+                "closePrice": outcome.close_price,
                 "riskReturn": outcome.risk_return,
                 "status": outcome.status,
+                "evaluatedAtUnix": outcome.evaluated_at_unix,
+                "observedThroughUnix": outcome.observed_through_unix,
+                "isFinal": outcome.is_final,
             })
         })
         .collect();
@@ -940,9 +1306,7 @@ async fn setups_analytics_study_expectancy(
     .await
     {
         Ok(Ok(series)) => series,
-        _ => {
-            return error_response(StatusCode::NOT_FOUND, "study_expectancy_unavailable")
-        }
+        _ => return error_response(StatusCode::NOT_FOUND, "study_expectancy_unavailable"),
     };
     let trend_points = series
         .trend_points
@@ -966,7 +1330,11 @@ async fn setups_analytics_study_expectancy(
 
 pub fn setups_analytics_router(state: Arc<AnalyticsState>) -> Router {
     Router::new()
-        .route("/v1/setups/analytics", get(setups_analytics))
+        .route(
+            "/v1/setups/analytics",
+            get(saved_setups_analytics).post(setups_analytics),
+        )
+        .route("/v1/setups/outcomes/refresh", post(refresh_outcomes))
         .route(
             "/v1/setups/analytics/studies",
             get(setups_analytics_studies),
@@ -986,6 +1354,10 @@ pub fn setups_analytics_router(state: Arc<AnalyticsState>) -> Router {
 mod tests {
     use super::*;
     use setups_analytics::OhlcCandle;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn recommendation_json() -> Value {
         json!({
@@ -1281,6 +1653,7 @@ mod tests {
             generation_id,
             recommendation,
             artifact_id,
+            trade_outcome: None,
         }
     }
 
@@ -1333,5 +1706,160 @@ mod tests {
         assert!(parse_studies(Some("0")).is_err());
         assert!(parse_studies(Some("a")).is_err());
         assert!(parse_studies(Some("1,,2")).is_err());
+    }
+
+    #[derive(Default)]
+    struct ChangingMarket {
+        candles: Mutex<Vec<OhlcCandle>>,
+        reads: AtomicUsize,
+        failure: AtomicUsize,
+    }
+
+    async fn market_fixture() -> (
+        AnalyticsState,
+        Arc<ChangingMarket>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let market = Arc::new(ChangingMarket::default());
+        let router = Router::new()
+            .route("/v1/instruments", get(|| async {
+                Json(json!({"instruments": [{"id": 7, "exchange": "bybit", "category": "linear", "symbol": "TESTUSDT", "status": "active"}]}))
+            }))
+            .route("/v1/candles", get(|State(market): State<Arc<ChangingMarket>>| async move {
+                market.reads.fetch_add(1, Ordering::SeqCst);
+                match market.failure.load(Ordering::SeqCst) {
+                    1 => return (StatusCode::SERVICE_UNAVAILABLE, "private upstream error body").into_response(),
+                    2 => return (StatusCode::OK, "private malformed upstream body").into_response(),
+                    _ => {}
+                }
+                let candles: Vec<Value> = market.candles.lock().unwrap().iter().map(|candle| json!({
+                    "openTimeUnix": candle.open_time_unix,
+                    "open": candle.open.to_string(), "high": candle.high.to_string(),
+                    "low": candle.low.to_string(), "close": candle.close.to_string(),
+                    "volume": "1", "quoteTurnover": "100",
+                })).collect();
+                Json(json!({"candles": candles, "nextCursorUnix": null})).into_response()
+            }))
+            .with_state(market.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let state = AnalyticsState {
+            pool: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test")
+                .unwrap(),
+            auth: Arc::new(crate::auth::SessionAuth::new(&[])),
+            reader: crate::analytics::AnalyticsCandleReader::new(&url, "fixture-key"),
+            market_url: url,
+            market_key: "fixture-key".into(),
+            forecast_cpu: Arc::new(tokio::sync::Semaphore::new(1)),
+            outcome_compute: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        (state, market, task)
+    }
+
+    async fn calculated_payload(state: &AnalyticsState) -> Value {
+        let parsed = vec![(
+            analytics_setup_row(
+                1,
+                fabric().close_time_unix,
+                recommendation_json(),
+                None,
+                None,
+            ),
+            recommendation(None),
+        )];
+        let outcomes = calculate_outcomes(state, &parsed)
+            .await
+            .unwrap_or_else(|_| panic!("fixture market read failed"));
+        let response = analytics_result(&parsed, &HashMap::new(), &outcomes);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn repeat_calculation_refreshes_missing_entry_and_totals_without_caching_no_data() {
+        let (state, market, server) = market_fixture().await;
+        let first = calculated_payload(&state).await;
+        assert_eq!(first["setups"][0]["status"], "no_data");
+        assert_eq!(
+            first["totals"],
+            json!({"selected": 1, "gatePassed": 0, "closed": 0, "meanR": null})
+        );
+
+        *market.candles.lock().unwrap() = vec![
+            candle(1_794_000_300, 100.0, 101.0, 99.0, 100.0),
+            candle(1_794_000_360, 100.0, 107.0, 99.0, 106.0),
+        ];
+        let second = calculated_payload(&state).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(second["setups"][0]["status"], "sl");
+        assert_eq!(second["setups"][0]["entryTimeUnix"], 1_794_000_300_i64);
+        assert_eq!(
+            second["totals"],
+            json!({"selected": 1, "gatePassed": 1, "closed": 1, "meanR": -1.0})
+        );
+        assert_eq!(market.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn repeat_calculation_observes_later_exit_candle_instead_of_caching_unclosed() {
+        let (state, market, server) = market_fixture().await;
+        *market.candles.lock().unwrap() = vec![candle(1_794_000_300, 100.0, 101.0, 99.0, 100.0)];
+        let first = calculated_payload(&state).await;
+        assert_eq!(first["setups"][0]["status"], "unclosed");
+        assert_eq!(first["totals"]["closed"], 0);
+
+        market
+            .candles
+            .lock()
+            .unwrap()
+            .push(candle(1_794_000_360, 100.0, 101.0, 79.0, 80.0));
+        let second = calculated_payload(&state).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(second["setups"][0]["status"], "tp");
+        assert_eq!(second["setups"][0]["closeTimeUnix"], 1_794_000_360_i64);
+        assert_eq!(second["totals"]["closed"], 1);
+        assert!((second["totals"]["meanR"].as_f64().unwrap() - 20.0 / 6.0).abs() < 1e-12);
+        assert_eq!(market.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn operational_candle_failures_are_not_reported_as_missing_data() {
+        let (state, market, server) = market_fixture().await;
+        let parsed = vec![(
+            analytics_setup_row(
+                1,
+                fabric().close_time_unix,
+                recommendation_json(),
+                None,
+                None,
+            ),
+            recommendation(None),
+        )];
+        for failure in [1, 2] {
+            market.failure.store(failure, Ordering::SeqCst);
+            let response = match calculate_outcomes(&state, &parsed).await {
+                Ok(_) => panic!("market failure must not produce successful no_data outcomes"),
+                Err(response) => response,
+            };
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = axum::body::to_bytes(response.into_body(), 16_384)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"error": "setups_analytics_market_data_unavailable"})
+            );
+        }
+        server.abort();
+        let _ = server.await;
+        assert_eq!(market.reads.load(Ordering::SeqCst), 2);
     }
 }

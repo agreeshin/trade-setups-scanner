@@ -48,6 +48,8 @@ pub struct AnalyticsState {
     pub reader: AnalyticsCandleReader,
     /// One bounded graph CPU lane, with no waiting request queue.
     pub forecast_cpu: Arc<tokio::sync::Semaphore>,
+    /// Released-setup calculations only; no waiting queue or retained candle history.
+    pub outcome_compute: Arc<tokio::sync::Semaphore>,
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {

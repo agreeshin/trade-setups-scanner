@@ -221,6 +221,7 @@ function SetupOutcomeRow({ setup }: { setup: SetupsAnalyticsSetup }) {
     <TableCell numeric className="text-success">{formatPrice(setup.tpPrice)}</TableCell>
     <TableCell numeric className="text-danger">{formatPrice(setup.slPrice)}</TableCell>
     <TableCell className="whitespace-nowrap tabular-nums">{formatTime(setup.closeTimeUnix)}</TableCell>
+    <TableCell numeric>{formatPrice(setup.closePrice ?? null)}</TableCell>
     <TableCell numeric className={(setup.riskReturn ?? 0) >= 0 ? "text-success" : "text-danger"}>{formatRisk(setup.riskReturn)}</TableCell>
     <TableCell><Badge variant={status.variant}>{status.label}</Badge></TableCell>
     <TableCell numeric>{setup.studyId === null ? "—" : `№${setup.studyId}`}</TableCell>
@@ -368,14 +369,15 @@ function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { s
       ? Math.floor(startedUnix / DAY_SECONDS) * DAY_SECONDS
       : Math.floor(Date.now() / 1000 / DAY_SECONDS) * DAY_SECONDS - 30 * DAY_SECONDS;
     void (async () => {
-      let outcomes: DailyOutcome[] = [];
+      let outcomes: DailyOutcome[];
       try {
         const value = await fetchSetupsAnalytics(algorithmId, fromUnix, Math.floor(Date.now() / 1000), [studyId], controller.signal);
         // The server model still consumes UTC-day aggregates; only the displayed raw trades regroup.
         outcomes = dailyOutcomes(value.setups, (unix) => Math.floor(unix / DAY_SECONDS) * DAY_SECONDS);
         if (!controller.signal.aborted) setLive(value.setups);
-      } catch {
-        if (!controller.signal.aborted) setLive([]);
+      } catch (cause) {
+        if (!controller.signal.aborted) setChartError(`Не удалось получить live-исходы для графика: ${errorText(cause)}`);
+        return;
       }
       try {
         const series = await fetchStudyExpectancy(studyId, outcomes.map((point) => ({ dayUnix: point.dayUnix, meanR: point.meanR, closedCount: point.closedCount })), controller.signal);
@@ -442,7 +444,7 @@ function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { s
       </div>}
       <div className="grid gap-2">
         <h4 className="font-medium">Динамика матожидания: ретроспектива и live</h4>
-        {chartError !== null && <p className="text-sm text-muted-foreground">{chartError}</p>}
+        {chartError !== null && <p role="alert" className="text-sm text-muted-foreground">{chartError}</p>}
         {chartError === null && series === null && <p className="text-sm text-muted-foreground">Загрузка графика…</p>}
         {series !== null && chartError === null && <StudyHorizonChart series={series} live={dailyOutcomes(live ?? [])} dividerDay={dividerDay} nowUnix={nowUnix} />}
       </div>
@@ -658,7 +660,7 @@ export function SetupsAnalyticsPanel() {
   return <section aria-label="Аналитика выпущенных сетапов" className="grid min-w-0 gap-4">
     <div className="flex items-center gap-2">
       <h2 className="text-lg font-semibold">Аналитика выпущенных сетапов</h2>
-      <InfoNote>Разовый расчёт по сохранённым рекомендациям исследований: вход по рекомендованному времени и гейту смещения цены, исход TP/SL по реальным минутным свечам за 7 суток. Результаты не кешируются.</InfoNote>
+      <InfoNote>Расчёт по сохранённым рекомендациям исследований: вход по рекомендованному времени и гейту смещения цены, исход TP/SL по реальным минутным свечам за 7 суток. Исход хранится в самом сетапе; используются сохранённые результаты, рассчитываются только недостающие.</InfoNote>
     </div>
     <Card>
       <CardContent className="flex flex-wrap items-end gap-3">
@@ -676,7 +678,7 @@ export function SetupsAnalyticsPanel() {
         <Button variant="outline" disabled={studiesMeta.length === 0} onClick={openPicker}>Исследования: {studiesLabel}</Button>
         <Button disabled={running || algorithmId === "" || range.value === null} onClick={() => { void run(); }}>{running ? "Расчёт…" : "Рассчитать"}</Button>
         {studiesStatus === "loading" && <Spinner label="Загрузка исследований…" />}
-        <p className="w-full text-xs text-muted-foreground">Время: {localTimezoneLabel()}. Смена даты сбрасывает время к полуночи в выбранном часовом поясе (для «Конец» сегодняшняя дата подставляет текущее время); список исследований обновляется при потере фокуса полей дат, после обновления выбраны все. Расчёт выполняется по нажатию кнопки, без кеша.</p>
+        <p className="w-full text-xs text-muted-foreground">Время: {localTimezoneLabel()}. Смена даты сбрасывает время к полуночи в выбранном часовом поясе (для «Конец» сегодняшняя дата подставляет текущее время); список исследований обновляется при потере фокуса полей дат, после обновления выбраны все. По нажатию кнопки используются сохранённые исходы и рассчитываются только недостающие.</p>
         {range.error !== null && <p role="alert" className="w-full text-xs text-danger">{range.error}</p>}
       </CardContent>
     </Card>
@@ -740,6 +742,7 @@ export function SetupsAnalyticsPanel() {
                     <TableHead numeric className="text-success">TP</TableHead>
                     <TableHead numeric className="text-danger">SL</TableHead>
                     <TableHead>Закрытие</TableHead>
+                    <TableHead numeric>Цена закрытия</TableHead>
                     <TableHead numeric>Результат</TableHead>
                     <TableHead>Статус</TableHead>
                     <TableHead numeric>Исследование</TableHead>

@@ -10,6 +10,7 @@ test.beforeEach(async ({ page }) => {
     if (path === "/v1/algorithms") return route.fulfill({ json: { algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "Общие настройки", params: {}, fields: [], enabled: true }] } });
     if (path === "/v1/settings/ui") return route.fulfill({ json: { value: {} } });
     if (path === "/v1/setups") return route.fulfill({ json: { setups: [], offset: 0, limit: 25, total: 0, snapshotId: 0 } });
+    if (path === "/v1/setups/outcomes/refresh") return route.fulfill({ json: { snapshotId: 0, observedThroughUnix: 200, processed: 0, computed: 0, updated: 0, nextCursor: null } });
     if (path === "/v1/replay-runs") return route.fulfill({ json: { runs: [] } });
     if (path === "/v1/history/backfill-jobs") return route.fulfill({ json: { jobs: [] } });
     if (path === "/v1/history/collection-targets") return route.fulfill({ json: { targets: [] } });
@@ -69,7 +70,10 @@ test.describe("application smoke", () => {
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     unavailable = true;
     await page.getByRole("button", { name: "Обновить", exact: true }).click();
-    await expect(page.getByRole("alert")).toContainText("Лента недоступна (HTTP 503)");
+    await expect(page.getByRole("alert")).toContainText("Ошибка обновления (HTTP 503)");
+    await expect(page.getByRole("alert")).toContainText("Показан последний подтверждённый список; данные могли устареть.");
+    await expect(page.getByText("bybit · ARCHIVEUSDT", { exact: true })).toBeVisible();
+    await expect(page.getByText("Сетапы не найдены.", { exact: true })).toHaveCount(0);
     unavailable = false;
     await page.getByRole("button", { name: "Обновить", exact: true }).click();
     await expect(page.getByText("bybit · ARCHIVEUSDT", { exact: true })).toBeVisible();

@@ -8,10 +8,11 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 
 pub mod admission;
 pub mod analytics;
-pub mod controls;
 pub mod continuous;
+pub mod controls;
 pub mod diagnostics;
 pub mod expectancy;
+pub mod live_outcomes;
 pub mod migrate;
 pub mod optimization;
 pub mod push;

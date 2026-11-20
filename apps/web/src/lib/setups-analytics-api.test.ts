@@ -15,8 +15,10 @@ const result = {
 };
 
 const calls: string[] = [];
+const methods: string[] = [];
 beforeEach(() => {
   calls.length = 0;
+  methods.length = 0;
   Object.defineProperty(URL, "createObjectURL", { configurable: true, writable: true, value: vi.fn(() => "blob:expectancy-png") });
   Object.defineProperty(URL, "revokeObjectURL", { configurable: true, writable: true, value: vi.fn() });
   vi.stubGlobal("fetch", vi.fn((path: string) => {
@@ -34,16 +36,26 @@ it("loads releaser studies for the algorithm and range", async () => {
   expect(calls[0]).toContain("/v1/setups/analytics/studies?algorithmId=price_volume_spike&fromUnix=1&toUnix=2");
 });
 
-it("passes selected studies and parses the full result", async () => {
-  vi.stubGlobal("fetch", vi.fn((path: string) => {
+it("posts selected studies in the unchanged query and parses the full result including exit price", async () => {
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     calls.push(path);
-    return Promise.resolve(json(result));
+    methods.push(init?.method ?? "GET");
+    return Promise.resolve(json({ ...result, setups: [{ ...setup, closePrice: 104.41 }] }));
   }));
   const data = await fetchSetupsAnalytics("a", 1, 2, [40, 41]);
   expect(data.totals.meanR).toBe(1.25);
   expect(data.studies[0]!.studyId).toBe(40);
   expect(data.setups[0]!.status).toBe("sl");
+  expect(data.setups[0]!.closePrice).toBe(104.41);
+  expect(methods).toEqual(["POST"]);
   expect(new URL(calls[0]!, "http://localhost").searchParams.get("studies")).toBe("40,41");
+});
+
+it("does not fall back to a calculating GET when POST is unsupported", async () => {
+  const fetch = vi.fn((_path: string, init?: RequestInit) => { methods.push(init?.method ?? "GET"); return Promise.resolve(json({}, 405)); });
+  vi.stubGlobal("fetch", fetch);
+  await expect(fetchSetupsAnalytics("a", 1, 2, null)).rejects.toThrow("HTTP 405");
+  expect(methods).toEqual(["POST"]); expect(fetch).toHaveBeenCalledTimes(1);
 });
 
 it("omits studies when all are selected", async () => {

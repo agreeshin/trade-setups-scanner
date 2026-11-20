@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 import { SetupTable } from "./setup-table";
@@ -6,9 +6,45 @@ import type { SetupRow } from "./platform-controls";
 import { applyInterfaceSettings } from "../lib/datetime-format";
 import type { AdaptiveExpectancySnapshot, AdaptiveRecommendation } from "../lib/setup-recommendation";
 import { RouteActiveContext } from "./route-active";
+import type { SetupTradeOutcome } from "../lib/setup-outcomes-api";
 
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); applyInterfaceSettings({ timezone: "auto" }); });
 const setup: SetupRow = { exchange: "bybit", category: "linear", symbol: "BTCUSDT", algorithmId: "price_volume_spike", openTimeUnix: 100, closeTimeUnix: 200, closePrice: "100" };
+const tradeOutcome: SetupTradeOutcome = { status: "tp", entryTimeUnix: 200, entryPrice: 100, gateThreshold: null, tpPrice: 110, slPrice: 95, closeTimeUnix: Date.parse("2026-11-19T23:30:00Z") / 1000, closePrice: 0.00007421, riskReturn: 2, evaluatedAtUnix: 1795125600, observedThroughUnix: 1795125540, isFinal: true };
+
+it.each([
+  { risk: 2, status: "tp" as const, text: "+2.00 R", color: "text-success", label: "TP" },
+  { risk: -1, status: "sl" as const, text: "-1.00 R", color: "text-danger", label: "SL" },
+  { risk: 0, status: "tp" as const, text: "+0.00 R", color: "text-muted-foreground", label: "TP" },
+  { risk: null, status: "unclosed" as const, text: "—", color: "text-muted-foreground", label: "Не закрылась" },
+  { risk: null, status: "no_data" as const, text: "—", color: "text-muted-foreground", label: "Нет данных" },
+  { risk: null, status: "gate_failed" as const, text: "—", color: "text-muted-foreground", label: "Гейт не пройден" },
+])("renders stored $status with signed R and $color without recalculating", ({ risk, status, text, color, label }) => {
+  const fetch = vi.fn(); vi.stubGlobal("fetch", fetch);
+  render(<SetupTable showOutcomes setups={[{ ...setup, tradeOutcome: { ...tradeOutcome, status, riskReturn: risk } }]} />);
+  const row = within(screen.getAllByRole("row")[1]!);
+  expect(row.getByText(text)).toHaveClass(color); expect(row.getByText(label, { selector: "span" })).toBeInTheDocument();
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it("distinguishes missing recommended results and WATCH, leaving replay columns unchanged", () => {
+  const view = render(<SetupTable showOutcomes setups={[{ ...setup, id: 1, recommendation }, { ...setup, id: 2, symbol: "WATCHUSDT" }]} />);
+  expect(screen.getByText("Не рассчитан")).toBeInTheDocument(); expect(screen.getByText("Без рекомендованных условий")).toBeInTheDocument();
+  expect(screen.queryByText("+0.00 R")).not.toBeInTheDocument();
+  view.rerender(<SetupTable setups={[{ ...setup, tradeOutcome }]} />);
+  expect(screen.queryByRole("columnheader", { name: "Результат сделки" })).not.toBeInTheDocument();
+});
+
+it("shows exit price and trade close in the configured timezone without changing signal close", async () => {
+  applyInterfaceSettings({ timezone: "Asia/Yekaterinburg" });
+  render(<SetupTable showOutcomes setups={[{ ...setup, tradeOutcome }]} />);
+  expect(screen.getByRole("columnheader", { name: "Закрытие сигнала" })).toBeInTheDocument();
+  await userEvent.click(screen.getByText("Подробности BTCUSDT"));
+  expect(screen.getByText("Закрытие сделки (Asia/Yekaterinburg)").nextElementSibling).toHaveTextContent("20.11.2026, 04:30:00");
+  expect(screen.getByText("Цена закрытия сделки").nextElementSibling).toHaveTextContent("0.00007421");
+  act(() => { applyInterfaceSettings({ timezone: "UTC" }); });
+  expect(screen.getByText("Закрытие сделки (UTC)").nextElementSibling).toHaveTextContent("19.11.2026, 23:30:00");
+});
 
 it("keeps metrics collapsed until requested and shows rounded display ratios and snapshot", async () => {
   render(<SetupTable setups={[{ ...setup, algorithmVersion: "v2", params: { windowMinutes: 5 }, details: { growthPct: "12.345", volumeLongRatio: "3.123456", volumeShortRatio: "4", overLong: true, overShort: true, missingMinutes: 2 } }]} />);

@@ -31,6 +31,7 @@ fn state(pool: PgPool, market: &str) -> Arc<AnalyticsState> {
         market_key: "fixture-market-key".into(),
         reader: AnalyticsCandleReader::new(market, "fixture-market-key"),
         forecast_cpu: Arc::new(tokio::sync::Semaphore::new(1)),
+        outcome_compute: Arc::new(tokio::sync::Semaphore::new(1)),
     })
 }
 fn graph_body() -> Value {

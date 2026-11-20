@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { useState } from "react";
+import { StrictMode, useState } from "react";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
@@ -10,11 +10,16 @@ import { RouteActiveContext } from "./route-active";
 import { usePlatformPoll } from "./use-platform-poll";
 
 const requests: string[] = [];
+const refreshSignals: (AbortSignal | null | undefined)[] = [];
+let refreshResponse: () => Response | Promise<Response>;
 
 beforeEach(() => {
   requests.length = 0;
-  vi.stubGlobal("fetch", vi.fn((path: string) => {
+  refreshSignals.length = 0;
+  refreshResponse = () => new Response(JSON.stringify({ snapshotId: 0, observedThroughUnix: 200, processed: 0, computed: 0, updated: 0, nextCursor: null }));
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     requests.push(path);
+    if (path === "/v1/setups/outcomes/refresh") { refreshSignals.push(init?.signal); return Promise.resolve(refreshResponse()); }
     let data: unknown = {};
     if (path === "/v1/status") data = { platform: "ready", marketData: "ready" };
     if (path === "/v1/settings/ui") data = { value: {} };
@@ -29,17 +34,43 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-function renderAppAt(initialPath: string) {
-  return render(
+function renderAppAt(initialPath: string, strict = false) {
+  const application = (
     <Provider store={createStore()}>
       <MemoryRouter initialEntries={[initialPath]}>
         <AppRoutes />
       </MemoryRouter>
-    </Provider>,
+    </Provider>
   );
+  return render(strict ? <StrictMode>{application}</StrictMode> : application);
 }
 
 describe("keep-alive navigation tabs", () => {
+  it("preserves the sole refresh through StrictMode, both Setups panels and repeated route navigation", async () => {
+    let finish: ((response: Response) => void) | undefined;
+    refreshResponse = () => new Promise<Response>((resolve) => { finish = resolve; });
+    const user = userEvent.setup();
+    const view = renderAppAt("/setups", true);
+    const icon = await screen.findByRole("button", { name: "Обновить результаты сетапов" });
+    expect(icon).toBeDisabled(); expect(refreshSignals).toHaveLength(1);
+    expect(refreshSignals[0]?.aborted).toBe(false);
+    await user.click(screen.getByRole("tab", { name: "Аналитика" }));
+    expect(screen.getByRole("status", { name: "Обновление результатов сделок" })).toBeVisible();
+    await user.click(screen.getByRole("link", { name: "Обзор" }));
+    expect(refreshSignals[0]?.aborted).toBe(false);
+    await act(async () => { finish?.(new Response(JSON.stringify({ snapshotId: 0, observedThroughUnix: 200, processed: 1, computed: 1, updated: 1, nextCursor: null }))); await Promise.resolve(); });
+    await user.click(screen.getByRole("link", { name: "Сетапы" }));
+    expect(screen.getByRole("tab", { name: "Аналитика" })).toHaveAttribute("aria-selected", "true");
+    await user.click(screen.getByRole("tab", { name: "Лента" }));
+    expect(screen.getByRole("button", { name: "Обновить результаты сетапов" })).toBe(icon);
+    expect(icon).toBeEnabled(); expect(icon).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByText(/Результаты обновлены:/)).toHaveTextContent("обновлено 1");
+    await user.click(screen.getByRole("link", { name: "Обзор" }));
+    await user.click(screen.getByRole("link", { name: "Сетапы" }));
+    expect(refreshSignals).toHaveLength(1); expect(refreshSignals[0]?.aborted).toBe(false);
+    view.unmount();
+  });
+
   it("mounts algorithms on first visit and preserves drafts without reloading on return", async () => {
     const user = userEvent.setup();
     const view = renderAppAt("/");

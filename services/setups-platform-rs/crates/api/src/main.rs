@@ -139,6 +139,7 @@ async fn main() {
     let continuous_state=Arc::new(setups_api::continuous::ContinuousState{pool:pool.clone(),auth:auth.clone(),config:continuous_config,notify:continuous_runtime.notify.clone(),available:continuous_runtime.available.clone()});
     let analytics_state = std::sync::Arc::new(setups_api::analytics::AnalyticsState {
         forecast_cpu: Arc::new(tokio::sync::Semaphore::new(1)),
+        outcome_compute: Arc::new(tokio::sync::Semaphore::new(1)),
         pool: pool.clone(),
         auth: auth.clone(),
         market_url: config.market_data_url.clone(),

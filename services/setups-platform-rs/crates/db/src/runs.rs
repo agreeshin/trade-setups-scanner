@@ -107,8 +107,10 @@ pub async fn get_run_full(pool: &PgPool, run_id: i64) -> Result<Option<ReplayRun
 
 /// Only the batch detail endpoint reads these bounded, potentially large output
 /// archives. Lists retain compact provenance IDs and never load analytical JSON.
-pub async fn replay_batch_archive(pool:&PgPool,batch_id:i64)->Result<Option<Value>,DbError> {
-    let Ok(id)=i32::try_from(batch_id) else {return Ok(None);};
+pub async fn replay_batch_archive(pool: &PgPool, batch_id: i64) -> Result<Option<Value>, DbError> {
+    let Ok(id) = i32::try_from(batch_id) else {
+        return Ok(None);
+    };
     Ok(sqlx::query_scalar("select jsonb_build_object('provenance',continuous_archive,'analytics',continuous_analytics_archive,'analyticsPresent',continuous_analytics_archive is not null,'context',continuous_analytics_context_archive,'replayManifest',continuous_replay_archive) from replay_batches where id=$1 and continuous_archive is not null")
         .bind(id).fetch_optional(pool).await?)
 }
@@ -493,10 +495,16 @@ pub async fn get_algorithm_params(
     algorithm_id: &str,
 ) -> Result<AlgorithmParams, DbError> {
     let stored = crate::settings_get(pool, &format!("algorithm:{algorithm_id}")).await?;
-    Ok(algorithm_params_from_settings(algorithm_id,stored.as_ref()))
+    Ok(algorithm_params_from_settings(
+        algorithm_id,
+        stored.as_ref(),
+    ))
 }
 
-pub(crate) fn algorithm_params_from_settings(algorithm_id: &str, stored: Option<&Value>) -> AlgorithmParams {
+pub(crate) fn algorithm_params_from_settings(
+    algorithm_id: &str,
+    stored: Option<&Value>,
+) -> AlgorithmParams {
     let mut value = match algorithm_id {
         SPIKE_DROP_ALGORITHM_ID => serde_json::to_value(SpikeDropParams::default()),
         _ => serde_json::to_value(SpikeParams::default()),
@@ -554,7 +562,9 @@ pub async fn cancel_replay_batch(
         tx.commit().await?;
         return Ok(None);
     }
-    if batch.as_ref().unwrap().try_get::<String,_>("origin")?=="continuous" {return Ok(Some((0,0)));}
+    if batch.as_ref().unwrap().try_get::<String, _>("origin")? == "continuous" {
+        return Ok(Some((0, 0)));
+    }
     let cancelled = sqlx::query(
         "update replay_runs set status = 'cancelled', updated_at = now() \
          where batch_id = $1 and status = 'queued'",
@@ -602,8 +612,15 @@ pub async fn delete_replay_batch(
         tx.commit().await?;
         return Ok(None);
     }
-    if sqlx::query_scalar::<_,bool>("select exists(select 1 from continuous_generations where replay_batch_id=$1)")
-        .bind(batch_id as i32).fetch_one(&mut *tx).await? {return Ok(Some(BatchDeleteOutcome::Referenced));}
+    if sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from continuous_generations where replay_batch_id=$1)",
+    )
+    .bind(batch_id as i32)
+    .fetch_one(&mut *tx)
+    .await?
+    {
+        return Ok(Some(BatchDeleteOutcome::Referenced));
+    }
     let children = sqlx::query("select status from replay_runs where batch_id = $1")
         .bind(batch_id as i32)
         .fetch_all(&mut *tx)
@@ -785,6 +802,7 @@ pub struct LiveSetupFull {
     pub adaptive_slot_id: Option<i64>,
     pub adaptive_generation_id: Option<i64>,
     pub recommendation: Option<Value>,
+    pub trade_outcome: Option<Value>,
     pub external_name: String,
 }
 
@@ -814,7 +832,7 @@ pub async fn live_setups_search(
     let total: i64 = count_row.try_get("total")?;
     let page_sql = format!(
         "select id, exchange_code, category, symbol, algorithm_id, algorithm_version, \
-         open_time, close_time, close_price, params, details, adaptive_slot_id, coalesce(adaptive_generation_id,(adaptive_generation_archive->>'generationId')::bigint) as adaptive_generation_id, recommendation, external_name from live_setups where {filter} \
+         open_time, close_time, close_price, params, details, adaptive_slot_id, coalesce(adaptive_generation_id,(adaptive_generation_archive->>'generationId')::bigint) as adaptive_generation_id, recommendation, trade_outcome, external_name from live_setups where {filter} \
          order by close_time desc, id desc offset {offset_ph} limit {limit_ph}"
     );
     let page = sqlx::query(&page_sql).bind(snapshot_id as i32);
@@ -835,11 +853,20 @@ pub async fn live_setups_search(
                 close_price: row.try_get("close_price")?,
                 params: row.try_get("params")?,
                 details: row.try_get("details")?,
-                origin: if row.try_get::<Option<i64>,_>("adaptive_slot_id")?.is_some() { "continuous".into() } else { "manual".into() },
+                origin: if row.try_get::<Option<i64>, _>("adaptive_slot_id")?.is_some() {
+                    "continuous".into()
+                } else {
+                    "manual".into()
+                },
                 adaptive_slot_id: row.try_get("adaptive_slot_id")?,
                 adaptive_generation_id: row.try_get("adaptive_generation_id")?,
                 recommendation: row.try_get("recommendation")?,
-                external_name: row.try_get::<Option<String>,_>("external_name")?.unwrap_or_else(||crate::algorithm_name(&row.get::<String,_>("algorithm_id"))),
+                trade_outcome: row.try_get("trade_outcome")?,
+                external_name: row
+                    .try_get::<Option<String>, _>("external_name")?
+                    .unwrap_or_else(|| {
+                        crate::algorithm_name(&row.get::<String, _>("algorithm_id"))
+                    }),
             })
         })
         .collect::<Result<Vec<_>, DbError>>()?;

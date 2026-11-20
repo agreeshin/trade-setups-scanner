@@ -248,6 +248,40 @@ it("shows study details with the past-and-live chart in a modal", async () => {
   expect(requests.some((path) => path === "/v1/setups/analytics/study-expectancy/40")).toBe(true);
 });
 
+it("reports a busy live-outcome read and does not request a misleading historical-only combined chart", async () => {
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  analyticsResponse = () => json({ error: "setups_outcomes_busy" }, 409);
+  fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" }));
+  await settle(); await settle();
+  const dialog = within(screen.getByRole("dialog"));
+  expect(requests.filter((path) => path === "/v1/setups/analytics/study-expectancy/40")).toHaveLength(0);
+  expect(dialog.getByRole("alert")).toHaveTextContent("HTTP 409");
+  expect(dialog.queryByTestId("study-horizon-chart")).not.toBeInTheDocument();
+  expect(dialog.queryByText("Загрузка графика…")).not.toBeInTheDocument();
+  expect(dialog.getByText("Полные параметры алгоритма")).toBeInTheDocument();
+  expect(dialog.getByText("TP 20% / SL 6% · +0.44 R")).toBeInTheDocument();
+});
+
+it("accepts a successful empty live population and still requests the saved study series with live=[]", async () => {
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  analyticsResponse = () => json({ totals: { selected: 0, gatePassed: 0, closed: 0, meanR: null }, studies: [], setups: [] });
+  fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" }));
+  await settle(); await settle();
+  const dialog = within(screen.getByRole("dialog"));
+  const seriesCalls = vi.mocked(globalThis.fetch).mock.calls.filter(([path]) => path === "/v1/setups/analytics/study-expectancy/40");
+  expect(seriesCalls).toHaveLength(1);
+  expect(seriesCalls[0]?.[1]?.body).toBe(JSON.stringify({ live: [] }));
+  expect(dialog.queryByRole("alert")).not.toBeInTheDocument();
+  const chart = dialog.getByTestId("study-horizon-chart");
+  expect(chart.querySelectorAll('[data-phase="past"]').length).toBeGreaterThan(0);
+  expect(chart.querySelectorAll('[data-phase="live"]')).toHaveLength(0);
+  expect(dialog.getByText("TP 20% / SL 6% · +0.44 R")).toBeInTheDocument();
+});
+
 it("opens legacy study details with null analytics without white screen", async () => {
   analyticsResponse = () => json(legacyAnalyticsResult);
   await rendered();
@@ -278,6 +312,16 @@ it("shows the limit error with a range hint", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
   await settle();
   expect(screen.getByRole("alert")).toHaveTextContent("Сузьте диапазон");
+});
+
+it("shows an operational candle-read failure instead of presenting missing-data results", async () => {
+  analyticsResponse = () => json({ error: "setups_analytics_market_data_unavailable" }, 502);
+  await rendered();
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await settle();
+  expect(screen.getByRole("alert")).toHaveTextContent("Не удалось прочитать свечи из сервиса данных");
+  expect(screen.getByRole("alert")).toHaveTextContent("Повторите расчёт после восстановления сервиса");
+  expect(screen.queryByTestId("setups-analytics-mean")).toBeNull();
 });
 
 it("groups the 19th at 22Z into the configured UTC+5 day and includes the last partial day without a zero outcome", async () => {

@@ -25,6 +25,7 @@ beforeEach(() => {
   rows = Array.from({ length: 60 }, (_, index) => row(60 - index)); respond = page;
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     requests.push({ path, signal: init?.signal });
+    if (path === "/v1/setups/outcomes/refresh") return Promise.resolve(json({ snapshotId: 60, observedThroughUnix: 200, processed: 0, computed: 0, updated: 0, nextCursor: null }));
     if (path === "/v1/settings/ui") return Promise.resolve(json({ value: { setupFilter: "BTC" } }));
     if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [] }));
     return Promise.resolve(respond(new URL(path, "http://localhost").searchParams));
@@ -134,4 +135,22 @@ it("keeps the feed panel alive behind the analytics sidebar section", async () =
   expect(screen.getByText("bybit · BTC60")).toBeInTheDocument();
   await tick(3000);
   expect(calls().length).toBeGreaterThan(feedCallsBefore);
+});
+
+it("rereads the current historical query after manual outcome refresh without resetting the snapshot or filter", async () => {
+  render(<SetupsPage />); await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Далее" })); await settle();
+  expect(params().get("offset")).toBe("25"); expect(params().get("snapshotId")).toBe("60");
+  const originalFetch = globalThis.fetch;
+  const refresh = vi.fn(() => Promise.resolve(json({ snapshotId: 60, observedThroughUnix: 200, processed: 1, computed: 1, updated: 1, nextCursor: null })));
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => path === "/v1/setups/outcomes/refresh" ? refresh() : originalFetch(path, init)));
+  const before = calls().length;
+  const icon = screen.getByRole("button", { name: "Обновить результаты сетапов" });
+  fireEvent.focus(icon); expect(screen.getByRole("tooltip")).toHaveTextContent("Обновить результаты сетапов");
+  fireEvent.click(icon); fireEvent.click(icon); await settle();
+  expect(refresh).toHaveBeenCalledTimes(1);
+  expect(calls()).toHaveLength(before + 1);
+  expect(params().get("offset")).toBe("25"); expect(params().get("snapshotId")).toBe("60"); expect(params().get("q")).toBe("BTC");
+  expect(screen.getByText("bybit · BTC35")).toBeInTheDocument();
+  expect(icon).toHaveAttribute("aria-busy", "false"); expect(icon).toBeEnabled();
 });

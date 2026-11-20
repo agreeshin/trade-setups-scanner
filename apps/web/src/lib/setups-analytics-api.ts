@@ -35,6 +35,7 @@ export interface SetupsAnalyticsSetup {
   tpPrice: number | null;
   slPrice: number | null;
   closeTimeUnix: number | null;
+  closePrice?: number | null;
   riskReturn: number | null;
   status: SetupsAnalyticsStatus;
 }
@@ -103,6 +104,7 @@ function isSetup(value: unknown): value is SetupsAnalyticsSetup {
     && (value.tpPrice === null || isFiniteNumber(value.tpPrice))
     && (value.slPrice === null || isFiniteNumber(value.slPrice))
     && (value.closeTimeUnix === null || isUnix(value.closeTimeUnix))
+    && (value.closePrice === undefined || value.closePrice === null || isFiniteNumber(value.closePrice))
     && (value.riskReturn === null || isFiniteNumber(value.riskReturn))
     && isStatus(value.status);
 }
@@ -119,6 +121,9 @@ async function readBody(response: Response): Promise<unknown> {
     const code = isRecord(body) && typeof body.error === "string" ? body.error : "";
     if (code === "setups_analytics_limit_exceeded") {
       throw new SetupsAnalyticsApiError("Сузьте диапазон: в выборке больше 5000 сетапов.", response.status);
+    }
+    if (code === "setups_analytics_market_data_unavailable") {
+      throw new SetupsAnalyticsApiError("Не удалось прочитать свечи из сервиса данных. Повторите расчёт после восстановления сервиса; это не отсутствие сделок.", response.status);
     }
     throw new SetupsAnalyticsApiError(`Расчёт недоступен: HTTP ${response.status}`, response.status);
   }
@@ -149,7 +154,7 @@ export async function fetchSetupsAnalytics(
 ): Promise<SetupsAnalyticsResult> {
   const params = new URLSearchParams({ algorithmId, fromUnix: String(fromUnix), toUnix: String(toUnix) });
   if (studies !== null) params.set("studies", studies.join(","));
-  const response = await apiFetch(`/v1/setups/analytics?${params}`, signal === undefined ? {} : { signal });
+  const response = await apiFetch(`/v1/setups/analytics?${params}`, { method: "POST", ...(signal === undefined ? {} : { signal }) });
   const body = await readBody(response);
   if (!isRecord(body) || !isTotals(body.totals) || !Array.isArray(body.studies) || !Array.isArray(body.setups)) {
     throw new SetupsAnalyticsApiError("Некорректный ответ расчёта");

@@ -544,6 +544,7 @@ async fn get_live_setups(
         .iter()
         .map(|row| {
             json!({
+                "id": row.id,
                 "exchange": row.exchange_code,
                 "category": row.category,
                 "symbol": row.symbol,
@@ -554,6 +555,7 @@ async fn get_live_setups(
                 "adaptiveSlotId": row.adaptive_slot_id,
                 "adaptiveGenerationId": row.adaptive_generation_id,
                 "recommendation": row.recommendation,
+                "tradeOutcome": row.trade_outcome,
                 "openTimeUnix": row.open_time.timestamp(),
                 "params": row.params,
                 "details": row.details.clone().unwrap_or(Value::Null),

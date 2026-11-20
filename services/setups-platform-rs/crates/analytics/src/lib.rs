@@ -1,4 +1,5 @@
 pub mod expectancy_chart;
+pub mod live_outcomes;
 pub mod manual_trend;
 
 use serde::{Deserialize, Serialize};
@@ -473,17 +474,8 @@ fn lower_bound(candles: &[OhlcCandle], target_unix: i64) -> usize {
     low
 }
 
-pub fn evaluate_limit(options: EvaluateLimitOptions<'_>) -> LimitEvaluation {
-    let EvaluateLimitOptions {
-        candles,
-        setup,
-        direction,
-        tp_pct,
-        sl_pct,
-        time_shift_minutes,
-        horizon_minutes,
-    } = options;
-    let no_data = LimitEvaluation {
+fn no_entry() -> LimitEvaluation {
+    LimitEvaluation {
         status: LimitStatus::NoData,
         entry_price: None,
         entry_time_unix: None,
@@ -492,22 +484,21 @@ pub fn evaluate_limit(options: EvaluateLimitOptions<'_>) -> LimitEvaluation {
         close_time_unix: None,
         move_pct: None,
         close_minutes: None,
-    };
-    let Some((entry_price, entry_candle)) = resolve_entry(candles, setup, time_shift_minutes)
-    else {
-        return no_data;
-    };
-    let entry_time_unix = entry_candle.open_time_unix + MINUTE_SECONDS;
-    let scan_start_unix = entry_time_unix;
+    }
+}
+
+pub fn trade_levels(entry_price: f64, tp_pct: f64, sl_pct: f64, direction: TradeDirection) -> (f64, f64) {
+    match direction {
+        TradeDirection::Short => (entry_price * (1.0 - tp_pct / 100.0), entry_price * (1.0 + sl_pct / 100.0)),
+        TradeDirection::Long => (entry_price * (1.0 + tp_pct / 100.0), entry_price * (1.0 - sl_pct / 100.0)),
+    }
+}
+
+/// Shared scanner; callers retain their distinct entry policy and scan origin.
+fn scan_limit(candles: &[OhlcCandle], direction: TradeDirection, tp_pct: f64, sl_pct: f64,
+    entry_price: f64, entry_time_unix: i64, horizon_minutes: i64) -> LimitEvaluation {
     let scan_end_unix = entry_time_unix + horizon_minutes * MINUTE_SECONDS;
-    let tp_price = match direction {
-        TradeDirection::Short => entry_price * (1.0 - tp_pct / 100.0),
-        TradeDirection::Long => entry_price * (1.0 + tp_pct / 100.0),
-    };
-    let sl_price = match direction {
-        TradeDirection::Short => entry_price * (1.0 + sl_pct / 100.0),
-        TradeDirection::Long => entry_price * (1.0 - sl_pct / 100.0),
-    };
+    let (tp_price, sl_price) = trade_levels(entry_price, tp_pct, sl_pct, direction);
     let touches_tp = |candle: &OhlcCandle| match direction {
         TradeDirection::Short => candle.low <= tp_price,
         TradeDirection::Long => candle.high >= tp_price,
@@ -516,7 +507,7 @@ pub fn evaluate_limit(options: EvaluateLimitOptions<'_>) -> LimitEvaluation {
         TradeDirection::Short => candle.high >= sl_price,
         TradeDirection::Long => candle.low <= sl_price,
     };
-    let mut start = lower_bound(candles, scan_start_unix);
+    let mut start = lower_bound(candles, entry_time_unix);
     while start < candles.len() {
         let candle = &candles[start];
         if candle.open_time_unix >= scan_end_unix {
@@ -554,84 +545,18 @@ pub fn evaluate_limit(options: EvaluateLimitOptions<'_>) -> LimitEvaluation {
     }
 }
 
+pub fn evaluate_limit(options: EvaluateLimitOptions<'_>) -> LimitEvaluation {
+    let Some((price, candle)) = resolve_entry(options.candles, options.setup, options.time_shift_minutes)
+        else { return no_entry(); };
+    scan_limit(options.candles, options.direction, options.tp_pct, options.sl_pct,
+        price, candle.open_time_unix + MINUTE_SECONDS, options.horizon_minutes)
+}
+
 pub fn evaluate_limit_at_open(options: EvaluateLimitOptions<'_>) -> LimitEvaluation {
-    let EvaluateLimitOptions {
-        candles,
-        setup,
-        direction,
-        tp_pct,
-        sl_pct,
-        time_shift_minutes,
-        horizon_minutes,
-    } = options;
-    let no_data = LimitEvaluation {
-        status: LimitStatus::NoData,
-        entry_price: None,
-        entry_time_unix: None,
-        tp_price: None,
-        sl_price: None,
-        close_time_unix: None,
-        move_pct: None,
-        close_minutes: None,
-    };
-    let entry_time_unix = setup.open_time_unix + time_shift_minutes * MINUTE_SECONDS;
-    let Some(entry_candle) = find_candle_by_open_time(candles, entry_time_unix) else {
-        return no_data;
-    };
-    let entry_price = entry_candle.open;
-    let scan_end_unix = entry_time_unix + horizon_minutes * MINUTE_SECONDS;
-    let tp_price = match direction {
-        TradeDirection::Short => entry_price * (1.0 - tp_pct / 100.0),
-        TradeDirection::Long => entry_price * (1.0 + tp_pct / 100.0),
-    };
-    let sl_price = match direction {
-        TradeDirection::Short => entry_price * (1.0 + sl_pct / 100.0),
-        TradeDirection::Long => entry_price * (1.0 - sl_pct / 100.0),
-    };
-    let touches_tp = |candle: &OhlcCandle| match direction {
-        TradeDirection::Short => candle.low <= tp_price,
-        TradeDirection::Long => candle.high >= tp_price,
-    };
-    let touches_sl = |candle: &OhlcCandle| match direction {
-        TradeDirection::Short => candle.high >= sl_price,
-        TradeDirection::Long => candle.low <= sl_price,
-    };
-    let mut index = lower_bound(candles, entry_time_unix);
-    while index < candles.len() {
-        let candle = &candles[index];
-        if candle.open_time_unix >= scan_end_unix {
-            break;
-        }
-        let hit_sl = touches_sl(candle);
-        if hit_sl || touches_tp(candle) {
-            let close_time_unix = candle.open_time_unix;
-            return LimitEvaluation {
-                status: if hit_sl {
-                    LimitStatus::Sl
-                } else {
-                    LimitStatus::Tp
-                },
-                entry_price: Some(entry_price),
-                entry_time_unix: Some(entry_time_unix),
-                tp_price: if hit_sl { None } else { Some(tp_price) },
-                sl_price: if hit_sl { Some(sl_price) } else { None },
-                close_time_unix: Some(close_time_unix),
-                move_pct: Some(if hit_sl { -sl_pct } else { tp_pct }),
-                close_minutes: Some((close_time_unix - entry_time_unix) as f64 / 60.0),
-            };
-        }
-        index += 1;
-    }
-    LimitEvaluation {
-        status: LimitStatus::Unclosed,
-        entry_price: Some(entry_price),
-        entry_time_unix: Some(entry_time_unix),
-        tp_price: None,
-        sl_price: None,
-        close_time_unix: None,
-        move_pct: None,
-        close_minutes: None,
-    }
+    let entry = options.setup.open_time_unix + options.time_shift_minutes * MINUTE_SECONDS;
+    let Some(candle) = find_candle_by_open_time(options.candles, entry) else { return no_entry(); };
+    scan_limit(options.candles, options.direction, options.tp_pct, options.sl_pct,
+        candle.open, entry, options.horizon_minutes)
 }
 
 pub struct EvaluateLimitOptions<'a> {

@@ -104,6 +104,62 @@ async function configure() {
   return dialog;
 }
 
+it("shows retained studies and standalone profiles when selecting the algorithm that owns them", async () => {
+  const growth = { ...algorithm, id: "price_volume_spike", externalName: "Рост" };
+  const drop = { ...algorithm, id: "price_drop_volume_spike", externalName: "Падение" };
+  const savedSpec = { ...spec, algorithmId: drop.id, direction: "long" as const };
+  const savedStudies = [study(3, "continuous", "running"), study(2, "continuous", "completed"), study(1, "continuous", "completed")]
+    .map((item) => ({ ...item, spec: savedSpec }));
+  const savedProfiles = [1, 2].map((id) => ({
+    ...asProfile({ id, minSetupsPerDay: id, status: "active", activeGenerationId: id, studyId: id,
+      meanExpectancy: 0.5, selectedCell: { tpPct: 40, slPct: 12, rawR: 1.5, meanR: 0.5, robustScore: 0.8 },
+      updatedAt: "2026-11-20T02:13:49Z" }),
+    algorithmId: drop.id, acceptedGenerationId: id, direction: "long" as const,
+  }));
+  const savedProcess = { ...profileController().process!, algorithmId: drop.id,
+    config: { lookbackDays: 30, minSetupsPerDay: [1, 2, 3], minMeanExpectancy: 0.15, adaptiveEnabled: true, study: savedSpec },
+    activeStudyId: 3, slots: savedProfiles };
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    const query = new URL(path, "http://localhost").searchParams;
+    const json = (body: unknown) => {
+      requests.push({ path, method: init?.method ?? "GET", body: null });
+      return Promise.resolve(new Response(JSON.stringify(body)));
+    };
+    if (path === "/v1/algorithms") return json({ algorithms: [growth, drop] });
+    if (path.startsWith("/v1/continuous-studies?")) return json({ processes: query.get("algorithmId") === drop.id ? [savedProcess] : [] });
+    if (path.startsWith("/v1/adaptive-profiles?")) {
+      const profiles = query.get("algorithmId") === drop.id ? savedProfiles : [];
+      return json({ profiles, total: profiles.length, offset: 0, limit: 50, limits: { totalProfiles: 50, runningProfiles: 30 }, blockedHandoffs: [] });
+    }
+    if (path.startsWith("/v1/adaptive-live/")) {
+      const algorithmId = path.split("/")[3];
+      return json({ algorithmId, enabled: algorithmId === drop.id });
+    }
+    if (path.startsWith("/v1/optimization-studies?")) {
+      const selected = !query.has("algorithmId") || query.get("algorithmId") === drop.id ? savedStudies : [];
+      const limit = Number(query.get("limit")); const offset = Number(query.get("offset"));
+      return json({ studies: selected.slice(offset, offset + limit).map(summarizeOptimizationStudy), total: selected.length, limit, offset });
+    }
+    return original(path, init);
+  }));
+
+  render(<AlgorithmsPage />);
+  const growthPanel = await screen.findByRole("tabpanel", { name: "Рост" });
+  expect(screen.getByRole("tab", { name: "Рост" })).toHaveAttribute("aria-selected", "true");
+  expect(await within(growthPanel).findByText("Исследований пока нет.")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Результат исследования 1" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Остановить адаптивный профиль 1" })).not.toBeInTheDocument();
+
+  await userEvent.click(screen.getByRole("tab", { name: "Падение" }));
+  expect(await screen.findByRole("button", { name: "Остановить адаптивный профиль 1" })).toBeEnabled();
+  expect(await screen.findByRole("button", { name: "Остановить адаптивный профиль 2" })).toBeEnabled();
+  for (const id of [1, 2, 3]) expect(await screen.findByRole("button", { name: `Результат исследования ${id}` })).toBeVisible();
+  expect(screen.getByText("Действующее поколение #1")).toBeVisible();
+  expect(screen.getByText("Действующее поколение #2")).toBeVisible();
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
 it("saves and restores forecast settings and separates the forward gate from the mean threshold", async () => {
   render(<AlgorithmsPage />);
   let dialog = await configure();
