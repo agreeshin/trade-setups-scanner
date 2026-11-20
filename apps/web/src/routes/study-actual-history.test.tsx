@@ -1,7 +1,8 @@
 import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actualCountsFixture, studyActualFixture } from "../../test/study-actual-fixture";
+import producerPagesJson from "../../test/study-actual-producer-pages.json?raw";
 import type { OptimizationStudySummary } from "../lib/optimization-api";
 import type { StudyActualSummary } from "../lib/study-actual-api";
 import { OptimizationHistory } from "./optimization-history";
@@ -48,8 +49,8 @@ beforeEach(() => {
   }));
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
-function surface(strict = false) {
-  const node = <OptimizationHistory algorithmId="spike" algorithmName="Всплеск" controller={controller} pageSize={5} pagination={false} onSelect={vi.fn()} onDelete={vi.fn()} />;
+function surface(strict = false, pageSize = 5) {
+  const node = <OptimizationHistory algorithmId="spike" algorithmName="Всплеск" controller={controller} pageSize={pageSize} pagination={false} onSelect={vi.fn()} onDelete={vi.fn()} />;
   return render(strict ? <StrictMode>{node}</StrictMode> : node);
 }
 
@@ -155,4 +156,67 @@ it("cleans up pending page polling and requests on unmount", async () => {
   rows[0] = row(49, studyActualFixture(49, { status: "queued", stage: "queued", revision: 1, jobId: "server-owned" }));
   const view = surface(); await settle(); const count = requests.length; view.unmount(); await settle(15000);
   expect(requests).toHaveLength(count); expect(requests.every((request) => request.signal?.aborted)).toBe(true);
+});
+
+describe("real serialized compact-list producer parity", () => {
+  type ProducerPhase = "idle" | "queued" | "running" | "completed" | "failed";
+  // Captured cookie-authenticated native HTTP pages, not summarizeOptimizationStudy output.
+  const pages = JSON.parse(producerPagesJson) as Record<ProducerPhase, { studies: { id: number; actual: StudyActualSummary }[] }>;
+  let phase: ProducerPhase;
+  beforeEach(() => {
+    phase = "idle";
+    vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      requests.push({ path, method, body: init?.body, ...(init?.signal ? { signal: init.signal } : {}) });
+      if (path.startsWith("/v1/optimization-studies?") && method === "GET") return Promise.resolve(json(pages[phase]));
+      if (path === "/v1/optimization-studies/1/actual/refresh" && method === "POST") {
+        phase = "queued"; return Promise.resolve(json(pages.queued.studies.find((study) => study.id === 1)!.actual, 202));
+      }
+      return Promise.resolve(json({ error: "unexpected request in captured-list parity" }, 404));
+    }));
+  });
+  const legacy = () => screen.getByRole("button", { name: "Расчёт после исследования 2 недоступен: execution_start_unavailable" });
+  const onlyCompactReads = () => expect(requests.filter((request) => request.method === "GET").every((request) => request.path.startsWith("/v1/optimization-studies?"))).toBe(true);
+
+  it("makes the first manual click available from the real idle list alone and keeps the legacy row disabled", async () => {
+    surface(false, 100); await settle();
+    expect(button(1)).toBeEnabled(); expect(legacy()).toBeDisabled();
+    expect(within(tableRow(1)).getByText("Не рассчитано")).toBeInTheDocument();
+    expect(requests).toHaveLength(1); expect(posts()).toHaveLength(0); onlyCompactReads();
+    fireEvent.click(legacy()); expect(posts()).toHaveLength(0);
+    fireEvent.click(button(1)); fireEvent.click(button(1));
+    expect(button(1)).toBeDisabled(); expect(posts()).toHaveLength(1); expect(posts()[0]?.body).toBe("{}");
+    await settle();
+    expect(within(tableRow(1)).getByRole("status")).toHaveTextContent("В очереди");
+    expect(button(1)).toHaveAttribute("aria-busy", "true"); expect(legacy()).toBeDisabled();
+    expect(posts()[0]?.path).toBe("/v1/optimization-studies/1/actual/refresh"); onlyCompactReads();
+  });
+
+  it.each(["queued", "running"] as const)("restores real %s state across reload and observes explicit completed counts using list polling only", async (pending) => {
+    phase = pending;
+    const view = surface(false, 100); await settle();
+    expect(button(1)).toBeDisabled(); expect(button(1).querySelector("svg")).toHaveClass("motion-safe:animate-spin");
+    const stage = pending === "queued" ? "В очереди" : "Расчёт исходов";
+    expect(within(tableRow(1)).getByRole("status")).toHaveTextContent(stage);
+    view.unmount(); surface(false, 100); await settle();
+    expect(button(1)).toBeDisabled(); expect(within(tableRow(1)).getByRole("status")).toHaveTextContent(stage);
+    phase = "completed"; await settle(3000);
+    expect(button(1)).toBeEnabled(); expect(legacy()).toBeDisabled();
+    expect(within(tableRow(1)).getByText("+0.00R")).toHaveClass("text-muted-foreground");
+    const badge = within(tableRow(1)).getByText("2/2"); expect(badge).toHaveClass("text-ambient-violet");
+    fireEvent.focus(badge);
+    expect(screen.getByRole("tooltip")).toHaveTextContent("Закрытые сделки / все сетапы");
+    expect(screen.getByRole("tooltip")).toHaveTextContent("TP: 1 · SL: 1 · гейт не пройден: 0 · не закрылись: 0 · нет данных: 0");
+    expect(posts()).toHaveLength(0); onlyCompactReads();
+    const count = requests.length; await settle(9000); expect(requests).toHaveLength(count);
+  });
+
+  it("renders the real failed revision and null counts without a fake zero, old badge or automatic retry", async () => {
+    phase = "failed"; surface(false, 100); await settle();
+    expect(within(tableRow(1)).getByRole("alert")).toHaveTextContent("fixture-failure: fixture-failure");
+    expect(within(tableRow(1)).queryByText("+0.00R")).not.toBeInTheDocument();
+    expect(within(tableRow(1)).queryByText("2/2")).not.toBeInTheDocument();
+    expect(button(1)).toBeEnabled(); expect(legacy()).toBeDisabled();
+    await settle(9000); expect(requests).toHaveLength(1); expect(posts()).toHaveLength(0); onlyCompactReads();
+  });
 });
