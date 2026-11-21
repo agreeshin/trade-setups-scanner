@@ -18,6 +18,15 @@ pub struct Source {
 }
 
 pub async fn source(pool:&PgPool,study:i64,owner:&str,cutoff:i64)->Result<Source,&'static str> {
+    load_source(pool,study,owner,cutoff,true).await
+}
+
+/// Original viewing never inherits a refresh job's current-period admission budget.
+pub async fn original_source(pool:&PgPool,study:i64,owner:&str)->Result<Source,&'static str> {
+    load_source(pool,study,owner,0,false).await
+}
+
+async fn load_source(pool:&PgPool,study:i64,owner:&str,cutoff:i64,refresh_budget:bool)->Result<Source,&'static str> {
     let row=sqlx::query("select s.spec,s.result,s.events,s.status,s.origin,coalesce(g.execution_started_at,s.execution_started_at) execution_start,md5(s.spec::text||coalesce(s.result::text,'null')) identity from optimization_studies s left join continuous_generations g on g.id=s.continuous_generation_id and g.owner_id=s.owner_id where s.id=$1 and s.owner_id=$2")
         .bind(study).bind(owner).fetch_optional(pool).await.map_err(|_|"study_actual_storage_unavailable")?.ok_or("study_not_found")?;
     if !matches!(row.get::<String,_>("status").as_str(),"completed"|"cancelled"|"failed") {return Err("study_active");}
@@ -59,9 +68,7 @@ pub async fn source(pool:&PgPool,study:i64,owner:&str,cutoff:i64)->Result<Source
     let value=Source{algorithm_id:spec.algorithm_id,algorithm_version:spec.algorithm_version,params,instruments:spec.instruments,
         start_unix:start.timestamp() as f64+start.timestamp_subsec_nanos() as f64/1e9,execution_started_at:start,direction:spec.direction,analytics,
         tp_pct:selected.tp_pct,sl_pct:selected.sl_pct,continuous,objective,original_endpoint:endpoint,source_artifact_id:artifact_id,artifact,source_identity:row.get("identity"),selection_from_open_unix};
-    let input_minutes=(cutoff-selection_from_open_unix).max(0)/60+i64::from(value.params.baseline_long_days())*1440;
-    if cutoff<0||input_minutes>MAX_CANDLES||cutoff-start.timestamp()>3660*86400 {return Err("study_actual_period_budget_exceeded");}
-    if serde_json::to_vec(&value).map_err(|_|"source_invalid")?.len()>1024*1024 {return Err("study_actual_source_budget_exceeded");}
+    if refresh_budget {value.refresh_eligibility(cutoff)?;}
     Ok(value)
 }
 
@@ -83,6 +90,12 @@ pub fn first_signal_open(start:DateTime<Utc>)->i64 {
     first_close-60
 }
 impl Source {
+    pub fn refresh_eligibility(&self,cutoff:i64)->Result<(),&'static str> {
+        let input_minutes=(cutoff-self.selection_from_open_unix).max(0)/60+i64::from(self.params.baseline_long_days())*1440;
+        if cutoff<0 || input_minutes>MAX_CANDLES || cutoff-self.execution_started_at.timestamp()>3660*86400 {return Err("study_actual_period_budget_exceeded");}
+        if serde_json::to_vec(self).map_err(|_|"source_invalid")?.len()>1024*1024 {return Err("study_actual_source_budget_exceeded");}
+        Ok(())
+    }
     pub fn work_minutes(&self,cutoff:i64)->i64 {((cutoff-self.selection_from_open_unix).max(0)/60+i64::from(self.params.baseline_long_days())*1440).saturating_mul(self.instruments.len() as i64)}
 }
 

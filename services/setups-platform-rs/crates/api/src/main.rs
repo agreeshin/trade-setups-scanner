@@ -29,6 +29,13 @@ fn with_telegram_router(app:axum::Router,pool:sqlx::PgPool,auth:Arc<SessionAuth>
 
 #[tokio::main]
 async fn main() {
+    let args=std::env::args().skip(1).collect::<Vec<_>>();
+    let materialize=if args.first().is_some_and(|arg|arg=="materialize-study-original") {
+        if args.len()==2 && args[1]=="--help" {println!("{}",setups_api::study_actual::legacy_cli::USAGE);return;}
+        Some(setups_api::study_actual::legacy_cli::parse(&args[1..]).unwrap_or_else(|error|{
+            eprintln!("{error}\n{}",setups_api::study_actual::legacy_cli::USAGE);std::process::exit(2)
+        }))
+    }else{None};
     let config = match PlatformConfig::from_env() {
         Ok(value) => value,
         Err(message) => {
@@ -36,6 +43,20 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if let Some(options)=materialize {
+        // Explicit one-shot operator mode: no restore, migration, status reset,
+        // server listener, live/research/replay workers, or adaptive publication.
+        let pool=PgPoolOptions::new().max_connections(2).acquire_timeout(Duration::from_secs(5))
+            .connect(&config.database_url).await.unwrap_or_else(|_|{eprintln!("materialization database connection unavailable");std::process::exit(1)});
+        let client=setups_mdclient::MarketDataClient::new(&config.market_data_url,&config.market_data_api_key);
+        let result=setups_api::study_actual::legacy_cli::run(&pool,&client,&options).await;
+        pool.close().await;
+        match result {
+            Ok(summary)=>println!("{summary}"),
+            Err(error)=>{let message:String=error.chars().take(512).map(|c|if c.is_control(){' '}else{c}).collect();eprintln!("materialization failed: {message}");std::process::exit(1);},
+        }
+        return;
+    }
     let mut continuous_config=setups_api::continuous::ContinuousRuntimeConfig::from_env().unwrap_or_else(|error|{eprintln!("{error}");std::process::exit(1)});
     config.resources.validate_continuous(&continuous_config).unwrap_or_else(|error|{eprintln!("runtime resource admission failed: {error}");std::process::exit(1)});
     continuous_config.replay_admission=config.replay_limits;

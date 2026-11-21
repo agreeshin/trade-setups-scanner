@@ -263,7 +263,7 @@ pub async fn save_gate(
     identity: &Value,
     gate: &Gate,
 ) -> Result<bool, DbError> {
-    save_gate_inner(pool, job, identity, gate, None).await
+    save_gate_inner(pool, job, identity, gate, None, None).await
 }
 
 /// New post-chain boundary: numbers and gate commit together. Legacy save_gate
@@ -279,7 +279,19 @@ pub async fn save_gate_with_expectancy(
     if gate.selected.is_some() && artifact.is_none() {
         return Err(DbError::Json("post_chain_expectancy_missing".into()));
     }
-    save_gate_inner(pool, job, identity, gate, artifact).await
+    save_gate_inner(pool, job, identity, gate, artifact, None).await
+}
+
+/// Native timestamped CLOSE-entry capture is sealed alongside the unchanged
+/// numerical artifact/gate; no runtime-chunk lifetime or new research run.
+pub async fn save_gate_with_expectancy_minutes(
+    pool:&PgPool, job:&ChainJob, identity:&Value, gate:&Gate,
+    artifact:Option<(&crate::expectancy::ArtifactIdentity,&Value)>, minutes:Option<&[crate::study_display::OriginalMinute]>,
+)->Result<bool,DbError> {
+    if gate.selected.is_some() && (artifact.is_none() || minutes.is_none()) {
+        return Err(DbError::Json("post_chain_original_minutes_missing".into()));
+    }
+    save_gate_inner(pool,job,identity,gate,artifact,minutes).await
 }
 
 async fn save_gate_inner(
@@ -288,6 +300,7 @@ async fn save_gate_inner(
     identity: &Value,
     gate: &Gate,
     artifact: Option<(&crate::expectancy::ArtifactIdentity, &Value)>,
+    minutes: Option<&[crate::study_display::OriginalMinute]>,
 ) -> Result<bool, DbError> {
     let mut tx = pool.begin().await?;
     if !scheduler::fenced(&mut tx, job).await? {
@@ -295,7 +308,8 @@ async fn save_gate_inner(
     }
     let required = artifact.is_some();
     if let Some((source, numerical)) = artifact {
-        crate::expectancy::seal_for_chain_in(&mut tx, job, source, numerical).await?;
+        let id=crate::expectancy::seal_for_chain_in(&mut tx, job, source, numerical).await?;
+        if let Some(points)=minutes {crate::study_display::seal_native_in(&mut tx,id,points).await?;}
     }
     let written=sqlx::query("update continuous_runtime_artifacts set gate_result=$3,gate_accepted=$4,gate_mean=$5,gate_selected=$6,gate_expectancy_required=$7,updated_at=now() where generation_id=$1 and identity=$2 and snapshot_manifest is not null and gate_result is null")
         .bind(job.generation_id).bind(identity).bind(&gate.result).bind(gate.accepted).bind(gate.mean).bind(&gate.selected).bind(required).execute(&mut *tx).await?.rows_affected();

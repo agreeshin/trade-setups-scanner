@@ -18,6 +18,7 @@ const STANDALONE_PROFILES: &str = "0023_standalone_adaptive_profiles.sql";
 const CONTINUOUS_PENDING_CONFIG: &str = "0024_continuous_pending_config.sql";
 const LIVE_SETUP_TRADE_OUTCOME: &str = "0025_live_setup_trade_outcome.sql";
 const STUDY_ACTUAL: &str = "0026_study_actual.sql";
+const STUDY_ORIGINAL_OUTCOMES: &str = "0027_study_original_outcomes.sql";
 const MIGRATIONS: &[&str] = &[
     BASELINE,
     RUN_NAMES,
@@ -36,6 +37,7 @@ const MIGRATIONS: &[&str] = &[
     CONTINUOUS_PENDING_CONFIG,
     LIVE_SETUP_TRADE_OUTCOME,
     STUDY_ACTUAL,
+    STUDY_ORIGINAL_OUTCOMES,
 ];
 
 fn migration_source(name: &str) -> &'static str {
@@ -63,6 +65,7 @@ fn migration_source(name: &str) -> &'static str {
         }
         LIVE_SETUP_TRADE_OUTCOME => include_str!("../migrations/0025_live_setup_trade_outcome.sql"),
         STUDY_ACTUAL => include_str!("../migrations/0026_study_actual.sql"),
+        STUDY_ORIGINAL_OUTCOMES => include_str!("../migrations/0027_study_original_outcomes.sql"),
         other => unreachable!("unknown migration {other}"),
     }
 }
@@ -144,7 +147,8 @@ mod tests {
                 STANDALONE_PROFILES,
                 CONTINUOUS_PENDING_CONFIG,
                 LIVE_SETUP_TRADE_OUTCOME,
-                STUDY_ACTUAL
+                STUDY_ACTUAL,
+                STUDY_ORIGINAL_OUTCOMES
             ]
         );
         let source = migration_source(RUN_NAMES);

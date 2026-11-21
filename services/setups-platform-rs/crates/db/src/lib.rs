@@ -18,6 +18,7 @@ pub mod optimization;
 pub mod push;
 pub mod runs;
 pub mod study_actual;
+pub mod study_display;
 pub mod telegram;
 
 #[derive(Debug)]

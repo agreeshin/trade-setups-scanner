@@ -206,11 +206,46 @@ pub struct ContinuousSelectedDaily {
     pub points: Vec<UtcDailyInput>,
 }
 
+/// Version 1 denotes the original historical CLOSE-entry classifier: entry at
+/// the shifted candle's close, scan from the next minute, original frozen cutoff
+/// and causal/gap rules. It must never denote the actual OPEN-entry evaluator.
+pub const CONTINUOUS_SELECTED_MINUTES_VERSION: u32 = 1;
+pub const CONTINUOUS_SELECTED_MINUTES_EVALUATOR: &str = "original-historical-close-1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinuousSelectedMinute {
+    /// Original signal close, NOT shifted entry or the trade's exit timestamp.
+    pub signal_close_unix: i64,
+    pub sum_r: f64,
+    pub closed_count: u64,
+    pub tp_count: u64,
+    pub sl_count: u64,
+}
+
+/// Separate display-source ledger, never inserted into a sealed expectancy
+/// artifact or scientific evaluation. Some(empty) is a completed capture with
+/// no closed outcomes; None means capture was not requested. The selected matrix
+/// cell independently proves completeness by exact TP/SL/count conservation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinuousSelectedMinutes {
+    pub version: u32,
+    pub evaluator: String,
+    pub tp_pct: f64,
+    pub sl_pct: f64,
+    /// Sorted unique signal-close instants, sparse and closed-only. Zero sum R
+    /// with positive closed_count is an observed result, never a missing point.
+    pub points: Vec<ContinuousSelectedMinute>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapturedContinuousAnalysis {
     pub evaluation: ContinuousEvaluation,
     pub selected_daily: Option<ContinuousSelectedDaily>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_minutes: Option<ContinuousSelectedMinutes>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -305,6 +340,130 @@ impl SelectedDailyCapture {
             return Err(StudyError::InvalidInput("selected daily capture differs from final cell counts".into()));
         }
         Ok(Some(ContinuousSelectedDaily { tp_pct: self.pair.tp_pct, sl_pct: self.pair.sl_pct, points }))
+    }
+}
+
+// One analysis owns the preallocated scalar-only vector. Events and unique
+// instants are both bounded by the ORIGINAL replay's setup count, admitted under
+// max_setups_per_candidate (normally 100k), never an actual-job candle limit.
+// Sorting/folding reuse this allocation; no candle/setup references escape. All
+// cancellation/error paths drop it, and successful ownership moves to the DTO.
+struct SelectedMinuteCapture {
+    pair: ContinuousCaptureCell,
+    cell_index: usize,
+    capacity: usize,
+    points: Vec<ContinuousSelectedMinute>,
+}
+
+impl SelectedMinuteCapture {
+    // Conservative JSON maximum including field names and worst-case i64/u64/
+    // finite-f64 spellings. Reserve serialization output alongside working RAM;
+    // there is no unbudgeted second event/output vector during compaction.
+    const JSON_POINT_BYTES: usize = 256;
+    const JSON_HEADER_BYTES: usize = 256;
+
+    fn new(
+        daily: &SelectedDailyCapture,
+        capacity: usize,
+        working_base: usize,
+        limits: &StudyLimits,
+    ) -> Result<Self, StudyError> {
+        limit("selected_minute_points", capacity, limits.max_setups_per_candidate)?;
+        let bytes = Self::budget_bytes(capacity);
+        limit(
+            "selected_minute_output_bytes",
+            Self::output_bytes(capacity),
+            limits.max_working_bytes,
+        )?;
+        limit("continuous_working_bytes", working_base.saturating_add(bytes), limits.max_working_bytes)?;
+        Ok(Self {
+            pair: daily.pair,
+            cell_index: daily.cell_index,
+            capacity,
+            points: Vec::with_capacity(capacity),
+        })
+    }
+
+    fn output_bytes(capacity: usize) -> usize {
+        capacity.saturating_mul(Self::JSON_POINT_BYTES).saturating_add(Self::JSON_HEADER_BYTES)
+    }
+
+    fn budget_bytes(capacity: usize) -> usize {
+        capacity.saturating_mul(size_of::<ContinuousSelectedMinute>())
+            .saturating_add(size_of::<Self>() + size_of::<ContinuousSelectedMinutes>())
+            .saturating_add(Self::output_bytes(capacity))
+    }
+
+    fn record(&mut self, signal_close: i64, before: (usize, usize), after: &MatrixCell) -> Result<(), StudyError> {
+        let tp = after.tp_count.checked_sub(before.0);
+        let sl = after.sl_count.checked_sub(before.1);
+        let (Some(tp), Some(sl)) = (tp, sl) else {
+            return Err(invalid("selected minute counter moved backwards"));
+        };
+        if tp > 1 || sl > 1 || tp + sl > 1 || signal_close % 60 != 0 {
+            return Err(invalid("invalid selected minute outcome delta/time"));
+        }
+        if tp + sl == 0 { return Ok(()); }
+        limit("selected_minute_points", self.points.len().saturating_add(1), self.capacity)?;
+        let sum_r = if tp == 1 { self.pair.tp_pct / self.pair.sl_pct } else { -1.0 };
+        self.points.push(ContinuousSelectedMinute {
+            signal_close_unix: signal_close,
+            sum_r,
+            closed_count: 1,
+            tp_count: tp as u64,
+            sl_count: sl as u64,
+        });
+        Ok(())
+    }
+
+    fn finish(mut self, matrix: &[MatrixCell], control: &Control<'_>) -> Result<Option<ContinuousSelectedMinutes>, StudyError> {
+        if control.stopped() { return Ok(None); }
+        // In-place, allocation-free bounded sort. Cancellation is checked before
+        // and after it and every 128 events while folding, never returning a
+        // partial ledger. Equal timestamps need no source/instrument tie-break.
+        self.points.sort_unstable_by_key(|point| point.signal_close_unix);
+        let (mut written, mut tp, mut sl, mut sum_r) = (0usize, 0u64, 0u64, 0.0);
+        for index in 0..self.points.len() {
+            if index % 128 == 0 && control.stopped() { return Ok(None); }
+            let point = self.points[index];
+            tp += point.tp_count;
+            sl += point.sl_count;
+            sum_r += point.sum_r;
+            if written > 0 && self.points[written - 1].signal_close_unix == point.signal_close_unix {
+                let previous = &mut self.points[written - 1];
+                previous.sum_r += point.sum_r;
+                previous.closed_count += point.closed_count;
+                previous.tp_count += point.tp_count;
+                previous.sl_count += point.sl_count;
+            } else {
+                self.points[written] = point;
+                written += 1;
+            }
+        }
+        self.points.truncate(written);
+        let cell = &matrix[self.cell_index];
+        if (tp, sl, tp + sl) != (cell.tp_count as u64, cell.sl_count as u64, cell.closed_count as u64) {
+            return Err(invalid("selected minute capture differs from final cell counts"));
+        }
+        // Reordering/folding fractional R can change the final few FP bits.
+        // Counts are exact; only sum R permits 1e-10 * max(1, total absolute R).
+        let positive_r = tp as f64 * (self.pair.tp_pct / self.pair.sl_pct);
+        let tolerance = 1e-10 * (positive_r + sl as f64).max(1.0);
+        let folded_r: f64 = self.points.iter().map(|point| point.sum_r).sum();
+        if !sum_r.is_finite() || !folded_r.is_finite()
+            || (sum_r - (positive_r - sl as f64)).abs() > tolerance
+            || (folded_r - sum_r).abs() > tolerance
+        {
+            return Err(invalid("selected minute capture violates R conservation"));
+        }
+        if control.stopped() { return Ok(None); }
+        Ok(Some(ContinuousSelectedMinutes {
+            version: CONTINUOUS_SELECTED_MINUTES_VERSION,
+            evaluator: CONTINUOUS_SELECTED_MINUTES_EVALUATOR.into(),
+            tp_pct: self.pair.tp_pct,
+            sl_pct: self.pair.sl_pct,
+            points: self.points,
+        }))
     }
 }
 
@@ -797,9 +956,14 @@ fn analyze_inner_with_daily(
     let mut capture = capture
         .map(|pair| SelectedDailyCapture::new(spec, pair, working_base, limits))
         .transpose()?;
+    let mut minutes = capture.as_ref().map(|daily| {
+        let capacity = replay.instruments.iter().fold(0usize, |total, raw| total.saturating_add(raw.setups.len()));
+        SelectedMinuteCapture::new(daily, capacity, working_base.saturating_add(daily.working_bytes()), limits)
+    }).transpose()?;
     limit(
         "continuous_working_bytes",
-        working_base.saturating_add(capture.as_ref().map_or(0, SelectedDailyCapture::working_bytes)),
+        working_base.saturating_add(capture.as_ref().map_or(0, SelectedDailyCapture::working_bytes))
+            .saturating_add(minutes.as_ref().map_or(0, |minutes| SelectedMinuteCapture::budget_bytes(minutes.capacity))),
         limits.max_working_bytes,
     )?;
     let mut daily = if !spec.trend_mode.is_mean() { Some(DailyMatrix::with_cutoff(spec, limits,replay.context.observation_cutoff)?) } else { None };
@@ -885,6 +1049,8 @@ fn analyze_inner_with_daily(
                 let after = &result.evaluation.matrix[capture.cell_index];
                 if (spec.trend_mode.is_mean() && spec.forecast.is_none()) || after.price_change_filtered_count == before.2 {
                     capture.record(setup.close_time_unix, (before.0, before.1), after)?;
+                    minutes.as_mut().expect("minute capture shares daily admission")
+                        .record(setup.close_time_unix, (before.0, before.1), after)?;
                 }
             }
         }
@@ -929,7 +1095,14 @@ fn analyze_inner_with_daily(
         }
         None => None,
     };
-    Ok(Some(CapturedContinuousAnalysis { evaluation: result, selected_daily }))
+    let selected_minutes = match minutes {
+        Some(minutes) => {
+            let Some(minutes) = minutes.finish(&result.evaluation.matrix, control)? else { return Ok(None); };
+            Some(minutes)
+        }
+        None => None,
+    };
+    Ok(Some(CapturedContinuousAnalysis { evaluation: result, selected_daily, selected_minutes }))
 }
 
 /// Recompute analytics from the materialized raw service replay and ORIGINAL
@@ -947,7 +1120,8 @@ pub fn analyze_continuous(
 }
 
 /// Same original analysis/classifier and validation, with optional compact
-/// daily outcomes for the caller's FINAL selected pair. Not an ordinary-cache
+/// daily outcomes and a separate versioned signal-minute ledger for the caller's
+/// FINAL selected pair. Neither changes the sealed artifact. Not an ordinary-cache
 /// rerun, not used by optimization trials, and not a new selection/gate.
 pub fn analyze_continuous_with_daily(
     spec: &StudyRequest,

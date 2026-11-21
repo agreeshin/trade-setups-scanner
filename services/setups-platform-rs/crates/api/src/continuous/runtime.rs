@@ -537,6 +537,7 @@ async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&Continuo
     let cpu_spec=spec.clone();let cpu_input=input.clone();let cpu_candidate=candidate.clone();let limits=config.optimizer.study_limits();
     let (captured,_)=blocking(cancel,None,move|token|core::analyze_continuous_with_daily(&cpu_spec,&cpu_input,&persisted,&cpu_candidate,&limits,&token,capture)).await?;
     let captured=captured.ok_or_else(interrupted)?;
+    drop(input); // Native outcome serialization retains no frozen input owner.
     let evaluation=captured.evaluation;
     if evaluation.evaluation.matrix!=best.matrix || evaluation.evaluation.summary.selected_setup_count!=best.support.selected_setup_count {
         return Err(JobError::new("post_chain_mismatch","Сохранённый replay/аналитика не совпали с frozen исследованием"));
@@ -546,21 +547,35 @@ async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&Continuo
         core::select_robust_cell_for_mode(&evaluation.evaluation.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell,spec.trend_mode)
     } else {core::select_robust_cell(&evaluation.evaluation.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell)}.map_err(compute_error)?;
     if selected!=expected_selected {return Err(JobError::new("post_chain_selected_cell_mismatch","Frozen selected pair changed during post-chain analytics"));}
+    let minutes=post_chain_minutes(selected.as_ref(),captured.selected_minutes)?;
     let derived=post_chain_expectancy(job,&spec,&best,&evaluation,selected.as_ref(),captured.selected_daily)?;
     let selected=selected.map(|cell|json!(cell));
     let mean=core::score_period_mean(&evaluation.evaluation.matrix,spec.min_closed_per_cell);
     let accepted=recommendation.is_some();
     let batch=persistence.call("batch_id",||async {sqlx::query_scalar::<_,i32>("select replay_batch_id from continuous_generations where id=$1").bind(job.generation_id).fetch_one(pool).await.map_err(Into::into)}).await?;
     let result=json!({"best":best,"selectedCell":selected,"meanExpectancy":mean,"analytics":evaluation,"recommendation":recommendation,"bootstrap":bootstrap,"setupSetId":format!("batch-{batch}")});
-    drop(input);
     let gate=recovery::Gate {result,accepted,mean,selected};
-    if !persistence.call("gate",||recovery::save_gate_with_expectancy(pool,job,&identity,&gate,derived.as_ref().map(|(source,numerical)|(source,numerical)))).await? {return Err(interrupted());}
+    if !persistence.call("gate",||recovery::save_gate_with_expectancy_minutes(pool,job,&identity,&gate,derived.as_ref().map(|(source,numerical)|(source,numerical)),minutes.as_deref())).await? {return Err(interrupted());}
     check_shutdown(shutdown)?;
     if !persistence.call("finalize",||db::finalize(pool,job,&gate.result,gate.accepted,gate.mean,gate.selected.as_ref())).await? {return Err(interrupted());}
     Ok(())
 }
 
 type DerivedExpectancy=(setups_db::expectancy::ArtifactIdentity,Value);
+
+fn post_chain_minutes(selected:Option<&core::RobustCell>,minutes:Option<core::ContinuousSelectedMinutes>)->Result<Option<Vec<setups_db::study_display::OriginalMinute>>,JobError> {
+    match (selected,minutes) {
+        (None,None)=>Ok(None),
+        (Some(pair),Some(minutes)) if minutes.version==core::CONTINUOUS_SELECTED_MINUTES_VERSION
+            && minutes.evaluator==core::CONTINUOUS_SELECTED_MINUTES_EVALUATOR
+            && minutes.tp_pct==pair.tp_pct && minutes.sl_pct==pair.sl_pct => {
+                if minutes.points.len()>setups_db::study_display::MAX_MINUTES {return Err(JobError::new("original_minutes_resource_limit","Native minute ledger exceeds storage admission"));}
+                Ok(Some(minutes.points.into_iter().map(|p|setups_db::study_display::OriginalMinute{signal_close_unix:p.signal_close_unix,
+                    sum_r:p.sum_r,closed_count:p.closed_count,tp_count:p.tp_count,sl_count:p.sl_count}).collect()))
+            },
+        _=>Err(JobError::new("original_minutes_source_mismatch","Native minute capture differs from original selected pair/kernel")),
+    }
+}
 
 fn post_chain_expectancy(job:&ChainJob,spec:&StudyRequest,best:&core::StudyBest,evaluation:&core::ContinuousEvaluation,
     selected:Option<&core::RobustCell>,daily:Option<core::ContinuousSelectedDaily>)->Result<Option<DerivedExpectancy>,JobError> {
@@ -861,6 +876,13 @@ mod persistence_tests {
             assert_eq!(artifact.source.provenance.snapshot_hash,input.snapshot_hash);
             assert_eq!(artifact.selected_cell.as_ref().unwrap().raw_r.as_ref().copied(),result["selectedCell"]["rawR"].as_f64());
             assert!(artifact.daily.as_ref().is_some());
+            let minutes:Value=sqlx::query_scalar("select minutes from study_original_outcomes where artifact_id=$1").bind(sealed.id).fetch_one(&pool).await.unwrap();
+            let minutes:Vec<setups_db::study_display::OriginalMinute>=serde_json::from_value(minutes).unwrap();
+            setups_db::study_display::validate_minutes(&artifact,&minutes).unwrap();
+            let selected=artifact.selected_cell.as_ref().unwrap();
+            assert_eq!(minutes.iter().map(|p|p.tp_count).sum::<u64>(),selected.tp_count);
+            assert_eq!(minutes.iter().map(|p|p.sl_count).sum::<u64>(),selected.sl_count);
+            assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_original_outcomes").fetch_one(&pool).await.unwrap(),1,"gate ACK retry must retain one immutable source sidecar");
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_expectancy_artifacts").fetch_one(&pool).await.unwrap(),1);
             assert_eq!(outcome.progress.evaluated_candidates,4);assert_eq!(outcome.detector_passes,4,"ACK retries must not reevaluate committed proposals");
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from continuous_generations").fetch_one(&pool).await.unwrap(),1);

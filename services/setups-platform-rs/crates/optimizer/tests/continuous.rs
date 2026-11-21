@@ -583,7 +583,8 @@ fn capture_and_assert_identical(spec: &StudyRequest, data: &StudyInput, replay: 
     let limits = StudyLimits::default(); let cancel = CancelToken::new();
     let original = analyze_continuous(spec, data, replay, candidate, &limits, &cancel).unwrap().unwrap();
     let off = analyze_continuous_with_daily(spec, data, replay, candidate, &limits, &cancel, None).unwrap().unwrap();
-    assert!(off.selected_daily.is_none()); assert_eq!(off.evaluation, original);
+    assert!(off.selected_daily.is_none()); assert!(off.selected_minutes.is_none()); assert_eq!(off.evaluation, original);
+    assert!(serde_json::to_value(&off).unwrap().get("selectedMinutes").is_none());
     let captured = analyze_continuous_with_daily(spec, data, replay, candidate, &limits, &cancel, Some(pair)).unwrap().unwrap();
     // All scientific fields, original axis order, diagnostics and exact float
     // serialization stay identical, not merely approximately equal averages.
@@ -594,7 +595,175 @@ fn capture_and_assert_identical(spec: &StudyRequest, data: &StudyInput, replay: 
     assert_eq!(daily.points.iter().map(|p|p.tp_count).sum::<u64>(), cell.tp_count as u64);
     assert_eq!(daily.points.iter().map(|p|p.sl_count).sum::<u64>(), cell.sl_count as u64);
     assert!(daily.points.len() <= setups_domain::expectancy::EXPECTANCY_MAX_POINTS);
+    let minutes = captured.selected_minutes.as_ref().unwrap();
+    assert_eq!(minutes.version, CONTINUOUS_SELECTED_MINUTES_VERSION);
+    assert_eq!(minutes.evaluator, CONTINUOUS_SELECTED_MINUTES_EVALUATOR);
+    assert_eq!((minutes.tp_pct, minutes.sl_pct), (pair.tp_pct, pair.sl_pct));
+    assert_eq!(minutes.points.iter().map(|p| p.closed_count).sum::<u64>(), cell.closed_count as u64);
+    assert_eq!(minutes.points.iter().map(|p| p.tp_count).sum::<u64>(), cell.tp_count as u64);
+    assert_eq!(minutes.points.iter().map(|p| p.sl_count).sum::<u64>(), cell.sl_count as u64);
+    assert!(minutes.points.iter().all(|p| p.closed_count > 0 && p.closed_count == p.tp_count + p.sl_count));
+    assert!(minutes.points.windows(2).all(|p| p[0].signal_close_unix < p[1].signal_close_unix));
+    assert!(minutes.points.len() <= limits.max_setups_per_candidate);
+    let expected = cell.tp_count as f64 * (pair.tp_pct / pair.sl_pct) - cell.sl_count as f64;
+    let tolerance = 1e-10 * (cell.tp_count as f64 * (pair.tp_pct / pair.sl_pct) + cell.sl_count as f64).max(1.0);
+    assert!((minutes.points.iter().map(|p| p.sum_r).sum::<f64>() - expected).abs() <= tolerance);
+    let output_bound = replay.instruments.iter().map(|r| r.setups.len()).sum::<usize>() * 256 + 256;
+    assert!(serde_json::to_vec(minutes).unwrap().len() <= output_bound);
     captured
+}
+
+#[test]
+fn selected_minutes_preserve_historical_close_entry_and_raw_signal_time_not_exit() {
+    let (mut spec, mut data, raw) = observed_fixture();
+    spec.analytics_params.time_shift_minutes = 1;
+    // CLOSE-entry is 100 at minute 60, with SL at minute 120. An OPEN-entry
+    // evaluation would instead enter at 200 and TP inside its entry candle.
+    data.instruments[0].candles[1].open = 200.0;
+    data.instruments[0].candles[1].high = 200.0;
+    data.instruments[0].candles[2].high = 105.0;
+    let result = capture_and_assert_identical(
+        &spec, &data, &raw, &candidate(&spec), ContinuousCaptureCell { tp_pct: 4.0, sl_pct: 4.0 },
+    );
+    assert_eq!(result.evaluation.evaluation.matrix[0].sl_count, 1);
+    let minutes = result.selected_minutes.unwrap();
+    assert_eq!(minutes.evaluator, "original-historical-close-1");
+    assert_eq!(minutes.points, vec![ContinuousSelectedMinute {
+        signal_close_unix: 60, sum_r: -1.0, closed_count: 1, tp_count: 0, sl_count: 1,
+    }]);
+    let wire = serde_json::to_value(&minutes).unwrap();
+    assert_eq!(wire["points"][0], json!({
+        "signalCloseUnix": 60, "sumR": -1.0, "closedCount": 1, "tpCount": 0, "slCount": 1,
+    }));
+    assert_eq!(serde_json::from_value::<ContinuousSelectedMinutes>(wire).unwrap(), minutes);
+}
+
+#[test]
+fn selected_minutes_fold_same_instant_across_instruments_and_keep_zero_sum_closed_points() {
+    let (mut spec, mut data, mut raw) = observed_fixture();
+    let mut second = identity();
+    second.symbol = "SECONDUSDT".into();
+    spec.instruments.push(second.clone());
+    let mut second_data = data.instruments[0].clone();
+    second_data.instrument = second.clone();
+    second_data.candles[1].high = 110.0;
+    let mut second_raw = raw.instruments[0].clone();
+    second_raw.instrument = second;
+    data.instruments[0].candles[1].low = 90.0;
+    data.instruments[0].candles[5].low = 90.0;
+    data.instruments.push(second_data);
+    raw.instruments.push(second_raw);
+    // Capture order is 60, 300, 60, not globally timestamp-sorted. The second
+    // instrument's censored minute 300 contributes no fake closed/zero outcome.
+    let result = capture_and_assert_identical(
+        &spec, &data, &raw, &candidate(&spec), ContinuousCaptureCell { tp_pct: 4.0, sl_pct: 4.0 },
+    );
+    assert_eq!(result.selected_minutes.unwrap().points, vec![
+        ContinuousSelectedMinute { signal_close_unix: 60, sum_r: 0.0, closed_count: 2, tp_count: 1, sl_count: 1 },
+        ContinuousSelectedMinute { signal_close_unix: 300, sum_r: 1.0, closed_count: 1, tp_count: 1, sl_count: 0 },
+    ]);
+    // The old daily payload is byte-identical, including all eligible rows.
+    let expected = ContinuousSelectedDaily {
+        tp_pct: 4.0, sl_pct: 4.0,
+        points: vec![setups_domain::expectancy::UtcDailyInput {
+            day_start_unix: 0, row_count: 4, tp_count: 2, sl_count: 1, mean_r: Some(1.0 / 3.0),
+        }],
+    };
+    assert_eq!(serde_json::to_vec(&result.selected_daily.unwrap()).unwrap(), serde_json::to_vec(&expected).unwrap());
+}
+
+#[test]
+fn selected_minutes_empty_capture_is_complete_and_not_a_missing_or_zero_outcome() {
+    let (spec, data, mut raw) = observed_fixture();
+    let pair = ContinuousCaptureCell { tp_pct: 4.0, sl_pct: 4.0 };
+    // Existing horizon-expired/right-censored rows still appear in daily input,
+    // but the separate closed-only ledger has no fabricated zero-R minute.
+    let result = capture_and_assert_identical(&spec, &data, &raw, &candidate(&spec), pair);
+    assert!(result.selected_minutes.unwrap().points.is_empty());
+    assert_eq!(result.selected_daily.unwrap().points[0].mean_r, None);
+    raw.instruments[0].setups.clear();
+    raw.instruments[0].last_raw_close_unix = None;
+    let result = capture_and_assert_identical(&spec, &data, &raw, &candidate(&spec), pair);
+    assert!(result.selected_minutes.as_ref().unwrap().points.is_empty());
+    assert!(result.selected_daily.as_ref().unwrap().points.is_empty());
+    let mut legacy_wire = serde_json::to_value(&result).unwrap();
+    legacy_wire.as_object_mut().unwrap().remove("selectedMinutes");
+    let legacy: CapturedContinuousAnalysis = serde_json::from_value(legacy_wire).unwrap();
+    assert!(legacy.selected_minutes.is_none());
+    assert_eq!(legacy.evaluation, result.evaluation);
+}
+
+#[test]
+fn selected_minutes_conserve_fractional_r_without_changing_daily_or_scientific_arithmetic() {
+    let (mut spec, mut data, mut raw) = observed_fixture();
+    spec.sl_levels = vec![12.0];
+    let template_data = data.instruments[0].clone();
+    let template_raw = raw.instruments[0].clone();
+    spec.instruments.clear();
+    data.instruments.clear();
+    raw.instruments.clear();
+    for index in 0..30 {
+        let mut instrument = identity();
+        instrument.symbol = format!("FRACTIONAL{index}USDT");
+        let mut input = template_data.clone();
+        input.instrument = instrument.clone();
+        if index < 21 { input.candles[1].low = 90.0; }
+        else { input.candles[1].high = 120.0; }
+        let mut replay = template_raw.clone();
+        replay.instrument = instrument.clone();
+        spec.instruments.push(instrument);
+        data.instruments.push(input);
+        raw.instruments.push(replay);
+    }
+    let result = capture_and_assert_identical(
+        &spec, &data, &raw, &candidate(&spec), ContinuousCaptureCell { tp_pct: 4.0, sl_pct: 12.0 },
+    );
+    let minutes = result.selected_minutes.unwrap();
+    assert_eq!(minutes.points.len(), 1);
+    let point = minutes.points[0];
+    assert_eq!((point.closed_count, point.tp_count, point.sl_count), (30, 21, 9));
+    assert!((point.sum_r - (21.0 * (4.0 / 12.0) - 9.0)).abs() <= 1e-10 * 16.0);
+}
+
+#[test]
+fn selected_minutes_obey_native_setup_and_byte_caps_and_cancel_without_partial_results() {
+    let (spec, mut data, raw) = observed_fixture();
+    data.instruments[0].candles[1].low = 90.0;
+    data.instruments[0].candles[5].high = 110.0;
+    let pair = ContinuousCaptureCell { tp_pct: 4.0, sl_pct: 4.0 };
+    assert_eq!(StudyLimits::default().max_setups_per_candidate, 100_000);
+    let limits = StudyLimits { max_setups_per_candidate: 2, ..StudyLimits::default() };
+    let run = |limits: &StudyLimits, cancel: &CancelToken| analyze_continuous_with_daily(
+        &spec, &data, &raw, &candidate(&spec), limits, cancel, Some(pair),
+    );
+    let result = run(&limits, &CancelToken::new()).unwrap().unwrap();
+    assert_eq!(result.selected_minutes.unwrap().points.len(), 2);
+    let below = StudyLimits { max_setups_per_candidate: 1, ..limits.clone() };
+    assert!(matches!(run(&below, &CancelToken::new()),
+        Err(StudyError::ResourceLimit { resource, .. }) if resource == "setups_per_candidate"));
+    let tiny = StudyLimits { max_working_bytes: 0, ..limits.clone() };
+    let daily_only_budget = match run(&tiny, &CancelToken::new()).unwrap_err() {
+        StudyError::ResourceLimit { resource, requested, .. } if resource == "continuous_working_bytes" => requested,
+        other => panic!("unexpected capture admission error: {other}"),
+    };
+    // The first admission above accounts for the unchanged daily capture. Its
+    // exact byte budget must NOT also admit the extra event/output allocation.
+    let daily_only = StudyLimits { max_working_bytes: daily_only_budget, ..limits.clone() };
+    let full_budget = match run(&daily_only, &CancelToken::new()).unwrap_err() {
+        StudyError::ResourceLimit { resource, requested, .. } if resource == "continuous_working_bytes" => requested,
+        other => panic!("unexpected minute admission error: {other}"),
+    };
+    assert!(full_budget > daily_only_budget);
+    let exact = StudyLimits { max_working_bytes: full_budget, ..limits.clone() };
+    assert!(run(&exact, &CancelToken::new()).unwrap().is_some());
+    for _ in 0..8 {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert!(run(&limits, &cancel).unwrap().is_none());
+        let completed = run(&limits, &CancelToken::new()).unwrap().unwrap();
+        assert_eq!(completed.selected_minutes.unwrap().points.len(), 2,
+            "a cancelled/failed call must not leak partial counters into the next call");
+    }
 }
 
 #[test]

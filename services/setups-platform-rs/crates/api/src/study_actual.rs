@@ -1,5 +1,9 @@
 //! Manual, durable post-start diagnostics. Never shares a live outcome or replay cache.
 pub(crate) mod model;
+pub mod display;
+pub mod legacy;
+pub mod legacy_cli;
+pub mod legacy_runtime;
 mod runtime;
 pub use runtime::{ActualHandle,start_actual_runtime};
 use crate::replay::{ReplayState,guard_auth};
@@ -45,8 +49,15 @@ async fn owns(state:&ReplayState,id:i64)->Result<(),Response> {
         Ok(Some(s)) if s.owner_id=="admin"=>Ok(()),Ok(_)=>Err(error(StatusCode::NOT_FOUND,"study_not_found")),Err(_)=>Err(error(StatusCode::INTERNAL_SERVER_ERROR,"study_actual_storage_unavailable"))
     }
 }
-async fn detail(State(state):State<Arc<ReplayState>>,headers:HeaderMap,Path(id):Path<i64>)->Response {
+async fn detail(State(state):State<Arc<ReplayState>>,headers:HeaderMap,Path(id):Path<i64>,Query(query):Query<HashMap<String,String>>)->Response {
     if let Err(e)=guard_auth(&state.auth,&headers,false){return e} if let Err(e)=owns(&state,id).await{return e}
+    if let Some(zone)=query.get("timeZone") {
+        return match display::detail(&state.pool,"admin",id,zone).await {
+            Ok(value)=>reply(StatusCode::OK,value),
+            Err("invalid_time_zone")=>error(StatusCode::BAD_REQUEST,"invalid_time_zone"),
+            Err(reason)=>error(StatusCode::INTERNAL_SERVER_ERROR,reason),
+        };
+    }
     match db::get(&state.pool,"admin",id).await {
         Ok(Some(row))=>reply(StatusCode::OK,dto(&row)),Ok(None)=>{
             let eligibility=match model::source(&state.pool,id,"admin",chrono::Utc::now().timestamp().div_euclid(60)*60).await {Ok(_)=>json!({"eligible":true,"reason":null}),Err(reason)=>json!({"eligible":false,"reason":reason})};
