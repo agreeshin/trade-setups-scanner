@@ -9,17 +9,24 @@ import { AppRoutes } from "../app-routes";
 import { createStore } from "../store";
 import { RouteActiveContext } from "./route-active";
 import { usePlatformPoll } from "./use-platform-poll";
+import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
 
 const requests: string[] = [];
+const mutations: string[] = [];
 const refreshSignals: (AbortSignal | null | undefined)[] = [];
 let refreshResponse: () => Response | Promise<Response>;
 
 beforeEach(() => {
   requests.length = 0;
+  mutations.length = 0;
   refreshSignals.length = 0;
+  window.localStorage.clear();
+  applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "UTC" });
+  vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
   refreshResponse = () => new Response(JSON.stringify({ snapshotId: 0, observedThroughUnix: 200, processed: 0, computed: 0, updated: 0, nextCursor: null }));
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     requests.push(path);
+    if (init?.method && init.method !== "GET") mutations.push(path);
     if (path === "/v1/setups/outcomes/refresh") { refreshSignals.push(init?.signal); return Promise.resolve(refreshResponse()); }
     let data: unknown = {};
     if (path === "/v1/status") data = { platform: "ready", marketData: "ready" };
@@ -30,10 +37,14 @@ beforeEach(() => {
       fields: [{ key: "priceGrowthPct", label: "Рост цены", type: "decimal", min: 0, max: 100, unit: "%" }],
     }] };
     if (path.startsWith("/v1/setups?")) data = { setups: [], offset: 0, limit: 25, total: 0, snapshotId: 0 };
+    if (path.startsWith("/v1/setups/analytics/studies?")) data = { studies: [{ studyId: 40, externalName: "Актуальное исследование", setupCount: 1, generationId: 36, artifactId: null }] };
+    if (path.startsWith("/v1/setups/analytics?")) data = { totals: { selected: 0, gatePassed: 0, closed: 0, meanR: null }, studies: [], setups: [] };
     return Promise.resolve(new Response(JSON.stringify(data), { status: 200 }));
   }));
 });
-afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+const analyticsPosts = () => mutations.filter((path) => path.startsWith("/v1/setups/analytics?"));
 
 function renderAppAt(initialPath: string, strict = false) {
   const application = (
@@ -67,7 +78,7 @@ describe("keep-alive navigation tabs", () => {
     expect(scrollTo).toHaveBeenCalled();
   });
 
-  it("preserves the sole refresh through StrictMode, both Setups panels and repeated route navigation", async () => {
+  it("preserves one StrictMode refresh across navigation, then calculates once on the first active ready visit", async () => {
     let finish: ((response: Response) => void) | undefined;
     refreshResponse = () => new Promise<Response>((resolve) => { finish = resolve; });
     const user = userEvent.setup();
@@ -75,21 +86,53 @@ describe("keep-alive navigation tabs", () => {
     const icon = await screen.findByRole("button", { name: "Обновить результаты сетапов" });
     expect(icon).toBeDisabled(); expect(refreshSignals).toHaveLength(1);
     expect(refreshSignals[0]?.aborted).toBe(false);
-    await user.click(screen.getByRole("tab", { name: "Аналитика" }));
     expect(screen.getByRole("status", { name: "Обновление результатов сделок" })).toBeVisible();
+    expect(screen.queryByRole("tab", { name: "Лента" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Аналитика" })).not.toBeInTheDocument();
+    expect(analyticsPosts()).toHaveLength(0);
+    expect(requests.filter((path) => path.startsWith("/v1/setups/analytics/studies?"))).toHaveLength(0);
     await user.click(screen.getByRole("link", { name: "Обзор" }));
     expect(refreshSignals[0]?.aborted).toBe(false);
     await act(async () => { finish?.(new Response(JSON.stringify({ snapshotId: 0, observedThroughUnix: 200, processed: 1, computed: 1, updated: 1, nextCursor: null }))); await Promise.resolve(); });
+    expect(analyticsPosts()).toHaveLength(0);
     await user.click(screen.getByRole("link", { name: "Сетапы" }));
-    expect(screen.getByRole("tab", { name: "Аналитика" })).toHaveAttribute("aria-selected", "true");
-    await user.click(screen.getByRole("tab", { name: "Лента" }));
+    await screen.findByTestId("setups-analytics-mean");
     expect(screen.getByRole("button", { name: "Обновить результаты сетапов" })).toBe(icon);
     expect(icon).toBeEnabled(); expect(icon).toHaveAttribute("aria-busy", "false");
     expect(screen.getByText(/Результаты обновлены:/)).toHaveTextContent("обновлено 1");
     await user.click(screen.getByRole("link", { name: "Обзор" }));
     await user.click(screen.getByRole("link", { name: "Сетапы" }));
     expect(refreshSignals).toHaveLength(1); expect(refreshSignals[0]?.aborted).toBe(false);
+    expect(analyticsPosts()).toHaveLength(1);
+    const refreshIndex = requests.indexOf("/v1/setups/outcomes/refresh");
+    const optionsIndex = requests.findIndex((path) => path.startsWith("/v1/setups/analytics/studies?"));
+    const calculateIndex = requests.findIndex((path) => path.startsWith("/v1/setups/analytics?"));
+    expect(refreshIndex).toBeLessThan(optionsIndex); expect(optionsIndex).toBeLessThan(calculateIndex);
     view.unmount();
+  });
+
+  it("uses the full-application boot second for End rather than saved End or the later first visit", async () => {
+    const boot = Date.parse("2026-11-21T12:34:56Z") / 1000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(boot * 1000);
+    window.localStorage.setItem("setups-analytics-filter-v1", JSON.stringify({ algorithmId: "price_volume_spike", from: "2026-11-14T00:00", to: "2026-11-15T00:00", studies: [999] }));
+    const user = userEvent.setup(); renderAppAt("/");
+    await screen.findByText("Сервис данных: готов");
+    clock.mockReturnValue((boot + 7200) * 1000);
+    await user.click(screen.getByRole("link", { name: "Сетапы" }));
+    await screen.findByTestId("setups-analytics-mean");
+    expect(screen.getByLabelText("Конец")).toHaveValue("2026-11-21T12:34");
+    expect(screen.getByLabelText("Начало (момент выхода сетапа)")).toHaveValue("2026-11-14T00:00");
+    const calculation = new URL(analyticsPosts()[0]!, "http://localhost").searchParams;
+    expect(calculation.get("toUnix")).toBe(String(boot));
+    expect(calculation.has("studies")).toBe(false);
+    const options = requests.filter((path) => path.startsWith("/v1/setups/analytics/studies?"));
+    expect(options).toHaveLength(1);
+    expect(new URL(options[0]!, "http://localhost").searchParams.get("toUnix")).toBe(String(boot));
+    await user.click(screen.getByRole("link", { name: "Обзор" }));
+    clock.mockReturnValue((boot + 10800) * 1000);
+    await user.click(screen.getByRole("link", { name: "Сетапы" }));
+    expect(screen.getByLabelText("Конец")).toHaveValue("2026-11-21T12:34");
+    expect(analyticsPosts()).toHaveLength(1); expect(refreshSignals).toHaveLength(1);
   });
 
   it("mounts algorithms on first visit and preserves drafts without reloading on return", async () => {
@@ -121,13 +164,18 @@ describe("keep-alive navigation tabs", () => {
     expect(requests.filter((path) => path === "/v1/algorithms")).toHaveLength(1);
   });
 
-  it("keeps the setups filter and refreshes follow-live immediately when returning to its tab", async () => {
+  it("retains Setups filters and fixed End across navigation without new refresh or calculation commands", async () => {
     const user = userEvent.setup();
     const view = renderAppAt("/setups");
-    const filter = await screen.findByRole<HTMLInputElement>("textbox");
+    const filter = await screen.findByRole<HTMLInputElement>("textbox", { name: "Инструмент, биржа или алгоритм" });
+    await screen.findByTestId("setups-analytics-mean");
+    const end = screen.getByLabelText("Конец");
+    const endValue = (end as HTMLInputElement).value;
     await user.type(filter, "BTC");
     expect(filter.value).toBe("BTC");
-    const setupsCallsBefore = requests.filter((path) => path.startsWith("/v1/setups?")).length;
+    await user.click(screen.getByRole("button", { name: "Рассчитать" }));
+    await screen.findByTestId("setups-analytics-mean");
+    expect(analyticsPosts()).toHaveLength(2);
 
     await user.click(screen.getByRole("link", { name: "Обзор" }));
     expect(view.container.querySelector('[data-page-path="/setups"]')).toHaveAttribute("hidden");
@@ -136,11 +184,15 @@ describe("keep-alive navigation tabs", () => {
 
     await user.click(screen.getByRole("link", { name: "Сетапы" }));
     expect(view.container.querySelector('[data-page-path="/setups"]')).not.toHaveAttribute("hidden");
-    const filterAfter = screen.getByRole<HTMLInputElement>("textbox");
+    const filterAfter = screen.getByRole<HTMLInputElement>("textbox", { name: "Инструмент, биржа или алгоритм" });
     expect(filterAfter.value).toBe("BTC");
-    const setupsCallsAfter = requests.filter((path) => path.startsWith("/v1/setups?")).length;
-    expect(setupsCallsAfter).toBe(setupsCallsBefore + 1);
-    expect(requests.filter((path) => path.startsWith("/v1/setups?")).at(-1)).toBe("/v1/setups?offset=0&limit=25&q=BTC&hideGateFailed=true");
+    expect(filterAfter).toBe(filter);
+    expect(screen.getByLabelText("Конец")).toBe(end); expect(end).toHaveValue(endValue);
+    expect(analyticsPosts()).toHaveLength(2); expect(refreshSignals).toHaveLength(1);
+    expect(new URL(analyticsPosts()[1]!, "http://localhost").searchParams.get("q")).toBe("BTC");
+    const latestHistory = new URL(requests.filter((path) => path.startsWith("/v1/setups?")).at(-1)!, "http://localhost").searchParams;
+    expect(latestHistory.get("q")).toBe("BTC"); expect(latestHistory.get("snapshotId")).toBe("0");
+    expect(screen.getByRole("link", { name: "Экспорт CSV (без фильтра)" })).toHaveAttribute("href", "/v1/export/setups.csv");
   });
 
   it("restores window scroll offset when returning to a tab", async () => {
@@ -173,7 +225,7 @@ function PollHarness() {
 describe("poll pause on hidden route", () => {
   it("stops polling while the route is inactive and resumes immediately on return", async () => {
     vi.useFakeTimers();
-    render(<PollHarness />);
+    const view = render(<PollHarness />);
     const pollCalls = () => requests.filter((path) => path === "/v1/poll").length;
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(pollCalls()).toBe(1);
@@ -185,5 +237,7 @@ describe("poll pause on hidden route", () => {
     act(() => { fireEvent.click(screen.getByRole("button", { name: "toggle" })); });
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(pollCalls()).toBe(3);
+    view.unmount(); await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
+    expect(pollCalls()).toBe(3); expect(vi.getTimerCount()).toBe(0);
   });
 });

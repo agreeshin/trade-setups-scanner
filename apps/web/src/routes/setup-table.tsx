@@ -12,12 +12,11 @@ const outcomeLabels: Record<SetupTradeOutcomeStatus, string> = { tp: "TP", sl: "
 const riskText = (value: number | null): string => value === null ? "—" : `${value >= 0 ? "+" : ""}${value.toFixed(2)} R`;
 const riskClass = (value: number | null): string => value === null || value === 0 ? "text-muted-foreground" : value > 0 ? "text-success" : "text-danger";
 
-function SetupDetails({ setup, showOutcome }: { setup: SetupRow; showOutcome: boolean }) {
+export function SetupSavedDetails({ setup, showOutcome }: { setup: SetupRow; showOutcome: boolean }) {
   const metrics = setup.details;
   const outcome = setup.tradeOutcome;
   const ratio = (value: string | null): string => value !== null && value.trim() !== "" && Number.isFinite(Number(value)) ? `${Number(value).toFixed(4)}×` : "нет базы/не определено";
-  return <details className="mt-1.5 min-w-48 rounded-sm border border-input/60 bg-muted/20 px-2.5 py-2 text-xs">
-    <summary className="cursor-pointer select-none font-medium text-muted-foreground transition-colors hover:text-foreground">Подробности {setup.symbol}</summary>
+  return <div className="min-w-0 text-sm">
     <dl className="mt-2 grid gap-2 text-xs">
       {setup.algorithmVersion !== undefined && <div><dt className="text-muted-foreground">Версия алгоритма</dt><dd className="tabular-nums">{setup.algorithmVersion}</dd></div>}
       {metrics ? <>
@@ -36,6 +35,13 @@ function SetupDetails({ setup, showOutcome }: { setup: SetupRow; showOutcome: bo
       <div><dt className="text-muted-foreground">Данные учтены по</dt><dd className="tabular-nums">{localTime(outcome.observedThroughUnix)}</dd></div>
     </dl></div>}
     {setup.params !== undefined && <div className="mt-3"><h3 className="text-xs font-medium">Параметры алгоритма</h3><dl className="mt-1 grid gap-1">{Object.entries(setup.params).map(([key, value]) => <div key={key} className="break-words"><dt className="text-muted-foreground">{key}</dt><dd>{value}</dd></div>)}</dl></div>}
+  </div>;
+}
+
+function SetupDetails({ setup, showOutcome }: { setup: SetupRow; showOutcome: boolean }) {
+  return <details className="mt-1.5 min-w-48 rounded-sm border border-input/60 bg-muted/20 px-2.5 py-2 text-xs">
+    <summary className="cursor-pointer select-none font-medium text-muted-foreground transition-colors hover:text-foreground">Подробности {setup.symbol}</summary>
+    <SetupSavedDetails setup={setup} showOutcome={showOutcome} />
   </details>;
 }
 

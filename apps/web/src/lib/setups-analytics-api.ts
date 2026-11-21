@@ -1,4 +1,6 @@
 import { apiFetch } from "./platform-api";
+import { parseSetupTradeOutcome } from "./setup-outcomes-api";
+import type { SetupRow } from "../routes/platform-controls";
 
 export interface SetupsAnalyticsStudyMeta {
   studyId: number;
@@ -125,6 +127,9 @@ async function readBody(response: Response): Promise<unknown> {
     if (code === "setups_analytics_market_data_unavailable") {
       throw new SetupsAnalyticsApiError("Не удалось прочитать свечи из сервиса данных. Повторите расчёт после восстановления сервиса; это не отсутствие сделок.", response.status);
     }
+    if (code === "setups_analytics_studies_limit_exceeded") {
+      throw new SetupsAnalyticsApiError("Слишком много исследований для одного списка. Сузьте диапазон или поиск; история сетапов остаётся доступной.", response.status);
+    }
     throw new SetupsAnalyticsApiError(`Расчёт недоступен: HTTP ${response.status}`, response.status);
   }
   return body;
@@ -135,8 +140,10 @@ export async function fetchSetupsAnalyticsStudies(
   fromUnix: number,
   toUnix: number,
   signal?: AbortSignal,
+  q = "",
 ): Promise<SetupsAnalyticsStudyMeta[]> {
   const params = new URLSearchParams({ algorithmId, fromUnix: String(fromUnix), toUnix: String(toUnix) });
+  if (q !== "") params.set("q", q);
   const response = await apiFetch(`/v1/setups/analytics/studies?${params}`, signal === undefined ? {} : { signal });
   const body = await readBody(response);
   if (!isRecord(body) || !Array.isArray(body.studies)) {
@@ -151,8 +158,10 @@ export async function fetchSetupsAnalytics(
   toUnix: number,
   studies: readonly number[] | null,
   signal?: AbortSignal,
+  q = "",
 ): Promise<SetupsAnalyticsResult> {
   const params = new URLSearchParams({ algorithmId, fromUnix: String(fromUnix), toUnix: String(toUnix) });
+  if (q !== "") params.set("q", q);
   if (studies !== null) params.set("studies", studies.join(","));
   const response = await apiFetch(`/v1/setups/analytics?${params}`, { method: "POST", ...(signal === undefined ? {} : { signal }) });
   const body = await readBody(response);
@@ -164,6 +173,68 @@ export async function fetchSetupsAnalytics(
     studies: expectArray(body.studies, isStudy, "studies"),
     setups: expectArray(body.setups, isSetup, "setups"),
   };
+}
+
+export interface SetupHistoryFilter {
+  algorithmId: string;
+  fromUnix: number;
+  toUnix: number;
+  studies: readonly number[] | null;
+  q: string;
+  hideGateFailed: boolean;
+}
+export interface SetupHistoryPage { setups: SetupRow[]; total: number; offset: number; limit: number; snapshotId: number }
+export interface TelegramTextEntity { type: "bold" | "code"; offset: number; length: number }
+export interface SetupDetailsResponse {
+  setup: SetupRow;
+  telegramMessage: { text: string; entities: TelegramTextEntity[] } | null;
+  reason?: string | null;
+}
+
+function savedSetup(value: unknown): SetupRow {
+  if (!isRecord(value) || !isId(value.id) || typeof value.symbol !== "string" || typeof value.exchange !== "string"
+    || typeof value.algorithmId !== "string" || typeof value.closePrice !== "string" || !isUnix(value.openTimeUnix) || !isUnix(value.closeTimeUnix)) {
+    throw new SetupsAnalyticsApiError("Некорректный ответ: сохранённый сетап");
+  }
+  return { ...value, tradeOutcome: parseSetupTradeOutcome(value.tradeOutcome) } as unknown as SetupRow;
+}
+
+export async function fetchSetupHistory(filter: SetupHistoryFilter, offset: number, snapshotId: number | undefined, signal: AbortSignal): Promise<SetupHistoryPage> {
+  const params = new URLSearchParams({ algorithmId: filter.algorithmId, fromUnix: String(filter.fromUnix), toUnix: String(filter.toUnix),
+    q: filter.q, hideGateFailed: String(filter.hideGateFailed), offset: String(offset), limit: "25" });
+  if (filter.studies !== null) params.set("studies", filter.studies.join(","));
+  if (snapshotId !== undefined) params.set("snapshotId", String(snapshotId));
+  const response = await apiFetch(`/v1/setups?${params}`, { signal });
+  const body = await readBody(response);
+  if (!isRecord(body) || !Array.isArray(body.setups) || body.setups.length > 25 || !isCount(body.total) || body.offset !== offset
+    || body.limit !== 25 || !isCount(body.snapshotId) || (snapshotId !== undefined && body.snapshotId !== snapshotId)) throw new SetupsAnalyticsApiError("Некорректный ответ: история сетапов");
+  return { setups: body.setups.map(savedSetup), total: body.total, offset: body.offset, limit: body.limit, snapshotId: body.snapshotId };
+}
+
+export async function fetchSetupDetails(id: number, signal: AbortSignal): Promise<SetupDetailsResponse> {
+  const response = await apiFetch(`/v1/setups/${id}/details`, { signal });
+  const body = await readBody(response);
+  if (!isRecord(body)) throw new SetupsAnalyticsApiError("Некорректный ответ: подробности сетапа");
+  const setup = savedSetup(body.setup);
+  if (setup.id !== id) throw new SetupsAnalyticsApiError("Изменилась идентичность сетапа");
+  if (body.telegramMessage === null) return { setup, telegramMessage: null, reason: typeof body.reason === "string" ? body.reason : null };
+  const message = body.telegramMessage;
+  if (!isRecord(message) || typeof message.text !== "string" || message.text.length > 4096 || !Array.isArray(message.entities) || message.entities.length > 32) {
+    throw new SetupsAnalyticsApiError("Некорректный канонический текст сетапа");
+  }
+  let end = 0;
+  const entities: TelegramTextEntity[] = [];
+  const text = message.text;
+  const boundary = (at: number) => !(at > 0 && at < text.length && /[\uDC00-\uDFFF]/.test(text[at]!) && /[\uD800-\uDBFF]/.test(text[at - 1]!));
+  for (const entity of message.entities) {
+    if (!isRecord(entity) || (entity.type !== "bold" && entity.type !== "code") || !isCount(entity.offset) || !isCount(entity.length)
+      || entity.length === 0 || entity.offset < end || entity.offset + entity.length > message.text.length || !boundary(entity.offset) || !boundary(entity.offset + entity.length)) {
+      throw new SetupsAnalyticsApiError("Некорректное форматирование текста сетапа");
+    }
+    end = entity.offset + entity.length;
+    entities.push({ type: entity.type, offset: entity.offset, length: entity.length });
+  }
+  return { setup, telegramMessage: { text: message.text, entities } };
 }
 
 export async function fetchExpectancyPngUrl(artifactId: number, signal?: AbortSignal): Promise<string> {

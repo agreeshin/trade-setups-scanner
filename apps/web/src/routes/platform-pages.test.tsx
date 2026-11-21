@@ -61,6 +61,9 @@ beforeEach(() => {
     if (path === "/v1/history/instruments/1/coverage") data = { instrumentId: 1, firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, intervals: [], gaps: [] };
     if (path === "/v1/history/instruments/coverage-summary") data = { instruments: instruments.map((instrument) => ({ instrumentId: instrument.id, exchange: instrument.exchange, category: instrument.category, symbol: instrument.symbol, status: instrument.status, firstMinuteUnix: null, lastMinuteUnix: null, totalCandles: 0, missingMinutes: 0, verifiedMinutes: 0 })) };
     if (path === "/v1/settings/ui") data = { value: { existing: "keep" } };
+    if (path === "/v1/setups/outcomes/refresh") data = { snapshotId: 601, observedThroughUnix: 200, processed: 0, computed: 0, updated: 0, nextCursor: null };
+    if (path.startsWith("/v1/setups/analytics/studies?")) data = { studies: [] };
+    if (path.startsWith("/v1/setups/analytics?")) data = { totals: { selected: 0, gatePassed: 0, closed: 0, meanR: null }, studies: [], setups: [] };
     if (path === "/v1/replay-runs") data = replayRunsResponse;
     if (method === "PATCH" && /^\/v1\/replay-(runs|batches)\/\d+$/.test(path)) {
       const { name } = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as { name: string };
@@ -89,7 +92,9 @@ beforeEach(() => {
       const params = new URL(path, "http://localhost").searchParams;
       const offset = Number(params.get("offset"));
       const limit = Number(params.get("limit"));
-      const all = Array.from({ length: 601 }, (_, index) => ({ symbol: `BTC${index}`, exchange: "bybit", algorithmId: "price_volume_spike", openTimeUnix: 100, closeTimeUnix: 200 + index, closePrice: "100" }));
+      const now = Math.floor(Date.now() / 1000);
+      const all = Array.from({ length: 601 }, (_, index) => ({ id: 601 - index, symbol: `BTC${index}`, exchange: "bybit", algorithmId: "price_volume_spike",
+        openTimeUnix: now - (index + 2) * 60, closeTimeUnix: now - (index + 1) * 60, closePrice: "100", recommendation: null, tradeOutcome: null }));
       const filtered = all.filter((row) => row.symbol.includes(params.get("q") ?? ""));
       data = { setups: filtered.slice(offset, offset + limit), offset, limit, total: filtered.length, snapshotId: 601 };
     }
@@ -479,44 +484,55 @@ describe("platform screens", () => {
 
   it("requests server pages and finds records beyond the former latest-500 cap", async () => {
     render(<SetupsPage />);
-    await screen.findByText("Страница 1 из 25 · Найдено: 601");
-    expect(screen.queryByText("bybit · BTC29")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Далее" }));
-    await screen.findByText("bybit · BTC29");
-    expect(requests.some((request) => request.path.includes("offset=25&limit=25&q=&hideGateFailed=true&snapshotId=601"))).toBe(true);
+    const history = within(screen.getByRole("region", { name: "История сохранённых сетапов" }));
+    await history.findByText("Страница 1 из 25");
+    expect(history.getByRole("heading")).toHaveTextContent("Найдено: 601");
+    expect(history.queryByRole("cell", { name: "BTC29" })).not.toBeInTheDocument();
+    await userEvent.click(history.getByRole("button", { name: "Далее" }));
+    await history.findByRole("cell", { name: "BTC29" });
+    const pages = () => requests.filter((request) => request.path.startsWith("/v1/setups?")).map((request) => new URL(request.path, "http://localhost").searchParams);
+    expect(pages().some((query) => query.get("offset") === "25" && query.get("limit") === "25" && query.get("q") === ""
+      && query.get("hideGateFailed") === "true" && query.get("snapshotId") === "601")).toBe(true);
     fireEvent.change(screen.getByLabelText("Инструмент, биржа или алгоритм"), { target: { value: "BTC600" } });
-    await screen.findByText("Страница 1 из 1 · Найдено: 1");
-    expect(screen.getByText("bybit · BTC600")).toBeInTheDocument();
-    expect(requests.some((request) => request.path === "/v1/setups?offset=0&limit=25&q=BTC600&hideGateFailed=true")).toBe(true);
+    await history.findByText("Страница 1 из 1");
+    expect(history.getByRole("heading")).toHaveTextContent("Найдено: 1");
+    expect(history.getByRole("cell", { name: "BTC600" })).toBeInTheDocument();
+    expect(pages().some((query) => query.get("offset") === "0" && query.get("limit") === "25" && query.get("q") === "BTC600"
+      && query.get("hideGateFailed") === "true" && !query.has("snapshotId"))).toBe(true);
     expect(screen.getByRole("link", { name: "Экспорт CSV (без фильтра)" })).toHaveAttribute("href", "/v1/export/setups.csv");
-    await userEvent.click(screen.getByRole("button", { name: "Обновить" }));
-    await screen.findByText("bybit · BTC600");
+    await userEvent.click(screen.getByRole("button", { name: "Обновить результаты сетапов" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Обновить результаты сетапов" })).toBeEnabled());
+    expect(history.getByRole("cell", { name: "BTC600" })).toBeInTheDocument();
+    expect(requests.filter((request) => request.path === "/v1/setups/outcomes/refresh")).toHaveLength(2);
+    expect(requests.filter((request) => request.path.startsWith("/v1/setups/analytics?") && request.method === "POST")).toHaveLength(1);
     expect(requests.some((request) => request.method === "PUT")).toBe(false);
   });
-  it("aborts stale feed requests and ignores their late responses", async () => {
+  it("aborts stale unified-history requests and ignores their late responses", async () => {
     let resolveSlow: ((response: Response) => void) | undefined;
     const signals: (AbortSignal | null | undefined)[] = [];
+    const original = globalThis.fetch;
     vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
-      if (path === "/v1/settings/ui") return Promise.resolve(new Response(JSON.stringify({ value: {} })));
+      if (!path.startsWith("/v1/setups?")) return original(path, init);
       signals.push(init?.signal);
       if (path.includes("q=slow")) return new Promise<Response>((resolve) => { resolveSlow = resolve; });
       const symbol = path.includes("q=fast") ? "FAST" : "INITIAL";
-      return Promise.resolve(new Response(JSON.stringify({ setups: [{ symbol, exchange: "bybit", algorithmId: "price_volume_spike", openTimeUnix: 100, closeTimeUnix: 200, closePrice: "100" }], total: 1, limit: 25, offset: 0, snapshotId: 1 })));
+      return Promise.resolve(new Response(JSON.stringify({ setups: [{ id: 1, symbol, exchange: "bybit", algorithmId: "price_volume_spike", openTimeUnix: 100,
+        closeTimeUnix: 200, closePrice: "100", recommendation: null, tradeOutcome: null }], total: 1, limit: 25, offset: 0, snapshotId: 1 })));
     }));
     const { unmount } = render(<SetupsPage />);
-    await screen.findByText("bybit · INITIAL");
+    await screen.findByRole("cell", { name: "INITIAL" });
     const filter = screen.getByLabelText("Инструмент, биржа или алгоритм");
     fireEvent.change(filter, { target: { value: "slow" } });
     await waitFor(() => { expect(resolveSlow).toBeDefined(); });
     const slowSignal = signals.at(-1);
     fireEvent.change(filter, { target: { value: "fast" } });
-    await screen.findByText("bybit · FAST");
+    await screen.findByRole("cell", { name: "FAST" });
     expect(slowSignal?.aborted).toBe(true);
     await act(async () => {
       resolveSlow?.(new Response(JSON.stringify({ setups: [], total: 0, limit: 25, offset: 0, snapshotId: 0 })));
       await Promise.resolve();
     });
-    expect(screen.getByText("bybit · FAST")).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "FAST" })).toBeInTheDocument();
     const lastSignal = signals.at(-1);
     unmount();
     expect(lastSignal?.aborted).toBe(true);

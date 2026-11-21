@@ -1,214 +1,221 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { StrictMode } from "react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
+import type { SetupsAnalyticsResult } from "../lib/setups-analytics-api";
+import type { AdaptiveRecommendation } from "../lib/setup-recommendation";
+import type { SetupTradeOutcomeStatus } from "../lib/setup-outcomes-api";
 import { SetupsPage } from "./setups-page";
 import { RouteActiveContext } from "./route-active";
 import type { SetupRow } from "./platform-controls";
-import type { SetupTradeOutcomeStatus } from "../lib/setup-outcomes-api";
 
-const row = (id: number): SetupRow => ({ id, exchange: "bybit", category: "linear", symbol: `BTC${id}`, algorithmId: "price_volume_spike", openTimeUnix: 100, closeTimeUnix: 200, closePrice: "100" });
-const outcomeRow = (id: number, status: SetupTradeOutcomeStatus): SetupRow => ({ ...row(id), tradeOutcome: {
-  status, entryTimeUnix: null, entryPrice: null, gateThreshold: null, tpPrice: null, slPrice: null,
-  closeTimeUnix: null, closePrice: null, riskReturn: null, evaluatedAtUnix: 200, observedThroughUnix: 200, isFinal: status === "gate_failed",
+const loadedAt = Date.parse("2026-11-21T12:34:56Z") / 1000;
+const row = (id: number): SetupRow => ({ id, exchange: "bybit", category: "linear", symbol: `BTC${id}`, algorithmId: "price_volume_spike",
+  openTimeUnix: loadedAt - 3660, closeTimeUnix: loadedAt - 3600, closePrice: "100", recommendation: null, tradeOutcome: null });
+const recommendation: AdaptiveRecommendation = { direction: "short", tpPct: 10, slPct: 5, rawR: 2, meanR: 0.3, robustScore: 0.2,
+  timeShiftMinutes: 0, priceChangePct: null, externalName: "Сохранённый алгоритм", studyId: 40, generationId: 36, slotId: 1, ownerId: "admin",
+  clusterEnabled: false, clusterGapMinutes: null, params: {}, provenance: { algorithmId: "price_volume_spike", algorithmVersion: "1",
+    optimizerVersion: "fixture", seed: 1, snapshotHash: "saved", capturedAt: "2026-11-20T00:00:00Z", fromUnix: loadedAt - 86400,
+    toUnix: loadedAt - 3600, observationCutoff: loadedAt - 3600 } };
+const outcomeRow = (id: number, status: SetupTradeOutcomeStatus): SetupRow => ({ ...row(id), recommendation, algorithmVersion: "snapshot-v1", params: { windowMinutes: 5 }, tradeOutcome: {
+  status, entryTimeUnix: loadedAt - 3600, entryPrice: 100, gateThreshold: null, tpPrice: 90, slPrice: 105,
+  closeTimeUnix: status === "tp" ? loadedAt - 1800 : null, closePrice: status === "tp" ? 90 : null, riskReturn: status === "tp" ? 2 : null,
+  evaluatedAtUnix: loadedAt, observedThroughUnix: loadedAt - 60, isFinal: status === "tp" || status === "gate_failed",
 } });
-const requests: { path: string; signal: AbortSignal | null | undefined }[] = [];
-let rows: SetupRow[];
-let respond: (params: URLSearchParams) => Response | Promise<Response>;
+const analyticsResult: SetupsAnalyticsResult = { totals: { selected: 2, gatePassed: 1, closed: 1, meanR: 2 }, studies: [], setups: [{
+  id: 6, symbol: "BTC6", exchange: "bybit", slotId: 1, studyId: 40, direction: "short", setupTimeUnix: loadedAt - 3600,
+  entryTimeUnix: loadedAt - 3600, entryPrice: 100, gateThreshold: null, tpPrice: 90, slPrice: 105, closeTimeUnix: loadedAt - 1800, closePrice: 90, riskReturn: 2, status: "tp",
+}] };
+const options = { studies: [{ studyId: 40, externalName: "Исходное исследование", setupCount: 2, generationId: 36, artifactId: null }] };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
-function page(params: URLSearchParams) {
-  const snapshot = Number(params.get("snapshotId") ?? rows[0]?.id ?? 0);
-  const filtered = rows.filter((item) => item.id! <= snapshot && item.symbol.includes(params.get("q") ?? "")
+const refreshed = () => json({ snapshotId: 60, observedThroughUnix: loadedAt - 60, processed: 1, computed: 1, updated: 1, nextCursor: null });
+const requests: { path: string; method: string; signal: AbortSignal | null | undefined }[] = [];
+let rows: SetupRow[];
+let total: number | undefined;
+let refreshResponse: () => Response | Promise<Response>;
+let studiesResponse: () => Response | Promise<Response>;
+let analyticsResponse: (params: URLSearchParams) => Response | Promise<Response>;
+let historyResponse: (params: URLSearchParams) => Response | Promise<Response>;
+function historyPage(params: URLSearchParams) {
+  const snapshot = Number(params.get("snapshotId") ?? Math.max(0, ...rows.map((item) => item.id!)));
+  const query = (params.get("q") ?? "").toLowerCase();
+  const filtered = rows.filter((item) => item.id! <= snapshot && `${item.symbol} ${item.exchange} ${item.algorithmId}`.toLowerCase().includes(query)
     && (params.get("hideGateFailed") !== "true" || item.tradeOutcome?.status !== "gate_failed"));
   const offset = Number(params.get("offset"));
-  return json({ setups: filtered.slice(offset, offset + 25), total: filtered.length, offset, limit: 25, snapshotId: snapshot });
+  return json({ setups: filtered.slice(offset, offset + 25), total: total ?? filtered.length, offset, limit: 25, snapshotId: snapshot });
 }
-const calls = () => requests.filter((request) => request.path.startsWith("/v1/setups?"));
-const params = () => new URL(calls().at(-1)!.path, "http://localhost").searchParams;
-const settle = async () => { await act(async () => { await vi.advanceTimersByTimeAsync(0); }); };
-const tick = async (ms = 3000) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
+const refreshes = () => requests.filter((request) => request.path === "/v1/setups/outcomes/refresh");
+const calculations = () => requests.filter((request) => request.path.startsWith("/v1/setups/analytics?") && request.method === "POST");
+const studyReads = () => requests.filter((request) => request.path.startsWith("/v1/setups/analytics/studies?"));
+const historyReads = () => requests.filter((request) => request.path.startsWith("/v1/setups?"));
+const params = (request: { path: string }) => new URL(request.path, "http://localhost").searchParams;
+const settle = async (ms = 0) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
+const history = () => within(screen.getByRole("region", { name: "История сохранённых сетапов" }));
 
 beforeEach(() => {
-  vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-13T12:00:00Z")); requests.length = 0;
-  rows = Array.from({ length: 60 }, (_, index) => row(60 - index)); respond = page;
+  vi.useFakeTimers(); vi.setSystemTime(loadedAt * 1000); requests.length = 0; total = undefined;
+  window.localStorage.clear(); applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "UTC" });
+  rows = [outcomeRow(7, "gate_failed"), outcomeRow(6, "tp"), row(5)];
+  refreshResponse = refreshed; studiesResponse = () => json(options); analyticsResponse = () => json(analyticsResult); historyResponse = historyPage;
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
-    requests.push({ path, signal: init?.signal });
-    if (path === "/v1/setups/outcomes/refresh") return Promise.resolve(json({ snapshotId: 60, observedThroughUnix: 200, processed: 0, computed: 0, updated: 0, nextCursor: null }));
+    requests.push({ path, method: init?.method ?? "GET", signal: init?.signal });
+    if (path === "/v1/setups/outcomes/refresh") return Promise.resolve(refreshResponse());
     if (path === "/v1/settings/ui") return Promise.resolve(json({ value: { setupFilter: "BTC" } }));
-    if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [] }));
-    return Promise.resolve(respond(new URL(path, "http://localhost").searchParams));
+    if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "", enabled: true, params: {}, fields: [] }] }));
+    if (path.startsWith("/v1/setups/analytics/studies?")) return Promise.resolve(studiesResponse());
+    if (path.startsWith("/v1/setups/analytics?")) return Promise.resolve(analyticsResponse(params({ path })));
+    if (path.startsWith("/v1/setups?")) return Promise.resolve(historyResponse(params({ path })));
+    const detail = /^\/v1\/setups\/(\d+)\/details$/.exec(path);
+    if (detail) {
+      const setup = rows.find((item) => item.id === Number(detail[1]));
+      const text = "СЕРВЕРНЫЙ SHORT BTC6\nУсловия: 123.456 USDT";
+      return Promise.resolve(json({ setup, telegramMessage: setup?.recommendation ? { text, entities: [{ type: "bold", offset: 0, length: 9 }, { type: "code", offset: text.indexOf("123.456"), length: 7 }] } : null, reason: "legacy_watch" }));
+    }
+    throw new Error(`Unexpected Setups request: ${path}`);
   }));
 });
-afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-it("defaults the server gate filter on, hides only saved gate failures and restores them when unchecked", async () => {
-  rows = [outcomeRow(7, "gate_failed"), outcomeRow(6, "tp"), outcomeRow(5, "sl"), outcomeRow(4, "unclosed"), outcomeRow(3, "no_data"), { ...row(2), tradeOutcome: null }, row(1)];
-  render(<SetupsPage />); await settle();
-  const checkbox = screen.getByRole("checkbox", { name: "Скрыть сетапы, которые не прошли гейт" });
-  expect(checkbox).toBeChecked(); expect(params().get("hideGateFailed")).toBe("true");
-  expect(screen.getByText("Страница 1 из 1 · Найдено: 6")).toBeInTheDocument();
-  expect(screen.queryByText("bybit · BTC7")).not.toBeInTheDocument();
-  for (const id of [6, 5, 4, 3, 2, 1]) expect(screen.getByText(`bybit · BTC${id}`)).toBeInTheDocument();
-  const refreshCalls = requests.filter((request) => request.path === "/v1/setups/outcomes/refresh").length;
-  fireEvent.click(checkbox); await settle();
-  expect(checkbox).not.toBeChecked(); expect(params().get("hideGateFailed")).toBe("false");
-  expect(screen.getByText("bybit · BTC7")).toBeInTheDocument();
-  expect(screen.getByText("Страница 1 из 1 · Найдено: 7")).toBeInTheDocument();
-  await tick(); expect(params().get("hideGateFailed")).toBe("false"); expect(params().get("q")).toBe("BTC");
-  fireEvent.change(screen.getByLabelText("Инструмент, биржа или алгоритм"), { target: { value: "BTC7" } }); await settle();
-  expect(params().get("hideGateFailed")).toBe("false"); expect(screen.getByText("bybit · BTC7")).toBeInTheDocument();
-  fireEvent.click(checkbox); await settle();
-  expect(checkbox).toBeChecked(); expect(screen.queryByText("bybit · BTC7")).not.toBeInTheDocument();
-  expect(requests.filter((request) => request.path === "/v1/setups/outcomes/refresh")).toHaveLength(refreshCalls);
+it("orders the sole StrictMode first calculation after outcome refresh and fresh options, without Feed or sidebar", async () => {
+  let finishRefresh: ((response: Response) => void) | undefined;
+  let finishStudies: ((response: Response) => void) | undefined;
+  refreshResponse = () => new Promise<Response>((resolve) => { finishRefresh = resolve; });
+  studiesResponse = () => new Promise<Response>((resolve) => { finishStudies = resolve; });
+  render(<StrictMode><SetupsPage /></StrictMode>); await settle();
+  expect(refreshes()).toHaveLength(1); expect(studyReads()).toHaveLength(0); expect(calculations()).toHaveLength(0);
+  expect(screen.getByRole("button", { name: "Обновить результаты сетапов" })).toBeDisabled();
+  expect(screen.queryByRole("tab")).not.toBeInTheDocument();
+  expect(document.querySelector('[data-slot="page-sidebar"]')).toBeNull();
+  expect(screen.queryByRole("heading", { name: "Аналитика выпущенных сетапов" })).not.toBeInTheDocument();
+  await act(async () => { finishRefresh?.(refreshed()); await Promise.resolve(); }); await settle();
+  expect(studyReads()).toHaveLength(1); expect(calculations()).toHaveLength(0);
+  expect(params(studyReads()[0]!).get("toUnix")).toBe(String(loadedAt));
+  expect(params(studyReads()[0]!).get("q")).toBe("BTC");
+  await act(async () => { finishStudies?.(json(options)); await Promise.resolve(); }); await settle();
+  expect(calculations()).toHaveLength(1);
+  expect(requests.indexOf(refreshes()[0]!)).toBeLessThan(requests.indexOf(studyReads()[0]!));
+  expect(requests.indexOf(studyReads()[0]!)).toBeLessThan(requests.indexOf(calculations()[0]!));
+  expect(screen.getByTestId("setups-analytics-mean")).toHaveTextContent("+2.00R");
+  await settle(9000); expect(refreshes()).toHaveLength(1); expect(calculations()).toHaveLength(1);
 });
 
-it("filters before pagination and keeps historical snapshots pinned when toggling the gate filter", async () => {
-  rows = rows.map((item) => item.id! >= 35 ? outcomeRow(item.id!, "gate_failed") : item);
+it("does not calculate or automatically repeat a failed initial refresh; explicit recovery completes the first calculation", async () => {
+  refreshResponse = () => json({}, 503);
   render(<SetupsPage />); await settle();
-  expect(screen.getByText("Страница 1 из 2 · Найдено: 34")).toBeInTheDocument();
-  expect(screen.getByText("bybit · BTC34")).toBeInTheDocument(); expect(screen.getByText("bybit · BTC10")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Далее" })); await settle();
-  expect(params().get("offset")).toBe("25"); expect(params().get("snapshotId")).toBe("60");
-  expect(params().get("hideGateFailed")).toBe("true"); expect(screen.getByText("bybit · BTC9")).toBeInTheDocument();
-  expect(screen.getByText("Страница 2 из 2 · Найдено: 34")).toBeInTheDocument();
-  rows.unshift(row(61));
-  fireEvent.click(screen.getByRole("checkbox", { name: "Скрыть сетапы, которые не прошли гейт" })); await settle();
-  expect(params().get("offset")).toBe("0"); expect(params().get("snapshotId")).toBe("60"); expect(params().get("q")).toBe("BTC");
-  expect(screen.getByText("Страница 1 из 3 · Найдено: 60")).toBeInTheDocument(); expect(screen.getByText("bybit · BTC60")).toBeInTheDocument();
-  expect(screen.queryByText("bybit · BTC61")).not.toBeInTheDocument();
-  const historicalCalls = calls().length; await tick(9000); expect(calls()).toHaveLength(historicalCalls);
-  fireEvent.click(screen.getByRole("button", { name: "Следить за live-лентой" })); await settle();
-  expect(params().get("hideGateFailed")).toBe("false"); expect(params().has("snapshotId")).toBe(false);
-  expect(screen.getByText("bybit · BTC61")).toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent("HTTP 503");
+  expect(screen.getByRole("alert")).toHaveTextContent("вручную");
+  expect(screen.getByRole("button", { name: "Рассчитать" })).toBeDisabled();
+  await settle(9000);
+  expect(refreshes()).toHaveLength(1); expect(studyReads()).toHaveLength(0); expect(calculations()).toHaveLength(0);
+  refreshResponse = refreshed;
+  const refresh = screen.getByRole("button", { name: "Обновить результаты сетапов" });
+  fireEvent.click(refresh); fireEvent.click(refresh); await settle();
+  expect(refreshes()).toHaveLength(2); expect(calculations()).toHaveLength(1);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getByTestId("setups-analytics-mean")).toHaveTextContent("+2.00R");
 });
 
-it("keeps a paused feed paused when changing the gate filter or refreshing its page", async () => {
-  render(<SetupsPage />); await settle();
-  fireEvent.click(screen.getByRole("button", { name: "Приостановить обновление" })); await settle();
-  fireEvent.click(screen.getByRole("checkbox", { name: "Скрыть сетапы, которые не прошли гейт" })); await settle();
-  expect(params().get("snapshotId")).toBe("60"); expect(params().get("hideGateFailed")).toBe("false");
-  const pausedCalls = calls().length; await tick(9000); expect(calls()).toHaveLength(pausedCalls);
-  fireEvent.click(screen.getByRole("button", { name: "Обновить" })); await settle();
-  expect(params().get("hideGateFailed")).toBe("false"); expect(params().has("snapshotId")).toBe(false);
-  const refreshedCalls = calls().length; await tick(9000); expect(calls()).toHaveLength(refreshedCalls);
-});
-
-it("follows the fresh first page every three seconds, preserving the filter and deduplicating IDs", async () => {
-  render(<SetupsPage />); await settle();
-  expect(calls()).toHaveLength(1); expect(params().get("q")).toBe("BTC"); expect(params().has("snapshotId")).toBe(false);
-  rows = [row(61), row(61), ...rows]; await tick();
-  expect(calls()).toHaveLength(2); expect(screen.getAllByText("bybit · BTC61")).toHaveLength(1);
-  expect(params().get("offset")).toBe("0"); expect(params().get("q")).toBe("BTC"); expect(params().has("snapshotId")).toBe(false);
-  expect(screen.getByText(/^Последнее успешное чтение:/)).toBeInTheDocument();
-});
-
-it("pauses live refresh and explicitly resumes with a fresh snapshot", async () => {
-  render(<SetupsPage />); await settle();
-  fireEvent.click(screen.getByRole("button", { name: "Приостановить обновление" })); await settle();
-  const pausedCalls = calls().length; rows.unshift(row(61)); await tick(9000);
-  expect(calls()).toHaveLength(pausedCalls); expect(screen.queryByText("bybit · BTC61")).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Следить за live-лентой" })); await settle();
-  expect(screen.getByText("bybit · BTC61")).toBeInTheDocument(); expect(params().has("snapshotId")).toBe(false);
-  await tick(); expect(calls()).toHaveLength(pausedCalls + 2);
-});
-
-it("pins historical pages during background activity and preserves explicit Refresh as latest first page", async () => {
-  render(<SetupsPage />); await settle();
-  fireEvent.click(screen.getByRole("button", { name: "Далее" })); await settle();
-  expect(params().get("offset")).toBe("25"); expect(params().get("snapshotId")).toBe("60");
-  const historicalCalls = calls().length; rows.unshift(row(61)); await tick(9000);
-  expect(calls()).toHaveLength(historicalCalls); expect(screen.getByText("bybit · BTC35")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Назад" })); await settle();
-  expect(params().get("snapshotId")).toBe("60"); expect(screen.queryByText("bybit · BTC61")).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Следить за live-лентой" })); await settle();
-  expect(params().get("offset")).toBe("0"); expect(params().has("snapshotId")).toBe(false); expect(screen.getByText("bybit · BTC61")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Далее" })); await settle();
-  fireEvent.click(screen.getByRole("button", { name: "Обновить" })); await settle();
-  expect(params().get("offset")).toBe("0"); expect(params().get("q")).toBe("BTC"); expect(params().has("snapshotId")).toBe(false);
-  expect(screen.getByText("bybit · BTC61")).toBeInTheDocument();
-});
-
-it("retains the last confirmed rows and read time on transient failure and recovers automatically", async () => {
-  render(<SetupsPage />); await settle();
-  const lastRead = screen.getByText(/^Последнее успешное чтение:/).textContent;
-  respond = () => json({}, 503); await tick();
-  expect(screen.getByText("bybit · BTC60")).toBeInTheDocument();
-  expect(screen.getByRole("alert")).toHaveTextContent("HTTP 503"); expect(screen.getByRole("alert")).toHaveTextContent("устареть");
-  expect(screen.getByText(/^Последнее успешное чтение:/).textContent).toBe(lastRead);
-  expect(screen.queryByText("Сетапы не найдены.")).not.toBeInTheDocument();
-  respond = page; rows.unshift(row(61)); await tick();
-  expect(screen.getByText("bybit · BTC61")).toBeInTheDocument(); expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-  expect(screen.getByText(/^Последнее успешное чтение:/).textContent).not.toBe(lastRead);
-});
-
-it("serializes slow reads, aborts inactive and hidden reads, and refreshes on activation without losing the filter", async () => {
+it("keeps a fixed paginated snapshot across time and route returns, without follow-live or repeated mutation", async () => {
+  rows = Array.from({ length: 60 }, (_, index) => row(60 - index));
   const view = render(<RouteActiveContext.Provider value><SetupsPage /></RouteActiveContext.Provider>); await settle();
-  let finish: ((response: Response) => void) | undefined;
-  respond = () => new Promise<Response>((resolve) => { finish = resolve; }); await tick();
-  expect(calls()).toHaveLength(2); const slowSignal = calls().at(-1)?.signal;
-  await tick(9000); expect(calls()).toHaveLength(2);
-  view.rerender(<RouteActiveContext.Provider value={false}><SetupsPage /></RouteActiveContext.Provider>); await settle();
-  expect(slowSignal?.aborted).toBe(true); await tick(9000); expect(calls()).toHaveLength(2);
-  respond = page; rows.unshift(row(61));
+  fireEvent.click(history().getByRole("button", { name: "Далее" })); await settle();
+  expect(params(historyReads().at(-1)!).get("offset")).toBe("25");
+  expect(params(historyReads().at(-1)!).get("snapshotId")).toBe("60");
+  const before = historyReads().length; rows.unshift(row(61)); await settle(9000);
+  expect(historyReads()).toHaveLength(before); expect(history().queryByText("BTC61")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /Следить за live|Приостановить обновление/ })).not.toBeInTheDocument();
+  view.rerender(<RouteActiveContext.Provider value={false}><SetupsPage /></RouteActiveContext.Provider>); await settle(9000);
   view.rerender(<RouteActiveContext.Provider value><SetupsPage /></RouteActiveContext.Provider>); await settle();
-  expect(calls()).toHaveLength(3); expect(params().get("q")).toBe("BTC"); expect(screen.getByText("bybit · BTC61")).toBeInTheDocument();
-  await act(async () => { finish?.(json({ setups: [], total: 0, offset: 0, limit: 25, snapshotId: 0 })); await Promise.resolve(); });
-  expect(screen.getByText("bybit · BTC61")).toBeInTheDocument();
-  const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
-  fireEvent(document, new Event("visibilitychange")); await tick(9000); expect(calls()).toHaveLength(3);
-  expect(calls().at(-1)?.signal?.aborted).toBe(true);
-  visibility.mockReturnValue("visible"); fireEvent(document, new Event("visibilitychange")); await settle();
-  expect(calls()).toHaveLength(4); expect(params().has("snapshotId")).toBe(false);
-  view.unmount(); expect(calls().at(-1)?.signal?.aborted).toBe(true); expect(vi.getTimerCount()).toBe(0);
-  expect(requests.filter((request) => request.path === "/v1/settings/ui")).toHaveLength(1);
+  expect(params(historyReads().at(-1)!).get("snapshotId")).toBe("60");
+  expect(params(historyReads().at(-1)!).get("offset")).toBe("25");
+  expect(history().getByText("BTC35")).toBeInTheDocument();
+  expect(refreshes()).toHaveLength(1); expect(calculations()).toHaveLength(1);
+  view.unmount(); await settle(); expect(vi.getTimerCount()).toBe(0);
 });
 
-it("schedules the next refresh only after a slow response settles", async () => {
+it("keeps WATCH/null outcomes accessible, while the gate Switch changes only displayed rows and never numeric totals", async () => {
   render(<SetupsPage />); await settle();
-  let finish: ((response: Response) => void) | undefined;
-  respond = () => new Promise<Response>((resolve) => { finish = resolve; }); await tick(); await tick(9000);
-  expect(calls()).toHaveLength(2);
-  respond = page; await act(async () => { finish?.(page(new URLSearchParams({ offset: "0", q: "BTC" }))); await Promise.resolve(); });
-  await tick(2999); expect(calls()).toHaveLength(2); await tick(1); expect(calls()).toHaveLength(3);
+  const control = screen.getByRole("switch", { name: "Скрыть сетапы, которые не прошли гейт" });
+  expect(control).toBeChecked(); expect(history().queryByText("BTC7")).not.toBeInTheDocument();
+  const watch = within(history().getByText("BTC5").closest("tr")!);
+  expect(watch.getByText("WATCH")).toBeInTheDocument(); expect(watch.getByText("неприменимо")).toBeInTheDocument();
+  expect(watch.queryByText(/LONG|SHORT|[+-]?0\.00\s*R/)).not.toBeInTheDocument();
+  expect(watch.getByRole("button", { name: "Подробности BTC5" })).toBeEnabled();
+  expect(within(history().getByText("BTC6").closest("tr")!).getByText("SHORT")).toBeInTheDocument();
+  fireEvent.click(control); await settle();
+  expect(control).not.toBeChecked(); expect(history().getByText("BTC7")).toBeInTheDocument();
+  expect(screen.getByTestId("setups-analytics-mean")).toHaveTextContent("+2.00R");
+  expect(screen.getByLabelText("Прошли гейт: 1 из 2")).toBeInTheDocument();
+  expect(refreshes()).toHaveLength(1); expect(calculations()).toHaveLength(1);
+  expect(params(historyReads().at(-1)!).get("hideGateFailed")).toBe("false");
+  fireEvent.click(watch.getByRole("button", { name: "Подробности BTC5" })); await settle();
+  expect(screen.getByRole("dialog", { name: "Подробности BTC5" })).toHaveTextContent("legacy_watch");
+  expect(calculations()).toHaveLength(1);
 });
 
-it("does not show a successful empty feed when the first read fails", async () => {
-  respond = () => json({}, 503); render(<SetupsPage />); await settle();
-  expect(screen.getByRole("alert")).toHaveTextContent("Лента недоступна");
-  expect(screen.queryByText("Сетапы не найдены.")).not.toBeInTheDocument();
-  respond = page; await tick(); expect(screen.getByText("bybit · BTC60")).toBeInTheDocument();
-});
-
-it("keeps the feed panel alive behind the analytics sidebar section", async () => {
+it("renders the canonical server Telegram text above saved details, never a reconstructed client caption", async () => {
   render(<SetupsPage />); await settle();
-  expect(screen.getByRole("tab", { name: "Лента" })).toHaveAttribute("aria-selected", "true");
-  expect(screen.getByRole("tabpanel", { name: "Лента" })).toBeVisible();
-  fireEvent.click(screen.getByRole("tab", { name: "Аналитика" })); await settle(); await tick(400);
-  expect(requests.some((request) => request.path === "/v1/algorithms")).toBe(true);
-  expect(screen.queryByRole("tabpanel", { name: "Лента" })).not.toBeInTheDocument();
-  expect(screen.getByRole("tabpanel", { name: "Аналитика" })).toBeVisible();
-  expect(screen.getByText("bybit · BTC60")).toBeInTheDocument();
-  const feedCallsBefore = calls().length;
-  fireEvent.click(screen.getByRole("tab", { name: "Лента" })); await settle();
-  expect(screen.queryByRole("tabpanel", { name: "Аналитика" })).not.toBeInTheDocument();
-  expect(screen.getByRole("tabpanel", { name: "Лента" })).toBeVisible();
-  expect(screen.getByText("bybit · BTC60")).toBeInTheDocument();
-  await tick(3000);
-  expect(calls().length).toBeGreaterThan(feedCallsBefore);
+  const trigger = history().getByRole("button", { name: "Подробности BTC6" });
+  fireEvent.click(trigger); await settle();
+  const dialog = screen.getByRole("dialog", { name: "Подробности BTC6" });
+  const text = dialog.querySelector("pre")!;
+  expect(text.textContent).toBe("СЕРВЕРНЫЙ SHORT BTC6\nУсловия: 123.456 USDT");
+  expect(within(text).getByText("СЕРВЕРНЫЙ", { selector: "strong" })).toBeInTheDocument();
+  expect(within(text).getByText("123.456", { selector: "code" })).toBeInTheDocument();
+  expect(within(dialog).getByText("snapshot-v1")).toBeInTheDocument();
+  expect(text.compareDocumentPosition(within(dialog).getByRole("heading", { name: "Сохранённые подробности" })) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  expect(requests.filter((request) => request.method !== "GET")).toHaveLength(2);
 });
 
-it("rereads the current historical query after manual outcome refresh without resetting the snapshot or filter", async () => {
+it("applies search to options, history and the next explicit calculation identity, retaining the global unfiltered CSV link", async () => {
   render(<SetupsPage />); await settle();
-  fireEvent.click(screen.getByRole("button", { name: "Далее" })); await settle();
-  expect(params().get("offset")).toBe("25"); expect(params().get("snapshotId")).toBe("60");
-  const originalFetch = globalThis.fetch;
-  const refresh = vi.fn(() => Promise.resolve(json({ snapshotId: 60, observedThroughUnix: 200, processed: 1, computed: 1, updated: 1, nextCursor: null })));
-  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => path === "/v1/setups/outcomes/refresh" ? refresh() : originalFetch(path, init)));
-  const before = calls().length;
-  const icon = screen.getByRole("button", { name: "Обновить результаты сетапов" });
-  fireEvent.focus(icon); expect(screen.getByRole("tooltip")).toHaveTextContent("Обновить результаты сетапов");
-  fireEvent.click(icon); fireEvent.click(icon); await settle();
-  expect(refresh).toHaveBeenCalledTimes(1);
-  expect(calls()).toHaveLength(before + 1);
-  expect(params().get("offset")).toBe("25"); expect(params().get("snapshotId")).toBe("60"); expect(params().get("q")).toBe("BTC");
-  expect(screen.getByText("bybit · BTC35")).toBeInTheDocument();
-  expect(icon).toHaveAttribute("aria-busy", "false"); expect(icon).toBeEnabled();
+  const csv = screen.getByRole("link", { name: "Экспорт CSV (без фильтра)" });
+  expect(csv).toHaveAttribute("href", "/v1/export/setups.csv");
+  const search = screen.getByRole("textbox", { name: "Инструмент, биржа или алгоритм" });
+  fireEvent.change(search, { target: { value: "BTC6_%" } }); await settle();
+  expect(calculations()).toHaveLength(1);
+  expect(params(studyReads().at(-1)!).get("q")).toBe("BTC6_%");
+  expect(params(historyReads().at(-1)!).get("q")).toBe("BTC6_%");
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  expect(calculations()).toHaveLength(2); expect(params(calculations()[1]!).get("q")).toBe("BTC6_%");
+  expect(params(calculations()[1]!).get("toUnix")).toBe(String(loadedAt));
+  expect(csv).toHaveAttribute("href", "/v1/export/setups.csv");
+  expect(refreshes()).toHaveLength(1);
+});
+
+it("aborts an obsolete calculation when filters change and rejects its late result after the new explicit request finishes", async () => {
+  let finishOld: ((response: Response) => void) | undefined;
+  analyticsResponse = (query) => query.get("q") === "BTC6"
+    ? json({ ...analyticsResult, totals: { ...analyticsResult.totals, meanR: -1 }, setups: analyticsResult.setups.map((setup) => ({ ...setup, status: "sl", riskReturn: -1 })) })
+    : new Promise<Response>((resolve) => { finishOld = resolve; });
+  render(<SetupsPage />); await settle();
+  expect(calculations()).toHaveLength(1);
+  const original = calculations()[0]!;
+  expect(original.signal?.aborted).toBe(false);
+  fireEvent.change(screen.getByRole("textbox", { name: "Инструмент, биржа или алгоритм" }), { target: { value: "BTC6" } }); await settle();
+  expect(original.signal?.aborted).toBe(true);
+  expect(calculations()).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  expect(calculations()).toHaveLength(2);
+  expect(params(calculations()[1]!).get("q")).toBe("BTC6");
+  expect(screen.getByTestId("setups-analytics-mean")).toHaveTextContent("-1.00R");
+  await act(async () => { finishOld?.(json(analyticsResult)); await Promise.resolve(); }); await settle();
+  expect(screen.getByTestId("setups-analytics-mean")).toHaveTextContent("-1.00R");
+  expect(screen.getByTestId("setups-daily-outcomes").querySelector('circle[data-mean-r="-1.00"]')).not.toBeNull();
+  expect(refreshes()).toHaveLength(1);
+});
+
+it("keeps history pagination available when numeric analysis rejects more than 5000 setups, without partial or zero success", async () => {
+  total = 5001; rows = Array.from({ length: 60 }, (_, index) => row(60 - index));
+  analyticsResponse = () => json({ error: "setups_analytics_limit_exceeded" }, 400);
+  render(<SetupsPage />); await settle();
+  expect(screen.getByRole("alert")).toHaveTextContent("5000");
+  expect(screen.queryByTestId("setups-analytics-mean")).not.toBeInTheDocument();
+  expect(history().getByText("BTC60")).toBeInTheDocument();
+  fireEvent.click(history().getByRole("button", { name: "Далее" })); await settle();
+  expect(history().getByText("BTC35")).toBeInTheDocument();
+  expect(history().getByRole("button", { name: "Подробности BTC35" })).toBeEnabled();
+  expect(params(historyReads().at(-1)!).get("offset")).toBe("25");
+  await settle(9000); expect(calculations()).toHaveLength(1); expect(refreshes()).toHaveLength(1);
+  expect(screen.getByRole("link", { name: "Экспорт CSV (без фильтра)" })).toHaveAttribute("href", "/v1/export/setups.csv");
 });

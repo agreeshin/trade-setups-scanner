@@ -825,13 +825,13 @@ it("saves actual metadata controls, date-free list/gate config and locked maturi
     study: { algorithmParams: { futureThreshold: "3.75", opaqueFixed: "kept" }, algorithmSearch: { futureThreshold: ["1.5", "2.5"] }, instruments: [{ symbol: "OLDUSDT" }] } });
   for (const key of ["fromUnix", "toUnix", "minSetupsPerDay", "setupMaturity"]) expect(config.study).not.toHaveProperty(key);
   expect(requests.filter((request) => request.method !== "GET" && !request.path.startsWith("/v1/optimization-drafts/"))).toHaveLength(1);
-  expect(screen.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" })).not.toBeChecked();
+  expect(screen.getByRole("switch", { name: "Разрешить адаптивное live-сканирование" })).not.toBeChecked();
   expect(screen.getByLabelText("Включён для live-сканирования")).not.toBeChecked();
 });
 
 it("shares common draft fields in both directions while preserving mode-specific values", async () => {
   render(<AlgorithmsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Запустить новую оптимизацию Мой алгоритм" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Запустить новое исследование Мой алгоритм" }));
   let manual = within(await screen.findByRole("dialog", { name: "Оптимизация · Мой алгоритм" }));
   const manualBaseline = await manual.findByLabelText("Baseline: Новый порог");
   fireEvent.change(manual.getByLabelText("Начало периода сигналов"), { target: { value: "2026-10-05T01:02" } });
@@ -858,7 +858,7 @@ it("shares common draft fields in both directions while preserving mode-specific
   });
   await userEvent.click(continuous.getByRole("button", { name: "Закрыть" }));
 
-  await userEvent.click(screen.getByRole("button", { name: "Запустить новую оптимизацию Мой алгоритм" }));
+  await userEvent.click(screen.getByRole("button", { name: "Запустить новое исследование Мой алгоритм" }));
   manual = within(await screen.findByRole("dialog", { name: "Оптимизация · Мой алгоритм" }));
   expect(await manual.findByLabelText("Начало периода сигналов")).toHaveValue("2026-10-05T01:02");
   expect(manual.getByLabelText("Направление сделки")).toHaveValue("long");
@@ -871,7 +871,7 @@ it("keeps adaptive permission independent and drains only through the common alg
   const dialog = await configure();
   await userEvent.click(dialog.getByRole("button", { name: "Сохранить параметры" }));
   await screen.findByRole("button", { name: "Запустить непрерывное исследование" });
-  await userEvent.click(screen.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" }));
+  await userEvent.click(screen.getByRole("switch", { name: "Разрешить адаптивное live-сканирование" }));
   await userEvent.click(screen.getByRole("button", { name: "Сохранить разрешение адаптивного live" }));
   await screen.findByText("Разрешение адаптивного live сохранено.");
   expect(process?.config?.adaptiveEnabled).toBe(true);
@@ -949,7 +949,7 @@ it("maps the adaptive dot to saved permission, never research state, draft or re
   const flexible = await screen.findByRole("tab", { name: "Live-сканирование с гибкими параметрами" });
   await screen.findByText("Непрерывное исследование включено");
   expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
-  await userEvent.click(screen.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" }));
+  await userEvent.click(screen.getByRole("switch", { name: "Разрешить адаптивное live-сканирование" }));
   expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
   await userEvent.click(screen.getByRole("button", { name: "Сохранить разрешение адаптивного live" }));
   await screen.findByText("Разрешение адаптивного live сохранено.");
@@ -985,7 +985,7 @@ it("shows unavailable rather than pretending the endpoint works and preserves fi
   expect(screen.getByRole("button", { name: "Настроить непрерывное исследование" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "Запустить непрерывное исследование" })).toBeDisabled();
   expect(screen.getByText("Сохранить алгоритм")).toBeEnabled();
-  expect(screen.getByRole("button", { name: "Запустить новую оптимизацию Мой алгоритм" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Запустить новое исследование Мой алгоритм" })).toBeEnabled();
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
 
@@ -1002,7 +1002,7 @@ it("shows active and completed continuous history with structured origin, withou
   await detail.findByText("Непрерывное");
   expect(detail.queryByRole("button", { name: "Остановить исследование" })).not.toBeInTheDocument();
   await userEvent.click(detail.getByRole("button", { name: "Закрыть" }));
-  await userEvent.click(screen.getByRole("button", { name: "Запустить новую оптимизацию Мой алгоритм" }));
+  await userEvent.click(screen.getByRole("button", { name: "Запустить новое исследование Мой алгоритм" }));
   const manual = within(await screen.findByRole("dialog", { name: "Оптимизация · Мой алгоритм" }));
   await waitFor(() => expect(manual.getByRole("button", { name: "Начать исследование" })).toBeEnabled());
   expect(requests.some((request) => request.path.endsWith("/cancel"))).toBe(false);
@@ -1080,7 +1080,7 @@ it("changes only live permission during running research without revision change
   await userEvent.click(screen.getByRole("button", { name: "Обновить статус непрерывного процесса" }));
   await userEvent.click(screen.getByRole("button", { name: "Обновить статус адаптивных профилей" }));
   await screen.findByText("Адаптивный live разрешён · принято профилей: 1.");
-  await userEvent.click(screen.getByRole("checkbox", { name: "Разрешить адаптивное live-сканирование" }));
+  await userEvent.click(screen.getByRole("switch", { name: "Разрешить адаптивное live-сканирование" }));
   await userEvent.click(screen.getByRole("button", { name: "Сохранить разрешение адаптивного live" }));
   await screen.findByText("Разрешение адаптивного live сохранено.");
   expect(process).toEqual({ ...before, config: { ...before.config, adaptiveEnabled: false } });

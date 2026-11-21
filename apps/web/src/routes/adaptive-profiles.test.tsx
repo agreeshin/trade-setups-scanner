@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, renderHook, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { adaptivePermission, listAdaptiveProfiles, type AdaptiveProfile, type ProfilePage } from "../lib/adaptive-profiles-api";
-import { AdaptiveProfiles } from "./continuous-study";
+import { AdaptiveLive, AdaptiveProfiles } from "./continuous-study";
 import { useAdaptiveProfiles } from "./use-adaptive-profiles";
 import type { Algorithm } from "./platform-controls";
 
@@ -63,8 +63,53 @@ function Surface() {
   const controller = useAdaptiveProfiles("test");
   return <AdaptiveProfiles algorithm={algorithm} controller={controller} />;
 }
+function PermissionSurface() {
+  const controller = useAdaptiveProfiles("test");
+  return <><AdaptiveLive controller={controller} /><AdaptiveProfiles algorithm={algorithm} controller={controller} /></>;
+}
 const writes = () => calls.filter((call) => call.method !== "GET");
 const reads = () => calls.filter((call) => call.path.startsWith("/v1/adaptive-profiles?"));
+
+it.each([true, false])("keeps the permission switch draft local until explicit Save (saved=%s)", async (saved) => {
+  enabled = saved;
+  render(<PermissionSurface />);
+  const control = screen.getByRole("switch", { name: "Разрешить адаптивное live-сканирование" });
+  expect(control).toBeDisabled();
+  await tick();
+  expect(control).toBeEnabled();
+  expect(control).toHaveAttribute("aria-checked", String(saved));
+  const save = screen.getByRole("button", { name: "Сохранить разрешение адаптивного live" });
+  expect(save).toBeDisabled();
+  fireEvent.click(control);
+  expect(control).toHaveAttribute("aria-checked", String(!saved));
+  expect(save).toBeEnabled();
+  expect(writes()).toHaveLength(0);
+  expect(enabled).toBe(saved);
+  fireEvent.click(save); await tick();
+  expect(writes()).toEqual([expect.objectContaining({ path: "/v1/adaptive-live/test/permission", method: "PUT", body: { enabled: !saved } })]);
+  expect(control).toHaveAttribute("aria-checked", String(!saved));
+  expect(save).toBeDisabled();
+  expect(screen.getByText("Разрешение адаптивного live сохранено.")).toBeInTheDocument();
+});
+
+it("retains an unsaved switch draft after Save fails without retrying or claiming success", async () => {
+  render(<PermissionSurface />); await tick();
+  permissionStatus = 503;
+  const control = screen.getByRole("switch", { name: "Разрешить адаптивное live-сканирование" });
+  const save = screen.getByRole("button", { name: "Сохранить разрешение адаптивного live" });
+  fireEvent.click(control); fireEvent.click(save); await tick();
+  expect(control).not.toBeChecked();
+  expect(enabled).toBe(true);
+  expect(writes()).toHaveLength(1);
+  expect(save).toBeEnabled();
+  expect(screen.getByRole("alert")).toHaveTextContent("HTTP 503");
+  expect(screen.queryByText("Разрешение адаптивного live сохранено.")).not.toBeInTheDocument();
+  permissionStatus = 200;
+  fireEvent.click(save); await tick();
+  expect(writes()).toHaveLength(2);
+  expect(writes()[1]).toMatchObject({ path: "/v1/adaptive-live/test/permission", method: "PUT", body: { enabled: false } });
+  expect(save).toBeDisabled();
+});
 
 it("loads retained out-of-queue profiles from the standalone API with their own direction and producing metric", async () => {
   render(<Surface />); await tick();

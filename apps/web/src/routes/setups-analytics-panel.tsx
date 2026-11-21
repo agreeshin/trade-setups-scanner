@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -7,13 +7,13 @@ import { Checkbox } from "../components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { EmptyState } from "../components/ui/empty-state";
 import { Field } from "../components/ui/field";
-import { InfoNote } from "../components/ui/info-note";
 import { Input } from "../components/ui/input";
 import { Select } from "../components/ui/select";
 import { Spinner } from "../components/ui/spinner";
+import { Switch } from "../components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
-import { fetchPlatform } from "../lib/platform-api";
-import { interfaceSettings, nextZonedDay, subscribeInterfaceSettings, zonedDateLabel, zonedDayStart } from "../lib/datetime-format";
+import { fetchPlatform, PLATFORM_URL } from "../lib/platform-api";
+import { effectiveTimezone, interfaceSettings, nextZonedDay, subscribeInterfaceSettings, zonedDateLabel, zonedDayStart } from "../lib/datetime-format";
 import { getOptimizationStudy, type OptimizationMatrixCell, type OptimizationStudy } from "../lib/optimization-api";
 import {
   fetchSetupsAnalytics,
@@ -31,14 +31,18 @@ import {
   endOfRangeDateChange,
   errorText,
   localDateInput,
+  localTime,
   localTimezoneLabel,
   replayRange,
   utcMidnightOnDateChange,
   type Algorithm,
+  savePreference,
 } from "./platform-controls";
 
 import { formatOutcomeRisk as formatRisk, outcomeMeanClass as meanColorClass, SetupOutcomesTable } from "./setup-outcomes-table";
 import { calendarDays, CHART_STYLE } from "./study-chart-style";
+import { SetupHistoryTable } from "./setup-history-table";
+import { useRouteActive } from "./route-active";
 
 const FILTER_STORAGE_KEY = "setups-analytics-filter-v1";
 
@@ -96,6 +100,8 @@ interface AnalyticsRange {
 
 interface CalculatedResult extends SetupsAnalyticsResult {
   range: AnalyticsRange;
+  calculatedAtUnix: number;
+  outcomesRevision: number;
 }
 
 function dailyOutcomes(setups: readonly SetupsAnalyticsSetup[], dayStart: (unix: number) => number = zonedDayStart): DailyOutcome[] {
@@ -444,8 +450,17 @@ function initialSelectedStudies(): ReadonlySet<number> | null {
   return studies ? new Set(studies) : null;
 }
 
-export function SetupsAnalyticsPanel() {
+interface InitialLoad { loadedAtUnix: number; interfaceReady: boolean; ready: boolean }
+
+export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevision = 0 }: { initialLoad?: InitialLoad; refreshControl?: ReactNode; outcomesRevision?: number } = {}) {
   useSyncExternalStore(subscribeInterfaceSettings, interfaceSettings, interfaceSettings);
+  const active = useRouteActive();
+  const unified = initialLoad !== undefined;
+  const [initialized, setInitialized] = useState(!unified);
+  const [preferencesReady, setPreferencesReady] = useState(!unified);
+  const [search, setSearch] = useState("");
+  const [savingSearch, setSavingSearch] = useState(false);
+  const [searchMessage, setSearchMessage] = useState<string | null>(null);
   const [algorithms, setAlgorithms] = useState<Algorithm[] | null>(null);
   const [algorithmId, setAlgorithmId] = useState(initialAlgorithmId);
   const [fromInput, setFromInput] = useState(() => initialRangeInputs().from);
@@ -459,28 +474,93 @@ export function SetupsAnalyticsPanel() {
   const [pickerSelection, setPickerSelection] = useState<ReadonlySet<number>>(new Set());
   const [detailStudyId, setDetailStudyId] = useState<number | null>(null);
   const [result, setResult] = useState<CalculatedResult | null>(null);
-  const [running, setRunning] = useState(false);
+  const [runningRequest, setRunningRequest] = useState<string | null>(null);
   const [hideGateFailed, setHideGateFailed] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<{ key: string; message: string } | null>(null);
   const calculateRef = useRef<AbortController | null>(null);
   const restoredSelection = useRef<ReadonlySet<number> | null>(initialSelectedStudies());
+  const autoAttempted = useRef(false);
+  const [studiesIdentity, setStudiesIdentity] = useState("");
+  const [studiesRevision, setStudiesRevision] = useState(0);
+  const loadedOptions = useRef<string | null>(null);
+  const timezone = effectiveTimezone();
+  const previousTimezone = useRef(timezone);
+  const [timezoneDirty, setTimezoneDirty] = useState(false);
+  const committedInstant = useRef<AnalyticsRange | null>(null);
+  // datetime-local controls display minutes, but the automatic End retains the
+  // exact application-load second until the user actually edits that field.
+  const automaticEnd = useRef<{ text: string; unix: number } | null>(null);
+  const interfaceReady = initialLoad?.interfaceReady ?? true;
+  const loadedAtUnix = initialLoad?.loadedAtUnix;
+
+  // Adjust this component's draft before rendering/starting effects when the
+  // application bootstrap becomes ready. No intermediate stale End is queried.
+  if (unified && !initialized && interfaceReady && loadedAtUnix !== undefined) {
+    const from = loadStoredFilter()?.from ?? localDateInput(loadedAtUnix - 7 * DAY_SECONDS);
+    const to = localDateInput(loadedAtUnix);
+    automaticEnd.current = { text: to, unix: loadedAtUnix };
+    setFromInput(from); setToInput(to); setCommitted({ from, to });
+    previousTimezone.current = effectiveTimezone();
+    setInitialized(true);
+  }
+
+  useEffect(() => {
+    if (!unified) return;
+    const controller = new AbortController();
+    void fetchPlatform<{ value: { setupFilter?: string } }>("/v1/settings/ui", controller.signal).then((value) => {
+      if (controller.signal.aborted) return;
+      if (value.kind === "ready" && typeof value.data.value.setupFilter === "string") setSearch(value.data.value.setupFilter.slice(0, 200));
+      if (value.kind === "unreachable") setStudiesError(`Сохранённый поиск недоступен (${value.detail})`);
+      setPreferencesReady(true);
+    });
+    return () => controller.abort();
+  }, [unified]);
+
+  if (unified && initialized && previousTimezone.current !== timezone) {
+    previousTimezone.current = timezone;
+    if (fromInput !== committed.from || toInput !== committed.to) {
+      setTimezoneDirty(true);
+    } else {
+      const instant = committedInstant.current;
+      if (instant !== null) {
+        const from = localDateInput(instant.fromUnix); const to = localDateInput(instant.toUnix);
+        if (automaticEnd.current !== null) automaticEnd.current.text = to;
+        setFromInput(from); setToInput(to); setCommitted({ from, to });
+      }
+    }
+  }
 
   const range = (() => {
     try {
-      return { value: replayRange(fromInput, toInput), error: null as string | null };
+      const value = replayRange(fromInput, toInput);
+      if (automaticEnd.current?.text === toInput) value.toUnix = automaticEnd.current.unix;
+      return { value, error: null as string | null };
     } catch (cause) {
       return { value: null, error: errorText(cause) };
     }
   })();
   const committedRange = (() => {
     try {
-      return replayRange(committed.from, committed.to);
+      const value = replayRange(committed.from, committed.to);
+      if (automaticEnd.current?.text === committed.to) value.toUnix = automaticEnd.current.unix;
+      return value;
     } catch {
       return null;
     }
   })();
   const committedFrom = committedRange?.fromUnix ?? null;
   const committedTo = committedRange?.toUnix ?? null;
+  const queriesReady = initialized && preferencesReady && !timezoneDirty && (!unified || previousTimezone.current === timezone);
+  const draftDates = fromInput !== committed.from || toInput !== committed.to;
+  if (queriesReady && committedRange !== null) committedInstant.current = committedRange;
+  const optionsKey = JSON.stringify([algorithmId, committedFrom, committedTo, search]);
+  const selectedStudyIds = selectedStudies === null || studiesMeta.length === 0 || studiesMeta.every((study) => selectedStudies.has(study.studyId))
+    ? null : [...selectedStudies].sort((a, b) => a - b);
+  const requestKey = JSON.stringify([algorithmId, range.value?.fromUnix, range.value?.toUnix, selectedStudyIds, search, timezoneDirty]);
+  const running = runningRequest === requestKey;
+  const error = failure?.key === requestKey ? failure.message : null;
+  const currentRequest = useRef(requestKey);
+  currentRequest.current = requestKey;
   const studiesStatus = algorithmId === "" || committedFrom === null || committedTo === null ? "idle" : studiesState;
 
   useEffect(() => {
@@ -496,38 +576,47 @@ export function SetupsAnalyticsPanel() {
   }, []);
 
   useEffect(() => {
-    if (algorithmId === "" || committedFrom === null || committedTo === null) return;
+    if (algorithmId === "" || committedFrom === null || committedTo === null || !queriesReady || (unified && !initialLoad?.ready)) return;
     const controller = new AbortController();
     const from = committedFrom;
     const to = committedTo;
     async function load() {
       setStudiesState("loading");
       try {
-        const items = await fetchSetupsAnalyticsStudies(algorithmId, from, to, controller.signal);
+        const items = await fetchSetupsAnalyticsStudies(algorithmId, from, to, controller.signal, search);
         if (controller.signal.aborted) return;
         setStudiesMeta(items);
         setStudiesState("ready");
+        setStudiesIdentity(optionsKey);
         setStudiesError(null);
         const restored = restoredSelection.current;
         if (restored === null) {
-          setSelectedStudies(null);
+          const preserve = loadedOptions.current === optionsKey;
+          setSelectedStudies((current) => {
+            if (!preserve || current === null || items.length === 0) return null;
+            const intersection = new Set(items.filter((item) => current.has(item.studyId)).map((item) => item.studyId));
+            return current.size === 0 ? new Set() : intersection.size === 0 ? null : intersection;
+          });
         } else {
           const intersection = new Set(items.filter((item) => restored.has(item.studyId)).map((item) => item.studyId));
-          setSelectedStudies(intersection.size === 0 ? null : intersection);
+          setSelectedStudies(restored.size === 0 ? new Set() : intersection.size === 0 ? null : intersection);
           restoredSelection.current = null;
         }
+        loadedOptions.current = optionsKey;
       } catch (cause) {
         if (controller.signal.aborted) return;
-        setStudiesMeta([]);
+        if (loadedOptions.current !== optionsKey) {
+          setStudiesMeta([]);
+          setSelectedStudies(null);
+        }
         setStudiesState("error");
         setStudiesError(errorText(cause));
-        setSelectedStudies(null);
         restoredSelection.current = null;
       }
     }
     void load();
     return () => controller.abort();
-  }, [algorithmId, committedFrom, committedTo]);
+  }, [algorithmId, committedFrom, committedTo, search, queriesReady, unified, initialLoad?.ready, optionsKey, studiesRevision]);
 
   useEffect(() => {
     storeFilter({
@@ -540,7 +629,21 @@ export function SetupsAnalyticsPanel() {
 
   useEffect(() => () => calculateRef.current?.abort(), []);
 
+  useEffect(() => {
+    calculateRef.current?.abort();
+  }, [requestKey]);
+
+  // No dependency array intentionally: readiness can settle in several stages.
+  // The attempt flag is set BEFORE dispatch, including StrictMode effect replay.
+  useEffect(() => {
+    if (!unified || !active || autoAttempted.current || !initialLoad?.ready || !queriesReady || draftDates
+      || studiesIdentity !== optionsKey || studiesState !== "ready" || algorithmId === "" || range.value === null) return;
+    autoAttempted.current = true;
+    void run();
+  });
+
   function commitDates() {
+    setTimezoneDirty(false);
     setCommitted({ from: fromInput, to: toInput });
   }
 
@@ -559,23 +662,24 @@ export function SetupsAnalyticsPanel() {
   }
 
   async function run() {
-    if (running || algorithmId === "" || range.value === null) return;
+    if (running || algorithmId === "" || range.value === null || !queriesReady || (unified && draftDates)) return;
     calculateRef.current?.abort();
     const controller = new AbortController();
     calculateRef.current = controller;
-    setRunning(true);
-    setError(null);
+    setRunningRequest(requestKey);
+    setFailure(null);
     try {
-      const studies = selectedStudies === null ? null : [...selectedStudies].sort((left, right) => left - right);
+      const studies = selectedStudyIds;
       const requestedRange = { ...range.value };
-      const data = await fetchSetupsAnalytics(algorithmId, requestedRange.fromUnix, requestedRange.toUnix, studies, controller.signal);
-      if (!controller.signal.aborted) setResult({ ...data, range: requestedRange });
+      const requestedKey = requestKey;
+      const data = await fetchSetupsAnalytics(algorithmId, requestedRange.fromUnix, requestedRange.toUnix, studies, controller.signal, search);
+      if (!controller.signal.aborted && currentRequest.current === requestedKey) setResult({ ...data, range: requestedRange, calculatedAtUnix: Date.now() / 1000, outcomesRevision });
     } catch (cause) {
-      if (!controller.signal.aborted) setError(errorText(cause));
+      if (!controller.signal.aborted) setFailure({ key: requestKey, message: errorText(cause) });
     } finally {
       if (calculateRef.current === controller) {
         calculateRef.current = null;
-        setRunning(false);
+        setRunningRequest(null);
       }
     }
   }
@@ -584,37 +688,51 @@ export function SetupsAnalyticsPanel() {
     ? `Все (${studiesMeta.length})`
     : `${selectedStudies.size} из ${studiesMeta.length}`;
   const detailMeta = detailStudyId === null ? undefined : studiesMeta.find((study) => study.studyId === detailStudyId);
+  const historyFilter = queriesReady && algorithmId !== "" && committedRange !== null ? {
+    algorithmId, ...committedRange, studies: selectedStudyIds, q: search, hideGateFailed,
+  } : null;
 
   return <section aria-label="Аналитика выпущенных сетапов" className="grid min-w-0 gap-4">
-    <div className="flex items-center gap-2">
-      <h2 className="text-lg font-semibold">Аналитика выпущенных сетапов</h2>
-      <InfoNote>Расчёт по сохранённым рекомендациям исследований: вход по рекомендованному времени и гейту смещения цены, исход TP/SL по реальным минутным свечам за 7 суток. Исход хранится в самом сетапе; используются сохранённые результаты, рассчитываются только недостающие.</InfoNote>
-    </div>
     <Card>
       <CardContent className="flex flex-wrap items-end gap-3">
+        {unified && <Field label="Инструмент, биржа или алгоритм" className="w-full max-w-sm">
+          {(control) => <Input {...control} placeholder="Инструмент, биржа или алгоритм" maxLength={200} value={search} disabled={!preferencesReady} onChange={(event) => { setSearch(event.target.value); setSearchMessage(null); setResult(null); }} />}
+        </Field>}
         <Field label="Алгоритм" className="w-full max-w-xs">
           {(control) => <Select {...control} value={algorithmId} disabled={algorithms === null} onChange={(event) => { setAlgorithmId(event.target.value); setResult(null); }}>
             {(algorithms ?? []).map((algorithm) => <option key={algorithm.id} value={algorithm.id}>{algorithmDisplayName(algorithm)}</option>)}
           </Select>}
         </Field>
         <Field label="Начало (момент выхода сетапа)" className="w-60">
-          {(control) => <Input {...control} type="datetime-local" value={fromInput} onBlur={commitDates} onChange={(event) => { setFromInput(utcMidnightOnDateChange(fromInput, event.target.value)); setResult(null); }} />}
+          {(control) => <Input {...control} disabled={!initialized} type="datetime-local" value={fromInput} onBlur={commitDates} onChange={(event) => { setFromInput(utcMidnightOnDateChange(fromInput, event.target.value)); setResult(null); }} />}
         </Field>
         <Field label="Конец" className="w-60">
-          {(control) => <Input {...control} type="datetime-local" value={toInput} onBlur={commitDates} onChange={(event) => { setToInput(endOfRangeDateChange(toInput, event.target.value)); setResult(null); }} />}
+          {(control) => <Input {...control} disabled={!initialized} type="datetime-local" value={toInput} onBlur={commitDates} onChange={(event) => { automaticEnd.current = null; setToInput(endOfRangeDateChange(toInput, event.target.value)); setResult(null); }} />}
         </Field>
         <Button variant="outline" disabled={studiesMeta.length === 0} onClick={openPicker}>Исследования: {studiesLabel}</Button>
-        <Button disabled={running || algorithmId === "" || range.value === null} onClick={() => { void run(); }}>{running ? "Расчёт…" : "Рассчитать"}</Button>
+        <Button disabled={running || algorithmId === "" || range.value === null || !queriesReady || (unified && (draftDates || !initialLoad?.ready || studiesIdentity !== optionsKey))} onClick={() => { void run(); }}>{running ? "Расчёт…" : "Рассчитать"}</Button>
+        {unified && <>
+          {refreshControl}
+          <Button variant="outline" disabled={savingSearch || !preferencesReady} onClick={() => { setSavingSearch(true); void savePreference("setupFilter", search).then(() => setSearchMessage("Фильтр сохранён в базе сигналов.")).catch((cause) => setSearchMessage(errorText(cause))).finally(() => setSavingSearch(false)); }}>Сохранить фильтр</Button>
+          <Button asChild variant="outline"><a href={`${PLATFORM_URL}/v1/export/setups.csv`}>Экспорт CSV (без фильтра)</a></Button>
+          <label className="flex items-center gap-2 text-sm text-muted-foreground"><Switch checked={hideGateFailed} onCheckedChange={setHideGateFailed} /> Скрыть сетапы, которые не прошли гейт</label>
+          <p className="w-full text-xs text-muted-foreground">Численная оценка — только пригодные адаптивные рекомендации, не все строки истории. CSV всегда содержит всю сохранённую live-историю без фильтров экрана. Снимок фиксирован; новый расчёт запускается вручную.</p>
+        </>}
         {studiesStatus === "loading" && <Spinner label="Загрузка исследований…" />}
         <p className="w-full text-xs text-muted-foreground">Время: {localTimezoneLabel()}. Смена даты сбрасывает время к полуночи в выбранном часовом поясе (для «Конец» сегодняшняя дата подставляет текущее время); список исследований обновляется при потере фокуса полей дат, после обновления выбраны все. По нажатию кнопки используются сохранённые исходы и рассчитываются только недостающие.</p>
         {range.error !== null && <p role="alert" className="w-full text-xs text-danger">{range.error}</p>}
+        {timezoneDirty && <p role="alert">Часовой пояс изменился при редактировании. Проверьте даты и завершите редактирование поля перед расчётом.</p>}
+        {searchMessage !== null && <p role="status">{searchMessage}</p>}
       </CardContent>
     </Card>
-    {studiesError && <Alert variant="destructive" role="alert"><AlertDescription>{studiesError}</AlertDescription></Alert>}
+    {studiesError && <Alert variant="destructive" role="alert"><AlertDescription>{studiesError}</AlertDescription>
+      {algorithmId !== "" && <Button variant="outline" disabled={studiesState === "loading"} onClick={() => setStudiesRevision((value) => value + 1)}>Повторить загрузку исследований</Button>}
+    </Alert>}
     {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
     {running && <Spinner label="Выполняется расчёт исходов сетапов…" />}
     {result && <Card>
       <CardContent className="grid gap-4">
+        {unified && <p className="text-xs text-muted-foreground">Последний расчёт: {localTime(result.calculatedAtUnix)}.{result.outcomesRevision !== outcomesRevision ? " Исходы обновились; нажмите «Рассчитать» для новой оценки." : ""}</p>}
         <div className="flex flex-wrap items-center gap-6">
           <div>
             <p className="text-sm text-muted-foreground">Среднее матожидание закрытых сделок</p>
@@ -652,7 +770,7 @@ export function SetupsAnalyticsPanel() {
             </Table>
           </div>
         </div>}
-        {result.setups.length === 0
+        {!unified && (result.setups.length === 0
           ? <EmptyState title="Нет сетапов по выбранным фильтрам" description="Измените диапазон, алгоритм или набор исследований." />
           : <div className="grid gap-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -660,16 +778,17 @@ export function SetupsAnalyticsPanel() {
               <label className="flex items-center gap-2 text-sm text-muted-foreground"><Checkbox checked={hideGateFailed} onCheckedChange={(checked) => setHideGateFailed(checked === true)} /> Скрыть сетапы, которые не прошли гейт</label>
             </div>
             <SetupOutcomesTable setups={hideGateFailed ? result.setups.filter((setup) => setup.status !== "gate_failed") : result.setups} />
-          </div>}
+          </div>)}
       </CardContent>
     </Card>}
+    {unified && <Card><CardContent><SetupHistoryTable filter={historyFilter} revision={outcomesRevision} /></CardContent></Card>}
     <StudyPickerDialog
       open={pickerOpen}
       studies={studiesMeta}
       selection={pickerSelection}
       onSelectionChange={togglePickerStudy}
       onClose={() => setPickerOpen(false)}
-      onApply={() => { setSelectedStudies(pickerSelection.size === studiesMeta.length ? null : new Set(pickerSelection)); setPickerOpen(false); }}
+      onApply={() => { setSelectedStudies(pickerSelection.size === studiesMeta.length ? null : new Set(pickerSelection)); setResult(null); setPickerOpen(false); }}
     />
     <StudyDetailsDialog key={detailStudyId ?? "none"} studyId={detailStudyId} algorithmId={algorithmId} fields={(algorithms ?? []).find((algorithm) => algorithm.id === algorithmId)?.fields ?? []} meta={detailMeta} onClose={() => setDetailStudyId(null)} />
   </section>;

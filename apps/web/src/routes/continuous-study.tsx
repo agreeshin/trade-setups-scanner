@@ -5,7 +5,7 @@ import type { AdaptiveProfile } from "../lib/adaptive-profiles-api";
 import { Alert } from "../components/ui/alert";
 import { Badge, type BadgeVariant } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
-import { Checkbox } from "../components/ui/checkbox";
+import { Switch } from "../components/ui/switch";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
@@ -191,7 +191,7 @@ export function AdaptiveLive({ controller }: { controller: AdaptiveProfilesContr
   const enabled = draft ?? savedPermission;
   const accepted = controller.page?.profiles.filter((profile) => profile.activeStatus === "active").length ?? 0;
   return <div className="grid gap-3">
-    <div className="flex items-center gap-2"><label className="flex items-center gap-2 text-sm"><Checkbox checked={enabled} disabled={!controller.available || controller.permissionBusy} onCheckedChange={(checked) => { setDraft(checked === true); setSaved(false); }} />Разрешить адаптивное live-сканирование</label>
+    <div className="flex items-center gap-2"><label className="flex items-center gap-2 text-sm"><Switch checked={enabled} disabled={!controller.available || controller.permissionBusy} onCheckedChange={(checked) => { setDraft(checked); setSaved(false); }} />Разрешить адаптивное live-сканирование</label>
     <InfoNote>Отдельное разрешение; исследование не включает live автоматически. Постоянные параметры не меняются. Готовность данных и общий выключатель live проверяются отдельно.</InfoNote></div>
     <p role="status" className="text-sm">{!controller.available ? "Состояние адаптивного live не подтверждено." : !savedPermission ? "Адаптивный live не разрешён." : accepted === 0 ? "Адаптивный live разрешён · действующих профилей нет, ожидается инициализация." : `Адаптивный live разрешён · принято профилей: ${accepted}.`}</p>
     <div><Button type="button" variant="outline" disabled={!controller.available || controller.permissionBusy || enabled === savedPermission} onClick={() => {

@@ -83,6 +83,8 @@ beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn((path: string) => {
     requests.push(path);
     if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "", enabled: true, params: {}, fields: [{ key: "spike_mult", label: "Множитель объёма", type: "decimal", min: 1, max: 20, unit: "×" }, { key: "min_quote_vol", label: "Мин. объём котировки", type: "decimal", min: 0, max: 1000000000, unit: "USDT" }] }] }));
+    if (path === "/v1/settings/ui") return Promise.resolve(json({ value: {} }));
+    if (path.startsWith("/v1/setups?")) return Promise.resolve(json({ setups: [], offset: Number(new URL(path, "http://fixture").searchParams.get("offset")), limit: 25, total: 0, snapshotId: 0 }));
     if (path.startsWith("/v1/setups/analytics/studies")) return Promise.resolve(json({ studies: [studyMeta1, studyMeta2] }));
     if (path === "/v1/setups/analytics/study-expectancy/40") {
       return Promise.resolve(expectancyResponse());
@@ -113,6 +115,73 @@ async function rendered() {
   await settle();
   return null;
 }
+
+it("forwards literal search to fresh options, the mathematical chart cohort and paged history without automatically repeating POST", async () => {
+  render(<SetupsAnalyticsPanel initialLoad={{ loadedAtUnix: unix("2026-11-13T12:00:37Z"), interfaceReady: true, ready: true }} />);
+  await settle(); await settle();
+  expect(analyticsCalls()).toHaveLength(1);
+  expect(new URL(analyticsCalls()[0]!, "http://fixture").searchParams.get("toUnix")).toBe(String(unix("2026-11-13T12:00:37Z")));
+  analyticsResponse = () => json({ totals: { selected: 1, gatePassed: 1, closed: 1, meanR: 2 }, studies: [], setups: [setupRow(9, 1, "tp", 2)] });
+  fireEvent.change(screen.getByLabelText("Инструмент, биржа или алгоритм"), { target: { value: "%_" } });
+  await settle();
+  expect(analyticsCalls()).toHaveLength(1);
+  expect(new URL(studiesCalls().at(-1)!, "http://fixture").searchParams.get("q")).toBe("%_");
+  expect(new URL(requests.filter((path) => path.startsWith("/v1/setups?")).at(-1)!, "http://fixture").searchParams.get("q")).toBe("%_");
+  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  expect(analyticsCalls()).toHaveLength(2);
+  expect(new URL(analyticsCalls().at(-1)!, "http://fixture").searchParams.get("q")).toBe("%_");
+  expect(screen.getByTestId("setups-analytics-mean")).toHaveTextContent("+2.00R");
+  expect(screen.getByTestId("setups-daily-outcomes").querySelector('circle[data-closed="1"]')).toHaveAttribute("data-mean-r", "2.00");
+});
+
+it("preserves clean committed instants and a mounted result on timezone changes, but does not reinterpret dirty edits", async () => {
+  render(<SetupsAnalyticsPanel initialLoad={{ loadedAtUnix: unix("2026-11-13T12:00:00Z"), interfaceReady: true, ready: true }} />);
+  await settle(); await settle();
+  const chart = screen.getByTestId("setups-daily-outcomes");
+  const end = chart.getAttribute("data-to-unix");
+  act(() => { applyInterfaceSettings({ timezone: "Asia/Yekaterinburg" }); }); await settle();
+  expect(screen.getByLabelText("Конец")).toHaveValue("2026-11-13T17:00");
+  expect(screen.getByTestId("setups-daily-outcomes")).toBe(chart); expect(chart).toHaveAttribute("data-to-unix", end);
+  expect(analyticsCalls()).toHaveLength(1);
+  fireEvent.change(screen.getByLabelText("Начало (момент выхода сетапа)"), { target: { value: "2026-11-07T14:15" } });
+  act(() => { applyInterfaceSettings({ timezone: "UTC" }); }); await settle();
+  expect(screen.getByLabelText("Начало (момент выхода сетапа)")).toHaveValue("2026-11-07T00:00");
+  expect(screen.getByRole("alert")).toHaveTextContent("при редактировании");
+  expect(screen.getByRole("button", { name: "Рассчитать" })).toBeDisabled();
+  expect(analyticsCalls()).toHaveLength(1);
+});
+
+it("preserves an explicit study subset across manual outcome-refresh readiness changes without another automatic calculation", async () => {
+  const initial = { loadedAtUnix: unix("2026-11-13T12:00:00Z"), interfaceReady: true, ready: true };
+  const view = render(<SetupsAnalyticsPanel initialLoad={initial} />); await settle(); await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Исследования: Все (2)" }));
+  fireEvent.click(screen.getByRole("checkbox", { name: "Исследование 41" }));
+  fireEvent.click(screen.getByRole("button", { name: "Готово" })); await settle();
+  expect(screen.getByRole("button", { name: "Исследования: 1 из 2" })).toBeInTheDocument();
+  view.rerender(<SetupsAnalyticsPanel initialLoad={{ ...initial, ready: false }} />); await settle();
+  view.rerender(<SetupsAnalyticsPanel initialLoad={initial} />); await settle();
+  expect(screen.getByRole("button", { name: "Исследования: 1 из 2" })).toBeInTheDocument();
+  expect(analyticsCalls()).toHaveLength(1);
+  const lastHistory = requests.filter((path) => path.startsWith("/v1/setups?")).at(-1)!;
+  expect(new URL(lastHistory, "http://fixture").searchParams.get("studies")).toBe("40");
+});
+
+it("waits after a study-options failure and continues the sole initial calculation only after explicit retry", async () => {
+  const savedFetch = globalThis.fetch;
+  let failed = false;
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    if (path.startsWith("/v1/setups/analytics/studies") && !failed) {
+      failed = true;
+      return Promise.resolve(json({ error: "unavailable" }, 503));
+    }
+    return savedFetch(path, init);
+  }));
+  render(<SetupsAnalyticsPanel initialLoad={{ loadedAtUnix: unix("2026-11-13T12:00:00Z"), interfaceReady: true, ready: true }} />);
+  await settle(); await settle();
+  expect(analyticsCalls()).toHaveLength(0);
+  fireEvent.click(screen.getByRole("button", { name: "Повторить загрузку исследований" })); await settle();
+  expect(analyticsCalls()).toHaveLength(1);
+});
 
 it("loads studies for the committed range and renders the calculated result", async () => {
   await rendered();
@@ -395,7 +464,7 @@ it("extends the selected axis to a shifted entry on the following local day with
   expect(shiftedEntry).toHaveAttribute("data-mean-r", "1.00");
 });
 
-it("uses the calculated range snapshot if the input changes while calculation is running", async () => {
+it("drops a stale calculation if its input changes while the response is running", async () => {
   applyInterfaceSettings({ timezone: "Asia/Yekaterinburg" });
   storeRange("2026-11-19T00:00", "2026-11-21T10:00");
   let resolveResponse: ((value: Response) => void) | undefined;
@@ -406,10 +475,7 @@ it("uses the calculated range snapshot if the input changes while calculation is
   fireEvent.change(screen.getByLabelText("Конец"), { target: { value: "2026-11-22T00:00" } });
   act(() => { resolveResponse!(json({ ...analyticsResult, setups: [rowAt(1, "2026-11-19T22:00:00Z", "tp", 1)] })); });
   await settle();
-  const chart = screen.getByTestId("setups-daily-outcomes");
-  expect(chart).toHaveAttribute("data-to-unix", String(unix("2026-11-21T05:00:00Z")));
-  expect(gridDays(chart)).toHaveLength(3);
-  expect(within(chart).queryByText("22.11.2026")).toBeNull();
+  expect(screen.queryByTestId("setups-daily-outcomes")).toBeNull();
   expect(screen.getByLabelText("Конец")).toHaveValue("2026-11-22T00:00");
 });
 

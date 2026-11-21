@@ -3,7 +3,6 @@ import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
 import { StatusDot } from "../components/ui/badge";
 import { Checkbox } from "../components/ui/checkbox";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Field } from "../components/ui/field";
 import { Input } from "../components/ui/input";
 import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
@@ -50,13 +49,11 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
   const optimizerAlgorithm = useMemo(() => ({ ...algorithm, params: baseline }), [algorithm, baseline]);
   const [optimizationOpen, setOptimizationOpen] = useState(false);
   const [historySelection, setHistorySelection] = useState<{ id: number; open: boolean; triggerId: string; continuous: boolean; cleanupRevision: number } | null>(null);
-  const [historyOpen, setHistoryOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<(OptimizationStudyAction & { cleanupRevision: number }) | null>(null);
   const selectedHistory = historySelection?.continuous && historySelection.cleanupRevision !== cleanupRevision ? null : historySelection;
   const selectedDeleteTarget = deleteTarget?.origin === "continuous" && deleteTarget.cleanupRevision !== cleanupRevision ? null : deleteTarget;
   const optimizerTriggerId = useId();
-  const historyTriggerId = useId();
-  const historyDialogId = useId();
+  const historyRegionId = useId();
   const [enabled, setEnabled] = useState(algorithm.enabled);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -162,27 +159,17 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     </ContinuousResearch>
     <Separator />
     <section aria-labelledby={`${optimizerTriggerId}-optimizations`} className="grid min-w-0 gap-4">
-    <h4 id={`${optimizerTriggerId}-optimizations`} className="text-center font-semibold">Ручные оптимизации</h4>
+    <h4 id={`${optimizerTriggerId}-optimizations`} className="text-center font-semibold">Исследования оптимальных параметров</h4>
     {optimization.error && <Alert variant="destructive" role="alert">{optimization.error}<Button type="button" variant="outline" onClick={optimization.refresh}>Обновить статус оптимизации</Button></Alert>}
-    <OptimizationHistory algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} pageSize={5} pagination={false} onSelect={selectHistory} onDelete={requestDelete} actions={<div className="flex flex-wrap gap-2">
-      <Button id={optimizerTriggerId} type="button" variant="outline" aria-label={`Запустить новую оптимизацию ${displayName}`} onClick={() => { setHistoryOpen(false); setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setOptimizationOpen(true); }}>Запустить новую оптимизацию</Button>
-      <Button id={historyTriggerId} type="button" variant="outline" onClick={() => { setOptimizationOpen(false); setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setHistoryOpen(true); }}>Посмотреть весь список</Button>
+    <OptimizationHistory id={historyRegionId} algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} active={selected && liveMode === "flexible" && selectedHistory?.open !== true && selectedDeleteTarget === null} onSelect={selectHistory} onDelete={requestDelete} actions={<div className="flex flex-wrap gap-2">
+      <Button id={optimizerTriggerId} type="button" variant="outline" aria-label={`Запустить новое исследование ${displayName}`} onClick={() => { setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setOptimizationOpen(true); }}>Запустить новое исследование</Button>
     </div>} />
     </section>
     </div>
   </form>
-    <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
-      <DialogContent id={historyDialogId} tabIndex={-1} className="max-w-[96rem]" onCloseAutoFocus={(event) => { event.preventDefault(); document.getElementById(historyTriggerId)?.focus(); }}>
-        <DialogHeader><DialogTitle>Все оптимизации · {displayName}</DialogTitle><DialogDescription>Полная история исследований алгоритма. ID открывает сохранённый результат, не закрывая список.</DialogDescription></DialogHeader>
-        <div className="grid min-w-0 gap-4">
-          {optimization.error && <Alert variant="destructive" role="alert">{optimization.error}<Button type="button" variant="outline" onClick={optimization.refresh}>Обновить статус оптимизации</Button></Alert>}
-          {historyOpen && <OptimizationHistory algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} pageSize={10} active={selectedHistory?.open !== true && selectedDeleteTarget === null} onSelect={selectHistory} onDelete={requestDelete} />}
-        </div>
-      </DialogContent>
-    </Dialog>
     <AlgorithmOptimizer algorithm={optimizerAlgorithm} controller={optimization} open={optimizationOpen} onOpenChange={setOptimizationOpen} returnFocusId={optimizerTriggerId} onDelete={requestDelete} />
-    <OptimizationStudyDialog id={selectedHistory?.id} algorithm={algorithm} controller={optimization} open={selectedHistory?.open === true} onOpenChange={(open) => setHistorySelection((previous) => previous ? { ...previous, open } : null)} returnFocusId={selectedHistory?.triggerId ?? optimizerTriggerId} fallbackFocusId={historyOpen ? historyDialogId : optimizerTriggerId} onDelete={requestDelete} />
-    <OptimizationDeleteDialog target={selectedDeleteTarget} controller={optimization} onClose={() => setDeleteTarget(null)} onDeleted={(id) => {
+    <OptimizationStudyDialog id={selectedHistory?.id} algorithm={algorithm} controller={optimization} open={selectedHistory?.open === true} onOpenChange={(open) => setHistorySelection((previous) => previous ? { ...previous, open } : null)} returnFocusId={selectedHistory?.triggerId ?? historyRegionId} fallbackFocusId={historyRegionId} onDelete={requestDelete} />
+    <OptimizationDeleteDialog target={selectedDeleteTarget} controller={optimization} fallbackFocusId={historyRegionId} onClose={() => setDeleteTarget(null)} onDeleted={(id) => {
       if (historySelection?.id === id) setHistorySelection(null);
       if (optimization.byAlgorithm[algorithm.id]?.id === id) setOptimizationOpen(false);
       setDeleteTarget(null);

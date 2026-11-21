@@ -10,6 +10,11 @@ export interface StatusContext { status: PlatformState<ServiceStatus>; refresh: 
 export const marketDataLabel = (value: ServiceStatus["marketData"]): string => ({ ready: "готов", not_ready: "не готов", unreachable: "недоступен" })[value];
 
 const StatusContextValue = createContext<StatusContext | null>(null);
+const ApplicationLoadContext = createContext<{ loadedAtUnix: number; interfaceReady: boolean } | null>(null);
+
+export function useApplicationLoad() {
+  return useContext(ApplicationLoadContext);
+}
 
 /** Service status shared by the layout with mounted pages. */
 export function useStatus(): StatusContext {
@@ -19,6 +24,8 @@ export function useStatus(): StatusContext {
 }
 
 export function AppLayout() {
+  const [loadedAtUnix] = useState(() => Math.floor(Date.now() / 1000));
+  const [interfaceReady, setInterfaceReady] = useState(false);
   const [status, setStatus] = useState<PlatformState<ServiceStatus>>({ kind: "loading" });
   const [revision, setRevision] = useState(0);
   useEffect(() => {
@@ -30,7 +37,9 @@ export function AppLayout() {
   useEffect(() => {
     let cancelled = false;
     void fetchPlatform<{ value: { interface?: unknown } }>("/v1/settings/ui").then((result) => {
-      if (!cancelled && result.kind === "ready" && result.data.value.interface !== undefined) applyInterfaceSettings(result.data.value.interface);
+      if (cancelled) return;
+      if (result.kind === "ready" && result.data.value.interface !== undefined) applyInterfaceSettings(result.data.value.interface);
+      setInterfaceReady(true);
     });
     return () => { cancelled = true; };
   }, []);
@@ -46,7 +55,9 @@ export function AppLayout() {
       <Button asChild variant="navigation" size="sm"><NavLink to="/history">История и сбор</NavLink></Button>
     </>} status={<>Сервис данных: {status.kind === "ready" ? marketDataLabel(status.data.marketData) : status.kind === "loading" ? "проверка…" : "статус недоступен"}</>}>
       <StatusContextValue.Provider value={{ status, refresh }}>
-        <Outlet />
+        <ApplicationLoadContext.Provider value={{ loadedAtUnix, interfaceReady }}>
+          <Outlet />
+        </ApplicationLoadContext.Provider>
       </StatusContextValue.Provider>
     </AppFrame>
   );

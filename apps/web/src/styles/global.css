@@ -38,6 +38,11 @@
     0%, 100% { opacity: 1; }
     50% { opacity: 0.6; }
   }
+  --animate-skeleton-shimmer: skeleton-shimmer 1.8s ease-in-out infinite;
+  @keyframes skeleton-shimmer {
+    from { background-position: 200% 0; }
+    to { background-position: -200% 0; }
+  }
 }
 
 body {
@@ -54,6 +59,9 @@ body {
   }
   [data-slot="app-main"]:has(> [data-slot="page-card"] [data-page-path="/algorithms"]:not([hidden])) {
     max-width: none;
+  }
+  [data-slot="app-main"]:has(> [data-slot="page-card"] [data-page-path="/setups"]:not([hidden])) {
+    max-width: calc(1920px + 3rem);
   }
 }
 
