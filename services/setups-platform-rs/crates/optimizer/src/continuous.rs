@@ -211,6 +211,9 @@ pub struct ContinuousSelectedDaily {
 /// and causal/gap rules. It must never denote the actual OPEN-entry evaluator.
 pub const CONTINUOUS_SELECTED_MINUTES_VERSION: u32 = 1;
 pub const CONTINUOUS_SELECTED_MINUTES_EVALUATOR: &str = "original-historical-close-1";
+/// Manual clustering/maturity and gap handling remain those of evaluation.rs.
+/// Only the scalar minute accumulator is shared with continuous capture.
+pub const MANUAL_SELECTED_MINUTES_EVALUATOR: &str = "original-manual-close-1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -348,11 +351,12 @@ impl SelectedDailyCapture {
 // max_setups_per_candidate (normally 100k), never an actual-job candle limit.
 // Sorting/folding reuse this allocation; no candle/setup references escape. All
 // cancellation/error paths drop it, and successful ownership moves to the DTO.
-struct SelectedMinuteCapture {
+pub(crate) struct SelectedMinuteCapture {
     pair: ContinuousCaptureCell,
-    cell_index: usize,
+    pub(crate) cell_index: usize,
     capacity: usize,
     points: Vec<ContinuousSelectedMinute>,
+    evaluator: &'static str,
 }
 
 impl SelectedMinuteCapture {
@@ -381,20 +385,33 @@ impl SelectedMinuteCapture {
             cell_index: daily.cell_index,
             capacity,
             points: Vec::with_capacity(capacity),
+            evaluator: CONTINUOUS_SELECTED_MINUTES_EVALUATOR,
         })
     }
+
+    pub(crate) fn manual(spec:&StudyRequest,pair:ContinuousCaptureCell,capacity:usize,limits:&StudyLimits)->Result<Self,StudyError> {
+        let tp=spec.tp_levels.iter().position(|v|*v==pair.tp_pct);
+        let sl=spec.sl_levels.iter().position(|v|*v==pair.sl_pct);
+        let (Some(tp),Some(sl))=(tp,sl) else {return Err(invalid("manual selected minute pair is outside original axes"));};
+        if !(pair.tp_pct/pair.sl_pct).is_finite() {return Err(invalid("manual selected minute R must be finite"));}
+        limit("selected_minute_points",capacity,limits.max_setups_per_candidate.min(100_000))?;
+        limit("manual_minute_working_bytes",Self::budget_bytes(capacity),limits.max_working_bytes)?;
+        Ok(Self{pair,cell_index:tp*spec.sl_levels.len()+sl,capacity,points:Vec::with_capacity(capacity),evaluator:MANUAL_SELECTED_MINUTES_EVALUATOR})
+    }
+
+    pub(crate) fn working_bytes(&self)->usize {Self::budget_bytes(self.capacity)}
 
     fn output_bytes(capacity: usize) -> usize {
         capacity.saturating_mul(Self::JSON_POINT_BYTES).saturating_add(Self::JSON_HEADER_BYTES)
     }
 
-    fn budget_bytes(capacity: usize) -> usize {
+    pub(crate) fn budget_bytes(capacity: usize) -> usize {
         capacity.saturating_mul(size_of::<ContinuousSelectedMinute>())
             .saturating_add(size_of::<Self>() + size_of::<ContinuousSelectedMinutes>())
             .saturating_add(Self::output_bytes(capacity))
     }
 
-    fn record(&mut self, signal_close: i64, before: (usize, usize), after: &MatrixCell) -> Result<(), StudyError> {
+    pub(crate) fn record(&mut self, signal_close: i64, before: (usize, usize), after: &MatrixCell) -> Result<(), StudyError> {
         let tp = after.tp_count.checked_sub(before.0);
         let sl = after.sl_count.checked_sub(before.1);
         let (Some(tp), Some(sl)) = (tp, sl) else {
@@ -416,7 +433,7 @@ impl SelectedMinuteCapture {
         Ok(())
     }
 
-    fn finish(mut self, matrix: &[MatrixCell], control: &Control<'_>) -> Result<Option<ContinuousSelectedMinutes>, StudyError> {
+    pub(crate) fn finish(mut self, matrix: &[MatrixCell], control: &Control<'_>) -> Result<Option<ContinuousSelectedMinutes>, StudyError> {
         if control.stopped() { return Ok(None); }
         // In-place, allocation-free bounded sort. Cancellation is checked before
         // and after it and every 128 events while folding, never returning a
@@ -459,7 +476,7 @@ impl SelectedMinuteCapture {
         if control.stopped() { return Ok(None); }
         Ok(Some(ContinuousSelectedMinutes {
             version: CONTINUOUS_SELECTED_MINUTES_VERSION,
-            evaluator: CONTINUOUS_SELECTED_MINUTES_EVALUATOR.into(),
+            evaluator: self.evaluator.into(),
             tp_pct: self.pair.tp_pct,
             sl_pct: self.pair.sl_pct,
             points: self.points,

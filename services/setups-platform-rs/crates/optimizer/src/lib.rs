@@ -24,6 +24,7 @@ pub use input_codec::{
     FrozenInputCodecLimits, FrozenInputDigest, read_frozen_input, write_frozen_input,
 };
 pub use search::run_study;
+pub use search::run_study_with_original_minutes;
 pub use search::search_continuous_resumable;
 pub use setups_replay::CancelToken;
 pub use types::*;

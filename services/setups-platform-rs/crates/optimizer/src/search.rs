@@ -560,6 +560,26 @@ pub fn run_study(
     run_study_mode(spec, input, limits, cancel, progress, None)
 }
 
+/// Manual runtime entry point with an independently owned immutable archive.
+/// Captures only a prospective incumbent, within the SAME deadline/cancel token,
+/// before best+ledger are promoted together. A failed capture keeps the previous
+/// complete pair. The scientific result/progress/checkpoint schemas are unchanged.
+pub fn run_study_with_original_minutes(
+    spec:&StudyRequest,input:&StudyInput,limits:&StudyLimits,cancel:&CancelToken,
+    progress:impl FnMut(StudyUpdate),
+)->Result<(StudyOutcome,Option<ManualOriginalArchive>),StudyError> {
+    let observation_cutoff=crate::evaluation::manual_forecast_observation_cutoff(spec,input)?;
+    let mut minutes=None;
+    let exit=run_engine(spec,input,limits,cancel,progress,EngineMode{
+        continuous:None,resume:None,manual_minutes:Some(&mut minutes),
+        #[cfg(test)] manual_capture_observer:None,
+    })?;
+    match exit {
+        ContinuousSearchExit::Completed(outcome)=>Ok((outcome,minutes.map(|minutes|ManualOriginalArchive{observation_cutoff,minutes}))),
+        ContinuousSearchExit::Suspended(_)=>Err(StudyError::Execution("unexpected manual suspension".into())),
+    }
+}
+
 pub(crate) fn run_study_mode(
     spec: &StudyRequest,
     input: &StudyInput,
@@ -577,6 +597,8 @@ pub(crate) fn run_study_mode(
         EngineMode {
             continuous,
             resume: None,
+            manual_minutes:None,
+            #[cfg(test)] manual_capture_observer:None,
         },
     )? {
         ContinuousSearchExit::Completed(outcome) => Ok(outcome),
@@ -595,6 +617,10 @@ struct ResumeHooks<'a> {
 struct EngineMode<'a> {
     continuous: Option<ContinuousContext>,
     resume: Option<ResumeHooks<'a>>,
+    manual_minutes:Option<&'a mut Option<ContinuousSelectedMinutes>>,
+    // A scoped unit-test probe, never compiled into the native runtime or DTOs.
+    #[cfg(test)]
+    manual_capture_observer:Option<&'a mut dyn FnMut(usize,usize,Instant)>,
 }
 
 /// Continuous-only private recovery. Callback MUST durably commit/ack before
@@ -618,6 +644,8 @@ pub fn search_continuous_resumable(
         progress,
         EngineMode {
             continuous: Some(context),
+            manual_minutes:None,
+            #[cfg(test)] manual_capture_observer:None,
             resume: Some(ResumeHooks {
                 control,
                 checkpoint: &mut checkpoint,
@@ -666,6 +694,9 @@ fn run_engine(
     let serialized_bytes = serde_json::to_vec(spec)
         .map_err(|error| invalid(error.to_string()))?
         .len();
+    let manual_archive_bytes = if mode.manual_minutes.is_some() {
+        crate::continuous::SelectedMinuteCapture::budget_bytes(limits.max_setups_per_candidate.min(100_000))
+    } else { 0 };
     // Include bounded search identities/coordinates plus a retained incumbent
     // matrix in the working reservation, before allocating a Rayon pool.
     let search_bytes = serialized_bytes
@@ -679,7 +710,10 @@ fn run_engine(
                 * spec.sl_levels.len()
                 * std::mem::size_of::<MatrixCell>()
                 * (limits.batch_size + 2),
-        );
+        )
+        // The current incumbent's scalar vector plus one temporary promotion
+        // capture/encode reservation. No input/setup references or trial cache.
+        .saturating_add(manual_archive_bytes.saturating_mul(2));
     limit(
         "search_working_bytes",
         search_bytes,
@@ -999,6 +1033,39 @@ fn run_engine(
                 .is_some_and(|score| (continuous.is_some() || spec.trend_mode.is_mean() || score > spec.min_forecast_expectancy)
                     && best.as_ref().is_none_or(|old| score > old.score));
             let incumbent = if improves {
+                if let Some(archive)=mode.manual_minutes.as_deref_mut() {
+                    let pair=if spec.forecast.is_some() {
+                        select_robust_cell_for_mode(&evaluation.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell,spec.trend_mode)
+                    }else{select_robust_cell(&evaluation.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell)}?;
+                    let captured=if let Some(pair)=pair {
+                        let mut promotion_limits=limits.clone();
+                        // The evaluator charges its collector itself. Reuse the
+                        // temporary allowance already held in search_bytes;
+                        // the incumbent reservation remains unavailable to it.
+                        promotion_limits.max_working_bytes=limits.max_working_bytes
+                            .checked_sub(search_bytes)
+                            .and_then(|remaining|remaining.checked_add(manual_archive_bytes))
+                            .ok_or_else(||StudyError::Execution("manual promotion working reservation is inconsistent".into()))?;
+                        #[cfg(test)]
+                        let mut closed=0;
+                        #[cfg(test)]
+                        let mut observe=|| {
+                            closed+=1;
+                            if let Some(observer)=mode.manual_capture_observer.as_deref_mut() {
+                                observer(trial,closed,control.deadline);
+                            }
+                        };
+                        let Some((verified,minutes))=crate::evaluation::evaluate_manual_with_minutes(
+                            spec,input,&batch[index].candidate,ContinuousCaptureCell{tp_pct:pair.tp_pct,sl_pct:pair.sl_pct},
+                            evaluation.summary.setup_count,&promotion_limits,stats.as_ref().expect("validated stats"),&control,
+                            #[cfg(test)] Some(&mut observe),
+                        )? else {interrupted=true;continue;};
+                        if verified!=evaluation {return Err(StudyError::Execution("manual incumbent capture differs from completed candidate".into()));}
+                        Some(minutes)
+                    }else{None};
+                    if control.stopped() {interrupted=true;continue;}
+                    *archive=captured;
+                }
                 best = Some(make_best(
                     spec,
                     input,
@@ -1431,6 +1498,188 @@ mod tests {
     use super::*;
     use rand::{SeedableRng, rngs::StdRng};
     use serde_json::json;
+
+    fn manual_fixture() -> (StudyRequest,StudyInput) {
+        const T0:i64=1_699_999_980;
+        let minute=|n:i64|T0+n*60;
+        let params=setups_domain::SpikeParams{baseline_long_days:1,baseline_short_days:1,..Default::default()};
+        let spec:StudyRequest=serde_json::from_value(json!({
+            "algorithmId":"price_volume_spike","algorithmVersion":"1.1.1","algorithmParams":params,
+            "analyticsParams":{"clusterEnabled":false,"clusterGapMinutes":480,"timeShiftMinutes":0,"priceChangePct":null},
+            "analyticsSearch":{"clusterEnabled":[true]},
+            "instruments":[{"exchange":"bybit","category":"linear","symbol":"FIXTUREUSDT"}],
+            "fromUnix":minute(1440),"toUnix":minute(1500),"direction":"long","seed":42,
+            "tpLevels":[20.0],"slLevels":[1.0],"horizonMinutes":30,"minClosedPerCell":1,
+            "minSetupsPerDay":0.0,"maxTrials":2,"maxSeconds":30
+        })).unwrap();
+        let mut bars=Vec::new();let mut candles=Vec::new();
+        for n in 0i64..1560 {
+            let exponent=((n.min(1464)-1434)/5).max(0) as i32;
+            let close=format!("{:.8}",100.0*1.13f64.powi(exponent));
+            let price=close.parse::<f64>().unwrap();
+            bars.push(setups_domain::DetectorBar{open_time_unix:minute(n),close,
+                quote_turnover:if (1435..1465).contains(&n) {"3000"} else {"10"}.into()});
+            candles.push(setups_analytics::OhlcCandle{open_time_unix:minute(n),open:price,close:price,
+                high:price*1.25,low:if n==1465 {price*0.5} else {price}});
+        }
+        let input=StudyInput{instruments:vec![InstrumentInput{instrument:spec.instruments[0].clone(),detector_bars:bars,candles}],
+            snapshot_hash:"manual-promotion-fixture".into(),captured_at:"2026-11-21T00:00:00Z".into()};
+        (spec,input)
+    }
+
+    #[test]
+    fn manual_newer_promotion_interruption_keeps_complete_incumbent_and_archive() {
+        let (spec,input)=manual_fixture();
+        let limits=StudyLimits{cpu_threads:1,batch_size:1,max_setups_per_candidate:6,..Default::default()};
+        let mut baseline_spec=spec.clone();baseline_spec.max_trials=1;
+        let (baseline,baseline_archive)=run_study_with_original_minutes(&baseline_spec,&input,&limits,&CancelToken::new(),|_|{}).unwrap();
+        let baseline=baseline.best.unwrap();let baseline_archive=baseline_archive.unwrap().minutes;
+        let (complete,_)=run_study_with_original_minutes(&spec,&input,&limits,&CancelToken::new(),|_|{}).unwrap();
+        let legacy=run_study(&spec,&input,&limits,&CancelToken::new(),|_|{}).unwrap();
+        assert_eq!(complete.best,legacy.best,"completed multi-promotion science is unchanged");
+        assert_eq!(complete.baseline,legacy.baseline);assert_eq!(complete.reason,legacy.reason);
+        assert!(complete.best.as_ref().unwrap().score>baseline.score,"fixture must really promote a newer candidate");
+        assert_eq!(complete.best.unwrap().trial_index,1);
+        for timeout in [false,true] {
+            let mut request=spec.clone();if timeout {request.max_seconds=1;}
+            let token=CancelToken::new();let mut archive=None;let mut reached=None;let mut promotions=Vec::new();
+            let mut observer=|trial,closed,deadline:Instant| {
+                if trial==1 && closed==1 {
+                    reached=Some((trial,closed));
+                    if timeout {std::thread::sleep(deadline.saturating_duration_since(Instant::now()));}
+                    else {token.cancel();}
+                }
+            };
+            let exit=run_engine(&request,&input,&limits,&token,|update| {
+                if let Some(best)=update.incumbent {promotions.push(best.trial_index);}
+            },EngineMode{continuous:None,resume:None,manual_minutes:Some(&mut archive),manual_capture_observer:Some(&mut observer)}).unwrap();
+            let ContinuousSearchExit::Completed(outcome)=exit else {panic!("manual study cannot suspend");};
+            assert_eq!(reached,Some((1,1)),"interruption is inside the real newer capture");
+            assert_eq!(outcome.reason,if timeout {TerminationReason::TimeBudget} else {TerminationReason::Cancelled});
+            assert_eq!(promotions,vec![0],"incomplete newer candidate must never be published");
+            let best=outcome.best.unwrap();assert_eq!(best.trial_index,baseline.trial_index);
+            assert_eq!(best.score,baseline.score);assert_eq!(best.params,baseline.params);
+            assert_eq!(best.analytics,baseline.analytics);assert_eq!(best.matrix,baseline.matrix);
+            assert_eq!(archive.unwrap(),baseline_archive,"prior ledger survives byte-for-byte");
+            assert_eq!(outcome.detector_passes,4,"two evaluations and two captures, no post-stop pass");
+        }
+    }
+
+    #[test]
+    fn manual_archive_point_and_byte_boundaries_and_empty_pair_are_explicit() {
+        use crate::continuous::SelectedMinuteCapture;
+        let (spec,_)=manual_fixture();let pair=ContinuousCaptureCell{tp_pct:20.0,sl_pct:1.0};
+        let bytes=SelectedMinuteCapture::budget_bytes(6);
+        let mut limits=StudyLimits{max_setups_per_candidate:6,max_working_bytes:bytes-1,..Default::default()};
+        assert_eq!(SelectedMinuteCapture::manual(&spec,pair,6,&limits).err(),Some(StudyError::ResourceLimit{
+            resource:"manual_minute_working_bytes".into(),limit:bytes-1,requested:bytes}));
+        limits.max_working_bytes=bytes;
+        assert!(SelectedMinuteCapture::manual(&spec,pair,6,&limits).is_ok());
+        assert!(matches!(SelectedMinuteCapture::manual(&spec,pair,7,&limits),Err(StudyError::ResourceLimit{resource,limit:6,requested:7}) if resource=="selected_minute_points"));
+        let unlimited=StudyLimits{max_setups_per_candidate:100_001,..Default::default()};
+        assert!(matches!(SelectedMinuteCapture::manual(&spec,pair,100_001,&unlimited),Err(StudyError::ResourceLimit{resource,limit:100_000,requested:100_001}) if resource=="selected_minute_points"));
+        let token=CancelToken::new();let passes=AtomicUsize::new(0);
+        let control=Control{cancel:&token,deadline:Instant::now()+Duration::from_secs(30),detector_passes:&passes};
+        let mut matrix=crate::evaluation::empty_matrix(&spec);
+        let empty=SelectedMinuteCapture::manual(&spec,pair,0,&limits).unwrap().finish(&matrix,&control).unwrap().unwrap();
+        assert!(empty.points.is_empty(),"selected-but-empty capture is Some, not interrupted None");
+        assert_eq!(empty.evaluator,MANUAL_SELECTED_MINUTES_EVALUATOR);
+        assert!(select_robust_cell(&matrix,&spec.tp_levels,&spec.sl_levels,1).unwrap().is_none(),"existing selector cannot admit an empty winner");
+        let mut capture=SelectedMinuteCapture::manual(&spec,pair,6,&limits).unwrap();
+        for n in 0..6 {matrix[0].tp_count+=1;capture.record(spec.from_unix,(n,0),&matrix[0]).unwrap();}
+        matrix[0].closed_count=6;
+        assert!(matches!(capture.record(spec.from_unix,(5,0),&matrix[0]),Err(StudyError::ResourceLimit{limit:6,requested:7,..})));
+        let archive=capture.finish(&matrix,&control).unwrap().unwrap();
+        assert_eq!(archive.points.len(),1);assert_eq!(archive.points.capacity(),6);
+        assert_eq!((archive.points[0].closed_count,archive.points[0].tp_count,archive.points[0].sum_r),(6,6,120.0));
+        assert!(serde_json::to_vec(&archive).unwrap().len()<=256+6*256,"encoding stays within reserved output bytes");
+    }
+
+    #[test]
+    fn manual_search_reserves_both_archives_and_returns_an_owned_frozen_snapshot() {
+        use crate::continuous::SelectedMinuteCapture;
+        let (mut spec,mut input)=manual_fixture();spec.max_trials=1;
+        let limits=StudyLimits{cpu_threads:1,batch_size:1,max_setups_per_candidate:6,max_working_bytes:1,..Default::default()};
+        let requested=|error:StudyError|match error {StudyError::ResourceLimit{resource,requested,..}=>{assert_eq!(resource,"search_working_bytes");requested},error=>panic!("unexpected {error:?}")};
+        let old=requested(run_study(&spec,&input,&limits,&CancelToken::new(),|_|{}).unwrap_err());
+        let new=requested(run_study_with_original_minutes(&spec,&input,&limits,&CancelToken::new(),|_|{}).unwrap_err());
+        assert_eq!(new-old,2*SelectedMinuteCapture::budget_bytes(6));
+        let tight=StudyLimits{max_working_bytes:new,..limits.clone()};
+        assert!(matches!(run_study_with_original_minutes(&spec,&input,&tight,&CancelToken::new(),|_|{}),Err(StudyError::ResourceLimit{resource,..}) if resource=="candidate_working_bytes"));
+        let limits=StudyLimits{max_working_bytes:128*1024*1024,..limits};
+        let before=format!("{input:?}");
+        let (outcome,archive)=run_study_with_original_minutes(&spec,&input,&limits,&CancelToken::new(),|_|{}).unwrap();
+        assert_eq!(format!("{input:?}"),before);
+        let archive=archive.unwrap();let saved=archive.clone();
+        assert!(archive.observation_cutoff>spec.to_unix,"manual observation retains the post-signal full horizon");
+        assert_eq!(archive.observation_cutoff,required_input_bounds(&spec).unwrap().candles_to_unix);
+        assert!(!serde_json::to_string(&outcome).unwrap().contains("original-manual-close-1"));
+        drop(outcome);input.instruments.clear();drop(input);drop(spec);
+        assert_eq!(archive,saved,"archive owns only scalar values and outlives all search/input owners");
+    }
+
+    #[test]
+    fn manual_zero_closed_matrix_cannot_manufacture_a_winner_or_archive() {
+        let (mut spec,input)=manual_fixture();spec.max_trials=1;
+        // With zero shift the unchanged positive gate rejects the zero move.
+        spec.analytics_params.price_change_pct=Some(1.0);
+        let limits=StudyLimits{cpu_threads:1,batch_size:1,max_setups_per_candidate:6,..Default::default()};
+        let candidate=StudyCandidate{params:spec.algorithm_params.clone(),analytics:spec.analytics_params.clone()};
+        let evaluated=crate::evaluate_candidate(&spec,&input,&candidate,&limits,&CancelToken::new()).unwrap().unwrap();
+        assert_eq!(evaluated.matrix[0].closed_count,0);
+        assert_eq!(evaluated.matrix[0].price_change_filtered_count,6);
+        assert!(select_robust_cell(&evaluated.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell).unwrap().is_none());
+        let (outcome,archive)=run_study_with_original_minutes(&spec,&input,&limits,&CancelToken::new(),|_|{}).unwrap();
+        assert!(outcome.best.is_none()&&archive.is_none());
+        assert_eq!(outcome.baseline,Some(evaluated.summary));
+    }
+
+    #[test]
+    fn manual_promotion_charges_the_reserved_temporary_archive_only_once() {
+        use crate::continuous::SelectedMinuteCapture;
+        let (spec,input)=manual_fixture();
+        let limits=StudyLimits{cpu_threads:1,batch_size:1,max_setups_per_candidate:6,..Default::default()};
+        let candidate=StudyCandidate{params:spec.algorithm_params.clone(),analytics:spec.analytics_params.clone()};
+        let token=CancelToken::new();
+        let requested=|error:StudyError,expected:&str|match error {
+            StudyError::ResourceLimit{resource,requested,..}=>{assert_eq!(resource,expected);requested},
+            error=>panic!("unexpected {error:?}"),
+        };
+        // Measure the unchanged standalone evaluator's real admission boundary
+        // from its base and first setup. All six fixture setups have equal size;
+        // exact success and one-byte-below failure below independently check T.
+        let tiny=StudyLimits{max_working_bytes:1,..limits.clone()};
+        let base=requested(crate::evaluate_candidate(&spec,&input,&candidate,&tiny,&token).unwrap_err(),"candidate_working_bytes");
+        let base_limit=StudyLimits{max_working_bytes:base,..limits.clone()};
+        let first=requested(crate::evaluate_candidate(&spec,&input,&candidate,&base_limit,&token).unwrap_err(),"candidate_working_bytes");
+        let evaluator=base+(first-base)*6;
+        let exact=StudyLimits{max_working_bytes:evaluator,..limits.clone()};
+        let evaluated=crate::evaluate_candidate(&spec,&input,&candidate,&exact,&token).unwrap().unwrap();
+        assert_eq!(evaluated.summary.setup_count,6);
+        let below=StudyLimits{max_working_bytes:evaluator-1,..limits.clone()};
+        assert_eq!(crate::evaluate_candidate(&spec,&input,&candidate,&below,&token).unwrap_err(),StudyError::ResourceLimit{
+            resource:"candidate_working_bytes".into(),limit:evaluator-1,requested:evaluator});
+        let search=requested(run_study(&spec,&input,&tiny,&token,|_|{}).unwrap_err(),"search_working_bytes");
+        let archive=SelectedMinuteCapture::budget_bytes(6);
+        let needed=search+2*archive+evaluator;
+        let cap=StudyLimits{max_working_bytes:needed,..limits.clone()};
+        let mut promotions=Vec::new();
+        let result=run_study_with_original_minutes(&spec,&input,&cap,&token,|update| {
+            if let Some(best)=update.incumbent {promotions.push(best.trial_index);}
+        });
+        assert!(result.is_ok(),"S0={search}, A={archive}, T={evaluator}, global={needed} fits two archives, not three: {result:?}");
+        let (outcome,ledger)=result.unwrap();
+        assert_eq!(promotions,vec![0,1],"the boundary must allow real replacement of an existing incumbent");
+        assert_eq!(outcome.detector_passes,4);
+        let legacy=run_study(&spec,&input,&limits,&token,|_|{}).unwrap();
+        assert_eq!(outcome.best,legacy.best);assert_eq!(outcome.baseline,legacy.baseline);
+        let ledger=ledger.unwrap().minutes;let best=outcome.best.unwrap();
+        assert_eq!(ledger.points.iter().map(|point|point.closed_count).sum::<u64>(),best.matrix[0].closed_count as u64);
+        let below=StudyLimits{max_working_bytes:needed-1,..limits};
+        assert_eq!(run_study_with_original_minutes(&spec,&input,&below,&token,|_|{}).unwrap_err(),StudyError::ResourceLimit{
+            resource:"candidate_working_bytes".into(),limit:evaluator-1,requested:evaluator});
+        eprintln!("manual promotion boundary: S0={search}, A={archive}, T={evaluator}, accepted={needed}, rejected={}",needed-1);
+    }
 
     fn toy_spec() -> StudyRequest {
         serde_json::from_value(json!({

@@ -534,6 +534,34 @@ pub(crate) fn evaluate_group(
     stats: &InputStats,
     control: &Control<'_>,
 ) -> Result<Vec<Option<CandidateEvaluation>>, StudyError> {
+    evaluate_group_inner(spec,input,candidates,limits,stats,control,None,
+        #[cfg(test)] None,
+    )
+}
+
+/// A single incumbent promotion owns the temporary capture. The unchanged
+/// manual classifier supplies counter deltas; no continuous trade semantics or
+/// per-trial archives are introduced. None means interrupted, never partial.
+pub(crate) fn evaluate_manual_with_minutes(
+    spec:&StudyRequest,input:&StudyInput,candidate:&StudyCandidate,pair:ContinuousCaptureCell,
+    capacity:usize,limits:&StudyLimits,stats:&InputStats,control:&Control<'_>,
+    #[cfg(test)] on_closed:Option<&mut dyn FnMut()>,
+)->Result<Option<(CandidateEvaluation,ContinuousSelectedMinutes)>,StudyError> {
+    if control.stopped() {return Ok(None);}
+    let mut minutes=crate::continuous::SelectedMinuteCapture::manual(spec,pair,capacity,limits)?;
+    let Some(evaluation)=evaluate_group_inner(spec,input,&[candidate],limits,stats,control,Some(&mut minutes),
+        #[cfg(test)] on_closed,
+    )?
+        .into_iter().next().flatten() else {return Ok(None);};
+    let Some(minutes)=minutes.finish(&evaluation.matrix,control)? else {return Ok(None);};
+    Ok(Some((evaluation,minutes)))
+}
+
+fn evaluate_group_inner(
+    spec:&StudyRequest,input:&StudyInput,candidates:&[&StudyCandidate],limits:&StudyLimits,
+    stats:&InputStats,control:&Control<'_>,mut minutes:Option<&mut crate::continuous::SelectedMinuteCapture>,
+    #[cfg(test)] mut on_closed:Option<&mut dyn FnMut()>,
+) -> Result<Vec<Option<CandidateEvaluation>>, StudyError> {
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -557,6 +585,7 @@ pub(crate) fn evaluate_group(
     let base_bytes = detector_bytes
         .saturating_add(matrix_bytes)
         .saturating_add(DailyMatrix::working_bytes(spec)?.saturating_mul(candidates.len()))
+        .saturating_add(minutes.as_ref().map_or(0,|capture|capture.working_bytes()))
         .saturating_add(16 * 1024);
     limit(
         "candidate_working_bytes",
@@ -658,6 +687,9 @@ pub(crate) fn evaluate_group(
                 return Ok(interrupted());
             };
             for index in indexes {
+                let before=minutes.as_ref().map(|capture| {
+                    let cell=&matrices[candidate_index][capture.cell_index];(cell.tp_count,cell.sl_count)
+                });
                 if control.stopped()
                     || !accumulate_setup_with_daily(
                         spec,
@@ -671,6 +703,17 @@ pub(crate) fn evaluate_group(
                     )
                 {
                     return Ok(interrupted());
+                }
+                if let Some(capture)=minutes.as_deref_mut() {
+                    let before=before.expect("capture counter snapshot");
+                    let after=&matrices[candidate_index][capture.cell_index];
+                    capture.record(setups[index].close_time_unix,before,after)?;
+                    // Test-local fault injection runs only AFTER the real scalar
+                    // outcome is stored, while this promotion is still incomplete.
+                    #[cfg(test)]
+                    if (after.tp_count,after.sl_count)!=before {
+                        if let Some(observer)=on_closed.as_deref_mut() {observer();}
+                    }
                 }
             }
         }

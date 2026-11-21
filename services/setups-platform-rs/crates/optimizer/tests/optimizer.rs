@@ -132,6 +132,100 @@ fn six_setups_over_ten_days() -> (StudyRequest, StudyInput) {
 }
 
 #[test]
+fn manual_incumbent_archive_preserves_manual_matrix_maturity_gaps_and_frozen_input() {
+    let (mut spec,mut data)=six_setups_over_ten_days();
+    spec.min_setups_per_day=0.0;spec.max_trials=1;
+    // Manual evaluation intentionally retains its existing gap semantics.
+    data.instruments[0].candles.retain(|c|c.open_time_unix!=minute(1466));
+    let before=format!("{data:?}");
+    let limits=StudyLimits{cpu_threads:1,batch_size:1,..StudyLimits::default()};
+    let mut first_unclustered=None;
+    for (cluster,maturity,shift,gate) in [(false,0.0,0,None),(true,1.0,0,None),(true,0.5,1,Some(-100.0))] {
+        spec.analytics_params.cluster_enabled=cluster;spec.setup_maturity=maturity;
+        spec.analytics_params.time_shift_minutes=shift;spec.analytics_params.price_change_pct=gate;
+        let old=run_study(&spec,&data,&limits,&CancelToken::new(),|_|{}).unwrap();
+        let (new,archive)=run_study_with_original_minutes(&spec,&data,&limits,&CancelToken::new(),|_|{}).unwrap();
+        assert_eq!(old.baseline,new.baseline);assert_eq!(old.reason,new.reason);
+        let best=new.best.unwrap();let original=old.best.unwrap();
+        assert_eq!(best,original,"capture never changes objective, matrix, provenance or selection");
+        let archive=archive.expect("completed manual winner has a selected-pair archive");
+        assert_eq!(archive.observation_cutoff,manual_forecast_observation_cutoff(&spec,&data).unwrap());
+        let archive=archive.minutes;
+        assert_eq!(archive.evaluator,MANUAL_SELECTED_MINUTES_EVALUATOR);
+        assert_eq!(archive.version,CONTINUOUS_SELECTED_MINUTES_VERSION);
+        let selected=select_robust_cell(&best.matrix,&spec.tp_levels,&spec.sl_levels,spec.min_closed_per_cell).unwrap().unwrap();
+        assert_eq!((archive.tp_pct,archive.sl_pct),(selected.tp_pct,selected.sl_pct));
+        let cell=best.matrix.iter().find(|c|c.tp_pct==archive.tp_pct&&c.sl_pct==archive.sl_pct).unwrap();
+        assert_eq!(archive.points.iter().map(|p|p.tp_count).sum::<u64>(),cell.tp_count as u64);
+        assert_eq!(archive.points.iter().map(|p|p.sl_count).sum::<u64>(),cell.sl_count as u64);
+        assert!(archive.points.windows(2).all(|w|w[0].signal_close_unix<w[1].signal_close_unix));
+        assert!(archive.points.iter().all(|p|p.signal_close_unix>=spec.from_unix&&p.signal_close_unix<spec.to_unix&&p.closed_count==p.tp_count+p.sl_count));
+        let sum: f64=archive.points.iter().map(|p|p.sum_r).sum();
+        assert!((sum-(cell.tp_count as f64*archive.tp_pct/archive.sl_pct-cell.sl_count as f64)).abs()<1e-10);
+        if !cluster {first_unclustered=archive.points.first().map(|p|p.signal_close_unix);}
+        if cluster&&maturity==1.0 {assert!(archive.points[0].signal_close_unix>first_unclustered.unwrap(),"manual late maturity must not become continuous first-signal selection");}
+        assert_eq!(format!("{data:?}"),before);
+    }
+}
+
+#[test]
+fn manual_archive_cancel_keeps_the_completed_incumbent_and_never_extends_the_clock() {
+    let (mut spec,data)=six_setups_over_ten_days();spec.min_setups_per_day=0.0;
+    let limits=StudyLimits{cpu_threads:1,batch_size:1,..StudyLimits::default()};
+    let token=CancelToken::new();let mut completed=None;
+    let (outcome,archive)=run_study_with_original_minutes(&spec,&data,&limits,&token,|update| {
+        if let Some(best)=update.incumbent {completed=Some(best);token.cancel();}
+    }).unwrap();
+    assert_eq!(outcome.reason,TerminationReason::Cancelled);
+    let best=outcome.best.unwrap();assert_eq!(best.matrix,completed.unwrap().matrix);
+    let archive=archive.unwrap().minutes;assert_eq!(archive.evaluator,MANUAL_SELECTED_MINUTES_EVALUATOR);
+    assert_eq!(archive.points.iter().map(|p|p.closed_count).sum::<u64>(),best.matrix[0].closed_count as u64);
+    let token=CancelToken::new();token.cancel();
+    let (outcome,archive)=run_study_with_original_minutes(&spec,&data,&limits,&token,|_|{}).unwrap();
+    assert!(outcome.best.is_none()&&archive.is_none());
+    spec.max_seconds=1;
+    let (outcome,archive)=run_study_with_original_minutes(&spec,&data,&limits,&CancelToken::new(),|update| {
+        if update.incumbent.is_some() {std::thread::sleep(std::time::Duration::from_millis(1010));}
+    }).unwrap();
+    assert_eq!(outcome.reason,TerminationReason::TimeBudget);
+    assert!(outcome.best.is_some()&&archive.is_some(),"deadline keeps the already completed best+archive, without final capture");
+}
+
+#[test]
+fn manual_archive_memory_is_admitted_before_search_and_no_winner_allocates_no_ledger() {
+    let (mut spec,data)=six_setups_over_ten_days();
+    let limits=StudyLimits{max_working_bytes:512*1024,..StudyLimits::default()};
+    assert!(matches!(run_study_with_original_minutes(&spec,&data,&limits,&CancelToken::new(),|_|{}),Err(StudyError::ResourceLimit{..})));
+    spec.min_closed_per_cell=100;
+    let (outcome,archive)=run_study_with_original_minutes(&spec,&data,&StudyLimits::default(),&CancelToken::new(),|_|{}).unwrap();
+    assert!(outcome.best.is_none()&&archive.is_none());
+}
+
+#[test]
+fn manual_archive_keeps_original_outcomes_closing_after_the_signal_period() {
+    let (mut spec,mut data)=six_setups_over_ten_days();
+    spec.to_unix=minute(1466);spec.max_trials=1;spec.min_setups_per_day=0.0;
+    // The last signal closes at 1465, but its first TP is after the signal
+    // period. The original full horizon, not that period end, must classify it.
+    for candle in &mut data.instruments[0].candles {
+        if (minute(1465)..minute(1471)).contains(&candle.open_time_unix) {candle.high=candle.close;}
+    }
+    let limits=StudyLimits{cpu_threads:1,batch_size:1,max_setups_per_candidate:6,..Default::default()};
+    let old=run_study(&spec,&data,&limits,&CancelToken::new(),|_|{}).unwrap();
+    let (new,archive)=run_study_with_original_minutes(&spec,&data,&limits,&CancelToken::new(),|_|{}).unwrap();
+    assert_eq!(new.best,old.best);assert_eq!(new.baseline,old.baseline);
+    let best=new.best.unwrap();let archive=archive.unwrap();
+    assert_eq!(archive.observation_cutoff,required_input_bounds(&spec).unwrap().candles_to_unix);
+    assert!(archive.observation_cutoff>spec.to_unix);
+    assert!(archive.minutes.points.iter().any(|point|point.signal_close_unix==minute(1465)));
+    assert!(archive.minutes.points.iter().all(|point|point.signal_close_unix<spec.to_unix));
+    let mut truncated=data.clone();truncated.instruments[0].candles.retain(|candle|candle.open_time_unix<spec.to_unix);
+    let cropped=run_study(&spec,&truncated,&limits,&CancelToken::new(),|_|{}).unwrap().best.unwrap();
+    assert_eq!(best.matrix[0].tp_count,cropped.matrix[0].tp_count+1,"an original TP after toUnix is genuinely included");
+    assert_eq!(archive.minutes.points.iter().map(|point|point.tp_count).sum::<u64>(),best.matrix[0].tp_count as u64);
+}
+
+#[test]
 fn default_frequency_gate_rejects_six_selected_setups_over_ten_days_even_with_high_r() {
     let (spec, data) = six_setups_over_ten_days();
     let evaluated = evaluate_candidate(
