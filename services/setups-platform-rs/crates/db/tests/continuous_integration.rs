@@ -1592,7 +1592,7 @@ async fn adaptive_batch_atomic_order_local_indices_exact_ack_and_single_wrapper_
 #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn adaptive_batch_partial_cas_durable_readiness_global_fences_promotion_and_stop() {
     isolated(|pool|async move {
-        let close=chrono::Utc::now().timestamp().div_euclid(60)*60;
+        let mut close=chrono::Utc::now().timestamp().div_euclid(60)*60-600;
         let mut profile=adaptive_batch_profile(&pool,close).await;
         let seed=adaptive_batch_scan(&profile,"ETHUSDT",close-60);
         assert!(db::commit_adaptive_scan_cas(&pool,&profile,&seed.instrument_key,None,&seed.checkpoint,&seed.setups).await.unwrap().applied);
@@ -1606,14 +1606,24 @@ async fn adaptive_batch_partial_cas_durable_readiness_global_fences_promotion_an
         assert_eq!(db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.unwrap().iter().map(|r|r.applied).collect::<Vec<_>>(),vec![true,false,false,false]);
         for (disable,enable) in [
             ("update settings set value='{}' where key='live'","update settings set value='{\"enabled\":true}' where key='live'"),
-            ("update continuous_processes set config_revision=config_revision+1","update continuous_processes set config_revision=config_revision-1"),
-            ("update continuous_slots set enabled=false","update continuous_slots set enabled=true"),
-            ("update continuous_processes set config=jsonb_set(config,'{adaptiveEnabled}','false')","update continuous_processes set config=jsonb_set(config,'{adaptiveEnabled}','true')"),
+            ("update adaptive_profiles set control_revision=control_revision+1","update adaptive_profiles set control_revision=control_revision-1"),
+            ("update adaptive_profiles set desired_running=false","update adaptive_profiles set desired_running=true"),
+            ("update adaptive_live_permissions set enabled=false","update adaptive_live_permissions set enabled=true"),
         ] {
+            close+=60;
+            let mut fresh=adaptive_batch_scan(&profile,"BTCUSDT",close);
+            fresh.previous=db::get_adaptive_checkpoint(&pool,profile.slot_id,&fresh.instrument_key).await.unwrap();
             sqlx::query(disable).execute(&pool).await.unwrap();let before=adaptive_batch_state(&pool).await;
-            assert!(db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.unwrap().iter().all(|r|!r.applied&&r.inserted.is_empty()));
+            assert!(db::commit_adaptive_scans_cas(&pool,&profile,std::slice::from_ref(&fresh)).await.unwrap().iter().all(|r|!r.applied&&r.inserted.is_empty()));
             assert_eq!(adaptive_batch_state(&pool).await,before);sqlx::query(enable).execute(&pool).await.unwrap();
+            let unfenced=db::commit_adaptive_scans_cas(&pool,&profile,&[fresh]).await.unwrap();
+            assert!(unfenced[0].applied);assert_eq!(unfenced[0].inserted.len(),1,"the identical scan must be eligible without this fence");
         }
+        let mut catch_up=adaptive_batch_scan(&profile,"ETHUSDT",close);
+        catch_up.previous=db::get_adaptive_checkpoint(&pool,profile.slot_id,&catch_up.instrument_key).await.unwrap();
+        assert!(db::commit_adaptive_scans_cas(&pool,&profile,&[catch_up]).await.unwrap()[0].applied);
+        let mut old_scan=adaptive_batch_scan(&profile,"BTCUSDT",close+60);
+        old_scan.previous=db::get_adaptive_checkpoint(&pool,profile.slot_id,&old_scan.instrument_key).await.unwrap();
         let pending=pending_fixture(&pool,&profile).await;
         let fence=db::live::claim_pending_warmup_at(&pool,&pending,"batch-promotion",close).await.unwrap().unwrap();
         assert!(db::live::report_warmup(&pool,&fence,"ready",Some(close),None).await.unwrap());
@@ -1625,12 +1635,29 @@ async fn adaptive_batch_partial_cas_durable_readiness_global_fences_promotion_an
         let initial=[db::live::InitialAdaptiveCheckpoint {instrument_key:INSTRUMENT.into(),state:promotion_state(fence.generation_id,close)}];
         assert!(db::live::promote_pending(&pool,&fence,Some(profile.generation_id),&expected,close,&initial).await.unwrap());
         let before=adaptive_batch_state(&pool).await;
-        assert!(db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.unwrap().iter().all(|r|!r.applied));
+        // Use the new durable predecessor even for the old captured generation:
+        // rejection must come from its generation fence, not a stale cursor.
+        old_scan.previous=db::get_adaptive_checkpoint(&pool,profile.slot_id,&old_scan.instrument_key).await.unwrap();
+        assert!(!db::commit_adaptive_scans_cas(&pool,&profile,std::slice::from_ref(&old_scan)).await.unwrap()[0].applied);
         assert_eq!(adaptive_batch_state(&pool).await,before);
         let promoted=db::active_adaptive_slots(&pool,OWNER).await.unwrap().remove(0);
-        assert!(db::stop(&pool,OWNER,ALGORITHM).await.unwrap());let stopped=adaptive_batch_state(&pool).await;
-        let scan=adaptive_batch_scan(&promoted,"BTCUSDT",close+60);
-        assert!(!db::commit_adaptive_scans_cas(&pool,&promoted,&[scan]).await.unwrap()[0].applied);
+        old_scan.checkpoint=promotion_state(promoted.generation_id,close+60);
+        let unfenced=db::commit_adaptive_scans_cas(&pool,&promoted,&[old_scan]).await.unwrap();
+        assert!(unfenced[0].applied);assert_eq!(unfenced[0].inserted.len(),1);
+        assert!(db::stop(&pool,OWNER,ALGORITHM).await.unwrap());
+        let mut scan=adaptive_batch_scan(&promoted,"BTCUSDT",close+120);
+        scan.previous=db::get_adaptive_checkpoint(&pool,promoted.slot_id,&scan.instrument_key).await.unwrap();
+        let after_research_stop=db::commit_adaptive_scans_cas(&pool,&promoted,&[scan]).await.unwrap();
+        assert!(after_research_stop[0].applied);assert_eq!(after_research_stop[0].inserted.len(),1,"research Stop does not stop independent live");
+        let mut scan=adaptive_batch_scan(&promoted,"BTCUSDT",close+180);
+        scan.previous=db::get_adaptive_checkpoint(&pool,promoted.slot_id,&scan.instrument_key).await.unwrap();
+        let command=db::profiles::ProfileCommand {expected_revision:promoted.config_revision,expected_generation_id:promoted.generation_id,request_id:"batch-profile-stop-0001".into()};
+        assert!(matches!(db::profiles::command(&pool,OWNER,promoted.slot_id,false,&command).await.unwrap(),db::profiles::CommandOutcome::Applied(_)));
+        let stopped=adaptive_batch_state(&pool).await;
+        assert!(!db::commit_adaptive_scans_cas(&pool,&promoted,std::slice::from_ref(&scan)).await.unwrap()[0].applied);
+        // Even a caller that refreshes the revision cannot bypass desiredRunning.
+        let mut stopped_profile=promoted.clone();stopped_profile.config_revision+=1;
+        assert!(!db::commit_adaptive_scans_cas(&pool,&stopped_profile,&[scan]).await.unwrap()[0].applied);
         assert_eq!(adaptive_batch_state(&pool).await,stopped);
     }).await;
 }
@@ -1806,14 +1833,11 @@ async fn pending_fixture(
     result["bootstrap"] = json!({"frozenPrefix":{"version":1}});
     sqlx::query("update continuous_generations g set study_id=$2,accepted=true,result=$3,config_revision=p.config_revision,spec=p.config->'study' from continuous_processes p where g.id=$1 and p.owner_id=g.owner_id and p.algorithm_id=g.algorithm_id")
         .bind(generation).bind(active.study_id).bind(result).execute(pool).await.unwrap();
-    sqlx::query(
-        "update continuous_slots set pending_generation_id=$2,pending_status='warming' where id=$1",
-    )
-    .bind(active.slot_id)
-    .bind(generation)
-    .execute(pool)
-    .await
-    .unwrap();
+    sqlx::query("insert into adaptive_profile_handoffs(generation_id,owner_id,slot_id) values($1,$2,$3)")
+        .bind(generation).bind(OWNER).bind(active.slot_id).execute(pool).await.unwrap();
+    assert_eq!(db::profiles::accept_handoffs(pool,OWNER).await.unwrap(),1);
+    assert_eq!(sqlx::query_scalar::<_,i64>("select accepted_generation_id from adaptive_profiles where id=$1")
+        .bind(active.slot_id).fetch_one(pool).await.unwrap(),generation);
     db::live::pending_adaptive_slots(pool, OWNER)
         .await
         .unwrap()
@@ -2437,6 +2461,16 @@ async fn pending_candidate_never_blocks_research_and_new_complete_round_supersed
             .bind(job.generation_id).bind(completed_batch).execute(&pool).await.unwrap();
         assert!(scheduler::finalize(&pool,&job,&result,true,Some(0.21),Some(&result["selectedCell"])).await.unwrap(),
             "live-only frozenPrefix presence is not research admission");
+        let before_handoff=db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap();
+        assert_eq!(before_handoff.slots[0].active_generation_id,Some(old.generation_id));
+        assert_eq!(before_handoff.slots[0].pending_generation_id,Some(pending.profile.generation_id),
+            "research finalize registers a handoff, not a live replacement");
+        assert_eq!(sqlx::query_scalar::<_,String>("select status from adaptive_profile_handoffs where generation_id=$1")
+            .bind(job.generation_id).fetch_one(&pool).await.unwrap(),"pending");
+        assert_eq!(db::profiles::accept_handoffs(&pool,OWNER).await.unwrap(),1);
+        assert_eq!(db::profiles::accept_handoffs(&pool,OWNER).await.unwrap(),0,"handoff consumption is idempotent");
+        assert_eq!(sqlx::query_scalar::<_,i64>("select accepted_generation_id from adaptive_profiles where id=$1")
+            .bind(old.slot_id).fetch_one(&pool).await.unwrap(),job.generation_id);
         let state=db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap();
         assert_eq!(state.slots[0].active_generation_id,Some(old.generation_id));
         assert_eq!(state.slots[0].pending_generation_id,Some(job.generation_id));
@@ -2497,9 +2531,17 @@ async fn waiting_subset_promotion_keeps_real_cursor_cas_and_late_join_has_own_pu
         assert_eq!(after.live_readiness.iter().find(|e|e.instrument_key==second).unwrap().publication_floor_close_unix,join);
         assert!(!join_waiting_adaptive_instrument(&pool,&after,second,None,join,&promotion_state(active.generation_id,join)).await.unwrap(),"lost-response retry cannot overwrite live cursor");
         assert_eq!(db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap().slots[0].live_readiness_summary.as_ref().unwrap().ready_instruments,2);
+        let before_stop=maintenance_live_snapshot(&pool).await;
+        let before_active=serde_json::to_value(db::active_adaptive_slots(&pool,OWNER).await.unwrap()).unwrap();
+        let before_summary=serde_json::to_value(db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap().slots[0].live_readiness_summary.as_ref().unwrap()).unwrap();
         assert!(db::stop(&pool,OWNER,ALGORITHM).await.unwrap());
-        assert!(!join_waiting_adaptive_instrument(&pool,&after,second,None,join,&promotion_state(active.generation_id,join)).await.unwrap());
-        assert!(db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap().slots[0].live_readiness_summary.is_none());
+        assert_eq!(maintenance_live_snapshot(&pool).await,before_stop,"research Stop preserves controls, accepted state and checkpoints");
+        assert_eq!(serde_json::to_value(db::active_adaptive_slots(&pool,OWNER).await.unwrap()).unwrap(),before_active);
+        assert_eq!(serde_json::to_value(db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap().slots[0].live_readiness_summary.as_ref().unwrap()).unwrap(),before_summary,
+            "research Stop preserves exact readiness and per-instrument floors");
+        assert!(!join_waiting_adaptive_instrument(&pool,&after,second,None,join,&promotion_state(active.generation_id,join)).await.unwrap(),
+            "duplicate join remains rejected by readiness/CAS, not research Stop");
+        assert_eq!(maintenance_live_snapshot(&pool).await,before_stop);
     }).await;
 }
 
@@ -3062,14 +3104,31 @@ async fn warmup_expiry_restart_and_stop_fence_pending_without_replacing_incumben
         assert_ne!(expired.token,restarted.token);
         assert!(!report_warmup(&pool,&expired,"ready",Some(CUTOFF),None).await.unwrap());
         assert!(report_warmup(&pool,&restarted,"ready",Some(CUTOFF),None).await.unwrap());
+        let before_research_stop=maintenance_live_snapshot(&pool).await;
+        let live_runtime_sql="select jsonb_build_object('slots',(select jsonb_agg(to_jsonb(s) order by id) from continuous_slots s),'lane',(select to_jsonb(w) from adaptive_live_warmup_lane w where id=1))";
+        let before_runtime:Value=sqlx::query_scalar(live_runtime_sql).fetch_one(&pool).await.unwrap();
         assert!(db::stop(&pool,OWNER,ALGORITHM).await.unwrap());
-        let process = db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap();
-        assert!(process.slots[0].active_generation_id.is_none());
-        assert!(process.slots[0].pending_generation_id.is_none());
-        assert!(!report_warmup(&pool,&restarted,"ready",Some(CUTOFF),None).await.unwrap());
+        assert_eq!(maintenance_live_snapshot(&pool).await,before_research_stop);
+        assert_eq!(sqlx::query_scalar::<_,Value>(live_runtime_sql).fetch_one(&pool).await.unwrap(),before_runtime,
+            "research Stop must not alter pending/active pointers, readiness or the warmup lease");
+        assert!(report_warmup(&pool,&restarted,"ready",Some(CUTOFF),None).await.unwrap(),
+            "the same live lease remains usable after research Stop");
         let initial = vec![InitialAdaptiveCheckpoint {instrument_key:INSTRUMENT.into(),state:promotion_state(pending.profile.generation_id,CUTOFF)}];
         let expected = vec![CheckpointExpectation {instrument_key:INSTRUMENT.into(),checkpoint:None}];
+        let command=db::profiles::ProfileCommand {expected_revision:restarted.config_revision,
+            expected_generation_id:pending.profile.generation_id,request_id:"warmup-profile-stop-0001".into()};
+        assert!(matches!(db::profiles::command(&pool,OWNER,old.slot_id,false,&command).await.unwrap(),db::profiles::CommandOutcome::Applied(_)));
+        let process = db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap();
+        assert_eq!(process.slots[0].active_generation_id,Some(old.generation_id),"profile Stop preserves the incumbent identity");
+        assert!(process.slots[0].pending_generation_id.is_none());
+        assert!(db::active_adaptive_slots(&pool,OWNER).await.unwrap().is_empty(),"retained identity is not publication permission");
+        let stopped=maintenance_live_snapshot(&pool).await;
+        let stopped_runtime:Value=sqlx::query_scalar(live_runtime_sql).fetch_one(&pool).await.unwrap();
+        assert!(!report_warmup(&pool,&restarted,"ready",Some(CUTOFF),None).await.unwrap());
         assert!(!promote_pending(&pool,&restarted,Some(old.generation_id),&expected,CUTOFF,&initial).await.unwrap());
+        assert_eq!(maintenance_live_snapshot(&pool).await,stopped);
+        assert_eq!(sqlx::query_scalar::<_,Value>(live_runtime_sql).fetch_one(&pool).await.unwrap(),stopped_runtime,
+            "fenced reports/promotion must not mutate retained live state");
     }).await;
 }
 
