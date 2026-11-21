@@ -1,13 +1,13 @@
 import { act, cleanup, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, expect, it } from "vitest";
-import { actualCutoff, actualDay, actualReportFixture, actualStart } from "../../test/study-actual-fixture";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { actualCutoff, actualDay, actualReportFixture, actualStart, havanaActualDetailFixture } from "../../test/study-actual-fixture";
 import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
-import type { OriginalObjectiveDTO } from "../lib/study-actual-api";
+import { getStudyActual, type OriginalObjectiveDTO } from "../lib/study-actual-api";
 import { StudyActualChart } from "./study-actual-chart";
 import { CHART_STYLE } from "./study-chart-style";
 
 beforeEach(() => { applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "UTC" }); });
-afterEach(() => { cleanup(); applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS); });
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS); });
 
 it("uses the reference study chart palette and responsive SVG geometry", () => {
   render(<StudyActualChart report={actualReportFixture()} />);
@@ -17,17 +17,19 @@ it("uses the reference study chart palette and responsive SVG geometry", () => {
   expect(chart).toHaveAttribute("data-cutoff", String(actualCutoff));
 });
 
-it("retains distinct original/post-start points on the same UTC day and never puts post-start geometry before S", () => {
+it("renders one server-weighted start-day observation on the exact same grid coordinate as the start marker", () => {
   render(<StudyActualChart report={actualReportFixture()} />);
   const chart = screen.getByTestId("study-actual-chart");
-  const past = chart.querySelector(`circle[data-phase="past"][data-day-unix="${actualDay}"]`)!;
-  const actual = chart.querySelector('circle[data-phase="actual"]')!;
+  const points = chart.querySelectorAll(`circle[data-phase="observed"][data-day-unix="${actualDay}"]`);
+  expect(points).toHaveLength(1);
+  const actual = points[0]!;
   const divider = screen.getByTestId("study-execution-divider").querySelector("line")!;
-  expect(past).toHaveAttribute("data-mean-r", "-0.5"); expect(actual).toHaveAttribute("data-mean-r", "1.25");
-  expect(actual).toHaveAttribute("data-day-unix", String(actualDay)); expect(actual).toHaveAttribute("data-plot-at-unix", String(actualStart));
-  expect(Number(actual.getAttribute("cx"))).toBeGreaterThanOrEqual(Number(divider.getAttribute("x1")));
-  expect(Number(past.getAttribute("cx"))).toBeLessThan(Number(divider.getAttribute("x1")));
-  expect(screen.queryByTestId("study-actual-line")).not.toBeInTheDocument();
+  expect(actual).toHaveAttribute("data-mean-r", "0.2"); expect(actual).toHaveAttribute("data-sum-r", "1");
+  expect(actual).toHaveAttribute("data-closed", "5");
+  expect(actual.getAttribute("cx")).toBe(divider.getAttribute("x1"));
+  expect(chart.querySelector(`[data-grid-day="${actualDay}"]`)).toHaveAttribute("x1", actual.getAttribute("cx"));
+  expect(screen.getByTestId("study-observed-line")).toBeInTheDocument();
+  expect(screen.getByTestId("study-execution-divider").querySelector("title")).toHaveTextContent("2026-11-20T12:00:00.125Z");
 });
 
 it.each([
@@ -40,26 +42,98 @@ it.each([
   const view = render(<StudyActualChart report={report} />);
   expect(screen.getByTestId("study-actual-chart")).toHaveAttribute("data-objective", originalObjective.trendMode);
   expect(screen.getByTestId("study-original-end-value")).toHaveTextContent("+0.80R");
-  view.rerender(<StudyActualChart report={{ ...report, actual: { daily: [{ ...report.actual.daily[0]!, meanR: -19 }] } }} />);
+  const originalProjection = JSON.stringify(report.projection);
+  view.rerender(<StudyActualChart report={{ ...report, display: { ...report.display!, daily: [{ ...report.display!.daily[0]!, meanR: -19, sumR: -76 }] } }} />);
   expect(screen.getByTestId("study-original-end-value")).toHaveTextContent("+0.80R");
+  expect(JSON.stringify(report.projection)).toBe(originalProjection);
+});
+
+it("keeps the Havana 04:30Z signal on the first-midnight server day through GET parsing, grid lookup and observed line", async () => {
+  const body = havanaActualDetailFixture(); const timeZone = "America/Havana";
+  act(() => { applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: timeZone }); });
+  const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(body), { status: 200 })); vi.stubGlobal("fetch", fetch);
+  const detail = await getStudyActual(49, new AbortController().signal, timeZone);
+  expect(detail.report!.display!.timeZone).toBe(timeZone);
+  const day = Date.parse("2026-11-01T04:00:00Z") / 1000;
+  const signal = detail.report!.actual.daily[0]!.plotAtUnix;
+  const signalDay = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(signal * 1000);
+  expect(signalDay).toBe("2026-11-01");
+  render(<StudyActualChart report={detail.report!} />);
+  const chart = screen.getByTestId("study-actual-chart");
+  const points = chart.querySelectorAll(`circle[data-phase="observed"][data-day-unix="${day}"]`);
+  expect(points).toHaveLength(1);
+  const point = points[0]!;
+  expect(point).toHaveAttribute("data-closed", "5"); expect(point).toHaveAttribute("data-mean-r", "0.2");
+  const coordinate = point.getAttribute("cx");
+  expect(screen.getByTestId("study-execution-divider").querySelector("line")).toHaveAttribute("x1", coordinate);
+  expect(chart.querySelector(`[data-grid-day="${day}"]`)).toHaveAttribute("x1", coordinate);
+  expect(screen.getByTestId("study-observed-line")).toHaveAttribute("points", expect.stringContaining(`${coordinate},${point.getAttribute("cy")}`));
+  const nextDay = Date.parse("2026-11-02T05:00:00Z") / 1000;
+  expect(chart.querySelector(`[data-grid-day="${nextDay}"]`)).toBeInTheDocument();
+  expect(nextDay - day).toBe(25 * 3600);
+  expect(chart.querySelector(`[data-axis-day="${day}"]`)).toHaveTextContent("01.11");
+  expect(point.querySelector("title")).toHaveTextContent("2026-11-01");
 });
 
 it("does not bridge null forecast gaps, zero-fill observations, or hide the trained yellow line when no post-start trades closed", () => {
-  const report = actualReportFixture();
-  render(<StudyActualChart report={{ ...report, actual: { daily: [{ ...report.actual.daily[0]!, meanR: null, closedCount: 0, tpCount: 0, slCount: 0 }] },
+  const report = actualReportFixture({ historical: { availability: { status: "unavailable", reason: "no_original_outcomes" }, daily: [] }, actual: { daily: [{ dayUnix: actualDay, plotAtUnix: actualStart, meanR: null, closedCount: 0, tpCount: 0, slCount: 0 }] } });
+  render(<StudyActualChart report={{ ...report,
     projection: { ...report.projection, points: [{ atUnix: actualDay - 86400, value: 0.2 }, { atUnix: actualDay, value: null }, { atUnix: actualCutoff, value: 0.8 }] } }} />);
   expect(screen.getAllByTestId("study-original-objective-segment")).toHaveLength(2);
   expect(screen.queryByTestId("study-original-objective-line")).not.toBeInTheDocument();
   expect(screen.getByTestId("study-original-end-value")).toHaveTextContent("+0.80R");
-  expect(screen.getByTestId("study-actual-chart").querySelector('circle[data-phase="actual"]')).toBeNull();
+  expect(screen.getByTestId("study-actual-chart").querySelector('circle[data-phase="observed"]')).toBeNull();
 });
 
-it("changes display labels with the configured timezone, not UTC cohort keys or numeric observations", () => {
-  render(<StudyActualChart report={actualReportFixture()} />);
-  const chart = screen.getByTestId("study-actual-chart"); const before = chart.querySelector('circle[data-phase="actual"]')!;
-  expect(before.querySelector("title")).toHaveTextContent("20.11.2026");
-  act(() => { applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "America/Los_Angeles" }); });
-  const after = chart.querySelector('circle[data-phase="actual"]')!;
-  expect(after).toHaveAttribute("data-day-unix", String(actualDay)); expect(after).toHaveAttribute("data-mean-r", "1.25");
-  expect(after.querySelector("title")).toHaveTextContent("19.11.2026");
+it.each([
+  ["America/New_York", "2026-11-01T17:00:00.125Z", "2026-11-01T04:00:00Z", "2026-11-02T05:00:00Z", "2026-11-01", "2026-11-02", 90000],
+  ["Asia/Kathmandu", "2026-11-20T01:00:00.125Z", "2026-11-19T18:15:00Z", "2026-11-20T18:15:00Z", "2026-11-20", "2026-11-21", 86400],
+] as const)("aligns exact %s local days, points and marker using real Unix spacing", (timeZone, executionStartedAt, firstIso, secondIso, firstDate, secondDate, distance) => {
+  act(() => { applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: timeZone }); });
+  const first = Date.parse(firstIso) / 1000; const second = Date.parse(secondIso) / 1000;
+  const base = actualReportFixture();
+  render(<StudyActualChart report={{ ...base, executionStartedAt, observedThroughUnix: second + 3600,
+    projection: { ...base.projection, points: [{ atUnix: first, value: 0.2 }, { atUnix: second, value: 0.8 }] },
+    display: { ...base.display!, timeZone, startDayUnix: first, daily: [
+      { dayUnix: first, date: firstDate, sumR: 2, meanR: 1, closedCount: 2, tpCount: 2, slCount: 0 },
+      { dayUnix: second, date: secondDate, sumR: -1, meanR: -1, closedCount: 1, tpCount: 0, slCount: 1 },
+    ] } }} />);
+  expect(second - first).toBe(distance);
+  const chart = screen.getByTestId("study-actual-chart");
+  const marker = screen.getByTestId("study-execution-divider");
+  expect(marker.querySelector("line")).toHaveAttribute("x1", chart.querySelector(`[data-grid-day="${first}"]`)!.getAttribute("x1"));
+  expect(chart.querySelector(`[data-day-unix="${first}"]`)).toHaveAttribute("cx", marker.querySelector("line")!.getAttribute("x1"));
+  expect(marker.querySelector("title")).toHaveTextContent(executionStartedAt);
+  expect(chart.querySelector(`[data-day-unix="${second}"] title`)).toHaveTextContent(secondDate);
+});
+
+it("keeps real missing calendar days as gaps instead of connecting across them", () => {
+  const base = actualReportFixture();
+  render(<StudyActualChart report={{ ...base, observedThroughUnix: actualDay + 86400,
+    display: { ...base.display!, daily: [base.display!.daily[0]!, { ...base.display!.daily[1]!, dayUnix: actualDay + 86400, date: "2026-11-21" }] } }} />);
+  expect(screen.queryByTestId("study-observed-line")).not.toBeInTheDocument();
+});
+
+it("uses only DD.MM axis labels through a local year crossing, retaining full accessible and tooltip dates", () => {
+  act(() => { applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "Asia/Kathmandu", dateOrder: "mdy", yearDigits: 2 }); });
+  const first = Date.parse("2026-12-30T18:15:00Z") / 1000; const second = first + 86400;
+  const base = actualReportFixture();
+  render(<StudyActualChart report={{ ...base, executionStartedAt: "2026-12-31T20:00:00.125Z", observedThroughUnix: second + 86400 + 100,
+    projection: { ...base.projection, points: [{ atUnix: first, value: 0.2 }, { atUnix: second, value: 0.8 }] },
+    display: { ...base.display!, timeZone: "Asia/Kathmandu", startDayUnix: second, daily: [{ ...base.display!.daily[0]!, dayUnix: second, date: "2027-01-01" }] } }} />);
+  const labels = screen.getByTestId("study-actual-chart").querySelectorAll("[data-axis-day]");
+  expect([...labels].map((label) => label.textContent)).toEqual(["31.12", "01.01", "02.01"]);
+  expect(labels[0]).toHaveAttribute("aria-label", "31.12.2026 (Asia/Kathmandu)");
+  expect(labels[1]).toHaveAttribute("aria-label", "01.01.2027 (Asia/Kathmandu)");
+  expect(screen.getByTestId("study-actual-chart").querySelector('circle[data-phase="observed"] title')).toHaveTextContent("2027-01-01");
+});
+
+it("keeps at most nine compact date ticks on a narrow forty-day chart", () => {
+  vi.stubGlobal("innerWidth", 375);
+  render(<StudyActualChart report={actualReportFixture({ observedThroughUnix: actualDay + 40 * 86400 })} />);
+  const chart = screen.getByTestId("study-actual-chart");
+  const labels = chart.querySelectorAll("[data-axis-day]");
+  expect(labels.length).toBeLessThanOrEqual(9);
+  expect([...labels].every((label) => /^\d{2}\.\d{2}$/.test(label.textContent ?? ""))).toBe(true);
+  expect(chart).toHaveClass("w-full");
 });

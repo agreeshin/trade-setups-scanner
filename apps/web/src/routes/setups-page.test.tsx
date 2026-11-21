@@ -3,15 +3,21 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { SetupsPage } from "./setups-page";
 import { RouteActiveContext } from "./route-active";
 import type { SetupRow } from "./platform-controls";
+import type { SetupTradeOutcomeStatus } from "../lib/setup-outcomes-api";
 
 const row = (id: number): SetupRow => ({ id, exchange: "bybit", category: "linear", symbol: `BTC${id}`, algorithmId: "price_volume_spike", openTimeUnix: 100, closeTimeUnix: 200, closePrice: "100" });
+const outcomeRow = (id: number, status: SetupTradeOutcomeStatus): SetupRow => ({ ...row(id), tradeOutcome: {
+  status, entryTimeUnix: null, entryPrice: null, gateThreshold: null, tpPrice: null, slPrice: null,
+  closeTimeUnix: null, closePrice: null, riskReturn: null, evaluatedAtUnix: 200, observedThroughUnix: 200, isFinal: status === "gate_failed",
+} });
 const requests: { path: string; signal: AbortSignal | null | undefined }[] = [];
 let rows: SetupRow[];
 let respond: (params: URLSearchParams) => Response | Promise<Response>;
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 function page(params: URLSearchParams) {
   const snapshot = Number(params.get("snapshotId") ?? rows[0]?.id ?? 0);
-  const filtered = rows.filter((item) => item.id! <= snapshot && item.symbol.includes(params.get("q") ?? ""));
+  const filtered = rows.filter((item) => item.id! <= snapshot && item.symbol.includes(params.get("q") ?? "")
+    && (params.get("hideGateFailed") !== "true" || item.tradeOutcome?.status !== "gate_failed"));
   const offset = Number(params.get("offset"));
   return json({ setups: filtered.slice(offset, offset + 25), total: filtered.length, offset, limit: 25, snapshotId: snapshot });
 }
@@ -32,6 +38,58 @@ beforeEach(() => {
   }));
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+it("defaults the server gate filter on, hides only saved gate failures and restores them when unchecked", async () => {
+  rows = [outcomeRow(7, "gate_failed"), outcomeRow(6, "tp"), outcomeRow(5, "sl"), outcomeRow(4, "unclosed"), outcomeRow(3, "no_data"), { ...row(2), tradeOutcome: null }, row(1)];
+  render(<SetupsPage />); await settle();
+  const checkbox = screen.getByRole("checkbox", { name: "Скрыть сетапы, которые не прошли гейт" });
+  expect(checkbox).toBeChecked(); expect(params().get("hideGateFailed")).toBe("true");
+  expect(screen.getByText("Страница 1 из 1 · Найдено: 6")).toBeInTheDocument();
+  expect(screen.queryByText("bybit · BTC7")).not.toBeInTheDocument();
+  for (const id of [6, 5, 4, 3, 2, 1]) expect(screen.getByText(`bybit · BTC${id}`)).toBeInTheDocument();
+  const refreshCalls = requests.filter((request) => request.path === "/v1/setups/outcomes/refresh").length;
+  fireEvent.click(checkbox); await settle();
+  expect(checkbox).not.toBeChecked(); expect(params().get("hideGateFailed")).toBe("false");
+  expect(screen.getByText("bybit · BTC7")).toBeInTheDocument();
+  expect(screen.getByText("Страница 1 из 1 · Найдено: 7")).toBeInTheDocument();
+  await tick(); expect(params().get("hideGateFailed")).toBe("false"); expect(params().get("q")).toBe("BTC");
+  fireEvent.change(screen.getByLabelText("Инструмент, биржа или алгоритм"), { target: { value: "BTC7" } }); await settle();
+  expect(params().get("hideGateFailed")).toBe("false"); expect(screen.getByText("bybit · BTC7")).toBeInTheDocument();
+  fireEvent.click(checkbox); await settle();
+  expect(checkbox).toBeChecked(); expect(screen.queryByText("bybit · BTC7")).not.toBeInTheDocument();
+  expect(requests.filter((request) => request.path === "/v1/setups/outcomes/refresh")).toHaveLength(refreshCalls);
+});
+
+it("filters before pagination and keeps historical snapshots pinned when toggling the gate filter", async () => {
+  rows = rows.map((item) => item.id! >= 35 ? outcomeRow(item.id!, "gate_failed") : item);
+  render(<SetupsPage />); await settle();
+  expect(screen.getByText("Страница 1 из 2 · Найдено: 34")).toBeInTheDocument();
+  expect(screen.getByText("bybit · BTC34")).toBeInTheDocument(); expect(screen.getByText("bybit · BTC10")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Далее" })); await settle();
+  expect(params().get("offset")).toBe("25"); expect(params().get("snapshotId")).toBe("60");
+  expect(params().get("hideGateFailed")).toBe("true"); expect(screen.getByText("bybit · BTC9")).toBeInTheDocument();
+  expect(screen.getByText("Страница 2 из 2 · Найдено: 34")).toBeInTheDocument();
+  rows.unshift(row(61));
+  fireEvent.click(screen.getByRole("checkbox", { name: "Скрыть сетапы, которые не прошли гейт" })); await settle();
+  expect(params().get("offset")).toBe("0"); expect(params().get("snapshotId")).toBe("60"); expect(params().get("q")).toBe("BTC");
+  expect(screen.getByText("Страница 1 из 3 · Найдено: 60")).toBeInTheDocument(); expect(screen.getByText("bybit · BTC60")).toBeInTheDocument();
+  expect(screen.queryByText("bybit · BTC61")).not.toBeInTheDocument();
+  const historicalCalls = calls().length; await tick(9000); expect(calls()).toHaveLength(historicalCalls);
+  fireEvent.click(screen.getByRole("button", { name: "Следить за live-лентой" })); await settle();
+  expect(params().get("hideGateFailed")).toBe("false"); expect(params().has("snapshotId")).toBe(false);
+  expect(screen.getByText("bybit · BTC61")).toBeInTheDocument();
+});
+
+it("keeps a paused feed paused when changing the gate filter or refreshing its page", async () => {
+  render(<SetupsPage />); await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Приостановить обновление" })); await settle();
+  fireEvent.click(screen.getByRole("checkbox", { name: "Скрыть сетапы, которые не прошли гейт" })); await settle();
+  expect(params().get("snapshotId")).toBe("60"); expect(params().get("hideGateFailed")).toBe("false");
+  const pausedCalls = calls().length; await tick(9000); expect(calls()).toHaveLength(pausedCalls);
+  fireEvent.click(screen.getByRole("button", { name: "Обновить" })); await settle();
+  expect(params().get("hideGateFailed")).toBe("false"); expect(params().has("snapshotId")).toBe(false);
+  const refreshedCalls = calls().length; await tick(9000); expect(calls()).toHaveLength(refreshedCalls);
+});
 
 it("follows the fresh first page every three seconds, preserving the filter and deduplicating IDs", async () => {
   render(<SetupsPage />); await settle();

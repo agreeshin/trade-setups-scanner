@@ -229,6 +229,72 @@ fn bar(at: i64, high: &str, low: &str) -> Value {
 
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn postgres_feed_gate_filter_preserves_unknown_outcomes_counts_search_and_snapshot_pages() {
+    isolated(|pool| async move {
+        let mut visible = Vec::new();
+        let mut all = Vec::new();
+        for (index, status) in [Some("gate_failed"), Some("tp"), Some("sl"), Some("unclosed"), Some("no_data"), None, Some("gate_failed")].into_iter().enumerate() {
+            let outcome = status.map(|status| json!({"status":status}));
+            let id: i32 = sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,trade_outcome) values('fixture','linear',$1,'price_volume_spike','1.1.1','{}',to_timestamp($2),to_timestamp($2+60),'100',$3) returning id")
+                .bind(format!("GATE{index}"))
+                .bind((RAW + index as i64 * 60) as f64)
+                .bind(outcome)
+                .fetch_one(&pool).await.unwrap();
+            all.push(i64::from(id));
+            if status != Some("gate_failed") { visible.push(i64::from(id)); }
+        }
+        visible.reverse(); all.reverse();
+        let original: Value = sqlx::query_scalar("select jsonb_agg(to_jsonb(l) order by id) from live_setups l").fetch_one(&pool).await.unwrap();
+        let (app, market, server, _) = app(pool.clone()).await;
+        for flag in ["", "&hideGateFailed=false"] {
+            let (status, page) = request(&app, "GET", &format!("/v1/setups?q=GATE&limit=2{flag}"), json!({})).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(page["total"], 7);
+            assert_eq!(page["setups"][0]["id"], all[0]);
+        }
+        let (status, first) = request(&app, "GET", "/v1/setups?q=GATE&hideGateFailed=true&limit=2", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["total"], 5);
+        assert_eq!(first["setups"].as_array().unwrap().len(), 2);
+        assert!(first["setups"][0]["tradeOutcome"].is_null(), "an unknown outcome must remain visible");
+        let snapshot = first["snapshotId"].as_i64().unwrap();
+        let (_, without_search) = request(&app, "GET", &format!("/v1/setups?hideGateFailed=true&snapshotId={snapshot}"), json!({})).await;
+        assert_eq!(without_search["total"], 6, "the no-search query retains WATCH and all five non-failed rows");
+        let newer: i32 = sqlx::query_scalar("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price) values('fixture','linear','GATE_NEW','price_volume_spike','1.1.1','{}',to_timestamp($1),to_timestamp($1+60),'100') returning id")
+            .bind((RAW + 1000) as f64).fetch_one(&pool).await.unwrap();
+        let mut actual = Vec::new();
+        for offset in [0, 2, 4] {
+            let (status, page) = request(&app, "GET", &format!("/v1/setups?q=GATE&hideGateFailed=true&limit=2&offset={offset}&snapshotId={snapshot}"), json!({})).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(page["total"], 5); assert_eq!(page["offset"], offset); assert_eq!(page["snapshotId"], snapshot);
+            for setup in page["setups"].as_array().unwrap() {
+                assert_ne!(setup["tradeOutcome"]["status"], "gate_failed");
+                actual.push(setup["id"].as_i64().unwrap());
+            }
+        }
+        assert_eq!(actual, visible);
+        let (_, empty) = request(&app, "GET", &format!("/v1/setups?q=GATE&hideGateFailed=true&limit=2&offset=6&snapshotId={snapshot}"), json!({})).await;
+        assert_eq!(empty["total"], 5); assert!(empty["setups"].as_array().unwrap().is_empty());
+        let (_, unhidden) = request(&app, "GET", &format!("/v1/setups?q=GATE&hideGateFailed=false&limit=25&snapshotId={snapshot}"), json!({})).await;
+        assert_eq!(unhidden["total"], 7);
+        assert_eq!(unhidden["setups"].as_array().unwrap().iter().map(|row| row["id"].as_i64().unwrap()).collect::<Vec<_>>(), all);
+        let (_, latest) = request(&app, "GET", "/v1/live/setups?q=GATE&hideGateFailed=true&limit=25", json!({})).await;
+        assert_eq!(latest["total"], 6); assert_eq!(latest["setups"][0]["id"], newer);
+        let (_, watch) = request(&app, "GET", "/v1/setups?q=WATCH&hideGateFailed=true", json!({})).await;
+        assert_eq!(watch["total"], 1); assert!(watch["setups"][0]["tradeOutcome"].is_null());
+        for invalid in ["1", "yes", "TRUE", ""] {
+            let (status, value) = request(&app, "GET", &format!("/v1/setups?hideGateFailed={invalid}"), json!({})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST); assert_eq!(value["error"], "invalid_query");
+        }
+        let retained: Value = sqlx::query_scalar("select jsonb_agg(to_jsonb(l) order by id) from live_setups l where id <= $1").bind(snapshot as i32).fetch_one(&pool).await.unwrap();
+        assert_eq!(retained, original, "feed filtering cannot rewrite setup or delivery data");
+        assert_eq!(market.calls.load(Ordering::SeqCst), 0, "feed filtering cannot recalculate outcomes");
+        server.abort(); let _ = server.await;
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
 async fn postgres_http_persist_refresh_cached_reads_pagination_failures_and_auth() {
     isolated(|pool| async move {
         let slot = profile(&pool, "admin").await;

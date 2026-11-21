@@ -30,6 +30,19 @@ export interface OriginalObjectiveDTO {
 export interface StudyActualDailyPoint {
   dayUnix: number; plotAtUnix: number; meanR: number | null; closedCount: number; tpCount: number; slCount: number;
 }
+export interface StudyActualDisplayDay {
+  dayUnix: number; date: string; sumR: number | null; meanR: number | null; closedCount: number; tpCount: number; slCount: number;
+}
+export interface StudyActualDisplayQuality {
+  availability: StudyActualAvailability; fidelity: string; complete: boolean; reason?: string;
+  /** Opaque, bounded provenance; never interpreted as evidence of available outcomes. */
+  sourceIdentity?: unknown;
+  rawReplayAvailable?: boolean;
+}
+export interface StudyActualDisplay {
+  timeZone: string; startDayUnix: number; daily: StudyActualDisplayDay[];
+  historical: StudyActualDisplayQuality; actual: StudyActualDisplayQuality;
+}
 export interface StudyActualReport {
   sourceArtifactId: number | null; retrospective: true; executionStartedAt: string; observedThroughUnix: number;
   historical: { availability: StudyActualAvailability; daily: StudyActualDailyPoint[] };
@@ -37,8 +50,12 @@ export interface StudyActualReport {
   originalObjective: OriginalObjectiveDTO | null;
   projection: { availability: StudyActualAvailability; method: string | null; points: { atUnix: number; value: number | null }[]; fittedOnPostStudyData: false };
   originalEndpoint: { meanR: StudyActualNumber; forecastR: StudyActualNumber; decisionR: StudyActualNumber; atUnix: number | null };
+  /** Additive read-only grouping; absent only on the unchanged legacy GET path. */
+  display?: StudyActualDisplay;
 }
-export interface StudyActualDetail extends StudyActualSummary { report: StudyActualReport | null }
+export interface StudyActualDetail extends StudyActualSummary {
+  report: StudyActualReport | null; originalReport?: StudyActualReport | null; originalReportUnavailableReason?: string | null;
+}
 export type StudyActualSetup = Omit<SetupsAnalyticsSetup, "slotId"> & { slotId: number | null };
 export interface StudyActualSetupPage {
   studyId: number; jobId: string; revision: number; retrospective: true; total: number; limit: number; offset: number; setups: StudyActualSetup[];
@@ -151,7 +168,51 @@ export function parseOriginalObjective(value: unknown): OriginalObjectiveDTO | n
   return { version: 1, trendMode: value.trendMode as OriginalObjectiveDTO["trendMode"], trendBendDays: value.trendBendDays,
     trendBlendLambda: value.trendBlendLambda, forecast };
 }
-function parseReport(value: unknown): StudyActualReport {
+function canonicalTimeZone(value: string): string {
+  try { return new Intl.DateTimeFormat("en-US", { timeZone: value }).resolvedOptions().timeZone; }
+  catch { throw invalidReport(); }
+}
+function displayQuality(value: unknown): StudyActualDisplayQuality {
+  if (!record(value) || typeof value.fidelity !== "string" || value.fidelity.length > 128 || typeof value.complete !== "boolean"
+    || !(value.reason === undefined || (typeof value.reason === "string" && value.reason.length <= 2000))
+    || !(value.rawReplayAvailable === undefined || typeof value.rawReplayAvailable === "boolean")) throw invalidReport();
+  if (value.sourceIdentity !== undefined && JSON.stringify(value.sourceIdentity).length > 4096) throw invalidReport();
+  return { availability: availability(value.availability), fidelity: value.fidelity, complete: value.complete,
+    ...(value.reason === undefined ? {} : { reason: value.reason }),
+    ...(value.sourceIdentity === undefined ? {} : { sourceIdentity: value.sourceIdentity }),
+    ...(value.rawReplayAvailable === undefined ? {} : { rawReplayAvailable: value.rawReplayAvailable }) };
+}
+function parseDisplay(value: unknown, executionStartedAt: string, expectedTimeZone?: string): StudyActualDisplay {
+  if (!record(value) || typeof value.timeZone !== "string" || value.timeZone.length > 128 || !count(value.startDayUnix)
+    || !Array.isArray(value.daily) || value.daily.length > 3661) throw invalidReport();
+  const zone = canonicalTimeZone(value.timeZone);
+  if (expectedTimeZone !== undefined && zone !== canonicalTimeZone(expectedTimeZone)) throw invalidReport();
+  const formatter = new Intl.DateTimeFormat("en-US", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit" });
+  const dateKey = (unix: number): string => {
+    if (!Number.isFinite(new Date(unix * 1000).getTime())) throw invalidReport();
+    const parts = formatter.formatToParts(unix * 1000);
+    return ["year", "month", "day"].map((part) => parts.find((item) => item.type === part)?.value).join("-");
+  };
+  const start = Date.parse(executionStartedAt) / 1000;
+  if (value.startDayUnix > start || dateKey(value.startDayUnix) !== dateKey(start)
+    || dateKey(value.startDayUnix - 1) === dateKey(value.startDayUnix)) throw invalidReport();
+  let previous = -Infinity;
+  const daily = value.daily.map((point: unknown): StudyActualDisplayDay => {
+    if (!record(point) || !count(point.dayUnix) || point.dayUnix <= previous || typeof point.date !== "string"
+      || !/^\d{4}-\d{2}-\d{2}$/.test(point.date) || point.date !== dateKey(point.dayUnix) || dateKey(point.dayUnix - 1) === point.date
+      || !(point.sumR === null || finite(point.sumR)) || !(point.meanR === null || finite(point.meanR))
+      || !count(point.closedCount) || !count(point.tpCount) || !count(point.slCount) || point.closedCount !== point.tpCount + point.slCount
+      || (point.closedCount === 0 ? point.meanR !== null || (point.sumR !== null && point.sumR !== 0)
+        : point.sumR === null || point.meanR === null || Math.abs(point.sumR / point.closedCount - point.meanR) > 1e-9 * Math.max(1, Math.abs(point.meanR)))) throw invalidReport();
+    previous = point.dayUnix;
+    return { dayUnix: point.dayUnix, date: point.date, sumR: point.sumR, meanR: point.meanR,
+      closedCount: point.closedCount, tpCount: point.tpCount, slCount: point.slCount };
+  });
+  if (daily.length > 1 && daily.at(-1)!.dayUnix - daily[0]!.dayUnix > 3661 * 86400) throw invalidReport();
+  return { timeZone: value.timeZone, startDayUnix: value.startDayUnix, daily,
+    historical: displayQuality(value.historical), actual: displayQuality(value.actual) };
+}
+function parseReport(value: unknown, expectedTimeZone?: string): StudyActualReport {
   if (!record(value) || !(value.sourceArtifactId === null || (count(value.sourceArtifactId) && value.sourceArtifactId > 0))
     || value.retrospective !== true || typeof value.executionStartedAt !== "string" || !Number.isFinite(Date.parse(value.executionStartedAt))
     || !count(value.observedThroughUnix) || !record(value.historical) || !record(value.actual) || !record(value.projection)
@@ -162,17 +223,25 @@ function parseReport(value: unknown): StudyActualReport {
     if (!record(point) || !finite(point.atUnix) || !(point.value === null || finite(point.value))) throw invalidReport();
     return { atUnix: point.atUnix, value: point.value };
   });
+  if (expectedTimeZone !== undefined && value.display === undefined) throw invalidReport();
   return { sourceArtifactId: value.sourceArtifactId, retrospective: true, executionStartedAt: value.executionStartedAt, observedThroughUnix: value.observedThroughUnix,
     historical: { availability: availability(value.historical.availability), daily: dailyPoints(value.historical.daily) },
     actual: { daily: dailyPoints(value.actual.daily) }, originalObjective: parseOriginalObjective(value.originalObjective),
     projection: { availability: availability(value.projection.availability), method: value.projection.method, points, fittedOnPostStudyData: false },
-    originalEndpoint: { meanR: availableNumber(value.originalEndpoint.meanR), forecastR: availableNumber(value.originalEndpoint.forecastR), decisionR: availableNumber(value.originalEndpoint.decisionR), atUnix: value.originalEndpoint.atUnix } };
+    originalEndpoint: { meanR: availableNumber(value.originalEndpoint.meanR), forecastR: availableNumber(value.originalEndpoint.forecastR), decisionR: availableNumber(value.originalEndpoint.decisionR), atUnix: value.originalEndpoint.atUnix },
+    ...(value.display === undefined ? {} : { display: parseDisplay(value.display, value.executionStartedAt, expectedTimeZone) }) };
 }
-export async function getStudyActual(studyId: number, signal: AbortSignal): Promise<StudyActualDetail> {
-  const body = await requestBody(studyId, { signal });
+export async function getStudyActual(studyId: number, signal: AbortSignal, timeZone?: string): Promise<StudyActualDetail> {
+  const query = timeZone === undefined ? "" : `?${new URLSearchParams({ timeZone })}`;
+  const body = await requestBody(studyId, { signal }, query);
   const summary = parseStudyActualSummary(body, studyId);
-  if (!record(body) || (summary.status === "completed" && (body.report == null || summary.jobId === null || summary.revision < 1 || summary.counts === null))) throw invalidReport();
-  return { ...summary, report: summary.status === "completed" ? parseReport(body.report) : null };
+  if (!record(body) || (timeZone !== undefined && !("originalReport" in body))
+    || !(body.originalReportUnavailableReason === undefined || body.originalReportUnavailableReason === null
+      || (typeof body.originalReportUnavailableReason === "string" && body.originalReportUnavailableReason.length <= 2000))
+    || (summary.status === "completed" && (body.report == null || summary.jobId === null || summary.revision < 1 || summary.counts === null))) throw invalidReport();
+  return { ...summary, report: summary.status === "completed" ? parseReport(body.report, timeZone) : null,
+    ...("originalReport" in body ? { originalReport: body.originalReport === null ? null : parseReport(body.originalReport, timeZone) } : {}),
+    ...(body.originalReportUnavailableReason === undefined ? {} : { originalReportUnavailableReason: body.originalReportUnavailableReason }) };
 }
 
 function parseSetup(value: unknown, studyId: number): StudyActualSetup {

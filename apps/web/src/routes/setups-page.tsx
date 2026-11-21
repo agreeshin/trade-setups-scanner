@@ -3,6 +3,7 @@ import { RefreshCw } from "lucide-react";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
 import { Card, CardContent } from "../components/ui/card";
+import { Checkbox } from "../components/ui/checkbox";
 import { Field } from "../components/ui/field";
 import { InfoNote } from "../components/ui/info-note";
 import { IconButton } from "../components/ui/icon-button";
@@ -20,7 +21,7 @@ import { SetupTable } from "./setup-table";
 import { useSetupOutcomesRefresh } from "./use-setup-outcomes-refresh";
 
 interface SetupPage { setups: SetupRow[]; offset: number; limit: number; total: number; snapshotId: number }
-interface FeedQuery { filter: string; offset: number; snapshotId?: number; mode: "live" | "paused" | "history" }
+interface FeedQuery { filter: string; hideGateFailed: boolean; offset: number; snapshotId?: number; mode: "live" | "paused" | "history" }
 interface FeedState { page: SetupPage | null; dataQuery: FeedQuery | null; responseQuery: FeedQuery | null; readAt: number | null; error: string | null }
 
 export function SetupsPage() {
@@ -29,7 +30,7 @@ export function SetupsPage() {
   const [section, setSection] = useState<"feed" | "analytics">("feed");
   // One replaceable page and one table-owned selected recommendation; no growing live history.
   const [state, setState] = useState<FeedState>({ page: null, dataQuery: null, responseQuery: null, readAt: null, error: null });
-  const [query, setQuery] = useState<FeedQuery>({ filter: "", offset: 0, mode: "live" });
+  const [query, setQuery] = useState<FeedQuery>({ filter: "", hideGateFailed: true, offset: 0, mode: "live" });
   const [preferencesReady, setPreferencesReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -39,7 +40,7 @@ export function SetupsPage() {
     let disposed = false;
     let request: AbortController | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const params = new URLSearchParams({ offset: String(query.offset), limit: "25", q: query.filter });
+    const params = new URLSearchParams({ offset: String(query.offset), limit: "25", q: query.filter, hideGateFailed: String(query.hideGateFailed) });
     if (query.snapshotId !== undefined) params.set("snapshotId", String(query.snapshotId));
     const following = query.mode === "live" && query.offset === 0 && query.snapshotId === undefined;
     async function load() {
@@ -78,7 +79,7 @@ export function SetupsPage() {
     const controller = new AbortController();
     void fetchPlatform<{ value: { setupFilter?: string } }>("/v1/settings/ui", controller.signal).then((result) => {
       if (controller.signal.aborted) return;
-      if (result.kind === "ready" && typeof result.data.value.setupFilter === "string") setQuery({ filter: result.data.value.setupFilter.slice(0, 200), offset: 0, mode: "live" });
+      if (result.kind === "ready" && typeof result.data.value.setupFilter === "string") setQuery({ filter: result.data.value.setupFilter.slice(0, 200), hideGateFailed: true, offset: 0, mode: "live" });
       else if (result.kind === "unreachable") setError(`Сохранённый фильтр недоступен (${result.detail})`);
       setPreferencesReady(true);
     });
@@ -110,16 +111,17 @@ export function SetupsPage() {
         <Card>
           <CardContent className="flex flex-wrap items-end gap-3">
             <Field label="Инструмент, биржа или алгоритм" className="w-full max-w-sm">
-              {(control) => <Input {...control} disabled={!preferencesReady} value={query.filter} maxLength={200} onChange={(event) => { setQuery({ filter: event.target.value, offset: 0, mode: query.mode === "paused" ? "paused" : "live" }); setMessage(null); }} />}
+              {(control) => <Input {...control} disabled={!preferencesReady} value={query.filter} maxLength={200} onChange={(event) => { setQuery({ filter: event.target.value, hideGateFailed: query.hideGateFailed, offset: 0, mode: query.mode === "paused" ? "paused" : "live" }); setMessage(null); }} />}
             </Field>
             <div className="flex flex-wrap gap-2">
               <Button variant="outline" disabled={busy || !preferencesReady} onClick={() => { void saveFilter(); }}>Сохранить фильтр</Button>
-              <Button variant="outline" disabled={!preferencesReady} onClick={() => setQuery({ filter: query.filter, offset: 0, mode: query.mode === "paused" ? "paused" : "live" })}>Обновить</Button>
+              <Button variant="outline" disabled={!preferencesReady} onClick={() => setQuery({ filter: query.filter, hideGateFailed: query.hideGateFailed, offset: 0, mode: query.mode === "paused" ? "paused" : "live" })}>Обновить</Button>
               <IconButton label="Обновить результаты сетапов" icon={RefreshCw} disabled={outcomes.pending} aria-busy={outcomes.pending} onClick={() => { void outcomes.refresh(); }} />
               {query.mode === "live" ? <Button variant="outline" disabled={!page || changingPage} onClick={() => { if (page) setQuery({ ...query, snapshotId: page.snapshotId, mode: "paused" }); }}>Приостановить обновление</Button>
-                : <Button variant="outline" disabled={!preferencesReady} onClick={() => setQuery({ filter: query.filter, offset: 0, mode: "live" })}>Следить за live-лентой</Button>}
+                : <Button variant="outline" disabled={!preferencesReady} onClick={() => setQuery({ filter: query.filter, hideGateFailed: query.hideGateFailed, offset: 0, mode: "live" })}>Следить за live-лентой</Button>}
               <Button asChild variant="outline"><a href={`${PLATFORM_URL}/v1/export/setups.csv`}>Экспорт CSV (без фильтра)</a></Button>
             </div>
+            <label className="flex w-full items-center gap-2 text-sm text-muted-foreground"><Checkbox disabled={!preferencesReady} checked={query.hideGateFailed} onCheckedChange={(checked) => setQuery({ ...query, hideGateFailed: checked === true, offset: 0 })} /> Скрыть сетапы, которые не прошли гейт</label>
             <p className="w-full text-xs text-muted-foreground" aria-live="polite">{query.mode === "live" ? "Live-лента · обновление каждые 3 с в активной видимой вкладке." : query.mode === "history" ? "Исторический снимок · автообновление приостановлено." : "Обновление ленты приостановлено."}</p>
             <InfoNote label="О выгрузке CSV">CSV содержит всю сохранённую live-ленту на начало выгрузки, без фильтра экрана и лимита строк. Статус и отмена доступны в загрузках браузера.</InfoNote>
           </CardContent>

@@ -819,6 +819,7 @@ pub async fn live_setups_search(
     q: Option<&str>,
     offset: i64,
     limit: i64,
+    hide_gate_failed: bool,
 ) -> Result<(i64, Vec<LiveSetupFull>), DbError> {
     let (filter, offset_ph, limit_ph) = match q {
         Some(_) => (
@@ -827,6 +828,11 @@ pub async fn live_setups_search(
             "$4",
         ),
         None => ("id <= $1", "$2", "$3"),
+    };
+    let filter = if hide_gate_failed {
+        format!("{filter} and trade_outcome->>'status' is distinct from 'gate_failed'")
+    } else {
+        filter.to_owned()
     };
     let count_sql = format!("select count(*)::bigint as total from live_setups where {filter}");
     let count = sqlx::query(&count_sql).bind(snapshot_id as i32);

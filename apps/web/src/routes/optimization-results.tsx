@@ -1,6 +1,8 @@
 import { Alert } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
+import { InfoNote } from "../components/ui/info-note";
+import { Separator } from "../components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { effectiveTimezone, formatIsoDateTime, formatUnix } from "../lib/datetime-format";
 import { isActiveStudy, isContinuousStudy, type OptimizationStudy } from "../lib/optimization-api";
@@ -18,12 +20,22 @@ const reasonLabels = { trial_budget: "Исчерпан бюджет trials", tim
 const expectancyFormatter = new Intl.NumberFormat("en-US", {
   notation: "standard", useGrouping: false, minimumFractionDigits: 2, maximumFractionDigits: 2,
 });
+const matrixFormatter = new Intl.NumberFormat("en-US", {
+  notation: "standard", useGrouping: false, minimumFractionDigits: 4, maximumFractionDigits: 4,
+});
 // Match the existing Analytics controls, not the optimizer search-coordinate wording.
 const analyticsLabels: Record<string, string> = {
   clusterEnabled: "Кластеризовать сетапы", clusterGapMinutes: "Разрыв кластера, ч",
   timeShiftMinutes: "Time-shift, мин", priceChangePct: "Смещение цены, %",
   setupMaturity: "Зрелость сетапа в кластере", horizonMinutes: "Горизонт сделки, мин (фиксирован)",
 };
+
+export function StudyStatusBadges({ study }: { study: Pick<OptimizationStudy, "status" | "origin"> }) {
+  return <>
+    <Badge variant={study.status === "failed" ? "danger" : study.status === "completed" ? "success" : "info"}>{statusLabels[study.status]}</Badge>
+    <Badge>{isContinuousStudy(study) ? "Непрерывное" : "Ручное"}</Badge>
+  </>;
+}
 
 export function OptimizationResults({ study, algorithm, controller, onNew }: { study: OptimizationStudy; algorithm: Algorithm; controller: OptimizationController; onNew?: () => void }) {
   const { progress, spec, result } = study;
@@ -40,19 +52,12 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
   const frequencyThreshold = spec.minSetupsPerDay === undefined ? "Гейт не применялся"
     : spec.minSetupsPerDay === 0 ? "0 (гейт отключён)" : String(spec.minSetupsPerDay);
   return <section className="grid min-w-0 gap-4" aria-label="Статус исследования">
-    <div className="flex flex-wrap items-center gap-2">
-      <h3 className="font-semibold">Исследование #{study.id}</h3>
-      {isContinuousStudy(study) && <InfoNote>Непрерывная оценка последних N суток: R учитывает только наблюдавшиеся закрытые TP/SL-сделки. На правом крае возможны будущие входы и незакрытые сделки; это не нулевая доходность, не принудительный SL и не полностью созревшая оценка всей выборки.</InfoNote>}
-      <InfoNote>{isContinuousStudy(study) ? "Адаптивный профиль допускается только после готовности всей серверной цепочки и гейта при отдельном разрешении live. Постоянные настройки не меняются." : "Результат не применяется к live-алгоритму или настройкам аналитики."} Закрытие окна не останавливает серверную работу.</InfoNote>
-      <Badge variant={study.status === "failed" ? "danger" : study.status === "completed" ? "success" : "info"}>{statusLabels[study.status]}</Badge>
-      <Badge>{isContinuousStudy(study) ? "Непрерывное" : "Ручное"}</Badge>
-    </div>
     <p className="text-sm" role="status">{phaseLabels[progress.phase] ?? progress.phase}</p>
     <dl className="grid gap-2 text-sm sm:grid-cols-2">
       <div><dt className="text-muted-foreground">Завершено trials / бюджет</dt><dd>{progress.evaluatedCandidates} / {progress.maxTrials}</dd></div>
       <div><dt className="text-muted-foreground">Оценимых кандидатов</dt><dd>{progress.scorableCandidates}</dd></div>
       <div><dt className="text-muted-foreground">Прошло, секунд</dt><dd>{progress.elapsedSeconds}</dd></div>
-      <div><dt className="text-muted-foreground">Текущий лучший score</dt><dd>{progress.bestScore === null ? "Ещё нет оценимого кандидата" : `${progress.bestScore} R`}</dd></div>
+      <div><dt className="text-muted-foreground">Текущий лучший score</dt><dd>{progress.bestScore === null ? "Ещё нет оценимого кандидата" : `${expectancyFormatter.format(progress.bestScore)} R`}</dd></div>
     </dl>
     <p className="text-xs text-muted-foreground">{spec.algorithmId} · версия {spec.algorithmVersion} · {spec.direction.toUpperCase()}. Период закрытия сигналов [{formatUnix(spec.fromUnix)}, {formatUnix(spec.toUnix)}). Инструментов: {spec.instruments.length}; TP×SL: {spec.tpLevels.length}×{spec.slLevels.length}. Seed: {spec.seed}; лимит времени: {spec.maxSeconds} с.</p>
     <section aria-label="Фиксированные требования исследования">
@@ -66,29 +71,28 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
       </dl>
     </section>
     <div className="flex flex-wrap gap-2">
-      <Button type="button" variant="outline" onClick={controller.refresh}>Обновить статус</Button>
+      {isActiveStudy(study) && <Button type="button" variant="outline" onClick={controller.refresh}>Обновить статус</Button>}
       {isActiveStudy(study) ? isContinuousStudy(study) ? <p className="text-sm">Непрерывное исследование останавливается только общей командой алгоритма.</p> : <Button type="button" variant="outline" disabled={study.status === "cancel_requested" || controller.cancelling !== null || controller.deleting !== null || controller.creating} onClick={() => { void controller.stop(study); }}>{controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить исследование"}</Button>
         : onNew && <Button type="button" disabled={!controller.ready || controller.active !== null} onClick={onNew}>Новое исследование</Button>}
     </div>
     {study.status === "cancel_requested" && <Alert role="status">Сервер завершает текущие задачи и очистку. Остановка ещё не завершена.</Alert>}
     {study.error && <Alert variant="destructive" role="alert">{study.error.code}: {study.error.message}</Alert>}
     {study.status === "failed" && study.result === null && <p className="text-sm">Итог не сохранён. Промежуточный bestScore не восстанавливает потерянного кандидата; автоматического перезапуска нет.</p>}
-    {result && <p className="text-sm">Причина завершения: {reasonLabels[result.reason]}.</p>}
+    {result && <><p className="text-sm">Причина завершения: {reasonLabels[result.reason]}.</p><Separator /></>}
     {result && !best && <Alert variant="warning">Нет оценимого кандидата, удовлетворившего требованиям всех выбранных ячеек и порогу «Минимум закрытых на ячейку»{spec.minSetupsPerDay !== undefined && spec.minSetupsPerDay > 0 ? " и частотному порогу «Минимум сетапов в день»" : ""}. Отсутствующий score не равен нулю.</Alert>}
     {best && <>
-      <div className="flex items-center gap-2"><h3 className="font-semibold">Лучший score: {best.score} R</h3>
-      <InfoNote>Хеши фиксируют происхождение входов, но не гарантируют точного повторения после изменения истории. Комиссии, funding и проскальзывание не учитываются.</InfoNote></div>
-      <p className="text-sm">{best.partial ? "Частичный итог остановленного исследования." : "Лучший полностью проверенный кандидат в пределах бюджета."} Это не доказанный глобальный оптимум. Score — равное среднее {blend ? "blend R" : forecast ? "прогноза R" : "R"} всех выбранных TP×SL-ячеек, а не выбор лучшей TP/SL-пары.</p>
-      {forecast && <p className="text-sm">{blend ? `Выбор по смеси среднего и прогноза (${blendLabel}).` : recipe?.method === "decayed_probability" ? "Выбор по вероятностному прогнозу TP с памятью." : "Выбор по прогнозу тренда."} Среднее всей матрицы за период: {best.meanScore == null ? "Не сохранено" : `${best.meanScore} R`}. Прогноз не является средним за период; ретроспективная оценка не доказывает качество будущих сделок.</p>}
+      <div className="flex flex-wrap items-center gap-2"><h3 className="font-semibold">Лучший score: {expectancyFormatter.format(best.score)} R</h3>
+      <InfoNote label="О лучшем score">{best.partial ? "Частичный итог остановленного исследования." : "Лучший полностью проверенный кандидат в пределах бюджета."} Это не доказанный глобальный оптимум. Score — равное среднее {blend ? "blend R" : forecast ? "прогноза R" : "R"} всех выбранных TP×SL-ячеек, а не выбор лучшей TP/SL-пары.</InfoNote></div>
+      {forecast && <p className="text-sm">{blend ? `Выбор по смеси среднего и прогноза (${blendLabel}).` : recipe?.method === "decayed_probability" ? "Выбор по вероятностному прогнозу TP с памятью." : "Выбор по прогнозу тренда."} Среднее всей матрицы за период: {best.meanScore == null ? "Не сохранено" : `${expectancyFormatter.format(best.meanScore)} R`}.{!blend && " Прогноз не является средним за период; ретроспективная оценка не доказывает качество будущих сделок."}</p>}
       <section aria-label="Лучшая forecast-пара" className="grid gap-2">
-        <h4 className="font-medium">Лучшая forecast-пара</h4>
-        <p className="text-xs text-muted-foreground">Максимальный чистый прогноз ячейки сохранённого победителя, не score всей матрицы. Среднее и TP/SL относятся к этой же ячейке.</p>
+        <div className="flex flex-wrap items-center gap-2"><h4 className="font-medium">Лучшая forecast-пара</h4><InfoNote label="О лучшей forecast-паре">Максимальный чистый прогноз ячейки сохранённого победителя, не score всей матрицы. Среднее и TP/SL относятся к этой же ячейке.</InfoNote></div>
         {pair == null ? <p className="text-sm">—</p> : <dl className="grid gap-2 text-sm sm:grid-cols-3">
           <div><dt className="text-muted-foreground">Прогноз матожидания</dt><dd>{expectancyFormatter.format(pair.forecastR)} R</dd></div>
           <div><dt className="text-muted-foreground">Среднее матожидание этой ячейки</dt><dd>{expectancyFormatter.format(pair.meanR)} R</dd></div>
           <div><dt className="text-muted-foreground">TP / SL</dt><dd>{pair.tpPct}% / {pair.slPct}%</dd></div>
         </dl>}
       </section>
+      <Separator />
       <section aria-label="Полные параметры результата" className="grid gap-2">
         <h4 className="font-medium">Полные параметры алгоритма</h4>
         <dl className="grid gap-2 text-sm sm:grid-cols-2">{Object.entries(best.params).map(([key, value]) => {
@@ -105,14 +109,17 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
           {typeof best.support?.avgSetupsPerDay === "number" && <div><dt className="text-muted-foreground">Среднее сетапов в день</dt><dd>{best.support.avgSetupsPerDay}</dd></div>}
         </dl>
       </section>
-      <div className="overflow-x-auto">
+      <details><summary className="cursor-pointer font-medium">Матрица и поддержка результата</summary>
+      <div className="mt-2 overflow-x-auto">
         <Table aria-label="Матрица и поддержка результата">
           <TableHeader><TableRow>{["TP %", "SL %", blend ? "Blend R" : forecast ? "Прогноз R" : "R", ...(forecast ? ["Среднее R за период"] : []), ...(blend ? ["Чистый прогноз R"] : []), "Среднее %", "Закрытых", "TP", "SL", "Не закрыты", "Нет данных", "Гейт исключил"].map((title) => <TableHead key={title} numeric>{title}</TableHead>)}</TableRow></TableHeader>
           <TableBody>{best.matrix.map((cell) => <TableRow key={`${cell.tpPct}:${cell.slPct}`}>
-            {[cell.tpPct, cell.slPct, cell.riskExpectancy, ...(forecast ? [cell.meanRiskExpectancy] : []), ...(blend ? [cell.forecastRiskExpectancy] : []), cell.avgMovePct, cell.closedCount, cell.tpCount, cell.slCount, cell.unclosedCount, cell.noDataCount, cell.priceChangeFilteredCount].map((value, index) => <TableCell key={index} numeric>{value ?? "—"}</TableCell>)}
+            {[cell.tpPct, cell.slPct, cell.riskExpectancy, ...(forecast ? [cell.meanRiskExpectancy] : []), ...(blend ? [cell.forecastRiskExpectancy] : []), cell.avgMovePct].map((value, index) => <TableCell key={index} numeric>{value == null ? "—" : matrixFormatter.format(value)}</TableCell>)}
+            {[cell.closedCount, cell.tpCount, cell.slCount, cell.unclosedCount, cell.noDataCount, cell.priceChangeFilteredCount].map((value, index) => <TableCell key={index} numeric>{value ?? "—"}</TableCell>)}
           </TableRow>)}</TableBody>
         </Table>
       </div>
+      </details>
       <dl className="grid gap-2 text-xs sm:grid-cols-2">{Object.entries(best.provenance).map(([key, value]) => <div className="break-all" key={key}><dt className="text-muted-foreground">{key}</dt><dd>{String(value)}</dd></div>)}</dl>
       <ul className="grid gap-1 text-sm">{best.conclusions.slice(0, 32).map((item, index) => <li className="break-words" key={index}>{item.slice(0, 1000)}</li>)}</ul>
     </>}
@@ -123,4 +130,3 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
     </section>
   </section>;
 }
-import { InfoNote } from "../components/ui/info-note";

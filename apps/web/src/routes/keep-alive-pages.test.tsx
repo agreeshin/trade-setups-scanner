@@ -1,4 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import { StrictMode, useState } from "react";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -46,6 +47,26 @@ function renderAppAt(initialPath: string, strict = false) {
 }
 
 describe("keep-alive navigation tabs", () => {
+  it("applies the Algorithms-only desktop width rule only while that retained page is visible", async () => {
+    const selector = '[data-slot="app-main"]:has(> [data-slot="page-card"] [data-page-path="/algorithms"]:not([hidden]))';
+    const globalStyles = readFileSync("src/styles/global.css", "utf8");
+    expect(globalStyles).toContain('@media (width >= 48rem)');
+    expect(globalStyles).toContain(`${selector} {\n    max-width: none;\n  }`);
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
+    const user = userEvent.setup(); renderAppAt("/");
+    const main = screen.getByRole("main");
+    expect(main.matches(selector)).toBe(false);
+    await user.click(screen.getByRole("link", { name: "Алгоритмы" }));
+    await screen.findByRole("tab", { name: "Рост цены и объёма" });
+    expect(main.matches(selector)).toBe(true);
+    expect(main.querySelector('[data-slot="page-sidebar"]')).toHaveClass("md:right-0", "md:fixed", "md:w-56");
+    await user.click(screen.getByRole("link", { name: "Обзор" }));
+    expect(main.matches(selector)).toBe(false);
+    expect(main.querySelector('[data-page-path="/algorithms"]')).toHaveAttribute("hidden");
+    expect(main).toHaveClass("max-w-7xl");
+    expect(scrollTo).toHaveBeenCalled();
+  });
+
   it("preserves the sole refresh through StrictMode, both Setups panels and repeated route navigation", async () => {
     let finish: ((response: Response) => void) | undefined;
     refreshResponse = () => new Promise<Response>((resolve) => { finish = resolve; });
@@ -119,7 +140,7 @@ describe("keep-alive navigation tabs", () => {
     expect(filterAfter.value).toBe("BTC");
     const setupsCallsAfter = requests.filter((path) => path.startsWith("/v1/setups?")).length;
     expect(setupsCallsAfter).toBe(setupsCallsBefore + 1);
-    expect(requests.filter((path) => path.startsWith("/v1/setups?")).at(-1)).toBe("/v1/setups?offset=0&limit=25&q=BTC");
+    expect(requests.filter((path) => path.startsWith("/v1/setups?")).at(-1)).toBe("/v1/setups?offset=0&limit=25&q=BTC&hideGateFailed=true");
   });
 
   it("restores window scroll offset when returning to a tab", async () => {

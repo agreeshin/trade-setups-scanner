@@ -4,8 +4,9 @@ import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Pagination } from "../components/ui/pagination";
+import { Separator } from "../components/ui/separator";
 import { Spinner } from "../components/ui/spinner";
-import { effectiveTimezone, formatIsoDateTime, formatUnix, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
+import { interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
 import { forecastRecipeLabel } from "../lib/forecast-recipe";
 import { getStudyActualSetups, isStudyActualPending, STUDY_ACTUAL_PAGE_SIZE, StudyActualApiError, type StudyActualDetail, type StudyActualSetupPage } from "../lib/study-actual-api";
 import { errorText } from "./platform-controls";
@@ -61,26 +62,33 @@ export function StudyActualSection({ studyId, revisionTrigger }: { studyId: numb
   const [selection, setSelection] = useState<{ revision: number; jobId: string } | null>(null);
   const section = useRef<HTMLElement>(null); const id = useId();
   const actual = detail.actual;
-  const report = actual?.status === "completed" ? actual.report : null;
+  const published = actual?.status === "completed" && actual.jobId !== null && actual.counts !== null ? actual : null;
+  const report = detail.report;
   const objective = report?.originalObjective;
   const label = objective ? objective.trendMode === "mean" ? "Среднее за исходный период" : `${objective.trendMode === "blend" ? `Смесь · λ ${objective.trendBlendLambda} · ` : ""}${forecastRecipeLabel(objective.forecast ?? undefined, objective.trendBendDays)}` : "Исходный objective недоступен";
   return <section ref={section} tabIndex={-1} aria-label="Матожидание после исследования" className="grid min-w-0 gap-3">
     {detail.error && <Alert variant="destructive" role="alert">{detail.error}<Button type="button" variant="outline" onClick={detail.refresh}>Повторить загрузку отчёта</Button></Alert>}
-    {!actual && !detail.error && <Spinner label="Загрузка сохранённого расчёта после исследования" />}
-    {actual && !report && <p role={actual.status === "failed" ? "alert" : "status"} className={actual.status === "failed" ? "text-sm text-danger" : "text-sm text-muted-foreground"}>
+    {detail.loading && !report && !detail.error && <Spinner label="Загрузка сохранённого расчёта после исследования" />}
+    {actual && !published && <p role={actual.status === "failed" ? "alert" : "status"} className={actual.status === "failed" ? "text-sm text-danger" : "text-sm text-muted-foreground"}>
       {isStudyActualPending(actual) ? "Выполняется расчёт после исследования. Предыдущие производные результаты удалены."
         : actual.status === "failed" ? `${actual.error?.code ?? "study_actual_failed"}: ${actual.error?.message ?? "Расчёт завершился ошибкой; повторный запуск выполняется вручную."}`
           : actual.eligibility.eligible ? "Расчёт после исследования ещё не выполнялся. Запустите его вручную в таблице исследований." : `Расчёт после исследования недоступен: ${actual.eligibility.reason ?? "нет подтверждённых исходных данных"}.`}
     </p>}
-    {actual && report && <>
-      <Button id={id} type="button" variant="outline" className="h-auto w-fit max-w-full whitespace-normal text-left" onClick={() => setSelection({ revision: actual.revision, jobId: actual.jobId! })}>Посмотреть список сетапов после исследования</Button>
+    {actual && !report && !detail.loading && <p className="text-sm text-muted-foreground">Исходный график недоступен: {actual.originalReportUnavailableReason ?? "сохранённый исходный отчёт отсутствует"}. Наличие исторического запуска не подтверждает сохранённые исходы сделок.</p>}
+    {published && <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2 text-sm"><span>Матожидание факт:</span><span className={`font-medium ${outcomeMeanClass(published.meanR)}`}>{formatOutcomeRisk(published.meanR)}</span>{published.counts && <Badge className="bg-ambient-violet/15 text-ambient-violet" title="Закрытые сделки / все сетапы">{published.counts.closed}/{published.counts.total}</Badge>}{published.meanR === null && <span className="text-muted-foreground">Нет закрытых сделок</span>}</div>
+        <Button id={id} type="button" variant="outline" className="ml-auto h-auto w-fit max-w-full whitespace-normal text-left" onClick={() => setSelection({ revision: published.revision, jobId: published.jobId! })}>Посмотреть список сетапов после исследования</Button>
+      </div>}
+    {report && <>
       <StudyActualChart report={report} />
-      {report.historical.availability.status === "unavailable" && <p className="text-sm text-muted-foreground">Исходная история графика недоступна: {report.historical.availability.reason}. Результат нового воспроизведения доступен независимо.</p>}
+      {report.display?.historical.availability.status === "unavailable" ? <p className="text-sm text-muted-foreground">Исходная история графика недоступна: {report.display.historical.availability.reason}. Наличие исторического запуска не подтверждает сохранённые исходы сделок.</p>
+        : report.historical.availability.status === "unavailable" && <p className="text-sm text-muted-foreground">Исходная история графика недоступна: {report.historical.availability.reason}.</p>}
+      {report.display && <p className="text-xs text-muted-foreground">Дневная группировка: {report.display.timeZone}. Исходная история: {report.display.historical.fidelity}{report.display.historical.complete ? "" : " · неполное покрытие"}{report.display.historical.reason ? ` · ${report.display.historical.reason}` : ""}. После исследования: {report.display.actual.fidelity}{report.display.actual.complete ? "" : " · неполное покрытие"}{report.display.actual.reason ? ` · ${report.display.actual.reason}` : ""}.</p>}
+      {report.display?.historical.rawReplayAvailable !== undefined && <p className="text-xs text-muted-foreground">Исходный исторический запуск: {report.display.historical.rawReplayAvailable ? "доступен" : "недоступен"}.</p>}
       {report.projection.availability.status === "unavailable" && <p className="text-sm text-muted-foreground">Исходная модельная линия недоступна: {report.projection.availability.reason}. Новый прогноз не подставляется.</p>}
-      <div className="flex flex-wrap items-center gap-2 text-sm"><span>Матожидание факт:</span><span className={`font-medium ${outcomeMeanClass(actual.meanR)}`}>{formatOutcomeRisk(actual.meanR)}</span>{actual.counts && <Badge className="bg-ambient-violet/15 text-ambient-violet" title="Закрытые сделки / все сетапы">{actual.counts.closed}/{actual.counts.total}</Badge>}{actual.meanR === null && <span className="text-muted-foreground">Нет закрытых сделок</span>}</div>
-      <p className="text-xs text-muted-foreground">Новое историческое воспроизведение · ревизия {actual.revision}. Старт: {formatIsoDateTime(report.executionStartedAt)}; данные до {formatUnix(report.observedThroughUnix)} ({effectiveTimezone()}). Дневные когорты исходно UTC; подписи — часовой пояс интерфейса. Это не выпущенные ботом сетапы и не обещание будущей доходности.</p>
-      <p className="text-xs text-muted-foreground">Жёлтая линия: {label}. Исходная модель, без переобучения по новым исходам.</p>
-      {selection?.revision === actual.revision && selection.jobId === actual.jobId && <ActualSetupsDialog key={`${actual.jobId}:${actual.revision}`} actual={actual} onClose={() => setSelection(null)} onInvalidated={detail.refresh} returnFocus={() => (document.getElementById(id) ?? section.current)?.focus()} />}
+      <p className="text-xs text-muted-foreground">Жёлтая линия: {label}.</p>
+      <Separator />
     </>}
+    {published && selection?.revision === published.revision && selection.jobId === published.jobId && <ActualSetupsDialog key={`${published.jobId}:${published.revision}`} actual={published} onClose={() => setSelection(null)} onInvalidated={detail.refresh} returnFocus={() => (document.getElementById(id) ?? section.current)?.focus()} />}
   </section>;
 }

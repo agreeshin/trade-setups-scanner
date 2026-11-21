@@ -51,6 +51,20 @@ const progress = { phase: "acquiring", evaluatedCandidates: 0, scorableCandidate
 function record(status: OptimizationStudy["status"] = "running"): OptimizationStudy {
   return { id: 17, status, spec, progress, result: null as OptimizationStudy["result"], error: null, createdAt: "2026-11-10T00:00:00Z", updatedAt: "2026-11-10T00:01:00Z", events: [{ at: "2026-11-10T00:00:00Z", kind: "started", message: "Подготовка снимка" }] };
 }
+function winnerRecord(mode: "mean" | "forecast" | "blend" = "blend", partial = false): OptimizationStudy {
+  const saved = record(partial ? "cancelled" : "completed");
+  const forecast = { method: "trend", version: 1, bendDays: "30" } as const;
+  const winnerProgress = { ...progress, phase: "done", bestScore: 0.23145202240242907 };
+  return { ...saved, progress: winnerProgress, spec: { ...spec, trendMode: mode, trendBlendLambda: 0.6, trendBendDays: "30", forecast },
+    forecastBest: { forecastR: 0.2695393706707151, meanR: 0.174321, tpPct: 4, slPct: 6 },
+    result: { progress: winnerProgress, reason: partial ? "cancelled" : "time_budget", best: {
+      score: 0.23145202240242907, meanScore: 0.174321, trendMode: mode, trendBlendLambda: 0.6, trendBendDays: "30", forecast, partial,
+      params: algorithm.params, analytics: spec.analyticsParams,
+      matrix: [{ tpPct: 4, slPct: 6, riskExpectancy: 0.23145202240242907, meanRiskExpectancy: 0.174321, forecastRiskExpectancy: 0.2695393706707151,
+        avgMovePct: -0.123456, closedCount: 100000, tpCount: 65000, slCount: 35000, unclosedCount: 2, noDataCount: 1, priceChangeFilteredCount: 0 }],
+      provenance: { optimizerVersion: "fixture", seed: 42, snapshotHash: "modal-layout", capturedAt: saved.createdAt }, conclusions: [],
+    } } };
+}
 let studies: ReturnType<typeof record>[];
 let createStatus: number;
 let deleteStatus: number;
@@ -110,8 +124,8 @@ beforeEach(() => {
       if (cancelStatus !== 202) return json({ error: "cancel_failed" }, cancelStatus);
       studies = studies.map((study) => study.id === Number(cancel[1]) ? { ...study, status: "cancel_requested" } : study); return json(studies.find((study) => study.id === Number(cancel[1])), 202);
     }
-    const actual = /^\/v1\/optimization-studies\/(\d+)\/actual$/.exec(path);
-    if (actual) return json(notCalculatedActualResponse(Number(actual[1])));
+    const actual = /^\/v1\/optimization-studies\/(\d+)\/actual(?:\?.*)?$/.exec(path);
+    if (actual) return json({ ...notCalculatedActualResponse(Number(actual[1])), originalReport: null });
     const detail = /^\/v1\/optimization-studies\/(\d+)$/.exec(path);
     if (detail) {
       const id = Number(detail[1]);
@@ -362,6 +376,98 @@ it("edits, persists and submits a new probability recipe while keeping mean the 
   expect(submitted.analyticsSearch).not.toHaveProperty("forecast");
 });
 
+it.each([
+  ["mean", false], ["forecast", false], ["blend", false],
+  ["mean", true], ["forecast", true], ["blend", true],
+] as const)("moves the complete %s score explanation (partial=%s) into a right-hand accessible InfoNote", async (mode, partial) => {
+  studies = [winnerRecord(mode, partial)];
+  render(<AlgorithmsPage />); await openOptimizer();
+  const heading = await screen.findByRole("heading", { name: "Лучший score: 0.23 R" });
+  const current = screen.getByText("Текущий лучший score").nextElementSibling!;
+  expect(current).toHaveTextContent("0.23 R");
+  const explanation = `${partial ? "Частичный итог остановленного исследования." : "Лучший полностью проверенный кандидат в пределах бюджета."} Это не доказанный глобальный оптимум. Score — равное среднее ${mode === "blend" ? "blend R" : mode === "forecast" ? "прогноза R" : "R"} всех выбранных TP×SL-ячеек, а не выбор лучшей TP/SL-пары.`;
+  expect(screen.queryByText(explanation)).not.toBeInTheDocument();
+  const help = within(heading.parentElement!).getByRole("button", { name: "О лучшем score" });
+  expect(heading.nextElementSibling).toContainElement(help);
+  if (mode === "mean") fireEvent.mouseEnter(help.closest('[data-slot="tooltip-trigger"]')!);
+  else if (mode === "forecast") act(() => { help.focus(); });
+  else { fireEvent.pointerDown(help, { pointerType: "touch" }); fireEvent.click(help); }
+  const tooltip = screen.getByText(explanation);
+  expect(tooltip).toHaveAttribute("role", "tooltip");
+  expect(help).toHaveAttribute("aria-describedby", tooltip.id);
+  fireEvent.pointerDown(heading);
+  expect(screen.queryByText(explanation)).not.toBeInTheDocument();
+  expect(screen.getByRole("dialog", { name: "Оптимизация · Новый алгоритм" })).toBeInTheDocument();
+  const reason = screen.getByText(`Причина завершения: ${partial ? "Явная остановка" : "Исчерпан бюджет времени"}.`);
+  expect(reason.nextElementSibling).toHaveAttribute("data-slot", "separator");
+  const parameters = screen.getByRole("region", { name: "Полные параметры результата" });
+  expect(parameters.previousElementSibling).toHaveAttribute("data-slot", "separator");
+  const pair = screen.getByRole("region", { name: "Лучшая forecast-пара" });
+  const caption = "Максимальный чистый прогноз ячейки сохранённого победителя, не score всей матрицы. Среднее и TP/SL относятся к этой же ячейке.";
+  expect(screen.queryByText(caption)).not.toBeInTheDocument();
+  const pairHelp = within(pair).getByRole("button", { name: "О лучшей forecast-паре" });
+  expect(within(pair).getByRole("heading").nextElementSibling).toContainElement(pairHelp);
+  fireEvent.click(pairHelp);
+  expect(screen.getByText(caption)).toHaveAttribute("role", "tooltip");
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it.each([[0.6, 0.174321, "40/60", "0.17 R"], [0.7, null, "30/70", "Не сохранено"]] as const)("shows only the concise saved blend caption for lambda %s and mean %s", async (lambda, mean, weights, formatted) => {
+  const saved = winnerRecord();
+  saved.result!.best = { ...saved.result!.best!, trendBlendLambda: lambda, meanScore: mean };
+  studies = [saved]; render(<AlgorithmsPage />); await openOptimizer();
+  expect(await screen.findByText(`Выбор по смеси среднего и прогноза (Смесь · ${weights}). Среднее всей матрицы за период: ${formatted}.`)).toBeInTheDocument();
+  expect(screen.queryByText(/Прогноз не является средним за период/)).not.toBeInTheDocument();
+  expect(saved.result!.best.score).toBe(0.23145202240242907);
+  expect(saved.result!.best.meanScore).toBe(mean);
+});
+
+it.each(["mean", "forecast", "blend"] as const)("keeps the %s matrix collapsed, keyboard-focusable and bounded, with four-decimal metrics but integer counts", async (mode) => {
+  const saved = winnerRecord(mode); const original = JSON.stringify(saved);
+  studies = [saved]; render(<AlgorithmsPage />); await openOptimizer();
+  await screen.findByRole("heading", { name: "Лучший score: 0.23 R" });
+  const disclosure = screen.getByText("Матрица и поддержка результата");
+  expect(disclosure.tagName).toBe("SUMMARY");
+  expect(disclosure).toHaveClass("cursor-pointer", "font-medium");
+  expect(disclosure.parentElement).not.toHaveAttribute("open");
+  expect(screen.getByRole("table", { name: "Матрица и поддержка результата" })).not.toBeVisible();
+  act(() => { disclosure.focus(); }); expect(disclosure).toHaveFocus();
+  await userEvent.tab(); expect(screen.getByText("Все входы исследования")).toHaveFocus();
+  await userEvent.tab({ shift: true }); expect(disclosure).toHaveFocus();
+  // jsdom does not synthesize native summary keyboard activation; keep the
+  // browser-owned details/summary contract, as with "Все входы исследования".
+  await userEvent.click(disclosure);
+  const table = screen.getByRole("table", { name: "Матрица и поддержка результата" });
+  expect(disclosure.parentElement).toHaveAttribute("open");
+  expect(table).toBeVisible();
+  expect(table.parentElement).toHaveClass("overflow-x-auto");
+  expect(within(table).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
+    "TP %", "SL %", mode === "blend" ? "Blend R" : mode === "forecast" ? "Прогноз R" : "R",
+    ...(mode !== "mean" ? ["Среднее R за период"] : []), ...(mode === "blend" ? ["Чистый прогноз R"] : []),
+    "Среднее %", "Закрытых", "TP", "SL", "Не закрыты", "Нет данных", "Гейт исключил",
+  ]);
+  const cells = within(within(table).getAllByRole("row")[1]!).getAllByRole("cell").map((cell) => cell.textContent);
+  expect(cells).toEqual(["4.0000", "6.0000", "0.2315", ...(mode !== "mean" ? ["0.1743"] : []), ...(mode === "blend" ? ["0.2695"] : []),
+    "-0.1235", "100000", "65000", "35000", "2", "1", "0"]);
+  expect(JSON.stringify(saved)).toBe(original);
+  await userEvent.click(disclosure);
+  expect(disclosure.parentElement).not.toHaveAttribute("open");
+  expect(table).not.toBeVisible();
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it("preserves unavailable matrix metrics as dashes and real numeric zero as four decimals", async () => {
+  const saved = winnerRecord();
+  saved.result!.best!.matrix = [{ ...saved.result!.best!.matrix[0]!, riskExpectancy: 0, avgMovePct: 0, meanRiskExpectancy: null, forecastRiskExpectancy: null }];
+  studies = [saved]; render(<AlgorithmsPage />); await openOptimizer();
+  await screen.findByRole("heading", { name: "Лучший score: 0.23 R" });
+  await userEvent.click(screen.getByText("Матрица и поддержка результата"));
+  const table = screen.getByRole("table", { name: "Матрица и поддержка результата" });
+  const cells = within(within(table).getAllByRole("row")[1]!).getAllByRole("cell");
+  expect(cells.slice(0, 6).map((cell) => cell.textContent)).toEqual(["4.0000", "6.0000", "0.0000", "—", "—", "0.0000"]);
+  expect(cells.slice(6).map((cell) => cell.textContent)).toEqual(["100000", "65000", "35000", "2", "1", "0"]);
+});
+
 it("labels a forecast winner and keeps its recorded negative period mean separate", async () => {
   const saved = record("completed");
   saved.spec = { ...spec, trendMode: "forecast", trendBendDays: "7" };
@@ -375,9 +481,11 @@ it("labels a forecast winner and keeps its recorded negative period mean separat
   saved.forecastBest = { forecastR: 0.5, meanR: -0.3, tpPct: 4, slPct: 4 };
   studies = [saved];
   render(<AlgorithmsPage />); await openOptimizer();
-  expect(await screen.findByText("Лучший score: 0.5 R")).toBeInTheDocument();
+  expect(await screen.findByText("Лучший score: 0.50 R")).toBeInTheDocument();
   expect(screen.getByText("Прогноз по тренду · перегиб 7 дней")).toBeInTheDocument();
-  expect(screen.getByText(/Среднее всей матрицы за период: -0.3 R/)).toBeInTheDocument();
+  expect(screen.getByText(/Среднее всей матрицы за период: -0.30 R/)).toBeInTheDocument();
+  expect(screen.getByRole("table", { name: "Матрица и поддержка результата" })).not.toBeVisible();
+  await userEvent.click(screen.getByText("Матрица и поддержка результата"));
   expect(screen.getByRole("columnheader", { name: "Прогноз R" })).toBeInTheDocument();
   expect(screen.getByRole("columnheader", { name: "Среднее R за период" })).toBeInTheDocument();
   const pair = within(screen.getByRole("region", { name: "Лучшая forecast-пара" }));
@@ -427,7 +535,7 @@ it.each([0, -0.126])("opens the exact history ID and shows its server forecast p
   const dialog = within(await screen.findByRole("dialog", { name: "Исследование #17 · Новый алгоритм" }));
   const pair = within(await dialog.findByRole("region", { name: "Лучшая forecast-пара" }));
   expect(pair.getAllByRole("definition").map((item) => item.textContent)).toEqual([`${forecastR.toFixed(2)} R`, "-0.70 R", "6% / 4%"]);
-  expect(dialog.getByText("Лучший score: 8 R")).toBeInTheDocument();
+  expect(dialog.getByText("Лучший score: 8.00 R")).toBeInTheDocument();
   expect(requests.filter((request) => /^\/v1\/optimization-studies\/\d+$/.test(request.path)).map((request) => request.path)).toEqual(["/v1/optimization-studies/17"]);
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
@@ -587,11 +695,14 @@ it.each([false, true])("restores full terminal inputs with exact UI labels and c
   studies = [{ ...record("completed"), ...(clusterEnabled ? { forecastBest: null } : {}), result: { progress: { ...progress, bestScore: best.score }, best, reason: "trial_budget" } }];
   render(<AlgorithmsPage />);
   await openOptimizer();
-  expect(await screen.findByText("Лучший score: 0.125 R")).toBeInTheDocument();
+  expect(await screen.findByText("Лучший score: 0.13 R")).toBeInTheDocument();
   expect(screen.getByText("snapshot-test-hash")).toBeInTheDocument();
   expect(within(screen.getByRole("region", { name: "Лучшая forecast-пара" })).getByText("—")).toBeInTheDocument();
+  await userEvent.click(screen.getByText("Матрица и поддержка результата"));
   expect(screen.getByRole("table", { name: "Матрица и поддержка результата" })).toHaveTextContent("Закрытых");
-  expect(screen.getByText(/не доказанный глобальный оптимум/)).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "О лучшем score" }));
+  expect(screen.getByRole("tooltip")).toHaveTextContent(/не доказанный глобальный оптимум/);
+  fireEvent.pointerDown(screen.getByRole("heading", { name: "Лучший score: 0.13 R" }));
   const requirements = within(screen.getByRole("region", { name: "Фиксированные требования исследования" }));
   expect(requirements.getByText("Гейт не применялся")).toBeInTheDocument();
   expect(screen.queryByText("Среднее сетапов в день")).not.toBeInTheDocument();
@@ -866,8 +977,10 @@ it("opens the requested older ID independently from latest discovery without nes
   expect(await screen.findByText("Исследование #17")).toBeInTheDocument();
   expect(screen.getAllByRole("dialog")).toHaveLength(1);
   studies.unshift({ ...record("completed"), id: 21 });
-  fireEvent.click(screen.getByRole("button", { name: "Обновить статус" }));
-  await waitFor(() => expect(requests.some((request) => request.path.startsWith("/v1/optimization-studies?"))).toBe(true));
+  const readsBefore = requests.filter((request) => request.path.startsWith("/v1/optimization-studies?")).length;
+  expect(screen.queryByRole("button", { name: "Обновить статус" })).not.toBeInTheDocument();
+  fireEvent(document, new Event("visibilitychange"));
+  await waitFor(() => expect(requests.filter((request) => request.path.startsWith("/v1/optimization-studies?")).length).toBeGreaterThan(readsBefore));
   expect(screen.getByText("Исследование #17")).toBeInTheDocument();
   expect(requests.some((request) => request.path === "/v1/optimization-studies/20" || request.path === "/v1/optimization-studies/21")).toBe(false);
   await userEvent.click(screen.getByRole("button", { name: "Закрыть" }));

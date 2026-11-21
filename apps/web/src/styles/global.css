@@ -52,6 +52,9 @@ body {
     max-width: calc(80rem + 14rem);
     padding-right: calc(14rem + 1.5rem);
   }
+  [data-slot="app-main"]:has(> [data-slot="page-card"] [data-page-path="/algorithms"]:not([hidden])) {
+    max-width: none;
+  }
 }
 
 /* Аналитика: цвет значений матожидания в матрице, 21 шаг интерполяции красный→зелёный (референс blago_bot_analysis) */

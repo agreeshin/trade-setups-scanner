@@ -1,11 +1,11 @@
 import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { actualDetailFixture, actualReportFixture, actualSetupFixture, studyActualFixture } from "../../test/study-actual-fixture";
+import { actualDetailFixture, actualReportFixture, actualSetupFixture, originalReportFixture, studyActualFixture } from "../../test/study-actual-fixture";
 import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS, formatUnix } from "../lib/datetime-format";
-import type { OptimizationStudy } from "../lib/optimization-api";
+import { summarizeOptimizationStudy, type OptimizationStudy } from "../lib/optimization-api";
 import { refreshStudyActual, type StudyActualDetail } from "../lib/study-actual-api";
-import { OptimizationStudyDialog } from "./algorithm-optimizer";
+import { AlgorithmOptimizer, OptimizationStudyDialog } from "./algorithm-optimizer";
 import { StudyActualSection } from "./study-actual-section";
 import type { OptimizationController } from "./use-optimization-studies";
 
@@ -19,7 +19,8 @@ const controller: OptimizationController = { byAlgorithm: {}, latestByAlgorithm:
   start: vi.fn(() => Promise.resolve(true)), stop: vi.fn(() => Promise.resolve()), remove: vi.fn(() => Promise.resolve(true)), clearError: vi.fn(), refresh: vi.fn() };
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
 let actual: StudyActualDetail;
-let read: () => Response | Promise<Response>;
+let selectedStudy: OptimizationStudy;
+let read: (timeZone: string) => Response | Promise<Response>;
 let page: (offset: number) => Response | Promise<Response>;
 const requests: { path: string; method: string; signal?: AbortSignal | null }[] = [];
 const settle = async (ms = 0) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
@@ -27,7 +28,7 @@ const listButton = () => screen.getByRole("button", { name: "Посмотрет�
 const pageCalls = () => requests.filter((request) => request.path.includes("/actual/setups?"));
 
 beforeEach(() => {
-  vi.useFakeTimers(); requests.length = 0; actual = actualDetailFixture();
+  vi.useFakeTimers(); requests.length = 0; actual = actualDetailFixture(); selectedStudy = study;
   applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "UTC" });
   vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
   read = () => json(actual);
@@ -35,10 +36,10 @@ beforeEach(() => {
     setups: Array.from({ length: 50 }, (_, index) => actualSetupFixture(offset + index + 1)) });
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET"; requests.push({ path, method, ...(init?.signal ? { signal: init.signal } : {}) });
-    if (path === "/v1/optimization-studies/49") return Promise.resolve(json(study));
-    if (path === "/v1/optimization-studies/49/actual") return Promise.resolve(read());
+    if (path === "/v1/optimization-studies/49") return Promise.resolve(json(selectedStudy));
+    if (new URL(path, "http://localhost").pathname === "/v1/optimization-studies/49/actual") return Promise.resolve(read(new URL(path, "http://localhost").searchParams.get("timeZone") ?? "UTC"));
     if (path === "/v1/optimization-studies/49/actual/refresh") {
-      actual = { ...studyActualFixture(49, { status: "queued", stage: "queued", revision: 2, jobId: "actual-49-2" }), report: null }; return Promise.resolve(json(actual, 202));
+      actual = { ...studyActualFixture(49, { status: "queued", stage: "queued", revision: 2, jobId: "actual-49-2" }), report: null, originalReport: originalReportFixture() }; return Promise.resolve(json(actual, 202));
     }
     if (path.includes("/actual/setups?")) return Promise.resolve(page(Number(new URL(path, "http://localhost").searchParams.get("offset"))));
     return Promise.resolve(json({}, 404));
@@ -48,21 +49,160 @@ afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstub
 function modal() {
   return render(<><button id="return-to-history">История</button><OptimizationStudyDialog id={49} algorithm={algorithm} controller={controller} open onOpenChange={vi.fn()} returnFocusId="return-to-history" onDelete={vi.fn()} /></>);
 }
+function zonedDetail(timeZone: "Asia/Tokyo" | "Asia/Kathmandu"): StudyActualDetail {
+  const base = actualDetailFixture(); const original = originalReportFixture();
+  const dayUnix = Date.parse(timeZone === "Asia/Tokyo" ? "2026-11-19T15:00:00Z" : "2026-11-19T18:15:00Z") / 1000;
+  return { ...base, report: { ...base.report!, display: { ...base.report!.display!, timeZone, startDayUnix: dayUnix,
+    daily: [{ dayUnix, date: "2026-11-20", sumR: 2, meanR: 2 / 9, closedCount: 9, tpCount: 4, slCount: 5 }] } },
+    originalReport: { ...original, display: { ...original.display!, timeZone, startDayUnix: dayUnix,
+      daily: [{ dayUnix, date: "2026-11-20", sumR: -0.5, meanR: -0.5 / 7, closedCount: 7, tpCount: 3, slCount: 4 }] } } };
+}
 
-it("puts the exact list button and chart immediately after the ID dialog header and before existing result details", async () => {
+it.each(["not_calculated", "queued", "running", "failed"] as const)("renders original-only history/model for %s with no post controls or automatic computation", async (status) => {
+  actual = { ...studyActualFixture(49, { status, stage: status === "not_calculated" ? null : status === "running" ? "replaying" : status }),
+    report: null, originalReport: originalReportFixture() };
+  modal(); await settle();
+  const chart = screen.getByTestId("study-actual-chart");
+  expect(chart.querySelectorAll('circle[data-phase="observed"]')).toHaveLength(2);
+  expect(chart.querySelector('[data-date="2026-11-20"]')).toHaveAttribute("data-mean-r", "-0.5");
+  expect(screen.getByTestId("study-original-end-value")).toHaveTextContent("+0.80R");
+  expect(screen.queryByText("Матожидание факт:")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Посмотреть список сетапов после исследования" })).not.toBeInTheDocument();
+  expect(pageCalls()).toHaveLength(0); expect(requests.every((request) => request.method === "GET")).toBe(true);
+  expect(requests.some((request) => request.path === "/v1/optimization-studies/49/actual?timeZone=UTC")).toBe(true);
+});
+
+it("does not present raw replay or old UTC aggregates as exact original outcomes", async () => {
+  const original = originalReportFixture();
+  original.display = { ...original.display!, daily: [], historical: { availability: { status: "unavailable", reason: "original_outcome_ledger_unavailable" },
+    fidelity: "unavailable", complete: false, rawReplayAvailable: true, sourceIdentity: "study:36:raw:1767" } };
+  actual = { ...studyActualFixture(), report: null, originalReport: original };
+  modal(); await settle();
+  expect(screen.getByTestId("study-actual-chart").querySelectorAll('circle[data-phase="observed"]')).toHaveLength(0);
+  expect(screen.getByText(/Исходная история графика недоступна: original_outcome_ledger_unavailable/)).toHaveTextContent("Наличие исторического запуска не подтверждает сохранённые исходы сделок.");
+  expect(screen.getByText("Исходный исторический запуск: доступен.")).toBeInTheDocument();
+  expect(screen.getByTestId("study-original-objective-line")).toBeInTheDocument();
+  expect(screen.queryByText("Матожидание факт:")).not.toBeInTheDocument();
+});
+
+it("shows the precise independent original-report unavailable reason without a fake chart or zero", async () => {
+  actual = { ...studyActualFixture(), report: null, originalReport: null, originalReportUnavailableReason: "execution_start_unavailable" };
+  modal(); await settle();
+  expect(screen.getByText(/Исходный график недоступен: execution_start_unavailable/)).toBeInTheDocument();
+  expect(screen.queryByTestId("study-actual-chart")).not.toBeInTheDocument();
+  expect(screen.queryByText("+0.00R")).not.toBeInTheDocument();
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it("keeps original-only chart through immediate refresh invalidation, queued replacement and failed refresh", async () => {
+  modal(); await settle();
+  await act(async () => { await refreshStudyActual(49, new AbortController().signal); });
+  expect(screen.getByTestId("study-actual-chart")).toBeInTheDocument();
+  expect(screen.queryByText("Матожидание факт:")).not.toBeInTheDocument();
+  await settle();
+  expect(screen.getByText(/Выполняется расчёт после исследования/)).toBeInTheDocument();
+  actual = { ...actual, status: "failed", stage: "failed", error: { code: "fixture_failure", stage: "evaluating", message: "Calculation failed" } };
+  await settle(3000);
+  expect(screen.getByText("fixture_failure: Calculation failed")).toBeInTheDocument();
+  expect(screen.getByTestId("study-original-end-value")).toHaveTextContent("+0.80R");
+  expect(screen.getByTestId("study-actual-chart").querySelector('[data-date="2026-11-20"]')).toHaveAttribute("data-mean-r", "-0.5");
+  expect(screen.queryByRole("button", { name: "Посмотреть список сетапов после исследования" })).not.toBeInTheDocument();
+  expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
+});
+
+it("replaces same-revision display reports on zone changes and fences late responses from the old zone", async () => {
+  modal(); await settle();
+  let resolveOld: (response: Response) => void = () => { throw new Error("not requested"); };
+  const old = actual;
+  read = (timeZone) => timeZone === "UTC" ? new Promise<Response>((resolve) => { resolveOld = resolve; }) : json(zonedDetail("Asia/Kathmandu"));
+  await settle(3000);
+  const pending = requests.at(-1)!;
+  act(() => { applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "Asia/Kathmandu" }); });
+  expect(screen.queryByTestId("study-actual-chart")).not.toBeInTheDocument();
+  await settle();
+  const chart = screen.getByTestId("study-actual-chart");
+  expect(chart).toHaveAttribute("data-time-zone", "Asia/Kathmandu");
+  expect(chart.querySelector('circle[data-phase="observed"]')).toHaveAttribute("data-closed", "9");
+  expect(chart.querySelector('circle[data-phase="observed"]')).toHaveAttribute("data-sum-r", "2");
+  expect(pending.signal?.aborted).toBe(true);
+  await act(async () => { resolveOld(json(old)); await Promise.resolve(); });
+  expect(screen.getByTestId("study-actual-chart")).toHaveAttribute("data-time-zone", "Asia/Kathmandu");
+  expect(screen.getByTestId("study-original-end-value")).toHaveTextContent("+0.80R");
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it("puts factual mean/counts left and the exact list button right above the chart, without old visible modal copy", async () => {
   modal(); await settle();
   const dialog = screen.getByRole("dialog", { name: "Исследование #49 · Всплеск" });
   const section = within(dialog).getByRole("region", { name: "Матожидание после исследования" });
   expect(dialog.querySelector('[data-slot="dialog-header"]')?.nextElementSibling).toBe(section);
-  expect(section.firstElementChild).toBe(listButton());
-  expect(listButton().nextElementSibling).toBe(screen.getByTestId("study-actual-chart"));
+  const toolbar = section.firstElementChild!;
+  expect(toolbar).toHaveClass("flex", "flex-wrap", "justify-between");
+  expect(toolbar.firstElementChild).toHaveTextContent("Матожидание факт:+1.25R123/176");
+  expect(toolbar.lastElementChild).toBe(listButton());
+  expect(listButton()).toHaveClass("ml-auto", "max-w-full", "whitespace-normal");
+  expect(within(toolbar as HTMLElement).getByTitle("Закрытые сделки / все сетапы")).toHaveTextContent("123/176");
+  expect(toolbar.nextElementSibling).toBe(screen.getByTestId("study-actual-chart"));
+  expect(dialog.querySelector('[data-slot="dialog-header"]')).toHaveTextContent("Исследование #49 · ВсплескЗавершеноНепрерывное");
+  expect(within(dialog).getAllByText(/Исследование #49/)).toHaveLength(1);
+  expect(within(dialog).queryByText("Сохранённое исследование. Просмотр и закрытие окна не меняют серверную работу или настройки.")).not.toBeInTheDocument();
+  expect(within(dialog).queryByText(/Новое историческое воспроизведение · ревизия/)).not.toBeInTheDocument();
+  expect(within(dialog).queryByText(/Исходная модель, без переобучения по новым исходам/)).not.toBeInTheDocument();
+  expect(within(dialog).getByText(/^Жёлтая линия:/)).toHaveTextContent("Смесь · λ 0.7 · Вероятность TP с памятью · v1 · H 14 дней · κ 10");
   const result = within(dialog).getByRole("region", { name: "Статус исследования" });
   expect(section.compareDocumentPosition(result) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  expect(within(result).queryByRole("heading", { name: /Исследование #/ })).not.toBeInTheDocument();
+  expect(within(result).queryByText("Непрерывное")).not.toBeInTheDocument();
+  expect(within(result).queryByRole("button", { name: "Пояснение" })).not.toBeInTheDocument();
   expect(requests.every((request) => request.method === "GET")).toBe(true); expect(pageCalls()).toHaveLength(0);
 });
 
+it.each(["mean", "forecast", "blend"] as const)("keeps the saved %s objective caption and places a separator immediately after it", async (mode) => {
+  actual = actualDetailFixture(49, { report: actualReportFixture({ originalObjective: {
+    version: 1, trendMode: mode, trendBendDays: "30", trendBlendLambda: 0.6,
+    forecast: { method: "trend", version: 1, bendDays: "30" },
+  } }) });
+  modal(); await settle();
+  const caption = screen.getByText(/^Жёлтая линия:/);
+  expect(caption).toHaveTextContent(mode === "mean" ? "Жёлтая линия: Среднее за исходный период."
+    : `Жёлтая линия: ${mode === "blend" ? "Смесь · λ 0.6 · " : ""}Прогноз по тренду · перегиб 30 дней · v1.`);
+  expect(caption.nextElementSibling).toHaveAttribute("data-slot", "separator");
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it.each([
+  ["queued", "В очереди"], ["running", "Выполняется"], ["cancel_requested", "Отмена запрошена"],
+  ["completed", "Завершено"], ["cancelled", "Отменено"], ["failed", "Ошибка исследования"],
+] as const)("shows truthful header badges and refresh only for an active saved %s study", async (status, label) => {
+  selectedStudy = { ...study, status };
+  modal(); await settle();
+  const dialog = screen.getByRole("dialog", { name: "Исследование #49 · Всплеск" });
+  const header = dialog.querySelector('[data-slot="dialog-header"]')!;
+  expect(header).toHaveTextContent(label); expect(header).toHaveTextContent("Непрерывное");
+  const active = ["queued", "running", "cancel_requested"].includes(status);
+  expect(within(dialog).queryByRole("button", { name: "Обновить статус" }) !== null).toBe(active);
+  expect(within(dialog).queryByRole("button", { name: "Остановить исследование" })).not.toBeInTheDocument();
+  if (active) expect(within(dialog).getByText("Непрерывное исследование останавливается только общей командой алгоритма.")).toBeInTheDocument();
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it.each(["completed", "running"] as const)("retains the sole ID/status/origin in the optimizer result header for %s manual studies", async (status) => {
+  selectedStudy = { ...study, status, origin: "manual" };
+  const optimization = { ...controller, ready: status !== "completed", byAlgorithm: { spike: summarizeOptimizationStudy(selectedStudy) } };
+  render(<AlgorithmOptimizer algorithm={algorithm} controller={optimization} open onOpenChange={vi.fn()} returnFocusId="return-to-history" onDelete={vi.fn()} />);
+  await settle();
+  const dialog = screen.getByRole("dialog", { name: "Оптимизация · Всплеск" });
+  const header = dialog.querySelector('[data-slot="dialog-header"]')!;
+  expect(header).toHaveTextContent("Исследование #49"); expect(header).toHaveTextContent("Ручное");
+  expect(header).toHaveTextContent(status === "completed" ? "Завершено" : "Выполняется");
+  expect(within(dialog).getAllByText("Исследование #49")).toHaveLength(1);
+  expect(within(dialog).queryByRole("button", { name: "Обновить статус" }) !== null).toBe(status === "running");
+  if (status === "running") expect(within(dialog).getByRole("button", { name: "Остановить исследование" })).toBeEnabled();
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
 it("does not calculate or show chart/list controls before the first successful manual job, including StrictMode", async () => {
-  actual = { ...studyActualFixture(), report: null };
+  actual = { ...studyActualFixture(), report: null, originalReport: null };
   render(<StrictMode><StudyActualSection studyId={49} revisionTrigger={0} /></StrictMode>); await settle();
   expect(screen.queryByRole("button", { name: "Посмотреть список сетапов после исследования" })).not.toBeInTheDocument();
   expect(screen.queryByTestId("study-actual-chart")).not.toBeInTheDocument(); expect(screen.getByRole("status")).toHaveTextContent("ещё не выполнялся");
@@ -115,9 +255,9 @@ it("invalidates chart/list on another tab's queued revision and ignores its late
   page = () => new Promise<Response>((resolve) => { resolvePage = resolve; });
   modal(); await settle(); fireEvent.click(listButton()); await settle();
   const pending = pageCalls()[0]!;
-  actual = { ...studyActualFixture(49, { status: "queued", stage: "queued", revision: 2, jobId: "actual-49-2" }), report: null };
+  actual = { ...studyActualFixture(49, { status: "queued", stage: "queued", revision: 2, jobId: "actual-49-2" }), report: null, originalReport: originalReportFixture() };
   await settle(3000);
-  expect(screen.queryByTestId("study-actual-chart")).not.toBeInTheDocument(); expect(screen.queryByRole("dialog", { name: "Сетапы после исследования #49" })).not.toBeInTheDocument();
+  expect(screen.getByTestId("study-actual-chart")).toBeInTheDocument(); expect(screen.queryByRole("dialog", { name: "Сетапы после исследования #49" })).not.toBeInTheDocument();
   expect(pending.signal?.aborted).toBe(true);
   await act(async () => { resolvePage(json({ studyId: 49, jobId: "actual-49-1", revision: 1, retrospective: true, total: 1, offset: 0, limit: 50, setups: [actualSetupFixture()] })); await Promise.resolve(); });
   expect(screen.queryByText("ACTUAL1USDT")).not.toBeInTheDocument();
@@ -130,9 +270,9 @@ it("invalidates immediately on accepted manual refresh and fences an old full-re
   let resolveOld: (response: Response) => void = () => { throw new Error("report not requested"); };
   read = () => new Promise<Response>((resolve) => { resolveOld = resolve; });
   await act(async () => { await refreshStudyActual(49, new AbortController().signal); });
-  expect(screen.queryByTestId("study-actual-chart")).not.toBeInTheDocument();
+  expect(screen.getByTestId("study-actual-chart")).toBeInTheDocument();
   await act(async () => { resolveOld(json(old)); await Promise.resolve(); });
-  expect(screen.queryByTestId("study-actual-chart")).not.toBeInTheDocument();
+  expect(screen.getByTestId("study-actual-chart")).toBeInTheDocument();
   read = () => json(actual); await settle(3000);
   expect(screen.getByText(/Предыдущие производные результаты удалены/)).toBeInTheDocument();
   expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
@@ -140,9 +280,9 @@ it("invalidates immediately on accepted manual refresh and fences an old full-re
 
 it("reconciles stale page revision with read-only state discovery and hides the deleted pair", async () => {
   modal(); await settle();
-  page = () => { actual = { ...studyActualFixture(49, { status: "running", stage: "replaying", revision: 2, jobId: "other-tab" }), report: null }; return json({ error: "study_actual_revision_changed" }, 409); };
+  page = () => { actual = { ...studyActualFixture(49, { status: "running", stage: "replaying", revision: 2, jobId: "other-tab" }), report: null, originalReport: originalReportFixture() }; return json({ error: "study_actual_revision_changed" }, 409); };
   fireEvent.click(listButton()); await settle();
-  expect(screen.queryByTestId("study-actual-chart")).not.toBeInTheDocument(); expect(screen.getByText(/Выполняется расчёт после исследования/)).toBeInTheDocument();
+  expect(screen.getByTestId("study-actual-chart")).toBeInTheDocument(); expect(screen.getByText(/Выполняется расчёт после исследования/)).toBeInTheDocument();
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
 
@@ -164,8 +304,15 @@ it("suspends observers while hidden, rereads on visibility restore, and releases
 it("keeps responsive controls and configured-timezone cells in the paged second modal", async () => {
   vi.stubGlobal("innerWidth", 375); modal(); await settle(); expect(listButton()).toHaveClass("max-w-full", "whitespace-normal", "h-auto");
   fireEvent.click(listButton()); await settle();
+  const dialog = screen.getByRole("dialog", { name: "Сетапы после исследования #49" });
+  fireEvent.click(screen.getByRole("button", { name: "Следующая страница сетапов" })); await settle();
+  const pagesBefore = pageCalls().length;
+  read = () => json(zonedDetail("Asia/Tokyo"));
   act(() => { applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "Asia/Tokyo" }); });
+  await settle();
+  expect(screen.getByRole("dialog", { name: "Сетапы после исследования #49" })).toBe(dialog);
   const table = screen.getByRole("table", { name: "Сетапы после исследования" });
   expect(table.querySelector("caption")).toHaveTextContent("Asia/Tokyo");
   expect(within(table).getAllByRole("row")[1]).toHaveTextContent(formatUnix(actualSetupFixture().setupTimeUnix));
+  expect(screen.getByText("ACTUAL51USDT")).toBeInTheDocument(); expect(pageCalls()).toHaveLength(pagesBefore);
 });

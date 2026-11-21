@@ -1135,7 +1135,7 @@ async fn history_purge_preserves_mixed_outputs_analytics_identity_and_supports_r
         let original=purge_preserved(&pool).await;
         let run_before=setups_db::runs::get_run_full(&pool,i64::from(f.run)).await.unwrap().unwrap();
         let batch_before=setups_db::runs::get_replay_batch(&pool,i64::from(f.batch)).await.unwrap().unwrap();
-        let live_before=setups_db::runs::live_setups_search(&pool,i64::from(i32::MAX),None,0,100).await.unwrap();
+        let live_before=setups_db::runs::live_setups_search(&pool,i64::from(i32::MAX),None,0,100,false).await.unwrap();
         let config_before=db::get(&pool,OWNER,ALGORITHM).await.unwrap().unwrap();
         let p=preview(&pool,OWNER).await.unwrap();
         assert!(p.eligible,"{:?}",p.blockers);
@@ -1149,7 +1149,7 @@ async fn history_purge_preserves_mixed_outputs_analytics_identity_and_supports_r
         assert_eq!(setups_db::runs::get_run_full(&pool,i64::from(f.run)).await.unwrap().unwrap(),run_before);
         let batch_after=setups_db::runs::get_replay_batch(&pool,i64::from(f.batch)).await.unwrap().unwrap();
         assert_eq!((batch_after.continuous_study_id,batch_after.continuous_generation_id,batch_after.setup_count),(batch_before.continuous_study_id,batch_before.continuous_generation_id,batch_before.setup_count));
-        assert_eq!(setups_db::runs::live_setups_search(&pool,i64::from(i32::MAX),None,0,100).await.unwrap(),live_before);
+        assert_eq!(setups_db::runs::live_setups_search(&pool,i64::from(i32::MAX),None,0,100,false).await.unwrap(),live_before);
         let archives:Value=sqlx::query_scalar("select jsonb_build_object('meta',continuous_archive,'analytics',continuous_analytics_archive,'replay',continuous_replay_archive) from replay_batches where id=$1").bind(f.batch).fetch_one(&pool).await.unwrap();
         assert_eq!(archives["meta"]["generationId"],f.active.generation_id);
         assert_eq!(archives["analytics"]["sentinel"],"independent post-chain");

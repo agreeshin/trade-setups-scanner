@@ -10,7 +10,7 @@ import type { CatalogInstrument } from "./instrument-picker";
 import { algorithmDisplayName, errorText, localDateInput, type Algorithm } from "./platform-controls";
 import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildOptimizationSpec, initialDomains, initialScope, type ScopeDraft } from "./optimization-form";
 import { OptimizationFields } from "./optimization-fields";
-import { OptimizationResults } from "./optimization-results";
+import { OptimizationResults, StudyStatusBadges } from "./optimization-results";
 import { OptimizationTrashIcon } from "./optimization-history";
 import { useOptimizationDetail } from "./use-optimization-detail";
 import { StudyActualSection } from "./study-actual-section";
@@ -110,8 +110,11 @@ export function OptimizationStudyDialog({ id, algorithm, controller, open, onOpe
 }) {
   const detail = useOptimizationDetail(id, open, controller.revision);
   return <Dialog open={open} onOpenChange={onOpenChange}>
-    <DialogContent className="max-w-4xl" onCloseAutoFocus={(event) => { event.preventDefault(); (document.getElementById(returnFocusId) ?? document.getElementById(fallbackFocusId))?.focus(); }}>
-      <DialogHeader><DialogTitle>Исследование #{id} · {algorithmDisplayName(algorithm)}</DialogTitle><DialogDescription>Сохранённое исследование. Просмотр и закрытие окна не меняют серверную работу или настройки.</DialogDescription></DialogHeader>
+    <DialogContent aria-describedby={undefined} className="max-w-4xl" onCloseAutoFocus={(event) => { event.preventDefault(); (document.getElementById(returnFocusId) ?? document.getElementById(fallbackFocusId))?.focus(); }}>
+      <DialogHeader><div className="flex flex-wrap items-center gap-2">
+        <DialogTitle><span>Исследование #{id}</span> · {algorithmDisplayName(algorithm)}</DialogTitle>
+        {detail?.study && <StudyStatusBadges study={detail.study} />}
+      </div></DialogHeader>
       {open && id !== undefined && <StudyActualSection key={id} studyId={id} revisionTrigger={controller.revision} />}
       <div className="grid min-w-0 gap-4">
         {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
@@ -126,15 +129,18 @@ export function AlgorithmOptimizer({ algorithm, controller, open, onOpenChange, 
   const [drafting, setDrafting] = useState(false);
   const showStudy = study && (isActiveStudy(study) || !drafting);
   const detail = useOptimizationDetail(study?.id, open && Boolean(showStudy), controller.revision, study && !isActiveStudy(study) ? study.updatedAt : undefined);
+  const headerStudy = showStudy ? detail?.study ?? study : undefined;
   return <Dialog open={open} onOpenChange={(next) => { if (!next) setDrafting(false); onOpenChange(next); }}>
     <DialogContent className="max-w-4xl" onCloseAutoFocus={(event) => { event.preventDefault(); document.getElementById(returnFocusId)?.focus(); }}>
       <DialogHeader>
-        <div className="flex items-center gap-2"><DialogTitle>Оптимизация · {algorithmDisplayName(algorithm)}</DialogTitle><InfoNote>Исследование изолировано от live, обычных прогонов и кешей. Все выбранные TP×SL-ячейки имеют равный вес; baseline оценивается как trial 0 и входит в бюджет. Открытие и изменение формы ничего не запускают.</InfoNote></div>
+        <div className="flex flex-wrap items-center gap-2"><DialogTitle>Оптимизация · {algorithmDisplayName(algorithm)}</DialogTitle>
+          {headerStudy && <><span className="font-semibold">Исследование #{headerStudy.id}</span><StudyStatusBadges study={headerStudy} /></>}
+          <InfoNote>Исследование изолировано от live, обычных прогонов и кешей. Все выбранные TP×SL-ячейки имеют равный вес; baseline оценивается как trial 0 и входит в бюджет. Открытие и изменение формы ничего не запускают.</InfoNote></div>
         <DialogDescription>Серверное исследование Plan A. Закрытие окна не останавливает работу; для остановки нужна отдельная команда.</DialogDescription>
       </DialogHeader>
       <div className="grid min-w-0 gap-4">
         {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
-        {!controller.ready && <div className="flex flex-wrap items-center gap-2 text-sm"><span>Проверяем сохранённые исследования. Новый запуск пока недоступен.</span><Button type="button" variant="outline" onClick={controller.refresh}>Обновить статус</Button></div>}
+        {!controller.ready && <div className="flex flex-wrap items-center gap-2 text-sm"><span>Проверяем сохранённые исследования. Новый запуск пока недоступен.</span>{(!showStudy || isActiveStudy(study)) && <Button type="button" variant="outline" onClick={controller.refresh}>Обновить статус</Button>}</div>}
         {controller.active && controller.active.spec.algorithmId !== algorithm.id && <Alert variant="warning">Исследование #{controller.active.id} для {controller.active.spec.algorithmId} уже выполняется. В платформе допускается только одно активное исследование.</Alert>}
         {showStudy ? <StudyDetail detail={detail} algorithm={algorithm} controller={controller} onDelete={onDelete} onNew={() => setDrafting(true)} />
           : <OptimizerForm algorithm={algorithm} controller={controller} onStarted={() => setDrafting(false)} />}

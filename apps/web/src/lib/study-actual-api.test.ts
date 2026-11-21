@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { actualCountsFixture, actualDetailFixture, actualReportFixture, actualSetupFixture, notCalculatedActualResponse, studyActualFixture } from "../../test/study-actual-fixture";
+import { actualCountsFixture, actualDetailFixture, actualReportFixture, actualSetupFixture, havanaActualDetailFixture, notCalculatedActualResponse, originalReportFixture, studyActualFixture } from "../../test/study-actual-fixture";
 import { SESSION_EXPIRED_EVENT } from "./platform-api";
 import { getStudyActual, getStudyActualSetups, getStudyActualSummary, parseOriginalObjective, parseStudyActualSummary, refreshStudyActual, StudyActualApiError } from "./study-actual-api";
 
@@ -98,6 +98,81 @@ it("does not expose stale report bytes attached to a queued replacement", async 
   const actual = { ...actualDetailFixture(), status: "queued", stage: "queued", counts: null, meanR: null };
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json(actual)));
   expect((await getStudyActual(49, new AbortController().signal)).report).toBeNull();
+});
+
+it.each(["not_calculated", "queued", "running", "failed"] as const)("reads independent original report for %s without exposing stale post bytes or starting a job", async (status) => {
+  const originalReport = originalReportFixture();
+  const body = { ...studyActualFixture(49, { status, stage: status === "not_calculated" ? null : status === "running" ? "replaying" : status }),
+    originalReport, report: actualReportFixture() };
+  const fetch = vi.fn().mockResolvedValue(json(body)); vi.stubGlobal("fetch", fetch);
+  const result = await getStudyActual(49, new AbortController().signal, "UTC");
+  expect(result.originalReport).toEqual(originalReport); expect(result.report).toBeNull();
+  expect(result.counts).toBeNull(); expect(result.meanR).toBeNull();
+  expect(fetch.mock.calls[0]?.[0]).toBe("/v1/optimization-studies/49/actual?timeZone=UTC");
+  expect((fetch.mock.calls[0]?.[1] as RequestInit).method).toBeUndefined();
+  expect(fetch).toHaveBeenCalledOnce();
+});
+
+it("encodes the IANA zone, accepts exact fractional-offset boundaries, and keeps the sealed projection unchanged", async () => {
+  const actual = actualDetailFixture(); const timeZone = "Asia/Kathmandu";
+  const dayUnix = Date.parse("2026-11-19T18:15:00Z") / 1000;
+  const display = { ...actual.report!.display!, timeZone, startDayUnix: dayUnix,
+    daily: [{ dayUnix, date: "2026-11-20", sumR: 9, meanR: 0.9, closedCount: 10, tpCount: 7, slCount: 3 }] };
+  const report = { ...actual.report!, display };
+  const fetch = vi.fn().mockResolvedValue(json({ ...actual, report, originalReport: { ...originalReportFixture(), display: { ...display, daily: [] } } }));
+  vi.stubGlobal("fetch", fetch);
+  const result = await getStudyActual(49, new AbortController().signal, timeZone);
+  expect(fetch.mock.calls[0]?.[0]).toBe("/v1/optimization-studies/49/actual?timeZone=Asia%2FKathmandu");
+  expect(result.report!.display!.daily[0]).toMatchObject({ sumR: 9, meanR: 0.9, closedCount: 10 });
+  expect(result.report!.projection).toEqual(actual.report!.projection);
+});
+
+it("accepts Havana's first repeated midnight and rejects a later PG midnight or mismatched requested zone", async () => {
+  const body = havanaActualDetailFixture();
+  const fetch = vi.fn().mockImplementation(() => Promise.resolve(json(body))); vi.stubGlobal("fetch", fetch);
+  const result = await getStudyActual(49, new AbortController().signal, "America/Havana");
+  expect(result.report!.display!.startDayUnix).toBe(Date.parse("2026-11-01T04:00:00Z") / 1000);
+  expect(result.report!.display!.daily.at(-1)).toMatchObject({ date: "2026-11-01", meanR: 0.2, closedCount: 5 });
+  expect(result.report!.actual.daily[0]!.plotAtUnix).toBe(Date.parse("2026-11-01T04:30:00Z") / 1000);
+  expect(fetch.mock.calls[0]?.[0]).toBe("/v1/optimization-studies/49/actual?timeZone=America%2FHavana");
+  await expect(getStudyActual(49, new AbortController().signal, "America/New_York")).rejects.toBeInstanceOf(StudyActualApiError);
+  const laterMidnight = Date.parse("2026-11-01T05:00:00Z") / 1000;
+  const report = { ...body.report!, executionStartedAt: "2026-11-01T05:30:00.125Z",
+    display: { ...body.report!.display!, startDayUnix: laterMidnight,
+      daily: body.report!.display!.daily.map((point) => point.date === "2026-11-01" ? { ...point, dayUnix: laterMidnight } : point) } };
+  fetch.mockImplementation(() => Promise.resolve(json({ ...body, report })));
+  await expect(getStudyActual(49, new AbortController().signal, "America/Havana")).rejects.toBeInstanceOf(StudyActualApiError);
+});
+
+it.each([
+  { timeZone: "Not/AZone" }, { timeZone: "America/New_York" }, { startDayUnix: 1795176000 },
+  { daily: [{ dayUnix: 1795132800, date: "2026-11-21", sumR: 1, meanR: 1, closedCount: 1, tpCount: 1, slCount: 0 }] },
+  { daily: [{ dayUnix: 1795132800, date: "2026-11-20", sumR: 1, meanR: 0, closedCount: 0, tpCount: 0, slCount: 0 }] },
+  { daily: [{ dayUnix: 1795132800, date: "2026-11-20", sumR: 9, meanR: 0.5, closedCount: 10, tpCount: 7, slCount: 3 }] },
+  { daily: [{ dayUnix: 1795132800, date: "2026-11-20", sumR: 1, meanR: 1, closedCount: 1, tpCount: 0, slCount: 0 }] },
+])("rejects malformed or wrongly grouped display metadata instead of relabeling UTC aggregates: %j", async (patch) => {
+  const actual = actualDetailFixture();
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json({ ...actual, report: { ...actual.report, display: { ...actual.report!.display, ...patch } } })));
+  await expect(getStudyActual(49, new AbortController().signal, "UTC")).rejects.toBeInstanceOf(StudyActualApiError);
+});
+
+it("rejects duplicate day points, missing display and oversized display collections on the zone-aware path", async () => {
+  const actual = actualDetailFixture(); const point = actual.report!.display!.daily[0]!;
+  for (const display of [undefined, { ...actual.report!.display, daily: [point, point] }, { ...actual.report!.display, daily: Array.from({ length: 3662 }, () => point) }]) {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json({ ...actual, report: { ...actual.report, display } })));
+    await expect(getStudyActual(49, new AbortController().signal, "UTC")).rejects.toBeInstanceOf(StudyActualApiError);
+  }
+});
+
+it("keeps truthful original-unavailable provenance separate from an available raw replay", async () => {
+  const originalReport = originalReportFixture();
+  originalReport.display = { ...originalReport.display!, daily: [], historical: { availability: { status: "unavailable", reason: "original_outcomes_unavailable" }, fidelity: "unavailable", complete: false,
+    sourceIdentity: { runId: 36, rawSetupCount: 1767, rawReplayAvailable: true } } };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json({ ...notCalculatedActualResponse(36), originalReport })));
+  const actual = await getStudyActual(36, new AbortController().signal, "UTC");
+  expect(actual.originalReport!.display!.historical.availability.status).toBe("unavailable");
+  expect(actual.originalReport!.display!.historical.sourceIdentity).toEqual({ runId: 36, rawSetupCount: 1767, rawReplayAvailable: true });
+  expect(actual.originalReport!.display!.daily).toEqual([]);
 });
 
 it("rejects a post-study refit instead of presenting it as the original objective", async () => {

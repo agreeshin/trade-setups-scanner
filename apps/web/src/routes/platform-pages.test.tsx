@@ -483,11 +483,11 @@ describe("platform screens", () => {
     expect(screen.queryByText("bybit · BTC29")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Далее" }));
     await screen.findByText("bybit · BTC29");
-    expect(requests.some((request) => request.path.includes("offset=25&limit=25&q=&snapshotId=601"))).toBe(true);
+    expect(requests.some((request) => request.path.includes("offset=25&limit=25&q=&hideGateFailed=true&snapshotId=601"))).toBe(true);
     fireEvent.change(screen.getByLabelText("Инструмент, биржа или алгоритм"), { target: { value: "BTC600" } });
     await screen.findByText("Страница 1 из 1 · Найдено: 1");
     expect(screen.getByText("bybit · BTC600")).toBeInTheDocument();
-    expect(requests.some((request) => request.path === "/v1/setups?offset=0&limit=25&q=BTC600")).toBe(true);
+    expect(requests.some((request) => request.path === "/v1/setups?offset=0&limit=25&q=BTC600&hideGateFailed=true")).toBe(true);
     expect(screen.getByRole("link", { name: "Экспорт CSV (без фильтра)" })).toHaveAttribute("href", "/v1/export/setups.csv");
     await userEvent.click(screen.getByRole("button", { name: "Обновить" }));
     await screen.findByText("bybit · BTC600");
