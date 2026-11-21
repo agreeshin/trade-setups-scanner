@@ -261,6 +261,56 @@ async fn manual_original_archive_terminal_is_atomic_idempotent_owned_and_shared_
 
 #[tokio::test]
 #[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn manual_original_archive_ack_uses_jsonb_numeric_equality_without_rewriting_science() {
+    use setups_db::study_display::{ManualArchive,OriginalMinute};
+    isolated(|pool| async move {
+        let exponent=json!(1e-7_f64);
+        let decoded:Value=sqlx::query_scalar("select $1::jsonb").bind(&exponent).fetch_one(&pool).await.unwrap();
+        let equal:bool=sqlx::query_scalar("select $1::jsonb is not distinct from $2::jsonb")
+            .bind(&exponent).bind(&decoded).fetch_one(&pool).await.unwrap();
+        eprintln!("JSONB numeric roundtrip: original={exponent}, decoded={decoded}, Rust equality={}, PostgreSQL equality={equal}",exponent==decoded);
+        assert_ne!(exponent,decoded,"fixture must exercise arbitrary_precision representation drift");
+        assert!(equal);assert_eq!(exponent.as_f64(),decoded.as_f64());
+        for elapsed in [1e-7_f64,0.125] {
+            for cancelled in [false,true] {
+                let progress=json!({"phase":"cleanup","evaluatedCandidates":1,"scorableCandidates":1,
+                    "maxTrials":1,"elapsedSeconds":elapsed,"bestScore":0.5});
+                let scientific=json!({"progress":progress,"reason":"trial_budget","baseline":null,
+                    "invalidProposals":0,"detectorPasses":1,"best":{"score":0.5,"partial":false,
+                    "params":setups_domain::SpikeParams::default(),"analytics":{"clusterEnabled":false,"clusterGapMinutes":null,
+                        "setupMaturity":null,"timeShiftMinutes":0,"priceChangePct":null,"horizonMinutes":3},
+                    "matrix":[{"tpPct":8.0,"slPct":4.0,"riskExpectancy":0.5,"avgMovePct":2.0,
+                        "tpCount":1,"slCount":1,"closedCount":2,"unclosedCount":0,"noDataCount":0,"priceChangeFilteredCount":0}],
+                    "provenance":{"optimizerVersion":"plan-a-3","seed":42,"snapshotHash":"immutable-manual-input","capturedAt":"2026-11-21T00:00:00Z"},
+                    "conclusions":[],"trialIndex":0,"support":{"score":0.5,"setupCount":2,"selectedSetupCount":2,
+                        "avgSetupsPerDay":1.0,"requiredSetupCount":0,"evaluatedMinutes":2880,"warmupMinutes":1440}}});
+                let spec=json!({"fromUnix":0,"toUnix":172800});
+                let id:i64=sqlx::query_scalar("insert into optimization_studies(algorithm_id,status,spec,progress,owner_id,execution_started_at) values('price_volume_spike',$1,$2,'{}','admin',to_timestamp($3)) returning id")
+                    .bind(if cancelled {"cancel_requested"}else{"running"}).bind(&spec).bind(START as f64+30.25).fetch_one(&pool).await.unwrap();
+                let archive=ManualArchive {observation_cutoff:172800,tp_pct:8.0,sl_pct:4.0,kernel:"original-manual-close-1".into(),minutes:vec![
+                    OriginalMinute {signal_close_unix:86340,sum_r:2.0,closed_count:1,tp_count:1,sl_count:0},
+                    OriginalMinute {signal_close_unix:86460,sum_r:-1.0,closed_count:1,tp_count:0,sl_count:1},
+                ]};
+                let events=json!([{ "kind":"completed","message":"fixture","at":"2026-11-21T00:00:00Z" }]);
+                optimization::finish_with_original_archive(&pool,id,"completed",&progress,Some(&scientific),None,&events,Some(&archive)).await.unwrap();
+                let stored:Value=sqlx::query_scalar("select to_jsonb(s) from optimization_studies s where id=$1").bind(id).fetch_one(&pool).await.unwrap();
+                let sealed:Value=sqlx::query_scalar("select to_jsonb(o) from study_manual_original_outcomes o where study_id=$1").bind(id).fetch_one(&pool).await.unwrap();
+                assert_eq!(stored["status"],if cancelled {"cancelled"}else{"completed"});
+                assert_eq!(stored["result"]["best"]["partial"],cancelled);
+                assert_eq!(stored["result"]["reason"],if cancelled {"cancelled"}else{"trial_budget"});
+                let retry=optimization::finish_with_original_archive(&pool,id,"completed",&progress,Some(&scientific),None,&events,Some(&archive)).await;
+                assert!(retry.is_ok(),"identical ACK retry failed: elapsed={elapsed}, cancelled={cancelled}, result={retry:?}");
+                let mut changed=scientific.clone();changed["progress"]["elapsedSeconds"]=json!(elapsed*2.0);
+                assert!(optimization::finish_with_original_archive(&pool,id,"completed",&progress,Some(&changed),None,&events,Some(&archive)).await.unwrap_err().to_string().contains("study_display_manual_terminal_conflict"));
+                assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(s) from optimization_studies s where id=$1").bind(id).fetch_one(&pool).await.unwrap(),stored,"retry/conflict must not rewrite science or timestamps");
+                assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(o) from study_manual_original_outcomes o where study_id=$1").bind(id).fetch_one(&pool).await.unwrap(),sealed,"retry/conflict must preserve archive source, hashes and createdAt");
+            }
+        }
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
 async fn concurrent_same_study_admission_and_claim_have_one_current_job() {
     isolated(|pool| async move {
         let study = seed(&pool, "admin", "same-study").await;

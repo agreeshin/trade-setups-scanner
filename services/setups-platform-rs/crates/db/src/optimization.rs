@@ -430,14 +430,16 @@ pub async fn finish_with_original_archive(
         if archive.is_some() {
             // A lost COMMIT ACK must verify what was committed, not turn an
             // already-terminal study into an unconditional default-success.
-            let stored:Option<Value>=sqlx::query_scalar("select result from optimization_studies where id=$1")
-                .bind(id).fetch_one(&mut *tx).await?;
             let mut expected=result.cloned();
             if previous.as_deref()==Some("cancelled") && let Some(value)=&mut expected {
                 value["reason"]=json!("cancelled");
                 if value.get("best").is_some_and(Value::is_object) {value["best"]["partial"]=json!(true);}
             }
-            if stored!=expected {return Err(DbError::Json("study_display_manual_terminal_conflict".into()));}
+            // JSONB normalizes numeric notation; compare in its value domain,
+            // not arbitrary_precision Number strings decoded back into Rust.
+            let same:bool=sqlx::query_scalar("select result is not distinct from $2::jsonb from optimization_studies where id=$1")
+                .bind(id).bind(&expected).fetch_one(&mut *tx).await?;
+            if !same {return Err(DbError::Json("study_display_manual_terminal_conflict".into()));}
             crate::study_display::seal_manual_in(&mut tx,id,archive.expect("archive presence checked")).await?;
         }
         tx.commit().await?;
