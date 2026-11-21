@@ -6,6 +6,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 pub const NOTIFICATION_LEASE_SECONDS: i64 = 30;
 pub const MAX_NOTIFICATION_ATTEMPTS: i32 = 5;
+pub const OBSERVED_CHART_PRESENTATION: &str = "original_observed_v1";
 
 #[derive(Debug, Clone)]
 pub struct NotificationJob {
@@ -73,8 +74,12 @@ pub(super) async fn enqueue(
     setup: &AdaptiveSetupWrite,
 ) -> Result<(), DbError> {
     let expiry = notification_expiry(tx, setup.setup.close_time_unix).await?;
+    // Presentation is immutable admission data, not a send-time archive lookup.
+    // The caller reaches this builder only for a newly inserted live setup;
+    // duplicate/lost-ACK retries never relabel an already admitted payload.
     let payload = json!({"instrument":{"exchange":setup.exchange_code,"category":setup.category,"symbol":setup.symbol},
-        "raw":setup.setup,"recommendation":setup.recommendation,"externalName":profile.external_name});
+        "raw":setup.setup,"recommendation":setup.recommendation,"externalName":profile.external_name,
+        "chartPresentation":OBSERVED_CHART_PRESENTATION});
     // The trigger persists explicit expired/skipped_capacity outcomes without a
     // job or rollback; every other SQL error still fails this scan transaction.
     sqlx::query("insert into adaptive_notification_outbox(setup_id,owner_id,algorithm_id,slot_id,generation_id,config_revision,raw_close_unix,expires_at,payload) values($1,$2,$3,$4,$5,$6,$7,to_timestamp($8),$9)")

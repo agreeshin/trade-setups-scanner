@@ -581,6 +581,11 @@ async fn saved_chart_png(
     charts: Option<&ChartRenderLane>,
 ) -> Result<Option<Vec<u8>>, &'static str> {
     use setups_domain::{AdaptiveRecommendationSnapshot, expectancy::ExpectancyArtifact};
+    let observed_presentation=match job.payload.get("chartPresentation") {
+        None=>false, // Preexisting queued payloads retain their exact old contract.
+        Some(serde_json::Value::String(value)) if value==setups_db::continuous::outbox::OBSERVED_CHART_PRESENTATION=>true,
+        _=>return Err("png_identity_mismatch"),
+    };
     let recommendation = &job.payload["recommendation"];
     let saved = &recommendation["expectancy"];
     let Some(id) = saved["artifactId"].as_i64().filter(|id| *id > 0) else {
@@ -613,7 +618,7 @@ async fn saved_chart_png(
             let numerical: ExpectancyArtifact = serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
                 .map_err(|_| "png_identity_mismatch")?;
             validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
-            let observed=tokio::runtime::Handle::current().block_on(chart_observed(&pool,&fence,id,&numerical))?;
+            let observed=if observed_presentation {tokio::runtime::Handle::current().block_on(chart_observed(&pool,&fence,id,&numerical))?}else{None};
             let rendered=match observed.as_deref() {
                 Some(points)=>setups_analytics::expectancy_chart::render_png_objective_observed(&numerical,expected,raw,value,points),
                 None=>setups_analytics::expectancy_chart::render_png_with_objective(&numerical,expected,raw,value),
@@ -659,7 +664,7 @@ async fn saved_chart_png(
                     serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
                         .map_err(|_| "png_identity_mismatch")?;
                 validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
-                let observed=tokio::runtime::Handle::current().block_on(chart_observed(&pool,&fence,id,&numerical))?;
+                let observed=if observed_presentation {tokio::runtime::Handle::current().block_on(chart_observed(&pool,&fence,id,&numerical))?}else{None};
                 let rendered=match observed.as_deref() {
                     Some(points)=>setups_analytics::expectancy_chart::render_png_model_observed(&numerical,raw_signal_at,forecast,points),
                     None=>setups_analytics::expectancy_chart::render_png_with_model(&numerical,raw_signal_at,forecast),
@@ -678,7 +683,8 @@ async fn saved_chart_png(
         serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
             .map_err(|_| "png_identity_mismatch")?;
     validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
-    if let Some(points)=chart_observed(pool,&fence,id,&numerical).await? {
+    let observed=if observed_presentation {chart_observed(pool,&fence,id,&numerical).await?}else{None};
+    if let Some(points)=observed {
         let charts=charts.ok_or("png_unavailable")?;
         // Same immutable generation fields used by the old asset renderer.
         // Render only this unfrozen future message: no version bump, cache
