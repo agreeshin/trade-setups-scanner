@@ -196,6 +196,71 @@ async fn continuous_reservation(pool: &PgPool, bytes: i64) -> i64 {
 
 #[tokio::test]
 #[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn manual_original_archive_terminal_is_atomic_idempotent_owned_and_shared_by_utc_and_iana() {
+    use setups_db::study_display::{self,ManualArchive,OriginalMinute};
+    async fn finish(pool:&PgPool,id:i64,result:&Value,archive:&ManualArchive)->Result<(),DbError> {
+        optimization::finish_with_original_archive(pool,id,"completed",&json!({}),Some(result),None,&json!([]),Some(archive)).await
+    }
+    isolated(|pool| async move {
+        let spec=json!({"fromUnix":0,"toUnix":172800});
+        let scientific=json!({"reason":"trial_budget","best":{"score":0.5,"partial":false,
+            "matrix":[{"tpPct":8.0,"slPct":4.0,"tpCount":1,"slCount":1,"closedCount":2}],
+            "provenance":{"snapshotHash":"immutable-manual-input","capturedAt":"2026-11-21T00:00:00Z"},
+            "analytics":{"clusterEnabled":true,"setupMaturity":1.0,"timeShiftMinutes":2,"horizonMinutes":3}}});
+        let id:i64=sqlx::query_scalar("insert into optimization_studies(algorithm_id,status,spec,progress,owner_id,execution_started_at) values('price_volume_spike','running',$1,'{}','admin',to_timestamp($2)) returning id")
+            .bind(&spec).bind(START as f64+30.25).fetch_one(&pool).await.unwrap();
+        let mut archive=ManualArchive{observation_cutoff:172800,tp_pct:8.0,sl_pct:4.0,kernel:"original-manual-close-1".into(),minutes:vec![
+            OriginalMinute{signal_close_unix:86340,sum_r:2.0,closed_count:1,tp_count:1,sl_count:0},
+            OriginalMinute{signal_close_unix:86460,sum_r:-1.0,closed_count:1,tp_count:0,sl_count:1},
+        ]};
+        // A rejected archive rolls back the terminal result as well.
+        archive.minutes[0].sum_r=3.0;
+        assert!(finish(&pool,id,&scientific,&archive).await.is_err());
+        let state:Value=sqlx::query_scalar("select to_jsonb(s) from optimization_studies s where id=$1").bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(state["status"],"running");assert!(state["result"].is_null());
+        archive.minutes[0].sum_r=2.0;
+        finish(&pool,id,&scientific,&archive).await.unwrap();
+        let sealed:Value=sqlx::query_scalar("select to_jsonb(o) from study_manual_original_outcomes o where study_id=$1").bind(id).fetch_one(&pool).await.unwrap();
+        finish(&pool,id,&scientific,&archive).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(o) from study_manual_original_outcomes o where study_id=$1").bind(id).fetch_one(&pool).await.unwrap(),sealed,"ACK retry cannot rewrite a source, digest, timestamp or projection");
+        let result:Value=sqlx::query_scalar("select result from optimization_studies where id=$1").bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(result,scientific,"no archive blob or fake artifact IDs in science");
+        let artifacts:i64=sqlx::query_scalar("select count(*) from study_expectancy_artifacts").fetch_one(&pool).await.unwrap();assert_eq!(artifacts,0);
+        let generations:i64=sqlx::query_scalar("select count(*) from continuous_generations").fetch_one(&pool).await.unwrap();assert_eq!(generations,0);
+        assert!(study_display::original_observed(&pool,"foreign",id,None,"UTC").await.unwrap().is_none());
+        let utc=study_display::original_observed(&pool,"admin",id,None,"UTC").await.unwrap().unwrap();
+        assert_eq!(utc.daily.len(),2);assert_eq!(utc.daily[0].mean_r,Some(2.0));assert_eq!(utc.daily[1].mean_r,Some(-1.0));
+        let local=study_display::original_observed(&pool,"admin",id,None,"Asia/Yekaterinburg").await.unwrap().unwrap();
+        assert_eq!(local.source_identity,utc.source_identity);assert_eq!(local.daily.len(),1);
+        assert_eq!((local.daily[0].sum_r,local.daily[0].closed_count,local.daily[0].mean_r),(1.0,2,Some(0.5)));
+        let display=study_display::display_snapshot(&pool,"admin",id,"UTC",Some(DateTime::from_timestamp(START,0).unwrap()),None,None).await.unwrap();
+        assert!(display.actual_row.is_none());assert_eq!(display.original_identity.as_deref(),Some(utc.source_identity.as_str()));
+        assert_eq!(serde_json::to_value(display.original_daily).unwrap(),serde_json::to_value(&utc.daily).unwrap());
+        // The genuine retained owner survives dropping/reopening a connection.
+        let reopened=PgPoolOptions::new().max_connections(1).connect_with((*pool.connect_options()).clone()).await.unwrap();
+        assert_eq!(study_display::original_observed(&reopened,"admin",id,None,"UTC").await.unwrap().unwrap().source_identity,utc.source_identity);reopened.close().await;
+        archive.minutes[0].signal_close_unix=86280;
+        assert!(finish(&pool,id,&scientific,&archive).await.is_err(),"different assignments with the same totals are not an ACK retry");
+        // Quota is global, not per requesting owner. An ACK retry is admitted
+        // at capacity, but a new result/archive transaction rolls back.
+        sqlx::query("with owners as (insert into optimization_studies(algorithm_id,status,spec,progress,owner_id) select 'price_volume_spike','completed','{}','{}','foreign' from generate_series(1,8191) returning id) insert into study_manual_original_outcomes(study_id,owner_id,source_key,study_identity,kernel,source,minutes,payload_sha256,payload_bytes) select id,'foreign',repeat('1',64),repeat('2',32),'original-manual-close-1','{}','[]',repeat('3',64),2 from owners")
+            .execute(&pool).await.unwrap();
+        archive.minutes[0].signal_close_unix=86340;
+        finish(&pool,id,&scientific,&archive).await.unwrap();
+        let second:i64=sqlx::query_scalar("insert into optimization_studies(algorithm_id,status,spec,progress,owner_id,execution_started_at) values('price_volume_spike','running',$1,'{}','admin',to_timestamp($2)) returning id")
+            .bind(&spec).bind(START as f64+30.25).fetch_one(&pool).await.unwrap();
+        assert!(finish(&pool,second,&scientific,&archive).await.unwrap_err().to_string().contains("ledger_resource_limit"));
+        assert_eq!(sqlx::query_as::<_,(String,Option<Value>)>("select status,result from optimization_studies where id=$1").bind(second).fetch_one(&pool).await.unwrap(),("running".into(),None));
+        assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_manual_original_outcomes where study_id=$1").bind(second).fetch_one(&pool).await.unwrap(),0);
+        optimization::finish(&pool,second,"failed",&json!({}),None,Some(&json!({"code":"original_archive_persistence_failed"})),&json!([])).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("select status from optimization_studies where id=$1").bind(second).fetch_one(&pool).await.unwrap(),"failed");
+        sqlx::query("delete from optimization_studies where id=$1").bind(id).execute(&pool).await.unwrap();
+        assert!(study_display::original_observed(&pool,"admin",id,None,"UTC").await.unwrap().is_none());
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
 async fn concurrent_same_study_admission_and_claim_have_one_current_job() {
     isolated(|pool| async move {
         let study = seed(&pool, "admin", "same-study").await;

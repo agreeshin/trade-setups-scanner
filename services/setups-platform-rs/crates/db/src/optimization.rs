@@ -406,6 +406,16 @@ pub async fn finish(
     error: Option<&Value>,
     events: &Value,
 ) -> Result<(), DbError> {
+    finish_with_original_archive(pool,id,status,progress,result,error,events,None).await
+}
+
+/// New manual runtime path. Terminal science and the separate bounded archive
+/// commit together. Old callers retain their historical no-archive behavior.
+#[allow(clippy::too_many_arguments)]
+pub async fn finish_with_original_archive(
+    pool:&PgPool,id:i64,status:&str,progress:&Value,result:Option<&Value>,error:Option<&Value>,events:&Value,
+    archive:Option<&crate::study_display::ManualArchive>,
+) -> Result<(),DbError> {
     assert!(matches!(status, "completed" | "cancelled" | "failed"));
     let mut tx = pool.begin().await?;
     let previous: Option<String> =
@@ -417,6 +427,19 @@ pub async fn finish(
         .as_deref()
         .is_some_and(|status| matches!(status, "running" | "cancel_requested"))
     {
+        if archive.is_some() {
+            // A lost COMMIT ACK must verify what was committed, not turn an
+            // already-terminal study into an unconditional default-success.
+            let stored:Option<Value>=sqlx::query_scalar("select result from optimization_studies where id=$1")
+                .bind(id).fetch_one(&mut *tx).await?;
+            let mut expected=result.cloned();
+            if previous.as_deref()==Some("cancelled") && let Some(value)=&mut expected {
+                value["reason"]=json!("cancelled");
+                if value.get("best").is_some_and(Value::is_object) {value["best"]["partial"]=json!(true);}
+            }
+            if stored!=expected {return Err(DbError::Json("study_display_manual_terminal_conflict".into()));}
+            crate::study_display::seal_manual_in(&mut tx,id,archive.expect("archive presence checked")).await?;
+        }
         tx.commit().await?;
         return Ok(());
     }
@@ -448,11 +471,12 @@ pub async fn finish(
     .bind(id)
     .bind(status)
     .bind(progress)
-    .bind(result)
+    .bind(&result)
     .bind(error)
     .bind(&events)
     .execute(&mut *tx)
     .await?;
+    if let Some(archive)=archive {crate::study_display::seal_manual_in(&mut tx,id,archive).await?;}
     tx.commit().await?;
     Ok(())
 }

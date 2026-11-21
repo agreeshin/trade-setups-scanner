@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 const MAX_ANALYTICS_SETUPS: i64 = 5000;
 const ANALYTICS_HORIZON_MINUTES: i64 = 10_080;
 const MAX_ANALYTICS_SLOTS: usize = 64;
+// Bounded metadata, not a cap on accessible setup history. The prior endpoint
+// could expose up to 5000 distinct studies; do not reduce that to the subset-ID cap.
+const MAX_STUDY_OPTIONS: usize = 5000;
 const MAX_WINDOW_SECONDS: i64 = 2 * ANALYTICS_HORIZON_MINUTES * 60;
 const MAX_OUTCOME_CANDLES: usize = 1_100_000;
 const MAX_OUTCOME_PAGES: usize = 512;
@@ -213,41 +216,22 @@ async fn load_setup_rows(
     to_unix: Option<i64>,
     studies: Option<&[i64]>,
     with_bounds: bool,
+    q: Option<&str>,
 ) -> Result<Vec<AnalyticsSetupRow>, Response> {
-    let mut filter = String::from(
-        "algorithm_id = $1 and adaptive_slot_id is not null and recommendation is not null \
-         and exists(select 1 from adaptive_profiles p where p.id=adaptive_slot_id and p.owner_id='admin')",
-    );
-    if with_bounds {
-        filter.push_str(" and close_time >= to_timestamp($2) and close_time < to_timestamp($3)");
-    } else if from_unix.is_some() {
-        filter.push_str(" and close_time >= to_timestamp($2) and close_time < to_timestamp($3)");
-    }
-    let studies_active = studies.is_some();
-    if studies_active {
-        let index = if filter.contains("$3") { 4 } else { 2 };
-        filter.push_str(&format!(
-            " and (recommendation->>'studyId') ~ '^[0-9]+$' and (recommendation->>'studyId')::bigint = any(${index})"
-        ));
-    }
-    let sql = format!(
+    let mut query = sqlx::QueryBuilder::new(
         "select id, exchange_code, category, symbol, algorithm_id, (extract(epoch from close_time))::bigint as close_unix, \
          close_price, adaptive_slot_id::bigint as slot_id, \
          coalesce(adaptive_generation_id, (adaptive_generation_archive->>'generationId')::bigint) as generation_id, \
-         expectancy_artifact_id as artifact_id, \
-         recommendation, trade_outcome from live_setups where {filter} order by close_time desc, id desc limit {}",
-        MAX_ANALYTICS_SETUPS + 1
+         expectancy_artifact_id as artifact_id, recommendation, trade_outcome from live_setups where adaptive_slot_id is not null and recommendation is not null \
+         and exists(select 1 from adaptive_profiles p where p.id=adaptive_slot_id and p.owner_id='admin')",
     );
-    let mut query = sqlx::query(&sql).bind(algorithm_id);
-    if filter.contains("$2") {
-        query = query
-            .bind(from_unix.unwrap_or(i64::MIN))
-            .bind(to_unix.unwrap_or(i64::MAX));
-    }
-    if studies_active {
-        query = query.bind(studies.expect("checked"));
-    }
-    let rows = query.fetch_all(pool).await.map_err(|_| {
+    debug_assert!(!with_bounds || (from_unix.is_some() && to_unix.is_some()));
+    setups_db::runs::push_live_setup_filters(&mut query, &setups_db::runs::LiveSetupFilter {
+        algorithm_id: Some(algorithm_id.to_owned()), from_unix, to_unix,
+        studies: studies.map(<[i64]>::to_vec), q: q.map(str::to_owned),
+    });
+    query.push(" order by close_time desc, id desc limit ").push_bind(MAX_ANALYTICS_SETUPS + 1);
+    let rows = query.build().fetch_all(pool).await.map_err(|_| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "setups_analytics_read_failed",
@@ -361,11 +345,12 @@ async fn study_map(
         .collect())
 }
 
-fn parse_studies(raw: Option<&str>) -> Result<Option<Vec<i64>>, Response> {
+pub(crate) fn parse_studies(raw: Option<&str>) -> Result<Option<Vec<i64>>, Response> {
     let Some(raw) = raw else {
         return Ok(None);
     };
     let mut studies = Vec::new();
+    if raw.is_empty() { return Ok(Some(studies)); }
     for part in raw.split(',') {
         let value = part
             .trim()
@@ -425,6 +410,10 @@ async fn analytics_request(
     if from_unix >= to_unix {
         return error_response(StatusCode::BAD_REQUEST, "invalid_query");
     }
+    let filter = match crate::batches::parse_setup_filter(&params) {
+        Ok(filter) => filter,
+        Err(response) => return response,
+    };
     let studies = match parse_studies(params.get("studies").map(String::as_str)) {
         Ok(value) => value,
         Err(response) => return response,
@@ -436,6 +425,7 @@ async fn analytics_request(
         Some(to_unix),
         studies.as_deref(),
         true,
+        filter.q.as_deref(),
     )
     .await
     {
@@ -1041,6 +1031,10 @@ async fn setups_analytics_studies(
     if let Err(response) = guard_auth(&state.auth, &headers, false) {
         return response;
     }
+    let filter = match crate::batches::parse_setup_filter(&params) {
+        Ok(filter) => filter,
+        Err(response) => return response,
+    };
     let algorithm_id = match params.get("algorithmId") {
         Some(value) if !value.trim().is_empty() && value.len() <= 200 => value.clone(),
         _ => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
@@ -1062,26 +1056,34 @@ async fn setups_analytics_studies(
         }
         _ => {}
     }
-    let rows =
-        match load_setup_rows(&state.pool, &algorithm_id, from_unix, to_unix, None, false).await {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
-    let generation_studies = match study_map(
-        &state.pool,
-        &rows
-            .iter()
-            .filter_map(|row| row.generation_id)
-            .collect::<Vec<_>>(),
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(response) => return response,
+    // Aggregate in PostgreSQL and return only bounded study metadata. The 5000
+    // trade cap applies to numerical calculations, not access to history/options.
+    let mut query = sqlx::QueryBuilder::new("with matched as (select id, close_time, algorithm_id, recommendation, expectancy_artifact_id, coalesce(adaptive_generation_id,(adaptive_generation_archive->>'generationId')::bigint) as generation_id from live_setups where adaptive_slot_id is not null and recommendation is not null and exists(select 1 from adaptive_profiles p where p.id=adaptive_slot_id and p.owner_id='admin')");
+    setups_db::runs::push_live_setup_filters(&mut query, &setups_db::runs::LiveSetupFilter {
+        algorithm_id: Some(algorithm_id), from_unix, to_unix, q: filter.q, studies: None,
+    });
+    query.push("), resolved as (select *, coalesce((select g.study_id from continuous_generations g where g.id=matched.generation_id), case when (recommendation->>'studyId') ~ '^[0-9]{1,18}$' then (recommendation->>'studyId')::bigint end) as study_id from matched) select distinct on(study_id) study_id, algorithm_id, recommendation->>'externalName' as external_name, count(*) over(partition by study_id)::bigint as setup_count, generation_id, expectancy_artifact_id from resolved where study_id is not null order by study_id, close_time desc, id desc limit ")
+        .push_bind((MAX_STUDY_OPTIONS + 1) as i64);
+    let rows = match query.build().fetch_all(&state.pool).await {
+        Ok(rows) => rows,
+        Err(_) => return read_error(),
     };
-    Json(json!({ "studies": studies_list(&rows, &generation_studies) })).into_response()
+    if rows.len() > MAX_STUDY_OPTIONS {
+        return error_response(StatusCode::BAD_REQUEST, "setups_analytics_studies_limit_exceeded");
+    }
+    let items: Result<Vec<Value>, sqlx::Error> = rows.iter().map(|row| {
+        let algorithm: String = row.try_get("algorithm_id")?;
+        let external: Option<String> = row.try_get("external_name")?;
+        Ok(json!({"studyId":row.try_get::<i64,_>("study_id")?, "externalName":external.filter(|name| !name.trim().is_empty()).unwrap_or_else(|| setups_db::algorithm_name(&algorithm)),
+            "setupCount":row.try_get::<i64,_>("setup_count")?, "generationId":row.try_get::<Option<i64>,_>("generation_id")?, "artifactId":row.try_get::<Option<i64>,_>("expectancy_artifact_id")?}))
+    }).collect();
+    match items {
+        Ok(items) => Json(json!({"studies":items})).into_response(),
+        Err(_) => read_error(),
+    }
 }
 
+#[cfg(test)]
 fn row_study_id(row: &AnalyticsSetupRow, generation_studies: &HashMap<i64, i64>) -> Option<i64> {
     row.generation_id
         .and_then(|generation| generation_studies.get(&generation).copied())
@@ -1092,6 +1094,7 @@ fn row_study_id(row: &AnalyticsSetupRow, generation_studies: &HashMap<i64, i64>)
         })
 }
 
+#[cfg(test)]
 fn studies_list(rows: &[AnalyticsSetupRow], generation_studies: &HashMap<i64, i64>) -> Vec<Value> {
     let mut counts: BTreeMap<i64, i64> = BTreeMap::new();
     let mut latest: BTreeMap<i64, &AnalyticsSetupRow> = BTreeMap::new();
@@ -1702,7 +1705,7 @@ mod tests {
         assert!(parse_studies(None).unwrap().is_none());
         let studies = parse_studies(Some("1, 3")).unwrap().unwrap();
         assert_eq!(studies, vec![1, 3]);
-        assert!(parse_studies(Some("")).is_err());
+        assert_eq!(parse_studies(Some("")).unwrap(), Some(vec![]));
         assert!(parse_studies(Some("0")).is_err());
         assert!(parse_studies(Some("a")).is_err());
         assert!(parse_studies(Some("1,,2")).is_err());

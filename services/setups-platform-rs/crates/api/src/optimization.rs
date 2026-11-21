@@ -597,6 +597,7 @@ async fn execute(
                     status: "failed",
                     progress: record.progress,
                     result: None,
+                    archive:None,
                     error: Some(error),
                     events: record.events,
                 },
@@ -628,8 +629,8 @@ async fn execute(
     latest.progress.elapsed_seconds = started.elapsed().as_secs_f64();
     // execute_inner has joined CPU work and released all raw input before the
     // terminal update releases the unique active-study slot.
-    let (status, result, error) = match outcome {
-        Ok(mut outcome) => {
+    let (status, result, error,archive) = match outcome {
+        Ok((mut outcome,archive)) => {
             let cancelled = outcome.reason == TerminationReason::Cancelled;
             outcome.progress = latest.progress.clone();
             let status = if cancelled { "cancelled" } else { "completed" };
@@ -641,7 +642,7 @@ async fn execute(
                     "Исследование завершено"
                 },
             );
-            (status, Some(json!(outcome)), None)
+            (status, Some(json!(outcome)), None,archive)
         }
         Err(error) => {
             eprintln!("optimization study failed: id={id} code={}", error.code);
@@ -650,6 +651,7 @@ async fn execute(
                 "failed",
                 None,
                 Some(json!({"code":error.code,"message":error.message})),
+                None,
             )
         }
     };
@@ -661,6 +663,7 @@ async fn execute(
             status,
             progress: json!(latest.progress),
             result,
+            archive,
             error,
             events: json!(latest.events),
         },
@@ -679,6 +682,7 @@ struct TerminalPayload {
     status: &'static str,
     progress: Value,
     result: Option<Value>,
+    archive:Option<setups_db::study_display::ManualArchive>,
     error: Option<Value>,
     events: Value,
 }
@@ -696,6 +700,7 @@ async fn finish_retry(
     }) {
         payload.status = "failed";
         payload.result = None;
+        payload.archive=None;
         payload.error = Some(
             json!({"code":"resource_limit","message":"Итог исследования превышает допустимый размер"}),
         );
@@ -706,6 +711,7 @@ async fn finish_retry(
         if stop.is_cancelled() {
             payload.status = "failed";
             payload.result = None;
+            payload.archive=None;
             payload.error = Some(
                 json!({"code":"interrupted_by_restart","message":"Исследование прервано остановкой сервера"}),
             );
@@ -713,7 +719,7 @@ async fn finish_retry(
             shutdown_deadline
                 .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(2));
         }
-        let finish = db::finish(
+        let finish = db::finish_with_original_archive(
             pool,
             payload.id,
             payload.status,
@@ -721,6 +727,7 @@ async fn finish_retry(
             payload.result.as_ref(),
             payload.error.as_ref(),
             &payload.events,
+            payload.archive.as_ref(),
         );
         let result = if let Some(deadline) = shutdown_deadline {
             match tokio::time::timeout_at(deadline, finish).await {
@@ -739,6 +746,7 @@ async fn finish_retry(
         match result {
             Ok(()) => return,
             Err(error) => {
+                if settle_archive_failure(&mut payload,&error) {continue;}
                 available.store(false, Ordering::SeqCst);
                 if failures.is_multiple_of(60) {
                     eprintln!(
@@ -759,6 +767,17 @@ async fn finish_retry(
             }
         }
     }
+}
+
+fn settle_archive_failure(payload:&mut TerminalPayload,error:&setups_db::DbError)->bool {
+    if payload.archive.is_none() || setups_db::continuous::recovery::is_transient(error) {return false;}
+    // Drop the bounded archive exactly once. Only the small visible failure
+    // continues through DB availability retry; immutable/quota errors do not.
+    let message:String=error.to_string().chars().take(400).map(|c|if c.is_control(){' '}else{c}).collect();
+    eprintln!("optimization original archive failed: id={} code=original_archive_persistence_failed {message}",payload.id);
+    payload.status="failed";payload.result=None;payload.archive=None;
+    payload.error=Some(json!({"code":"original_archive_persistence_failed","message":message}));
+    true
 }
 
 #[derive(Debug)]
@@ -797,7 +816,7 @@ async fn execute_inner(
     stop: &CancellationToken,
     started: Instant,
     latest: &mut Latest,
-) -> Result<StudyOutcome, JobError> {
+) -> Result<(StudyOutcome,Option<setups_db::study_display::ManualArchive>), JobError> {
     let deadline = tokio::time::Instant::from_std(started) + Duration::from_secs(spec.max_seconds);
     persist(pool, id, latest)
         .await
@@ -809,11 +828,11 @@ async fn execute_inner(
             tokio::select! {
                 biased;
                 _ = stop.cancelled() => return Err(JobError::new("interrupted_by_restart","Исследование прервано остановкой сервера")),
-                _ = tokio::time::sleep_until(deadline) => return Ok(empty_outcome(latest,TerminationReason::TimeBudget)),
+                _ = tokio::time::sleep_until(deadline) => return Ok((empty_outcome(latest,TerminationReason::TimeBudget),None)),
                 result = &mut acquisition => break result?,
                 _ = tokio::time::sleep(POLL) => {
                     if db::cancellation_requested(pool,id).await.map_err(|e| JobError::new("database_error",e.to_string()))? {
-                        return Ok(empty_outcome(latest,TerminationReason::Cancelled));
+                        return Ok((empty_outcome(latest,TerminationReason::Cancelled),None));
                     }
                     latest.progress.elapsed_seconds = started.elapsed().as_secs_f64();
                 }
@@ -840,7 +859,7 @@ async fn execute_inner(
     let mut cpu = tokio::task::spawn_blocking(move || {
         // All merging happens synchronously on the evaluator thread BEFORE
         // publication. A slow DB writer can skip snapshots, not events.
-        setups_optimizer::run_study(&cpu_spec, &input, &limits, &cpu_cancel, move |update| {
+        setups_optimizer::run_study_with_original_minutes(&cpu_spec, &input, &limits, &cpu_cancel, move |update| {
             callback_state.merge(update, acquisition_elapsed);
             sender.send_replace(callback_state.clone());
         })
@@ -887,7 +906,7 @@ async fn execute_inner(
     if let Some(error) = persistence_error {
         return Err(JobError::new("database_error", error));
     }
-    let mut outcome = result.map_err(|_| JobError::new("worker_failed","Вычислительная задача завершилась с ошибкой"))?
+    let (mut outcome,archive) = result.map_err(|_| JobError::new("worker_failed","Вычислительная задача завершилась с ошибкой"))?
         .map_err(|error| match error {
             setups_optimizer::StudyError::ResourceLimit { .. } => JobError::new("resource_limit",format!("{error}. Уменьшите область исследования или увеличьте соответствующий OPTIMIZATION_* лимит.")),
             _ => JobError::new("evaluation_failed",error.to_string()),
@@ -902,12 +921,48 @@ async fn execute_inner(
             best.partial = reason == TerminationReason::Cancelled;
         }
     }
-    Ok(outcome)
+    let archive=archive.map(|archive|setups_db::study_display::ManualArchive {
+        observation_cutoff:archive.observation_cutoff,tp_pct:archive.minutes.tp_pct,sl_pct:archive.minutes.sl_pct,
+        kernel:archive.minutes.evaluator,minutes:archive.minutes.points.into_iter().map(|p|setups_db::study_display::OriginalMinute {
+            signal_close_unix:p.signal_close_unix,sum_r:p.sum_r,closed_count:p.closed_count,tp_count:p.tp_count,sl_count:p.sl_count,
+        }).collect(),
+    });
+    if outcome.best.is_some() && archive.is_none() {
+        return Err(JobError::new("original_archive_missing","Завершённый победитель не содержит исходного временного архива"));
+    }
+    Ok((outcome,archive))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn terminal_archive() -> TerminalPayload {
+        TerminalPayload{id:1,status:"completed",progress:json!({}),result:Some(json!({"best":{"score":1.0}})),error:None,events:json!([]),
+            archive:Some(setups_db::study_display::ManualArchive{observation_cutoff:120,tp_pct:8.0,sl_pct:4.0,kernel:"original-manual-close-1".into(),
+                minutes:vec![setups_db::study_display::OriginalMinute{signal_close_unix:60,sum_r:2.0,closed_count:1,tp_count:1,sl_count:0}]})}
+    }
+
+    #[test]
+    fn permanent_archive_quota_and_invariant_errors_settle_once_and_release_payload() {
+        for code in ["study_display_ledger_resource_limit","study_display_manual_count_mismatch","study_display_immutable_ledger_conflict"] {
+            let mut payload=terminal_archive();
+            let error=setups_db::DbError::Json(code.into());
+            assert!(settle_archive_failure(&mut payload,&error));
+            assert_eq!(payload.status,"failed");assert!(payload.archive.is_none());assert!(payload.result.is_none());
+            assert_eq!(payload.error.as_ref().unwrap()["code"],"original_archive_persistence_failed");
+            assert!(payload.error.as_ref().unwrap()["message"].as_str().unwrap().contains(code));
+            assert!(!settle_archive_failure(&mut payload,&error),"permanent archive cannot re-enter the archive retry path");
+        }
+    }
+
+    #[test]
+    fn transient_archive_database_error_keeps_the_same_bounded_retry_payload() {
+        let mut payload=terminal_archive();let pointer=payload.archive.as_ref().unwrap().minutes.as_ptr();
+        assert!(!settle_archive_failure(&mut payload,&setups_db::DbError::Sqlx(sqlx::Error::PoolClosed)));
+        assert_eq!(payload.status,"completed");assert_eq!(payload.archive.as_ref().unwrap().minutes.as_ptr(),pointer);
+        assert!(payload.result.is_some());assert!(payload.error.is_none());
+    }
+
     #[test]
     fn synchronous_callback_merge_keeps_bounded_events_when_watch_is_overwritten() {
         let progress = StudyProgress {

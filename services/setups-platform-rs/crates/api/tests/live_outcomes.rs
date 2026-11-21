@@ -227,6 +227,93 @@ fn bar(at: i64, high: &str, low: &str) -> Value {
     json!({"openTimeUnix":at,"open":"100","high":high,"low":low,"close":"100","volume":"1","quoteTurnover":"100"})
 }
 
+fn final_outcome(r: f64) -> Value {
+    json!({"status":if r > 0.0 {"tp"} else {"sl"},"entryTimeUnix":ENTRY,"entryPrice":100.0,"gateThreshold":null,
+        "tpPrice":120.0,"slPrice":94.0,"closeTimeUnix":ENTRY+60,"closePrice":if r > 0.0 {120.0} else {94.0},
+        "riskReturn":r,"evaluatedAtUnix":ENTRY+120,"observedThroughUnix":ENTRY+120,"isFinal":true})
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn postgres_unified_literal_filters_match_math_options_history_and_readonly_details() {
+    isolated(|pool| async move {
+        let slot = profile(&pool,"admin").await;
+        let mut ids = Vec::new();
+        for (index,(symbol,r)) in [("SPECIAL%_USDT",2.0),("SPECIALX_USDT",-1.0),("SPECIALXYUSDT",2.0)].into_iter().enumerate() {
+            let id = setup(&pool,slot,RAW+index as i64*60).await;
+            sqlx::query("update live_setups set symbol=$1,trade_outcome=$2 where id=$3").bind(symbol).bind(final_outcome(r)).bind(id as i32).execute(&pool).await.unwrap();
+            ids.push(id);
+        }
+        let before: Value = sqlx::query_scalar("select jsonb_agg(to_jsonb(l) order by id) from live_setups l").fetch_one(&pool).await.unwrap();
+        let (app,market,server,_) = app(pool.clone()).await;
+        for (q,count,mean) in [("%25_",1,2.0),("specialx_",1,-1.0),("BYBIT",3,1.0),("price_volume",3,1.0)] {
+            let query = format!("algorithmId=price_volume_spike&fromUnix={RAW}&toUnix={}&q={q}",RAW+1000);
+            for method in ["GET","POST"] {
+                let (status,value) = request(&app,method,&format!("/v1/setups/analytics?{query}"),json!({})).await;
+                assert_eq!(status,StatusCode::OK,"{value}"); assert_eq!(value["totals"]["selected"],count); assert_eq!(value["totals"]["meanR"],mean);
+                assert_eq!(value["setups"].as_array().unwrap().len(),count as usize);
+            }
+            let (status,options) = request(&app,"GET",&format!("/v1/setups/analytics/studies?{query}"),json!({})).await;
+            assert_eq!(status,StatusCode::OK,"{options}"); assert_eq!(options["studies"][0]["setupCount"],count);
+            let (status,history) = request(&app,"GET",&format!("/v1/setups?{query}&limit=25"),json!({})).await;
+            assert_eq!(status,StatusCode::OK,"{history}"); assert_eq!(history["total"],count);
+        }
+        let query = format!("algorithmId=price_volume_spike&fromUnix={RAW}&toUnix={}&studies=",RAW+1000);
+        let (_,empty) = request(&app,"GET",&format!("/v1/setups?{query}"),json!({})).await;
+        assert_eq!(empty["total"],0);
+        let (_,empty) = request(&app,"POST",&format!("/v1/setups/analytics?{query}"),json!({})).await;
+        assert_eq!(empty["totals"]["selected"],0);
+        let (status,detail) = request(&app,"GET","/v1/setups/1/details",json!({})).await;
+        assert_eq!(status,StatusCode::OK,"{detail}"); assert!(detail["setup"]["recommendation"].is_null());
+        assert!(detail["setup"]["tradeOutcome"].is_null()); assert!(detail["telegramMessage"]["text"].as_str().unwrap().starts_with("WATCH WATCHUSDT"));
+        let (status,unsupported) = request(&app,"GET",&format!("/v1/setups/{}/details",ids[0]),json!({})).await;
+        assert_eq!(status,StatusCode::OK); assert!(unsupported["telegramMessage"].is_null()); assert!(unsupported["reason"].is_string());
+        let anonymous = app.clone().oneshot(Request::builder().uri("/v1/setups/1/details").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(anonymous.status(),StatusCode::UNAUTHORIZED);
+        assert_eq!(request(&app,"GET","/v1/setups/2147483648/details",json!({})).await.0,StatusCode::BAD_REQUEST);
+        assert_eq!(request(&app,"GET","/v1/setups/2147483647/details",json!({})).await.0,StatusCode::NOT_FOUND);
+        assert_eq!(market.calls.load(Ordering::SeqCst),0,"saved reads/details/filtering must not consult market data");
+        let after: Value = sqlx::query_scalar("select jsonb_agg(to_jsonb(l) order by id) from live_setups l").fetch_one(&pool).await.unwrap();
+        assert_eq!(before,after,"no saved row or recommendation may be rewritten");
+        let csv = app.clone().oneshot(Request::builder().uri("/v1/export/setups.csv?q=NOTHING&studies=").header("x-api-key","fixture-key").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = csv.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.starts_with("exchange,category,symbol,algorithmId,algorithmVersion,openTimeUnix,closeTimeUnix,closePrice\r\n"));
+        assert!(text.contains("WATCHUSDT") && text.contains("SPECIAL%_USDT") && text.contains("SPECIALXYUSDT"));
+        server.abort();
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn postgres_unified_history_and_study_options_remain_accessible_beyond_math_limit() {
+    isolated(|pool| async move {
+        let slot = profile(&pool,"admin").await;
+        let id = setup(&pool,slot,RAW).await;
+        let rec: Value = sqlx::query_scalar("select recommendation from live_setups where id=$1").bind(id as i32).fetch_one(&pool).await.unwrap();
+        sqlx::query("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price,adaptive_slot_id,recommendation) select 'bybit','linear','TESTUSDT','price_volume_spike','1.1.1','{}',to_timestamp($1+g*60-60),to_timestamp($1+g*60),'100',$2,$3 from generate_series(1,5000) g")
+            .bind(RAW as f64).bind(slot).bind(rec).execute(&pool).await.unwrap();
+        sqlx::query("insert into live_setups(exchange_code,category,symbol,algorithm_id,algorithm_version,params,open_time,close_time,close_price) values('bybit','linear','WATCH_MORE','price_volume_spike','1.1.1','{}',to_timestamp($1),to_timestamp($1+60),'100')").bind(RAW as f64).execute(&pool).await.unwrap();
+        let orphan = profile(&pool,"orphan-fixture").await;
+        setup(&pool,orphan,RAW+5002*60).await;
+        sqlx::query("delete from adaptive_profiles where id=$1").bind(orphan).execute(&pool).await.unwrap();
+        let (app,market,server,_) = app(pool.clone()).await;
+        let query = format!("algorithmId=price_volume_spike&fromUnix={RAW}&toUnix={}",RAW+1_000_000);
+        let (status,failed) = request(&app,"POST",&format!("/v1/setups/analytics?{query}"),json!({})).await;
+        assert_eq!(status,StatusCode::BAD_REQUEST); assert_eq!(failed["error"],"setups_analytics_limit_exceeded");
+        let (status,options) = request(&app,"GET",&format!("/v1/setups/analytics/studies?{query}"),json!({})).await;
+        assert_eq!(status,StatusCode::OK,"{options}"); assert_eq!(options["studies"][0]["setupCount"],5001);
+        let (status,page) = request(&app,"GET",&format!("/v1/setups?{query}&offset=5000&limit=25"),json!({})).await;
+        assert_eq!(status,StatusCode::OK,"{page}"); assert_eq!(page["total"],5003); assert_eq!(page["setups"].as_array().unwrap().len(),3);
+        let (status,subset) = request(&app,"GET",&format!("/v1/setups?{query}&studies=40&limit=25"),json!({})).await;
+        assert_eq!(status,StatusCode::OK); assert_eq!(subset["total"],5002,"an explicit subset matches actual saved recommendation study, not WATCH attribution");
+        let (status,detail) = request(&app,"GET",&format!("/v1/setups/{id}/details"),json!({})).await;
+        assert_eq!(status,StatusCode::OK); assert_eq!(detail["setup"]["id"],id);
+        assert_eq!(market.calls.load(Ordering::SeqCst),0);
+        server.abort();
+    }).await;
+}
+
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
 async fn postgres_feed_gate_filter_preserves_unknown_outcomes_counts_search_and_snapshot_pages() {

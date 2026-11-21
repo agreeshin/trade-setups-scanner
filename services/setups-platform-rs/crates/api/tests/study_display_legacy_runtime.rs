@@ -54,12 +54,14 @@ fn retained_loader_checks_identity_recipe_counts_and_metadata_fence_without_acti
     let (record,saved,artifact,replay)=parts();assert!(assemble_source("other",36,&record,&saved,&artifact,replay,&facts()).is_err());
 }
 
-struct Mock { bad_cursor:bool, changed:bool, catalog:AtomicUsize, candles:AtomicUsize, guards:AtomicUsize }
+struct Mock { bad_cursor:bool, changed:bool, catalog:AtomicUsize, candles:AtomicUsize, guards:AtomicUsize,
+    head_revision:AtomicUsize, candle_variant:AtomicUsize }
 async fn catalog(State(s):State<Arc<Mock>>)->Json<Value> {s.catalog.fetch_add(1,Ordering::Relaxed);Json(json!({"instruments":[{"id":7,"exchange":"fixture","category":"linear","symbol":"TEST","status":"delisted"}]}))}
 async fn guard(State(s):State<Arc<Mock>>,Json(body):Json<Value>)->Json<Value> {
     s.guards.fetch_add(1,Ordering::Relaxed);let previous=body["readGuards"][0]["previous"].is_object();
+    let revision=s.head_revision.load(Ordering::Relaxed)+usize::from(previous);
     Json(json!({"checkedAt":"2026-11-17T08:00:00Z","instruments":[{"instrumentId":7,"status":"known","latestStoredOpenTimeUnix":null,"contiguousThroughOpenTimeUnix":null,
-        "candles":[],"missingRanges":[{"fromUnix":body["fromUnix"],"toUnix":body["toUnix"]}],"readGuard":{"status":if previous&&s.changed{"invalid"}else{"valid"},"token":{"epoch":"fixture-source","revision":if previous{"2"}else{"1"}}}}]}))
+        "candles":[],"missingRanges":[{"fromUnix":body["fromUnix"],"toUnix":body["toUnix"]}],"readGuard":{"status":if previous&&s.changed{"invalid"}else{"valid"},"token":{"epoch":"fixture-source","revision":revision.to_string()}}}]}))
 }
 async fn candles(State(s):State<Arc<Mock>>,Query(q):Query<BTreeMap<String,String>>)->Json<Value> {
     s.candles.fetch_add(1,Ordering::Relaxed);let after=q.get("afterUnix").map(|s|s.parse::<i64>().unwrap());
@@ -67,10 +69,12 @@ async fn candles(State(s):State<Arc<Mock>>,Query(q):Query<BTreeMap<String,String
     let mut times:Vec<_>=(0..6).map(|i|i*60).filter(|&at|at>=from&&at<to&&after.is_none_or(|last|at>last)).collect();
     let more=after.is_none()&&times.len()>2;if more {times.truncate(2);}
     let next=more.then(||if s.bad_cursor {times[0]}else{*times.last().unwrap()});
-    Json(json!({"candles":times.into_iter().map(|at|json!({"openTimeUnix":at,"open":"100","high":"100","low":if at==120{"90"}else{"100"},"close":"100","volume":"10","quoteTurnover":"1000"})).collect::<Vec<_>>(),"nextCursorUnix":next}))
+    let hit_low=if s.candle_variant.load(Ordering::Relaxed)==0 {"90"}else{"89"};
+    Json(json!({"candles":times.into_iter().map(|at|json!({"openTimeUnix":at,"open":"100","high":"100","low":if at==120{hit_low}else{"100"},"close":"100","volume":"10","quoteTurnover":"1000"})).collect::<Vec<_>>(),"nextCursorUnix":next}))
 }
 async fn server(bad_cursor:bool,changed:bool)->(MarketDataClient,Arc<Mock>,tokio::task::JoinHandle<()>) {
-    let s=Arc::new(Mock {bad_cursor,changed,catalog:AtomicUsize::new(0),candles:AtomicUsize::new(0),guards:AtomicUsize::new(0)});
+    let s=Arc::new(Mock {bad_cursor,changed,catalog:AtomicUsize::new(0),candles:AtomicUsize::new(0),guards:AtomicUsize::new(0),
+        head_revision:AtomicUsize::new(1),candle_variant:AtomicUsize::new(0)});
     let app=Router::new().route("/v1/instruments",get(catalog)).route("/v1/candles",get(candles)).route("/v1/candles/tail-batch",post(guard)).with_state(s.clone());
     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
     let task=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
@@ -101,6 +105,41 @@ async fn guarded_provider_rejects_changed_prefix_or_invalid_page_cursor() {
         assert!(prepare_from_source(&source(),&client,&legacy::LegacyLimits::default(),&facts(),&core::CancelToken::new()).await.is_err());
         server.abort();let _=server.await;
     }
+}
+
+#[tokio::test]
+async fn guarded_read_revision_changes_composite_proof_not_identical_scoped_candle_content() {
+    let (client,calls,server)=server(false,false).await;
+    let source=source();let limits=legacy::LegacyLimits::default();let cancel=core::CancelToken::new();
+    let first=prepare_from_source(&source,&client,&limits,&facts(),&cancel).await.unwrap();
+    // The real MD token carries the instrument insertion HEAD revision, even
+    // when intervening inserts do not overlap the requested historical range.
+    // Both invocations must still validate their own before/after read fence.
+    calls.head_revision.store(101,Ordering::Relaxed);
+    let second=prepare_from_source(&source,&client,&limits,&facts(),&cancel).await.unwrap();
+    assert_eq!(first.source_hash,second.source_hash);
+    assert_eq!(first.original_snapshot_hash,second.original_snapshot_hash);
+    assert!(first.conservation_matched && second.conservation_matched);
+    let before=&first.inputs[0];let after=&second.inputs[0];
+    assert_eq!(before.instrument,after.instrument);assert_eq!(before.instrument_id,after.instrument_id);
+    assert_eq!(before.windows_hash,after.windows_hash);assert_eq!(before.candle_hash,after.candle_hash);
+    assert_eq!(before.candle_count,after.candle_count);assert_eq!(before.missing_minutes,after.missing_minutes);
+    assert_ne!(before.read_identity,after.read_identity);
+    assert_ne!(first.input_hash,second.input_hash);
+    assert_ne!(first.proof_hash,second.proof_hash);
+    assert_eq!(serde_json::to_vec(&first.selected_minutes).unwrap(),serde_json::to_vec(&second.selected_minutes).unwrap());
+    assert_eq!(serde_json::to_vec(&first.daily).unwrap(),serde_json::to_vec(&second.daily).unwrap());
+    // Identical totals alone do not prove identical OHLC. A low-only change
+    // keeps this TP/daily result while changing the content fingerprint.
+    calls.head_revision.store(201,Ordering::Relaxed);
+    calls.candle_variant.store(1,Ordering::Relaxed);
+    let altered=prepare_from_source(&source,&client,&limits,&facts(),&cancel).await.unwrap();
+    assert_eq!(serde_json::to_vec(&second.selected_minutes).unwrap(),serde_json::to_vec(&altered.selected_minutes).unwrap());
+    assert!(altered.conservation_matched);
+    assert_ne!(second.inputs[0].candle_hash,altered.inputs[0].candle_hash);
+    assert_eq!(calls.guards.load(Ordering::Relaxed),6,"two guards still required per invocation");
+    assert_eq!(calls.candles.load(Ordering::Relaxed),6,"one two-page candle read per invocation");
+    server.abort();let _=server.await;
 }
 
 #[tokio::test]

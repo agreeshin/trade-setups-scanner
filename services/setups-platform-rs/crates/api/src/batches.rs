@@ -7,8 +7,8 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use setups_db::runs::{
     BatchDeleteOutcome, BatchSetupRow, cancel_replay_batch, delete_replay_batch, get_replay_batch,
-    get_run_page, live_setups_page, live_setups_search, live_setups_snapshot, rename_replay_batch,
-    replay_batch_result_page,
+    get_run_page, get_live_setup_full, live_setups_page, live_setups_search_filtered, live_setups_snapshot, rename_replay_batch,
+    replay_batch_result_page, LiveSetupFilter, LiveSetupFull,
 };
 use setups_db::{settings_get, settings_set};
 use std::collections::HashMap;
@@ -530,24 +530,49 @@ async fn get_live_setups(
             Err(_) => return internal_error(),
         },
     };
-    let query = params.get("q").map(String::as_str).unwrap_or("");
-    if query.len() > 200 {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_query");
-    }
-    let search = query.trim();
-    let search = if search.is_empty() {
-        None
-    } else {
-        Some(search)
+    let filter = match parse_setup_filter(&params) {
+        Ok(filter) => filter,
+        Err(response) => return response,
     };
     let (total, rows) =
-        match live_setups_search(&state.pool, snapshot_id, search, offset, limit, hide_gate_failed).await {
+        match live_setups_search_filtered(&state.pool, snapshot_id, offset, limit, hide_gate_failed, &filter).await {
             Ok(value) => value,
             Err(_) => return internal_error(),
         };
     let setups: Vec<Value> = rows
         .iter()
-        .map(|row| {
+        .map(live_setup_dto)
+        .collect();
+    Json(json!({
+        "setups": setups,
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+        "snapshotId": snapshot_id,
+    }))
+    .into_response()
+}
+
+pub(crate) fn parse_setup_filter(params: &HashMap<String, String>) -> Result<LiveSetupFilter, Response> {
+    let invalid = || error_response(StatusCode::BAD_REQUEST, "invalid_query");
+    let q = params.get("q").map(String::as_str).unwrap_or("");
+    if q.len() > 200 { return Err(invalid()); }
+    let q = (!q.trim().is_empty()).then(|| q.trim().to_owned());
+    let algorithm_id = match params.get("algorithmId") {
+        Some(value) if value.trim().is_empty() || value.len() > 200 => return Err(invalid()),
+        value => value.cloned(),
+    };
+    let time = |key: &str| params.get(key).map(|value| value.parse::<i64>().map_err(|_| invalid())).transpose();
+    let from_unix = time("fromUnix")?;
+    let to_unix = time("toUnix")?;
+    if from_unix.is_some() != to_unix.is_some() || from_unix.zip(to_unix).is_some_and(|(from, to)| from >= to) {
+        return Err(invalid());
+    }
+    let studies = crate::setups_analytics::parse_studies(params.get("studies").map(String::as_str))?;
+    Ok(LiveSetupFilter { q, algorithm_id, from_unix, to_unix, studies })
+}
+
+fn live_setup_dto(row: &LiveSetupFull) -> Value {
             json!({
                 "id": row.id,
                 "exchange": row.exchange_code,
@@ -567,16 +592,50 @@ async fn get_live_setups(
                 "closeTimeUnix": row.close_time.timestamp(),
                 "closePrice": row.close_price,
             })
-        })
-        .collect();
-    Json(json!({
-        "setups": setups,
-        "offset": offset,
-        "limit": limit,
-        "total": total,
-        "snapshotId": snapshot_id,
-    }))
-    .into_response()
+}
+
+/// Pure adapter of the saved row to the exact sender formatter. It never
+/// creates a delivery job or consults settings, chart sources or market data.
+fn setup_telegram_message(row: &LiveSetupFull) -> Result<Value, &'static str> {
+    if let Some(recommendation) = &row.recommendation {
+        let raw = serde_json::from_value::<setups_domain::SpikeSetup>(json!({
+            "algorithmId": row.algorithm_id, "algorithmVersion": row.algorithm_version,
+            "openTimeUnix": row.open_time.timestamp(), "closeTimeUnix": row.close_time.timestamp(),
+            "closePrice": row.close_price, "params": row.params, "details": row.details,
+        })).map_err(|_| "saved_setup_unsupported")?;
+        let instrument = setups_worker::adaptive::AdaptiveInstrument {
+            exchange: row.exchange_code.clone(), category: row.category.clone(), symbol: row.symbol.clone(),
+        };
+        let caption = setups_worker::adaptive::recommendation_telegram_caption(&instrument, &raw, recommendation)
+            .map_err(|_| "saved_recommendation_unsupported")?;
+        Ok(json!({"text": caption.text, "entities": caption.entities}))
+    } else {
+        let text = setups_worker::telegram::fixed_watch_text(&row.symbol, &row.external_name, &row.exchange_code, row.close_time.timestamp())?;
+        Ok(json!({"text": text, "entities": []}))
+    }
+}
+
+async fn get_setup_details(State(state): State<Arc<ReplayState>>, headers: HeaderMap, Path(raw): Path<String>) -> Response {
+    if let Err(response) = guard(&state, &headers, false) { return response; }
+    let id = match raw.parse::<i64>() {
+        Ok(id) if (1..=i32::MAX as i64).contains(&id) => id,
+        _ => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
+    };
+    let row = match get_live_setup_full(&state.pool, id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "setup_not_found"),
+        Err(_) => return internal_error(),
+    };
+    let (message, reason) = match setup_telegram_message(&row) {
+        Ok(message) => (message, None),
+        Err(reason) => (Value::Null, Some(reason)),
+    };
+    // One response-owned record; no page/history cache. Bound even legacy JSON.
+    let value = json!({"setup": live_setup_dto(&row), "telegramMessage": message, "reason": reason});
+    match serde_json::to_vec(&value) {
+        Ok(body) if body.len() <= 1024 * 1024 => ([(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-store")], body).into_response(),
+        _ => error_response(StatusCode::INTERNAL_SERVER_ERROR, "setup_details_size_limit"),
+    }
 }
 
 pub fn batches_router(state: Arc<ReplayState>) -> Router {
@@ -593,6 +652,7 @@ pub fn batches_router(state: Arc<ReplayState>) -> Router {
         .route("/v1/replay-runs/{id}/export.csv", get(export_run_csv))
         .route("/v1/export/setups.csv", get(export_live_setups_csv))
         .route("/v1/setups", get(get_live_setups))
+        .route("/v1/setups/{id}/details", get(get_setup_details))
         .route("/v1/live/setups", get(get_live_setups))
         .route(
             "/v1/settings/notifications",
@@ -608,6 +668,63 @@ pub fn batches_router(state: Arc<ReplayState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn saved_fixture() -> LiveSetupFull {
+        let params = serde_json::to_value(setups_domain::AlgorithmParams::default()).unwrap();
+        LiveSetupFull { id: 7, exchange_code: "bybit".into(), category: "linear".into(), symbol: "COIN😀USDT".into(),
+            algorithm_id: "price_volume_spike".into(), algorithm_version: Some("1.1.1".into()),
+            open_time: chrono::DateTime::from_timestamp(86280, 0).unwrap(), close_time: chrono::DateTime::from_timestamp(86340, 0).unwrap(),
+            close_price: "0.000000123456789".into(), params: params.clone(), details: None, origin: "continuous".into(),
+            adaptive_slot_id: Some(7), adaptive_generation_id: Some(3), trade_outcome: None, external_name: "Saved <name> 😀".into(),
+            recommendation: Some(json!({"direction":"short","tpPct":14,"slPct":4,"rawR":0.32,"meanR":0.21,"robustScore":0.29,
+                "timeShiftMinutes":3,"priceChangePct":-1,"clusterEnabled":true,"clusterGapMinutes":480,
+                "provenance":{"algorithmId":"price_volume_spike","algorithmVersion":"1.1.1","optimizerVersion":"fixture",
+                    "seed":42,"snapshotHash":"fixture","capturedAt":"2026-11-12T00:00:00Z","fromUnix":0,"toUnix":86400,"observationCutoff":86000},
+                "studyId":42,"generationId":3,"slotId":7,"ownerId":"admin","externalName":"Saved <name> 😀","params":params,"rawSignalAt":86340,"recommendedEntryAt":86520})) }
+    }
+
+    #[test]
+    fn setup_details_uses_exact_sender_bytes_and_utf16_entities_for_both_directions() {
+        for direction in ["short", "long"] {
+            let mut row = saved_fixture();
+            row.recommendation.as_mut().unwrap()["direction"] = json!(direction);
+            let before = live_setup_dto(&row);
+            let raw: setups_domain::SpikeSetup = serde_json::from_value(json!({"algorithmId":row.algorithm_id,"algorithmVersion":row.algorithm_version,
+                "openTimeUnix":row.open_time.timestamp(),"closeTimeUnix":row.close_time.timestamp(),"closePrice":row.close_price,"params":row.params,"details":row.details})).unwrap();
+            let instrument = setups_worker::adaptive::AdaptiveInstrument {exchange:row.exchange_code.clone(),category:row.category.clone(),symbol:row.symbol.clone()};
+            let canonical = setups_worker::adaptive::recommendation_telegram_caption(&instrument,&raw,row.recommendation.as_ref().unwrap()).unwrap();
+            let message = setup_telegram_message(&row).unwrap();
+            assert_eq!(message["text"], canonical.text);
+            assert_eq!(message["entities"], serde_json::to_value(canonical.entities).unwrap());
+            assert_eq!(live_setup_dto(&row), before);
+            assert!(message["entities"].as_array().unwrap().iter().all(|entity| entity["type"].is_string()));
+        }
+    }
+
+    #[test]
+    fn watch_details_share_the_fixed_sender_text_and_never_invent_conditions() {
+        let mut row = saved_fixture(); row.recommendation = None; row.adaptive_slot_id = None;
+        let message = setup_telegram_message(&row).unwrap();
+        assert_eq!(message["text"], setups_worker::telegram::fixed_watch_text(&row.symbol,&row.external_name,&row.exchange_code,row.close_time.timestamp()).unwrap());
+        assert_eq!(message["entities"], json!([]));
+        row.recommendation = Some(json!({"direction":"short"}));
+        assert!(setup_telegram_message(&row).is_err());
+    }
+
+    #[test]
+    fn shared_setup_filter_preserves_literal_search_and_explicit_empty_studies() {
+        let params = HashMap::from([("q".into(), "  %_  ".into()), ("studies".into(), "".into())]);
+        let filter = parse_setup_filter(&params).unwrap();
+        assert_eq!(filter.q.as_deref(), Some("%_"));
+        assert_eq!(filter.studies, Some(vec![]));
+        let mut query = sqlx::QueryBuilder::new("select 1 from live_setups where true");
+        setups_db::runs::push_live_setup_filters(&mut query,&filter);
+        assert!(query.sql().contains("strpos(lower(concat_ws"));
+        assert!(!query.sql().contains("%_"));
+        assert!(!query.sql().to_lowercase().contains("like"));
+        assert!(parse_setup_filter(&HashMap::from([("q".into(), "x".repeat(201))])).is_err());
+        assert!(parse_setup_filter(&HashMap::from([("fromUnix".into(), "1".into())])).is_err());
+    }
 
     #[test]
     fn csv_cell_quotes_and_escapes_formula_prefix() {

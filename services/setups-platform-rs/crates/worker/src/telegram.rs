@@ -613,7 +613,12 @@ async fn saved_chart_png(
             let numerical: ExpectancyArtifact = serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
                 .map_err(|_| "png_identity_mismatch")?;
             validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
-            setups_analytics::expectancy_chart::render_png_with_objective(&numerical, expected, raw, value)
+            let observed=tokio::runtime::Handle::current().block_on(chart_observed(&pool,&fence,id,&numerical))?;
+            let rendered=match observed.as_deref() {
+                Some(points)=>setups_analytics::expectancy_chart::render_png_objective_observed(&numerical,expected,raw,value,points),
+                None=>setups_analytics::expectancy_chart::render_png_with_objective(&numerical,expected,raw,value),
+            };
+            rendered
                 .map(Some).map_err(|_| "png_objective_unavailable")
         }).await;
     }
@@ -654,11 +659,12 @@ async fn saved_chart_png(
                     serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
                         .map_err(|_| "png_identity_mismatch")?;
                 validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
-                setups_analytics::expectancy_chart::render_png_with_model(
-                    &numerical,
-                    raw_signal_at,
-                    forecast,
-                )
+                let observed=tokio::runtime::Handle::current().block_on(chart_observed(&pool,&fence,id,&numerical))?;
+                let rendered=match observed.as_deref() {
+                    Some(points)=>setups_analytics::expectancy_chart::render_png_model_observed(&numerical,raw_signal_at,forecast,points),
+                    None=>setups_analytics::expectancy_chart::render_png_with_model(&numerical,raw_signal_at,forecast),
+                };
+                rendered
                 .map(Some)
                 .map_err(|_| "png_unavailable")
             })
@@ -672,6 +678,17 @@ async fn saved_chart_png(
         serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
             .map_err(|_| "png_identity_mismatch")?;
     validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
+    if let Some(points)=chart_observed(pool,&fence,id,&numerical).await? {
+        let charts=charts.ok_or("png_unavailable")?;
+        // Same immutable generation fields used by the old asset renderer.
+        // Render only this unfrozen future message: no version bump, cache
+        // rewrite, scanner admission or requeue of historical PNG assets.
+        let saved:serde_json::Value=sqlx::query_scalar("select jsonb_strip_nulls(jsonb_build_object('trendMode',g.spec->'trendMode','trendBendDays',g.spec->'trendBendDays','trendBlendLambda',g.spec->'trendBlendLambda')) from study_expectancy_artifacts a left join continuous_generations g on g.id=a.source_generation_id and g.owner_id=a.owner_id where a.id=$1 and a.owner_id=$2")
+            .bind(id).bind(&fence.owner_id).fetch_one(pool).await.map_err(|_|"png_lookup_unavailable")?;
+        let trend=serde_json::from_value(saved).map_err(|_|"png_identity_mismatch")?;
+        return charts.render(move||setups_analytics::expectancy_chart::render_png_trend_observed(&numerical,trend,&points)
+            .map(Some).map_err(|_|"png_unavailable")).await;
+    }
     let version = key.render_version.to_string();
     let png = setups_db::expectancy::load_png_by_image_key(pool, &job.owner_id, &key)
         .await
@@ -687,6 +704,18 @@ async fn saved_chart_png(
         return Err("png_hash_mismatch");
     }
     Ok(Some(png))
+}
+
+async fn chart_observed(pool:&PgPool,fence:&ChartSourceFence,id:i64,numerical:&setups_domain::expectancy::ExpectancyArtifact)
+    ->Result<Option<Vec<setups_domain::expectancy::UtcDailyPoint>>,&'static str> {
+    let archive=setups_db::study_display::original_observed(pool,&fence.owner_id,fence.study_id,Some(id),"UTC").await
+        .map_err(|error| {
+            let message:String=error.to_string().chars().take(300).map(|c|if c.is_control(){' '}else{c}).collect();
+            setups_db::diagnostics::emit(setups_db::diagnostics::Level::Error,"telegram_original_source_invalid",
+                serde_json::json!({"studyId":fence.study_id,"artifactId":id,"message":message}));
+            "png_identity_mismatch"
+        })?;
+    archive.map(|archive|archive.utc_points(numerical.origin_unix).map_err(|_|"png_identity_mismatch")).transpose()
 }
 
 /// Only bounded scalar source fences cross to the CPU lane, not the job's full
@@ -1089,6 +1118,16 @@ async fn test_via(attempt: &TelegramTestAttempt, access: &impl RelayAccess) -> T
     test_result(&attempt.request_id, result)
 }
 
+/// Pure saved-WATCH presentation, also used by the read-only setup detail API.
+/// No delivery, clock, settings or current algorithm values are consulted.
+pub fn fixed_watch_text(symbol: &str, name: &str, exchange: &str, close_unix: i64) -> Result<String, &'static str> {
+    if name.trim().is_empty() || name.chars().count() > 120 || name.len() > 480 || name.chars().any(char::is_control) {
+        return Err("invalid_saved_payload");
+    }
+    let time = chrono::DateTime::from_timestamp(close_unix, 0).ok_or("invalid_saved_payload")?;
+    Ok(format!("WATCH {symbol} · {name}\n{exchange} · {}", time.format("%Y-%m-%d %H:%M:%S UTC")))
+}
+
 fn render_message(job: &TelegramJob, now: i64) -> Result<Vec<u8>, ClientFailure> {
     let instrument: crate::adaptive::AdaptiveInstrument =
         serde_json::from_value(job.payload["instrument"].clone())
@@ -1121,15 +1160,8 @@ fn render_message(job: &TelegramJob, now: i64) -> Result<Vec<u8>, ClientFailure>
         {
             return Err(ClientFailure::before("invalid_saved_payload"));
         }
-        let time = chrono::DateTime::from_timestamp(raw.close_time_unix, 0)
-            .ok_or_else(|| ClientFailure::before("invalid_saved_payload"))?;
-        format!(
-            "WATCH {} · {}\n{} · {}",
-            instrument.symbol,
-            name,
-            instrument.exchange,
-            time.format("%Y-%m-%d %H:%M:%S UTC")
-        )
+        fixed_watch_text(&instrument.symbol, name, &instrument.exchange, raw.close_time_unix)
+            .map_err(ClientFailure::before)?
     } else if job.slot_id.is_some()
         && job.generation_id.is_some()
         && job.config_revision.is_some()

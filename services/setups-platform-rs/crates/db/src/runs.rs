@@ -821,39 +821,67 @@ pub async fn live_setups_search(
     limit: i64,
     hide_gate_failed: bool,
 ) -> Result<(i64, Vec<LiveSetupFull>), DbError> {
-    let (filter, offset_ph, limit_ph) = match q {
-        Some(_) => (
-            "id <= $1 and strpos(lower(concat_ws(' ', symbol, exchange_code, algorithm_id)), lower($2)) > 0",
-            "$3",
-            "$4",
-        ),
-        None => ("id <= $1", "$2", "$3"),
-    };
-    let filter = if hide_gate_failed {
-        format!("{filter} and trade_outcome->>'status' is distinct from 'gate_failed'")
-    } else {
-        filter.to_owned()
-    };
-    let count_sql = format!("select count(*)::bigint as total from live_setups where {filter}");
-    let count = sqlx::query(&count_sql).bind(snapshot_id as i32);
-    let count = if let Some(q) = q {
-        count.bind(q)
-    } else {
-        count
-    };
-    let count_row = count.fetch_one(pool).await?;
-    let total: i64 = count_row.try_get("total")?;
-    let page_sql = format!(
-        "select id, exchange_code, category, symbol, algorithm_id, algorithm_version, \
-         open_time, close_time, close_price, params, details, adaptive_slot_id, coalesce(adaptive_generation_id,(adaptive_generation_archive->>'generationId')::bigint) as adaptive_generation_id, recommendation, trade_outcome, external_name from live_setups where {filter} \
-         order by close_time desc, id desc offset {offset_ph} limit {limit_ph}"
-    );
-    let page = sqlx::query(&page_sql).bind(snapshot_id as i32);
-    let page = if let Some(q) = q { page.bind(q) } else { page };
-    let rows = page.bind(offset).bind(limit).fetch_all(pool).await?;
-    let setups = rows
-        .iter()
-        .map(|row| {
+    live_setups_search_filtered(pool, snapshot_id, offset, limit, hide_gate_failed,
+        &LiveSetupFilter { q: q.map(str::to_owned), ..Default::default() }).await
+}
+
+/// Operation-owned filters shared by history and numerical analytics. An empty
+/// study list is an explicit empty selection; None means all, including WATCH.
+#[derive(Debug, Default, Clone)]
+pub struct LiveSetupFilter {
+    pub q: Option<String>,
+    pub algorithm_id: Option<String>,
+    pub from_unix: Option<i64>,
+    pub to_unix: Option<i64>,
+    pub studies: Option<Vec<i64>>,
+}
+
+pub fn push_live_setup_filters(query: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>, filter: &LiveSetupFilter) {
+    if let Some(q) = &filter.q {
+        query.push(" and strpos(lower(concat_ws(' ', symbol, exchange_code, algorithm_id)), lower(")
+            .push_bind(q.clone()).push(")) > 0");
+    }
+    if let Some(algorithm) = &filter.algorithm_id {
+        query.push(" and algorithm_id = ").push_bind(algorithm.clone());
+    }
+    if let Some(from) = filter.from_unix {
+        query.push(" and close_time >= to_timestamp(").push_bind(from as f64).push(")");
+    }
+    if let Some(to) = filter.to_unix {
+        query.push(" and close_time < to_timestamp(").push_bind(to as f64).push(")");
+    }
+    if let Some(studies) = &filter.studies {
+        // CASE avoids casts of malformed legacy values; numeric also safely
+        // handles a 19-digit value outside bigint without losing valid IDs.
+        query.push(" and (case when (recommendation->>'studyId') ~ '^[0-9]{1,19}$' then (recommendation->>'studyId')::numeric end) = any(")
+            .push_bind(studies.clone()).push("::bigint[])");
+    }
+}
+
+const LIVE_SETUP_COLUMNS: &str = "id, exchange_code, category, symbol, algorithm_id, algorithm_version, open_time, close_time, close_price, params, details, adaptive_slot_id, coalesce(adaptive_generation_id,(adaptive_generation_archive->>'generationId')::bigint) as adaptive_generation_id, recommendation, trade_outcome, external_name";
+
+pub async fn live_setups_search_filtered(pool: &PgPool, snapshot_id: i64, offset: i64, limit: i64,
+    hide_gate_failed: bool, filter: &LiveSetupFilter) -> Result<(i64, Vec<LiveSetupFull>), DbError> {
+    let mut count = sqlx::QueryBuilder::new("select count(*)::bigint from live_setups where id <= ");
+    count.push_bind(snapshot_id as i32);
+    push_live_setup_filters(&mut count, filter);
+    if hide_gate_failed { count.push(" and trade_outcome->>'status' is distinct from 'gate_failed'"); }
+    let total = count.build_query_scalar::<i64>().fetch_one(pool).await?;
+    let mut page = sqlx::QueryBuilder::new(format!("select {LIVE_SETUP_COLUMNS} from live_setups where id <= "));
+    page.push_bind(snapshot_id as i32);
+    push_live_setup_filters(&mut page, filter);
+    if hide_gate_failed { page.push(" and trade_outcome->>'status' is distinct from 'gate_failed'"); }
+    page.push(" order by close_time desc, id desc offset ").push_bind(offset).push(" limit ").push_bind(limit);
+    let rows = page.build().fetch_all(pool).await?;
+    Ok((total, rows.iter().map(live_setup_full).collect::<Result<_, _>>()?))
+}
+
+pub async fn get_live_setup_full(pool: &PgPool, id: i64) -> Result<Option<LiveSetupFull>, DbError> {
+    let sql = format!("select {LIVE_SETUP_COLUMNS} from live_setups where id=$1");
+    sqlx::query(&sql).bind(id as i32).fetch_optional(pool).await?.as_ref().map(live_setup_full).transpose()
+}
+
+fn live_setup_full(row: &PgRow) -> Result<LiveSetupFull, DbError> {
             Ok(LiveSetupFull {
                 id: i64::from(row.try_get::<i32, _>("id")?),
                 exchange_code: row.try_get("exchange_code")?,
@@ -881,9 +909,6 @@ pub async fn live_setups_search(
                         crate::algorithm_name(&row.get::<String, _>("algorithm_id"))
                     }),
             })
-        })
-        .collect::<Result<Vec<_>, DbError>>()?;
-    Ok((total, setups))
 }
 
 pub async fn last_live_setup_open_time(

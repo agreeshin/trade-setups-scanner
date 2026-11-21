@@ -213,9 +213,11 @@ async fn exact_display_verified_reconstruction_is_separate_fenced_immutable_publ
     let identity=VerifiedOriginalIdentity{owner_id:"admin".into(),study_id:id,artifact_id:artifact,artifact_key:format!("{id:064x}"),
         study_identity:sqlx::query_scalar("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1").bind(id).fetch_one(&pool).await.unwrap(),
         original_snapshot_hash:"f".repeat(64),source_hash:"1".repeat(64),input_hash:"2".repeat(64),proof_hash:"3".repeat(64),tp_pct:10.0,sl_pct:10.0};
-    let evidence=json!({"fidelity":"verified_original_reconstruction","scope":"closed_outcomes_only","conservationMatched":true,"evaluator":"original-historical-close-1",
-        "firstCanonicalAddOnlyVerified":true,"canonicalOhlcPreservedVerified":true,"historicalCloseKernelCompatibleVerified":true,"writerAuditHash":"4".repeat(64),
-        "sourceHash":identity.source_hash,"inputHash":identity.input_hash,"proofHash":identity.proof_hash,"originalSnapshotHash":identity.original_snapshot_hash,"originalArtifactKey":identity.artifact_key,"studyIdentity":identity.study_identity});
+    let evidence=json!({"fidelity":"verified_original_reconstruction","scope":"closed_outcomes_only","proofBasis":"add_only_closed_set_monotonicity",
+        "sourceHash":identity.source_hash,"inputHash":identity.input_hash,"proofHash":identity.proof_hash,"originalSnapshotHash":identity.original_snapshot_hash,"originalArtifactKey":identity.artifact_key,
+        "studyIdentity":identity.study_identity,"conservationMatched":true,"evaluator":"original-historical-close-1","writerAuditHash":"4".repeat(64),
+        "firstCanonicalAddOnlyVerified":true,"canonicalOhlcPreservedVerified":true,"historicalCloseKernelCompatibleVerified":true,
+        "instrumentCount":1,"utcDayCount":1,"closedCount":2,"tpCount":1,"slCount":1});
     assert!(display::publish_verified_original_reconstruction(&pool,&identity,&points,&evidence).await.unwrap_err().to_string().contains("immutable_ledger_conflict"),"reconstruction cannot relabel/overwrite native evidence");
     sqlx::query("delete from study_original_outcomes where artifact_id=$1").bind(artifact).execute(&pool).await.unwrap();
     let mut stale=identity.clone();stale.study_identity="0".repeat(32);let mut stale_evidence=evidence.clone();stale_evidence["studyIdentity"]=json!(stale.study_identity);
@@ -230,6 +232,28 @@ async fn exact_display_verified_reconstruction_is_separate_fenced_immutable_publ
     let (app,_,market,server)=fixture(&pool,start).await;let (status,detail)=http(&app,"GET",&format!("/v1/optimization-studies/{id}/actual?timeZone=Asia%2FKathmandu")).await;assert_eq!(status,StatusCode::OK,"{detail}");
     assert_eq!(detail["originalReport"]["display"]["historical"]["fidelity"],"verified_original_reconstruction");assert_eq!(detail["originalReport"]["display"]["historical"]["sourceIdentity"],publication.source_identity);
     assert_eq!(detail["originalReport"]["display"]["daily"][0]["meanR"],0.0,"zero with observed closes is not a null gap");
+    let cached=display::original_observed(&pool,"admin",id,Some(artifact),"UTC").await.unwrap().unwrap();
+    use sha2::{Digest,Sha256};
+    let old_hash=format!("{:x}",Sha256::digest(serde_json::to_vec(&evidence).unwrap()));
+    // Disposable DB fault injection only. Real 1c5 rows have the original CLI
+    // digest and NULL projection columns; both UTC and IANA remain available.
+    sqlx::query("alter table study_original_outcomes disable trigger user").execute(&pool).await.unwrap();
+    sqlx::query("update study_original_outcomes set evidence_sha256=$2,utc_daily=null,utc_daily_sha256=null,utc_source_payload_sha256=null where artifact_id=$1")
+        .bind(artifact).bind(&old_hash).execute(&pool).await.unwrap();
+    let legacy=display::original_observed(&pool,"admin",id,Some(artifact),"UTC").await.unwrap().unwrap();
+    assert_eq!(serde_json::to_value(&legacy.daily).unwrap(),serde_json::to_value(&cached.daily).unwrap());
+    assert!(legacy.source_identity.ends_with(&old_hash));
+    assert_eq!(display::original_observed(&pool,"admin",id,Some(artifact),"Asia/Kathmandu").await.unwrap().unwrap().daily[0].closed_count,2);
+    let mut corrupt=evidence.clone();corrupt["canonicalOhlcPreservedVerified"]=json!(false);
+    let corrupt_hash=format!("{:x}",Sha256::digest(serde_json::to_vec(&corrupt).unwrap()));
+    sqlx::query("update study_original_outcomes set evidence=$2,evidence_sha256=$3 where artifact_id=$1").bind(artifact).bind(corrupt).bind(corrupt_hash).execute(&pool).await.unwrap();
+    for zone in ["UTC","Asia/Kathmandu"] {
+        assert!(display::original_observed(&pool,"admin",id,Some(artifact),zone).await.unwrap_err().to_string().contains("verified_evidence_invalid"));
+    }
+    sqlx::query("update study_original_outcomes set evidence=$2,evidence_sha256=$3,utc_daily=$4,utc_daily_sha256=repeat('0',64),utc_source_payload_sha256=payload_sha256 where artifact_id=$1")
+        .bind(artifact).bind(&evidence).bind(old_hash).bind(serde_json::to_value(&cached.daily).unwrap()).execute(&pool).await.unwrap();
+    assert!(display::original_observed(&pool,"admin",id,Some(artifact),"UTC").await.unwrap_err().to_string().contains("archive_projection_corrupt"));
+    sqlx::query("alter table study_original_outcomes enable trigger user").execute(&pool).await.unwrap();
     assert_eq!(sqlx::query_as::<_,(String,String)>("select s.result::text,a.numerical_snapshot::text from optimization_studies s join study_expectancy_artifacts a on a.source_study_id=s.id where s.id=$1").bind(id).fetch_one(&pool).await.unwrap(),immutable);
     assert_eq!(market.calls.load(Ordering::SeqCst),0);market.stop.cancel();server.abort();let _=server.await;
 }).await;}
