@@ -147,10 +147,22 @@ describe("keep-alive navigation tabs", () => {
     await user.click(algorithmsLink);
     expect(screen.getByRole("heading", { level: 1, name: "Алгоритмы" })).toHaveClass("sr-only");
     expect(algorithmsLink).toHaveAttribute("aria-current", "page");
-    await user.click(await screen.findByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
+    const fixed = await screen.findByRole("tab", { name: "Live-сканирование с постоянными параметрами" });
+    const liveTabs = screen.getByRole("tablist", { name: "Режим live · Рост цены и объёма" });
+    expect(liveTabs).toHaveAttribute("data-slot", "tabs-list");
+    expect(liveTabs).toHaveClass("min-w-0", "max-w-full", "overflow-x-auto");
+    expect(liveTabs).toHaveClass("w-full", "justify-start", "sm:w-fit", "sm:justify-center-safe", "sm:justify-self-center");
+    expect(fixed).toHaveAttribute("data-slot", "tabs-trigger");
+    liveTabs.scrollLeft = 90;
+    await user.click(fixed);
     const growth = await screen.findByRole("spinbutton", { name: "Рост цены (%)" });
+    const fixedPanel = growth.closest('[data-slot="tabs-content"]')!;
+    fixedPanel.scrollTop = 240;
     fireEvent.change(growth, { target: { value: "15" } });
     await user.click(screen.getByRole("checkbox", { name: "Включён для live-сканирования" }));
+    await user.click(screen.getByRole("tab", { name: "Live-сканирование с гибкими параметрами" }));
+    expect(growth).toBeInTheDocument(); expect(growth).not.toBeVisible();
+    expect(fixedPanel).toHaveAttribute("hidden");
 
     await user.click(navigation.getByRole("link", { name: "Обзор" }));
     expect(view.container.querySelector('[data-page-path="/algorithms"]')).toHaveAttribute("hidden");
@@ -158,10 +170,17 @@ describe("keep-alive navigation tabs", () => {
 
     await user.click(algorithmsLink);
     expect(view.container.querySelector('[data-page-path="/algorithms"]')).not.toHaveAttribute("hidden");
+    expect(screen.getByRole("tab", { name: "Live-сканирование с гибкими параметрами" })).toHaveAttribute("data-state", "active");
+    expect(screen.getByRole("tablist", { name: "Режим live · Рост цены и объёма" })).toBe(liveTabs);
+    expect(liveTabs.scrollLeft).toBe(90);
+    await user.click(fixed);
     expect(screen.getByRole("spinbutton", { name: "Рост цены (%)" })).toBe(growth);
+    expect(growth.closest('[data-slot="tabs-content"]')).toBe(fixedPanel);
+    expect(fixedPanel.scrollTop).toBe(240);
     expect(growth).toHaveValue(15);
     expect(screen.getByRole("checkbox", { name: "Включён для live-сканирования" })).not.toBeChecked();
     expect(requests.filter((path) => path === "/v1/algorithms")).toHaveLength(1);
+    expect(mutations).toHaveLength(0);
   });
 
   it("retains Setups filters and fixed End across navigation without new refresh or calculation commands", async () => {

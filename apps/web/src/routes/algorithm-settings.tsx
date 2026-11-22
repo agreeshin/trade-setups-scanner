@@ -8,7 +8,7 @@ import { Input } from "../components/ui/input";
 import { PageSidebar, PageSidebarPanel } from "../components/ui/page-sidebar";
 import { InfoNote } from "../components/ui/info-note";
 import { Separator } from "../components/ui/separator";
-import { SegmentedList, SegmentedTrigger } from "../components/ui/segmented";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import { fetchPlatform, type PlatformState } from "../lib/platform-api";
 import type { OptimizationStudyAction } from "../lib/optimization-api";
 import { isContinuousWorkActive } from "../lib/continuous-api";
@@ -114,21 +114,15 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     {nameBusy && <p role="status" className="text-sm">Сохранение названия…</p>}
     {nameError && <Alert variant="destructive" role="alert">{nameError}</Alert>}
     {nameSaved && <p role="status" className="text-sm">Название алгоритма сохранено.</p>}
-    <SegmentedList role="tablist" aria-label={`Режим live · ${displayName}`} className="w-full justify-center justify-self-center sm:w-fit">
-      {liveTabs.map((tab, index) => <SegmentedTrigger key={tab.id} id={`${optimizerTriggerId}-tab-${tab.id}`} role="tab" aria-label={tab.label}
-        aria-selected={liveMode === tab.id} aria-controls={`${optimizerTriggerId}-panel-${tab.id}`} tabIndex={liveMode === tab.id ? 0 : -1}
-        aria-describedby={tab.enabled ? `${optimizerTriggerId}-status-${tab.id}` : undefined} className="h-auto min-w-0 flex-1 shrink basis-56 gap-2 whitespace-normal py-2 text-center"
-        onClick={() => setLiveMode(tab.id)} onKeyDown={(event) => {
-          const next = event.key === "Home" ? 0 : event.key === "End" ? liveTabs.length - 1
-            : event.key === "ArrowRight" ? (index + 1) % liveTabs.length : event.key === "ArrowLeft" ? (index + liveTabs.length - 1) % liveTabs.length : null;
-          if (next === null) return;
-          event.preventDefault();
-          const target = liveTabs[next]!; setLiveMode(target.id); document.getElementById(`${optimizerTriggerId}-tab-${target.id}`)?.focus();
-        }}>
-        {tab.label}{tab.enabled && <><StatusDot active data-slot="segmented-status-dot" /><span id={`${optimizerTriggerId}-status-${tab.id}`} className="sr-only">Live-сканирование включено</span></>}
-      </SegmentedTrigger>)}
-    </SegmentedList>
-    <div role="tabpanel" id={`${optimizerTriggerId}-panel-constant`} aria-labelledby={`${optimizerTriggerId}-tab-constant`} hidden={liveMode !== "constant"} tabIndex={0}>
+    <Tabs value={liveMode} onValueChange={setLiveMode} className="grid min-w-0 gap-4">
+    <TabsList aria-label={`Режим live · ${displayName}`} className="h-auto w-full min-w-0 justify-start gap-0 rounded-none border-0 border-b bg-transparent p-0 sm:w-fit sm:justify-center-safe sm:justify-self-center">
+      {liveTabs.map((tab) => <TabsTrigger key={tab.id} value={tab.id} aria-label={tab.label}
+        aria-describedby={tab.enabled ? `${optimizerTriggerId}-status-${tab.id}` : undefined}
+        className="h-auto gap-2 rounded-none border-b-2 border-transparent px-4 py-3 focus-visible:ring-inset data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-primary data-[state=active]:shadow-none">
+        {tab.label}{tab.enabled && <><StatusDot active data-slot="tabs-status-dot" /><span id={`${optimizerTriggerId}-status-${tab.id}`} className="sr-only">Live-сканирование включено</span></>}
+      </TabsTrigger>)}
+    </TabsList>
+    <TabsContent value="constant" forceMount hidden={liveMode !== "constant"} className="mt-0 min-w-0">
     <section className="grid min-w-0 gap-4">
     <div className="flex items-center justify-center gap-2 text-center"><h4 className="font-semibold">Live-сканирование с постоянными параметрами</h4>
     <InfoNote>Порог цены задаётся в процентах — рост или падение, зависит от алгоритма; окно в минутах. Множитель объёма 3 означает 3× (300% базового объёма). Изменения общие для live и новых исторических запусков; завершённые запуски сохраняют свой снимок параметров.</InfoNote></div>
@@ -142,8 +136,8 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     {error && <Alert variant="destructive" role="alert">{error}</Alert>}
     {saved && <Alert variant="success" role="status">Настройки алгоритма сохранены.</Alert>}
     <div><Button disabled={busy} type="submit">{busy ? "Сохранение…" : "Сохранить алгоритм"}</Button></div>
-    </section></div>
-    <div role="tabpanel" id={`${optimizerTriggerId}-panel-flexible`} aria-labelledby={`${optimizerTriggerId}-tab-flexible`} hidden={liveMode !== "flexible"} tabIndex={0} className="grid min-w-0 gap-4">
+    </section></TabsContent>
+    <TabsContent value="flexible" forceMount hidden={liveMode !== "flexible"} className="mt-0 grid min-w-0 gap-4">
     <section aria-labelledby={`${optimizerTriggerId}-flexible`} className="grid min-w-0 gap-3">
       <div className="flex items-center justify-center gap-2 text-center"><h4 id={`${optimizerTriggerId}-flexible`} className="min-w-0 font-semibold">Live-сканирование с гибкими параметрами</h4>
         <InfoNote label="О самостоятельных адаптивных профилях">Профиль появляется только после полного принятого исследования. Stop/Play каждой строки не управляет исследованием. Research Stop и изменение очереди сохраняют профили, их рекомендации и историю. Кандидат инициализируется независимо, без повторной проверки исторического результата. Дата профиля — изменение состояния, не дата исследования.</InfoNote></div>
@@ -165,7 +159,8 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
       <Button id={optimizerTriggerId} type="button" variant="outline" aria-label={`Запустить новое исследование ${displayName}`} onClick={() => { setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setOptimizationOpen(true); }}>Запустить новое исследование</Button>
     </div>} />
     </section>
-    </div>
+    </TabsContent>
+    </Tabs>
   </form>
     <AlgorithmOptimizer algorithm={optimizerAlgorithm} controller={optimization} open={optimizationOpen} onOpenChange={setOptimizationOpen} returnFocusId={optimizerTriggerId} onDelete={requestDelete} />
     <OptimizationStudyDialog id={selectedHistory?.id} algorithm={algorithm} controller={optimization} open={selectedHistory?.open === true} onOpenChange={(open) => setHistorySelection((previous) => previous ? { ...previous, open } : null)} returnFocusId={selectedHistory?.triggerId ?? historyRegionId} fallbackFocusId={historyRegionId} onDelete={requestDelete} />

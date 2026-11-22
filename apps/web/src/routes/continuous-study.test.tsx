@@ -940,12 +940,17 @@ it("renames with an isolated partial PUT and never overwrites unsaved fixed para
   expect(requests.filter((request) => request.method === "PUT")[1]?.body).toEqual({ params: { futureThreshold: "8.5", opaqueFixed: "kept" }, enabled: false });
 });
 
-it("keeps heading/name above Segmented and preserves fixed drafts across keyboard tab changes", async () => {
+it("keeps heading/name above line Tabs and retains drafts, panels and local scroll across keyboard changes", async () => {
+  const user = userEvent.setup();
   render(<AlgorithmsPage />);
   const name = await screen.findByLabelText("Внешнее название алгоритма");
   const tabs = screen.getByRole("tablist", { name: "Режим live · Мой алгоритм" });
-  expect(tabs).toHaveAttribute("data-slot", "segmented-list");
-  expect(tabs).toHaveClass("justify-self-center", "justify-center", "w-full", "sm:w-fit");
+  expect(tabs).toHaveAttribute("data-slot", "tabs-list");
+  expect(tabs).toHaveAttribute("aria-orientation", "horizontal");
+  expect(tabs).toHaveClass("w-full", "min-w-0", "max-w-full", "overflow-x-auto", "justify-start", "border-b", "bg-transparent", "rounded-none");
+  expect(tabs).toHaveClass("sm:w-fit", "sm:justify-center-safe", "sm:justify-self-center");
+  expect(tabs).not.toHaveClass("bg-muted/40", "rounded-md");
+  expect(tabs.parentElement).toHaveClass("grid", "min-w-0");
   expect(screen.getByRole("heading", { name: "Мой алгоритм · 1" }).parentElement).toHaveClass("justify-center", "text-center");
   const profiles = screen.getByRole("heading", { name: "Адаптивные профили" });
   expect(profiles.parentElement).toHaveClass("justify-center", "text-center");
@@ -955,24 +960,54 @@ it("keeps heading/name above Segmented and preserves fixed drafts across keyboar
   const flexible = within(tabs).getByRole("tab", { name: "Live-сканирование с гибкими параметрами" });
   const fixed = within(tabs).getByRole("tab", { name: "Live-сканирование с постоянными параметрами" });
   expect(flexible).toHaveAttribute("aria-selected", "true");
-  expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
-  expect(fixed.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
-  fireEvent.keyDown(flexible, { key: "ArrowRight" });
-  expect(fixed).toHaveFocus();
+  expect(flexible).toHaveAttribute("data-state", "active");
+  for (const tab of [flexible, fixed]) {
+    expect(tab).toHaveAttribute("data-slot", "tabs-trigger");
+    expect(tab).toHaveClass("shrink-0", "whitespace-nowrap", "rounded-none", "border-b-2", "data-[state=active]:border-primary", "data-[state=active]:bg-transparent", "data-[state=active]:text-primary", "data-[state=active]:shadow-none");
+    expect(tab).toHaveClass("focus-visible:ring-2", "focus-visible:ring-ring", "focus-visible:ring-inset");
+    expect(tab).not.toHaveClass("data-[state=active]:bg-background", "data-[state=active]:shadow-sm");
+    const panel = document.getElementById(tab.getAttribute("aria-controls")!);
+    expect(panel).toHaveAttribute("data-slot", "tabs-content");
+    expect(panel).toHaveAttribute("aria-labelledby", tab.id);
+  }
+  const flexiblePanel = document.getElementById(flexible.getAttribute("aria-controls")!)!;
+  const fixedPanel = document.getElementById(fixed.getAttribute("aria-controls")!)!;
+  const permissionSwitch = screen.getByRole("switch", { name: "Разрешить адаптивное live-сканирование" });
+  expect(fixedPanel).toHaveAttribute("hidden");
+  tabs.scrollLeft = 80; flexiblePanel.scrollTop = 120;
+  expect(flexible.querySelector('[data-slot="tabs-status-dot"]')).toBeNull();
+  expect(fixed.querySelector('[data-slot="tabs-status-dot"]')).toBeNull();
+  await user.click(flexible);
+  await user.keyboard("{ArrowRight}");
+  await waitFor(() => expect(fixed).toHaveFocus());
+  expect(fixed).toHaveAttribute("data-state", "active");
+  expect(flexiblePanel).toHaveAttribute("hidden");
+  expect(flexiblePanel).toContainElement(permissionSwitch);
+  expect(permissionSwitch).not.toBeVisible();
   expect(fixed).toHaveAttribute("tabindex", "0");
   const input = screen.getByRole("spinbutton", { name: "Новый порог (%)" });
   fireEvent.change(input, { target: { value: "8.5" } });
   fireEvent.click(screen.getByRole("checkbox", { name: "Включён для live-сканирования" }));
-  expect(fixed.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
-  fireEvent.keyDown(fixed, { key: "Home" });
-  expect(flexible).toHaveFocus(); expect(input).not.toBeVisible();
+  expect(fixed.querySelector('[data-slot="tabs-status-dot"]')).toBeNull();
+  await user.keyboard("{Home}");
+  await waitFor(() => expect(flexible).toHaveFocus()); expect(input).not.toBeVisible();
+  expect(fixedPanel).toContainElement(input);
+  expect(fixedPanel).toHaveAttribute("hidden");
+  expect(screen.getByRole("switch", { name: "Разрешить адаптивное live-сканирование" })).toBe(permissionSwitch);
+  expect(flexiblePanel.scrollTop).toBe(120); expect(tabs.scrollLeft).toBe(80);
   expect(document.getElementById(flexible.getAttribute("aria-controls")!)).toHaveAttribute("aria-labelledby", flexible.id);
-  fireEvent.keyDown(flexible, { key: "End" });
+  await user.keyboard("{End}");
+  await waitFor(() => expect(fixed).toHaveFocus());
   expect(screen.getByRole("spinbutton", { name: "Новый порог (%)" })).toBe(input);
   expect(input).toHaveValue(8.5);
+  await user.keyboard("{ArrowRight}");
+  await waitFor(() => expect(flexible).toHaveFocus());
+  await user.keyboard("{ArrowLeft}");
+  await waitFor(() => expect(fixed).toHaveFocus());
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
   await userEvent.click(screen.getByRole("button", { name: "Сохранить алгоритм" }));
   await screen.findByText("Настройки алгоритма сохранены.");
-  expect(fixed.querySelector('[data-slot="segmented-status-dot"]')).toHaveClass("bg-success");
+  expect(fixed.querySelector('[data-slot="tabs-status-dot"]')).toHaveClass("bg-success");
   expect(fixed).toHaveAccessibleDescription("Live-сканирование включено");
 });
 
@@ -983,15 +1018,15 @@ it("maps the adaptive dot to saved permission, never research state, draft or re
   render(<AlgorithmsPage />);
   const flexible = await screen.findByRole("tab", { name: "Live-сканирование с гибкими параметрами" });
   await screen.findByText("Непрерывное исследование включено");
-  expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
+  expect(flexible.querySelector('[data-slot="tabs-status-dot"]')).toBeNull();
   await userEvent.click(screen.getByRole("switch", { name: "Разрешить адаптивное live-сканирование" }));
-  expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
+  expect(flexible.querySelector('[data-slot="tabs-status-dot"]')).toBeNull();
   await userEvent.click(screen.getByRole("button", { name: "Сохранить разрешение адаптивного live" }));
   await screen.findByText("Разрешение адаптивного live сохранено.");
-  expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toHaveClass("bg-success");
-  expect(flexible.querySelector('[data-slot="segmented-status-dot"]')).toHaveClass("size-2.5", "ring-2", "ring-background", "motion-safe:animate-live-status");
+  expect(flexible.querySelector('[data-slot="tabs-status-dot"]')).toHaveClass("bg-success");
+  expect(flexible.querySelector('[data-slot="tabs-status-dot"]')).toHaveClass("size-2.5", "ring-2", "ring-background", "motion-safe:animate-live-status");
   expect(flexible).toHaveAccessibleDescription("Live-сканирование включено");
-  expect(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }).querySelector('[data-slot="segmented-status-dot"]')).toBeNull();
+  expect(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }).querySelector('[data-slot="tabs-status-dot"]')).toBeNull();
 });
 
 it("skips unchanged blur saves and surfaces rename failure without losing the retry draft", async () => {

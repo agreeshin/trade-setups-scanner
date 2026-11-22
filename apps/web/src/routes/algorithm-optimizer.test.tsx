@@ -149,7 +149,7 @@ function historyButton(name: string, queries: Pick<typeof screen, "findByRole"> 
 
 async function openOptimizer() {
   const flexible = await screen.findByRole("tab", { name: "Live-сканирование с гибкими параметрами" });
-  if (flexible.getAttribute("aria-selected") !== "true") fireEvent.click(flexible);
+  if (flexible.getAttribute("aria-selected") !== "true") fireEvent.mouseDown(flexible, { button: 0, ctrlKey: false });
   await userEvent.click(await screen.findByRole("button", { name: "Запустить новое исследование Новый алгоритм" }));
   return screen.findByRole("dialog", { name: "Оптимизация · Новый алгоритм" });
 }
@@ -158,12 +158,16 @@ function enterDates() {
   fireEvent.change(screen.getByLabelText("Конец периода сигналов"), { target: { value: "2026-10-03T00:00" } });
 }
 
-it("shows retained Segmented live panels and keeps fixed controls independent when continuous is unavailable", async () => {
+it("shows retained Radix live panels and keeps fixed controls independent when continuous is unavailable", async () => {
   render(<AlgorithmsPage />);
   const first = within((await screen.findByText("Новый алгоритм · 2.0")).closest("form")!);
   expect(first.getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual([
     "Live-сканирование с гибкими параметрами", "Live-сканирование с постоянными параметрами",
   ]);
+  expect(first.getByRole("tablist")).toHaveAttribute("data-slot", "tabs-list");
+  for (const tab of first.getAllByRole("tab")) expect(tab).toHaveAttribute("data-slot", "tabs-trigger");
+  const flexiblePanel = first.getByRole("tabpanel", { name: "Live-сканирование с гибкими параметрами" });
+  expect(flexiblePanel).toHaveAttribute("data-slot", "tabs-content");
   expect(first.getAllByRole("separator")).toHaveLength(3);
   for (const divider of first.getAllByRole("separator")) expect(divider).toHaveClass("my-4");
   const flexible = within(first.getByRole("region", { name: "Live-сканирование с гибкими параметрами" }));
@@ -177,6 +181,8 @@ it("shows retained Segmented live panels and keeps fixed controls independent wh
   expect(within(history).queryByRole("heading", { name: "Последние исследования" })).not.toBeInTheDocument();
   expect(within(history).getByRole("button", { name: "Запустить новое исследование Новый алгоритм" }).closest("div")?.nextElementSibling).toContainElement(within(history).getByRole("table"));
   await userEvent.click(first.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
+  expect(flexiblePanel).toBeInTheDocument(); expect(flexiblePanel).not.toBeVisible();
+  expect(flexiblePanel).toHaveAttribute("hidden");
   const constant = within(first.getByRole("tabpanel", { name: "Live-сканирование с постоянными параметрами" }));
   const toggle = constant.getByRole("checkbox", { name: "Включён для live-сканирования" });
   expect(toggle).toBeChecked();
@@ -293,12 +299,12 @@ it.each([0, 1])("switches algorithm cards without stale metadata and submits onl
   const ownLabel = targetIndex === 0 ? "Рост цены" : "Падение цены";
   const otherLabel = targetIndex === 0 ? "Падение цены" : "Рост цены";
   render(<AlgorithmsPage />);
-  await userEvent.click(await screen.findByRole("tab", { name: other.name }));
+  fireEvent.click(await screen.findByRole("tab", { name: other.name }));
   fireEvent.click(await screen.findByRole("button", { name: `Запустить новое исследование ${other.name}` }));
   const previous = within(await screen.findByRole("dialog", { name: `Оптимизация · ${other.name}` }));
   fireEvent.change(await previous.findByLabelText(`Baseline: ${otherLabel}`), { target: { value: "91" } });
-  await userEvent.click(previous.getByRole("button", { name: "Закрыть" }));
-  await userEvent.click(screen.getByRole("tab", { name: target.name }));
+  fireEvent.click(previous.getByRole("button", { name: "Закрыть" }));
+  fireEvent.click(screen.getByRole("tab", { name: target.name }));
   fireEvent.click(screen.getByRole("button", { name: `Запустить новое исследование ${target.name}` }));
   const controls = within(await screen.findByRole("dialog", { name: `Оптимизация · ${target.name}` }));
   expect(await controls.findByLabelText(`Baseline: ${ownLabel}`)).toHaveValue("12");
@@ -640,7 +646,7 @@ it("renders ungrouped metadata in normal settings and uses its saved values as t
   render(<AlgorithmsPage />);
   const heading = await screen.findByText("Новый алгоритм · 2.0");
   const settings = within(heading.closest("form")!);
-  fireEvent.click(settings.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
+  fireEvent.mouseDown(settings.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }), { button: 0, ctrlKey: false });
   const threshold = settings.getByLabelText("Новый порог (%)");
   const window = settings.getByLabelText("Новое окно (мин)");
   expect(threshold).toHaveValue(2.5);
@@ -969,7 +975,7 @@ it("keeps shared discovery fast for a hidden algorithm's running process between
   fireEvent.click(screen.getByRole("tab", { name: "Новый алгоритм" }));
   await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   expect(screen.getByRole("tab", { name: "Новый алгоритм" })).toHaveAttribute("aria-selected", "true");
-  fireEvent.click(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }), { button: 0, ctrlKey: false });
   const fixed = screen.getByRole("spinbutton", { name: "Новый порог (%)" });
   fireEvent.change(fixed, { target: { value: "8.5" } });
   const globalReads = () => requests.filter((request) => request.path === "/v1/optimization-studies?limit=1&offset=0").length;
@@ -1104,10 +1110,10 @@ it.each(["completed", "cancelled", "failed"] as const)("allows explicit deletion
   studies = [{ ...record("completed"), id: 20, origin: "manual" },
     { ...record(status), origin: "continuous", continuousGenerationId: null, continuousSlotId: null }];
   render(<AlgorithmsPage />);
-  fireEvent.click(await screen.findByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
+  fireEvent.mouseDown(await screen.findByRole("tab", { name: "Live-сканирование с постоянными параметрами" }), { button: 0, ctrlKey: false });
   const fixed = await screen.findByRole("spinbutton", { name: "Новый порог (%)" });
   fireEvent.change(fixed, { target: { value: "8.5" } });
-  fireEvent.click(screen.getByRole("tab", { name: "Live-сканирование с гибкими параметрами" }));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Live-сканирование с гибкими параметрами" }), { button: 0, ctrlKey: false });
   await userEvent.click(await historyButton("Удалить исследование 17"));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
   expect(requests.every((request) => request.method === "GET")).toBe(true);
@@ -1153,10 +1159,10 @@ it("distinguishes retained-chain deletion conflict and refreshes study discovery
 it("previews owner-wide continuous cleanup once, cancels safely, and preserves drafts/manual rows after one confirmed command", async () => {
   studies = [{ ...record("completed"), id: 20, origin: "manual" }, { ...record("failed"), origin: "continuous" }];
   render(<AlgorithmsPage />);
-  fireEvent.click(await screen.findByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
+  fireEvent.mouseDown(await screen.findByRole("tab", { name: "Live-сканирование с постоянными параметрами" }), { button: 0, ctrlKey: false });
   const fixed = await screen.findByRole("spinbutton", { name: "Новый порог (%)" });
   fireEvent.change(fixed, { target: { value: "8.5" } });
-  fireEvent.click(screen.getByRole("tab", { name: "Live-сканирование с гибкими параметрами" }));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Live-сканирование с гибкими параметрами" }), { button: 0, ctrlKey: false });
   expect(screen.getAllByRole("button", { name: "Удалить историю непрерывных исследований…" })).toHaveLength(1);
   const controls = within(screen.getByRole("region", { name: "Непрерывные исследования" })).getByRole("region", { name: "Управление непрерывным исследованием" });
   expect(within(controls).getByRole("button", { name: "Удалить историю непрерывных исследований…" })).toHaveTextContent(/^$/);
