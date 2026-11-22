@@ -11,6 +11,10 @@ use std::{
 use tower::ServiceExt;
 
 const NOW: i64 = 1_800_000_000;
+// Loopback tests must tolerate scheduler stalls, not race a 75ms wall-clock
+// deadline against other tests. ACK-loss responses are held explicitly below.
+const TEST_HTTP_TIMEOUT: Duration = Duration::from_secs(1);
+const TEST_DEADLINE: Duration = Duration::from_secs(5);
 const NONCE: &str = "0123456789abcdef0123456789abcdef";
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 struct Directory(PathBuf);
@@ -34,6 +38,8 @@ struct MockState {
     send_mode: AtomicU8,
     permission_mode: AtomicU8,
     calls: std::sync::Mutex<Vec<(String, Value)>>,
+    committed: tokio::sync::Notify,
+    response_gate: tokio::sync::Semaphore,
 }
 struct Mock {
     origin: String,
@@ -42,6 +48,9 @@ struct Mock {
 }
 impl Drop for Mock {
     fn drop(&mut self) {
+        // Also release accepted handlers; aborting only the listener does not
+        // own the lifetime of connections spawned by axum::serve.
+        self.state.response_gate.close();
         self.task.abort();
     }
 }
@@ -51,6 +60,8 @@ impl Mock {
             send_mode: AtomicU8::new(0),
             permission_mode: AtomicU8::new(0),
             calls: std::sync::Mutex::new(Vec::new()),
+            committed: tokio::sync::Notify::new(),
+            response_gate: tokio::sync::Semaphore::new(0),
         });
         let router = Router::new()
             .route(
@@ -78,6 +89,32 @@ impl Mock {
             .filter(|(name, _)| name == method)
             .count()
     }
+    async fn wait_for_call(&self, method: &str, count: usize) {
+        tokio::time::timeout(TEST_DEADLINE, async {
+            loop {
+                let committed = self.state.committed.notified();
+                if self.calls(method) >= count {
+                    return;
+                }
+                committed.await;
+            }
+        })
+        .await
+        .expect("mock did not commit the expected call");
+    }
+    async fn after_commit<F: std::future::Future>(&self, method: &str, operation: F) -> F::Output {
+        tokio::pin!(operation);
+        tokio::time::timeout(TEST_DEADLINE, async {
+            tokio::select! {
+                biased;
+                () = self.wait_for_call(method, 1) => {}
+                _ = &mut operation => panic!("client completed before mock commit was observed"),
+            }
+            operation.await
+        })
+        .await
+        .expect("client did not finish after mock commit")
+    }
 }
 async fn mock_handler(
     State(state): State<Arc<MockState>>,
@@ -102,6 +139,9 @@ async fn mock_handler(
         assert!(calls.len() < 128);
         calls.push((method.clone(), body));
     }
+    // Recording the call models Telegram's external side effect. Signal it
+    // before withholding its ACK so timeout tests prove commit-before-error.
+    state.committed.notify_one();
     let mode = if matches!(method.as_str(), "sendMessage" | "sendPhoto") {
         state.send_mode.load(Ordering::Relaxed)
     } else {
@@ -110,7 +150,7 @@ async fn mock_handler(
     match mode {
         1=>(StatusCode::TOO_MANY_REQUESTS,Json(json!({"ok":false,"error_code":429,"description":"SECRET-UPSTREAM-DESCRIPTION","parameters":{"retry_after":7}}))).into_response(),
         2=>(StatusCode::FORBIDDEN,Json(json!({"ok":false,"error_code":403,"description":"SECRET-UPSTREAM-DESCRIPTION"}))).into_response(),
-        3=>{tokio::time::sleep(Duration::from_millis(200)).await;Json(json!({"ok":true,"result":{"message_id":42}})).into_response()},
+        3=>{let _closed=state.response_gate.acquire().await;Json(json!({"ok":true,"result":{"message_id":42}})).into_response()},
         4=>(StatusCode::OK,"not json SECRET-UPSTREAM-DESCRIPTION").into_response(),
         5=>(StatusCode::OK,"x".repeat(32769)).into_response(),
         6=>(StatusCode::TEMPORARY_REDIRECT,[("location","http://127.0.0.1:1/must-not-follow")],Json(json!({"ok":false}))).into_response(),
@@ -199,7 +239,7 @@ impl Fixture {
         let app = App::new(
             SecretKey::from_bytes([7; 32]),
             store,
-            Telegram::for_test(mock.origin.clone(), Duration::from_millis(75)),
+            Telegram::for_test(mock.origin.clone(), TEST_HTTP_TIMEOUT),
             2,
             Arc::new(move || clock.load(Ordering::Relaxed)),
         );
@@ -297,6 +337,37 @@ async fn send(f: &Fixture, body: Vec<u8>) -> (u16, Value) {
         true,
     )
     .await
+}
+
+#[tokio::test]
+async fn loopback_client_survives_scheduler_gap_larger_than_legacy_deadline() {
+    let f = Fixture::new().await;
+    let operation = f.app.telegram.send("scheduler-gap");
+    tokio::pin!(operation);
+    // Start reqwest's deadline before withholding this current-thread runtime.
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(operation.await, Ok(42));
+    assert_eq!(f.mock.calls("sendMessage"), 1);
+}
+
+#[tokio::test]
+async fn mock_ack_loss_stays_uncertain_with_realistic_client_budget() {
+    let f = Fixture::new().await;
+    f.mock.state.send_mode.store(3, Ordering::Relaxed);
+    let telegram = Telegram::for_test(f.mock.origin.clone(), TEST_HTTP_TIMEOUT);
+    assert_eq!(
+        f.mock.after_commit("sendMessage", telegram.send("ack-loss")).await,
+        Err(TelegramError::Timeout)
+    );
+    assert_eq!(f.mock.calls("sendMessage"), 1);
+    let state = f.mock.state.clone();
+    drop(f);
+    assert!(state.response_gate.is_closed());
 }
 
 #[tokio::test]
@@ -488,7 +559,7 @@ async fn timeout_uncertainty_is_retryable_not_false_success_and_bad_upstream_is_
     let f = Fixture::new().await;
     f.mock.state.send_mode.store(3, Ordering::Relaxed);
     let body = message("ack-lost");
-    let (status, error) = send(&f, body.clone()).await;
+    let (status, error) = f.mock.after_commit("sendMessage", send(&f, body.clone())).await;
     assert_eq!(status, 503);
     assert_eq!(error["code"], "telegram_timeout");
     assert_eq!(send(&f, body.clone()).await.0, 503);
@@ -510,41 +581,37 @@ async fn timeout_uncertainty_is_retryable_not_false_success_and_bad_upstream_is_
 }
 #[tokio::test]
 async fn concurrent_id_is_busy_no_db_mutex_over_telegram_await_and_cancel_does_not_skip_lease() {
-    let f = Fixture::new().await;
-    f.mock.state.send_mode.store(3, Ordering::Relaxed);
-    let body = message("concurrent");
-    let app = f.app.clone();
-    let first_body = body.clone();
-    let first = tokio::spawn(async move {
-        execute(
-            &app,
-            request("POST", protocol::MESSAGES_PATH, first_body, NOW, 7),
-            true,
-        )
-        .await
-    });
-    for _ in 0..30 {
-        if f.mock.calls("sendMessage") > 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    assert_eq!(f.mock.calls("sendMessage"), 1);
-    assert_eq!(
-        tokio::time::timeout(Duration::from_millis(50), send(&f, body.clone()))
+    tokio::time::timeout(TEST_DEADLINE, async {
+        let mut f = Fixture::new().await;
+        // This test cancels an in-flight send; HTTP timeout is tested separately.
+        // Keep its client deadline beyond the outer deadlock guard.
+        Arc::get_mut(&mut f.app).unwrap().telegram =
+            Telegram::for_test(f.mock.origin.clone(), TEST_DEADLINE * 2);
+        f.mock.state.send_mode.store(3, Ordering::Relaxed);
+        let body = message("concurrent");
+        let app = f.app.clone();
+        let first_body = body.clone();
+        let first = tokio::spawn(async move {
+            execute(
+                &app,
+                request("POST", protocol::MESSAGES_PATH, first_body, NOW, 7),
+                true,
+            )
             .await
-            .unwrap()
-            .0,
-        409
-    );
-    tokio::time::timeout(Duration::from_millis(50), f.app.store.health())
-        .await
-        .unwrap()
-        .unwrap();
-    first.abort();
-    let _ = first.await;
-    assert_eq!(send(&f, body).await.0, 409);
-    assert_eq!(f.mock.calls("sendMessage"), 1);
+        });
+        f.mock.wait_for_call("sendMessage", 1).await;
+        assert!(!first.is_finished());
+        let (status, error) = send(&f, body.clone()).await;
+        assert_eq!(status, 409);
+        assert_eq!(error["code"], "delivery_in_flight");
+        f.app.store.health().await.unwrap();
+        first.abort();
+        let _ = first.await;
+        assert_eq!(send(&f, body).await.0, 409);
+        assert_eq!(f.mock.calls("sendMessage"), 1);
+    })
+    .await
+    .expect("in-flight send blocked busy admission, storage health or cancellation");
 }
 #[tokio::test]
 async fn capacity_expired_lease_fencing_destination_and_actual_cleanup() {
@@ -630,7 +697,9 @@ async fn exact_post_replay_after_timeout_and_restart_never_creates_another_attem
     let body = message("durable-post-nonce");
     f.mock.state.send_mode.store(3, Ordering::Relaxed);
     let same = || request_nonce("POST", protocol::MESSAGES_PATH, body.clone(), NOW, 7, NONCE);
-    assert_eq!(execute(&f.app, same(), true).await.0, 503);
+    let (status, error) = f.mock.after_commit("sendMessage", execute(&f.app, same(), true)).await;
+    assert_eq!(status, 503);
+    assert_eq!(error["code"], "telegram_timeout");
     assert_eq!(f.mock.calls("sendMessage"), 1);
     f.now.store(NOW + 1, Ordering::Relaxed);
     assert_eq!(execute(&f.app, same(), true).await.0, 409);
@@ -646,7 +715,7 @@ async fn exact_post_replay_after_timeout_and_restart_never_creates_another_attem
     let restarted = App::new(
         SecretKey::from_bytes([7; 32]),
         store,
-        Telegram::for_test(f.mock.origin.clone(), Duration::from_millis(75)),
+        Telegram::for_test(f.mock.origin.clone(), TEST_HTTP_TIMEOUT),
         2,
         Arc::new(move || clock.load(Ordering::Relaxed)),
     );
@@ -1085,7 +1154,7 @@ async fn v2_photo_receipts_survive_restart_and_wire_switch_cannot_republish_id()
     let restarted = App::new(
         SecretKey::from_bytes([7; 32]),
         store,
-        Telegram::for_test(f.mock.origin.clone(), Duration::from_millis(75)),
+        Telegram::for_test(f.mock.origin.clone(), TEST_HTTP_TIMEOUT),
         2,
         Arc::new(move || clock.load(Ordering::Relaxed)),
     );
@@ -1130,7 +1199,10 @@ async fn v2_photo_timeout_replay_and_rate_limit_never_change_into_text_fallback(
             NONCE,
         )
     };
-    assert_eq!(execute(&f.app, same(), true).await.0, 503);
+    let (status, error) = f.mock.after_commit("sendPhoto", execute(&f.app, same(), true)).await;
+    assert_eq!(status, 503);
+    assert_eq!(error["code"], "telegram_timeout");
+    assert_eq!(f.mock.calls("sendPhoto"), 1);
     f.now.store(NOW + 1, Ordering::Relaxed);
     let (status, error) = execute(&f.app, same(), true).await;
     assert_eq!(status, 409);

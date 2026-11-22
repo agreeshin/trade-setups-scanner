@@ -1453,16 +1453,38 @@ async fn saved_png_regression(pool: &PgPool, relay: &LocalRelay) {
     assert!(job.payload.get("chartPresentation").is_none());
     // An archive can become available after the durable admission. This must
     // not replace the real persisted PNG of an already queued legacy job.
-    let minutes=vec![
-        setups_db::study_display::OriginalMinute{signal_close_unix:first+60,sum_r:3.5,closed_count:1,tp_count:1,sl_count:0},
-        setups_db::study_display::OriginalMinute{signal_close_unix:first+86460,sum_r:-1.0,closed_count:1,tp_count:0,sl_count:1},
+    let minutes = vec![
+        setups_db::study_display::OriginalMinute {
+            signal_close_unix: first + 60,
+            sum_r: 3.5,
+            closed_count: 1,
+            tp_count: 1,
+            sl_count: 0,
+        },
+        setups_db::study_display::OriginalMinute {
+            signal_close_unix: first + 86460,
+            sum_r: -1.0,
+            closed_count: 1,
+            tp_count: 0,
+            sl_count: 1,
+        },
     ];
-    let digest=format!("{:x}",sha2::Sha256::digest(serde_json::to_vec(&minutes).unwrap()));
+    let digest = format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_json::to_vec(&minutes).unwrap())
+    );
     sqlx::query("insert into study_original_outcomes(artifact_id,source_key,kernel,minutes,payload_sha256,payload_bytes) values($1,$2,'original-historical-close-1',$3,$4,octet_length($3::jsonb::text))")
         .bind(id).bind(&key).bind(serde_json::to_value(&minutes).unwrap()).bind(digest).execute(pool).await.unwrap();
-    let observed=setups_db::study_display::original_observed(pool,"admin",study,Some(id),"UTC").await.unwrap().unwrap();
-    assert_eq!(observed.daily.iter().map(|p|p.closed_count).sum::<u64>(),2);
-    observed_admission_regression(pool,&job,&identity,&numeric).await;
+    let observed =
+        setups_db::study_display::original_observed(pool, "admin", study, Some(id), "UTC")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        observed.daily.iter().map(|p| p.closed_count).sum::<u64>(),
+        2
+    );
+    observed_admission_regression(pool, &job, &identity, &numeric).await;
     let outcome = send_job_via(pool, worker, &job, &AtomicBool::new(false), relay)
         .await
         .unwrap();
@@ -1474,8 +1496,10 @@ async fn saved_png_regression(pool: &PgPool, relay: &LocalRelay) {
             .await
             .unwrap();
     let parsed = v2::RelayMessage::parse(&frozen, now).unwrap();
-    assert!(parsed.attachment.unwrap().decode_png().unwrap()==png_fixture(),
-        "queued legacy job must use its exact persisted PNG despite a newly available archive and real render lane");
+    assert!(
+        parsed.attachment.unwrap().decode_png().unwrap() == png_fixture(),
+        "queued legacy job must use its exact persisted PNG despite a newly available archive and real render lane"
+    );
     assert!(!relay.photo.load(Ordering::SeqCst));
     assert_eq!(relay.presentation_calls.load(Ordering::SeqCst), 2);
     db::finish(pool, worker, &job, outcome).await.unwrap();
@@ -1636,74 +1660,259 @@ async fn saved_png_regression(pool: &PgPool, relay: &LocalRelay) {
     model_png_regression(pool, &job, &identity, &numeric).await;
 }
 
-async fn observed_admission_regression(pool:&PgPool,legacy:&TelegramJob,identity:&setups_db::expectancy::ArtifactIdentity,numeric:&setups_domain::expectancy::ExpectancyArtifact) {
+async fn observed_admission_regression(
+    pool: &PgPool,
+    legacy: &TelegramJob,
+    identity: &setups_db::expectancy::ArtifactIdentity,
+    numeric: &setups_domain::expectancy::ExpectancyArtifact,
+) {
     use serde_json::json;
     use setups_db::continuous as live;
-    let profile=live::ActiveAdaptiveSlot {
-        owner_id:legacy.owner_id.clone(),algorithm_id:legacy.algorithm_id.clone(),slot_id:identity.slot_id,generation_id:identity.generation_id,
-        study_id:identity.study_id,config_revision:legacy.config_revision.unwrap(),min_setups_per_day:4.0,spec:json!({"algorithmVersion":"1.1.1"}),
-        result:json!({}),params:legacy.payload["raw"]["params"].clone(),analytics:identity.effective_analytics.clone(),
-        selected_cell:json!({"tpPct":identity.tp_pct,"slPct":identity.sl_pct}),mean_expectancy:1.25,direction:"short".into(),
-        external_name:"Captured name".into(),live_initialization:None,live_readiness:vec![],
+    let profile = live::ActiveAdaptiveSlot {
+        owner_id: legacy.owner_id.clone(),
+        algorithm_id: legacy.algorithm_id.clone(),
+        slot_id: identity.slot_id,
+        generation_id: identity.generation_id,
+        study_id: identity.study_id,
+        config_revision: legacy.config_revision.unwrap(),
+        min_setups_per_day: 4.0,
+        spec: json!({"algorithmVersion":"1.1.1"}),
+        result: json!({}),
+        params: legacy.payload["raw"]["params"].clone(),
+        analytics: identity.effective_analytics.clone(),
+        selected_cell: json!({"tpPct":identity.tp_pct,"slPct":identity.sl_pct}),
+        mean_expectancy: 1.25,
+        direction: "short".into(),
+        external_name: "Captured name".into(),
+        live_initialization: None,
+        live_readiness: vec![],
     };
-    let raw=serde_json::from_value(legacy.payload["raw"].clone()).unwrap();
-    let mut row=live::AdaptiveSetupWrite {exchange_code:"bybit".into(),category:"linear".into(),symbol:"TESTUSDT".into(),setup:raw,recommendation:legacy.payload["recommendation"].clone()};
-    let checkpoint=json!({"nextOpenUnix":legacy.raw_close_unix+60});
-    let before:serde_json::Value=sqlx::query_scalar("select to_jsonb(o) from telegram_delivery_outbox o where id=$1").bind(legacy.id).fetch_one(pool).await.unwrap();
-    let duplicate=live::commit_adaptive_scan_cas(pool,&profile,"bybit/linear/TESTUSDT",None,&checkpoint,std::slice::from_ref(&row)).await.unwrap();
-    assert!(duplicate.applied&&duplicate.inserted.is_empty());
-    assert!(!live::commit_adaptive_scan_cas(pool,&profile,"bybit/linear/TESTUSDT",None,&checkpoint,std::slice::from_ref(&row)).await.unwrap().applied);
-    assert_eq!(sqlx::query_scalar::<_,serde_json::Value>("select to_jsonb(o) from telegram_delivery_outbox o where id=$1").bind(legacy.id).fetch_one(pool).await.unwrap(),before,"legacy duplicate and lost ACK never relabel an admitted job");
-    row.symbol="NEWADMITUSDT".into();
-    let admitted=live::commit_adaptive_scan_cas(pool,&profile,"bybit/linear/NEWADMITUSDT",None,&checkpoint,std::slice::from_ref(&row)).await.unwrap();
-    assert!(admitted.applied);assert_eq!(admitted.inserted.len(),1);
-    let setup=admitted.inserted[0].id;
-    let first:serde_json::Value=sqlx::query_scalar("select to_jsonb(o) from telegram_delivery_outbox o where setup_id::bigint=$1").bind(setup).fetch_one(pool).await.unwrap();
-    assert_eq!(first["payload"]["chartPresentation"],live::outbox::OBSERVED_CHART_PRESENTATION);
-    let earliest:serde_json::Value=sqlx::query_scalar("select payload from adaptive_notification_outbox where setup_id::bigint=$1").bind(setup).fetch_one(pool).await.unwrap();
-    assert_eq!(earliest,first["payload"],"the earliest durable payload and Telegram payload share the opt-in");
-    assert!(!live::commit_adaptive_scan_cas(pool,&profile,"bybit/linear/NEWADMITUSDT",None,&checkpoint,std::slice::from_ref(&row)).await.unwrap().applied);
-    assert_eq!(sqlx::query_scalar::<_,serde_json::Value>("select to_jsonb(o) from telegram_delivery_outbox o where setup_id::bigint=$1").bind(setup).fetch_one(pool).await.unwrap(),first,"new admission lost ACK also preserves exact durable bytes");
-    observed_new_delivery(pool,legacy,numeric,setup).await;
+    let raw = serde_json::from_value(legacy.payload["raw"].clone()).unwrap();
+    let mut row = live::AdaptiveSetupWrite {
+        exchange_code: "bybit".into(),
+        category: "linear".into(),
+        symbol: "TESTUSDT".into(),
+        setup: raw,
+        recommendation: legacy.payload["recommendation"].clone(),
+    };
+    let checkpoint = json!({"nextOpenUnix":legacy.raw_close_unix+60});
+    let before: serde_json::Value =
+        sqlx::query_scalar("select to_jsonb(o) from telegram_delivery_outbox o where id=$1")
+            .bind(legacy.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let duplicate = live::commit_adaptive_scan_cas(
+        pool,
+        &profile,
+        "bybit/linear/TESTUSDT",
+        None,
+        &checkpoint,
+        std::slice::from_ref(&row),
+    )
+    .await
+    .unwrap();
+    assert!(duplicate.applied && duplicate.inserted.is_empty());
+    assert!(
+        !live::commit_adaptive_scan_cas(
+            pool,
+            &profile,
+            "bybit/linear/TESTUSDT",
+            None,
+            &checkpoint,
+            std::slice::from_ref(&row)
+        )
+        .await
+        .unwrap()
+        .applied
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "select to_jsonb(o) from telegram_delivery_outbox o where id=$1"
+        )
+        .bind(legacy.id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        before,
+        "legacy duplicate and lost ACK never relabel an admitted job"
+    );
+    row.symbol = "NEWADMITUSDT".into();
+    let admitted = live::commit_adaptive_scan_cas(
+        pool,
+        &profile,
+        "bybit/linear/NEWADMITUSDT",
+        None,
+        &checkpoint,
+        std::slice::from_ref(&row),
+    )
+    .await
+    .unwrap();
+    assert!(admitted.applied);
+    assert_eq!(admitted.inserted.len(), 1);
+    let setup = admitted.inserted[0].id;
+    let first: serde_json::Value = sqlx::query_scalar(
+        "select to_jsonb(o) from telegram_delivery_outbox o where setup_id::bigint=$1",
+    )
+    .bind(setup)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        first["payload"]["chartPresentation"],
+        live::outbox::OBSERVED_CHART_PRESENTATION
+    );
+    let earliest: serde_json::Value = sqlx::query_scalar(
+        "select payload from adaptive_notification_outbox where setup_id::bigint=$1",
+    )
+    .bind(setup)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        earliest, first["payload"],
+        "the earliest durable payload and Telegram payload share the opt-in"
+    );
+    assert!(
+        !live::commit_adaptive_scan_cas(
+            pool,
+            &profile,
+            "bybit/linear/NEWADMITUSDT",
+            None,
+            &checkpoint,
+            std::slice::from_ref(&row)
+        )
+        .await
+        .unwrap()
+        .applied
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "select to_jsonb(o) from telegram_delivery_outbox o where setup_id::bigint=$1"
+        )
+        .bind(setup)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        first,
+        "new admission lost ACK also preserves exact durable bytes"
+    );
+    observed_new_delivery(pool, legacy, numeric, setup).await;
 }
 
-async fn observed_new_delivery(pool:&PgPool,legacy:&TelegramJob,numeric:&setups_domain::expectancy::ExpectancyArtifact,setup:i64) {
-    let (relay,server)=local_relay(3).await;
-    let worker="observed-new-worker";
-    let job=db::claim(pool,worker,1).await.unwrap().remove(0);
-    assert_eq!(job.setup_id,setup);assert!(job.request_body.is_none());
-    let id=job.payload["recommendation"]["expectancy"]["artifactId"].as_i64().unwrap();
-    let archive=setups_db::study_display::original_observed(pool,&job.owner_id,numeric.source.study_id.parse().unwrap(),Some(id),"UTC").await.unwrap().unwrap();
-    let points=archive.utc_points(numeric.origin_unix).unwrap();
-    let expected=setups_analytics::expectancy_chart::render_png_trend_observed(numeric,Default::default(),&points).unwrap();
-    let outcome=send_job_via(pool,worker,&job,&AtomicBool::new(false),&relay).await.unwrap();
-    assert!(matches!(outcome,TelegramOutcome::Retry{..}));
-    let frozen:Vec<u8>=sqlx::query_scalar("select request_body from telegram_delivery_outbox where id=$1").bind(job.id).fetch_one(pool).await.unwrap();
-    let attached=v2::RelayMessage::parse(&frozen,job.raw_close_unix).unwrap().attachment.unwrap().decode_png().unwrap();
-    assert!(attached==expected,"new opted-in admission uses the canonical observed projection");
-    assert!(attached!=png_fixture(),"new presentation is not the legacy cached PNG");
-    db::finish(pool,worker,&job,outcome).await.unwrap();
+async fn observed_new_delivery(
+    pool: &PgPool,
+    legacy: &TelegramJob,
+    numeric: &setups_domain::expectancy::ExpectancyArtifact,
+    setup: i64,
+) {
+    let (relay, server) = local_relay(3).await;
+    let worker = "observed-new-worker";
+    let job = db::claim(pool, worker, 1).await.unwrap().remove(0);
+    assert_eq!(job.setup_id, setup);
+    assert!(job.request_body.is_none());
+    let id = job.payload["recommendation"]["expectancy"]["artifactId"]
+        .as_i64()
+        .unwrap();
+    let archive = setups_db::study_display::original_observed(
+        pool,
+        &job.owner_id,
+        numeric.source.study_id.parse().unwrap(),
+        Some(id),
+        "UTC",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let points = archive.utc_points(numeric.origin_unix).unwrap();
+    let expected = setups_analytics::expectancy_chart::render_png_trend_observed(
+        numeric,
+        Default::default(),
+        &points,
+    )
+    .unwrap();
+    let outcome = send_job_via(pool, worker, &job, &AtomicBool::new(false), &relay)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, TelegramOutcome::Retry { .. }));
+    let frozen: Vec<u8> =
+        sqlx::query_scalar("select request_body from telegram_delivery_outbox where id=$1")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let attached = v2::RelayMessage::parse(&frozen, job.raw_close_unix)
+        .unwrap()
+        .attachment
+        .unwrap()
+        .decode_png()
+        .unwrap();
+    assert!(
+        attached == expected,
+        "new opted-in admission uses the canonical observed projection"
+    );
+    assert!(
+        attached != png_fixture(),
+        "new presentation is not the legacy cached PNG"
+    );
+    db::finish(pool, worker, &job, outcome).await.unwrap();
     // Fault injection only in this disposable DB. A present corrupt archive
     // fails opted-in jobs, while legacy contracts never consult that archive.
-    let ledger:serde_json::Value=sqlx::query_scalar("select to_jsonb(o) from study_original_outcomes o where artifact_id=$1").bind(id).fetch_one(pool).await.unwrap();
-    sqlx::query("delete from study_original_outcomes where artifact_id=$1").bind(id).execute(pool).await.unwrap();
-    let mut corrupt=ledger.clone();corrupt["payload_sha256"]=serde_json::json!("0".repeat(64));
+    let ledger: serde_json::Value = sqlx::query_scalar(
+        "select to_jsonb(o) from study_original_outcomes o where artifact_id=$1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query("delete from study_original_outcomes where artifact_id=$1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut corrupt = ledger.clone();
+    corrupt["payload_sha256"] = serde_json::json!("0".repeat(64));
     sqlx::query("insert into study_original_outcomes select * from jsonb_populate_record(null::study_original_outcomes,$1)").bind(corrupt).execute(pool).await.unwrap();
-    assert!(matches!(saved_chart_png(pool,&job,Some(&relay.charts)).await,Err("png_identity_mismatch")));
-    assert!(saved_chart_png(pool,legacy,Some(&relay.charts)).await.unwrap().unwrap()==png_fixture());
-    let mut unknown=job.clone();unknown.payload["chartPresentation"]=serde_json::json!("unsupported_future_version");
-    assert!(matches!(saved_chart_png(pool,&unknown,Some(&relay.charts)).await,Err("png_identity_mismatch")));
+    assert!(matches!(
+        saved_chart_png(pool, &job, Some(&relay.charts)).await,
+        Err("png_identity_mismatch")
+    ));
+    assert!(
+        saved_chart_png(pool, legacy, Some(&relay.charts))
+            .await
+            .unwrap()
+            .unwrap()
+            == png_fixture()
+    );
+    let mut unknown = job.clone();
+    unknown.payload["chartPresentation"] = serde_json::json!("unsupported_future_version");
+    assert!(matches!(
+        saved_chart_png(pool, &unknown, Some(&relay.charts)).await,
+        Err("png_identity_mismatch")
+    ));
     sqlx::query("update telegram_delivery_outbox set not_before=clock_timestamp()-interval '1 second' where id=$1").bind(job.id).execute(pool).await.unwrap();
-    let mut retry=db::claim(pool,worker,1).await.unwrap().remove(0);assert_eq!(retry.id,job.id);
-    retry.payload=serde_json::Value::Null;relay.mode.store(0,Ordering::SeqCst);
-    let outcome=send_job_via(pool,worker,&retry,&AtomicBool::new(false),&relay).await.unwrap();
-    assert!(matches!(outcome,TelegramOutcome::Sent));
-    assert_eq!(relay.presentation_calls.load(Ordering::SeqCst),1);
-    assert!(relay.calls.lock().unwrap().last().unwrap().1==frozen,"frozen opted-in retry ignores changed/corrupt source");
-    db::finish(pool,worker,&retry,outcome).await.unwrap();
-    sqlx::query("delete from study_original_outcomes where artifact_id=$1").bind(id).execute(pool).await.unwrap();
+    let mut retry = db::claim(pool, worker, 1).await.unwrap().remove(0);
+    assert_eq!(retry.id, job.id);
+    retry.payload = serde_json::Value::Null;
+    relay.mode.store(0, Ordering::SeqCst);
+    let outcome = send_job_via(pool, worker, &retry, &AtomicBool::new(false), &relay)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, TelegramOutcome::Sent));
+    assert_eq!(relay.presentation_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        relay.calls.lock().unwrap().last().unwrap().1 == frozen,
+        "frozen opted-in retry ignores changed/corrupt source"
+    );
+    db::finish(pool, worker, &retry, outcome).await.unwrap();
+    sqlx::query("delete from study_original_outcomes where artifact_id=$1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query("insert into study_original_outcomes select * from jsonb_populate_record(null::study_original_outcomes,$1)").bind(ledger).execute(pool).await.unwrap();
-    server.abort();let _=server.await;
+    server.abort();
+    let _ = server.await;
 }
 
 async fn model_png_regression(

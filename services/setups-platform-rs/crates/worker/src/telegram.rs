@@ -575,17 +575,34 @@ async fn saved_presentation_with_lane(
 /// Read only the artifact named by this immutable recommendation. All decoded
 /// numerical JSON (<=1 MiB) and PNG bytes (<=256 KiB) belong to this one attempt
 /// and are released before its result; no current-profile lookup or cache here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SavedChartPresentation {
+    Legacy,
+    ObservedV1,
+    ObservedV2,
+}
+
 async fn saved_chart_png(
     pool: &PgPool,
     job: &TelegramJob,
     charts: Option<&ChartRenderLane>,
 ) -> Result<Option<Vec<u8>>, &'static str> {
     use setups_domain::{AdaptiveRecommendationSnapshot, expectancy::ExpectancyArtifact};
-    let observed_presentation=match job.payload.get("chartPresentation") {
-        None=>false, // Preexisting queued payloads retain their exact old contract.
-        Some(serde_json::Value::String(value)) if value==setups_db::continuous::outbox::OBSERVED_CHART_PRESENTATION=>true,
-        _=>return Err("png_identity_mismatch"),
+    let presentation = match job.payload.get("chartPresentation") {
+        None => SavedChartPresentation::Legacy, // Preexisting queued payloads retain their exact old contract.
+        Some(serde_json::Value::String(value))
+            if value == setups_db::continuous::outbox::OBSERVED_CHART_PRESENTATION_V1 =>
+        {
+            SavedChartPresentation::ObservedV1
+        }
+        Some(serde_json::Value::String(value))
+            if value == setups_db::continuous::outbox::OBSERVED_CHART_PRESENTATION =>
+        {
+            SavedChartPresentation::ObservedV2
+        }
+        _ => return Err("png_identity_mismatch"),
     };
+    let observed_presentation = presentation != SavedChartPresentation::Legacy;
     let recommendation = &job.payload["recommendation"];
     let saved = &recommendation["expectancy"];
     let Some(id) = saved["artifactId"].as_i64().filter(|id| *id > 0) else {
@@ -599,33 +616,87 @@ async fn saved_chart_png(
     let snapshot: AdaptiveRecommendationSnapshot =
         serde_json::from_value(recommendation.clone()).map_err(|_| "png_identity_mismatch")?;
     let fence = ChartSourceFence::from_job(job)?;
-    if saved.get("objective").is_some_and(|objective| !objective.is_null()) {
+    if saved
+        .get("objective")
+        .is_some_and(|objective| !objective.is_null())
+    {
         let charts = charts.ok_or("png_objective_unavailable")?;
-        let saved: crate::adaptive::AdaptiveExpectancySnapshot = serde_json::from_value(saved.clone()).map_err(|_| "png_identity_mismatch")?;
+        let saved: crate::adaptive::AdaptiveExpectancySnapshot =
+            serde_json::from_value(saved.clone()).map_err(|_| "png_identity_mismatch")?;
         let objective = saved.objective.as_ref().ok_or("png_identity_mismatch")?;
-        let expected = setups_domain::expectancy::ExpectancyObjective::from_recommendation(&snapshot).map_err(|_| "png_identity_mismatch")?;
-        let value = objective.decision_r.as_ref().copied().ok_or("png_objective_unavailable")?;
-        let overlay = crate::adaptive::ExpectancyOverlayKey::for_objective(&key, job.raw_close_unix, value, expected, snapshot.provenance.observation_cutoff)
-            .map_err(|_| "png_identity_mismatch")?;
-        if objective.settings != expected || saved.image_key.as_ref() != Some(&key)
-            || saved.overlay_key.as_ref() != Some(&overlay) || saved.forecast_at_unix != job.raw_close_unix
-            || saved.artifact_id != Some(id) { return Err("png_identity_mismatch"); }
+        let expected =
+            setups_domain::expectancy::ExpectancyObjective::from_recommendation(&snapshot)
+                .map_err(|_| "png_identity_mismatch")?;
+        let expected_render_version = if presentation == SavedChartPresentation::ObservedV2 {
+            setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION
+        } else {
+            setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION_V1
+        };
+        if key.render_version != expected_render_version {
+            return Err("png_identity_mismatch");
+        }
+        let value = objective
+            .decision_r
+            .as_ref()
+            .copied()
+            .ok_or("png_objective_unavailable")?;
+        let overlay = crate::adaptive::ExpectancyOverlayKey::for_objective(
+            &key,
+            job.raw_close_unix,
+            value,
+            expected,
+            snapshot.provenance.observation_cutoff,
+        )
+        .map_err(|_| "png_identity_mismatch")?;
+        if objective.settings != expected
+            || saved.image_key.as_ref() != Some(&key)
+            || saved.overlay_key.as_ref() != Some(&overlay)
+            || saved.forecast_at_unix != job.raw_close_unix
+            || saved.artifact_id != Some(id)
+        {
+            return Err("png_identity_mismatch");
+        }
         let raw = job.raw_close_unix;
         let pool = pool.clone();
-        return charts.render(move || {
-            let mut artifact = tokio::runtime::Handle::current().block_on(setups_db::expectancy::get(&pool, &fence.owner_id, id))
-                .map_err(|_| "png_lookup_unavailable")?.ok_or("png_objective_unavailable")?;
-            let numerical: ExpectancyArtifact = serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
-                .map_err(|_| "png_identity_mismatch")?;
-            validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
-            let observed=if observed_presentation {tokio::runtime::Handle::current().block_on(chart_observed(&pool,&fence,id,&numerical))?}else{None};
-            let rendered=match observed.as_deref() {
-                Some(points)=>setups_analytics::expectancy_chart::render_png_objective_observed(&numerical,expected,raw,value,points),
-                None=>setups_analytics::expectancy_chart::render_png_with_objective(&numerical,expected,raw,value),
-            };
-            rendered
-                .map(Some).map_err(|_| "png_objective_unavailable")
-        }).await;
+        return charts
+            .render(move || {
+                let mut artifact = tokio::runtime::Handle::current()
+                    .block_on(setups_db::expectancy::get(&pool, &fence.owner_id, id))
+                    .map_err(|_| "png_lookup_unavailable")?
+                    .ok_or("png_objective_unavailable")?;
+                let numerical: ExpectancyArtifact =
+                    serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
+                        .map_err(|_| "png_identity_mismatch")?;
+                validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
+                let observed = if observed_presentation {
+                    tokio::runtime::Handle::current()
+                        .block_on(chart_observed(&pool, &fence, id, &numerical))?
+                } else {
+                    None
+                };
+                let rendered = match (presentation, observed.as_deref()) {
+                    (SavedChartPresentation::ObservedV2, Some(points)) => {
+                        setups_analytics::expectancy_chart::render_png_objective_observed_v2(
+                            &numerical, expected, raw, value, points,
+                        )
+                    }
+                    (SavedChartPresentation::ObservedV2, None) => {
+                        setups_analytics::expectancy_chart::render_png_with_objective_v2(
+                            &numerical, expected, raw, value,
+                        )
+                    }
+                    (_, Some(points)) => {
+                        setups_analytics::expectancy_chart::render_png_objective_observed(
+                            &numerical, expected, raw, value, points,
+                        )
+                    }
+                    (_, None) => setups_analytics::expectancy_chart::render_png_with_objective(
+                        &numerical, expected, raw, value,
+                    ),
+                };
+                rendered.map(Some).map_err(|_| "png_objective_unavailable")
+            })
+            .await;
     }
     if let Some(recipe) = snapshot.forecast {
         let charts = charts.ok_or("png_unavailable")?;
@@ -664,14 +735,43 @@ async fn saved_chart_png(
                     serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
                         .map_err(|_| "png_identity_mismatch")?;
                 validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
-                let observed=if observed_presentation {tokio::runtime::Handle::current().block_on(chart_observed(&pool,&fence,id,&numerical))?}else{None};
-                let rendered=match observed.as_deref() {
-                    Some(points)=>setups_analytics::expectancy_chart::render_png_model_observed(&numerical,raw_signal_at,forecast,points),
-                    None=>setups_analytics::expectancy_chart::render_png_with_model(&numerical,raw_signal_at,forecast),
+                let observed = if observed_presentation {
+                    tokio::runtime::Handle::current()
+                        .block_on(chart_observed(&pool, &fence, id, &numerical))?
+                } else {
+                    None
                 };
-                rendered
-                .map(Some)
-                .map_err(|_| "png_unavailable")
+                let rendered = match (presentation, observed.as_deref()) {
+                    (SavedChartPresentation::ObservedV2, Some(points)) => {
+                        setups_analytics::expectancy_chart::render_png_model_observed_v2(
+                            &numerical,
+                            raw_signal_at,
+                            forecast,
+                            points,
+                        )
+                    }
+                    (SavedChartPresentation::ObservedV2, None) => {
+                        setups_analytics::expectancy_chart::render_png_with_model_v2(
+                            &numerical,
+                            raw_signal_at,
+                            forecast,
+                        )
+                    }
+                    (_, Some(points)) => {
+                        setups_analytics::expectancy_chart::render_png_model_observed(
+                            &numerical,
+                            raw_signal_at,
+                            forecast,
+                            points,
+                        )
+                    }
+                    (_, None) => setups_analytics::expectancy_chart::render_png_with_model(
+                        &numerical,
+                        raw_signal_at,
+                        forecast,
+                    ),
+                };
+                rendered.map(Some).map_err(|_| "png_unavailable")
             })
             .await;
     }
@@ -683,17 +783,33 @@ async fn saved_chart_png(
         serde_json::from_value(std::mem::take(&mut artifact.numerical_snapshot))
             .map_err(|_| "png_identity_mismatch")?;
     validate_chart_source(&fence, id, &key, &snapshot, &artifact, &numerical)?;
-    let observed=if observed_presentation {chart_observed(pool,&fence,id,&numerical).await?}else{None};
-    if let Some(points)=observed {
-        let charts=charts.ok_or("png_unavailable")?;
+    let observed = if observed_presentation {
+        chart_observed(pool, &fence, id, &numerical).await?
+    } else {
+        None
+    };
+    if let Some(points) = observed {
+        let charts = charts.ok_or("png_unavailable")?;
         // Same immutable generation fields used by the old asset renderer.
         // Render only this unfrozen future message: no version bump, cache
         // rewrite, scanner admission or requeue of historical PNG assets.
         let saved:serde_json::Value=sqlx::query_scalar("select jsonb_strip_nulls(jsonb_build_object('trendMode',g.spec->'trendMode','trendBendDays',g.spec->'trendBendDays','trendBlendLambda',g.spec->'trendBlendLambda')) from study_expectancy_artifacts a left join continuous_generations g on g.id=a.source_generation_id and g.owner_id=a.owner_id where a.id=$1 and a.owner_id=$2")
             .bind(id).bind(&fence.owner_id).fetch_one(pool).await.map_err(|_|"png_lookup_unavailable")?;
-        let trend=serde_json::from_value(saved).map_err(|_|"png_identity_mismatch")?;
-        return charts.render(move||setups_analytics::expectancy_chart::render_png_trend_observed(&numerical,trend,&points)
-            .map(Some).map_err(|_|"png_unavailable")).await;
+        let trend = serde_json::from_value(saved).map_err(|_| "png_identity_mismatch")?;
+        return charts
+            .render(move || {
+                let rendered = if presentation == SavedChartPresentation::ObservedV2 {
+                    setups_analytics::expectancy_chart::render_png_trend_observed_v2(
+                        &numerical, trend, &points,
+                    )
+                } else {
+                    setups_analytics::expectancy_chart::render_png_trend_observed(
+                        &numerical, trend, &points,
+                    )
+                };
+                rendered.map(Some).map_err(|_| "png_unavailable")
+            })
+            .await;
     }
     let version = key.render_version.to_string();
     let png = setups_db::expectancy::load_png_by_image_key(pool, &job.owner_id, &key)
@@ -712,16 +828,41 @@ async fn saved_chart_png(
     Ok(Some(png))
 }
 
-async fn chart_observed(pool:&PgPool,fence:&ChartSourceFence,id:i64,numerical:&setups_domain::expectancy::ExpectancyArtifact)
-    ->Result<Option<Vec<setups_domain::expectancy::UtcDailyPoint>>,&'static str> {
-    let archive=setups_db::study_display::original_observed(pool,&fence.owner_id,fence.study_id,Some(id),"UTC").await
-        .map_err(|error| {
-            let message:String=error.to_string().chars().take(300).map(|c|if c.is_control(){' '}else{c}).collect();
-            setups_db::diagnostics::emit(setups_db::diagnostics::Level::Error,"telegram_original_source_invalid",
-                serde_json::json!({"studyId":fence.study_id,"artifactId":id,"message":message}));
-            "png_identity_mismatch"
-        })?;
-    archive.map(|archive|archive.utc_points(numerical.origin_unix).map_err(|_|"png_identity_mismatch")).transpose()
+async fn chart_observed(
+    pool: &PgPool,
+    fence: &ChartSourceFence,
+    id: i64,
+    numerical: &setups_domain::expectancy::ExpectancyArtifact,
+) -> Result<Option<Vec<setups_domain::expectancy::UtcDailyPoint>>, &'static str> {
+    let archive = setups_db::study_display::original_observed(
+        pool,
+        &fence.owner_id,
+        fence.study_id,
+        Some(id),
+        "UTC",
+    )
+    .await
+    .map_err(|error| {
+        let message: String = error
+            .to_string()
+            .chars()
+            .take(300)
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        setups_db::diagnostics::emit(
+            setups_db::diagnostics::Level::Error,
+            "telegram_original_source_invalid",
+            serde_json::json!({"studyId":fence.study_id,"artifactId":id,"message":message}),
+        );
+        "png_identity_mismatch"
+    })?;
+    archive
+        .map(|archive| {
+            archive
+                .utc_points(numerical.origin_unix)
+                .map_err(|_| "png_identity_mismatch")
+        })
+        .transpose()
 }
 
 /// Only bounded scalar source fences cross to the CPU lane, not the job's full
@@ -784,12 +925,15 @@ fn validate_chart_source(
             != artifact.key
         || key.derived_snapshot_id != artifact.key
         || numerical.image_key(key.render_version) != *key
-        || (key.render_version != setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION && key.render_version
-            != if snapshot.forecast.is_some() {
-                setups_analytics::expectancy_chart::PROBABILITY_RENDER_VERSION
-            } else {
-                1
-            })
+        || (key.render_version != setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION
+            && key.render_version
+                != setups_analytics::expectancy_chart::OBJECTIVE_RENDER_VERSION_V1
+            && key.render_version
+                != if snapshot.forecast.is_some() {
+                    setups_analytics::expectancy_chart::PROBABILITY_RENDER_VERSION
+                } else {
+                    1
+                })
         || source.forecast != snapshot.forecast
         || identity.forecast != snapshot.forecast
         || numerical.calculation_version
@@ -1126,12 +1270,24 @@ async fn test_via(attempt: &TelegramTestAttempt, access: &impl RelayAccess) -> T
 
 /// Pure saved-WATCH presentation, also used by the read-only setup detail API.
 /// No delivery, clock, settings or current algorithm values are consulted.
-pub fn fixed_watch_text(symbol: &str, name: &str, exchange: &str, close_unix: i64) -> Result<String, &'static str> {
-    if name.trim().is_empty() || name.chars().count() > 120 || name.len() > 480 || name.chars().any(char::is_control) {
+pub fn fixed_watch_text(
+    symbol: &str,
+    name: &str,
+    exchange: &str,
+    close_unix: i64,
+) -> Result<String, &'static str> {
+    if name.trim().is_empty()
+        || name.chars().count() > 120
+        || name.len() > 480
+        || name.chars().any(char::is_control)
+    {
         return Err("invalid_saved_payload");
     }
     let time = chrono::DateTime::from_timestamp(close_unix, 0).ok_or("invalid_saved_payload")?;
-    Ok(format!("WATCH {symbol} · {name}\n{exchange} · {}", time.format("%Y-%m-%d %H:%M:%S UTC")))
+    Ok(format!(
+        "WATCH {symbol} · {name}\n{exchange} · {}",
+        time.format("%Y-%m-%d %H:%M:%S UTC")
+    ))
 }
 
 fn render_message(job: &TelegramJob, now: i64) -> Result<Vec<u8>, ClientFailure> {
@@ -1166,8 +1322,13 @@ fn render_message(job: &TelegramJob, now: i64) -> Result<Vec<u8>, ClientFailure>
         {
             return Err(ClientFailure::before("invalid_saved_payload"));
         }
-        fixed_watch_text(&instrument.symbol, name, &instrument.exchange, raw.close_time_unix)
-            .map_err(ClientFailure::before)?
+        fixed_watch_text(
+            &instrument.symbol,
+            name,
+            &instrument.exchange,
+            raw.close_time_unix,
+        )
+        .map_err(ClientFailure::before)?
     } else if job.slot_id.is_some()
         && job.generation_id.is_some()
         && job.config_revision.is_some()

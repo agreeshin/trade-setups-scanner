@@ -34,7 +34,8 @@ pub const RENDER_VERSION: u32 = 1;
 /// existing study PNGs and queued delivery bodies retain their original bytes.
 pub const PROBABILITY_RENDER_VERSION: u32 = 2;
 /// New objective-specific overlays only, never the legacy asset scanner.
-pub const OBJECTIVE_RENDER_VERSION: u32 = 3;
+pub const OBJECTIVE_RENDER_VERSION_V1: u32 = 3;
+pub const OBJECTIVE_RENDER_VERSION: u32 = 4;
 pub const WIDTH: u32 = 900;
 pub const HEIGHT: u32 = 320;
 pub const MAX_PNG_BYTES: usize = 256 * 1024;
@@ -56,6 +57,39 @@ const RIGHT: f64 = 872.0;
 const TOP: f64 = 66.0;
 const BOTTOM: f64 = 258.0;
 const LABEL_WIDTH: f64 = 112.0;
+const LABEL_HEIGHT: f64 = 15.0;
+const LABEL_DESCENDER: f64 = 2.0;
+const LABEL_GAP: f64 = 4.0;
+const MARKER_RADIUS: f64 = 5.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectionPresentation {
+    V1,
+    V2,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectionLabelBox {
+    x: f64,
+    baseline_y: f64,
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+fn projection_label_box(marker_x: f64, marker_y: f64) -> ProjectionLabelBox {
+    let right = (marker_x - LABEL_GAP).clamp(LEFT + LABEL_WIDTH, RIGHT - LABEL_GAP);
+    let baseline_y = marker_y - MARKER_RADIUS - LABEL_GAP - LABEL_DESCENDER;
+    ProjectionLabelBox {
+        x: right,
+        baseline_y,
+        left: right - LABEL_WIDTH,
+        top: baseline_y - (LABEL_HEIGHT - LABEL_DESCENDER),
+        right,
+        bottom: baseline_y + LABEL_DESCENDER,
+    }
+}
 
 /// Only the three immutable study fields needed by this render. Missing legacy
 /// fields use study defaults; invalid present values fail rather than guessing.
@@ -215,18 +249,144 @@ pub fn render_png_with_objective(
 
 /// Observed override only. All scalar/model/recipe evaluation still consumes
 /// artifact.daily with its original scientific nonclosed-row weights.
-pub fn render_png_objective_observed(artifact:&ExpectancyArtifact,objective:ExpectancyObjective,raw:i64,value:f64,observed:&[UtcDailyPoint])->Result<Vec<u8>,RenderError> {
-    rasterize_svg(&render_svg_objective_observed(artifact,objective,raw,value,Some(observed))?)
+pub fn render_png_objective_observed(
+    artifact: &ExpectancyArtifact,
+    objective: ExpectancyObjective,
+    raw: i64,
+    value: f64,
+    observed: &[UtcDailyPoint],
+) -> Result<Vec<u8>, RenderError> {
+    rasterize_svg(&render_svg_objective_observed(
+        artifact,
+        objective,
+        raw,
+        value,
+        Some(observed),
+    )?)
 }
 
-pub fn render_png_model_observed(artifact:&ExpectancyArtifact,raw:i64,value:f64,observed:&[UtcDailyPoint])->Result<Vec<u8>,RenderError> {
-    let recipe=artifact.source.forecast.ok_or(RenderError::ForecastMismatch)?;
-    let model=plot_forecast(artifact,recipe)?;
-    rasterize_svg(&render_svg_projection(artifact,raw,value,model,PROBABILITY_RENDER_VERSION,"Ретроспективная модельная оценка",Some(observed))?)
+pub fn render_png_with_objective_v2(
+    artifact: &ExpectancyArtifact,
+    objective: ExpectancyObjective,
+    raw: i64,
+    value: f64,
+) -> Result<Vec<u8>, RenderError> {
+    rasterize_svg(&render_svg_objective_presentation(
+        artifact,
+        objective,
+        raw,
+        value,
+        None,
+        OBJECTIVE_RENDER_VERSION,
+        ProjectionPresentation::V2,
+    )?)
 }
 
-pub fn render_png_trend_observed(artifact:&ExpectancyArtifact,study:StudyTrend,observed:&[UtcDailyPoint])->Result<Vec<u8>,RenderError> {
-    rasterize_svg(&render_svg_trend_observed(artifact,study,Some(observed))?)
+pub fn render_png_objective_observed_v2(
+    artifact: &ExpectancyArtifact,
+    objective: ExpectancyObjective,
+    raw: i64,
+    value: f64,
+    observed: &[UtcDailyPoint],
+) -> Result<Vec<u8>, RenderError> {
+    rasterize_svg(&render_svg_objective_presentation(
+        artifact,
+        objective,
+        raw,
+        value,
+        Some(observed),
+        OBJECTIVE_RENDER_VERSION,
+        ProjectionPresentation::V2,
+    )?)
+}
+
+pub fn render_png_model_observed(
+    artifact: &ExpectancyArtifact,
+    raw: i64,
+    value: f64,
+    observed: &[UtcDailyPoint],
+) -> Result<Vec<u8>, RenderError> {
+    let recipe = artifact
+        .source
+        .forecast
+        .ok_or(RenderError::ForecastMismatch)?;
+    let model = plot_forecast(artifact, recipe)?;
+    rasterize_svg(&render_svg_projection(
+        artifact,
+        raw,
+        value,
+        model,
+        PROBABILITY_RENDER_VERSION,
+        "Ретроспективная модельная оценка",
+        Some(observed),
+        ProjectionPresentation::V1,
+    )?)
+}
+
+pub fn render_png_with_model_v2(
+    artifact: &ExpectancyArtifact,
+    raw: i64,
+    value: f64,
+) -> Result<Vec<u8>, RenderError> {
+    let recipe = artifact
+        .source
+        .forecast
+        .ok_or(RenderError::ForecastMismatch)?;
+    let model = plot_forecast(artifact, recipe)?;
+    rasterize_svg(&render_svg_projection(
+        artifact,
+        raw,
+        value,
+        model,
+        PROBABILITY_RENDER_VERSION,
+        "Ретроспективная модельная оценка",
+        None,
+        ProjectionPresentation::V2,
+    )?)
+}
+
+pub fn render_png_model_observed_v2(
+    artifact: &ExpectancyArtifact,
+    raw: i64,
+    value: f64,
+    observed: &[UtcDailyPoint],
+) -> Result<Vec<u8>, RenderError> {
+    let recipe = artifact
+        .source
+        .forecast
+        .ok_or(RenderError::ForecastMismatch)?;
+    let model = plot_forecast(artifact, recipe)?;
+    rasterize_svg(&render_svg_projection(
+        artifact,
+        raw,
+        value,
+        model,
+        PROBABILITY_RENDER_VERSION,
+        "Ретроспективная модельная оценка",
+        Some(observed),
+        ProjectionPresentation::V2,
+    )?)
+}
+
+pub fn render_png_trend_observed(
+    artifact: &ExpectancyArtifact,
+    study: StudyTrend,
+    observed: &[UtcDailyPoint],
+) -> Result<Vec<u8>, RenderError> {
+    rasterize_svg(&render_svg_trend_observed(artifact, study, Some(observed))?)
+}
+
+pub fn render_png_trend_observed_v2(
+    artifact: &ExpectancyArtifact,
+    study: StudyTrend,
+    observed: &[UtcDailyPoint],
+) -> Result<Vec<u8>, RenderError> {
+    rasterize_svg(&render_svg_trend_presentation(
+        artifact,
+        study,
+        Some(observed),
+        true,
+    )?)
 }
 
 fn render_svg_with_objective(
@@ -235,10 +395,36 @@ fn render_svg_with_objective(
     raw_signal_at: i64,
     saved_decision_r: f64,
 ) -> Result<String, RenderError> {
-    render_svg_objective_observed(artifact,objective,raw_signal_at,saved_decision_r,None)
+    render_svg_objective_observed(artifact, objective, raw_signal_at, saved_decision_r, None)
 }
 
-fn render_svg_objective_observed(artifact:&ExpectancyArtifact,objective:ExpectancyObjective,raw_signal_at:i64,saved_decision_r:f64,observed:Option<&[UtcDailyPoint]>)->Result<String,RenderError> {
+fn render_svg_objective_observed(
+    artifact: &ExpectancyArtifact,
+    objective: ExpectancyObjective,
+    raw_signal_at: i64,
+    saved_decision_r: f64,
+    observed: Option<&[UtcDailyPoint]>,
+) -> Result<String, RenderError> {
+    render_svg_objective_presentation(
+        artifact,
+        objective,
+        raw_signal_at,
+        saved_decision_r,
+        observed,
+        OBJECTIVE_RENDER_VERSION_V1,
+        ProjectionPresentation::V1,
+    )
+}
+
+fn render_svg_objective_presentation(
+    artifact: &ExpectancyArtifact,
+    objective: ExpectancyObjective,
+    raw_signal_at: i64,
+    saved_decision_r: f64,
+    observed: Option<&[UtcDailyPoint]>,
+    render_version: u32,
+    presentation: ProjectionPresentation,
+) -> Result<String, RenderError> {
     let series = artifact
         .objective_series(objective)
         .map_err(RenderError::InvalidArtifact)?;
@@ -302,9 +488,10 @@ fn render_svg_objective_observed(artifact:&ExpectancyArtifact,objective:Expectan
         raw_signal_at,
         saved_decision_r,
         model,
-        OBJECTIVE_RENDER_VERSION,
+        render_version,
         &format!("{label} · ретроспективная оценка"),
         observed,
+        presentation,
     )
 }
 
@@ -395,7 +582,10 @@ fn combined_trend(
     if total <= 0.0 {
         return Ok(None);
     }
-    let combined_mean = weighted.iter().map(|(value, weight)| value * weight).sum::<f64>()
+    let combined_mean = weighted
+        .iter()
+        .map(|(value, weight)| value * weight)
+        .sum::<f64>()
         / total;
     let Some(first) = input.first().map(|point| point.day) else {
         return Ok(None);
@@ -472,26 +662,66 @@ fn daily_points(artifact: &ExpectancyArtifact) -> Result<&[UtcDailyPoint], Rende
     }
 }
 
-fn observed_points<'a>(artifact:&'a ExpectancyArtifact,observed:Option<&'a [UtcDailyPoint]>)->Result<&'a [UtcDailyPoint],RenderError> {
-    let Some(points)=observed else {return daily_points(artifact);};
-    if points.len()>7322 {return Err(RenderError::InvalidGeometry);}
-    let (mut tp,mut sl,mut previous)=(0u64,0u64,None);
-    let q=artifact.source.tp_pct/artifact.source.sl_pct;
-    for p in points {
-        let closed=p.tp_count.checked_add(p.sl_count).ok_or(RenderError::InvalidGeometry)?;
-        let valid_date=p.date.len()==10&&p.date.is_ascii()&&p.date.as_bytes()[4]==b'-'&&p.date.as_bytes()[7]==b'-'
-            &&p.date.bytes().enumerate().all(|(i,b)|i==4||i==7||b.is_ascii_digit());
-        let expected=(closed>0).then(||(p.tp_count as f64*q-p.sl_count as f64)/closed as f64);
-        let valid_mean=match (p.mean_r,expected) {(None,None)=>true,(Some(a),Some(b))=>a.is_finite()&&(a-b).abs()<=1e-10*(1.0+q),_=>false};
-        if !valid_date || p.day_start_unix%86400!=0 || previous.is_some_and(|at|at>=p.day_start_unix)
-            || p.day_start_unix<artifact.from_unix.div_euclid(86400)*86400 || p.day_start_unix>=artifact.to_unix
-            || p.x_utc_days!=(i128::from(p.day_start_unix)-i128::from(artifact.origin_unix)) as f64/86400.0
-            || p.row_count!=closed || !valid_mean {return Err(RenderError::InvalidGeometry);}
-        tp=tp.checked_add(p.tp_count).ok_or(RenderError::InvalidGeometry)?;
-        sl=sl.checked_add(p.sl_count).ok_or(RenderError::InvalidGeometry)?;previous=Some(p.day_start_unix);
+fn observed_points<'a>(
+    artifact: &'a ExpectancyArtifact,
+    observed: Option<&'a [UtcDailyPoint]>,
+) -> Result<&'a [UtcDailyPoint], RenderError> {
+    let Some(points) = observed else {
+        return daily_points(artifact);
+    };
+    if points.len() > 7322 {
+        return Err(RenderError::InvalidGeometry);
     }
-    let cell=artifact.selected_cell.as_ref().ok_or(RenderError::InvalidGeometry)?;
-    if (tp,sl)!=(cell.tp_count,cell.sl_count) {return Err(RenderError::InvalidGeometry);}
+    let (mut tp, mut sl, mut previous) = (0u64, 0u64, None);
+    let q = artifact.source.tp_pct / artifact.source.sl_pct;
+    for p in points {
+        let closed = p
+            .tp_count
+            .checked_add(p.sl_count)
+            .ok_or(RenderError::InvalidGeometry)?;
+        let valid_date = p.date.len() == 10
+            && p.date.is_ascii()
+            && p.date.as_bytes()[4] == b'-'
+            && p.date.as_bytes()[7] == b'-'
+            && p.date
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+        let expected =
+            (closed > 0).then(|| (p.tp_count as f64 * q - p.sl_count as f64) / closed as f64);
+        let valid_mean = match (p.mean_r, expected) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.is_finite() && (a - b).abs() <= 1e-10 * (1.0 + q),
+            _ => false,
+        };
+        if !valid_date
+            || p.day_start_unix % 86400 != 0
+            || previous.is_some_and(|at| at >= p.day_start_unix)
+            || p.day_start_unix < artifact.from_unix.div_euclid(86400) * 86400
+            || p.day_start_unix >= artifact.to_unix
+            || p.x_utc_days
+                != (i128::from(p.day_start_unix) - i128::from(artifact.origin_unix)) as f64
+                    / 86400.0
+            || p.row_count != closed
+            || !valid_mean
+        {
+            return Err(RenderError::InvalidGeometry);
+        }
+        tp = tp
+            .checked_add(p.tp_count)
+            .ok_or(RenderError::InvalidGeometry)?;
+        sl = sl
+            .checked_add(p.sl_count)
+            .ok_or(RenderError::InvalidGeometry)?;
+        previous = Some(p.day_start_unix);
+    }
+    let cell = artifact
+        .selected_cell
+        .as_ref()
+        .ok_or(RenderError::InvalidGeometry)?;
+    if (tp, sl) != (cell.tp_count, cell.sl_count) {
+        return Err(RenderError::InvalidGeometry);
+    }
     Ok(points)
 }
 
@@ -746,10 +976,23 @@ fn render_svg_with_trend(
     artifact: &ExpectancyArtifact,
     study: StudyTrend,
 ) -> Result<String, RenderError> {
-    render_svg_trend_observed(artifact,study,None)
+    render_svg_trend_observed(artifact, study, None)
 }
 
-fn render_svg_trend_observed(artifact:&ExpectancyArtifact,study:StudyTrend,observed:Option<&[UtcDailyPoint]>)->Result<String,RenderError> {
+fn render_svg_trend_observed(
+    artifact: &ExpectancyArtifact,
+    study: StudyTrend,
+    observed: Option<&[UtcDailyPoint]>,
+) -> Result<String, RenderError> {
+    render_svg_trend_presentation(artifact, study, observed, false)
+}
+
+fn render_svg_trend_presentation(
+    artifact: &ExpectancyArtifact,
+    study: StudyTrend,
+    observed: Option<&[UtcDailyPoint]>,
+    connect_sparse: bool,
+) -> Result<String, RenderError> {
     artifact.validate().map_err(RenderError::InvalidArtifact)?;
     let points = artifact.daily.as_ref().ok_or_else(|| {
         let setups_domain::expectancy::MetricAvailability::Unavailable { reason } = &artifact.daily
@@ -764,7 +1007,7 @@ fn render_svg_trend_observed(artifact:&ExpectancyArtifact,study:StudyTrend,obser
     let trend = display_trend(points, mean, study)?;
     // Fit above uses only sealed scientific weights. The override below is
     // restricted to drawing observed history, never model input or projection.
-    let points=observed_points(artifact,observed)?;
+    let points = observed_points(artifact, observed)?;
     let geometry = Geometry::from_points(points, trend.as_ref())?;
     let title_color = if mean > 0.0 {
         POSITIVE
@@ -785,7 +1028,7 @@ fn render_svg_trend_observed(artifact:&ExpectancyArtifact,study:StudyTrend,obser
     )?;
     write_axes(&mut svg, geometry)?;
     write_grid(&mut svg, geometry)?;
-    write_daily_segments(&mut svg, points, geometry)?;
+    write_daily_segments(&mut svg, points, geometry, connect_sparse)?;
     if let Some(trend) = &trend {
         write!(
             svg,
@@ -916,8 +1159,32 @@ fn write_daily_segments(
     svg: &mut BoundedSvg,
     points: &[UtcDailyPoint],
     geometry: Geometry,
+    connect_sparse: bool,
 ) -> Result<(), RenderError> {
-    // Null buckets break the line; absent calendar dates retain their distance.
+    if connect_sparse {
+        let finite: Vec<_> = points
+            .iter()
+            .filter(|point| point.mean_r.is_some())
+            .collect();
+        if finite.len() > 1 {
+            write!(
+                svg,
+                r#"<polyline class="daily-segment" fill="none" stroke="{LINE}" stroke-width="2" stroke-linejoin="round" points=""#
+            )?;
+            for point in finite {
+                write!(
+                    svg,
+                    "{:.3},{:.3} ",
+                    geometry.x(point.x_utc_days),
+                    geometry.y(point.mean_r.expect("finite point"))
+                )?;
+            }
+            write!(svg, "\"/>")?;
+        }
+        return Ok(());
+    }
+    // Legacy v1: explicit null buckets break the line. Missing calendar dates
+    // retain their real distance in both versions.
     let mut segment_start = 0;
     for end in 0..=points.len() {
         if end == points.len() || points[end].mean_r.is_none() {
@@ -1116,6 +1383,7 @@ fn render_svg_with_model(
         PROBABILITY_RENDER_VERSION,
         "Ретроспективная модельная оценка",
         None,
+        ProjectionPresentation::V1,
     )
 }
 
@@ -1126,7 +1394,8 @@ fn render_svg_projection(
     model: PlotForecast,
     render_version: u32,
     series_label: &str,
-    observed:Option<&[UtcDailyPoint]>,
+    observed: Option<&[UtcDailyPoint]>,
+    presentation: ProjectionPresentation,
 ) -> Result<String, RenderError> {
     let cutoff = artifact.source.provenance.observation_cutoff;
     if raw_signal_at < cutoff {
@@ -1137,7 +1406,7 @@ fn render_svg_projection(
     }
     // Matches the caption's signed, two-decimal formatting, including -0.00.
     // An unreasonably wide label degrades to text, never clips a false value.
-    let points = observed_points(artifact,observed)?;
+    let points = observed_points(artifact, observed)?;
     let geometry = probability_geometry(points, &model, artifact.origin_unix, raw_signal_at)?;
     let cutoff_x = geometry.x(utc_day_offset(artifact.origin_unix, cutoff)?);
     let marker_x = geometry.x(utc_day_offset(artifact.origin_unix, raw_signal_at)?);
@@ -1160,7 +1429,12 @@ fn render_svg_projection(
     )?;
     write_axes(&mut svg, geometry)?;
     write_grid(&mut svg, geometry)?;
-    write_daily_segments(&mut svg, points, geometry)?;
+    write_daily_segments(
+        &mut svg,
+        points,
+        geometry,
+        presentation == ProjectionPresentation::V2,
+    )?;
     // Retrospective prefixes come only from the shared evaluator. Null prefixes
     // are not zeroes and break segments; no timestamp/label-availability claim
     // is inferred from the raw-signal cohort date.
@@ -1197,19 +1471,34 @@ fn render_svg_projection(
         svg,
         r#"<circle id="raw-close-marker" data-at-unix="{raw_signal_at}" data-forecast-r="{saved_forecast_r}" cx="{marker_x:.3}" cy="{marker_y:.3}" r="5" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="2"/>"#
     )?;
-    let label_at_left = marker_x > RIGHT - LABEL_WIDTH;
-    let label_x = if label_at_left {
-        marker_x - 10.0
+    if presentation == ProjectionPresentation::V2 {
+        let label = projection_label_box(marker_x, marker_y);
+        write!(
+            svg,
+            r#"<text id="raw-close-label" data-forecast-r="{saved_forecast_r}" data-box-left="{:.3}" data-box-top="{:.3}" data-box-right="{:.3}" data-box-bottom="{:.3}" x="{:.3}" y="{:.3}" text-anchor="end" font-size="11" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="3" paint-order="stroke fill">{}</text>"#,
+            label.left,
+            label.top,
+            label.right,
+            label.bottom,
+            label.x,
+            label.baseline_y,
+            risk_label(saved_forecast_r)
+        )?;
     } else {
-        marker_x + 10.0
-    };
-    write!(
-        svg,
-        r#"<text id="raw-close-label" data-forecast-r="{saved_forecast_r}" x="{label_x:.3}" y="{:.3}" text-anchor="{}" font-size="11" fill="{TREND}">{}</text>"#,
-        (marker_y + 4.0).clamp(TOP, BOTTOM),
-        if label_at_left { "end" } else { "start" },
-        risk_label(saved_forecast_r)
-    )?;
+        let label_at_left = marker_x > RIGHT - LABEL_WIDTH;
+        let label_x = if label_at_left {
+            marker_x - 10.0
+        } else {
+            marker_x + 10.0
+        };
+        write!(
+            svg,
+            r#"<text id="raw-close-label" data-forecast-r="{saved_forecast_r}" x="{label_x:.3}" y="{:.3}" text-anchor="{}" font-size="11" fill="{TREND}">{}</text>"#,
+            (marker_y + 4.0).clamp(TOP, BOTTOM),
+            if label_at_left { "end" } else { "start" },
+            risk_label(saved_forecast_r)
+        )?;
+    }
     // Reserve the right edge for the explicit C/raw-close annotation. Calendar
     // labels are spaced in pixels; a very late raw-close never overlaps them.
     let mut previous_x: Option<f64> = None;
@@ -1312,30 +1601,180 @@ mod tests {
     }
     #[test]
     fn observed_override_keeps_sealed_weights_and_identical_models_in_all_three_graph_paths() {
-        let mut input=input();
-        if let MetricAvailability::Available{value}=&mut input.daily {value[0].row_count=50;value[2].row_count=900;}
-        let weighted=build_expectancy_artifact(input).unwrap();
-        for recipe in [None,Some(ForecastRecipe::engineering_baseline()),Some(ForecastRecipe::Trend{version:1,bend_days:TrendBendDays::Seven})] {
-            let artifact=recipe.map_or_else(||weighted.clone(),|recipe|explicit_fixture(weighted.clone(),recipe));
-            let sealed=artifact.to_json().unwrap();
-            let observed:Vec<_>=daily_points(&artifact).unwrap().iter().cloned().map(|mut p|{p.row_count=p.tp_count+p.sl_count;p}).collect();
-            assert_ne!(observed[0].row_count,daily_points(&artifact).unwrap()[0].row_count);
-            let study=StudyTrend{trend_mode:TrendMode::Forecast,..StudyTrend::default()};
-            assert_eq!(render_svg_with_trend(&artifact,study).unwrap(),render_svg_trend_observed(&artifact,study,Some(&observed)).unwrap());
-            let objective=ExpectancyObjective{version:1,trend_mode:TrendMode::Forecast,
-                trend_bend_days:match recipe{Some(ForecastRecipe::Trend{bend_days,..})=>bend_days,_=>TrendBendDays::Linear},
-                trend_blend_lambda:TrendBlendLambda::default(),forecast:recipe};
-            let value=*artifact.objective_series(objective).unwrap().decision_r.as_ref().unwrap();
-            let raw=artifact.source.provenance.observation_cutoff+86400;
-            assert_eq!(render_svg_with_objective(&artifact,objective,raw,value).unwrap(),render_svg_objective_observed(&artifact,objective,raw,value,Some(&observed)).unwrap());
-            if let Some(recipe)=recipe {
-                assert_eq!(render_svg_with_model(&artifact,recipe,raw,value).unwrap(),
-                    render_svg_projection(&artifact,raw,value,plot_forecast(&artifact,recipe).unwrap(),PROBABILITY_RENDER_VERSION,"Ретроспективная модельная оценка",Some(&observed)).unwrap());
-            }
-            assert_eq!(artifact.to_json().unwrap(),sealed);
-            let mut bad=observed.clone();bad[0].mean_r=Some(99.0);
-            assert!(render_svg_trend_observed(&artifact,study,Some(&bad)).is_err());
+        let mut input = input();
+        if let MetricAvailability::Available { value } = &mut input.daily {
+            value[0].row_count = 50;
+            value[2].row_count = 900;
         }
+        let weighted = build_expectancy_artifact(input).unwrap();
+        for recipe in [
+            None,
+            Some(ForecastRecipe::engineering_baseline()),
+            Some(ForecastRecipe::Trend {
+                version: 1,
+                bend_days: TrendBendDays::Seven,
+            }),
+        ] {
+            let artifact = recipe.map_or_else(
+                || weighted.clone(),
+                |recipe| explicit_fixture(weighted.clone(), recipe),
+            );
+            let sealed = artifact.to_json().unwrap();
+            let observed: Vec<_> = daily_points(&artifact)
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(|mut p| {
+                    p.row_count = p.tp_count + p.sl_count;
+                    p
+                })
+                .collect();
+            assert_ne!(
+                observed[0].row_count,
+                daily_points(&artifact).unwrap()[0].row_count
+            );
+            let study = StudyTrend {
+                trend_mode: TrendMode::Forecast,
+                ..StudyTrend::default()
+            };
+            assert_eq!(
+                render_svg_with_trend(&artifact, study).unwrap(),
+                render_svg_trend_observed(&artifact, study, Some(&observed)).unwrap()
+            );
+            let objective = ExpectancyObjective {
+                version: 1,
+                trend_mode: TrendMode::Forecast,
+                trend_bend_days: match recipe {
+                    Some(ForecastRecipe::Trend { bend_days, .. }) => bend_days,
+                    _ => TrendBendDays::Linear,
+                },
+                trend_blend_lambda: TrendBlendLambda::default(),
+                forecast: recipe,
+            };
+            let value = *artifact
+                .objective_series(objective)
+                .unwrap()
+                .decision_r
+                .as_ref()
+                .unwrap();
+            let raw = artifact.source.provenance.observation_cutoff + 86400;
+            assert_eq!(
+                render_svg_with_objective(&artifact, objective, raw, value).unwrap(),
+                render_svg_objective_observed(&artifact, objective, raw, value, Some(&observed))
+                    .unwrap()
+            );
+            if let Some(recipe) = recipe {
+                assert_eq!(
+                    render_svg_with_model(&artifact, recipe, raw, value).unwrap(),
+                    render_svg_projection(
+                        &artifact,
+                        raw,
+                        value,
+                        plot_forecast(&artifact, recipe).unwrap(),
+                        PROBABILITY_RENDER_VERSION,
+                        "Ретроспективная модельная оценка",
+                        Some(&observed),
+                        ProjectionPresentation::V1
+                    )
+                    .unwrap()
+                );
+            }
+            assert_eq!(artifact.to_json().unwrap(), sealed);
+            let mut bad = observed.clone();
+            bad[0].mean_r = Some(99.0);
+            assert!(render_svg_trend_observed(&artifact, study, Some(&bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn future_objective_label_is_above_the_marker_and_inside_the_chart() {
+        for marker_x in [LEFT, (LEFT + RIGHT) / 2.0, RIGHT] {
+            for marker_y in [TOP, (TOP + BOTTOM) / 2.0, BOTTOM] {
+                let label = projection_label_box(marker_x, marker_y);
+                assert!(label.left >= LEFT);
+                assert!(label.right <= RIGHT - LABEL_GAP);
+                assert!(label.top > 28.0, "title remains above the label band");
+                assert!(label.bottom < BOTTOM);
+                assert!(label.bottom + LABEL_GAP <= marker_y - MARKER_RADIUS);
+            }
+        }
+
+        let recipe = ForecastRecipe::Trend {
+            version: 1,
+            bend_days: TrendBendDays::Linear,
+        };
+        let artifact = explicit_fixture(fixture(), recipe);
+        let objective = ExpectancyObjective {
+            version: 1,
+            trend_mode: TrendMode::Forecast,
+            trend_bend_days: TrendBendDays::Linear,
+            trend_blend_lambda: TrendBlendLambda::default(),
+            forecast: Some(recipe),
+        };
+        let value = *artifact
+            .objective_series(objective)
+            .unwrap()
+            .decision_r
+            .as_ref()
+            .unwrap();
+        let raw = artifact.source.provenance.observation_cutoff + 86400;
+        let old = render_svg_objective_observed(&artifact, objective, raw, value, None).unwrap();
+        let new = render_svg_objective_presentation(
+            &artifact,
+            objective,
+            raw,
+            value,
+            None,
+            OBJECTIVE_RENDER_VERSION,
+            ProjectionPresentation::V2,
+        )
+        .unwrap();
+        assert!(old.contains("data-render-version=\"3\""));
+        assert!(!old.contains("data-box-bottom="));
+        assert!(new.contains("data-render-version=\"4\""));
+        assert!(new.contains("data-box-bottom="));
+        assert!(new.contains("paint-order=\"stroke fill\""));
+    }
+
+    #[test]
+    fn future_observed_line_connects_only_consecutive_finite_points_across_null_days() {
+        let artifact = fixture();
+        let points = daily_points(&artifact).unwrap();
+        let geometry = Geometry::from_points(points, None).unwrap();
+        let mut old = BoundedSvg(String::new());
+        let mut new = BoundedSvg(String::new());
+        write_daily_segments(&mut old, points, geometry, false).unwrap();
+        write_daily_segments(&mut new, points, geometry, true).unwrap();
+
+        let point_count = |svg: &str| {
+            let start = svg.find("points=\"").unwrap() + "points=\"".len();
+            let end = svg[start..].find('"').unwrap() + start;
+            svg[start..end].split_whitespace().count()
+        };
+        assert_eq!(old.0.matches("class=\"daily-segment\"").count(), 1);
+        assert_eq!(
+            point_count(&old.0),
+            2,
+            "legacy v1 still breaks at the explicit null bucket"
+        );
+        assert_eq!(new.0.matches("class=\"daily-segment\"").count(), 1);
+        assert_eq!(
+            point_count(&new.0),
+            3,
+            "v2 joins all finite observations without adding a bucket"
+        );
+
+        let mut single = points.to_vec();
+        for point in single.iter_mut().skip(1) {
+            point.mean_r = None;
+        }
+        let geometry = Geometry::from_points(&single, None).unwrap();
+        let mut one = BoundedSvg(String::new());
+        write_daily_segments(&mut one, &single, geometry, true).unwrap();
+        assert!(
+            one.0.is_empty(),
+            "one finite observation has no invented segment"
+        );
     }
 
     fn with_outcomes(tp_pct: f64, sl_pct: f64, days: &[(i64, u64, u64)]) -> ExpectancyArtifact {
@@ -2034,11 +2473,7 @@ mod tests {
             .sum();
         let sum_past: f64 = points
             .iter()
-            .filter_map(|point| {
-                point
-                    .mean_r
-                    .map(|value| value * (point.row_count as f64))
-            })
+            .filter_map(|point| point.mean_r.map(|value| value * (point.row_count as f64)))
             .sum();
         let expected = (sum_past + 0.4 * 5.0) / (total_past + 5.0);
         let value = series.trend_points.last().expect("two points").1;

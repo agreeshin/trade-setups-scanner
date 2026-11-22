@@ -6,7 +6,8 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 pub const NOTIFICATION_LEASE_SECONDS: i64 = 30;
 pub const MAX_NOTIFICATION_ATTEMPTS: i32 = 5;
-pub const OBSERVED_CHART_PRESENTATION: &str = "original_observed_v1";
+pub const OBSERVED_CHART_PRESENTATION_V1: &str = "original_observed_v1";
+pub const OBSERVED_CHART_PRESENTATION: &str = "original_observed_v2";
 
 #[derive(Debug, Clone)]
 pub struct NotificationJob {
