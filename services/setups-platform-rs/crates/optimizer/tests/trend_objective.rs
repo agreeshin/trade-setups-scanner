@@ -191,6 +191,58 @@ fn explicit_blend_keeps_pure_forecast_distinct_and_preserves_strict_forward_gate
 }
 
 #[test]
+fn matrix_forward_gate_uses_arithmetic_mean_not_sum_in_manual_and_continuous() {
+    let (mut spec,input,candidate)=fixture();
+    spec.forecast=Some(ForecastRecipe::engineering_baseline());
+    spec.max_trials=1; // Only the fixed baseline: no other candidate can clear the gate.
+    let limits=StudyLimits::default();let cancel=CancelToken::new();
+    let context=ContinuousContext{observation_cutoff:spec.to_unix};
+    let provenance=Provenance{optimizer_version:CONTINUOUS_OPTIMIZER_VERSION.into(),seed:spec.seed,
+        snapshot_hash:input.snapshot_hash.clone(),captured_at:input.captured_at.clone()};
+    for mode in [TrendMode::Forecast,TrendMode::Blend] {
+        spec.trend_mode=mode;spec.min_forecast_expectancy=0.0;
+        let evaluated=evaluate_continuous(&spec,&input,&candidate,context,&limits,&cancel).unwrap().unwrap();
+        let matrix=&evaluated.evaluation.matrix;
+        assert_eq!(matrix.len(),spec.tp_levels.len()*spec.sl_levels.len());
+        assert!(matrix.len()>1);
+        let sum: f64=matrix.iter().map(|cell|cell.risk_expectancy.unwrap()).sum();
+        let average=sum/matrix.len() as f64;
+        let forecast_average=matrix.iter().map(|cell|cell.forecast_risk_expectancy.unwrap()).sum::<f64>()/matrix.len() as f64;
+        assert!(average>0.0 && sum>average,"fixture must distinguish sum from mean");
+        assert_eq!(evaluated.evaluation.summary.score,Some(average));
+        // Repeating the same cell population cannot multiply the objective by K.
+        for repetitions in [1,2,4] {
+            let repeated: Vec<_>=(0..repetitions).flat_map(|_|matrix.iter().cloned()).collect();
+            assert!((score_matrix(&repeated,spec.min_closed_per_cell).unwrap()-average).abs()<1e-12);
+        }
+        for (threshold,accepted) in [(average/2.0,true),(average,false),((average+sum)/2.0,false)] {
+            spec.min_forecast_expectancy=threshold;
+            let recommendation=recommend_continuous(&spec,&candidate,&evaluated,&provenance,context,99.0).unwrap();
+            let best=run_study(&spec,&input,&limits,&cancel,|_|{}).unwrap().best;
+            assert_eq!(recommendation.is_some(),accepted,"continuous {mode:?}, threshold={threshold}, mean={average}, sum={sum}");
+            assert_eq!(best.is_some(),accepted,"manual {mode:?}, threshold={threshold}, mean={average}, sum={sum}");
+            if let Some(best)=best {assert_eq!(best.score,average);}
+            if let Some(recommendation)=recommendation {
+                let forecast=recommendation.search_forecast.unwrap();
+                assert_eq!(forecast.matrix_r,forecast_average,"pure F remains separate from blend");
+                match mode {
+                    TrendMode::Forecast=>assert!(forecast.blend.is_none()),
+                    TrendMode::Blend=>assert_eq!(forecast.blend.unwrap().matrix_r,average),
+                    TrendMode::Mean=>unreachable!(),
+                }
+            }
+        }
+        spec.min_forecast_expectancy=0.0;
+        for invalid in [None,Some(f64::NAN),Some(f64::INFINITY)] {
+            let mut incomplete=evaluated.clone();
+            incomplete.evaluation.matrix[0].risk_expectancy=invalid;
+            assert!(recommend_continuous(&spec,&candidate,&incomplete,&provenance,context,99.0).unwrap().is_none(),
+                "an unavailable selected cell must not disappear from the denominator");
+        }
+    }
+}
+
+#[test]
 fn probability_one_day_is_available_but_missing_cells_frequency_and_real_minimum_still_reject() {
     let (mut spec,input,candidate)=fixture();let limits=StudyLimits::default();let cancel=CancelToken::new();
     spec.from_unix=30*86400;spec.trend_mode=TrendMode::Forecast;
@@ -208,6 +260,7 @@ fn probability_one_day_is_available_but_missing_cells_frequency_and_real_minimum
     let incomplete=evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap().unwrap();
     assert_eq!(incomplete.matrix.len(),4);assert!(incomplete.matrix.iter().any(|c|c.closed_count==0 && c.forecast_risk_expectancy.is_none()));
     assert!(incomplete.summary.score.is_none());
+    assert!(run_study(&spec,&input,&limits,&cancel,|_|{}).unwrap().best.is_none(),"manual search cannot discard an unavailable selected cell");
 }
 
 #[test]
