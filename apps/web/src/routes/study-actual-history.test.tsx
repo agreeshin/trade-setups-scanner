@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actualCountsFixture, studyActualFixture } from "../../test/study-actual-fixture";
 import producerPagesJson from "../../test/study-actual-producer-pages.json?raw";
+import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
 import type { OptimizationStudySummary } from "../lib/optimization-api";
 import type { StudyActualSummary } from "../lib/study-actual-api";
 import { OptimizationHistory } from "./optimization-history";
@@ -29,6 +30,7 @@ const settle = async (ms = 0) => { await act(async () => { await vi.advanceTimer
 
 beforeEach(() => {
   vi.useFakeTimers(); requests.length = 0; rows = [row(49), row(48)];
+  applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "UTC" });
   vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
   post = (id) => {
     const next = studyActualFixture(id, { revision: 1, jobId: `job-${id}`, status: "queued", stage: "queued", observedThroughUnix: 1795201200 });
@@ -48,7 +50,7 @@ beforeEach(() => {
     return Promise.resolve(json({}, 404));
   }));
 });
-afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS); });
 function surface(strict = false, pageSize = 5) {
   const node = <OptimizationHistory algorithmId="spike" algorithmName="Всплеск" controller={controller} pageSize={pageSize} pagination={false} onSelect={vi.fn()} onDelete={vi.fn()} />;
   return render(strict ? <StrictMode>{node}</StrictMode> : node);
@@ -99,6 +101,40 @@ it("uses closed/all counts, displays null as unavailable rather than zero, and e
   fireEvent.focus(within(tableRow()).getByText("0/23"));
   expect(screen.getByRole("tooltip")).toHaveTextContent("Закрытые сделки / все сетапы");
   expect(screen.getByRole("tooltip")).toHaveTextContent("гейт не пройден: 20");
+});
+
+it("renders the compact API last setup using reactive interface timezone/date/clock settings without any extra requests", async () => {
+  rows[0] = row(49, studyActualFixture(49, { status: "completed", stage: "completed", counts: actualCountsFixture, meanR: 1.25, lastSetupAt: "2026-11-20T23:30:00.125Z" }));
+  surface(); await settle();
+  const timestamp = within(tableRow()).getByLabelText("Последний включённый сетап");
+  expect(timestamp).toHaveTextContent("20.11.2026, 23:30:00");
+  const count = requests.length;
+  act(() => { applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "Asia/Kathmandu", dateOrder: "ymd", dateSeparator: "-" }); });
+  expect(timestamp).toHaveTextContent("2026-11-21, 05:15:00");
+  act(() => { applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "America/New_York", dateOrder: "mdy", dateSeparator: "/", yearDigits: 2, time24: false }); });
+  expect(timestamp).toHaveTextContent("11/20/26, 06:30:00 PM");
+  await settle(); expect(requests).toHaveLength(count); expect(posts()).toHaveLength(0);
+  expect(requests.every((request) => request.path.startsWith("/v1/optimization-studies?"))).toBe(true);
+  expect(rows[0].actual!.lastSetupAt).toBe("2026-11-20T23:30:00.125Z");
+});
+
+it.each([null, undefined])("shows missing/legacy lastSetupAt %s as a dash, not cutoff or research metadata", async (lastSetupAt) => {
+  rows[0] = row(49, studyActualFixture(49, { status: "completed", stage: "completed", counts: { total: 0, closed: 0, tp: 0, sl: 0, gateFailed: 0, unclosed: 0, noData: 0 }, observedThroughUnix: 1795201200, ...(lastSetupAt === undefined ? {} : { lastSetupAt }) }));
+  surface(); await settle();
+  expect(within(tableRow()).getByLabelText("Последний включённый сетап")).toHaveTextContent(/^—$/);
+  expect(within(tableRow()).getByText("0/0")).toBeInTheDocument();
+  expect(requests).toHaveLength(1); expect(posts()).toHaveLength(0);
+});
+
+it("shows the server last setup even without closed trades and removes it immediately during replacement", async () => {
+  rows[0] = row(49, studyActualFixture(49, { status: "completed", stage: "completed", counts: { total: 23, closed: 0, tp: 0, sl: 0, gateFailed: 20, unclosed: 3, noData: 0 }, lastSetupAt: "2026-11-20T17:45:00Z" }));
+  surface(); await settle();
+  expect(within(tableRow()).getByLabelText("Последний включённый сетап")).toHaveTextContent("20.11.2026, 17:45:00");
+  expect(within(tableRow()).getByText("0/23")).toBeInTheDocument();
+  fireEvent.click(button());
+  expect(within(tableRow()).getByLabelText("Последний включённый сетап")).toHaveTextContent(/^—$/);
+  await settle(); expect(within(tableRow()).queryByText("20.11.2026, 17:45:00")).not.toBeInTheDocument();
+  expect(posts()).toHaveLength(1);
 });
 
 it.each([1.25, 0, -0.00001])("uses the unrounded sign of server mean %s", async (meanR) => {

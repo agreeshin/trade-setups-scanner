@@ -72,7 +72,7 @@ async fn http(app: &Router, cookie: &str, method: &str, path: &str) -> (StatusCo
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
-const KEYS: [&str; 10] = ["studyId", "eligibility", "jobId", "revision", "status", "stage", "observedThroughUnix", "counts", "meanR", "error"];
+const KEYS: [&str; 11] = ["studyId", "eligibility", "jobId", "revision", "status", "stage", "observedThroughUnix", "counts", "meanR", "lastSetupAt", "error"];
 fn project(value: &Value) -> Value { Value::Object(KEYS.into_iter().map(|key| (key.to_owned(), value[key].clone())).collect()) }
 fn schema(value: &Value, id: i64) {
     assert_eq!(value["studyId"], id);
@@ -86,6 +86,7 @@ fn schema(value: &Value, id: i64) {
     else { assert!(matches!(value["stage"].as_str(), Some("queued" | "acquiring" | "replaying" | "evaluating" | "publishing" | "completed" | "failed"))); }
     assert!(value["observedThroughUnix"].is_null() || value["observedThroughUnix"].as_u64().is_some());
     assert!(value["meanR"].is_null() || value["meanR"].as_f64().is_some_and(f64::is_finite));
+    assert!(value["lastSetupAt"].is_null() || value["lastSetupAt"].as_str().is_some_and(|at| at.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(at).is_ok()));
     if !value["counts"].is_null() {
         for key in ["total", "closed", "tp", "sl", "gateFailed", "unclosed", "noData"] { assert!(value["counts"][key].as_u64().is_some(), "TS count {key}"); }
         assert!(value["counts"]["closed"].as_u64() <= value["counts"]["total"].as_u64());
@@ -134,6 +135,7 @@ async fn browser_history_enables_first_refresh_and_matches_real_get_for_every_he
         let idle = same_as_get(&app, &cookie, id, "not_calculated").await;
         assert_eq!(idle["eligibility"], json!({"eligible":true,"reason":null}), "no original chart/head must not disable first click");
         assert_eq!(idle["revision"], 0);
+        assert!(idle["lastSetupAt"].is_null());
         assert!(idle["jobId"].is_null() && idle["counts"].is_null() && idle["observedThroughUnix"].is_null());
         assert_eq!(listed(&app, &cookie, legacy_ineligible).await["eligibility"],
             json!({"eligible":false,"reason":"execution_start_unavailable"}));
@@ -153,11 +155,13 @@ async fn browser_history_enables_first_refresh_and_matches_real_get_for_every_he
             json!({"setupTimeUnix":start+120,"status":"sl","riskReturn":-1.0})];
         assert!(db::append(&pool, &job, batch, db::InstrumentOutput { exchange:"fixture",category:"linear",symbol:"FIX",
             emitted:&json!(setup_rows),rows:&setup_rows,quality:&json!({}) }).await.unwrap());
+        assert!(same_as_get(&app, &cookie, id, "running").await["lastSetupAt"].is_null(), "staging rows must stay unpublished");
         let totals = json!({"total":2,"closed":2,"tp":1,"sl":1,"gateFailed":0,"unclosed":0,"noData":0,"meanR":0.0});
         assert!(db::finish(&pool, &job, &json!({"privateReport":"x".repeat(4096)}), &totals).await.unwrap());
         let done = same_as_get(&app, &cookie, id, "completed").await;
         assert_eq!(done["counts"], totals);
         assert_eq!(done["meanR"], 0.0);
+        assert_eq!(done["lastSetupAt"], json!(chrono::DateTime::from_timestamp(start+120, 0).unwrap()));
         assert_eq!(db::page(&pool,"admin",id,1,0,100).await.unwrap().unwrap().len(), 2);
         assert_eq!(done["eligibility"]["eligible"], true);
         capture_page(&mut producer_pages, &app, &cookie, "completed").await;
@@ -168,6 +172,7 @@ async fn browser_history_enables_first_refresh_and_matches_real_get_for_every_he
         let failed = same_as_get(&app, &cookie, id, "failed").await;
         assert_eq!(failed["revision"], 2);
         assert!(failed["counts"].is_null() && failed["meanR"].is_null());
+        assert!(failed["lastSetupAt"].is_null());
         assert_eq!(failed["error"]["code"], "fixture-failure");
         capture_page(&mut producer_pages, &app, &cookie, "failed").await;
         // Optional producer evidence for frontend parity. These are complete
@@ -180,6 +185,79 @@ async fn browser_history_enables_first_refresh_and_matches_real_get_for_every_he
             assert!(!text.contains(cookie.split_once('=').unwrap().1), "never export session credentials");
             std::fs::write(path, bytes).expect("write sanitized real producer pages");
         }
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "explicit local TEST_DATABASE_URL ending _test and CREATEDB required"]
+async fn last_setup_at_is_published_revision_owned_utc_max_for_every_outcome() {
+    isolated(|pool| async move {
+        // Database session timezone must not change the wire's UTC timestamp.
+        let zoned = PgPoolOptions::new().max_connections(3).connect_with(
+            (*pool.connect_options()).clone().options([("timezone", "Asia/Kathmandu")]),
+        ).await.unwrap();
+        let (app, cookie) = fixture(&zoned);
+        let start = chrono::Utc::now().timestamp().div_euclid(60) * 60 - 600;
+        let latest = start + 300;
+        for outcome in ["tp", "sl", "gate_failed", "unclosed", "no_data"] {
+            let id = seed(&pool, "admin", start).await;
+            let actual = format!("/v1/optimization-studies/{id}/actual");
+            let refresh = format!("{actual}/refresh");
+            let idle = same_as_get(&app, &cookie, id, "not_calculated").await;
+            assert!(idle["lastSetupAt"].is_null());
+            assert_eq!(http(&app, &cookie, "POST", &refresh).await.0, StatusCode::ACCEPTED);
+            let job = db::claim(&pool, 2).await.unwrap().unwrap();
+            let batch = db::create_batch(&pool, &job).await.unwrap().unwrap();
+            // Latest signal is inserted first. A later trade-close/evaluation
+            // time on the older signal is deliberately not the requested max.
+            let rows = vec![
+                json!({"setupTimeUnix":latest,"status":outcome,"riskReturn":match outcome {"tp"=>Some(1.0),"sl"=>Some(-1.0),_=>None}}),
+                json!({"setupTimeUnix":start+60,"closeTimeUnix":start+360,"checkedAtUnix":start+540,"status":"tp","riskReturn":1.0}),
+            ];
+            assert!(db::append(&pool, &job, batch, db::InstrumentOutput { exchange:"fixture",category:"linear",symbol:"FIX",
+                emitted:&json!(rows),rows:&rows,quality:&json!({}) }).await.unwrap());
+            assert!(same_as_get(&app, &cookie, id, "running").await["lastSetupAt"].is_null());
+            let closed = if matches!(outcome, "tp" | "sl") { 2 } else { 1 };
+            let totals = json!({"total":2,"closed":closed,"tp":1+i32::from(outcome=="tp"),"sl":i32::from(outcome=="sl"),
+                "gateFailed":i32::from(outcome=="gate_failed"),"unclosed":i32::from(outcome=="unclosed"),"noData":i32::from(outcome=="no_data"),
+                "meanR":if outcome=="sl" {0.0} else {1.0}});
+            assert!(db::finish(&pool, &job, &json!({"fixture":true}), &totals).await.unwrap());
+            // Fault-injected leftover revision must not contaminate this max.
+            sqlx::query("insert into study_actual_setups(owner_id,study_id,revision,run_id,signal_close_unix,instrument_key,row_data) select owner_id,study_id,revision+100,run_id,$2,instrument_key,row_data from study_actual_setups where study_id=$1 limit 1")
+                .bind(id).bind(start+540).execute(&pool).await.unwrap();
+            let done = same_as_get(&app, &cookie, id, "completed").await;
+            assert_eq!(done["lastSetupAt"], json!(chrono::DateTime::from_timestamp(latest, 0).unwrap()), "latest {outcome} must count before the price gate");
+            let (status, displayed) = http(&app, &cookie, "GET", &format!("{actual}?timeZone=Asia%2FKathmandu")).await;
+            assert_eq!(status, StatusCode::OK, "{displayed}");
+            assert_eq!(displayed["lastSetupAt"], done["lastSetupAt"]);
+            let raw_page = setups_db::optimization::list(&pool, None, 100, 0).await.unwrap();
+            assert_eq!(raw_page.studies.iter().find(|s|s.id==id).unwrap().actual.as_ref().unwrap()["lastSetupAt"], done["lastSetupAt"]);
+            // Invalid browser command must preserve the published dataset/head.
+            let response = app.clone().oneshot(Request::builder().method("POST").uri(&refresh)
+                .header("cookie", &cookie).header("host", "fixture.test").header("origin", "http://fixture.test")
+                .header("x-platform-request", "1").header("content-type", "application/json")
+                .body(Body::from("{\"winner\":{}}")).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(same_as_get(&app, &cookie, id, "completed").await, done);
+            // Remove only the fault-injected row before exercising real cleanup.
+            sqlx::query("delete from study_actual_setups where study_id=$1 and revision<>$2")
+                .bind(id).bind(job.revision).execute(&pool).await.unwrap();
+            assert_eq!(http(&app, &cookie, "POST", &refresh).await.0, StatusCode::ACCEPTED);
+            assert!(same_as_get(&app, &cookie, id, "queued").await["lastSetupAt"].is_null());
+            let replacement = db::claim(&pool, 2).await.unwrap().unwrap();
+            db::fail(&pool, &replacement, "fixture_failure").await.unwrap();
+            assert!(same_as_get(&app, &cookie, id, "failed").await["lastSetupAt"].is_null());
+            assert_eq!(http(&app, &cookie, "POST", &refresh).await.0, StatusCode::ACCEPTED);
+            let empty = db::claim(&pool, 2).await.unwrap().unwrap();
+            let empty_batch = db::create_batch(&pool, &empty).await.unwrap().unwrap();
+            assert!(db::append(&pool, &empty, empty_batch, db::InstrumentOutput { exchange:"fixture",category:"linear",symbol:"FIX",
+                emitted:&json!([]),rows:&[],quality:&json!({}) }).await.unwrap());
+            assert!(db::finish(&pool, &empty, &json!({}), &json!({"total":0,"closed":0,"tp":0,"sl":0,"gateFailed":0,"unclosed":0,"noData":0,"meanR":null})).await.unwrap());
+            let empty = same_as_get(&app, &cookie, id, "completed").await;
+            assert!(empty["lastSetupAt"].is_null());
+            assert_eq!(empty["counts"]["total"], 0);
+        }
+        zoned.close().await;
     }).await;
 }
 

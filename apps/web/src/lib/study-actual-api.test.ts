@@ -43,8 +43,19 @@ it("keeps explicit closed/all counts and nullable mean, never deriving either fr
   expect(parseStudyActualSummary(studyActualFixture(49, { status: "completed", stage: "completed", counts: actualCountsFixture, meanR: 0 }), 49).meanR).toBe(0);
 });
 
+it("preserves additive UTC lastSetupAt from the compact summary and actual detail without inferring a legacy value", async () => {
+  const lastSetupAt = "2026-11-20T17:45:00.125Z";
+  const body = { ...actualDetailFixture(), lastSetupAt };
+  const fetch = vi.fn().mockImplementation(() => Promise.resolve(json(body))); vi.stubGlobal("fetch", fetch);
+  expect((await getStudyActualSummary(49, new AbortController().signal)).lastSetupAt).toBe(lastSetupAt);
+  expect((await getStudyActual(49, new AbortController().signal)).lastSetupAt).toBe(lastSetupAt);
+  expect(parseStudyActualSummary({ ...studyActualFixture(), lastSetupAt: null }, 49).lastSetupAt).toBeNull();
+  expect(parseStudyActualSummary(studyActualFixture(), 49).lastSetupAt).toBeUndefined();
+  expect(fetch).toHaveBeenCalledTimes(2);
+});
+
 it.each([
-  { revision: -1 }, { status: "success" }, { studyId: 50 }, { observedThroughUnix: NaN },
+  { revision: -1 }, { lastSetupAt: 1795200000 }, { lastSetupAt: "not-a-timestamp" }, { lastSetupAt: "2026-11-20T17:45:00" }, { status: "success" }, { studyId: 50 }, { observedThroughUnix: NaN },
   { counts: { ...actualCountsFixture, closed: 177 } }, { counts: { ...actualCountsFixture, noData: -1 } },
   { counts: { ...actualCountsFixture, closed: 0 }, meanR: 0 },
   { status: "queued", stage: null }, { status: "running", stage: null },

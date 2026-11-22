@@ -489,7 +489,7 @@ pub async fn display_snapshot(pool:&PgPool,owner:&str,study:i64,zone:&str,start:
     sqlx::query("set local statement_timeout='5000'").execute(&mut *tx).await?;
     let valid:bool=sqlx::query_scalar("select exists(select 1 from pg_timezone_names where name=$1)").bind(zone).fetch_one(&mut *tx).await?;
     if !valid {return Err(invalid("invalid_time_zone"));}
-    let actual_row=sqlx::query_scalar::<_,Value>("select (to_jsonb(a)-'source')||jsonb_build_object('sourceFacts',a.source-'artifact') from study_actualizations a where owner_id=$1 and study_id=$2")
+    let actual_row=sqlx::query_scalar::<_,Value>(&crate::study_actual::head_sql())
         .bind(owner).bind(study).fetch_optional(&mut *tx).await?;
     let start=start.or_else(||actual_row.as_ref()?.get("execution_started_at")?.as_str()?.parse::<DateTime<Utc>>().ok());
     let start_day_unix=match start {

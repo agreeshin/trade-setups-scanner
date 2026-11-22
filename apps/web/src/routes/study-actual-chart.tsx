@@ -5,7 +5,7 @@ import { formatOutcomeRisk } from "./setup-outcomes-table";
 import { calendarDays, CHART_STYLE as C } from "./study-chart-style";
 
 interface PlotPoint { at: number; value: number | null }
-/** Null is a real gap, not a zero or permission to connect the neighboring observations. */
+/** Preserve the sealed projection's explicit null gaps; observed data uses a separate sparse polyline. */
 function segments(points: readonly PlotPoint[]): PlotPoint[][] {
   const lines: PlotPoint[][] = []; let line: PlotPoint[] = [];
   for (const point of points) {
@@ -37,14 +37,15 @@ export function StudyActualChart({ report }: { report: StudyActualReport }) {
   if (!Number.isFinite(first) || last - first > 3661 * 86400) return <p role="alert">Период графика превышает допустимые 3660 суток.</p>;
   const span = Math.max(nextZonedDay(first) - first, last - first);
   const x = (at: number) => C.left + ((at - first) / span) * (C.right - C.left);
-  const values = [...observed.map((point) => point.meanR), ...projection.map((point) => point.value)].filter((value): value is number => value !== null);
+  const values = [...observed.map((point) => point.meanR), ...projection.map((point) => point.value)].filter((value): value is number => value !== null && Number.isFinite(value));
   const low = Math.min(0, ...values); const high = Math.max(0, ...values);
   const pad = high - low < 1e-9 ? 0.5 : (high - low) * 0.08;
   const min = low - pad; const max = high + pad;
   const y = (value: number) => C.bottom - ((value - min) / (max - min)) * (C.bottom - C.top);
   const days = calendarDays(first, zonedDayStart(last));
-  const byDay = new Map(observed.map((point) => [point.dayUnix, point]));
-  const observedPoints = days.map((day) => ({ at: day, value: byDay.get(day)?.meanR ?? null }));
+  // Only real finite observations enter the line/markers; missing days remain grid-only.
+  const availableObserved = observed.filter((point) => point.meanR !== null && Number.isFinite(point.meanR)).sort((left, right) => left.dayUnix - right.dayUnix);
+  const observedPoints = availableObserved.map((point) => ({ at: point.dayUnix, value: point.meanR }));
   const labelStep = Math.max(1, Math.ceil((days.length - 1) / 8));
   const levels: number[] = [];
   const levelStep = Math.max(1, Math.ceil((max - min) / 20));
@@ -65,8 +66,8 @@ export function StudyActualChart({ report }: { report: StudyActualReport }) {
     </g>)}
     {projection.at(-1)?.value != null && <text data-testid="study-original-end-value" x={x(projection.at(-1)!.atUnix)} y={Math.max(y(projection.at(-1)!.value!) - 8, C.top + 12)} textAnchor="end" fontSize={11} fontWeight={600} fill={C.trend}>{formatOutcomeRisk(projection.at(-1)!.value)}</text>}
     <g data-phase-segment="observed">
-      {segments(observedPoints).map((line, index) => line.length > 1 && <polyline key={index} data-testid="study-observed-line" fill="none" stroke={C.line} strokeWidth={2} points={path(line)} />)}
-      {observed.filter((point) => point.meanR !== null).map((point) => <circle key={point.dayUnix} data-phase="observed" data-day-unix={point.dayUnix} data-date={point.date} data-sum-r={point.sumR} data-mean-r={point.meanR} data-closed={point.closedCount}
+      {observedPoints.length > 1 && <polyline data-testid="study-observed-line" fill="none" stroke={C.line} strokeWidth={2} points={path(observedPoints)} />}
+      {availableObserved.map((point) => <circle key={point.dayUnix} data-phase="observed" data-day-unix={point.dayUnix} data-date={point.date} data-sum-r={point.sumR} data-mean-r={point.meanR} data-closed={point.closedCount}
         cx={x(point.dayUnix)} cy={y(point.meanR!)} r={3} fill={point.meanR! >= 0 ? C.positive : C.negative}>
         <title>{`${zonedDateLabel(point.dayUnix)} (${point.date}, ${timeZone}): ${formatOutcomeRisk(point.meanR)} · закрытых ${point.closedCount} · TP ${point.tpCount} / SL ${point.slCount}`}</title>
       </circle>)}

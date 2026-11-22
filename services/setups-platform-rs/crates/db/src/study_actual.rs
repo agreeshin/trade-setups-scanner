@@ -11,6 +11,14 @@ pub const MAX_OUTPUT_BYTES: i64 = 64 * 1024 * 1024;
 pub const RESERVED_BYTES:i64=MAX_OUTPUT_BYTES*4+8*1024*1024;
 pub const MAX_ROWS: i64 = 100_000;
 
+/// Scalar projection for a `study_actualizations a` head. The page index serves
+/// MAX without transferring trades; staging and other owners/revisions stay out.
+pub const LAST_SETUP_CLOSE_UNIX_SQL: &str = "(select max(s.signal_close_unix) from study_actual_setups s where s.owner_id=a.owner_id and s.study_id=a.study_id and s.revision=a.revision and a.status='completed' and a.batch_id is not null)";
+
+pub(crate) fn head_sql() -> String {
+    format!("select (to_jsonb(a)-'source')||jsonb_build_object('sourceFacts',a.source-'artifact','last_setup_close_unix',{LAST_SETUP_CLOSE_UNIX_SQL}) from study_actualizations a where owner_id=$1 and study_id=$2")
+}
+
 #[derive(Debug)]
 pub enum Admission { Created(Value), Busy(Value), Resource, SourceChanged }
 
@@ -20,14 +28,17 @@ pub enum Admission { Created(Value), Busy(Value), Resource, SourceChanged }
 pub fn compact_summary(row:&Value)->Value {
     let completed=row["status"]=="completed";
     let reason=row["eligibility_reason"].as_str();
+    let last_setup_at=if completed && row["totals"]["total"]!=0 {
+        row["last_setup_close_unix"].as_i64().and_then(|at|DateTime::<Utc>::from_timestamp(at,0))
+    }else{None};
     json!({"studyId":row["study_id"],"eligibility":{"eligible":reason.is_none(),"reason":reason},
         "jobId":row["job_id"],"revision":row["revision"].as_i64().unwrap_or(0),"status":row["status"].as_str().unwrap_or("not_calculated"),"stage":row["stage"],
         "observedThroughUnix":row["observed_through_unix"],"counts":if completed{row["totals"].clone()}else{Value::Null},
-        "meanR":if completed{row["totals"]["meanR"].clone()}else{Value::Null},"error":row["error"]})
+        "meanR":if completed{row["totals"]["meanR"].clone()}else{Value::Null},"lastSetupAt":last_setup_at,"error":row["error"]})
 }
 
 pub async fn get(pool: &PgPool, owner: &str, study: i64) -> Result<Option<Value>, DbError> {
-    Ok(sqlx::query_scalar("select (to_jsonb(a)-'source')||jsonb_build_object('sourceFacts',a.source-'artifact') from study_actualizations a where owner_id=$1 and study_id=$2")
+    Ok(sqlx::query_scalar(&head_sql())
         .bind(owner).bind(study).fetch_optional(pool).await?)
 }
 
@@ -88,7 +99,7 @@ pub async fn admit(pool:&PgPool, request:Request<'_>) -> Result<Admission,DbErro
     let previous=sqlx::query("select revision,status from study_actualizations where owner_id=$1 and study_id=$2 for update")
         .bind(owner).bind(study).fetch_optional(&mut *tx).await?;
     if previous.as_ref().is_some_and(|r| matches!(r.get::<String,_>("status").as_str(),"queued"|"running")) {
-        let value=sqlx::query_scalar("select (to_jsonb(a)-'source')||jsonb_build_object('sourceFacts',a.source-'artifact') from study_actualizations a where owner_id=$1 and study_id=$2")
+        let value=sqlx::query_scalar(&head_sql())
             .bind(owner).bind(study).fetch_one(&mut *tx).await?;
         return Ok(Admission::Busy(value));
     }
@@ -104,7 +115,7 @@ pub async fn admit(pool:&PgPool, request:Request<'_>) -> Result<Admission,DbErro
     if revision>1 {cleanup(&mut tx,owner,study,revision-1).await?;}
     sqlx::query("insert into study_actualizations(owner_id,study_id,job_id,revision,execution_started_at,observed_through_unix,source,source_identity,status,stage,work_minutes,reserved_bytes) values($1,$2,$3,$4,$5,$6,$7,$8,'queued','queued',$9,$10) on conflict(owner_id,study_id) do update set job_id=excluded.job_id,revision=excluded.revision,token=study_actualizations.token+1,execution_started_at=excluded.execution_started_at,observed_through_unix=excluded.observed_through_unix,source=excluded.source,source_identity=excluded.source_identity,status='queued',stage='queued',progress='{}',report=null,totals=null,error=null,batch_id=null,work_minutes=excluded.work_minutes,reserved_bytes=excluded.reserved_bytes,requested_at=clock_timestamp(),started_at=null,completed_at=null")
         .bind(owner).bind(study).bind(job).bind(revision).bind(start).bind(cutoff).bind(source).bind(identity).bind(work).bind(RESERVED_BYTES).execute(&mut *tx).await?;
-    let value=sqlx::query_scalar("select (to_jsonb(a)-'source')||jsonb_build_object('sourceFacts',a.source-'artifact') from study_actualizations a where owner_id=$1 and study_id=$2")
+    let value=sqlx::query_scalar(&head_sql())
         .bind(owner).bind(study).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     Ok(Admission::Created(value))

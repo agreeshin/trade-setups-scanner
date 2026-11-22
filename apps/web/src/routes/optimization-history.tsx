@@ -35,7 +35,7 @@ function OptimizationHistoryRow({ study, latest, controller, busy, instanceId, o
     <TableCell>{study.spec.minSetupsPerDay ?? "Гейт не применялся"}</TableCell>
     <TableCell>{study.bestScore === null || !Number.isFinite(study.bestScore) ? "—" : `${scoreFormatter.format(study.bestScore)} R`}</TableCell>
     <TableCell>{study.forecastBest == null || !Number.isFinite(study.forecastBest.forecastR) ? "—" : `${scoreFormatter.format(study.forecastBest.forecastR)} R`}</TableCell>
-    <TableCell><div className="max-h-14 overflow-y-auto"><StudyActualFact action={actual} /></div></TableCell>
+    <TableCell><StudyActualFact action={actual} /></TableCell>
     <TableCell><div className="flex items-center gap-1">
       <StudyActualRefreshButton studyId={study.id} action={actual} />
       {isActiveStudy(study)
@@ -109,13 +109,14 @@ export function OptimizationHistory({ id, algorithmId, algorithmName, controller
   return <section id={id} tabIndex={-1} aria-label={`История оптимизации · ${algorithmName}`} className="grid min-w-0 gap-3">
     {error && <Alert variant="destructive" role="alert">{error}<Button type="button" variant="outline" onClick={() => setRetry((value) => value + 1)}>Повторить загрузку истории</Button></Alert>}
     {actions}
-    <div className="overflow-x-auto">
+    {/* Reserve 20 h-13 rows plus a header outside the table; real rows never inherit its height. */}
+    <div className={pageSize === 20 ? "min-h-[68.25rem] overflow-x-auto" : "overflow-x-auto"}>
       <Table aria-label={`Исследования · ${algorithmName}`} aria-busy={loading || placeholders} className="table-fixed min-w-7xl">
         <colgroup>{["w-20", "w-28", "w-96", "w-48", "w-40", "w-32", "w-44", "w-52", "w-60"].map((width, index) => <col key={index} className={width} />)}</colgroup>
         <TableHeader><TableRow>{["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучший Score", "Лучший прогноз матожидания", "Матожидание факт", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
-        <TableBody className="[&_tr]:h-20">{placeholders ? <TableSkeletonRows rows={pageSize} columns={9} /> : <>
+        <TableBody className="[&_td]:py-1.5 [&_td]:align-middle">{placeholders ? <TableSkeletonRows rows={pageSize} columns={9} /> : <>
           {currentPage?.studies.map((study) => <OptimizationHistoryRow key={study.id} study={study} latest={latest} controller={controller} busy={busy} instanceId={instanceId} onSelect={onSelect} onDelete={onDelete} onActualChanged={() => setRetry((value) => value + 1)} />)}
-          {Array.from({ length: padding }, (_, index) => <TableRow key={`padding-${index}`} aria-hidden="true" className="hover:bg-transparent"><TableCell colSpan={9} /></TableRow>)}
+          {Array.from({ length: padding }, (_, index) => <TableRow key={`padding-${index}`} aria-hidden="true" className="h-13 hover:bg-transparent"><TableCell colSpan={9} /></TableRow>)}
         </>}</TableBody>
       </Table>
     </div>

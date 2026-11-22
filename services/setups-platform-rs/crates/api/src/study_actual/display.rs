@@ -62,7 +62,7 @@ pub async fn detail(pool: &PgPool, owner: &str, study: i64, zone: &str) -> Resul
         None => json!({"studyId":study,"eligibility":{"eligible":eligibility.is_ok(),"reason":eligibility.err()},
             "jobId":null,"revision":0,"status":"not_calculated","stage":null,"executionStartedAt":null,"fromUnix":null,
             "observedThroughUnix":null,"requestedAt":null,"startedAt":null,"completedAt":null,"replayBatchId":null,
-            "progress":{},"counts":null,"meanR":null,"error":null,"report":null}),
+            "progress":{},"counts":null,"meanR":null,"lastSetupAt":null,"error":null,"report":null}),
     };
     let Some(start_day_unix) = snapshot.start_day_unix else {
         value["originalReport"] = Value::Null;

@@ -6,7 +6,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Pagination } from "../components/ui/pagination";
 import { Separator } from "../components/ui/separator";
 import { Spinner } from "../components/ui/spinner";
-import { interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
+import { formatIsoDateTime, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
 import { forecastRecipeLabel } from "../lib/forecast-recipe";
 import { getStudyActualSetups, isStudyActualPending, STUDY_ACTUAL_PAGE_SIZE, StudyActualApiError, type StudyActualDetail, type StudyActualSetupPage } from "../lib/study-actual-api";
 import { errorText } from "./platform-controls";
@@ -76,7 +76,7 @@ export function StudyActualSection({ studyId, revisionTrigger }: { studyId: numb
     </p>}
     {actual && !report && !detail.loading && <p className="text-sm text-muted-foreground">Исходный график недоступен: {actual.originalReportUnavailableReason ?? "сохранённый исходный отчёт отсутствует"}. Наличие исторического запуска не подтверждает сохранённые исходы сделок.</p>}
     {published && <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2 text-sm"><span>Матожидание факт:</span><span className={`font-medium ${outcomeMeanClass(published.meanR)}`}>{formatOutcomeRisk(published.meanR)}</span>{published.counts && <Badge className="bg-ambient-violet/15 text-ambient-violet" title="Закрытые сделки / все сетапы">{published.counts.closed}/{published.counts.total}</Badge>}{published.meanR === null && <span className="text-muted-foreground">Нет закрытых сделок</span>}</div>
+        <div className="flex flex-wrap items-center gap-2 text-sm"><span>Матожидание факт:</span><span className={`font-medium ${outcomeMeanClass(published.meanR)}`}>{formatOutcomeRisk(published.meanR)}</span>{published.counts && <Badge className="bg-ambient-violet/15 text-ambient-violet" title="Закрытые сделки / все сетапы">{published.counts.closed}/{published.counts.total}</Badge>}{published.meanR === null && <span className="text-muted-foreground">Нет закрытых сделок</span>}<span aria-label="Последний включённый сетап" title="Последний включённый сетап" className="basis-full whitespace-nowrap text-xs text-muted-foreground">{published.lastSetupAt == null ? "—" : formatIsoDateTime(published.lastSetupAt)}</span></div>
         <Button id={id} type="button" variant="outline" className="ml-auto h-auto w-fit max-w-full whitespace-normal text-left" onClick={() => setSelection({ revision: published.revision, jobId: published.jobId! })}>Посмотреть список сетапов после исследования</Button>
       </div>}
     {report && <>

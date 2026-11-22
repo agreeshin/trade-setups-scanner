@@ -16,6 +16,25 @@ use std::{future::Future, str::FromStr};
 const START: i64 = 1_794_000_000;
 const CUTOFF: i64 = START + 600;
 
+#[test]
+fn compact_last_setup_at_is_nullable_utc_and_visible_without_closed_trades() {
+    let mut row = json!({"study_id":1,"status":"completed","totals":{"total":23,"closed":0,"meanR":null},"last_setup_close_unix":START});
+    let summary = actual::compact_summary(&row);
+    assert_eq!(summary["lastSetupAt"], json!(DateTime::from_timestamp(START, 0).unwrap()));
+    assert!(summary["meanR"].is_null(), "last setup is not restricted to closed trades");
+    for status in ["not_calculated", "queued", "running", "failed"] {
+        row["status"] = json!(status);
+        assert!(actual::compact_summary(&row)["lastSetupAt"].is_null(), "{status} cannot expose a previous timestamp");
+    }
+    row["status"] = json!("completed");
+    row["totals"]["total"] = json!(0);
+    assert!(actual::compact_summary(&row)["lastSetupAt"].is_null());
+    row["totals"]["total"] = json!(23);
+    row.as_object_mut().unwrap().remove("last_setup_close_unix");
+    let legacy = actual::compact_summary(&row);
+    assert!(legacy.get("lastSetupAt").is_some_and(Value::is_null), "legacy rows get an additive nullable field");
+}
+
 async fn isolated<F, Fut>(body: F)
 where
     F: FnOnce(PgPool) -> Fut + 'static,
@@ -578,6 +597,56 @@ async fn replacement_only_deletes_owned_pair_and_fences_every_old_writer() {
         let identity: String = sqlx::query_scalar("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1")
             .bind(study.id).fetch_one(&pool).await.unwrap();
         assert_eq!(identity, study.identity);
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn rejected_or_rolled_back_replacement_preserves_the_entire_published_pair() {
+    async fn snapshot(pool: &PgPool, study: i64) -> Value {
+        sqlx::query_scalar("select jsonb_build_object(\
+            'study',(select to_jsonb(s) from optimization_studies s where id=$1),\
+            'head',(select to_jsonb(a) from study_actualizations a where study_id=$1 and owner_id='admin'),\
+            'rows',(select jsonb_agg(to_jsonb(s) order by id) from study_actual_setups s where study_id=$1 and owner_id='admin'),\
+            'runs',(select jsonb_agg(to_jsonb(r) order by id) from replay_runs r where actual_study_id=$1 and owner_id='admin'),\
+            'batches',(select jsonb_agg(to_jsonb(b) order by id) from replay_batches b where actual_study_id=$1 and owner_id='admin'),\
+            'quality',(select jsonb_agg(to_jsonb(q) order by run_id,from_unix) from replay_quality_intervals q join replay_runs r on r.id=q.run_id where r.actual_study_id=$1 and r.owner_id='admin'))")
+            .bind(study).fetch_one(pool).await.unwrap()
+    }
+    isolated(|pool| async move {
+        let study = seed(&pool, "admin", "rejected-replacement").await;
+        let foreign = seed(&pool, "foreign", "protected-foreign").await;
+        seed_sentinels(&pool).await;
+        let (_, old_batch) = complete(&pool, &study, "published").await;
+        complete(&pool, &foreign, "reserved-foreign-job").await;
+        let published = snapshot(&pool, study.id).await;
+        let protected_before = protected(&pool).await;
+        assert!(matches!(admit(&pool, &study, "no-capacity", ReplayAdmissionLimits { max_pending_runs:0, ..Default::default() }).await.unwrap(), Admission::Resource));
+        assert_eq!(snapshot(&pool, study.id).await, published);
+        let mut invalid = study.clone();
+        invalid.identity = "changed-source".into();
+        assert!(matches!(admit(&pool, &invalid, "invalid", Default::default()).await.unwrap(), Admission::SourceChanged));
+        assert_eq!(snapshot(&pool, study.id).await, published);
+        // The unique job collision occurs AFTER cleanup has deleted the old
+        // rows, runs, quality and batch. The complete transaction must roll back.
+        assert!(admit(&pool, &study, "reserved-foreign-job", Default::default()).await.is_err());
+        assert_eq!(snapshot(&pool, study.id).await, published, "late admission error must restore every published byte and pointer");
+        assert_eq!(protected(&pool).await, protected_before);
+        let accepted = created(admit(&pool, &study, "accepted", Default::default()).await.unwrap());
+        assert_eq!(accepted["revision"], 2);
+        for key in ["batch_id", "report", "totals"] { assert!(accepted[key].is_null(), "accepted replacement must hide {key}"); }
+        assert_pair_absent(&pool, study.id, old_batch).await;
+        let job = claim(&pool).await;
+        let batch = actual::create_batch(&pool, &job).await.unwrap().unwrap();
+        assert!(append(&pool, &job, batch, "CURRENT", &rows(3)).await.unwrap());
+        let staging = snapshot(&pool, study.id).await;
+        assert!(matches!(admit(&pool, &study, "busy", Default::default()).await.unwrap(), Admission::Busy(_)));
+        assert_eq!(snapshot(&pool, study.id).await, staging, "busy cannot clean current staging");
+        assert!(actual::page(&pool, study.owner, study.id, 2, 0, 100).await.unwrap().is_none());
+        assert!(actual::finish(&pool, &job, &json!({"revision":2}), &json!({"total":3})).await.unwrap());
+        assert_eq!(actual::page(&pool, study.owner, study.id, 2, 0, 100).await.unwrap().unwrap().len(), 3);
+        assert_eq!(protected(&pool).await, protected_before);
+        assert_eq!(snapshot(&pool, study.id).await["study"], published["study"], "original study/spec/result/model/history are never refresh-owned");
     }).await;
 }
 

@@ -6,7 +6,7 @@ use setups_domain::{SPIKE_ALGORITHM_ID, SPIKE_ALGORITHM_VERSION, SPIKE_DROP_ALGO
 use sqlx::{PgPool, Row, postgres::PgRow};
 use std::collections::HashMap;
 
-const SUMMARY_KEYS: [&str; 10] = ["studyId", "eligibility", "jobId", "revision", "status", "stage", "observedThroughUnix", "counts", "meanR", "error"];
+const SUMMARY_KEYS: [&str; 11] = ["studyId", "eligibility", "jobId", "revision", "status", "stage", "observedThroughUnix", "counts", "meanR", "lastSetupAt", "error"];
 
 fn compact(row: &Value) -> Value {
     // Share the actual GET producer, then positively allowlist table fields.
@@ -51,7 +51,7 @@ pub(crate) async fn enrich(pool: &PgPool, owner: &str, page: &mut StudyPage) -> 
     let ids: Vec<i64> = page.studies.iter().map(|study| study.id).collect();
     // Only scalars/booleans and the compact head cross the SQL boundary. The
     // bounded legacy event scan never transfers events/matrices/frozen models.
-    let rows = sqlx::query(r#"
+    let rows = sqlx::query(&[r#"
         select s.id,s.owner_id,s.status,s.algorithm_id,s.spec->>'algorithmVersion' algorithm_version,
           coalesce(s.spec->>'algorithmId'=s.algorithm_id,false) algorithm_matches,
           coalesce(g.execution_started_at,s.execution_started_at) execution_start,
@@ -68,12 +68,14 @@ pub(crate) async fn enrich(pool: &PgPool, owner: &str, page: &mut StudyPage) -> 
             '$.best.matrix[*] ? (@.closedCount > 0 && @.tpPct > 0 && @.tpPct <= 100 && @.slPct > 0 && @.slPct <= 100 && @.riskExpectancy.type() == "number")'),false) has_closed_cell,
           case when a.study_id is not null then jsonb_build_object(
             'study_id',a.study_id,'job_id',a.job_id,'revision',a.revision,'status',a.status,'stage',a.stage,
-            'observed_through_unix',a.observed_through_unix,'totals',a.totals,'error',a.error) end head
+            'observed_through_unix',a.observed_through_unix,'totals',a.totals,'error',a.error,'last_setup_close_unix',"#,
+        setups_db::study_actual::LAST_SETUP_CLOSE_UNIX_SQL,
+        r#") end head
         from optimization_studies s
         left join continuous_generations g on g.id=s.continuous_generation_id and g.owner_id=s.owner_id
         left join study_actualizations a on a.study_id=s.id and a.owner_id=s.owner_id and s.owner_id=$2
         where s.id=any($1)
-    "#).bind(&ids).bind(owner).fetch_all(pool).await?;
+    "#].concat()).bind(&ids).bind(owner).fetch_all(pool).await?;
     let mut summaries = HashMap::with_capacity(rows.len());
     for row in rows {
         let id: i64 = row.try_get("id")?;

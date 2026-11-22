@@ -835,7 +835,7 @@ it("shows the full inline history in server pages of twenty, preserving summary 
   expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучший Score", "Лучший прогноз матожидания", "Матожидание факт", "Действия"]);
   expect(table.getAllByRole("row")).toHaveLength(21);
   const first = within(table.getAllByRole("row")[1]!);
-  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#50", "Ручное", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "Менее 1 мин", "0", "0.00 R", "0.00 R", "Не рассчитано", ""]);
+  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#50", "Ручное", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "Менее 1 мин", "0", "0.00 R", "0.00 R", "Не рассчитано—", ""]);
   expect(table.getAllByRole("row")[2]).toHaveTextContent("Гейт не применялся");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("—");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("1 дн 1 ч 1 мин");
@@ -848,7 +848,11 @@ it("shows the full inline history in server pages of twenty, preserving summary 
   expect(section.getByRole("button", { name: /Предыдущая страница/ })).toBeDisabled();
   expect(element).toHaveClass("table-fixed", "min-w-7xl");
   expect(element.querySelectorAll("colgroup col")).toHaveLength(9);
-  expect(element.querySelector("tbody")).toHaveClass("[&_tr]:h-20");
+  expect(element.querySelector("tbody")).toHaveClass("[&_td]:py-1.5", "[&_td]:align-middle");
+  expect(element.querySelector("tbody")).not.toHaveClass("[&_tr]:h-20");
+  expect(element.parentElement).toHaveClass("min-h-[68.25rem]");
+  expect(table.getAllByRole("row")[1]).not.toHaveClass("h-20", "h-13");
+  expect(element.querySelector(".max-h-14")).toBeNull();
   const ids = [...document.querySelectorAll("[id]")].map((element) => element.id);
   expect(new Set(ids).size).toBe(ids.length);
   fireEvent.click(section.getByRole("button", { name: /Следующая страница/ }));
@@ -860,6 +864,8 @@ it("shows the full inline history in server pages of twenty, preserving summary 
   expect(table.getAllByRole("row")).toHaveLength(6);
   expect(element.querySelectorAll("tbody tr")).toHaveLength(20);
   expect(element.querySelectorAll('tbody tr[aria-hidden="true"]')).toHaveLength(15);
+  expect([...element.querySelectorAll('tbody tr[aria-hidden="true"]')].every((row) => row.classList.contains("h-13"))).toBe(true);
+  expect(element.parentElement).toHaveClass("min-h-[68.25rem]");
   expect(section.getByRole("button", { name: /Следующая страница/ })).toBeDisabled();
   expect(requests.some((request) => new URL(request.path, "http://localhost").searchParams.get("offset") === "20")).toBe(true);
   expect(requests.filter((request) => /limit=(5|10)&/.test(request.path))).toHaveLength(0);

@@ -19,6 +19,8 @@ export interface StudyActualSummary {
   observedThroughUnix: number | null;
   counts: StudyActualCounts | null;
   meanR: number | null;
+  /** UTC raw signal-close maximum of the published owned dataset; absent on legacy APIs. */
+  lastSetupAt?: string | null;
   error: { code: string; stage: string; message: string } | null;
 }
 export type StudyActualAvailability = { status: "available" } | { status: "unavailable"; reason: string };
@@ -81,6 +83,8 @@ export function parseStudyActualSummary(value: unknown, studyId: number): StudyA
     || !(value.jobId === null || typeof value.jobId === "string") || !count(value.revision)
     || !statuses.includes(value.status) || !(stages.includes(value.stage) || (value.status === "not_calculated" && value.stage === null))
     || !(value.observedThroughUnix === null || count(value.observedThroughUnix))
+    || !(value.lastSetupAt === undefined || value.lastSetupAt === null || (typeof value.lastSetupAt === "string"
+      && /(?:Z|[+-]\d{2}:\d{2})$/.test(value.lastSetupAt) && Number.isFinite(Date.parse(value.lastSetupAt))))
     || !(value.meanR === null || finite(value.meanR))) throw invalid();
   const rawCounts = value.counts;
   let counts: StudyActualCounts | null = null;
@@ -98,7 +102,8 @@ export function parseStudyActualSummary(value: unknown, studyId: number): StudyA
   }
   return { studyId, eligibility: { eligible: value.eligibility.eligible, reason: value.eligibility.reason },
     jobId: value.jobId, revision: value.revision, status: value.status as StudyActualStatus, stage: value.stage as StudyActualStage | null,
-    observedThroughUnix: value.observedThroughUnix, counts, meanR: value.meanR, error };
+    observedThroughUnix: value.observedThroughUnix, counts, meanR: value.meanR,
+    ...(value.lastSetupAt === undefined ? {} : { lastSetupAt: value.lastSetupAt }), error };
 }
 
 async function requestBody(studyId: number, init: RequestInit, suffix = ""): Promise<unknown> {

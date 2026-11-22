@@ -61,7 +61,7 @@ async fn detail(State(state):State<Arc<ReplayState>>,headers:HeaderMap,Path(id):
     match db::get(&state.pool,"admin",id).await {
         Ok(Some(row))=>reply(StatusCode::OK,dto(&row)),Ok(None)=>{
             let eligibility=match model::source(&state.pool,id,"admin",chrono::Utc::now().timestamp().div_euclid(60)*60).await {Ok(_)=>json!({"eligible":true,"reason":null}),Err(reason)=>json!({"eligible":false,"reason":reason})};
-            reply(StatusCode::OK,json!({"studyId":id,"eligibility":eligibility,"jobId":null,"revision":0,"status":"not_calculated","stage":null,"executionStartedAt":null,"fromUnix":null,"observedThroughUnix":null,"requestedAt":null,"startedAt":null,"completedAt":null,"replayBatchId":null,"progress":{},"counts":null,"meanR":null,"error":null,"report":null}))
+            reply(StatusCode::OK,json!({"studyId":id,"eligibility":eligibility,"jobId":null,"revision":0,"status":"not_calculated","stage":null,"executionStartedAt":null,"fromUnix":null,"observedThroughUnix":null,"requestedAt":null,"startedAt":null,"completedAt":null,"replayBatchId":null,"progress":{},"counts":null,"meanR":null,"lastSetupAt":null,"error":null,"report":null}))
         },Err(_)=>error(StatusCode::INTERNAL_SERVER_ERROR,"study_actual_storage_unavailable")
     }
 }

@@ -1,9 +1,10 @@
+import { useSyncExternalStore } from "react";
 import { RefreshCw } from "lucide-react";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { IconButton } from "../components/ui/icon-button";
 import { Tooltip } from "../components/ui/tooltip";
-import { formatUnix } from "../lib/datetime-format";
+import { formatIsoDateTime, formatUnix, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
 import type { StudyActualStage } from "../lib/study-actual-api";
 import { formatOutcomeRisk, outcomeMeanClass } from "./setup-outcomes-table";
 import type { useStudyActualAction } from "./use-study-actual-action";
@@ -12,6 +13,7 @@ type ActualAction = ReturnType<typeof useStudyActualAction>;
 const stageLabels: Record<StudyActualStage, string> = { queued: "В очереди", acquiring: "Подготовка данных", replaying: "Исторический прогон", evaluating: "Расчёт исходов", publishing: "Сохранение результата", completed: "Готово", failed: "Ошибка расчёта" };
 
 export function StudyActualFact({ action }: { action: ActualAction }) {
+  useSyncExternalStore(subscribeInterfaceSettings, interfaceSettings);
   const { actual, pending, submitting, uncertain, error } = action;
   return <div className="grid gap-1 text-sm">
     {pending ? <span role="status" className="text-muted-foreground">{uncertain ? "Статус расчёта уточняется…" : submitting ? "Отправка запроса…" : actual?.stage ? stageLabels[actual.stage] : "В очереди"}</span>
@@ -25,6 +27,7 @@ export function StudyActualFact({ action }: { action: ActualAction }) {
         {actual.meanR === null && <span className="text-xs text-muted-foreground">{actual.counts.total === 0 ? "Нет сетапов в периоде" : "Нет закрытых сделок"}</span>}
       </> : actual?.status === "failed" ? <span role="alert" className="text-danger">{actual.error ? `${actual.error.code}: ${actual.error.message.slice(0, 300)}` : "Расчёт завершился ошибкой. Повторите запуск вручную."}</span>
         : <span className="text-muted-foreground">Не рассчитано</span>}
+    <span aria-label="Последний включённый сетап" title="Последний включённый сетап" className="whitespace-nowrap text-xs text-muted-foreground">{!pending && actual?.status === "completed" && actual.counts !== null && actual.lastSetupAt != null ? formatIsoDateTime(actual.lastSetupAt) : "—"}</span>
     {error && <span role="alert" className="text-danger">{error}</span>}
     {uncertain && <Button type="button" variant="outline" size="sm" disabled={submitting} onClick={() => { void action.reconcile(); }}>Проверить статус расчёта</Button>}
   </div>;

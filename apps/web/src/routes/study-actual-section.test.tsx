@@ -157,6 +157,27 @@ it("puts factual mean/counts left and the exact list button right above the char
   expect(requests.every((request) => request.method === "GET")).toBe(true); expect(pageCalls()).toHaveLength(0);
 });
 
+it("shows the API last setup below factual mean/counts using interface formats, with no setup-page request", async () => {
+  actual = { ...actual, lastSetupAt: "2026-11-20T17:45:00.125Z" };
+  modal(); await settle();
+  const timestamp = screen.getByLabelText("Последний включённый сетап");
+  expect(timestamp).toHaveTextContent("20.11.2026, 17:45:00");
+  expect(timestamp).toHaveClass("basis-full");
+  const count = requests.length;
+  act(() => { applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "UTC", dateOrder: "mdy", dateSeparator: "/", yearDigits: 2, time24: false }); });
+  expect(timestamp).toHaveTextContent("11/20/26, 05:45:00 PM");
+  await settle(); expect(requests).toHaveLength(count); expect(pageCalls()).toHaveLength(0);
+  expect(actual.lastSetupAt).toBe("2026-11-20T17:45:00.125Z");
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it.each([null, undefined])("shows an unavailable last setup %s as a dash in actual detail, never cutoff or job time", async (lastSetupAt) => {
+  actual = { ...actual, ...(lastSetupAt === undefined ? {} : { lastSetupAt }) };
+  modal(); await settle();
+  expect(screen.getByLabelText("Последний включённый сетап")).toHaveTextContent(/^—$/);
+  expect(pageCalls()).toHaveLength(0); expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
 it.each(["mean", "forecast", "blend"] as const)("keeps the saved %s objective caption and places a separator immediately after it", async (mode) => {
   actual = actualDetailFixture(49, { report: actualReportFixture({ originalObjective: {
     version: 1, trendMode: mode, trendBendDays: "30", trendBlendLambda: 0.6,

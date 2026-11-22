@@ -77,7 +77,7 @@ fn materialize_command_help_and_invalid_arguments_do_not_start_server_or_require
 }
 fn canonical(value:&Value,id:i64) {
     assert_eq!(value["studyId"],id);assert!(value["eligibility"]["eligible"].is_boolean());assert!(value["eligibility"]["reason"].is_null()||value["eligibility"]["reason"].is_string());
-    for key in ["jobId","revision","status","stage","observedThroughUnix","counts","meanR","error"] {assert!(value.get(key).is_some(),"missing TS summary field {key}: {value}");}
+    for key in ["jobId","revision","status","stage","observedThroughUnix","counts","meanR","lastSetupAt","error"] {assert!(value.get(key).is_some(),"missing TS summary field {key}: {value}");}
     assert!(value["revision"].as_u64().is_some());
     if value["status"]=="not_calculated" {assert!(value["stage"].is_null());}else{assert!(value["stage"].is_string());}
     if !value["counts"].is_null() {for key in ["total","closed","tp","sl","gateFailed","unclosed","noData"] {assert!(value["counts"][key].as_u64().is_some(),"invalid TS count {key}");}}
@@ -146,9 +146,11 @@ async fn exact_display_original_only_weighted_merge_and_refresh_preservation_wir
     let (id,artifact,spec)=original_ledger_fixture(&pool,start,points).await;
     sqlx::query("update optimization_studies set execution_started_at=to_timestamp($2) where id=$1").bind(id).bind(start as f64+0.25).execute(&pool).await.unwrap();
     let immutable:(String,String)=sqlx::query_as("select s.result::text,a.numerical_snapshot::text from optimization_studies s join study_expectancy_artifacts a on a.source_study_id=s.id where s.id=$1").bind(id).fetch_one(&pool).await.unwrap();
+    let original_archive:Value=sqlx::query_scalar("select to_jsonb(o) from study_original_outcomes o where artifact_id=$1").bind(artifact).fetch_one(&pool).await.unwrap();
     let (app,_,market,server)=fixture(&pool,start).await;let path=format!("/v1/optimization-studies/{id}/actual");let zoned=format!("{path}?timeZone=Asia%2FKathmandu");
     let (_,legacy)=http(&app,"GET",&path).await;assert!(legacy.get("originalReport").is_none());assert!(legacy["report"].is_null());
     let (status,before)=http(&app,"GET",&zoned).await;assert_eq!(status,StatusCode::OK,"{before}");assert_eq!(before["status"],"not_calculated");assert!(before["report"].is_null());
+    assert!(before.get("lastSetupAt").is_some_and(Value::is_null));
     let original=&before["originalReport"];let display=&original["display"];
     assert_eq!(original["executionStartedAt"],"2026-11-20T23:30:00.250Z");assert_eq!(display["timeZone"],"Asia/Kathmandu");
     assert_eq!(display["startDayUnix"],unix("2026-11-20T18:15:00Z"));assert_eq!(display["daily"].as_array().unwrap().len(),1);
@@ -166,15 +168,20 @@ async fn exact_display_original_only_weighted_merge_and_refresh_preservation_wir
     let mut report=original.clone();report.as_object_mut().unwrap().remove("display");report["observedThroughUnix"]=json!(start+7200);
     assert!(db::finish(&pool,&job,&report,&json!({"total":1,"closed":1,"tp":0,"sl":1,"gateFailed":0,"unclosed":0,"noData":0,"meanR":-1.0})).await.unwrap());
     let (status,completed)=http(&app,"GET",&zoned).await;assert_eq!(status,StatusCode::OK,"{completed}");let merged=&completed["report"]["display"];
+    assert_eq!(completed["lastSetupAt"],"2026-11-21T00:30:00Z");
     assert_eq!(merged["daily"].as_array().unwrap().len(),1);assert_eq!(merged["daily"][0]["closedCount"],5);assert_eq!(merged["daily"][0]["tpCount"],3);assert_eq!(merged["daily"][0]["slCount"],2);
     assert_eq!(merged["daily"][0]["sumR"],1.0);assert_eq!(merged["daily"][0]["meanR"],0.2);assert_eq!(completed["originalReport"],*original);
     for key in ["originalObjective","originalEndpoint","projection","executionStartedAt"] {assert_eq!(completed["report"][key],report[key],"original model field {key} changed");}
     let (_,old_completed)=http(&app,"GET",&path).await;assert_eq!(old_completed["report"],report,"without timeZone saved wire report stays untouched");assert!(old_completed.get("originalReport").is_none());
+    assert_eq!(old_completed["lastSetupAt"],completed["lastSetupAt"]);
     assert!(matches!(db::admit(&pool,admit("display-replacement")).await.unwrap(),db::Admission::Created(_)));
     let (_,queued)=http(&app,"GET",&zoned).await;assert_eq!(queued["status"],"queued");assert!(queued["report"].is_null());assert_eq!(queued["originalReport"],*original);
+    assert!(queued["lastSetupAt"].is_null());
     let replacement=db::claim(&pool,2).await.unwrap().unwrap();let (_,running)=http(&app,"GET",&zoned).await;assert_eq!(running["status"],"running");assert_eq!(running["originalReport"],*original);
     db::fail(&pool,&replacement,"fixture_failure").await.unwrap();let (_,failed)=http(&app,"GET",&zoned).await;assert_eq!(failed["status"],"failed");assert!(failed["report"].is_null());assert_eq!(failed["originalReport"],*original);
+    assert!(failed["lastSetupAt"].is_null());
     assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from study_original_outcomes where artifact_id=$1").bind(artifact).fetch_one(&pool).await.unwrap(),1);
+    assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(o) from study_original_outcomes o where artifact_id=$1").bind(artifact).fetch_one(&pool).await.unwrap(),original_archive,"refresh must preserve the sealed ledger/provenance/timestamps byte-for-byte");
     assert_eq!(sqlx::query_as::<_,(String,String)>("select s.result::text,a.numerical_snapshot::text from optimization_studies s join study_expectancy_artifacts a on a.source_study_id=s.id where s.id=$1").bind(id).fetch_one(&pool).await.unwrap(),immutable);
     assert_eq!(market.calls.load(Ordering::SeqCst),0,"GET must never acquire market history");
     if let Ok(path)=std::env::var("STUDY_DISPLAY_WIRE_PATH") {std::fs::write(path,serde_json::to_vec_pretty(&json!({"before":before,"completed":completed,"queued":queued,"running":running,"failed":failed})).unwrap()).unwrap();}

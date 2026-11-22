@@ -107,11 +107,39 @@ it.each([
   expect(chart.querySelector(`[data-day-unix="${second}"] title`)).toHaveTextContent(secondDate);
 });
 
-it("keeps real missing calendar days as gaps instead of connecting across them", () => {
+it.each(["original-only", "merged"])("connects sparse %s finite observations with real time spacing and no invented points/tooltips", (source) => {
+  const base = actualReportFixture({ ...(source === "original-only" ? { actual: { daily: [] } } : {}) });
+  const first = base.display!.daily[0]!;
+  const daily = [first,
+    { ...first, dayUnix: actualDay, date: "2026-11-20", meanR: null, sumR: null, closedCount: 0, tpCount: 0, slCount: 0 },
+    { ...first, dayUnix: actualDay + 2 * 86400, date: "2026-11-22", meanR: -1, sumR: -4 },
+    { ...first, dayUnix: actualDay + 3 * 86400, date: "2026-11-23", meanR: 0, sumR: 0 }];
+  const report = { ...base, observedThroughUnix: actualDay + 4 * 86400, display: { ...base.display!, daily } };
+  const sealedProjection = JSON.stringify(report.projection); const originalDays = JSON.stringify(daily);
+  render(<StudyActualChart report={report} />);
+  const chart = screen.getByTestId("study-actual-chart");
+  const points = [...chart.querySelectorAll('circle[data-phase="observed"]')];
+  expect(points).toHaveLength(3);
+  expect(points.map((point) => point.getAttribute("data-date"))).toEqual(["2026-11-19", "2026-11-22", "2026-11-23"]);
+  expect(screen.getAllByTestId("study-observed-line")).toHaveLength(1);
+  expect(screen.getByTestId("study-observed-line").getAttribute("points")?.split(" ")).toEqual(points.map((point) => `${point.getAttribute("cx")},${point.getAttribute("cy")}`));
+  const xs = points.map((point) => Number(point.getAttribute("cx")));
+  expect((xs[1]! - xs[0]!) / (xs[2]! - xs[1]!)).toBeCloseTo(3);
+  expect(chart.querySelector(`[data-grid-day="${actualDay + 86400}"]`)).toBeInTheDocument();
+  expect(chart.querySelector(`[data-day-unix="${actualDay + 86400}"]`)).toBeNull();
+  expect(chart.querySelector(`[data-day-unix="${actualDay}"]`)).toBeNull();
+  expect(chart.querySelectorAll('circle[data-phase="observed"] title')).toHaveLength(3);
+  expect(JSON.stringify(report.projection)).toBe(sealedProjection); expect(JSON.stringify(daily)).toBe(originalDays);
+});
+
+it.each([[], [0.5], [null, NaN, Infinity], [1, NaN, -1]].map((values) => ({ values })))("draws only finite observations $values and requires two points for an observed segment", ({ values }) => {
   const base = actualReportFixture();
-  render(<StudyActualChart report={{ ...base, observedThroughUnix: actualDay + 86400,
-    display: { ...base.display!, daily: [base.display!.daily[0]!, { ...base.display!.daily[1]!, dayUnix: actualDay + 86400, date: "2026-11-21" }] } }} />);
-  expect(screen.queryByTestId("study-observed-line")).not.toBeInTheDocument();
+  render(<StudyActualChart report={{ ...base, observedThroughUnix: actualDay + 4 * 86400,
+    display: { ...base.display!, daily: values.map((meanR, index) => ({ ...base.display!.daily[0]!, dayUnix: actualDay + index * 86400, date: `2026-11-${20 + index}`, meanR })) } }} />);
+  const finiteCount = values.filter((value) => value !== null && Number.isFinite(value)).length;
+  expect(screen.getByTestId("study-actual-chart").querySelectorAll('circle[data-phase="observed"]')).toHaveLength(finiteCount);
+  expect(screen.queryAllByTestId("study-observed-line")).toHaveLength(finiteCount > 1 ? 1 : 0);
+  expect(screen.getByTestId("study-actual-chart").innerHTML).not.toMatch(/(?:cx|cy|points)="[^"]*(?:NaN|Infinity)/);
 });
 
 it("uses only DD.MM axis labels through a local year crossing, retaining full accessible and tooltip dates", () => {

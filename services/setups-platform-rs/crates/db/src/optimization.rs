@@ -197,14 +197,16 @@ pub async fn list(
     // binds below during integration cleanup. The API bulk summary projection
     // is authoritative and replaces this bounded metadata; keeping it for the
     // current handoff does not change client eligibility or add SQL round-trips.
-    let rows = sqlx::query(
+    let rows = sqlx::query(&[
         "select page.id,page.status,page.spec,page.progress,page.error,page.created_at,page.updated_at, \
          page.origin,page.owner_id,page.continuous_generation_id,page.continuous_slot_id, \
          (case when page.status in ('queued','running','cancel_requested') \
           then page.progress->>'bestScore' else page.result#>>'{best,score}' end)::double precision as best_score, \
          coalesce(page.result#>'{best,trendMode}',page.spec->'trendMode') as forecast_mode, \
          winner.cell as best_forecast_cell, \
-         coalesce((select jsonb_build_object('study_id',page.id,'job_id',a.job_id,'revision',a.revision,'status',a.status,'stage',a.stage,'totals',a.totals,'observed_through_unix',a.observed_through_unix,'error',a.error) from study_actualizations a where a.owner_id=page.owner_id and a.study_id=page.id), \
+         coalesce((select jsonb_build_object('study_id',page.id,'job_id',a.job_id,'revision',a.revision,'status',a.status,'stage',a.stage,'totals',a.totals,'observed_through_unix',a.observed_through_unix,'error',a.error,'last_setup_close_unix',",
+        crate::study_actual::LAST_SETUP_CLOSE_UNIX_SQL,
+        ") from study_actualizations a where a.owner_id=page.owner_id and a.study_id=page.id), \
           jsonb_build_object('study_id',page.id,'status','not_calculated','eligibility_reason',case \
            when page.status not in ('completed','cancelled','failed') then 'study_active' \
            when jsonb_typeof(page.result->'best') is distinct from 'object' then 'winner_missing' \
@@ -233,7 +235,7 @@ pub async fn list(
           order by (metric.forecast#>>'{}')::numeric desc,entry.position limit 1 \
          ) winner on true \
          order by (page.status in ('queued','running','cancel_requested')) desc,page.id desc",
-    )
+    ].concat())
     .bind(algorithm)
     .bind(limit)
     .bind(offset)
