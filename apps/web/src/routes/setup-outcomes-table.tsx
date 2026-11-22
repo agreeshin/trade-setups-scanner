@@ -1,6 +1,6 @@
-import { Badge } from "../components/ui/badge";
+import { SetupOutcomeBadge } from "../components/entity-status-badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
-import type { SetupsAnalyticsSetup, SetupsAnalyticsStatus } from "../lib/setups-analytics-api";
+import type { SetupsAnalyticsSetup } from "../lib/setups-analytics-api";
 import { localTime, localTimezoneLabel } from "./platform-controls";
 
 /** Display fields shared by issued setups and retrospective artifacts; no fabricated adaptive-profile identity. */
@@ -15,14 +15,8 @@ export function formatOutcomeRisk(value: number | null): string {
 export function outcomeMeanClass(value: number | null): string {
   return value === null || value === 0 ? "text-muted-foreground" : value > 0 ? "text-success" : "text-danger";
 }
-const statusBadges: Record<SetupsAnalyticsStatus, { label: string; variant: "success" | "danger" | "neutral" | "warning" }> = {
-  tp: { label: "TP", variant: "success" }, sl: { label: "SL", variant: "danger" },
-  unclosed: { label: "не закрылась", variant: "neutral" }, no_data: { label: "нет данных", variant: "neutral" },
-  gate_failed: { label: "гейт не пройден", variant: "warning" },
-};
 
 export function SetupOutcomeRow({ setup }: { setup: SetupOutcomeDisplayRow }) {
-  const status = statusBadges[setup.status];
   return <TableRow>
     <TableCell className="font-medium">{setup.symbol}</TableCell>
     <TableCell className="whitespace-nowrap tabular-nums">{localTime(setup.setupTimeUnix)}</TableCell>
@@ -32,7 +26,7 @@ export function SetupOutcomeRow({ setup }: { setup: SetupOutcomeDisplayRow }) {
     <TableCell className="whitespace-nowrap tabular-nums">{setup.closeTimeUnix === null ? "—" : localTime(setup.closeTimeUnix)}</TableCell>
     <TableCell numeric>{formatPrice(setup.closePrice ?? null)}</TableCell>
     <TableCell numeric className={(setup.riskReturn ?? 0) >= 0 ? "text-success" : "text-danger"}>{formatOutcomeRisk(setup.riskReturn)}</TableCell>
-    <TableCell><Badge variant={status.variant}>{status.label}</Badge></TableCell>
+    <TableCell><SetupOutcomeBadge status={setup.status} /></TableCell>
     <TableCell numeric>{setup.studyId === null ? "—" : `№${setup.studyId}`}</TableCell>
   </TableRow>;
 }

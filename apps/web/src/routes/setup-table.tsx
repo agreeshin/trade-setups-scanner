@@ -1,14 +1,13 @@
 import { useRef, useState, useSyncExternalStore } from "react";
 import { localTime, localTimezoneLabel, type SetupRow } from "./platform-controls";
 import { Badge } from "../components/ui/badge";
+import { SetupOutcomeBadge } from "../components/entity-status-badge";
 import { EmptyState } from "../components/ui/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { formatSetupRecommendation } from "../lib/setup-recommendation";
 import { interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
-import type { SetupTradeOutcomeStatus } from "../lib/setup-outcomes-api";
 import { SetupRecommendationDialog, SetupRecommendationPreview, type SelectedSetupRecommendation } from "./setup-recommendation-preview";
 
-const outcomeLabels: Record<SetupTradeOutcomeStatus, string> = { tp: "TP", sl: "SL", unclosed: "Не закрылась", no_data: "Нет данных", gate_failed: "Гейт не пройден" };
 const riskText = (value: number | null): string => value === null ? "—" : `${value >= 0 ? "+" : ""}${value.toFixed(2)} R`;
 const riskClass = (value: number | null): string => value === null || value === 0 ? "text-muted-foreground" : value > 0 ? "text-success" : "text-danger";
 
@@ -28,7 +27,7 @@ export function SetupSavedDetails({ setup, showOutcome }: { setup: SetupRow; sho
       </> : <div><dt className="text-muted-foreground">Метрики сетапа</dt><dd>Не сохранены для этой записи.</dd></div>}
     </dl>
     {showOutcome && outcome && <div className="mt-3"><h3 className="text-xs font-medium">Результат сделки</h3><dl className="mt-1 grid gap-1">
-      <div><dt className="text-muted-foreground">Статус сделки</dt><dd>{outcomeLabels[outcome.status]}</dd></div>
+      <div><dt className="text-muted-foreground">Статус сделки</dt><dd><SetupOutcomeBadge status={outcome.status} /></dd></div>
       <div><dt className="text-muted-foreground">Закрытие сделки ({localTimezoneLabel()})</dt><dd className="tabular-nums">{outcome.closeTimeUnix === null ? "—" : localTime(outcome.closeTimeUnix)}</dd></div>
       <div><dt className="text-muted-foreground">Цена закрытия сделки</dt><dd className="tabular-nums">{outcome.closePrice === null ? "—" : String(outcome.closePrice)}</dd></div>
       <div><dt className="text-muted-foreground">Рассчитано</dt><dd className="tabular-nums">{localTime(outcome.evaluatedAtUnix)}</dd></div>
@@ -72,7 +71,7 @@ export function SetupTable({ setups, showOutcomes = false }: { setups: SetupRow[
         <TableCell className="whitespace-nowrap tabular-nums">{localTime(setup.openTimeUnix)}</TableCell>
         <TableCell className="whitespace-nowrap tabular-nums">{localTime(setup.closeTimeUnix)}</TableCell>
         <TableCell numeric>{setup.closePrice}</TableCell>
-        {showOutcomes && <TableCell numeric><div className={`font-medium ${riskClass(setup.tradeOutcome?.riskReturn ?? null)}`}>{riskText(setup.tradeOutcome?.riskReturn ?? null)}</div><span className="text-xs text-muted-foreground">{setup.tradeOutcome ? outcomeLabels[setup.tradeOutcome.status] : setup.recommendation ? "Не рассчитан" : "Без рекомендованных условий"}</span></TableCell>}
+        {showOutcomes && <TableCell numeric><div className={`font-medium ${riskClass(setup.tradeOutcome?.riskReturn ?? null)}`}>{riskText(setup.tradeOutcome?.riskReturn ?? null)}</div><SetupOutcomeBadge status={setup.tradeOutcome?.status} recommended={!!setup.recommendation} /></TableCell>}
         <TableCell><SetupRecommendationPreview setup={setup} onOpen={setSelection} dialogOpen={selection !== null} /><SetupDetails setup={setup} showOutcome={showOutcomes} /></TableCell>
         <TableCell>{setup.exchange === "bybit" && setup.category === "linear" ? <div className="flex flex-wrap gap-x-3 gap-y-1"><a className="text-primary underline-offset-4 hover:underline" href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(`BYBIT:${setup.symbol}.P`)}`} target="_blank" rel="noopener noreferrer">TradingView</a><a className="text-primary underline-offset-4 hover:underline" href={`https://www.bybit.com/trade/usdt/${encodeURIComponent(setup.symbol)}`} target="_blank" rel="noopener noreferrer">Bybit</a></div> : <span className="text-muted-foreground">Нет ссылки</span>}</TableCell>
       </TableRow>)}</TableBody>

@@ -2,6 +2,10 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
 import { SetupsAnalyticsPanel } from "./setups-analytics-panel";
+import { forecastViewFixture } from "../../test/setups-forecast-fixture";
+import type { SetupsProjectionRequest } from "../lib/setups-projection-api";
+import { AnalyticsPage } from "./analytics-page";
+import { RouteActiveContext } from "./route-active";
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 const studyMeta1 = { studyId: 40, externalName: "Всплеск цены и оборота", setupCount: 3, generationId: 36, artifactId: 900 };
@@ -64,6 +68,9 @@ const legacyAnalyticsResult = {
 
 const requests: string[] = [];
 let analyticsResponse: () => Response | Promise<Response> = () => json(analyticsResult);
+let settingsResponse: (init?: RequestInit) => Response | Promise<Response>;
+let metadataResponse: () => Response;
+let projectionResponse: (init: RequestInit) => Response | Promise<Response>;
 let studyResponse = () => json(optimizationStudy40);
 let expectancyResponse = () => {
   const horizonDays = Array.from({ length: 13 }, (_, index) => 1793923200 + index * 86400);
@@ -74,18 +81,23 @@ const defaultExpectancyResponse = expectancyResponse;
 beforeEach(() => {
   vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-13T12:00:00Z")); requests.length = 0;
   analyticsResponse = () => json(analyticsResult);
+  settingsResponse = () => json({ settings: null });
+  metadataResponse = () => json({ studies: [studyMeta1, studyMeta2] });
+  projectionResponse = () => json({ error: "no_projection_fixture" }, 503);
   studyResponse = () => json(optimizationStudy40);
   expectancyResponse = defaultExpectancyResponse;
   window.localStorage.clear();
   applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "UTC" });
   Object.defineProperty(URL, "createObjectURL", { configurable: true, writable: true, value: vi.fn(() => "blob:expectancy-png") });
   Object.defineProperty(URL, "revokeObjectURL", { configurable: true, writable: true, value: vi.fn() });
-  vi.stubGlobal("fetch", vi.fn((path: string) => {
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     requests.push(path);
     if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "", enabled: true, params: {}, fields: [{ key: "spike_mult", label: "Множитель объёма", type: "decimal", min: 1, max: 20, unit: "×" }, { key: "min_quote_vol", label: "Мин. объём котировки", type: "decimal", min: 0, max: 1000000000, unit: "USDT" }] }] }));
     if (path === "/v1/settings/ui") return Promise.resolve(json({ value: {} }));
+    if (path === "/v1/settings/web-analytics") return Promise.resolve(settingsResponse(init));
     if (path.startsWith("/v1/setups?")) return Promise.resolve(json({ setups: [], offset: Number(new URL(path, "http://fixture").searchParams.get("offset")), limit: 25, total: 0, snapshotId: 0 }));
-    if (path.startsWith("/v1/setups/analytics/studies")) return Promise.resolve(json({ studies: [studyMeta1, studyMeta2] }));
+    if (path.startsWith("/v1/setups/analytics/studies")) return Promise.resolve(metadataResponse());
+    if (path.startsWith("/v1/setups/analytics/forecast-view?")) return Promise.resolve(projectionResponse(init!));
     if (path === "/v1/setups/analytics/study-expectancy/40") {
       return Promise.resolve(expectancyResponse());
     }
@@ -206,14 +218,14 @@ it("loads studies for the committed range and renders the calculated result", as
   expect(screen.getByText("SYM1")).toBeInTheDocument();
   expect(screen.getAllByText("TP")).toHaveLength(2);
   expect(screen.getAllByText("SL")).toHaveLength(2);
-  expect(screen.getByText("не закрылась")).toBeInTheDocument();
-  expect(screen.getByText("нет данных")).toBeInTheDocument();
+  expect(screen.getByText("Не закрылась")).toBeInTheDocument();
+  expect(screen.getByText("Нет данных")).toBeInTheDocument();
   expect(screen.getByText("4/5")).toBeInTheDocument();
-  expect(screen.queryByText("гейт не пройден")).toBeNull();
+  expect(screen.queryByText("Гейт не пройден")).toBeNull();
   expect(screen.queryByText("SYM5")).toBeNull();
   expect(screen.getAllByText("№40").length).toBe(4);
   fireEvent.click(screen.getByLabelText("Скрыть сетапы, которые не прошли гейт"));
-  expect(screen.getByText("гейт не пройден")).toBeInTheDocument();
+  expect(screen.getByText("Гейт не пройден")).toBeInTheDocument();
   expect(screen.getByText("SYM5")).toBeInTheDocument();
   expect(screen.getByText("5/5")).toBeInTheDocument();
 });
@@ -573,4 +585,149 @@ it("maps modal buckets and release continuity to the configured day but preserve
   expect(gridDays(chart).at(-1)).toBe(unix("2026-11-21T08:00:00Z"));
   expect(analyticsCalls()).toHaveLength(callsBeforeChange);
   expect(vi.mocked(fetch).mock.calls.filter(([path]) => path === "/v1/setups/analytics/study-expectancy/40")).toHaveLength(1);
+});
+
+type ForecastBody = Pick<SetupsProjectionRequest, "snapshot" | "forecast" | "trendMode" | "trendBlendLambda" | "timeZone">;
+const forecastBody = (init: RequestInit) => { if (typeof init.body !== "string") throw new Error("Expected JSON string"); return JSON.parse(init.body) as ForecastBody; };
+const projectionCalls = () => vi.mocked(fetch).mock.calls.filter(([path]) => typeof path === "string" && path.startsWith("/v1/setups/analytics/forecast-view?"));
+function enableSnapshotForecast() {
+  const snapshot = { snapshotId: 5, observationCutoff: Math.floor(Date.now() / 60000) * 60, fingerprint: "a".repeat(64) };
+  analyticsResponse = () => json({ ...analyticsResult, snapshot });
+  settingsResponse = () => json({ settings: { trendMode: "forecast", trendBendDays: "linear", forecast: { method: "trend", version: 1, bendDays: "linear" } } });
+  projectionResponse = (init) => json(forecastViewFixture({ ...forecastBody(init), expectedSelected: 5 }));
+  return snapshot;
+}
+
+it("renders the server M/F/B projection from the full calculated snapshot independently of empty visible history, without changing End or refreshing outcomes", async () => {
+  const snapshot = enableSnapshotForecast();
+  render(<SetupsAnalyticsPanel initialLoad={{ loadedAtUnix: Math.floor(Date.now() / 1000), interfaceReady: true, ready: true }} />);
+  await settle(); await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  const originalEnd = screen.getByLabelText<HTMLInputElement>("Конец").value;
+  expect(analyticsCalls()).toHaveLength(1); expect(projectionCalls()).toHaveLength(1);
+  expect(screen.getByText("Сетапы не найдены.")).toBeInTheDocument();
+  expect(forecastBody(projectionCalls()[0]![1]!)).toMatchObject({ snapshot, trendMode: "forecast" });
+  expect(new URL(projectionCalls()[0]![0] as string, "http://fixture").searchParams.has("offset")).toBe(false);
+  expect(screen.getByTestId("setups-analytics-mean")).toHaveTextContent("+1.25R");
+  expect(screen.getByTestId("setups-model-summary")).toHaveTextContent("+3.75R");
+  expect(screen.getByText("Модель F · Тренд дневной суммы R")).toBeInTheDocument();
+  expect(screen.getByTestId("setups-model-now-value")).toHaveTextContent("+3.75R");
+  const marker = screen.getByTestId("setups-model-now-marker");
+  expect(marker).toHaveAttribute("fill", "#f5b041"); expect(marker).toHaveAttribute("data-now-unix", String(snapshot.observationCutoff + 37));
+  expect(screen.getByTestId("setups-model-now-value").getAttribute("x")).toBe(marker.getAttribute("cx"));
+  for (const circle of screen.getByTestId("setups-daily-outcomes").querySelectorAll("circle")) {
+    expect(Number(circle.getAttribute("cy"))).toBeGreaterThanOrEqual(66); expect(Number(circle.getAttribute("cy"))).toBeLessThanOrEqual(258);
+  }
+  fireEvent.click(screen.getByRole("button", { name: "Смесь" }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  expect(projectionCalls()).toHaveLength(2); expect(forecastBody(projectionCalls()[1]![1]!)).toMatchObject({ snapshot, trendMode: "blend", trendBlendLambda: 0.7 });
+  expect(screen.getByTestId("setups-model-summary")).toHaveTextContent("+3.00R");
+  expect(screen.getByTestId("setups-model-now-value")).toHaveTextContent("+3.00R");
+  expect(screen.getByTestId("setups-analytics-mean")).toHaveTextContent("+1.25R");
+  await act(async () => { await vi.advanceTimersByTimeAsync(600000); });
+  expect(screen.getByLabelText("Конец")).toHaveValue(originalEnd); expect(analyticsCalls()).toHaveLength(1); expect(projectionCalls()).toHaveLength(2);
+  expect(requests.some((path) => /outcomes\/refresh|study-actual|replay|maintenance|optimization-studies/.test(path))).toBe(false);
+});
+
+it.each(["success", "failure"])("ignores an older projection's late %s after a newer control change and response", async (outcome) => {
+  enableSnapshotForecast();
+  const pending: { body: ForecastBody; resolve: (value: Response) => void }[] = [];
+  projectionResponse = (init) => new Promise<Response>((resolve) => { pending.push({ body: forecastBody(init), resolve }); });
+  render(<SetupsAnalyticsPanel initialLoad={{ loadedAtUnix: Math.floor(Date.now() / 1000), interfaceReady: true, ready: true }} />);
+  await settle(); await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  fireEvent.click(screen.getByRole("button", { name: "Смесь" }));
+  expect(screen.getByTestId("setups-model-summary")).toHaveTextContent("—");
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  expect(pending).toHaveLength(2);
+  await act(async () => { pending[1]!.resolve(json(forecastViewFixture({ ...pending[1]!.body, expectedSelected: 5 }))); await Promise.resolve(); });
+  expect(screen.getByTestId("setups-model-summary")).toHaveTextContent("+3.00R");
+  await act(async () => { pending[0]!.resolve(outcome === "success" ? json(forecastViewFixture({ ...pending[0]!.body, expectedSelected: 5 })) : json({ error: "late" }, 503)); await Promise.resolve(); });
+  expect(screen.getByTestId("setups-model-summary")).toHaveTextContent("+3.00R");
+  expect(screen.getByTestId("setups-model-now-value")).toHaveTextContent("+3.00R");
+  expect(screen.queryByText(/HTTP 503/)).not.toBeInTheDocument(); expect(analyticsCalls()).toHaveLength(1);
+});
+
+it("keeps a changed/unavailable snapshot explicit with no zero/old curve and no implicit retry", async () => {
+  enableSnapshotForecast(); projectionResponse = () => json({ error: "setups_analytics_snapshot_changed" }, 409);
+  render(<SetupsAnalyticsPanel initialLoad={{ loadedAtUnix: Math.floor(Date.now() / 1000), interfaceReady: true, ready: true }} />);
+  await settle(); await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  expect(screen.getByText(/Сохранённые исходы снимка изменились/)).toBeInTheDocument();
+  expect(screen.getByTestId("setups-model-summary")).toHaveTextContent("—"); expect(screen.queryByTestId("setups-model-line")).toBeNull();
+  expect(screen.getByTestId("setups-analytics-mean")).toHaveTextContent("+1.25R");
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  expect(projectionCalls()).toHaveLength(1); expect(analyticsCalls()).toHaveLength(1);
+});
+
+it("draws every local calendar day independently of sparse labels and adds the finite fractional daily observed maximum, not the largest individual trade", async () => {
+  storeRange("2026-10-01T00:00", "2026-11-01T00:00");
+  analyticsResponse = () => json({ ...analyticsResult, setups: [rowAt(1, "2026-10-10T01:00:00Z", "tp", 3), rowAt(2, "2026-10-10T05:00:00Z", "sl", -1), rowAt(3, "2026-10-20T01:00:00Z", "tp", 2.125)] });
+  await rendered(); fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  const chart = screen.getByTestId("setups-daily-outcomes");
+  expect(chart.querySelectorAll("[data-grid-day] line")).toHaveLength(31);
+  expect(chart.querySelectorAll("[data-grid-day] text").length).toBeLessThan(31);
+  expect(chart.querySelector('[data-observed-max-r="2.125"]')).not.toBeNull();
+  expect(chart.querySelector('[data-observed-max-r="3"]')).toBeNull();
+  expect(within(chart).getByLabelText("Фактический максимум: 2.125 R")).toHaveTextContent("+2.13R");
+  expect(chart.querySelector('circle[data-closed="2"]')).toHaveAttribute("data-mean-r", "1.00");
+});
+
+it("uses only compact saved metadata for best score, pure forecast and original recommended raw-R pair; factual denominator remains current selected cohort", async () => {
+  metadataResponse = () => json({ studies: [{ ...studyMeta1, status: "completed", bestScore: 0.99,
+    forecastBest: { forecastR: 1.9, meanR: 0.1, tpPct: 30, slPct: 2 }, bestCell: { tpPct: 14, slPct: 4, rawR: -0.3 } }, studyMeta2] });
+  await rendered(); fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  const row = within(screen.getByRole("button", { name: "Подробности исследования 40" }).closest("tr")!);
+  expect(row.getByText("+0.99R")).toBeInTheDocument(); expect(row.getByText("+1.90R")).toBeInTheDocument();
+  expect(row.getByText("TP 14% / SL 4% · -0.30R")).toBeInTheDocument();
+  expect(row.getByLabelText("Факт: 2 закрытых из 5 выбранных")).toHaveTextContent("2/5");
+  expect(row.getByText("Завершено")).toHaveAttribute("data-slot", "badge");
+  expect(requests.some((path) => /optimization-studies|study-actual|study-expectancy/.test(path))).toBe(false);
+});
+
+it("shows settings load/save failures and disables failed-load controls instead of silently applying defaults", async () => {
+  settingsResponse = () => json({ error: "offline" }, 503);
+  await rendered();
+  expect(screen.getByRole("alert")).toHaveTextContent("Не удалось загрузить общие настройки");
+  expect(screen.getByRole("button", { name: "Прогноз" })).toBeDisabled();
+  settingsResponse = (init) => init?.method === "PUT" ? json({ error: "offline" }, 503) : json({ settings: { trendMode: "mean" } });
+  fireEvent.click(screen.getByRole("button", { name: "Повторить загрузку настроек" })); await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Прогноз" }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+  expect(screen.getByRole("alert")).toHaveTextContent("Ошибка сохранения настроек");
+  expect(screen.getByRole("button", { name: "Прогноз" })).toHaveAttribute("aria-pressed", "true");
+});
+
+it("keeps an inactive mounted Analytics owner synchronized and prevents its later unrelated autosave from overwriting newer Setups controls", async () => {
+  settingsResponse = () => json({ settings: { trendMode: "mean", trendBendDays: "linear", clusterGapInput: "8",
+    forecast: { method: "trend", version: 1, bendDays: "linear" }, sections: { "long-matrix": { unrelated: "keep" } } } });
+  const savedFetch = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    if (path === "/v1/analytics/sets") return Promise.resolve(json({ sets: [{ setId: "run-12", label: "Набор 12", params: {}, setupCount: 0, fromUnix: 1700000000, toUnix: 1700600000 }] }));
+    if (path.startsWith("/v1/analytics/months")) return Promise.resolve(json({ months: [] }));
+    if (path === "/v1/analytics/cache/summary") return Promise.resolve(json({ tables: [], total: 0 }));
+    return savedFetch(path, init);
+  }));
+  render(<><RouteActiveContext.Provider value={false}><div data-testid="inactive-analytics"><AnalyticsPage /></div></RouteActiveContext.Provider><SetupsAnalyticsPanel /></>);
+  await settle();
+  const analytics = within(screen.getByTestId("inactive-analytics"));
+  const setups = within(screen.getByRole("region", { name: "Общий прогноз Analytics и Сетапов" }));
+  fireEvent.change(analytics.getByLabelText("Разрыв кластера, ч"), { target: { value: "20" } });
+  fireEvent.blur(analytics.getByLabelText("Разрыв кластера, ч"));
+  fireEvent.click(setups.getByRole("button", { name: "Прогноз" }));
+  fireEvent.change(setups.getByLabelText("Метод прогноза"), { target: { value: "decayed_probability" } });
+  fireEvent.change(setups.getByLabelText("Память модели H, дней"), { target: { value: "7" } });
+  expect(analytics.getByRole("button", { name: "Прогноз" })).toHaveAttribute("aria-pressed", "true");
+  expect(analytics.getByLabelText("Память модели H, дней")).toHaveValue(7);
+  await act(async () => { await vi.advanceTimersByTimeAsync(801); });
+  const writes = vi.mocked(fetch).mock.calls.filter(([path, init]) => path === "/v1/settings/web-analytics" && init?.method === "PUT");
+  expect(writes).toHaveLength(1);
+  expect(JSON.parse(writes[0]![1]!.body as string)).toMatchObject({ clusterGapInput: "20", trendMode: "forecast",
+    forecast: { method: "decayed_probability", halfLifeDays: "7" }, sections: { "long-matrix": { unrelated: "keep" } } });
+  expect(analyticsCalls()).toHaveLength(0); expect(projectionCalls()).toHaveLength(0);
+});
+
+it("bounds the calendar SVG rather than allocating a day node for every day of arbitrary multi-decade input", async () => {
+  storeRange("2000-01-01T00:00", "2026-11-13T12:00");
+  await rendered(); fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  expect(screen.getByText(/диапазон календарной сетки превышает десять лет/)).toBeInTheDocument();
+  expect(screen.queryByTestId("setups-daily-outcomes")).toBeNull();
+  expect(screen.getByTestId("setups-analytics-mean")).toHaveTextContent("+1.25R");
 });

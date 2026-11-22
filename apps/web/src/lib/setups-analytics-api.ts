@@ -8,6 +8,12 @@ export interface SetupsAnalyticsStudyMeta {
   setupCount: number;
   generationId: number | null;
   artifactId: number | null;
+  /** Additive, saved scalar projections. Missing means an older API, not zero. */
+  status?: string;
+  bestScore?: number | null;
+  forecastBest?: { forecastR: number; meanR: number; tpPct: number; slPct: number } | null;
+  bestCell?: { tpPct: number; slPct: number; rawR: number } | null;
+  metricsUnavailableReason?: string | null;
 }
 
 export interface SetupsAnalyticsTotals {
@@ -46,6 +52,13 @@ export interface SetupsAnalyticsResult {
   totals: SetupsAnalyticsTotals;
   studies: SetupsAnalyticsStudy[];
   setups: SetupsAnalyticsSetup[];
+  /** Fingerprint covers the full calculated cohort and its frozen saved outcomes. */
+  snapshot?: SetupsAnalyticsSnapshot;
+}
+export interface SetupsAnalyticsSnapshot {
+  snapshotId: number;
+  observationCutoff: number;
+  fingerprint: string;
 }
 
 export class SetupsAnalyticsApiError extends Error {
@@ -80,7 +93,19 @@ function isStudyMeta(value: unknown): value is SetupsAnalyticsStudyMeta {
     && typeof value.externalName === "string"
     && isCount(value.setupCount)
     && (value.generationId === null || isId(value.generationId))
-    && (value.artifactId === null || isId(value.artifactId));
+    && (value.artifactId === null || isId(value.artifactId))
+    && (value.status === undefined || typeof value.status === "string")
+    && (value.bestScore === undefined || value.bestScore === null || isFiniteNumber(value.bestScore))
+    && (value.forecastBest === undefined || value.forecastBest === null || (isRecord(value.forecastBest)
+      && [value.forecastBest.forecastR, value.forecastBest.meanR, value.forecastBest.tpPct, value.forecastBest.slPct].every(isFiniteNumber)))
+    && (value.bestCell === undefined || value.bestCell === null || (isRecord(value.bestCell)
+      && [value.bestCell.tpPct, value.bestCell.slPct, value.bestCell.rawR].every(isFiniteNumber)))
+    && (value.metricsUnavailableReason === undefined || value.metricsUnavailableReason === null || typeof value.metricsUnavailableReason === "string");
+}
+
+export function isSetupsAnalyticsSnapshot(value: unknown): value is SetupsAnalyticsSnapshot {
+  return isRecord(value) && isCount(value.snapshotId) && isCount(value.observationCutoff)
+    && value.observationCutoff % 60 === 0 && typeof value.fingerprint === "string" && /^[a-f0-9]{64}$/i.test(value.fingerprint);
 }
 
 function isTotals(value: unknown): value is SetupsAnalyticsTotals {
@@ -165,13 +190,15 @@ export async function fetchSetupsAnalytics(
   if (studies !== null) params.set("studies", studies.join(","));
   const response = await apiFetch(`/v1/setups/analytics?${params}`, { method: "POST", ...(signal === undefined ? {} : { signal }) });
   const body = await readBody(response);
-  if (!isRecord(body) || !isTotals(body.totals) || !Array.isArray(body.studies) || !Array.isArray(body.setups)) {
+  if (!isRecord(body) || !isTotals(body.totals) || !Array.isArray(body.studies) || !Array.isArray(body.setups)
+    || (body.snapshot !== undefined && !isSetupsAnalyticsSnapshot(body.snapshot))) {
     throw new SetupsAnalyticsApiError("Некорректный ответ расчёта");
   }
   return {
     totals: body.totals,
     studies: expectArray(body.studies, isStudy, "studies"),
     setups: expectArray(body.setups, isSetup, "setups"),
+    ...(body.snapshot === undefined ? {} : { snapshot: body.snapshot }),
   };
 }
 

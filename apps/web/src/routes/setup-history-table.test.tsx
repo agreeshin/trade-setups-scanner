@@ -28,7 +28,7 @@ const settle = async () => { await act(async () => { await vi.advanceTimersByTim
 it("keeps WATCH/null outcomes visible and pins paging and route-return reads to one snapshot", async () => {
   const view = render(<RouteActiveContext.Provider value><SetupHistoryTable filter={filter} /></RouteActiveContext.Provider>);
   await settle();
-  expect(screen.getByText("WATCH1")).toBeInTheDocument(); expect(screen.getByText("неприменимо")).toBeInTheDocument();
+  expect(screen.getByText("WATCH1")).toBeInTheDocument(); expect(screen.getByText("Неприменимо")).toHaveAttribute("data-slot", "badge");
   expect(screen.queryByText("+0.00R")).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Далее" })); await settle();
   expect(screen.getByText("WATCH2")).toBeInTheDocument(); expect(screen.queryByText("WATCH1")).toBeNull();

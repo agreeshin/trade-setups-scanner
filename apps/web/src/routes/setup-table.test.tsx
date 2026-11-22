@@ -23,13 +23,14 @@ it.each([
   const fetch = vi.fn(); vi.stubGlobal("fetch", fetch);
   render(<SetupTable showOutcomes setups={[{ ...setup, tradeOutcome: { ...tradeOutcome, status, riskReturn: risk } }]} />);
   const row = within(screen.getAllByRole("row")[1]!);
-  expect(row.getByText(text)).toHaveClass(color); expect(row.getByText(label, { selector: "span" })).toBeInTheDocument();
+  expect(row.getByText(text)).toHaveClass(color);
+  expect(row.getAllByText(label, { selector: '[data-slot="badge"]' })[0]).toBeVisible();
   expect(fetch).not.toHaveBeenCalled();
 });
 
 it("distinguishes missing recommended results and WATCH, leaving replay columns unchanged", () => {
   const view = render(<SetupTable showOutcomes setups={[{ ...setup, id: 1, recommendation }, { ...setup, id: 2, symbol: "WATCHUSDT" }]} />);
-  expect(screen.getByText("Не рассчитан")).toBeInTheDocument(); expect(screen.getByText("Без рекомендованных условий")).toBeInTheDocument();
+  expect(screen.getByText("Не рассчитано")).toHaveAttribute("data-slot", "badge"); expect(screen.getByText("Неприменимо")).toHaveAttribute("data-slot", "badge");
   expect(screen.queryByText("+0.00 R")).not.toBeInTheDocument();
   view.rerender(<SetupTable setups={[{ ...setup, tradeOutcome }]} />);
   expect(screen.queryByRole("columnheader", { name: "Результат сделки" })).not.toBeInTheDocument();

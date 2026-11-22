@@ -61,6 +61,7 @@ beforeEach(() => {
     requests.push({ path, method: init?.method ?? "GET", signal: init?.signal });
     if (path === "/v1/setups/outcomes/refresh") return Promise.resolve(refreshResponse());
     if (path === "/v1/settings/ui") return Promise.resolve(json({ value: { setupFilter: "BTC" } }));
+    if (path === "/v1/settings/web-analytics") return Promise.resolve(json({ settings: { trendMode: "mean" } }));
     if (path === "/v1/algorithms") return Promise.resolve(json({ algorithms: [{ id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "", enabled: true, params: {}, fields: [] }] }));
     if (path.startsWith("/v1/setups/analytics/studies?")) return Promise.resolve(studiesResponse());
     if (path.startsWith("/v1/setups/analytics?")) return Promise.resolve(analyticsResponse(params({ path })));
@@ -138,7 +139,7 @@ it("keeps WATCH/null outcomes accessible, while the gate Switch changes only dis
   const control = screen.getByRole("switch", { name: "Скрыть сетапы, которые не прошли гейт" });
   expect(control).toBeChecked(); expect(history().queryByText("BTC7")).not.toBeInTheDocument();
   const watch = within(history().getByText("BTC5").closest("tr")!);
-  expect(watch.getByText("WATCH")).toBeInTheDocument(); expect(watch.getByText("неприменимо")).toBeInTheDocument();
+  expect(watch.getByText("WATCH")).toBeInTheDocument(); expect(watch.getByText("Неприменимо")).toHaveAttribute("data-slot", "badge");
   expect(watch.queryByText(/LONG|SHORT|[+-]?0\.00\s*R/)).not.toBeInTheDocument();
   expect(watch.getByRole("button", { name: "Подробности BTC5" })).toBeEnabled();
   expect(within(history().getByText("BTC6").closest("tr")!).getByText("SHORT")).toBeInTheDocument();

@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { SharedForecastControls } from "../components/shared-forecast-controls";
+import { StudyStatusBadge } from "../components/entity-status-badge";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -14,7 +16,10 @@ import { Switch } from "../components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { fetchPlatform, PLATFORM_URL } from "../lib/platform-api";
 import { effectiveTimezone, interfaceSettings, nextZonedDay, subscribeInterfaceSettings, zonedDateLabel, zonedDayStart } from "../lib/datetime-format";
-import { getOptimizationStudy, type OptimizationMatrixCell, type OptimizationStudy } from "../lib/optimization-api";
+import { getOptimizationStudy, isTrendBlendLambda, type OptimizationMatrixCell, type OptimizationStudy } from "../lib/optimization-api";
+import { useSharedAnalyticsSettings } from "../lib/analytics-settings-store";
+import { buildForecastRecipe } from "../lib/forecast-recipe";
+import { fetchSetupsProjection, type SetupsProjection, type SetupsProjectionRequest } from "../lib/setups-projection-api";
 import {
   fetchSetupsAnalytics,
   fetchSetupsAnalyticsStudies,
@@ -102,12 +107,14 @@ interface CalculatedResult extends SetupsAnalyticsResult {
   range: AnalyticsRange;
   calculatedAtUnix: number;
   outcomesRevision: number;
+  studyMetadata: SetupsAnalyticsStudyMeta[];
+  calculationFilter: { algorithmId: string; studies: number[] | null; q: string };
 }
 
 function dailyOutcomes(setups: readonly SetupsAnalyticsSetup[], dayStart: (unix: number) => number = zonedDayStart): DailyOutcome[] {
   const byDay = new Map<number, { sum: number; count: number }>();
   for (const setup of setups) {
-    if ((setup.status !== "tp" && setup.status !== "sl") || setup.entryTimeUnix === null || setup.riskReturn === null) continue;
+    if ((setup.status !== "tp" && setup.status !== "sl") || setup.entryTimeUnix === null || setup.riskReturn === null || !Number.isFinite(setup.riskReturn)) continue;
     const day = dayStart(setup.entryTimeUnix);
     const bucket = byDay.get(day) ?? { sum: 0, count: 0 };
     bucket.sum += setup.riskReturn;
@@ -116,19 +123,27 @@ function dailyOutcomes(setups: readonly SetupsAnalyticsSetup[], dayStart: (unix:
   }
   return [...byDay.entries()]
     .map(([dayUnix, bucket]) => ({ dayUnix, closedCount: bucket.count, meanR: bucket.sum / bucket.count }))
+    .filter((point) => Number.isFinite(point.meanR))
     .sort((left, right) => left.dayUnix - right.dayUnix);
 }
 
-function DailyOutcomesChart({ setups, range }: { setups: readonly SetupsAnalyticsSetup[]; range: AnalyticsRange }) {
+export function DailyOutcomesChart({ setups, range, projection = null, modelLabel = "Модель" }: { setups: readonly SetupsAnalyticsSetup[]; range: AnalyticsRange; projection?: SetupsProjection | null; modelLabel?: string }) {
   const outcomes = dailyOutcomes(setups);
-  const firstDay = Math.min(zonedDayStart(range.fromUnix), outcomes[0]?.dayUnix ?? Infinity);
+  const model = projection?.availability.status === "available" ? projection : null;
+  const firstDay = Math.min(zonedDayStart(range.fromUnix), outcomes[0]?.dayUnix ?? Infinity, model?.points[0] ? zonedDayStart(model.points[0].atUnix) : Infinity);
   // The API interval is [from, to): an exact midnight end does not add an empty next day.
   // Selection is by raw signal, so a shifted entry can also extend beyond the selected interval.
   const lastDay = Math.max(zonedDayStart(range.toUnix - 1), outcomes.at(-1)?.dayUnix ?? -Infinity);
-  const timeSpan = Math.max(nextZonedDay(firstDay) - firstDay, lastDay - firstDay);
+  const lastInstant = Math.max(range.toUnix - 1, lastDay, model?.nowUnix ?? -Infinity, model?.points.at(-1)?.atUnix ?? -Infinity);
+  const timeSpan = Math.max(1, lastInstant - firstDay);
+  // Bound the day-grid SVG to the server's ten-year projection scope instead of
+  // expanding arbitrary datetime input into millions of retained DOM nodes.
+  if (timeSpan > 3662 * DAY_SECONDS) return <p role="status" className="text-sm text-muted-foreground">График дней недоступен: диапазон календарной сетки превышает десять лет. Сузьте диапазон.</p>;
   const xOf = (dayUnix: number) => CHART_STYLE.left + ((dayUnix - firstDay) / timeSpan) * (CHART_STYLE.right - CHART_STYLE.left);
-  const allDays = calendarDays(firstDay, lastDay);
-  const values = outcomes.map((point) => point.meanR);
+  const allDays = calendarDays(firstDay, zonedDayStart(lastInstant));
+  const observedValues = outcomes.map((point) => point.meanR);
+  const observedMax = observedValues.length ? Math.max(...observedValues) : null;
+  const values = [...observedValues, ...(model?.points.map((point) => point.value) ?? [])];
   const rawMin = Math.min(0, ...values);
   const rawMax = Math.max(0, ...values);
   const pad = rawMax - rawMin < 1e-9 ? 0.5 : (rawMax - rawMin) * 0.08;
@@ -136,29 +151,39 @@ function DailyOutcomesChart({ setups, range }: { setups: readonly SetupsAnalytic
   const yMax = rawMax + pad;
   const yOf = (value: number) => CHART_STYLE.bottom - ((value - yMin) / (yMax - yMin)) * (CHART_STYLE.bottom - CHART_STYLE.top);
   const labelStep = Math.max(1, Math.ceil((allDays.length - 1) / 8));
-  const gridDays = allDays.filter((_, index) => index % labelStep === 0 || index === allDays.length - 1);
   const gridLevels: number[] = [];
-  for (let level = Math.ceil(yMin); level <= Math.floor(yMax); level += 1) {
-    if (level !== 0) gridLevels.push(level);
+  const levelStep = Math.max(1, Math.ceil((Math.floor(yMax) - Math.ceil(yMin)) / 8));
+  for (let level = Math.ceil(yMin); level <= Math.floor(yMax); level += levelStep) {
+    if (level !== 0 && (observedMax === null || Math.abs(yOf(level) - yOf(observedMax)) >= 14)) gridLevels.push(level);
   }
   return <svg data-testid="setups-daily-outcomes" data-from-unix={range.fromUnix} data-to-unix={range.toUnix} viewBox={`0 0 ${CHART_STYLE.width} ${CHART_STYLE.height}`} role="img" aria-label="Средний результат закрытых сделок по дням входа" className="w-full rounded-md border border-input/60">
     <rect width={CHART_STYLE.width} height={CHART_STYLE.height} fill={CHART_STYLE.background} />
     <text x={CHART_STYLE.width / 2} y={28} textAnchor="middle" fontSize={14} fill={CHART_STYLE.foreground}>Результаты торговли по дням</text>
-    {gridDays.map((dayUnix) => <g key={`day-${dayUnix}`} data-grid-day={dayUnix}>
+    {allDays.map((dayUnix, index) => <g key={`day-${dayUnix}`} data-grid-day={dayUnix}>
       <line x1={xOf(dayUnix)} y1={CHART_STYLE.top} x2={xOf(dayUnix)} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.grid} strokeWidth={1} />
-      <text x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{zonedDateLabel(dayUnix)}</text>
+      {(index % labelStep === 0 || index === allDays.length - 1) && <text x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{zonedDateLabel(dayUnix)}</text>}
     </g>)}
     {gridLevels.map((level) => <g key={`level-${level}`}>
       <line x1={CHART_STYLE.left} y1={yOf(level)} x2={CHART_STYLE.right} y2={yOf(level)} stroke={CHART_STYLE.grid} strokeWidth={1} />
       <text x={CHART_STYLE.left - 8} y={yOf(level) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>{level} R</text>
     </g>)}
     <line x1={CHART_STYLE.left} y1={yOf(0)} x2={CHART_STYLE.right} y2={yOf(0)} stroke={CHART_STYLE.axis} strokeWidth={1.5} />
-    <text x={CHART_STYLE.left - 8} y={yOf(0) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>0 R</text>
+    <text data-observed-max-r={observedMax === 0 ? 0 : undefined} x={CHART_STYLE.left - 8} y={yOf(0) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>0 R</text>
+    {observedMax !== null && observedMax !== 0 && <g data-observed-max-r={observedMax}>
+      <line x1={CHART_STYLE.left} x2={CHART_STYLE.right} y1={yOf(observedMax)} y2={yOf(observedMax)} stroke={CHART_STYLE.grid} />
+      <text x={CHART_STYLE.left - 8} y={yOf(observedMax) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis} aria-label={`Фактический максимум: ${observedMax} R`}>{formatRisk(observedMax)}</text>
+    </g>}
     {outcomes.length > 1 && <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={outcomes.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
     {outcomes.length === 0 && <text x={CHART_STYLE.width / 2} y={CHART_STYLE.top + 20} textAnchor="middle" fontSize={12} fill={CHART_STYLE.axis}>Нет закрытых сделок для графика по дням.</text>}
     {outcomes.map((point) => <circle key={`point-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={zonedDateLabel(point.dayUnix)} data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)}>
       <title>{`${zonedDateLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title>
     </circle>)}
+    {model !== null && <>
+      <polyline data-testid="setups-model-line" fill="none" stroke={CHART_STYLE.trend} strokeWidth={2} points={model.points.map((point) => `${xOf(point.atUnix)},${yOf(point.value)}`).join(" ")} />
+      <line x1={xOf(model.nowUnix)} x2={xOf(model.nowUnix)} y1={CHART_STYLE.top} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.trend} strokeDasharray="4 4" />
+      <circle data-testid="setups-model-now-marker" data-now-unix={model.nowUnix} cx={xOf(model.nowUnix)} cy={yOf(model.decisionR!)} r={4} fill={CHART_STYLE.trend}><title>{`${modelLabel} · ${localTime(model.nowUnix)} · ${formatRisk(model.decisionR)}`}</title></circle>
+      <text data-testid="setups-model-now-value" x={xOf(model.nowUnix)} y={yOf(model.decisionR!) - 10} textAnchor="end" fontSize={12} fill={CHART_STYLE.trend}>{formatRisk(model.decisionR)}</text>
+    </>}
   </svg>;
 }
 
@@ -352,6 +377,7 @@ function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { s
       {loadError !== null && <p role="alert" className="text-sm text-danger">{loadError}</p>}
       {study === null && loadError === null && <p className="text-sm text-muted-foreground">Загрузка подробностей…</p>}
       {study !== null && <div className="grid gap-4">
+        <StudyStatusBadge status={study.status} />
         <dl className="grid gap-2 text-sm sm:grid-cols-2">
           <div><dt className="text-muted-foreground">Лучший score</dt><dd className="tabular-nums">{score === null ? "—" : formatSignedR(score)}</dd></div>
           <div><dt className="text-muted-foreground">{pairKindLabel}</dt><dd className="tabular-nums">{pair === null ? "Не сохранено" : pair.text}</dd></div>
@@ -454,6 +480,7 @@ interface InitialLoad { loadedAtUnix: number; interfaceReady: boolean; ready: bo
 
 export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevision = 0 }: { initialLoad?: InitialLoad; refreshControl?: ReactNode; outcomesRevision?: number } = {}) {
   useSyncExternalStore(subscribeInterfaceSettings, interfaceSettings, interfaceSettings);
+  const shared = useSharedAnalyticsSettings();
   const active = useRouteActive();
   const unified = initialLoad !== undefined;
   const [initialized, setInitialized] = useState(!unified);
@@ -474,6 +501,7 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
   const [pickerSelection, setPickerSelection] = useState<ReadonlySet<number>>(new Set());
   const [detailStudyId, setDetailStudyId] = useState<number | null>(null);
   const [result, setResult] = useState<CalculatedResult | null>(null);
+  const [modelState, setModelState] = useState<{ key: string; value: SetupsProjection | null; error: string | null } | null>(null);
   const [runningRequest, setRunningRequest] = useState<string | null>(null);
   const [hideGateFailed, setHideGateFailed] = useState(true);
   const [failure, setFailure] = useState<{ key: string; message: string } | null>(null);
@@ -673,7 +701,7 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
       const requestedRange = { ...range.value };
       const requestedKey = requestKey;
       const data = await fetchSetupsAnalytics(algorithmId, requestedRange.fromUnix, requestedRange.toUnix, studies, controller.signal, search);
-      if (!controller.signal.aborted && currentRequest.current === requestedKey) setResult({ ...data, range: requestedRange, calculatedAtUnix: Date.now() / 1000, outcomesRevision });
+      if (!controller.signal.aborted && currentRequest.current === requestedKey) setResult({ ...data, range: requestedRange, calculatedAtUnix: Math.floor(Date.now() / 1000), outcomesRevision, studyMetadata: studiesMeta, calculationFilter: { algorithmId, studies, q: search } });
     } catch (cause) {
       if (!controller.signal.aborted) setFailure({ key: requestKey, message: errorText(cause) });
     } finally {
@@ -691,6 +719,44 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
   const historyFilter = queriesReady && algorithmId !== "" && committedRange !== null ? {
     algorithmId, ...committedRange, studies: selectedStudyIds, q: search, hideGateFailed,
   } : null;
+  const settingsStatus = shared.status;
+  const modelMode = shared.settings?.trendMode;
+  const modelBend = shared.settings?.trendBendDays;
+  const modelForecast = shared.settings?.forecast;
+  const modelLambda = shared.settings?.trendBlendLambda;
+  const modelRequest = useMemo((): { request: SetupsProjectionRequest; error?: never } | { error: string; request?: never } | null => {
+    if (result === null || settingsStatus !== "ready" || modelMode === undefined || modelBend === undefined) return null;
+    try {
+      if (result.snapshot === undefined) throw new Error("Сервер не предоставил идентификатор готового снимка. Модель недоступна; исходы не обновлялись.");
+      const lambda = Number(modelLambda ?? "0.7");
+      if (modelMode === "blend" && !isTrendBlendLambda(lambda)) throw new Error("Доля прогноза λ: 0.05–0.95 с шагом 0.01.");
+      const forecast = buildForecastRecipe(modelMode === "mean" ? { method: "trend", version: 1, bendDays: modelBend }
+        : modelForecast ?? { method: "trend", version: 1, bendDays: modelBend });
+      return { request: { snapshot: result.snapshot, ...result.range, ...result.calculationFilter,
+        expectedSelected: result.totals.selected, timeZone: timezone, trendMode: modelMode,
+        trendBlendLambda: modelMode === "blend" ? lambda : 0.7, forecast } };
+    } catch (cause) { return { error: errorText(cause) }; }
+  }, [result, settingsStatus, modelMode, modelBend, modelForecast, modelLambda, timezone]);
+  const modelKey = JSON.stringify(modelRequest);
+  const currentModelKey = useRef(modelKey); currentModelKey.current = modelKey;
+  useEffect(() => {
+    if (!active || !modelRequest?.request) return;
+    const controller = new AbortController();
+    const request = modelRequest.request;
+    const timer = window.setTimeout(() => {
+      void fetchSetupsProjection(request, controller.signal).then((value) => {
+        if (!controller.signal.aborted && currentModelKey.current === modelKey) setModelState({ key: modelKey, value, error: null });
+      }).catch((cause) => {
+        if (!controller.signal.aborted && currentModelKey.current === modelKey) setModelState({ key: modelKey, value: null, error: errorText(cause) });
+      });
+    }, 250);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [modelRequest, modelKey, active]);
+  const projection = modelState?.key === modelKey ? modelState.value : null;
+  const modelError = modelRequest?.error ?? (modelState?.key === modelKey ? modelState.error : null)
+    ?? (projection?.availability.status === "unavailable" ? projection.availability.reason : null);
+  const modelLabel = shared.settings?.trendMode === "mean" ? "Модель M · среднее"
+    : `${shared.settings?.trendMode === "blend" ? `Модель B · смесь M/F, λ ${shared.settings.trendBlendLambda ?? "0.7"}` : "Модель F"} · ${shared.settings?.forecast?.method === "decayed_probability" ? "Вероятность TP с памятью" : "Тренд дневной суммы R"}`;
 
   return <section aria-label="Аналитика выпущенных сетапов" className="grid min-w-0 gap-4">
     <Card>
@@ -729,6 +795,7 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
       {algorithmId !== "" && <Button variant="outline" disabled={studiesState === "loading"} onClick={() => setStudiesRevision((value) => value + 1)}>Повторить загрузку исследований</Button>}
     </Alert>}
     {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
+    <div className="flex min-w-0 justify-end"><SharedForecastControls /></div>
     {running && <Spinner label="Выполняется расчёт исходов сетапов…" />}
     {result && <Card>
       <CardContent className="grid gap-4">
@@ -739,12 +806,20 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
             <p data-testid="setups-analytics-mean" className={`text-4xl font-semibold tabular-nums ${meanColorClass(result.totals.meanR)}`}>{formatRisk(result.totals.meanR)}</p>
             <p className="text-xs text-muted-foreground">закрытых сделок: {result.totals.closed}</p>
           </div>
+          <div className="text-warning" aria-label="Текущая модельная оценка">
+            <p className="text-sm">{modelLabel}</p>
+            <p data-testid="setups-model-summary" className="text-2xl font-semibold tabular-nums">{formatRisk(projection?.availability.status === "available" ? projection.decisionR : null)}</p>
+            {projection !== null && <p className="text-xs">На {localTime(projection.nowUnix)} · фактическое M не изменяется</p>}
+          </div>
           <div className="flex flex-col items-start gap-1">
             <span className="text-xs text-muted-foreground">Прошли гейт / выбрано</span>
             <GateBadge passed={result.totals.gatePassed} selected={result.totals.selected} />
           </div>
         </div>
-        <DailyOutcomesChart setups={result.setups} range={result.range} />
+        {modelError && <p role="status" className="text-sm text-warning">Модель недоступна: {modelError}</p>}
+        {modelRequest?.request && modelState?.key !== modelKey && <p role="status" className="text-xs text-muted-foreground">Загрузка модели готового снимка…</p>}
+        <p className="text-xs text-muted-foreground">Точки — дневные средние закрытых сделок. Прямая/перегиб обучаются сервером на дневной сумме R, не на средних точках и не на текущей странице таблицы. Вероятность TP с памятью использует общий evaluator. Изменение модели не обновляет исходы, End или cutoff.</p>
+        <DailyOutcomesChart setups={result.setups} range={result.range} projection={projection} modelLabel={modelLabel} />
         {result.studies.length > 0 && <div className="grid gap-2">
           <h3 className="text-sm font-semibold text-muted-foreground">Исследования-основы</h3>
           <div className="overflow-x-auto rounded-md border border-input/60">
@@ -753,19 +828,30 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
                 <TableRow className="hover:bg-transparent">
                   <TableHead>Исследование</TableHead>
                   <TableHead>Прошли гейт / выбрано</TableHead>
-                  <TableHead numeric>Матожидание</TableHead>
+                  <TableHead numeric>Лучший Score</TableHead>
+                  <TableHead numeric>Лучший прогноз</TableHead>
+                  <TableHead numeric>Матожидание факт</TableHead>
+                  <TableHead>Лучшая ячейка</TableHead>
+                  <TableHead>Статус</TableHead>
                   <TableHead numeric>Закрытых</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {result.studies.map((study) => <TableRow key={study.studyId}>
+                {result.studies.map((study) => {
+                  const meta = result.studyMetadata.find((item) => item.studyId === study.studyId);
+                  const reason = meta?.metricsUnavailableReason ?? "Сохранённые метрики исследования недоступны";
+                  return <TableRow key={study.studyId}>
                   <TableCell>
                     <Button type="button" variant="outline" size="sm" aria-label={`Подробности исследования ${study.studyId}`} onClick={() => setDetailStudyId(study.studyId)}>#{study.studyId}</Button>
                   </TableCell>
                   <TableCell><GateBadge passed={study.gatePassed} selected={study.selected} /></TableCell>
-                  <TableCell numeric className={`font-medium ${meanColorClass(study.meanR)}`}>{formatRisk(study.meanR)}</TableCell>
+                  <TableCell numeric title={reason}>{meta?.bestScore == null ? "—" : formatRisk(meta.bestScore)}</TableCell>
+                  <TableCell numeric title="Чистый F лучшей forecast-ячейки; не выбранная ячейка другого objective">{formatRisk(meta?.forecastBest?.forecastR ?? null)}</TableCell>
+                  <TableCell numeric className={`font-medium ${meanColorClass(study.meanR)}`}>{formatRisk(study.meanR)} <Badge variant="warning" aria-label={`Факт: ${study.closed} закрытых из ${study.selected} выбранных`}>{study.closed}/{study.selected}</Badge></TableCell>
+                  <TableCell title={meta?.bestCell ? "Исходная рекомендованная TP/SL-пара выбранного objective и её сырой R, не robust rank" : reason}>{meta?.bestCell ? `TP ${meta.bestCell.tpPct}% / SL ${meta.bestCell.slPct}% · ${formatRisk(meta.bestCell.rawR)}` : "—"}</TableCell>
+                  <TableCell><StudyStatusBadge status={meta?.status} /></TableCell>
                   <TableCell numeric><Badge variant="warning">{study.closed}/{study.gatePassed}</Badge></TableCell>
-                </TableRow>)}
+                </TableRow>; })}
               </TableBody>
             </Table>
           </div>

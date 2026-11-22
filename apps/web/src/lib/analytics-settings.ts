@@ -18,23 +18,26 @@ export interface AnalyticsUserSettings {
   sections: Partial<Record<AnalyticsSectionKey, Record<string, unknown>>>;
 }
 
-export async function fetchAnalyticsSettings(): Promise<AnalyticsUserSettings | null> {
-  const response = await apiFetch("/v1/settings/web-analytics");
+export async function fetchAnalyticsSettings(signal?: AbortSignal): Promise<AnalyticsUserSettings | null> {
+  const response = await apiFetch("/v1/settings/web-analytics", signal ? { signal } : {});
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 120)}`);
   const body = (await response.json()) as { settings: Record<string, unknown> | null };
   const raw = body.settings;
   if (raw === null || typeof raw !== "object" || Object.keys(raw).length === 0) return null;
   const partial = raw as Partial<AnalyticsUserSettings>;
+  const forecast = restoreForecastRecipeDraft(partial.forecast);
   return {
+    ...raw,
     setId: typeof partial.setId === "string" && partial.setId !== "" ? partial.setId : null,
     clusterize: partial.clusterize !== false,
     maturity: typeof partial.maturity === "number" && Number.isFinite(partial.maturity) ? partial.maturity : 0.5,
     clusterGapInput: typeof partial.clusterGapInput === "string" && partial.clusterGapInput !== "" ? partial.clusterGapInput : "8",
     autoCalc: partial.autoCalc === true,
-    trendBendDays: partial.trendBendDays === "7" || partial.trendBendDays === "14" || partial.trendBendDays === "30" ? partial.trendBendDays : "linear",
+    trendBendDays: forecast?.method === "trend" ? forecast.bendDays
+      : partial.trendBendDays === "7" || partial.trendBendDays === "14" || partial.trendBendDays === "30" ? partial.trendBendDays : "linear",
     trendMode: partial.trendMode === "forecast" || partial.trendMode === "blend" ? partial.trendMode : "mean",
     trendBlendLambda: typeof partial.trendBlendLambda === "string" || typeof partial.trendBlendLambda === "number" ? String(partial.trendBlendLambda) : "0.7",
-    forecast: restoreForecastRecipeDraft(partial.forecast),
+    forecast,
     sections: partial.sections !== null && typeof partial.sections === "object" ? partial.sections : {},
   };
 }

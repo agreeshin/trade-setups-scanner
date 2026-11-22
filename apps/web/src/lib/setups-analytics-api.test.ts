@@ -103,3 +103,22 @@ it("rejects malformed payloads", async () => {
   vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(json({ setups: [{ id: 1, status: "unknown" }] }))));
   await expect(fetchSetupsAnalytics("a", 1, 2, null)).rejects.toThrow(SetupsAnalyticsApiError);
 });
+
+it("retains compact saved scalar metrics and a valid calculated-cohort snapshot without matrix/detail reads", async () => {
+  const meta = { ...studyMeta, bestScore: 0.99, forecastBest: { tpPct: 30, slPct: 2, forecastR: 1.9, meanR: 0.1 }, bestCell: { tpPct: 14, slPct: 4, rawR: -0.3 } };
+  const snapshot = { snapshotId: 9, observationCutoff: 1200, fingerprint: "a".repeat(64) };
+  vi.stubGlobal("fetch", vi.fn((path: string) => Promise.resolve(json(path.includes("/studies?") ? { studies: [meta] } : { ...result, snapshot }))));
+  expect((await fetchSetupsAnalyticsStudies("a", 1, 2))[0]).toEqual(meta);
+  expect((await fetchSetupsAnalytics("a", 1, 2, null)).snapshot).toEqual(snapshot);
+  expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+});
+
+it("keeps unavailable saved metrics nullable and rejects malformed additive fields rather than guessing defaults", async () => {
+  const nullable = { ...studyMeta, bestScore: null, forecastBest: null, bestCell: null };
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(json({ studies: [nullable] }))));
+  expect((await fetchSetupsAnalyticsStudies("a", 1, 2))[0]).toEqual(nullable);
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(json({ studies: [{ ...studyMeta, bestCell: { tpPct: 14, slPct: 4 } }] }))));
+  await expect(fetchSetupsAnalyticsStudies("a", 1, 2)).rejects.toThrow(SetupsAnalyticsApiError);
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(json({ ...result, snapshot: { snapshotId: 9, observationCutoff: 1201, fingerprint: "bad" } }))));
+  await expect(fetchSetupsAnalytics("a", 1, 2, null)).rejects.toThrow(SetupsAnalyticsApiError);
+});

@@ -35,14 +35,13 @@ import {
   type TradeRow,
 } from "../lib/analytics-api";
 import {
-  fetchAnalyticsSettings,
-  saveAnalyticsSettings,
   type AnalyticsSectionKey,
   type AnalyticsUserSettings,
 } from "../lib/analytics-settings";
+import { updateSharedAnalyticsSettings, useSharedAnalyticsSettings } from "../lib/analytics-settings-store";
 import { effectiveTimezone, formatUnix, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
 import { buildDailyExpectancy, buildDailyExpectancyModel, type DailyExpectancyPoint } from "../lib/daily-expectancy";
-import { buildForecastRecipe, forecastRecipeLabel, initialForecastRecipeDraft, type ForecastRecipeDraft } from "../lib/forecast-recipe";
+import { buildForecastRecipe, forecastRecipeLabel, type ForecastRecipeDraft } from "../lib/forecast-recipe";
 import { buildObservedForecastDays } from "../lib/forecast-observations";
 import type { ForecastCurveRequest } from "../lib/forecast-api";
 import { isTrendBlendLambda } from "../lib/optimization-api";
@@ -850,12 +849,13 @@ type AnalyticsSection = "short" | "long" | "cache";
 
 export function AnalyticsPage() {
   useSyncExternalStore(subscribeInterfaceSettings, interfaceSettings, interfaceSettings);
+  const sharedSettings = useSharedAnalyticsSettings();
+  const settingsState = sharedSettings.status === "idle" ? "loading" : sharedSettings.status;
+  const settingsError = sharedSettings.error;
+  const saveStatus = sharedSettings.saveStatus;
   const [sets, setSets] = useState<AnalyticsSet[]>([]);
   const [setsState, setSetsState] = useState<"loading" | "ready" | "error">("loading");
-  const [settingsState, setSettingsState] = useState<"loading" | "ready" | "error">("loading");
-  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [savedSettings, setSavedSettings] = useState<AnalyticsUserSettings | null>(null);
-  const [saveStatus, setSaveStatus] = useState<"idle" | "saved" | "error">("idle");
   const [setId, setSetId] = useState("");
   const [section, setSection] = useState<AnalyticsSection>("short");
   const [clusterize, setClusterize] = useState(true);
@@ -863,71 +863,53 @@ export function AnalyticsPage() {
   const [maturityDraft, setMaturityDraft] = useState(0.5);
   const [maturity, setMaturity] = useState(0.5);
   const [autoCalc, setAutoCalc] = useState(false);
-  const [trendBendDays, setTrendBendDays] = useState<TrendBendDays>("linear");
-  const [trendMode, setTrendMode] = useState<TrendMode>("mean");
-  const [forecast, setForecast] = useState<ForecastRecipeDraft | undefined>(initialForecastRecipeDraft);
-  const [trendBlendLambda, setTrendBlendLambda] = useState("0.7");
+  const trendBendDays = sharedSettings.settings?.trendBendDays ?? "linear";
+  const trendMode = sharedSettings.settings?.trendMode ?? "mean";
+  const forecast = sharedSettings.settings?.forecast;
+  const trendBlendLambda = sharedSettings.settings?.trendBlendLambda ?? "0.7";
   // One frozen cutoff for all matrix cells and the supplied-outcome graph scope.
   const [observationCutoff, setObservationCutoff] = useState(() => Math.floor(Date.now() / 1000));
   const [runToken, setRunToken] = useState(0);
   const sectionsRef = useRef<Partial<Record<AnalyticsSectionKey, Record<string, unknown>>>>({});
+  const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    void Promise.all([
-      fetchAnalyticsSets().catch(() => null),
-      fetchAnalyticsSettings().then((settings) => ({ settings, error: null as string | null })).catch((cause: unknown) => ({ settings: null, error: cause instanceof Error ? cause.message : "ошибка загрузки" })),
-    ]).then(([items, settingsResult]) => {
+    void fetchAnalyticsSets().then((items) => {
       if (cancelled) return;
-      const { settings } = settingsResult;
-      if (items !== null) {
-        setSets(items);
-        setSetsState("ready");
-        setSetId((current) => {
-          if (current !== "") return current;
-          const savedId = settings?.setId ?? null;
-          if (savedId !== null && items.some((set) => set.setId === savedId)) return savedId;
-          return items.length > 0 ? (items[0]!.setId) : current;
-        });
-      } else {
-        setSetsState("error");
-      }
-      if (settings !== null) {
-        setClusterize(settings.clusterize);
-        setMaturityDraft(settings.maturity);
-        setMaturity(settings.maturity);
-        setClusterGapInput(settings.clusterGapInput);
-        setAutoCalc(settings.autoCalc);
-        setTrendBendDays(settings.forecast?.method === "trend" ? settings.forecast.bendDays : settings.trendBendDays);
-        setTrendMode(settings.trendMode);
-        setForecast(settings.forecast);
-        setTrendBlendLambda(settings.trendBlendLambda ?? "0.7");
-      }
-      setSavedSettings(settings);
-      setSettingsError(settingsResult.error);
-      setSettingsState(settingsResult.error ? "error" : "ready");
-      if (settings?.autoCalc === true) setRunToken(1);
-    });
+      setSets(items); setSetsState("ready");
+    }).catch(() => { if (!cancelled) setSetsState("error"); });
     return () => { cancelled = true; };
   }, []);
+
+  const settings = sharedSettings.settings;
+  // Seed once before mounting section forms. Keep-alive forecast edits thereafter
+  // come directly from the shared owner, never from this bootstrap snapshot.
+  if (!hydrated && settingsState === "ready" && settings !== null && setsState !== "loading") {
+    setSetId(settings.setId !== null && sets.some((item) => item.setId === settings.setId) ? settings.setId : sets[0]?.setId ?? "");
+    setClusterize(settings.clusterize);
+    setMaturityDraft(settings.maturity);
+    setMaturity(settings.maturity);
+    setClusterGapInput(settings.clusterGapInput);
+    setAutoCalc(settings.autoCalc);
+    setSavedSettings(settings);
+    if (settings.autoCalc) setRunToken(1);
+    setHydrated(true);
+  }
 
   const reportShortMatrix = useCallback((snapshot: Record<string, unknown>) => { sectionsRef.current["short-matrix"] = snapshot; }, []);
   const reportShortTrades = useCallback((snapshot: Record<string, unknown>) => { sectionsRef.current["short-trades"] = snapshot; }, []);
   const reportLongMatrix = useCallback((snapshot: Record<string, unknown>) => { sectionsRef.current["long-matrix"] = snapshot; }, []);
   const reportLongTrades = useCallback((snapshot: Record<string, unknown>) => { sectionsRef.current["long-trades"] = snapshot; }, []);
 
-  const collectSettings = useCallback((): AnalyticsUserSettings => ({
+  const collectSettings = useCallback((): Partial<AnalyticsUserSettings> => ({
     setId: setId === "" ? null : setId,
     clusterize,
     maturity,
     clusterGapInput,
     autoCalc,
-    trendBendDays,
-    trendMode,
-    forecast,
-    trendBlendLambda,
     sections: { ...sectionsRef.current },
-  }), [setId, clusterize, maturity, clusterGapInput, autoCalc, trendBendDays, trendMode, forecast, trendBlendLambda]);
+  }), [setId, clusterize, maturity, clusterGapInput, autoCalc]);
   const collectRef = useRef(collectSettings);
   useEffect(() => { collectRef.current = collectSettings; }, [collectSettings]);
 
@@ -941,9 +923,7 @@ export function AnalyticsPage() {
     if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
     commitTimerRef.current = window.setTimeout(() => {
       commitTimerRef.current = null;
-      void saveAnalyticsSettings(collectRef.current())
-        .then(() => setSaveStatus("saved"))
-        .catch(() => setSaveStatus("error"));
+      updateSharedAnalyticsSettings(collectRef.current(), 0);
       if (matrixRelevant && collectRef.current().autoCalc) setRunToken((token) => token + 1);
     }, 800);
   }, []);
@@ -965,7 +945,7 @@ export function AnalyticsPage() {
     <PageSidebar label="Подразделы аналитики" value={section} onValueChange={setSection} items={[
       { id: "short", label: "SHORT" }, { id: "long", label: "LONG" }, { id: "cache", label: "Кеш" },
     ]}>
-    <fieldset disabled={settingsState !== "ready"} className="grid min-w-0 gap-4">
+    <fieldset disabled={settingsState !== "ready" || !hydrated} className="grid min-w-0 gap-4">
         <div className="grid gap-3">
           <h3 className="text-sm font-semibold text-muted-foreground">Набор и параметры запуска</h3>
           <div className="flex flex-wrap items-end gap-3">
@@ -973,7 +953,7 @@ export function AnalyticsPage() {
               {(control) => (
                 <Select {...control} value={setId} disabled={setsState !== "ready"} onChange={(event) => { setSetId(event.target.value); onSettingsCommit(); }}>
                   {sets.length === 0 && <option value="">Нет завершённых запусков</option>}
-                  {sets.map((set) => <option key={set.setId} value={set.setId}>{set.label}</option>)}
+                  {hydrated && sets.map((set) => <option key={set.setId} value={set.setId}>{set.label}</option>)}
                 </Select>
               )}
             </Field>
@@ -1036,11 +1016,11 @@ export function AnalyticsPage() {
           <div className="flex items-center gap-2"><h3 className="text-sm font-semibold text-muted-foreground">Матожидание и модель прогноза</h3>
           <InfoNote>Режим mean по умолчанию. Среднее M, чистый прогноз F и decisionR смеси различаются. Probability использует только наблюдавшиеся TP/SL и единый cutoff C; за C продолжение плоское. Прежний trend доступен отдельно для сравнения; его fitted endpoint не является probability-моделью или третьей компонентой смеси. Ретроспективная кривая не доказывает OOS-качество.</InfoNote></div>
           <AnalyticsTrendControls mode={trendMode} bend={trendBendDays}
-            forecast={forecast} onForecastChange={(next) => { setForecast(next); if (next.method === "trend") setTrendBendDays(next.bendDays); onSettingsCommit(); }}
-            onBlendModeChange={() => { setTrendMode("blend"); onSettingsCommit(); }} blendLambda={trendBlendLambda}
-            onBlendLambdaChange={(lambda) => { setTrendBlendLambda(lambda); onSettingsCommit(); }}
-            onModeChange={(mode) => { setTrendMode(mode); onSettingsCommit(); }}
-            onBendChange={(bend) => { setTrendBendDays(bend); onSettingsCommit(); }} />
+            forecast={forecast} onForecastChange={(next) => { updateSharedAnalyticsSettings({ forecast: next, ...(next.method === "trend" ? { trendBendDays: next.bendDays } : {}) }); onSettingsCommit(); }}
+            onBlendModeChange={() => { updateSharedAnalyticsSettings({ trendMode: "blend" }); onSettingsCommit(); }} blendLambda={trendBlendLambda}
+            onBlendLambdaChange={(lambda) => { updateSharedAnalyticsSettings({ trendBlendLambda: lambda }); onSettingsCommit(); }}
+            onModeChange={(mode) => { updateSharedAnalyticsSettings({ trendMode: mode }); onSettingsCommit(); }}
+            onBendChange={(bend) => { updateSharedAnalyticsSettings({ trendBendDays: bend }); onSettingsCommit(); }} />
           {forecast && <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
             <span>Cutoff C: {formatUnix(observationCutoff)} ({effectiveTimezone()}) · зафиксирован для матриц и модельного графика, не двигается по часам.</span>
             <Button type="button" variant="outline" onClick={() => { setObservationCutoff(Math.floor(Date.now() / 1000)); onSettingsCommit(); }}>Новый cutoff C</Button>
@@ -1054,7 +1034,7 @@ export function AnalyticsPage() {
     {setsState === "ready" && sets.length === 0 && (
       <EmptyState title="Нет наборов для аналитики" description="Аналитика работает по завершённым историческим запускам. Создайте запуск на странице «Запуски» и дождитесь его завершения." />
     )}
-    {settingsState === "ready" && (<>
+    {settingsState === "ready" && hydrated && (<>
     <PageSidebarPanel value="short">
       <MatrixSection
         trendBendDays={trendBendDays}

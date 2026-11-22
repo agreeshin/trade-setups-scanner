@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Badge } from "../components/ui/badge";
+import { SetupOutcomeBadge } from "../components/entity-status-badge";
 import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { EmptyState } from "../components/ui/empty-state";
@@ -53,7 +54,6 @@ function SetupDetailsDialog({ selection, close, restoreFocus }: { selection: { i
   </Dialog>;
 }
 
-const labels = { tp: "TP", sl: "SL", unclosed: "не закрылась", no_data: "нет данных", gate_failed: "гейт не пройден" };
 const price = (value: number | null | undefined) => value === null || value === undefined ? "—" : String(Number(value.toPrecision(6)));
 
 /** One replaceable page and one selected detail snapshot; no retained page cache. */
@@ -109,7 +109,7 @@ export function SetupHistoryTable({ filter, revision = 0 }: { filter: SetupHisto
           <TableCell className="whitespace-nowrap">{localTime(setup.closeTimeUnix)}</TableCell><TableCell numeric>{price(outcome?.entryPrice)}</TableCell><TableCell numeric>{price(outcome?.tpPrice)}</TableCell><TableCell numeric>{price(outcome?.slPrice)}</TableCell>
           <TableCell className="whitespace-nowrap">{outcome?.closeTimeUnix === null || outcome?.closeTimeUnix === undefined ? "—" : localTime(outcome.closeTimeUnix)}</TableCell><TableCell numeric>{price(outcome?.closePrice)}</TableCell>
           <TableCell numeric className={outcomeMeanClass(outcome?.riskReturn ?? null)}>{formatOutcomeRisk(outcome?.riskReturn ?? null)}</TableCell>
-          <TableCell>{outcome ? labels[outcome.status] : setup.recommendation ? "Не рассчитан / неприменимо" : "неприменимо"}</TableCell>
+          <TableCell><SetupOutcomeBadge status={outcome?.status} recommended={!!setup.recommendation} /></TableCell>
           <TableCell>{setup.recommendation?.studyId ? `№${setup.recommendation.studyId}` : "—"}</TableCell>
           <TableCell><Button id={`setup-details-${setup.id}`} variant="outline" size="sm" aria-label={`Подробности ${setup.symbol}`} onClick={() => { if (setup.id !== undefined) setSelection({ id: setup.id, symbol: setup.symbol }); }}>Подробности</Button></TableCell></TableRow>;
       })}</TableBody>

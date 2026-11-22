@@ -21,6 +21,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod forecast_view;
+mod study_metrics;
+
 const MAX_ANALYTICS_SETUPS: i64 = 5000;
 const ANALYTICS_HORIZON_MINUTES: i64 = 10_080;
 const MAX_ANALYTICS_SLOTS: usize = 64;
@@ -196,7 +199,10 @@ fn read_error() -> Response {
 }
 
 fn outcome_read_limit() -> Response {
-    error_response(StatusCode::BAD_REQUEST, "setups_outcomes_read_budget_exceeded")
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "setups_outcomes_read_budget_exceeded",
+    )
 }
 
 fn query_i64(params: &HashMap<String, String>, key: &str) -> Result<Option<i64>, Response> {
@@ -217,6 +223,7 @@ async fn load_setup_rows(
     studies: Option<&[i64]>,
     with_bounds: bool,
     q: Option<&str>,
+    snapshot_id: Option<i64>,
 ) -> Result<Vec<AnalyticsSetupRow>, Response> {
     let mut query = sqlx::QueryBuilder::new(
         "select id, exchange_code, category, symbol, algorithm_id, (extract(epoch from close_time))::bigint as close_unix, \
@@ -226,11 +233,22 @@ async fn load_setup_rows(
          and exists(select 1 from adaptive_profiles p where p.id=adaptive_slot_id and p.owner_id='admin')",
     );
     debug_assert!(!with_bounds || (from_unix.is_some() && to_unix.is_some()));
-    setups_db::runs::push_live_setup_filters(&mut query, &setups_db::runs::LiveSetupFilter {
-        algorithm_id: Some(algorithm_id.to_owned()), from_unix, to_unix,
-        studies: studies.map(<[i64]>::to_vec), q: q.map(str::to_owned),
-    });
-    query.push(" order by close_time desc, id desc limit ").push_bind(MAX_ANALYTICS_SETUPS + 1);
+    setups_db::runs::push_live_setup_filters(
+        &mut query,
+        &setups_db::runs::LiveSetupFilter {
+            algorithm_id: Some(algorithm_id.to_owned()),
+            from_unix,
+            to_unix,
+            studies: studies.map(<[i64]>::to_vec),
+            q: q.map(str::to_owned),
+        },
+    );
+    if let Some(snapshot_id) = snapshot_id {
+        query.push(" and id <= ").push_bind(snapshot_id as i32);
+    }
+    query
+        .push(" order by close_time desc, id desc limit ")
+        .push_bind(MAX_ANALYTICS_SETUPS + 1);
     let rows = query.build().fetch_all(pool).await.map_err(|_| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -350,7 +368,9 @@ pub(crate) fn parse_studies(raw: Option<&str>) -> Result<Option<Vec<i64>>, Respo
         return Ok(None);
     };
     let mut studies = Vec::new();
-    if raw.is_empty() { return Ok(Some(studies)); }
+    if raw.is_empty() {
+        return Ok(Some(studies));
+    }
     for part in raw.split(',') {
         let value = part
             .trim()
@@ -365,6 +385,22 @@ pub(crate) fn parse_studies(raw: Option<&str>) -> Result<Option<Vec<i64>>, Respo
         return Err(error_response(StatusCode::BAD_REQUEST, "invalid_query"));
     }
     Ok(Some(studies))
+}
+
+fn calculation_filter(
+    params: &HashMap<String, String>,
+) -> Result<setups_db::runs::LiveSetupFilter, Response> {
+    let mut filter = crate::batches::parse_setup_filter(params)?;
+    if filter
+        .algorithm_id
+        .as_ref()
+        .is_none_or(|id| id.trim().is_empty() || id.len() > 200)
+        || !matches!((filter.from_unix, filter.to_unix), (Some(from), Some(to)) if from < to)
+    {
+        return Err(error_response(StatusCode::BAD_REQUEST, "invalid_query"));
+    }
+    filter.studies = parse_studies(params.get("studies").map(String::as_str))?;
+    Ok(filter)
 }
 
 async fn setups_analytics(
@@ -392,40 +428,19 @@ async fn analytics_request(
     if let Err(response) = guard_auth(&state.auth, &headers, fill_missing) {
         return response;
     }
-    let algorithm_id = match params.get("algorithmId") {
-        Some(value) if !value.trim().is_empty() && value.len() <= 200 => value.clone(),
-        _ => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
-    };
-    let from_unix = match query_i64(&params, "fromUnix") {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let to_unix = match query_i64(&params, "toUnix") {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let (Some(from_unix), Some(to_unix)) = (from_unix, to_unix) else {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_query");
-    };
-    if from_unix >= to_unix {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_query");
-    }
-    let filter = match crate::batches::parse_setup_filter(&params) {
+    let filter = match calculation_filter(&params) {
         Ok(filter) => filter,
-        Err(response) => return response,
-    };
-    let studies = match parse_studies(params.get("studies").map(String::as_str)) {
-        Ok(value) => value,
         Err(response) => return response,
     };
     let rows = match load_setup_rows(
         &state.pool,
-        &algorithm_id,
-        Some(from_unix),
-        Some(to_unix),
-        studies.as_deref(),
+        filter.algorithm_id.as_deref().expect("validated algorithm"),
+        filter.from_unix,
+        filter.to_unix,
+        filter.studies.as_deref(),
         true,
         filter.q.as_deref(),
+        None,
     )
     .await
     {
@@ -460,7 +475,7 @@ async fn analytics_request(
         Ok(outcomes) => outcomes,
         Err(response) => return response,
     };
-    analytics_result(&parsed, &studies, &outcomes)
+    analytics_result(&parsed, &studies, &outcomes, cutoff)
 }
 
 fn market_read_error(symbol: &str, cause: &str) -> Response {
@@ -948,6 +963,7 @@ fn analytics_result(
     parsed: &[(AnalyticsSetupRow, ParsedRecommendation)],
     studies: &HashMap<i64, i64>,
     outcomes: &[Option<SetupOutcome>],
+    cutoff: i64,
 ) -> Response {
     let mut order: Vec<usize> = (0..parsed.len()).collect();
     order.sort_by(|left, right| {
@@ -1007,6 +1023,7 @@ fn analytics_result(
         })
         .collect();
     Json(json!({
+        "snapshot": forecast_view::snapshot(parsed, outcomes, cutoff),
         "totals": agg_json(&totals),
         "studies": per_study
             .iter()
@@ -1058,27 +1075,65 @@ async fn setups_analytics_studies(
     }
     // Aggregate in PostgreSQL and return only bounded study metadata. The 5000
     // trade cap applies to numerical calculations, not access to history/options.
-    let mut query = sqlx::QueryBuilder::new("with matched as (select id, close_time, algorithm_id, recommendation, expectancy_artifact_id, coalesce(adaptive_generation_id,(adaptive_generation_archive->>'generationId')::bigint) as generation_id from live_setups where adaptive_slot_id is not null and recommendation is not null and exists(select 1 from adaptive_profiles p where p.id=adaptive_slot_id and p.owner_id='admin')");
-    setups_db::runs::push_live_setup_filters(&mut query, &setups_db::runs::LiveSetupFilter {
-        algorithm_id: Some(algorithm_id), from_unix, to_unix, q: filter.q, studies: None,
-    });
-    query.push("), resolved as (select *, coalesce((select g.study_id from continuous_generations g where g.id=matched.generation_id), case when (recommendation->>'studyId') ~ '^[0-9]{1,18}$' then (recommendation->>'studyId')::bigint end) as study_id from matched) select distinct on(study_id) study_id, algorithm_id, recommendation->>'externalName' as external_name, count(*) over(partition by study_id)::bigint as setup_count, generation_id, expectancy_artifact_id from resolved where study_id is not null order by study_id, close_time desc, id desc limit ")
+    let mut query = sqlx::QueryBuilder::new(
+        "with matched as (select id, close_time, algorithm_id, recommendation, expectancy_artifact_id, coalesce(adaptive_generation_id,(adaptive_generation_archive->>'generationId')::bigint) as generation_id from live_setups where adaptive_slot_id is not null and recommendation is not null and exists(select 1 from adaptive_profiles p where p.id=adaptive_slot_id and p.owner_id='admin')",
+    );
+    setups_db::runs::push_live_setup_filters(
+        &mut query,
+        &setups_db::runs::LiveSetupFilter {
+            algorithm_id: Some(algorithm_id),
+            from_unix,
+            to_unix,
+            q: filter.q,
+            studies: None,
+        },
+    );
+    query.push("), resolved as (select *, coalesce((select g.study_id from continuous_generations g where g.id=matched.generation_id), case when (recommendation->>'studyId') ~ '^[0-9]{1,18}$' then (recommendation->>'studyId')::bigint end) as study_id from matched) select distinct on(study_id) study_id, algorithm_id, recommendation->>'externalName' as external_name, count(*) over(partition by study_id)::bigint as setup_count, generation_id, expectancy_artifact_id, jsonb_build_object('tpPct',recommendation->'tpPct','slPct',recommendation->'slPct','rawR',recommendation->'rawR') recommended_cell from resolved where study_id is not null order by study_id, close_time desc, id desc limit ")
         .push_bind((MAX_STUDY_OPTIONS + 1) as i64);
     let rows = match query.build().fetch_all(&state.pool).await {
         Ok(rows) => rows,
         Err(_) => return read_error(),
     };
     if rows.len() > MAX_STUDY_OPTIONS {
-        return error_response(StatusCode::BAD_REQUEST, "setups_analytics_studies_limit_exceeded");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "setups_analytics_studies_limit_exceeded",
+        );
     }
-    let items: Result<Vec<Value>, sqlx::Error> = rows.iter().map(|row| {
-        let algorithm: String = row.try_get("algorithm_id")?;
-        let external: Option<String> = row.try_get("external_name")?;
-        Ok(json!({"studyId":row.try_get::<i64,_>("study_id")?, "externalName":external.filter(|name| !name.trim().is_empty()).unwrap_or_else(|| setups_db::algorithm_name(&algorithm)),
-            "setupCount":row.try_get::<i64,_>("setup_count")?, "generationId":row.try_get::<Option<i64>,_>("generation_id")?, "artifactId":row.try_get::<Option<i64>,_>("expectancy_artifact_id")?}))
-    }).collect();
+    let ids = rows
+        .iter()
+        .map(|row| row.try_get::<i64, _>("study_id"))
+        .collect::<Result<Vec<_>, _>>();
+    let metrics = match ids {
+        Ok(ids) => match study_metrics::load(&state.pool, &ids).await {
+            Ok(metrics) => metrics,
+            Err(response) => return response,
+        },
+        Err(_) => return read_error(),
+    };
+    let items: Result<Vec<Value>, sqlx::Error> = rows
+        .iter()
+        .map(|row| {
+            let algorithm: String = row.try_get("algorithm_id")?;
+            let external: Option<String> = row.try_get("external_name")?;
+            let study_id: i64 = row.try_get("study_id")?;
+            let metric = metrics.get(&study_id);
+            let best_cell = study_metrics::best_cell(&row.try_get::<Value, _>("recommended_cell")?);
+            Ok(study_metrics::compact(
+                study_id,
+                external
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| setups_db::algorithm_name(&algorithm)),
+                row.try_get("setup_count")?,
+                row.try_get("generation_id")?,
+                row.try_get("expectancy_artifact_id")?,
+                best_cell,
+                metric,
+            ))
+        })
+        .collect();
     match items {
-        Ok(items) => Json(json!({"studies":items})).into_response(),
+        Ok(items) => study_metrics::response(items),
         Err(_) => read_error(),
     }
 }
@@ -1338,6 +1393,10 @@ pub fn setups_analytics_router(state: Arc<AnalyticsState>) -> Router {
             get(saved_setups_analytics).post(setups_analytics),
         )
         .route("/v1/setups/outcomes/refresh", post(refresh_outcomes))
+        .route(
+            "/v1/setups/analytics/forecast-view",
+            post(forecast_view::handle),
+        )
         .route(
             "/v1/setups/analytics/studies",
             get(setups_analytics_studies),
@@ -1777,7 +1836,12 @@ mod tests {
         let outcomes = calculate_outcomes(state, &parsed)
             .await
             .unwrap_or_else(|_| panic!("fixture market read failed"));
-        let response = analytics_result(&parsed, &HashMap::new(), &outcomes);
+        let response = analytics_result(
+            &parsed,
+            &HashMap::new(),
+            &outcomes,
+            chrono::Utc::now().timestamp().div_euclid(60) * 60,
+        );
         let body = axum::body::to_bytes(response.into_body(), 16_384)
             .await
             .unwrap();
