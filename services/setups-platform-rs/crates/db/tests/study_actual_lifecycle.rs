@@ -1247,6 +1247,43 @@ async fn automatic_seed(pool: &PgPool, label: &str) -> Study {
 
 #[tokio::test]
 #[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn identical_configuration_preserves_queued_automatic_identity_scan_and_due() {
+    isolated(|pool| async move {
+        let a = automatic_seed(&pool, "no-op").await;
+        enabled(&pool, "admin", "price_volume_spike").await;
+        let ticket = scheduler::next(&pool).await.unwrap().unwrap();
+        let accepted = created(auto(&pool, &ticket, &a, "automatic-no-op").await);
+        sqlx::query("update study_actual_continuous set scan_study_id=$1,scan_execution_started_at=$2,last_skip_reason='fixture_skip',next_due_at=clock_timestamp()+interval '10 minutes' where owner_id='admin' and algorithm_id='price_volume_spike'")
+            .bind(a.id).bind(ticket.candidates[0].start).execute(&pool).await.unwrap();
+        async fn snapshot(pool: &PgPool, study: i64) -> Value {
+            sqlx::query_scalar("select jsonb_build_object('settings',(select to_jsonb(c)||jsonb_build_object('rowXmin',c.xmin::text) from study_actual_continuous c where owner_id='admin' and algorithm_id='price_volume_spike'),'head',(select to_jsonb(a)||jsonb_build_object('rowXmin',a.xmin::text) from study_actualizations a where owner_id='admin' and study_id=$1))")
+                .bind(study).fetch_one(pool).await.unwrap()
+        }
+        let before = snapshot(&pool, a.id).await;
+        let revision = ticket.settings.revision;
+        for zone in ["UTC", "Etc/UTC"] {
+            assert!(matches!(scheduler::configure(&pool, "admin", "price_volume_spike", revision, true, "1970-01-01", zone).await.unwrap(), scheduler::Configure::Saved(s) if s.revision==revision));
+            assert_eq!(snapshot(&pool, a.id).await, before,
+                "no-op must preserve every settings/head field and row xmin, including populated scan/due/error state");
+        }
+        assert!(matches!(scheduler::configure(&pool, "admin", "price_volume_spike", revision-1, true, "1970-01-01", "UTC").await.unwrap(), scheduler::Configure::Conflict(_)),
+            "CAS precedes semantic no-op detection");
+        assert_eq!(snapshot(&pool, a.id).await, before);
+        let job = claim(&pool).await;
+        assert_eq!(job.job_id, "automatic-no-op");
+        assert_eq!(job.revision, accepted["revision"].as_i64().unwrap());
+        assert_eq!(job.cutoff, ticket.cutoff);
+        assert!(scheduler::ensure(&pool, "admin", "price_volume_spike").await.unwrap().cursor_study_id.is_none());
+        actual::create_batch(&pool, &job).await.unwrap().unwrap();
+        assert!(actual::finish(&pool, &job, &json!({}), &json!({})).await.unwrap());
+        let settled = scheduler::ensure(&pool, "admin", "price_volume_spike").await.unwrap();
+        assert_eq!(settled.cursor_study_id, Some(a.id));
+        assert_eq!(settled.revision, revision);
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
 async fn owner_lane_two_coordinators_manual_fifo_priority_and_atomic_terminal_cursor() {
     isolated(|pool|async move {
         let a=automatic_seed(&pool,"a").await;let b=automatic_seed(&pool,"b").await;let c=automatic_seed(&pool,"c").await;

@@ -64,16 +64,55 @@ pub fn valid_algorithm(id: &str) -> bool {
     matches!(id, "price_volume_spike" | "price_drop_volume_spike")
 }
 
-/// One resolver for API and headless runtime. Global UI settings belong to the
-/// legacy admin only; never borrow another owner's timezone. Auto/invalid => UTC.
+/// Read-only effective defaults shared by GET and durable initialization.
+/// Global UI settings belong to the legacy admin only; never borrow another
+/// owner's timezone. Auto/invalid => UTC. Capture the clock once for this view.
+async fn effective_default(
+    connection: &mut PgConnection,
+    owner: &str,
+    algorithm: &str,
+) -> Result<Settings, DbError> {
+    let row = sqlx::query("with instant as (select clock_timestamp() as now_at), zone as (select coalesce((select name from pg_timezone_names where name=(select value#>>'{interface,timezone}' from settings where key='ui' and $1='admin') and length(name)<=128),'UTC') name), d as (select name,now_at,timezone(name,now_at)::date as from_date from zone cross join instant) select name,from_date,to_timestamp(study_local_day_start(name,from_date)) from_boundary,now_at next_due_at from d")
+        .bind(owner).fetch_one(connection).await?;
+    Ok(Settings {
+        owner_id: owner.into(),
+        algorithm_id: algorithm.into(),
+        enabled: true,
+        from_date: row.try_get("from_date")?,
+        from_boundary: row.try_get("from_boundary")?,
+        time_zone: row.try_get("name")?,
+        revision: 1,
+        cursor_generation: 1,
+        cursor_study_id: None,
+        cursor_execution_started_at: None,
+        reset_pending: false,
+        next_due_at: row.try_get("next_due_at")?,
+        last_skip_reason: None,
+    })
+}
+
+/// Durable initialization belongs to explicit PUT and headless bootstrap only.
 pub async fn ensure(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Settings, DbError> {
     if !valid_algorithm(algorithm) {
         return Err(DbError::Json("invalid_algorithm_id".into()));
     }
     let mut tx = pool.begin().await?;
     crate::continuous::owner_lock(&mut tx, owner).await?;
-    sqlx::query("with zone as (select coalesce((select name from pg_timezone_names where name=(select value#>>'{interface,timezone}' from settings where key='ui' and $1='admin') and length(name)<=128),'UTC') name), d as (select name,timezone(name,clock_timestamp())::date as local_date from zone) insert into study_actual_continuous(owner_id,algorithm_id,from_date,from_boundary,time_zone) select $1,$2,local_date,to_timestamp(study_local_day_start(name,local_date)),name from d on conflict do nothing")
-        .bind(owner).bind(algorithm).execute(&mut *tx).await?;
+    if let Some(row) =
+        sqlx::query("select * from study_actual_continuous where owner_id=$1 and algorithm_id=$2")
+            .bind(owner)
+            .bind(algorithm)
+            .fetch_optional(&mut *tx)
+            .await?
+    {
+        let settings = decode(&row)?;
+        tx.commit().await?;
+        return Ok(settings);
+    }
+    let defaults = effective_default(&mut tx, owner, algorithm).await?;
+    sqlx::query("insert into study_actual_continuous(owner_id,algorithm_id,from_date,from_boundary,time_zone,next_due_at) values($1,$2,$3,$4,$5,$6) on conflict do nothing")
+        .bind(owner).bind(algorithm).bind(defaults.from_date).bind(defaults.from_boundary)
+        .bind(defaults.time_zone).bind(defaults.next_due_at).execute(&mut *tx).await?;
     let r =
         sqlx::query("select * from study_actual_continuous where owner_id=$1 and algorithm_id=$2")
             .bind(owner)
@@ -143,6 +182,12 @@ pub async fn configure(
     // Preserve the absolute boundary if only enablement changes, even when UI
     // timezone changed. A date edit explicitly normalizes a new boundary.
     let changed_date = old.from_date != day;
+    if !changed_date && old.enabled == enabled {
+        // A same-date save retains the effective stored timezone/boundary.
+        // No semantic edit means no new fence, scan reset, or due-time churn.
+        tx.commit().await?;
+        return Ok(Configure::Saved(old));
+    }
     let r=sqlx::query("update study_actual_continuous set enabled=$3,from_date=$4,from_boundary=case when $6 then to_timestamp(study_local_day_start($5,$4)) else from_boundary end,time_zone=case when $6 then $5 else time_zone end,config_revision=config_revision+1,cursor_generation=cursor_generation+case when $6 then 1 else 0 end,cursor_study_id=case when $6 then null else cursor_study_id end,cursor_execution_started_at=case when $6 then null else cursor_execution_started_at end,reset_pending=reset_pending or $6,scan_study_id=null,scan_execution_started_at=null,next_due_at=clock_timestamp(),last_skip_reason=null,updated_at=clock_timestamp() where owner_id=$1 and algorithm_id=$2 returning *")
         .bind(owner).bind(algorithm).bind(enabled).bind(day).bind(zone).bind(changed_date).fetch_one(&mut *tx).await?;
     // Running remains fenced to its own revision and may publish. Stale queued
@@ -153,9 +198,23 @@ pub async fn configure(
 }
 
 pub async fn state(pool: &PgPool, owner: &str, algorithm: &str) -> Result<Value, DbError> {
-    let settings = ensure(pool, owner, algorithm).await?;
+    if !valid_algorithm(algorithm) {
+        return Err(DbError::Json("invalid_algorithm_id".into()));
+    }
+    let mut connection = pool.acquire().await?;
+    let existing =
+        sqlx::query("select * from study_actual_continuous where owner_id=$1 and algorithm_id=$2")
+            .bind(owner)
+            .bind(algorithm)
+            .fetch_optional(&mut *connection)
+            .await?;
+    let settings = if let Some(row) = existing {
+        decode(&row)?
+    } else {
+        effective_default(&mut connection, owner, algorithm).await?
+    };
     let queue:Value=sqlx::query_scalar("select jsonb_build_object('manualQueued',count(*) filter(where status='queued' and request_origin='manual'),'automaticQueued',count(*) filter(where status='queued' and request_origin='automatic'),'running', (select jsonb_build_object('studyId',study_id,'jobId',job_id,'requestOrigin',request_origin,'status',status,'algorithmId',source->>'algorithmId') from study_actualizations where owner_id=$1 and status='running' order by queue_sequence limit 1)) from study_actualizations where owner_id=$1 and status in ('queued','running')")
-        .bind(owner).fetch_one(pool).await?;
+        .bind(owner).fetch_one(&mut *connection).await?;
     let mut result = serde_json::to_value(settings).map_err(crate::json_error)?;
     result["queue"] = queue;
     Ok(result)

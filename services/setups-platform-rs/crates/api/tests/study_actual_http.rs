@@ -249,6 +249,127 @@ async fn continuous_http_strict_revision_validation_readonly_get_and_browser_mut
 
 #[tokio::test]
 #[ignore = "requires isolated local TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn missing_continuous_get_is_select_only_concurrent_and_put_can_initialize() {
+    isolated(|pool| async move {
+        let start = chrono::Utc::now().timestamp().div_euclid(60) * 60 - 600;
+        let id = seed(&pool, start).await;
+        let (_app, state, market, server) = fixture(&pool, start).await;
+        sqlx::query("delete from study_actual_continuous").execute(&pool).await.unwrap();
+        setups_db::settings_set(&pool, "ui", &json!({"interface":{"timezone":"Asia/Kathmandu"}})).await.unwrap();
+        let readonly = PgPoolOptions::new().max_connections(3)
+            .connect_with((*pool.connect_options()).clone().options([("default_transaction_read_only", "on")])).await.unwrap();
+        let app = study_actual_router(Arc::new(ReplayState {
+            pool: readonly.clone(), auth: state.auth.clone(), market_url: state.market_url.clone(),
+            market_key: state.market_key.clone(), limits: state.limits,
+        }));
+        let url = "/v1/optimization-studies/actual/continuous?algorithmId=price_volume_spike";
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("select pg_advisory_xact_lock(hashtextextended('admin',72423415))").execute(&mut *held).await.unwrap();
+        let before = chrono::Utc::now();
+        let responses = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(http(&app, "GET", url), http(&app, "GET", url))
+        }).await;
+        held.rollback().await.unwrap();
+        let ((left_status, left), (right_status, right)) = responses.expect("GET must not acquire the owner mutation lock");
+        let after = chrono::Utc::now();
+        for (status, response) in [(left_status, &left), (right_status, &right)] {
+            assert_eq!(status, StatusCode::OK, "read-only PostgreSQL session must accept GET: {response}");
+            assert_eq!(response["algorithmId"], "price_volume_spike");
+            assert_eq!(response["enabled"], true);
+            assert_eq!(response["revision"], 1);
+            assert_eq!(response["cursorGeneration"], 1);
+            assert_eq!(response["resetPending"], false);
+            assert!(response["cursorStudyId"].is_null());
+            assert!(response["cursorExecutionStartedAt"].is_null());
+            assert!(response["lastSkipReason"].is_null());
+            assert_eq!(response["timeZone"], "Asia/Kathmandu");
+            assert_eq!(response["queue"], json!({"manualQueued":0,"automaticQueued":0,"running":null}));
+            let due = chrono::DateTime::parse_from_rfc3339(response["nextDueAt"].as_str().unwrap()).unwrap().with_timezone(&chrono::Utc);
+            assert!(due >= before && due <= after);
+        }
+        let expected: (String, chrono::DateTime<chrono::Utc>) = sqlx::query_as("select timezone('Asia/Kathmandu',clock_timestamp())::date::text,to_timestamp(study_local_day_start('Asia/Kathmandu',timezone('Asia/Kathmandu',clock_timestamp())::date))").fetch_one(&pool).await.unwrap();
+        assert_eq!(left["fromDate"], expected.0);
+        assert_eq!(left["fromBoundary"], json!(expected.1));
+        let mut left_stable = left.clone();let mut right_stable = right.clone();
+        left_stable.as_object_mut().unwrap().remove("nextDueAt");right_stable.as_object_mut().unwrap().remove("nextDueAt");
+        assert_eq!(left_stable, right_stable, "concurrent reads resolve the same effective defaults");
+        for zone in ["auto", "invalid/zone"] {
+            setups_db::settings_set(&pool, "ui", &json!({"interface":{"timezone":zone}})).await.unwrap();
+            let (status, fallback) = http(&app, "GET", url).await;
+            assert_eq!(status, StatusCode::OK);assert_eq!(fallback["timeZone"], "UTC");
+        }
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from study_actual_continuous").fetch_one(&pool).await.unwrap(), 0);
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from study_actualizations").fetch_one(&pool).await.unwrap(), 0);
+        assert_eq!(market.calls.load(Ordering::SeqCst), 0);
+        let write_app = study_actual_router(state.clone());
+        assert_eq!(http(&write_app, "POST", &format!("/v1/optimization-studies/{id}/actual/refresh")).await.0, StatusCode::ACCEPTED);
+        let queued: Value = sqlx::query_scalar("select to_jsonb(a) from study_actualizations a where study_id=$1").bind(id).fetch_one(&pool).await.unwrap();
+        let (status, queued_view) = http(&app, "GET", url).await;
+        assert_eq!(status, StatusCode::OK);assert_eq!(queued_view["queue"], json!({"manualQueued":1,"automaticQueued":0,"running":null}));
+        assert_eq!(sqlx::query_scalar::<_, Value>("select to_jsonb(a) from study_actualizations a where study_id=$1").bind(id).fetch_one(&pool).await.unwrap(), queued);
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from study_actual_continuous").fetch_one(&pool).await.unwrap(), 0);
+        let job = db::claim(&pool, 2).await.unwrap().unwrap();
+        let running: Value = sqlx::query_scalar("select to_jsonb(a) from study_actualizations a where study_id=$1").bind(id).fetch_one(&pool).await.unwrap();
+        let (status, running_view) = http(&app, "GET", url).await;
+        assert_eq!(status, StatusCode::OK);assert_eq!(running_view["queue"]["manualQueued"], 0);
+        assert_eq!(running_view["queue"]["running"]["jobId"], job.job_id);
+        assert_eq!(running_view["queue"]["running"]["requestOrigin"], "manual");
+        assert_eq!(sqlx::query_scalar::<_, Value>("select to_jsonb(a) from study_actualizations a where study_id=$1").bind(id).fetch_one(&pool).await.unwrap(), running);
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from study_actual_continuous").fetch_one(&pool).await.unwrap(), 0);
+        db::fail(&pool, &job, "fixture_manual_terminal").await.unwrap();
+        let terminal: Value = sqlx::query_scalar("select to_jsonb(a) from study_actualizations a where study_id=$1").bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(market.calls.load(Ordering::SeqCst), 0);
+        readonly.close().await;
+        setups_db::settings_set(&pool, "ui", &json!({"interface":{"timezone":"Asia/Kathmandu"}})).await.unwrap();
+        let app = study_actual_router(state);
+        let (status, saved) = http_body(&app, "PUT", url, json!({"enabled":true,"fromDate":left["fromDate"],"timeZone":left["timeZone"],"revision":left["revision"]})).await;
+        assert_eq!(status, StatusCode::OK, "virtual revision 1 must be usable by explicit initializing PUT: {saved}");
+        assert_eq!(saved["revision"], 1, "initializing identical defaults needs no extra settings revision");
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from study_actual_continuous").fetch_one(&pool).await.unwrap(), 1);
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from study_actualizations").fetch_one(&pool).await.unwrap(), 1);
+        assert_eq!(sqlx::query_scalar::<_, Value>("select to_jsonb(a) from study_actualizations a where study_id=$1").bind(id).fetch_one(&pool).await.unwrap(), terminal);
+        assert_eq!(market.calls.load(Ordering::SeqCst), 0);
+        market.stop.cancel();server.abort();let _ = server.await;
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated local TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn identical_continuous_put_preserves_queued_auto_and_terminal_cursor() {
+    isolated(|pool| async move {
+        let start = chrono::Utc::now().timestamp().div_euclid(60) * 60 - 600;
+        let id = seed(&pool, start).await;
+        let (app, state, market, server) = fixture(&pool, start).await;
+        assert_eq!(http(&app, "POST", &format!("/v1/optimization-studies/{id}/actual/refresh")).await.0, StatusCode::ACCEPTED);
+        let source: Value = sqlx::query_scalar("select source from study_actualizations where study_id=$1").bind(id).fetch_one(&pool).await.unwrap();
+        let prime = db::claim(&pool, 2).await.unwrap().unwrap();db::fail(&pool, &prime, "prime_source").await.unwrap();
+        let url = "/v1/optimization-studies/actual/continuous?algorithmId=price_volume_spike";
+        let (_, old) = http(&app, "GET", url).await;
+        assert_eq!(http_body(&app, "PUT", url, json!({"enabled":true,"fromDate":"1970-01-01","timeZone":"UTC","revision":old["revision"]})).await.0, StatusCode::OK);
+        let ticket = db::continuous::next(&pool).await.unwrap().unwrap();
+        let accepted = db::continuous::admit(&pool, &ticket, db::Request {
+            owner: "admin", study: id, job: "http-automatic-no-op", start: chrono::DateTime::from_timestamp(start, 0).unwrap(), cutoff: ticket.cutoff,
+            source: &source, identity: source["sourceIdentity"].as_str().unwrap(), work: 1500, limits: &state.limits,
+        }).await.unwrap();
+        let db::Admission::Created(accepted) = accepted else {panic!("automatic admission rejected: {accepted:?}");};
+        let (_, settings) = http(&app, "GET", url).await;
+        let before: Value = sqlx::query_scalar("select jsonb_build_object('settings',(select to_jsonb(c)||jsonb_build_object('rowXmin',c.xmin::text) from study_actual_continuous c where owner_id='admin' and algorithm_id='price_volume_spike'),'head',(select to_jsonb(a)||jsonb_build_object('rowXmin',a.xmin::text) from study_actualizations a where study_id=$1))").bind(id).fetch_one(&pool).await.unwrap();
+        let (status, saved) = http_body(&app, "PUT", url, json!({"enabled":settings["enabled"],"fromDate":settings["fromDate"],"timeZone":settings["timeZone"],"revision":settings["revision"]})).await;
+        assert_eq!(status, StatusCode::OK);assert_eq!(saved, settings);
+        let after: Value = sqlx::query_scalar("select jsonb_build_object('settings',(select to_jsonb(c)||jsonb_build_object('rowXmin',c.xmin::text) from study_actual_continuous c where owner_id='admin' and algorithm_id='price_volume_spike'),'head',(select to_jsonb(a)||jsonb_build_object('rowXmin',a.xmin::text) from study_actualizations a where study_id=$1))").bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(after, before, "identical PUT cannot rewrite settings or the accepted automatic head");
+        let job = db::claim(&pool, 2).await.unwrap().unwrap();
+        assert_eq!(job.job_id, "http-automatic-no-op");assert_eq!(job.revision, accepted["revision"].as_i64().unwrap());assert_eq!(job.cutoff, ticket.cutoff);
+        assert!(db::continuous::state(&pool, "admin", "price_volume_spike").await.unwrap()["cursorStudyId"].is_null());
+        db::fail(&pool, &job, "fixture_terminal").await.unwrap();
+        assert_eq!(db::continuous::state(&pool, "admin", "price_volume_spike").await.unwrap()["cursorStudyId"], id);
+        assert_eq!(market.calls.load(Ordering::SeqCst), 0);
+        market.stop.cancel();server.abort();let _ = server.await;
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated local TEST_DATABASE_URL ending _test with CREATEDB"]
 async fn headless_default_automatic_runtime_skips_invalid_source_and_reports_canonical_origin() {
     isolated(|pool|async move {
     let start=chrono::Utc::now().timestamp().div_euclid(60)*60-600;let invalid=seed(&pool,start).await;let valid=seed(&pool,start).await;
