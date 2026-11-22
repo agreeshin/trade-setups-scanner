@@ -109,7 +109,7 @@ async fn calendar(
     let (Some(first), Some(last)) = (entries.iter().min(), entries.iter().max()) else {
         return Ok(Vec::new());
     };
-    let days = sqlx::query("with bounds as (select timezone($1,to_timestamp($2))::date lo, timezone($1,to_timestamp($3))::date hi), days as (select lo+i as day from bounds cross join lateral generate_series(0,case when hi-lo <= 3660 then hi-lo else 3661 end) i) select (day-date '1970-01-01')::bigint day,study_local_day_start($1,day) at,study_local_day_start($1,day+1) next from days order by day limit 3662")
+    let days = sqlx::query("with bounds as (select timezone($1,to_timestamp($2))::date lo, timezone($1,to_timestamp($3))::date hi), days as (select lo+i as day from bounds cross join lateral generate_series(0,case when hi-lo <= 3660 then hi-lo else 3661 end) i) select (day-date '1970-01-01')::bigint AS day,study_local_day_start($1,day) at,study_local_day_start($1,day+1) next from days order by day limit 3662")
         .bind(zone).bind(*first as f64).bind(*last as f64).fetch_all(pool).await.map_err(|_| read_error())?;
     if days.len() > MAX_TREND_DAYS {
         return Err(error_response(

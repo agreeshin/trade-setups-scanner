@@ -101,3 +101,9 @@ it("reports changed snapshot explicitly without retry, new calculation or outcom
   await expect(fetchSetupsProjection(request, new AbortController().signal)).rejects.toThrow("исходы снимка изменились");
   expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
 });
+
+it("reports generic HTTP failure without a presentation prefix or automatic retry", async () => {
+  stub({ error: "internal_server_error" }, 500);
+  await expect(fetchSetupsProjection(request, new AbortController().signal)).rejects.toThrow(/^HTTP 500$/);
+  expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+});

@@ -233,6 +233,106 @@ fn final_outcome(r: f64) -> Value {
         "riskReturn":r,"evaluatedAtUnix":ENTRY+120,"observedThroughUnix":ENTRY+120,"isFinal":true})
 }
 
+async fn forecast_storage(pool: &PgPool) -> Value {
+    sqlx::query_scalar(
+        "select jsonb_build_object(\
+            'setups', (select jsonb_agg(to_jsonb(l) order by id) from live_setups l), \
+            'studies', (select jsonb_agg(to_jsonb(s) order by id) from optimization_studies s), \
+            'generations', (select jsonb_agg(to_jsonb(g) order by id) from continuous_generations g), \
+            'artifacts', (select jsonb_agg(to_jsonb(a) order by id) from study_expectancy_artifacts a))",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn postgres_forecast_view_calendar_unavailable_and_user_zone_model_are_readonly() {
+    isolated(|pool| async move {
+        let slot = profile(&pool, "admin").await;
+        let spec = json!({"algorithmId":"price_volume_spike","algorithmVersion":"1.1.1",
+            "direction":"short","tpLevels":[20.0],"slLevels":[6.0]});
+        let result = json!({"best":{"score":0.3,"matrix":[{"tpPct":20.0,"slPct":6.0,
+            "riskExpectancy":0.3,"closedCount":10,"tpCount":3,"slCount":7}]}});
+        let study: i64 = sqlx::query_scalar("insert into optimization_studies(algorithm_id,status,spec,progress,result,owner_id) values('price_volume_spike','completed',$1,'{}',$2,'admin') returning id")
+            .bind(&spec).bind(&result).fetch_one(&pool).await.unwrap();
+        sqlx::query("update continuous_generations set study_id=$1,spec=$2,result=$3 where slot_id=$4")
+            .bind(study).bind(spec).bind(result).bind(slot).execute(&pool).await.unwrap();
+        let (app, market, server, _) = app(pool.clone()).await;
+        let assertions = tokio::spawn(async move {
+            let day = RAW.div_euclid(86_400) * 86_400;
+            let query = format!("algorithmId=price_volume_spike&fromUnix={day}&toUnix={}&studies={study}&q=TESTUSDT", day + 86_400);
+            for count in 1..=2 {
+                // 18:30Z and 19:30Z share a UTC date but straddle midnight in UTC+5.
+                let entry = day + 18 * 3600 + 1800 + (count - 1) * 3600;
+                let id = setup(&pool, slot, entry - 300).await;
+                let outcome = json!({"status":if count == 1 {"tp"} else {"sl"},
+                    "entryTimeUnix":entry,"entryPrice":100.0,"gateThreshold":null,
+                    "tpPrice":80.0,"slPrice":106.0,"closeTimeUnix":entry+60,
+                    "closePrice":if count == 1 {80.0} else {106.0},
+                    "riskReturn":if count == 1 {20.0/6.0} else {-1.0},
+                    "evaluatedAtUnix":entry+120,"observedThroughUnix":entry+120,"isFinal":true});
+                sqlx::query("update live_setups set trade_outcome=$1,recommendation=recommendation || jsonb_build_object('studyId',$2::bigint) where id=$3")
+                    .bind(outcome).bind(study).bind(id as i32).execute(&pool).await.unwrap();
+                let before = forecast_storage(&pool).await;
+                // Obtain the fingerprint/cutoff from the public saved-analytics flow,
+                // not from a reimplementation of the private snapshot hash.
+                let (status, saved) = request(&app, "GET", &format!("/v1/setups/analytics?{query}"), json!({})).await;
+                assert_eq!(status, StatusCode::OK, "{saved}");
+                assert_eq!(saved["totals"]["selected"], count);
+                assert_eq!(saved["totals"]["closed"], count);
+                assert_eq!(saved["snapshot"]["snapshotId"], id);
+                assert_eq!(saved["snapshot"]["fingerprint"].as_str().unwrap().len(), 64);
+                for zone in ["UTC", "Asia/Yekaterinburg"] {
+                    let body = json!({"snapshot":saved["snapshot"],"forecast":{"method":"trend","version":1,"bendDays":"linear"},
+                        "trendMode":"forecast","trendBlendLambda":0.7,"timeZone":zone});
+                    let (status, view) = request(&app, "POST", &format!("/v1/setups/analytics/forecast-view?{query}"), body).await;
+                    assert_eq!(status, StatusCode::OK, "count={count} zone={zone}: {view}");
+                    assert_eq!(view["snapshot"], saved["snapshot"]);
+                    assert_eq!(view["snapshotId"], id);
+                    assert_eq!(view["selected"], count);
+                    assert_eq!(view["closed"], count);
+                    assert_eq!(view["meanR"], saved["totals"]["meanR"]);
+                    assert_eq!(view["timeZone"], zone);
+                    assert_eq!(view["observationCutoff"], saved["snapshot"]["observationCutoff"]);
+                    assert!(view["nowUnix"].as_i64().unwrap() >= view["observationCutoff"].as_i64().unwrap());
+                    assert_eq!(view["retrospective"], true);
+                    assert_eq!(view["model"]["target"], "daily_sum_r");
+                    assert_eq!(view["model"]["endpoint"]["atUnix"], view["nowUnix"]);
+                    if count == 1 || zone == "UTC" {
+                        let unavailable = json!({"status":"unavailable","reason":"insufficient_finite_days"});
+                        assert_eq!(view["availability"], unavailable);
+                        assert_eq!(view["forecastAvailability"], unavailable);
+                        for field in ["forecastR", "decisionR"] {
+                            assert!(view[field].is_null());
+                            assert!(view["model"]["endpoint"][field].is_null());
+                        }
+                        assert_eq!(view["model"]["points"], json!([]));
+                    } else {
+                        assert_eq!(view["availability"], json!({"status":"available"}));
+                        assert_eq!(view["forecastAvailability"], json!({"status":"available"}));
+                        for field in ["forecastR", "decisionR"] {
+                            assert!((view[field].as_f64().unwrap() + 1.0).abs() < 1e-12);
+                            assert_eq!(view["model"]["endpoint"][field], view[field]);
+                        }
+                        let points = view["model"]["points"].as_array().unwrap();
+                        assert_eq!(points[0]["atUnix"], day - 5 * 3600);
+                        assert!((points[0]["forecastR"].as_f64().unwrap() - 20.0 / 6.0).abs() < 1e-12);
+                        assert!(points.iter().any(|point| point["atUnix"] == day + 19 * 3600));
+                        assert_eq!(points.last().unwrap(), &view["model"]["endpoint"]);
+                    }
+                }
+                assert_eq!(market.calls.load(Ordering::SeqCst), 0, "forecast display cannot read candles or refresh outcomes");
+                assert_eq!(forecast_storage(&pool).await, before, "setup/outcome/recommendation and saved science rows must remain unchanged");
+            }
+        }).await;
+        server.abort();
+        let _ = server.await;
+        assertions.expect("forecast HTTP/DB assertions after fake market cleanup");
+    }).await;
+}
+
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
 async fn postgres_unified_literal_filters_match_math_options_history_and_readonly_details() {

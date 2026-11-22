@@ -657,6 +657,40 @@ it("keeps a changed/unavailable snapshot explicit with no zero/old curve and no 
   expect(projectionCalls()).toHaveLength(1); expect(analyticsCalls()).toHaveLength(1);
 });
 
+it("shows the HTTP 500 model error with exactly one presentation prefix while keeping prior results and never retrying or replaying", async () => {
+  enableSnapshotForecast(); projectionResponse = () => json({ error: "internal_server_error" }, 500);
+  await rendered(); fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  const mean = screen.getByTestId("setups-analytics-mean");
+  const chart = screen.getByTestId("setups-daily-outcomes");
+  const setup = screen.getByText("SYM1");
+  const study = screen.getByRole("button", { name: "Подробности исследования 40" });
+  expect(mean).toHaveTextContent("+1.25R"); expect(setup).toBeVisible();
+  expect(chart.querySelector('circle[data-closed="2"]')).toBeInTheDocument();
+  expect(analyticsCalls()).toHaveLength(1); expect(projectionCalls()).toHaveLength(0);
+  await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  const messages = screen.getAllByText(/^Модель недоступна:/);
+  expect(messages).toHaveLength(1);
+  expect(messages[0]).toHaveAttribute("role", "status");
+  expect(messages[0]).toHaveTextContent(/^Модель недоступна: HTTP 500$/);
+  expect(screen.getByTestId("setups-analytics-mean")).toBe(mean); expect(mean).toHaveTextContent("+1.25R");
+  expect(screen.getByTestId("setups-daily-outcomes")).toBe(chart);
+  expect(chart.querySelector('circle[data-closed="2"]')).toBeInTheDocument();
+  expect(screen.getByText("SYM1")).toBe(setup); expect(setup).toBeVisible(); expect(study).toBeVisible();
+  expect(screen.getByTestId("setups-model-summary")).toHaveTextContent(/^—$/);
+  expect(screen.queryByTestId("setups-model-line")).not.toBeInTheDocument();
+  const count = requests.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+  expect(requests).toHaveLength(count); expect(analyticsCalls()).toHaveLength(1); expect(projectionCalls()).toHaveLength(1);
+  const writes = vi.mocked(fetch).mock.calls.filter(([, init]) => (init?.method ?? "GET") !== "GET");
+  expect(writes.map(([path]) => {
+    if (typeof path !== "string") throw new Error("Expected a string request URL");
+    return new URL(path, "http://fixture").pathname;
+  })).toEqual([
+    "/v1/setups/analytics", "/v1/setups/analytics/forecast-view",
+  ]);
+  expect(requests.some((path) => /outcomes\/refresh|study-actual|replay|maintenance|optimization-studies/.test(path))).toBe(false);
+});
+
 it("draws every local calendar day independently of sparse labels and adds the finite fractional daily observed maximum, not the largest individual trade", async () => {
   storeRange("2026-10-01T00:00", "2026-11-01T00:00");
   analyticsResponse = () => json({ ...analyticsResult, setups: [rowAt(1, "2026-10-10T01:00:00Z", "tp", 3), rowAt(2, "2026-10-10T05:00:00Z", "sl", -1), rowAt(3, "2026-10-20T01:00:00Z", "tp", 2.125)] });

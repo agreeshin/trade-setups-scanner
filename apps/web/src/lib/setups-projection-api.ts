@@ -59,7 +59,7 @@ export async function fetchSetupsProjection(request: SetupsProjectionRequest, si
       forecast: request.forecast, trendMode: request.trendMode, trendBlendLambda: request.trendBlendLambda, timeZone: request.timeZone }) });
   if (!response.ok) throw new Error(response.status === 409
     ? "Сохранённые исходы снимка изменились. Модель недоступна до нового ручного расчёта; исходы не обновлялись."
-    : `Модель недоступна: HTTP ${response.status}`);
+    : `HTTP ${response.status}`);
   const v: unknown = await response.json();
   if (!record(v) || !isSetupsAnalyticsSnapshot(v.snapshot)
     || v.snapshot.snapshotId !== request.snapshot.snapshotId || v.snapshot.observationCutoff !== request.snapshot.observationCutoff
