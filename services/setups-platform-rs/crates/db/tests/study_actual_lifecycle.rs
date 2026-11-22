@@ -4,13 +4,18 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use setups_db::{
     DbError,
-    admission::{self, AdmissionInstrument, ReplayAdmissionInput, ReplayAdmissionLimits, ReserveStatus},
+    admission::{
+        self, AdmissionInstrument, ReplayAdmissionInput, ReplayAdmissionLimits, ReserveStatus,
+    },
     optimization::{self, DeleteStudyOutcome},
     runs,
     study_actual::{self as actual, Admission, InstrumentOutput, Job, Request},
 };
 use setups_domain::AlgorithmParams;
-use sqlx::{PgPool, postgres::{PgConnectOptions, PgPoolOptions}};
+use sqlx::{
+    PgPool,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
 use std::{future::Future, str::FromStr};
 
 const START: i64 = 1_794_000_000;
@@ -20,11 +25,20 @@ const CUTOFF: i64 = START + 600;
 fn compact_last_setup_at_is_nullable_utc_and_visible_without_closed_trades() {
     let mut row = json!({"study_id":1,"status":"completed","totals":{"total":23,"closed":0,"meanR":null},"last_setup_close_unix":START});
     let summary = actual::compact_summary(&row);
-    assert_eq!(summary["lastSetupAt"], json!(DateTime::from_timestamp(START, 0).unwrap()));
-    assert!(summary["meanR"].is_null(), "last setup is not restricted to closed trades");
+    assert_eq!(
+        summary["lastSetupAt"],
+        json!(DateTime::from_timestamp(START, 0).unwrap())
+    );
+    assert!(
+        summary["meanR"].is_null(),
+        "last setup is not restricted to closed trades"
+    );
     for status in ["not_calculated", "queued", "running", "failed"] {
         row["status"] = json!(status);
-        assert!(actual::compact_summary(&row)["lastSetupAt"].is_null(), "{status} cannot expose a previous timestamp");
+        assert!(
+            actual::compact_summary(&row)["lastSetupAt"].is_null(),
+            "{status} cannot expose a previous timestamp"
+        );
     }
     row["status"] = json!("completed");
     row["totals"]["total"] = json!(0);
@@ -32,7 +46,10 @@ fn compact_last_setup_at_is_nullable_utc_and_visible_without_closed_trades() {
     row["totals"]["total"] = json!(23);
     row.as_object_mut().unwrap().remove("last_setup_close_unix");
     let legacy = actual::compact_summary(&row);
-    assert!(legacy.get("lastSetupAt").is_some_and(Value::is_null), "legacy rows get an additive nullable field");
+    assert!(
+        legacy.get("lastSetupAt").is_some_and(Value::is_null),
+        "legacy rows get an additive nullable field"
+    );
 }
 
 async fn isolated<F, Fut>(body: F)
@@ -40,19 +57,42 @@ where
     F: FnOnce(PgPool) -> Fut + 'static,
     Fut: Future<Output = ()> + 'static,
 {
+    isolated_upgrade(body, false).await;
+}
+
+async fn isolated_upgrade<F, Fut>(body: F, legacy_heads: bool)
+where
+    F: FnOnce(PgPool) -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
     let options = PgConnectOptions::from_str(
         &std::env::var("TEST_DATABASE_URL").expect("explicit local *_test URL required"),
-    ).unwrap();
+    )
+    .unwrap();
     assert!(options.get_database().unwrap_or("").ends_with("_test"));
-    assert!(matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"));
+    assert!(matches!(
+        options.get_host(),
+        "localhost" | "127.0.0.1" | "::1"
+    ));
     let options = options.options([("statement_timeout", "15000"), ("lock_timeout", "5000")]);
-    let admin = PgPoolOptions::new().max_connections(2)
-        .connect_with(options.clone()).await.unwrap();
-    let name = format!("actual_lifecycle_{}_{}_test", std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap());
-    sqlx::query(&format!("create database {name}")).execute(&admin).await.unwrap();
-    let connected = PgPoolOptions::new().max_connections(6)
-        .connect_with(options.database(&name)).await;
+    let admin = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let name = format!(
+        "actual_lifecycle_{}_{}_test",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    sqlx::query(&format!("create database {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let connected = PgPoolOptions::new()
+        .max_connections(6)
+        .connect_with(options.database(&name))
+        .await;
     // Keep the pool outside the child task: assertion/migration panics still
     // close connections and drop only this generated database before unwinding.
     let outcome = if let Ok(pool) = &connected {
@@ -67,6 +107,12 @@ where
                 sqlx::raw_sql(&baseline).execute(&child).await.unwrap();
                 sqlx::raw_sql("set search_path to public; create table kysely_migration(name varchar(255) primary key,timestamp varchar(255) not null); insert into kysely_migration values('0009_legacy','fixture')")
                     .execute(&child).await.unwrap();
+                if legacy_heads {
+                    sqlx::query("insert into kysely_migration values('0029_study_actual_continuous.sql','pre-upgrade-fixture')").execute(&child).await.unwrap();
+                    setups_db::migrate::ensure_migrations(&child).await.unwrap();
+                    sqlx::raw_sql("insert into optimization_studies(algorithm_id,status,spec,progress,owner_id,execution_started_at) values('price_volume_spike','completed','{}','{}','upgrade',now()),('price_volume_spike','completed','{}','{}','upgrade',now()),('price_volume_spike','completed','{}','{}','upgrade',now()); insert into study_actualizations(owner_id,study_id,job_id,revision,status,stage,execution_started_at,observed_through_unix,source,source_identity,work_minutes,reserved_bytes,requested_at) select 'upgrade',id,'upgrade-'||id,1,case when id=3 then 'running' else 'queued' end,'fixture',now(),0,'{}','fixture',0,1,to_timestamp(100-id) from optimization_studies order by id; delete from kysely_migration where name='0029_study_actual_continuous.sql';")
+                        .execute(&child).await.unwrap();
+                }
                 setups_db::migrate::ensure_migrations(&child).await.unwrap();
                 let repeated = setups_db::migrate::ensure_migrations(&child).await.unwrap();
                 assert!(repeated.starts_with("0 applied"), "migration replay: {repeated}");
@@ -79,10 +125,12 @@ where
         None
     };
     let cleanup = sqlx::query(&format!("drop database {name} with(force)"))
-        .execute(&admin).await;
+        .execute(&admin)
+        .await;
     admin.close().await;
     cleanup.expect("owned disposable DB cleanup failed");
-    let result = outcome.unwrap_or_else(|| panic!("child DB connection failed: {:?}", connected.err()));
+    let result =
+        outcome.unwrap_or_else(|| panic!("child DB connection failed: {:?}", connected.err()));
     if let Err(error) = result {
         std::panic::resume_unwind(error.into_panic());
     }
@@ -108,14 +156,35 @@ async fn seed(pool: &PgPool, owner: &'static str, label: &str) -> Study {
         .fetch_one(pool).await.unwrap();
     let identity: String = sqlx::query_scalar("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1")
         .bind(id).fetch_one(pool).await.unwrap();
-    Study { owner, id, identity, source }
+    Study {
+        owner,
+        id,
+        identity,
+        source,
+    }
 }
 
-async fn admit(pool: &PgPool, study: &Study, name: &str, limits: ReplayAdmissionLimits) -> Result<Admission, DbError> {
-    actual::admit(pool, Request { owner: study.owner, study: study.id, job: name,
-        start: DateTime::from_timestamp(START + 30, 250_000_000).unwrap(),
-        cutoff: CUTOFF, source: &study.source, identity: &study.identity, work: 60, limits: &limits,
-    }).await
+async fn admit(
+    pool: &PgPool,
+    study: &Study,
+    name: &str,
+    limits: ReplayAdmissionLimits,
+) -> Result<Admission, DbError> {
+    actual::admit(
+        pool,
+        Request {
+            owner: study.owner,
+            study: study.id,
+            job: name,
+            start: DateTime::from_timestamp(START + 30, 250_000_000).unwrap(),
+            cutoff: CUTOFF,
+            source: &study.source,
+            identity: &study.identity,
+            work: 60,
+            limits: &limits,
+        },
+    )
+    .await
 }
 
 fn created(admission: Admission) -> Value {
@@ -126,47 +195,118 @@ fn created(admission: Admission) -> Value {
 }
 
 async fn head(pool: &PgPool, study: &Study) -> Value {
-    actual::get(pool, study.owner, study.id).await.unwrap().unwrap()
+    actual::get(pool, study.owner, study.id)
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 async fn claim(pool: &PgPool) -> Job {
-    actual::claim(pool, 2).await.unwrap().expect("queued job should be claimable")
+    actual::claim(pool, 2)
+        .await
+        .unwrap()
+        .expect("queued job should be claimable")
 }
 
 fn rows(count: usize) -> Vec<Value> {
     let statuses = ["tp", "sl", "gate_failed", "unclosed", "no_data"];
-    (0..count).map(|i| json!({"setupTimeUnix":START + (i as i64 + 1) * 60,
-        "status":statuses[i % statuses.len()], "sentinel":i})).collect()
+    (0..count)
+        .map(|i| {
+            json!({"setupTimeUnix":START + (i as i64 + 1) * 60,
+        "status":statuses[i % statuses.len()], "sentinel":i})
+        })
+        .collect()
 }
 
-async fn append(pool: &PgPool, job: &Job, batch: i32, symbol: &str, rows: &[Value]) -> Result<bool, DbError> {
+async fn append(
+    pool: &PgPool,
+    job: &Job,
+    batch: i32,
+    symbol: &str,
+    rows: &[Value],
+) -> Result<bool, DbError> {
     let emitted = json!(rows);
-    actual::append(pool, job, batch, InstrumentOutput { exchange: "bybit", category: "linear",
-        symbol, emitted: &emitted, rows, quality: &json!({"fixture":"quality"}),
-    }).await
+    actual::append(
+        pool,
+        job,
+        batch,
+        InstrumentOutput {
+            exchange: "bybit",
+            category: "linear",
+            symbol,
+            emitted: &emitted,
+            rows,
+            quality: &json!({"fixture":"quality"}),
+        },
+    )
+    .await
 }
 
 async fn complete(pool: &PgPool, study: &Study, name: &str) -> (Job, i32) {
-    created(admit(pool, study, name, ReplayAdmissionLimits::default()).await.unwrap());
+    created(
+        admit(pool, study, name, ReplayAdmissionLimits::default())
+            .await
+            .unwrap(),
+    );
     let job = claim(pool).await;
     assert_eq!(job.study, study.id);
     let batch = actual::create_batch(pool, &job).await.unwrap().unwrap();
-    assert!(append(pool, &job, batch, "BTCUSDT", &rows(5)).await.unwrap());
+    assert!(
+        append(pool, &job, batch, "BTCUSDT", &rows(5))
+            .await
+            .unwrap()
+    );
     sqlx::query("insert into replay_quality_intervals(run_id,from_unix,to_unix,reason) select id,$2,$3,'fixture' from replay_runs where batch_id=$1")
         .bind(batch).bind(START).bind(START + 60).execute(pool).await.unwrap();
-    assert!(actual::finish(pool, &job, &json!({"fixture":"sealed-report"}),
-        &json!({"artifactSetupCount":5,"closedCount":2})).await.unwrap());
+    assert!(
+        actual::finish(
+            pool,
+            &job,
+            &json!({"fixture":"sealed-report"}),
+            &json!({"artifactSetupCount":5,"closedCount":2})
+        )
+        .await
+        .unwrap()
+    );
     (job, batch)
 }
 
 async fn count(pool: &PgPool, query: &str, id: i64) -> i64 {
-    sqlx::query_scalar(query).bind(id).fetch_one(pool).await.unwrap()
+    sqlx::query_scalar(query)
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 async fn assert_pair_absent(pool: &PgPool, study: i64, batch: i32) {
-    assert_eq!(count(pool, "select count(*) from study_actual_setups where study_id=$1", study).await, 0);
-    assert_eq!(count(pool, "select count(*) from replay_runs where batch_id=$1::bigint", batch.into()).await, 0);
-    assert_eq!(count(pool, "select count(*) from replay_batches where id=$1::bigint", batch.into()).await, 0);
+    assert_eq!(
+        count(
+            pool,
+            "select count(*) from study_actual_setups where study_id=$1",
+            study
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            pool,
+            "select count(*) from replay_runs where batch_id=$1::bigint",
+            batch.into()
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            pool,
+            "select count(*) from replay_batches where id=$1::bigint",
+            batch.into()
+        )
+        .await,
+        0
+    );
 }
 
 async fn seed_sentinels(pool: &PgPool) {
@@ -205,7 +345,10 @@ async fn protected(pool: &PgPool) -> Value {
 }
 
 async fn continuous_reservation(pool: &PgPool, bytes: i64) -> i64 {
-    sqlx::query("insert into continuous_owner_lanes(owner_id) values('reservation')").execute(pool).await.unwrap();
+    sqlx::query("insert into continuous_owner_lanes(owner_id) values('reservation')")
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query("insert into continuous_processes(owner_id,algorithm_id,config) values('reservation','price_volume_spike','{}')").execute(pool).await.unwrap();
     let slot: i64 = sqlx::query_scalar("insert into continuous_slots(owner_id,algorithm_id,min_setups_per_day) values('reservation','price_volume_spike',0) returning id")
         .fetch_one(pool).await.unwrap();
@@ -216,9 +359,24 @@ async fn continuous_reservation(pool: &PgPool, bytes: i64) -> i64 {
 #[tokio::test]
 #[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
 async fn manual_original_archive_terminal_is_atomic_idempotent_owned_and_shared_by_utc_and_iana() {
-    use setups_db::study_display::{self,ManualArchive,OriginalMinute};
-    async fn finish(pool:&PgPool,id:i64,result:&Value,archive:&ManualArchive)->Result<(),DbError> {
-        optimization::finish_with_original_archive(pool,id,"completed",&json!({}),Some(result),None,&json!([]),Some(archive)).await
+    use setups_db::study_display::{self, ManualArchive, OriginalMinute};
+    async fn finish(
+        pool: &PgPool,
+        id: i64,
+        result: &Value,
+        archive: &ManualArchive,
+    ) -> Result<(), DbError> {
+        optimization::finish_with_original_archive(
+            pool,
+            id,
+            "completed",
+            &json!({}),
+            Some(result),
+            None,
+            &json!([]),
+            Some(archive),
+        )
+        .await
     }
     isolated(|pool| async move {
         let spec=json!({"fromUnix":0,"toUnix":172800});
@@ -281,7 +439,7 @@ async fn manual_original_archive_terminal_is_atomic_idempotent_owned_and_shared_
 #[tokio::test]
 #[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
 async fn manual_original_archive_ack_uses_jsonb_numeric_equality_without_rewriting_science() {
-    use setups_db::study_display::{ManualArchive,OriginalMinute};
+    use setups_db::study_display::{ManualArchive, OriginalMinute};
     isolated(|pool| async move {
         let exponent=json!(1e-7_f64);
         let decoded:Value=sqlx::query_scalar("select $1::jsonb").bind(&exponent).fetch_one(&pool).await.unwrap();
@@ -335,26 +493,56 @@ async fn concurrent_same_study_admission_and_claim_have_one_current_job() {
         let study = seed(&pool, "admin", "same-study").await;
         let foreign = seed(&pool, "foreign", "foreign").await;
         let limits = ReplayAdmissionLimits::default();
-        let (left, right) = tokio::join!(admit(&pool, &study, "left", limits), admit(&pool, &study, "right", limits));
+        let (left, right) = tokio::join!(
+            admit(&pool, &study, "left", limits),
+            admit(&pool, &study, "right", limits)
+        );
         let (accepted, busy) = match (left.unwrap(), right.unwrap()) {
-            (Admission::Created(a), Admission::Busy(b)) | (Admission::Busy(b), Admission::Created(a)) => (a, b),
+            (Admission::Created(a), Admission::Busy(b))
+            | (Admission::Busy(b), Admission::Created(a)) => (a, b),
             other => panic!("exactly one Created and one Busy required: {other:?}"),
         };
         assert_eq!(accepted["revision"], 1);
-        assert_eq!(accepted, busy, "Busy must return the same current queued head");
-        assert!(accepted.get("source").is_none(), "private frozen source must not be exposed");
+        assert_eq!(
+            accepted, busy,
+            "Busy must return the same current queued head"
+        );
+        assert!(
+            accepted.get("source").is_none(),
+            "private frozen source must not be exposed"
+        );
         let (left, right) = tokio::join!(actual::claim(&pool, 2), actual::claim(&pool, 2));
-        assert_eq!(usize::from(left.unwrap().is_some()) + usize::from(right.unwrap().is_some()), 1);
+        assert_eq!(
+            usize::from(left.unwrap().is_some()) + usize::from(right.unwrap().is_some()),
+            1
+        );
         assert_eq!(head(&pool, &study).await["status"], "running");
-        assert!(actual::get(&pool, foreign.owner, study.id).await.unwrap().is_none());
+        assert!(
+            actual::get(&pool, foreign.owner, study.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let mut impostor = study.clone();
         impostor.owner = foreign.owner;
-        assert!(matches!(admit(&pool, &impostor, "impostor", limits).await.unwrap(), Admission::SourceChanged));
+        assert!(matches!(
+            admit(&pool, &impostor, "impostor", limits).await.unwrap(),
+            Admission::SourceChanged
+        ));
         let mut changed = foreign.clone();
         changed.identity = "wrong-frozen-source".into();
-        assert!(matches!(admit(&pool, &changed, "changed", limits).await.unwrap(), Admission::SourceChanged));
-        assert!(actual::get(&pool, foreign.owner, foreign.id).await.unwrap().is_none());
-    }).await;
+        assert!(matches!(
+            admit(&pool, &changed, "changed", limits).await.unwrap(),
+            Admission::SourceChanged
+        ));
+        assert!(
+            actual::get(&pool, foreign.owner, foreign.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -621,33 +809,102 @@ async fn rejected_or_rolled_back_replacement_preserves_the_entire_published_pair
         complete(&pool, &foreign, "reserved-foreign-job").await;
         let published = snapshot(&pool, study.id).await;
         let protected_before = protected(&pool).await;
-        assert!(matches!(admit(&pool, &study, "no-capacity", ReplayAdmissionLimits { max_pending_runs:0, ..Default::default() }).await.unwrap(), Admission::Resource));
+        assert!(matches!(
+            admit(
+                &pool,
+                &study,
+                "no-capacity",
+                ReplayAdmissionLimits {
+                    max_pending_runs: 0,
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap(),
+            Admission::Resource
+        ));
         assert_eq!(snapshot(&pool, study.id).await, published);
         let mut invalid = study.clone();
         invalid.identity = "changed-source".into();
-        assert!(matches!(admit(&pool, &invalid, "invalid", Default::default()).await.unwrap(), Admission::SourceChanged));
+        assert!(matches!(
+            admit(&pool, &invalid, "invalid", Default::default())
+                .await
+                .unwrap(),
+            Admission::SourceChanged
+        ));
         assert_eq!(snapshot(&pool, study.id).await, published);
         // The unique job collision occurs AFTER cleanup has deleted the old
         // rows, runs, quality and batch. The complete transaction must roll back.
-        assert!(admit(&pool, &study, "reserved-foreign-job", Default::default()).await.is_err());
-        assert_eq!(snapshot(&pool, study.id).await, published, "late admission error must restore every published byte and pointer");
+        assert!(
+            admit(&pool, &study, "reserved-foreign-job", Default::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            snapshot(&pool, study.id).await,
+            published,
+            "late admission error must restore every published byte and pointer"
+        );
         assert_eq!(protected(&pool).await, protected_before);
-        let accepted = created(admit(&pool, &study, "accepted", Default::default()).await.unwrap());
+        let accepted = created(
+            admit(&pool, &study, "accepted", Default::default())
+                .await
+                .unwrap(),
+        );
         assert_eq!(accepted["revision"], 2);
-        for key in ["batch_id", "report", "totals"] { assert!(accepted[key].is_null(), "accepted replacement must hide {key}"); }
+        for key in ["batch_id", "report", "totals"] {
+            assert!(
+                accepted[key].is_null(),
+                "accepted replacement must hide {key}"
+            );
+        }
         assert_pair_absent(&pool, study.id, old_batch).await;
         let job = claim(&pool).await;
         let batch = actual::create_batch(&pool, &job).await.unwrap().unwrap();
-        assert!(append(&pool, &job, batch, "CURRENT", &rows(3)).await.unwrap());
+        assert!(
+            append(&pool, &job, batch, "CURRENT", &rows(3))
+                .await
+                .unwrap()
+        );
         let staging = snapshot(&pool, study.id).await;
-        assert!(matches!(admit(&pool, &study, "busy", Default::default()).await.unwrap(), Admission::Busy(_)));
-        assert_eq!(snapshot(&pool, study.id).await, staging, "busy cannot clean current staging");
-        assert!(actual::page(&pool, study.owner, study.id, 2, 0, 100).await.unwrap().is_none());
-        assert!(actual::finish(&pool, &job, &json!({"revision":2}), &json!({"total":3})).await.unwrap());
-        assert_eq!(actual::page(&pool, study.owner, study.id, 2, 0, 100).await.unwrap().unwrap().len(), 3);
+        assert!(matches!(
+            admit(&pool, &study, "busy", Default::default())
+                .await
+                .unwrap(),
+            Admission::Busy(_)
+        ));
+        assert_eq!(
+            snapshot(&pool, study.id).await,
+            staging,
+            "busy cannot clean current staging"
+        );
+        assert!(
+            actual::page(&pool, study.owner, study.id, 2, 0, 100)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            actual::finish(&pool, &job, &json!({"revision":2}), &json!({"total":3}))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            actual::page(&pool, study.owner, study.id, 2, 0, 100)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            3
+        );
         assert_eq!(protected(&pool).await, protected_before);
-        assert_eq!(snapshot(&pool, study.id).await["study"], published["study"], "original study/spec/result/model/history are never refresh-owned");
-    }).await;
+        assert_eq!(
+            snapshot(&pool, study.id).await["study"],
+            published["study"],
+            "original study/spec/result/model/history are never refresh-owned"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -657,11 +914,23 @@ async fn recovery_preserves_queued_and_fails_fenced_running_with_owned_cleanup()
         let running = seed(&pool, "admin", "running").await;
         let queued = seed(&pool, "foreign", "queued").await;
         seed_sentinels(&pool).await;
-        created(admit(&pool, &running, "running", ReplayAdmissionLimits::default()).await.unwrap());
+        created(
+            admit(&pool, &running, "running", ReplayAdmissionLimits::default())
+                .await
+                .unwrap(),
+        );
         let job = claim(&pool).await;
         let batch = actual::create_batch(&pool, &job).await.unwrap().unwrap();
-        assert!(append(&pool, &job, batch, "STAGING", &rows(3)).await.unwrap());
-        created(admit(&pool, &queued, "queued", ReplayAdmissionLimits::default()).await.unwrap());
+        assert!(
+            append(&pool, &job, batch, "STAGING", &rows(3))
+                .await
+                .unwrap()
+        );
+        created(
+            admit(&pool, &queued, "queued", ReplayAdmissionLimits::default())
+                .await
+                .unwrap(),
+        );
         let queued_before = head(&pool, &queued).await;
         let protected_before = protected(&pool).await;
         actual::recover(&pool).await.unwrap();
@@ -669,14 +938,25 @@ async fn recovery_preserves_queued_and_fails_fenced_running_with_owned_cleanup()
         assert_eq!(head(&pool, &queued).await, queued_before);
         let failed = head(&pool, &running).await;
         assert_eq!(failed["status"], "failed");
-        assert_eq!(failed["error"]["code"], "study_actual_interrupted_by_restart");
+        assert_eq!(
+            failed["error"]["code"],
+            "study_actual_interrupted_by_restart"
+        );
         assert_eq!(failed["reserved_bytes"], 0);
         assert!(failed["report"].is_null() && failed["batch_id"].is_null());
         assert!(failed["token"].as_i64().unwrap() > job.token);
         assert_pair_absent(&pool, running.id, batch).await;
-        assert!(!actual::progress(&pool, &job, "late", &json!({})).await.unwrap());
+        assert!(
+            !actual::progress(&pool, &job, "late", &json!({}))
+                .await
+                .unwrap()
+        );
         assert!(!append(&pool, &job, batch, "LATE", &rows(1)).await.unwrap());
-        assert!(!actual::finish(&pool, &job, &json!({}), &json!({})).await.unwrap());
+        assert!(
+            !actual::finish(&pool, &job, &json!({}), &json!({}))
+                .await
+                .unwrap()
+        );
         actual::fail(&pool, &job, "late").await.unwrap();
         assert_eq!(head(&pool, &running).await, failed);
         assert_eq!(protected(&pool).await, protected_before);
@@ -685,7 +965,8 @@ async fn recovery_preserves_queued_and_fails_fenced_running_with_owned_cleanup()
         assert_eq!(recovered.job_id, "queued");
         assert_eq!(recovered.cutoff, CUTOFF);
         assert_eq!(recovered.revision, 1);
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -699,17 +980,63 @@ async fn ownership_mismatch_rolls_back_cleanup_without_deleting_foreign_pair() {
         let (_, foreign_batch) = complete(&pool, &foreign, "foreign").await;
         // Deliberate DB fault injection: a pointer is not deletion authority.
         sqlx::query("update study_actualizations set batch_id=$2 where study_id=$1")
-            .bind(study.id).bind(foreign_batch).execute(&pool).await.unwrap();
+            .bind(study.id)
+            .bind(foreign_batch)
+            .execute(&pool)
+            .await
+            .unwrap();
         let before = head(&pool, &study).await;
         let protected_before = protected(&pool).await;
-        let error = admit(&pool, &study, "must-rollback", ReplayAdmissionLimits::default()).await.unwrap_err();
-        assert!(error.to_string().contains("study_actual_owned_pair_mismatch"), "{error}");
-        assert_eq!(head(&pool, &study).await, before, "batch pointer update must roll back");
-        assert_eq!(count(&pool, "select count(*) from study_actual_setups where study_id=$1", study.id).await, 5, "row deletion must roll back");
-        assert_eq!(count(&pool, "select count(*) from replay_batches where id=$1::bigint", owned_batch.into()).await, 1);
-        assert_eq!(count(&pool, "select count(*) from replay_runs where batch_id=$1::bigint", owned_batch.into()).await, 1);
+        let error = admit(
+            &pool,
+            &study,
+            "must-rollback",
+            ReplayAdmissionLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("study_actual_owned_pair_mismatch"),
+            "{error}"
+        );
+        assert_eq!(
+            head(&pool, &study).await,
+            before,
+            "batch pointer update must roll back"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "select count(*) from study_actual_setups where study_id=$1",
+                study.id
+            )
+            .await,
+            5,
+            "row deletion must roll back"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "select count(*) from replay_batches where id=$1::bigint",
+                owned_batch.into()
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "select count(*) from replay_runs where batch_id=$1::bigint",
+                owned_batch.into()
+            )
+            .await,
+            1
+        );
         assert_eq!(protected(&pool).await, protected_before);
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -768,4 +1095,607 @@ async fn explicit_manual_study_delete_blocks_active_but_cleans_terminal_actual_o
         assert_eq!(optimization::delete(&pool, continuous_study.id).await.unwrap(), Some(DeleteStudyOutcome::Referenced));
         assert_eq!(protected(&pool).await, protected_before);
     }).await;
+}
+
+use actual::continuous as scheduler;
+async fn enabled(pool: &PgPool, owner: &str, algorithm: &str) -> scheduler::Settings {
+    let settings = scheduler::ensure(pool, owner, algorithm).await.unwrap();
+    match scheduler::configure(
+        pool,
+        owner,
+        algorithm,
+        settings.revision,
+        true,
+        "1970-01-01",
+        "UTC",
+    )
+    .await
+    .unwrap()
+    {
+        scheduler::Configure::Saved(s) => s,
+        _ => panic!("configuration rejected"),
+    }
+}
+async fn due(pool: &PgPool, owner: &str) {
+    sqlx::query("update study_actual_continuous set next_due_at=clock_timestamp()-interval '1 second' where owner_id=$1").bind(owner).execute(pool).await.unwrap();
+}
+async fn auto(pool: &PgPool, ticket: &scheduler::Ticket, study: &Study, job: &str) -> Admission {
+    scheduler::admit(
+        pool,
+        ticket,
+        Request {
+            owner: study.owner,
+            study: study.id,
+            job,
+            start: ticket
+                .candidates
+                .iter()
+                .find(|c| c.study == study.id)
+                .unwrap()
+                .start,
+            cutoff: ticket.cutoff,
+            source: &study.source,
+            identity: &study.identity,
+            work: 60,
+            limits: &Default::default(),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn continuous_migration_applies_to_real_0028_and_preserves_durable_legacy_heads() {
+    isolated_upgrade(|pool|async move {
+        let rows:Vec<(i64,String,i64,String)>=sqlx::query_as("select study_id,status,queue_sequence,request_origin from study_actualizations order by queue_sequence").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.iter().map(|r|r.0).collect::<Vec<_>>(),vec![3,2,1],"bigserial upgrade must restore requested FIFO, not physical insertion order");
+        assert_eq!(rows.iter().map(|r|r.1.as_str()).collect::<Vec<_>>(),vec!["running","queued","queued"]);
+        assert!(rows.iter().all(|r|r.3=="manual"));
+        let retained:Vec<(String,i64,i64,Value,i64)>=sqlx::query_as("select job_id,revision,observed_through_unix,source,reserved_bytes from study_actualizations order by study_id").fetch_all(&pool).await.unwrap();
+        assert_eq!(retained,(1..=3).map(|id|(format!("upgrade-{id}"),1,0,json!({}),1)).collect::<Vec<_>>(),"upgrade must not rewrite accepted identity/revision/C/source/reservation");
+        let has_exact_column:bool=sqlx::query_scalar("select exists(select 1 from information_schema.columns where table_name='optimization_studies' and column_name='execution_started_at')").fetch_one(&pool).await.unwrap();
+        assert!(has_exact_column,"0026 adds the exact clock before 0029 indexes it");
+        assert!(sqlx::query("update study_actualizations set status='running' where study_id=2").execute(&pool).await.is_err(),"DB trigger also protects old claim queries during rolling overlap");
+        actual::recover(&pool).await.unwrap();
+        let job=claim(&pool).await;assert_eq!(job.study,2);actual::fail(&pool,&job,"fixture").await.unwrap();
+        let second=claim(&pool).await;assert_eq!(second.study,1);
+        let max:i64=sqlx::query_scalar("select max(queue_sequence) from study_actualizations").fetch_one(&pool).await.unwrap();
+        let next:i64=sqlx::query_scalar("select nextval(pg_get_serial_sequence('study_actualizations','queue_sequence'))").fetch_one(&pool).await.unwrap();assert!(next>max);
+    },true).await;
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn continuous_defaults_are_persistent_owner_isolated_and_share_api_headless_resolver() {
+    isolated(|pool|async move {
+        setups_db::settings_set(&pool,"ui",&json!({"interface":{"timezone":"Asia/Kathmandu"}})).await.unwrap();
+        scheduler::bootstrap(&pool).await.unwrap();
+        let first=scheduler::ensure(&pool,"admin","price_volume_spike").await.unwrap();
+        assert!(first.enabled);assert_eq!(first.time_zone,"Asia/Kathmandu");
+        let expected:(chrono::NaiveDate,chrono::DateTime<Utc>)=sqlx::query_as("select timezone('Asia/Kathmandu',clock_timestamp())::date,to_timestamp(study_local_day_start('Asia/Kathmandu',timezone('Asia/Kathmandu',clock_timestamp())::date))").fetch_one(&pool).await.unwrap();
+        assert_eq!((first.from_date,first.from_boundary),expected);
+        setups_db::settings_set(&pool,"ui",&json!({"interface":{"timezone":"America/New_York"}})).await.unwrap();
+        scheduler::bootstrap(&pool).await.unwrap();
+        let repeated=scheduler::ensure(&pool,"admin","price_volume_spike").await.unwrap();
+        assert_eq!(serde_json::to_value(&first).unwrap(),serde_json::to_value(&repeated).unwrap());
+        let foreign=scheduler::ensure(&pool,"foreign","price_volume_spike").await.unwrap();assert_eq!(foreign.time_zone,"UTC");
+        let configured=enabled(&pool,"admin","price_volume_spike").await;
+        assert_ne!(configured.from_boundary,first.from_boundary);
+        assert_eq!(scheduler::ensure(&pool,"foreign","price_volume_spike").await.unwrap().revision,1);
+        assert_eq!(scheduler::ensure(&pool,"admin","price_drop_volume_spike").await.unwrap().revision,1);
+        assert!(matches!(scheduler::configure(&pool,"admin","price_volume_spike",1,false,"1970-01-01","UTC").await.unwrap(),scheduler::Configure::Conflict(_)));
+        for (day,zone) in [("2026-02-30","UTC"),("2026-2-01","UTC"),("1969-12-31","UTC"),("2026-11-22","Mars/Olympus")] {
+            assert!(matches!(scheduler::configure(&pool,"admin","price_volume_spike",configured.revision,true,day,zone).await.unwrap(),scheduler::Configure::Invalid(_)));
+        }
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn automatic_completed_exact_date_order_ties_new_study_wrap_and_cutoff_backoff() {
+    isolated(|pool|async move {
+        let a=seed(&pool,"admin","a").await;let b=seed(&pool,"admin","b").await;
+        let cancelled=seed(&pool,"admin","cancelled").await;let partial=seed(&pool,"admin","partial").await;
+        let before=seed(&pool,"admin","before").await;let malformed=seed(&pool,"admin","malformed").await;
+        sqlx::query("update optimization_studies set status='cancelled' where id=$1").bind(cancelled.id).execute(&pool).await.unwrap();
+        sqlx::query("update optimization_studies set result=jsonb_set(result,'{best}','{\"partial\":true}') where id=$1").bind(partial.id).execute(&pool).await.unwrap();
+        sqlx::query("update optimization_studies set execution_started_at=to_timestamp(0) where id=$1").bind(before.id).execute(&pool).await.unwrap();
+        sqlx::query("update optimization_studies set execution_started_at=null,events='[{\"kind\":\"started\",\"at\":\"bad\"}]' where id=$1").bind(malformed.id).execute(&pool).await.unwrap();
+        // Seed helper's scientific result intentionally has no best; add just
+        // the DB coarse eligibility marker, then recompute exact identity.
+        for study in [&a,&b,&cancelled,&before,&malformed] {sqlx::query("update optimization_studies set result=result||'{\"best\":{\"partial\":false}}' where id=$1").bind(study.id).execute(&pool).await.unwrap();}
+        let refresh_identity=|study:Study,pool:PgPool|async move {let mut study=study;study.identity=sqlx::query_scalar("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1").bind(study.id).fetch_one(&pool).await.unwrap();study};
+        let a=refresh_identity(a,pool.clone()).await;let b=refresh_identity(b,pool.clone()).await;
+        let config=enabled(&pool,"admin","price_volume_spike").await;
+        let day=DateTime::from_timestamp(START,0).unwrap().date_naive().to_string();
+        assert!(matches!(scheduler::configure(&pool,"admin","price_volume_spike",config.revision,true,&day,"UTC").await.unwrap(),scheduler::Configure::Saved(_)));
+        let t=scheduler::next(&pool).await.unwrap().unwrap();assert_eq!(t.candidates.iter().map(|c|c.study).collect::<Vec<_>>(),vec![a.id,b.id]);
+        let limited=setups_db::admission::ReplayAdmissionLimits{max_pending_runs:0,..Default::default()};
+        assert!(matches!(scheduler::admit(&pool,&t,Request{owner:"admin",study:a.id,job:"global-shortage",start:t.candidates[0].start,cutoff:t.cutoff,source:&a.source,identity:&a.identity,work:60,limits:&limited}).await.unwrap(),Admission::Resource));
+        scheduler::backoff(&pool,&t,"resource_limit").await.unwrap();
+        let scan:Option<i64>=sqlx::query_scalar("select scan_study_id from study_actual_continuous where owner_id='admin'").fetch_one(&pool).await.unwrap();assert!(scan.is_none(),"global shortage cannot advance through uninspected candidates");
+        assert!(scheduler::next(&pool).await.unwrap().is_none());
+        due(&pool,"admin").await;
+        created(auto(&pool,&t,&a,"auto-a").await);let job=claim(&pool).await;actual::fail(&pool,&job,"expected").await.unwrap();
+        let state=scheduler::ensure(&pool,"admin","price_volume_spike").await.unwrap();assert_eq!(state.cursor_study_id,Some(a.id));
+        let t=scheduler::next(&pool).await.unwrap().unwrap();assert_eq!(t.candidates[0].study,b.id);
+        created(auto(&pool,&t,&b,"auto-b").await);let job=claim(&pool).await;actual::fail(&pool,&job,"expected").await.unwrap();
+        assert!(scheduler::next(&pool).await.unwrap().is_none(),"completed last study persists next-minute backoff");
+        // A newly completed later study is discovered before wrap, regardless
+        // of created/updated clocks and without materializing a cycle.
+        let mut c=seed(&pool,"admin","new").await;
+        sqlx::query("update optimization_studies set result=result||'{\"best\":{\"partial\":false}}',execution_started_at=to_timestamp($2),created_at=to_timestamp(0) where id=$1").bind(c.id).bind((START+31) as f64).execute(&pool).await.unwrap();
+        c.identity=sqlx::query_scalar("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1").bind(c.id).fetch_one(&pool).await.unwrap();
+        due(&pool,"admin").await;let t=scheduler::next(&pool).await.unwrap().unwrap();assert_eq!(t.candidates[0].study,c.id);
+        created(auto(&pool,&t,&c,"auto-c").await);let job=claim(&pool).await;actual::fail(&pool,&job,"expected").await.unwrap();
+        due(&pool,"admin").await;let t=scheduler::next(&pool).await.unwrap().unwrap();assert!(t.wrapped);assert_eq!(t.candidates[0].study,a.id);
+        let old=head(&pool,&a).await;assert!(matches!(auto(&pool,&t,&a,"duplicate-cutoff").await,Admission::Deferred));assert_eq!(head(&pool,&a).await,old);
+        assert!(scheduler::next(&pool).await.unwrap().is_none());
+        // Same-cutoff suppression is automatic only.
+        created(admit(&pool,&a,"manual-same-cutoff",Default::default()).await.unwrap());let manual=claim(&pool).await;
+        actual::fail(&pool,&manual,"manual").await.unwrap();assert_eq!(scheduler::ensure(&pool,"admin","price_volume_spike").await.unwrap().cursor_study_id,Some(c.id));
+    }).await;
+}
+
+async fn automatic_seed(pool: &PgPool, label: &str) -> Study {
+    let mut study = seed(pool, "admin", label).await;
+    sqlx::query("update optimization_studies set result=result||'{\"best\":{\"partial\":false}}' where id=$1").bind(study.id).execute(pool).await.unwrap();
+    study.identity=sqlx::query_scalar("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1").bind(study.id).fetch_one(pool).await.unwrap();
+    study
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn owner_lane_two_coordinators_manual_fifo_priority_and_atomic_terminal_cursor() {
+    isolated(|pool|async move {
+        let a=automatic_seed(&pool,"a").await;let b=automatic_seed(&pool,"b").await;let c=automatic_seed(&pool,"c").await;
+        enabled(&pool,"admin","price_volume_spike").await;
+        let t=scheduler::next(&pool).await.unwrap().unwrap();created(auto(&pool,&t,&a,"automatic-first").await);
+        // A later manual request outranks an already committed/unclaimed auto.
+        created(admit(&pool,&b,"manual-first",Default::default()).await.unwrap());
+        let (left,right)=tokio::join!(actual::claim(&pool,2),actual::claim(&pool,2));
+        let claims:Vec<_>=[left.unwrap(),right.unwrap()].into_iter().flatten().collect();assert_eq!(claims.len(),1);assert_eq!(claims[0].study,b.id);
+        actual::fail(&pool,&claims[0],"manual").await.unwrap();
+        assert!(scheduler::ensure(&pool,"admin","price_volume_spike").await.unwrap().cursor_study_id.is_none());
+        let running=claim(&pool).await;assert_eq!(running.study,a.id);
+        created(admit(&pool,&b,"fifo-1",Default::default()).await.unwrap());created(admit(&pool,&c,"fifo-2",Default::default()).await.unwrap());
+        assert!(actual::claim(&pool,2).await.unwrap().is_none(),"running auto is not interrupted by manual");
+        assert!(scheduler::next(&pool).await.unwrap().is_none());
+        let batch=actual::create_batch(&pool,&running).await.unwrap().unwrap();append(&pool,&running,batch,"FIX",&rows(1)).await.unwrap();
+        // Publication and cursor advancement MUST roll back together on a
+        // fault after the completed-head update. Retry is the same job/C.
+        sqlx::raw_sql("create function cursor_fixture() returns trigger language plpgsql as $$begin if new.cursor_study_id is not null then raise exception 'cursor fixture';end if;return new;end$$;create trigger cursor_fixture before update on study_actual_continuous for each row execute function cursor_fixture();").execute(&pool).await.unwrap();
+        assert!(actual::finish(&pool,&running,&json!({}),&json!({})).await.is_err());assert_eq!(head(&pool,&a).await["status"],"running");
+        sqlx::query("drop trigger cursor_fixture on study_actual_continuous").execute(&pool).await.unwrap();
+        assert!(actual::finish(&pool,&running,&json!({}),&json!({})).await.unwrap());
+        let sealed=serde_json::to_value(scheduler::ensure(&pool,"admin","price_volume_spike").await.unwrap()).unwrap();assert_eq!(sealed["cursorStudyId"],a.id);
+        actual::fail(&pool,&running,"uncertain-ack").await.unwrap();assert!(!actual::finish(&pool,&running,&json!({}),&json!({})).await.unwrap());
+        assert_eq!(serde_json::to_value(scheduler::ensure(&pool,"admin","price_volume_spike").await.unwrap()).unwrap(),sealed);
+        for expected in [b.id,c.id] {let job=claim(&pool).await;assert_eq!(job.study,expected);actual::fail(&pool,&job,"manual").await.unwrap();}
+        assert_eq!(serde_json::to_value(scheduler::ensure(&pool,"admin","price_volume_spike").await.unwrap()).unwrap(),sealed);
+        due(&pool,"admin").await;assert_eq!(scheduler::next(&pool).await.unwrap().unwrap().candidates[0].study,b.id);
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn config_revision_fences_loading_queued_and_running_without_interrupting_manual() {
+    isolated(|pool| async move {
+        let a = automatic_seed(&pool, "a").await;
+        let b = automatic_seed(&pool, "b").await;
+        enabled(&pool, "admin", "price_volume_spike").await;
+        let t = scheduler::next(&pool).await.unwrap().unwrap();
+        scheduler::configure(
+            &pool,
+            "admin",
+            "price_volume_spike",
+            t.settings.revision,
+            false,
+            "1970-01-01",
+            "UTC",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            auto(&pool, &t, &a, "stale-loading").await,
+            Admission::Deferred
+        ));
+        assert!(actual::get(&pool, "admin", a.id).await.unwrap().is_none());
+        enabled(&pool, "admin", "price_volume_spike").await;
+        let t = scheduler::next(&pool).await.unwrap().unwrap();
+        created(auto(&pool, &t, &a, "stale-queued").await);
+        scheduler::configure(
+            &pool,
+            "admin",
+            "price_volume_spike",
+            t.settings.revision,
+            false,
+            "1970-01-01",
+            "UTC",
+        )
+        .await
+        .unwrap();
+        assert!(actual::claim(&pool, 2).await.unwrap().is_none());
+        assert_eq!(head(&pool, &a).await["status"], "failed");
+        enabled(&pool, "admin", "price_volume_spike").await;
+        // Previous queued cutoff remains deduped; a different eligible study runs.
+        let t = scheduler::next(&pool).await.unwrap().unwrap();
+        created(auto(&pool, &t, &b, "running-config").await);
+        let job = claim(&pool).await;
+        let old = scheduler::ensure(&pool, "admin", "price_volume_spike")
+            .await
+            .unwrap();
+        scheduler::configure(
+            &pool,
+            "admin",
+            "price_volume_spike",
+            old.revision,
+            true,
+            "1970-01-02",
+            "Asia/Kathmandu",
+        )
+        .await
+        .unwrap();
+        created(
+            admit(&pool, &a, "manual-survives", Default::default())
+                .await
+                .unwrap(),
+        );
+        actual::finish(&pool, &job, &json!({}), &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(head(&pool, &b).await["status"], "completed");
+        let changed = scheduler::ensure(&pool, "admin", "price_volume_spike")
+            .await
+            .unwrap();
+        assert!(changed.cursor_study_id.is_none());
+        assert!(changed.reset_pending);
+        let manual = claim(&pool).await;
+        assert_eq!(manual.study, a.id);
+        actual::fail(&pool, &manual, "fixture").await.unwrap();
+        assert!(
+            scheduler::ensure(&pool, "admin", "price_volume_spike")
+                .await
+                .unwrap()
+                .reset_pending
+        );
+        due(&pool, "admin").await;
+        let _ = scheduler::next(&pool).await.unwrap();
+        assert!(
+            !scheduler::ensure(&pool, "admin", "price_volume_spike")
+                .await
+                .unwrap()
+                .reset_pending
+        );
+        assert!(
+            scheduler::ensure(&pool, "admin", "price_volume_spike")
+                .await
+                .unwrap()
+                .cursor_study_id
+                .is_none(),
+            "the new date resets the cursor only before the next automatic scan"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn maintenance_preserves_queued_auto_across_recovery_resume_and_waits_for_running() {
+    isolated(|pool| async move {
+        use setups_db::continuous::maintenance;
+        let a = automatic_seed(&pool, "a").await;
+        let b = automatic_seed(&pool, "b").await;
+        enabled(&pool, "admin", "price_volume_spike").await;
+        let t = scheduler::next(&pool).await.unwrap().unwrap();
+        created(auto(&pool, &t, &a, "durable-auto").await);
+        let queued = head(&pool, &a).await;
+        let status = maintenance::set_paused(&pool, "admin", true).await.unwrap();
+        assert_eq!(status.state, "drained");
+        assert!(actual::claim(&pool, 2).await.unwrap().is_none());
+        assert!(scheduler::next(&pool).await.unwrap().is_none());
+        actual::recover(&pool).await.unwrap();
+        assert_eq!(
+            head(&pool, &a).await,
+            queued,
+            "pause/restart preserve job, revision, cutoff, fence and reserved bytes"
+        );
+        created(
+            admit(&pool, &b, "manual-paused", Default::default())
+                .await
+                .unwrap(),
+        );
+        let status = maintenance::status(&pool, "admin").await.unwrap();
+        assert_eq!(status.state, "drained");
+        assert_eq!(status.active_manual_actual, 1);
+        let manual = claim(&pool).await;
+        assert_eq!(manual.study, b.id);
+        actual::fail(&pool, &manual, "manual").await.unwrap();
+        assert_eq!(head(&pool, &a).await, queued);
+        maintenance::set_paused(&pool, "admin", false)
+            .await
+            .unwrap();
+        let running = claim(&pool).await;
+        assert_eq!(running.job_id, "durable-auto");
+        assert_eq!(
+            running.cutoff,
+            queued["observed_through_unix"].as_i64().unwrap()
+        );
+        let status = maintenance::set_paused(&pool, "admin", true).await.unwrap();
+        assert_eq!(status.state, "draining");
+        assert_eq!(status.running_automatic_actual, 1);
+        actual::recover(&pool).await.unwrap();
+        let failed = head(&pool, &a).await;
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(
+            scheduler::ensure(&pool, "admin", "price_volume_spike")
+                .await
+                .unwrap()
+                .cursor_study_id,
+            Some(a.id)
+        );
+        assert_eq!(
+            maintenance::status(&pool, "admin").await.unwrap().state,
+            "drained"
+        );
+        assert!(
+            !actual::finish(&pool, &running, &json!({}), &json!({}))
+                .await
+                .unwrap()
+        );
+        maintenance::set_paused(&pool, "admin", false)
+            .await
+            .unwrap();
+        due(&pool, "admin").await;
+        let ticket = scheduler::next(&pool).await.unwrap().unwrap();
+        let (paused, admission) = tokio::join!(
+            maintenance::set_paused(&pool, "admin", true),
+            auto(&pool, &ticket, &b, "drain-race")
+        );
+        paused.unwrap();
+        assert!(matches!(
+            admission,
+            Admission::Created(_) | Admission::Deferred
+        ));
+        assert!(
+            actual::claim(&pool, 2).await.unwrap().is_none(),
+            "no auto can acquire ownership after committed drain"
+        );
+        assert_eq!(
+            maintenance::status(&pool, "admin").await.unwrap().state,
+            "drained"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn enable_only_noop_and_restart_terminal_preserve_automatic_position() {
+    isolated(|pool| async move {
+        let a = automatic_seed(&pool, "a").await;
+        let b = automatic_seed(&pool, "b").await;
+        let c = automatic_seed(&pool, "c").await;
+        let d = automatic_seed(&pool, "d").await;
+        enabled(&pool, "admin", "price_volume_spike").await;
+        let t = scheduler::next(&pool).await.unwrap().unwrap();
+        created(auto(&pool, &t, &a, "a").await);
+        let job = claim(&pool).await;
+        actual::fail(&pool, &job, "a").await.unwrap();
+        let t = scheduler::next(&pool).await.unwrap().unwrap();
+        created(auto(&pool, &t, &b, "b").await);
+        let job = claim(&pool).await;
+        scheduler::configure(
+            &pool,
+            "admin",
+            "price_volume_spike",
+            t.settings.revision,
+            false,
+            "1970-01-01",
+            "UTC",
+        )
+        .await
+        .unwrap();
+        actual::finish(&pool, &job, &json!({}), &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            scheduler::ensure(&pool, "admin", "price_volume_spike")
+                .await
+                .unwrap()
+                .cursor_study_id,
+            Some(b.id)
+        );
+        let reenabled = enabled(&pool, "admin", "price_volume_spike").await;
+        assert_eq!(reenabled.cursor_study_id, Some(b.id));
+        let t = scheduler::next(&pool).await.unwrap().unwrap();
+        assert_eq!(t.candidates[0].study, c.id);
+        created(auto(&pool, &t, &c, "c").await);
+        let job = claim(&pool).await;
+        scheduler::configure(
+            &pool,
+            "admin",
+            "price_volume_spike",
+            t.settings.revision,
+            true,
+            "1970-01-01",
+            "UTC",
+        )
+        .await
+        .unwrap();
+        actual::fail(&pool, &job, "noop").await.unwrap();
+        assert_eq!(
+            scheduler::ensure(&pool, "admin", "price_volume_spike")
+                .await
+                .unwrap()
+                .cursor_study_id,
+            Some(c.id)
+        );
+        let t = scheduler::next(&pool).await.unwrap().unwrap();
+        created(auto(&pool, &t, &d, "d").await);
+        let _job = claim(&pool).await;
+        scheduler::configure(
+            &pool,
+            "admin",
+            "price_volume_spike",
+            t.settings.revision,
+            false,
+            "1970-01-01",
+            "UTC",
+        )
+        .await
+        .unwrap();
+        actual::recover(&pool).await.unwrap();
+        assert_eq!(
+            scheduler::ensure(&pool, "admin", "price_volume_spike")
+                .await
+                .unwrap()
+                .cursor_study_id,
+            Some(d.id)
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn two_algorithm_turns_are_fair_and_exact_event_start_keys_preserve_nanoseconds() {
+    isolated(|pool| async move {
+        let a = automatic_seed(&pool, "a").await;
+        let mut b = automatic_seed(&pool, "b").await;
+        sqlx::query(
+            "update optimization_studies set algorithm_id='price_drop_volume_spike' where id=$1",
+        )
+        .bind(b.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        b.source["algorithmId"] = json!("price_drop_volume_spike");
+        enabled(&pool, "admin", "price_volume_spike").await;
+        enabled(&pool, "admin", "price_drop_volume_spike").await;
+        let t = scheduler::next(&pool).await.unwrap().unwrap();
+        assert_eq!(t.settings.algorithm_id, "price_volume_spike");
+        created(auto(&pool, &t, &a, "a").await);
+        let job = claim(&pool).await;
+        actual::fail(&pool, &job, "a").await.unwrap();
+        let t = scheduler::next(&pool).await.unwrap().unwrap();
+        assert_eq!(t.settings.algorithm_id, "price_drop_volume_spike");
+        created(auto(&pool, &t, &b, "b").await);
+        let job = claim(&pool).await;
+        actual::fail(&pool, &job, "b").await.unwrap();
+        let settings = scheduler::ensure(&pool, "admin", "price_drop_volume_spike")
+            .await
+            .unwrap();
+        scheduler::configure(
+            &pool,
+            "admin",
+            "price_drop_volume_spike",
+            settings.revision,
+            false,
+            "1970-01-01",
+            "UTC",
+        )
+        .await
+        .unwrap();
+        for timestamp in [
+            "2026-11-22T00:00:59.999999999Z",
+            "2026-11-22T05:00:00.000000001+05:00",
+            "2026-11-22T00:01:00.250Z",
+        ] {
+            let parsed = DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .with_timezone(&Utc);
+            let events =
+                json!([{"kind":"started","at":"malformed"},{"kind":"started","at":timestamp}]);
+            let value: String = sqlx::query_scalar("select study_actual_execution_start($1)::text")
+                .bind(&events)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                value.parse::<f64>().unwrap(),
+                parsed.timestamp() as f64 + parsed.timestamp_subsec_nanos() as f64 / 1e9
+            );
+            let expected = format!(
+                "{}.{:09}",
+                parsed.timestamp(),
+                parsed.timestamp_subsec_nanos()
+            );
+            let exact: bool =
+                sqlx::query_scalar("select study_actual_execution_start($1)=$2::text::numeric")
+                    .bind(&events)
+                    .bind(&expected)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(exact, "fractional precision changed: {value} vs {expected}");
+            sqlx::query(
+                "update optimization_studies set execution_started_at=null,events=$2 where id=$1",
+            )
+            .bind(a.id)
+            .bind(events)
+            .execute(&pool)
+            .await
+            .unwrap();
+            due(&pool, "admin").await;
+            let t = scheduler::next(&pool).await.unwrap().unwrap();
+            assert_eq!(t.candidates[0].start, parsed);
+            scheduler::skipped(&pool, &t, "fixture").await.unwrap();
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "explicit loopback TEST_DATABASE_URL and CREATEDB required"]
+async fn owner_then_queue_order_allows_cleanup_admit_and_claim_to_progress() {
+    isolated(|pool| async move {
+        let a = automatic_seed(&pool, "a").await;
+        enabled(&pool, "admin", "price_volume_spike").await;
+        let t = scheduler::next(&pool).await.unwrap().unwrap();
+        // Hold purge's first lock. The admitting connection must wait BEFORE
+        // owning QUEUE_LOCK, otherwise acquiring it below reproduces inversion.
+        let mut guard = pool.begin().await.unwrap();
+        sqlx::query("select pg_advisory_xact_lock(hashtextextended('admin',72423415))")
+            .execute(&mut *guard)
+            .await
+            .unwrap();
+        let child = pool.clone();
+        let source = a.clone();
+        let task = tokio::spawn(async move { auto(&child, &t, &source, "concurrent").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sqlx::query("select pg_advisory_xact_lock($1)")
+                .bind(actual::QUEUE_LOCK)
+                .execute(&mut *guard),
+        )
+        .await
+        .expect("owner/queue lock inversion")
+        .unwrap();
+        guard.rollback().await.unwrap();
+        created(task.await.unwrap());
+        let preview = setups_db::continuous::cleanup::preview(&pool, "admin")
+            .await
+            .unwrap();
+        let (purge, claimed) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(
+                setups_db::continuous::cleanup::purge(&pool, "admin", &preview.fingerprint),
+                actual::claim(&pool, 2)
+            )
+        })
+        .await
+        .expect("claim and purge deadlocked");
+        purge.unwrap();
+        let job = claimed.unwrap().unwrap();
+        actual::fail(&pool, &job, "fixture").await.unwrap();
+        created(
+            admit(&pool, &a, "manual-progress", Default::default())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(claim(&pool).await.job_id, "manual-progress");
+    })
+    .await;
 }

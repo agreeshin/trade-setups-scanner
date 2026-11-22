@@ -1,22 +1,62 @@
 //! Browser-session HTTP history summaries against disposable PostgreSQL; no worker/market.
-use axum::{Router, body::Body, http::{Request, StatusCode}};
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, StatusCode},
+};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use setups_api::{SessionAuth, auth::PostSessionResult, optimization::{OptimizationState, optimization_router}, replay::ReplayState, study_actual::study_actual_router};
+use setups_api::{
+    SessionAuth,
+    auth::PostSessionResult,
+    optimization::{OptimizationState, optimization_router},
+    replay::ReplayState,
+    study_actual::study_actual_router,
+};
 use setups_db::study_actual as db;
-use sqlx::{PgPool, postgres::{PgConnectOptions, PgPoolOptions}};
-use std::{future::Future, sync::{Arc, atomic::AtomicBool}};
+use sqlx::{
+    PgPool,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
+use std::{
+    future::Future,
+    sync::{Arc, atomic::AtomicBool},
+};
 use tower::ServiceExt;
 
 async fn isolated<F, Fut>(body: F)
-where F: FnOnce(PgPool) -> Fut + 'static, Fut: Future<Output = ()> + 'static {
-    let options: PgConnectOptions = std::env::var("TEST_DATABASE_URL").expect("explicit local *_test URL required").parse().unwrap();
+where
+    F: FnOnce(PgPool) -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    let options: PgConnectOptions = std::env::var("TEST_DATABASE_URL")
+        .expect("explicit local *_test URL required")
+        .parse()
+        .unwrap();
     assert!(options.get_database().unwrap_or("").ends_with("_test"));
-    assert!(matches!(options.get_host(), "127.0.0.1" | "localhost" | "::1"));
-    let admin = PgPoolOptions::new().max_connections(2).connect_with(options.clone()).await.unwrap();
-    let name = format!("actual_summary_{}_{}_test", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap());
-    sqlx::query(&format!("create database {name}")).execute(&admin).await.unwrap();
-    let pool = PgPoolOptions::new().max_connections(6).connect_with(options.database(&name)).await.unwrap();
+    assert!(matches!(
+        options.get_host(),
+        "127.0.0.1" | "localhost" | "::1"
+    ));
+    let admin = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let name = format!(
+        "actual_summary_{}_{}_test",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    sqlx::query(&format!("create database {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(6)
+        .connect_with(options.database(&name))
+        .await
+        .unwrap();
     let child = pool.clone();
     let result = tokio::task::LocalSet::new().run_until(async move { tokio::task::spawn_local(async move {
         let baseline = include_str!("../../db/migrations/0010_baseline.sql").lines()
@@ -29,14 +69,20 @@ where F: FnOnce(PgPool) -> Fut + 'static, Fut: Future<Output = ()> + 'static {
         body(child).await;
     }).await }).await;
     pool.close().await;
-    sqlx::query(&format!("drop database {name} with(force)")).execute(&admin).await.unwrap();
+    sqlx::query(&format!("drop database {name} with(force)"))
+        .execute(&admin)
+        .await
+        .unwrap();
     admin.close().await;
-    if let Err(error) = result { std::panic::resume_unwind(error.into_panic()); }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error.into_panic());
+    }
 }
 
 async fn seed(pool: &PgPool, owner: &str, start: i64) -> i64 {
     let mut params = json!(setups_domain::SpikeParams::default());
-    params["baselineLongDays"] = json!(1); params["baselineShortDays"] = json!(1);
+    params["baselineLongDays"] = json!(1);
+    params["baselineShortDays"] = json!(1);
     let spec = json!({"algorithmId":"price_volume_spike","algorithmVersion":setups_domain::SPIKE_ALGORITHM_VERSION,
         "algorithmParams":params,"analyticsParams":{"clusterEnabled":false,"clusterGapMinutes":480,"timeShiftMinutes":0,"priceChangePct":null},
         "instruments":[{"exchange":"fixture","category":"linear","symbol":"FIX"}],"fromUnix":start-7*86400,"toUnix":start-60,
@@ -52,69 +98,183 @@ async fn seed(pool: &PgPool, owner: &str, start: i64) -> i64 {
 
 fn fixture(pool: &PgPool) -> (Router, String) {
     let auth = Arc::new(SessionAuth::new(&["summary-fixture-key".into()]));
-    let PostSessionResult::Issued { token, .. } = auth.post_session(Some("summary-fixture-key"), setups_api::now_ms()) else { panic!("fixture login failed") };
+    let PostSessionResult::Issued { token, .. } =
+        auth.post_session(Some("summary-fixture-key"), setups_api::now_ms())
+    else {
+        panic!("fixture login failed")
+    };
     let cookie = format!("{}={token}", setups_api::COOKIE_NAME);
-    let optimizer = optimization_router(Arc::new(OptimizationState { pool: pool.clone(), auth: auth.clone(), config: Default::default(),
-        notify: Arc::new(tokio::sync::Notify::new()), available: Arc::new(AtomicBool::new(true)) }));
-    let actual = study_actual_router(Arc::new(ReplayState { pool: pool.clone(), auth,
-        market_url: "http://127.0.0.1:1".into(), market_key: "unused".into(), limits: Default::default() }));
+    let optimizer = optimization_router(Arc::new(OptimizationState {
+        pool: pool.clone(),
+        auth: auth.clone(),
+        config: Default::default(),
+        notify: Arc::new(tokio::sync::Notify::new()),
+        available: Arc::new(AtomicBool::new(true)),
+    }));
+    let actual = study_actual_router(Arc::new(ReplayState {
+        pool: pool.clone(),
+        auth,
+        market_url: "http://127.0.0.1:1".into(),
+        market_key: "unused".into(),
+        limits: Default::default(),
+    }));
     (optimizer.merge(actual), cookie)
 }
 
 async fn http(app: &Router, cookie: &str, method: &str, path: &str) -> (StatusCode, Value) {
-    let response = app.clone().oneshot(Request::builder().method(method).uri(path)
-        .header("cookie", cookie).header("host", "fixture.test").header("origin", "http://fixture.test")
-        .header("x-platform-request", "1").header("content-type", "application/json")
-        .body(Body::from("{}")).unwrap()).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("cookie", cookie)
+                .header("host", "fixture.test")
+                .header("origin", "http://fixture.test")
+                .header("x-platform-request", "1")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     let status = response.status();
     assert_eq!(response.headers()["cache-control"], "no-store");
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
-const KEYS: [&str; 11] = ["studyId", "eligibility", "jobId", "revision", "status", "stage", "observedThroughUnix", "counts", "meanR", "lastSetupAt", "error"];
-fn project(value: &Value) -> Value { Value::Object(KEYS.into_iter().map(|key| (key.to_owned(), value[key].clone())).collect()) }
+const KEYS: [&str; 12] = [
+    "studyId",
+    "eligibility",
+    "jobId",
+    "requestOrigin",
+    "revision",
+    "status",
+    "stage",
+    "observedThroughUnix",
+    "counts",
+    "meanR",
+    "lastSetupAt",
+    "error",
+];
+fn project(value: &Value) -> Value {
+    Value::Object(
+        KEYS.into_iter()
+            .map(|key| (key.to_owned(), value[key].clone()))
+            .collect(),
+    )
+}
 fn schema(value: &Value, id: i64) {
     assert_eq!(value["studyId"], id);
-    for key in KEYS { assert!(value.get(key).is_some(), "missing TS field {key}: {value}"); }
+    for key in KEYS {
+        assert!(value.get(key).is_some(), "missing TS field {key}: {value}");
+    }
     assert!(value["eligibility"]["eligible"].is_boolean());
     assert!(value["eligibility"]["reason"].is_null() || value["eligibility"]["reason"].is_string());
     assert!(value["jobId"].is_null() || value["jobId"].is_string());
     assert!(value["revision"].as_u64().is_some());
-    assert!(matches!(value["status"].as_str(), Some("not_calculated" | "queued" | "running" | "completed" | "failed")));
-    if value["status"] == "not_calculated" { assert!(value["stage"].is_null()); }
-    else { assert!(matches!(value["stage"].as_str(), Some("queued" | "acquiring" | "replaying" | "evaluating" | "publishing" | "completed" | "failed"))); }
-    assert!(value["observedThroughUnix"].is_null() || value["observedThroughUnix"].as_u64().is_some());
-    assert!(value["meanR"].is_null() || value["meanR"].as_f64().is_some_and(f64::is_finite));
-    assert!(value["lastSetupAt"].is_null() || value["lastSetupAt"].as_str().is_some_and(|at| at.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(at).is_ok()));
-    if !value["counts"].is_null() {
-        for key in ["total", "closed", "tp", "sl", "gateFailed", "unclosed", "noData"] { assert!(value["counts"][key].as_u64().is_some(), "TS count {key}"); }
-        assert!(value["counts"]["closed"].as_u64() <= value["counts"]["total"].as_u64());
-        if value["counts"]["closed"] == 0 { assert!(value["meanR"].is_null()); }
+    assert!(matches!(
+        value["status"].as_str(),
+        Some("not_calculated" | "queued" | "running" | "completed" | "failed")
+    ));
+    if value["status"] == "not_calculated" {
+        assert!(value["stage"].is_null());
+    } else {
+        assert!(matches!(
+            value["stage"].as_str(),
+            Some(
+                "queued"
+                    | "acquiring"
+                    | "replaying"
+                    | "evaluating"
+                    | "publishing"
+                    | "completed"
+                    | "failed"
+            )
+        ));
     }
-    if !value["error"].is_null() { for key in ["code", "stage", "message"] { assert!(value["error"][key].is_string()); } }
-    for heavy in ["source", "sourceFacts", "report", "matrix", "events", "artifact", "candles"] { assert!(value.get(heavy).is_none(), "heavy list field {heavy}"); }
+    assert!(
+        value["observedThroughUnix"].is_null() || value["observedThroughUnix"].as_u64().is_some()
+    );
+    assert!(value["meanR"].is_null() || value["meanR"].as_f64().is_some_and(f64::is_finite));
+    assert!(
+        value["lastSetupAt"].is_null()
+            || value["lastSetupAt"].as_str().is_some_and(
+                |at| at.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(at).is_ok()
+            )
+    );
+    if !value["counts"].is_null() {
+        for key in [
+            "total",
+            "closed",
+            "tp",
+            "sl",
+            "gateFailed",
+            "unclosed",
+            "noData",
+        ] {
+            assert!(value["counts"][key].as_u64().is_some(), "TS count {key}");
+        }
+        assert!(value["counts"]["closed"].as_u64() <= value["counts"]["total"].as_u64());
+        if value["counts"]["closed"] == 0 {
+            assert!(value["meanR"].is_null());
+        }
+    }
+    if !value["error"].is_null() {
+        for key in ["code", "stage", "message"] {
+            assert!(value["error"][key].is_string());
+        }
+    }
+    for heavy in [
+        "source",
+        "sourceFacts",
+        "report",
+        "matrix",
+        "events",
+        "artifact",
+        "candles",
+    ] {
+        assert!(value.get(heavy).is_none(), "heavy list field {heavy}");
+    }
     assert_eq!(value.as_object().unwrap().len(), KEYS.len());
 }
 
 async fn listed(app: &Router, cookie: &str, id: i64) -> Value {
     let (status, page) = http(app, cookie, "GET", "/v1/optimization-studies?limit=100").await;
     assert_eq!(status, StatusCode::OK, "{page}");
-    let value = page["studies"].as_array().unwrap().iter().find(|row| row["id"] == id).unwrap()["actual"].clone();
+    let value = page["studies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap()["actual"]
+        .clone();
     schema(&value, id);
     value
 }
 
 async fn same_as_get(app: &Router, cookie: &str, id: i64, expected_status: &str) -> Value {
     let summary = listed(app, cookie, id).await;
-    let (status, detail) = http(app, cookie, "GET", &format!("/v1/optimization-studies/{id}/actual")).await;
+    let (status, detail) = http(
+        app,
+        cookie,
+        "GET",
+        &format!("/v1/optimization-studies/{id}/actual"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{detail}");
     assert_eq!(summary, project(&detail));
     assert_eq!(summary["status"], expected_status);
     summary
 }
 
-async fn capture_page(pages: &mut serde_json::Map<String, Value>, app: &Router, cookie: &str, label: &str) {
+async fn capture_page(
+    pages: &mut serde_json::Map<String, Value>,
+    app: &Router,
+    cookie: &str,
+    label: &str,
+) {
     assert!(pages.len() < 5);
     let (status, page) = http(app, cookie, "GET", "/v1/optimization-studies?limit=100").await;
     assert_eq!(status, StatusCode::OK);
@@ -282,7 +442,7 @@ async fn bulk_idle_eligibility_requires_proven_start_winner_owner_and_supported_
         sqlx::query("update optimization_studies set events=$2 where id=$1").bind(invalid)
             .bind(json!([{"kind":"started","at":"not-a-timestamp"}])).execute(&pool).await.unwrap();
         sqlx::query("update optimization_studies set events=$2 where id=$1").bind(legacy)
-            .bind(json!([{"kind":"started","at":chrono::DateTime::from_timestamp(start,0).unwrap().to_rfc3339()}])).execute(&pool).await.unwrap();
+            .bind(json!([{"kind":"started","at":"malformed"},{"kind":"started","at":chrono::DateTime::from_timestamp(start,0).unwrap().to_rfc3339()}])).execute(&pool).await.unwrap();
         sqlx::query("update optimization_studies set result=null where id=$1").bind(no_winner).execute(&pool).await.unwrap();
         sqlx::query("update optimization_studies set spec=jsonb_set(spec,'{algorithmVersion}','\"old\"') where id=$1").bind(unsupported).execute(&pool).await.unwrap();
         let (app, cookie) = fixture(&pool);

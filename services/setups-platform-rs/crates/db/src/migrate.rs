@@ -20,6 +20,7 @@ const LIVE_SETUP_TRADE_OUTCOME: &str = "0025_live_setup_trade_outcome.sql";
 const STUDY_ACTUAL: &str = "0026_study_actual.sql";
 const STUDY_ORIGINAL_OUTCOMES: &str = "0027_study_original_outcomes.sql";
 const MANUAL_ORIGINAL_OUTCOMES: &str = "0028_manual_original_outcomes.sql";
+const STUDY_ACTUAL_CONTINUOUS: &str = "0029_study_actual_continuous.sql";
 const MIGRATIONS: &[&str] = &[
     BASELINE,
     RUN_NAMES,
@@ -40,6 +41,7 @@ const MIGRATIONS: &[&str] = &[
     STUDY_ACTUAL,
     STUDY_ORIGINAL_OUTCOMES,
     MANUAL_ORIGINAL_OUTCOMES,
+    STUDY_ACTUAL_CONTINUOUS,
 ];
 
 fn migration_source(name: &str) -> &'static str {
@@ -69,6 +71,7 @@ fn migration_source(name: &str) -> &'static str {
         STUDY_ACTUAL => include_str!("../migrations/0026_study_actual.sql"),
         STUDY_ORIGINAL_OUTCOMES => include_str!("../migrations/0027_study_original_outcomes.sql"),
         MANUAL_ORIGINAL_OUTCOMES => include_str!("../migrations/0028_manual_original_outcomes.sql"),
+        STUDY_ACTUAL_CONTINUOUS => include_str!("../migrations/0029_study_actual_continuous.sql"),
         other => unreachable!("unknown migration {other}"),
     }
 }
@@ -152,7 +155,8 @@ mod tests {
                 LIVE_SETUP_TRADE_OUTCOME,
                 STUDY_ACTUAL,
                 STUDY_ORIGINAL_OUTCOMES,
-                MANUAL_ORIGINAL_OUTCOMES
+                MANUAL_ORIGINAL_OUTCOMES,
+                STUDY_ACTUAL_CONTINUOUS
             ]
         );
         let source = migration_source(RUN_NAMES);

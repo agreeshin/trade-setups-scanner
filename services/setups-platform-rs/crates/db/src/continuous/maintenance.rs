@@ -11,6 +11,8 @@ pub struct MaintenanceStatus {
     pub state: &'static str,
     pub active_chains: i64,
     pub resumable_chains: i64,
+    pub running_automatic_actual: i64,
+    pub active_manual_actual: i64,
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -19,10 +21,11 @@ pub async fn status(pool: &PgPool, owner: &str) -> Result<MaintenanceStatus, DbE
         .bind(owner).fetch_one(pool).await?;
     let admission_paused = row.try_get("paused")?;
     let active_chains = row.try_get("active")?;
+    let (running_automatic_actual,active_manual_actual):(i64,i64)=sqlx::query_as("select count(*) filter(where request_origin='automatic' and status='running'),count(*) filter(where request_origin='manual' and status in ('queued','running')) from study_actualizations where owner_id=$1").bind(owner).fetch_one(pool).await?;
     Ok(MaintenanceStatus {
         admission_paused,
         state: if admission_paused {
-            if active_chains == 0 {
+            if active_chains == 0 && running_automatic_actual == 0 {
                 "drained"
             } else {
                 "draining"
@@ -31,6 +34,8 @@ pub async fn status(pool: &PgPool, owner: &str) -> Result<MaintenanceStatus, DbE
             "running"
         },
         active_chains,
+        running_automatic_actual,
+        active_manual_actual,
         resumable_chains: row.try_get("resumable")?,
         updated_at: row.try_get("updated_at")?,
     })

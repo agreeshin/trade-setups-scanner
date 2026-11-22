@@ -204,7 +204,7 @@ pub async fn list(
           then page.progress->>'bestScore' else page.result#>>'{best,score}' end)::double precision as best_score, \
          coalesce(page.result#>'{best,trendMode}',page.spec->'trendMode') as forecast_mode, \
          winner.cell as best_forecast_cell, \
-         coalesce((select jsonb_build_object('study_id',page.id,'job_id',a.job_id,'revision',a.revision,'status',a.status,'stage',a.stage,'totals',a.totals,'observed_through_unix',a.observed_through_unix,'error',a.error,'last_setup_close_unix',",
+          coalesce((select jsonb_build_object('study_id',page.id,'job_id',a.job_id,'request_origin',a.request_origin,'revision',a.revision,'status',a.status,'stage',a.stage,'totals',a.totals,'observed_through_unix',a.observed_through_unix,'error',a.error,'last_setup_close_unix',",
         crate::study_actual::LAST_SETUP_CLOSE_UNIX_SQL,
         ") from study_actualizations a where a.owner_id=page.owner_id and a.study_id=page.id), \
           jsonb_build_object('study_id',page.id,'status','not_calculated','eligibility_reason',case \
@@ -265,7 +265,9 @@ pub async fn list(
                 owner_id: row.try_get("owner_id")?,
                 continuous_generation_id: row.try_get("continuous_generation_id")?,
                 continuous_slot_id: row.try_get("continuous_slot_id")?,
-                actual:Some(crate::study_actual::compact_summary(&row.try_get::<Value,_>("actual")?)),
+                actual: Some(crate::study_actual::compact_summary(
+                    &row.try_get::<Value, _>("actual")?,
+                )),
             })
         })
         .collect::<Result<_, DbError>>()?;
@@ -286,17 +288,18 @@ pub enum DeleteStudyOutcome {
 
 pub async fn delete(pool: &PgPool, id: i64) -> Result<Option<DeleteStudyOutcome>, DbError> {
     let mut tx = pool.begin().await?;
-    let head =
-        sqlx::query("select status,owner_id from optimization_studies where id=$1 for no key update")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let head = sqlx::query(
+        "select status,owner_id from optimization_studies where id=$1 for no key update",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some(head) = head else {
         tx.commit().await?;
         return Ok(None);
     };
-    let status:String=head.try_get("status")?;
-    let owner:String=head.try_get("owner_id")?;
+    let status: String = head.try_get("status")?;
+    let owner: String = head.try_get("owner_id")?;
     if !matches!(status.as_str(), "completed" | "cancelled" | "failed") {
         tx.commit().await?;
         return Ok(Some(DeleteStudyOutcome::Active));
@@ -310,7 +313,7 @@ pub async fn delete(pool: &PgPool, id: i64) -> Result<Option<DeleteStudyOutcome>
     {
         return Ok(Some(DeleteStudyOutcome::Referenced));
     }
-    if !crate::study_actual::cleanup_for_study_delete(&mut tx,&owner,id).await? {
+    if !crate::study_actual::cleanup_for_study_delete(&mut tx, &owner, id).await? {
         return Ok(Some(DeleteStudyOutcome::Referenced));
     }
     sqlx::query("delete from optimization_studies where id=$1")
@@ -408,16 +411,22 @@ pub async fn finish(
     error: Option<&Value>,
     events: &Value,
 ) -> Result<(), DbError> {
-    finish_with_original_archive(pool,id,status,progress,result,error,events,None).await
+    finish_with_original_archive(pool, id, status, progress, result, error, events, None).await
 }
 
 /// New manual runtime path. Terminal science and the separate bounded archive
 /// commit together. Old callers retain their historical no-archive behavior.
 #[allow(clippy::too_many_arguments)]
 pub async fn finish_with_original_archive(
-    pool:&PgPool,id:i64,status:&str,progress:&Value,result:Option<&Value>,error:Option<&Value>,events:&Value,
-    archive:Option<&crate::study_display::ManualArchive>,
-) -> Result<(),DbError> {
+    pool: &PgPool,
+    id: i64,
+    status: &str,
+    progress: &Value,
+    result: Option<&Value>,
+    error: Option<&Value>,
+    events: &Value,
+    archive: Option<&crate::study_display::ManualArchive>,
+) -> Result<(), DbError> {
     assert!(matches!(status, "completed" | "cancelled" | "failed"));
     let mut tx = pool.begin().await?;
     let previous: Option<String> =
@@ -432,17 +441,30 @@ pub async fn finish_with_original_archive(
         if archive.is_some() {
             // A lost COMMIT ACK must verify what was committed, not turn an
             // already-terminal study into an unconditional default-success.
-            let mut expected=result.cloned();
-            if previous.as_deref()==Some("cancelled") && let Some(value)=&mut expected {
-                value["reason"]=json!("cancelled");
-                if value.get("best").is_some_and(Value::is_object) {value["best"]["partial"]=json!(true);}
+            let mut expected = result.cloned();
+            if previous.as_deref() == Some("cancelled")
+                && let Some(value) = &mut expected
+            {
+                value["reason"] = json!("cancelled");
+                if value.get("best").is_some_and(Value::is_object) {
+                    value["best"]["partial"] = json!(true);
+                }
             }
             // JSONB normalizes numeric notation; compare in its value domain,
             // not arbitrary_precision Number strings decoded back into Rust.
             let same:bool=sqlx::query_scalar("select result is not distinct from $2::jsonb from optimization_studies where id=$1")
                 .bind(id).bind(&expected).fetch_one(&mut *tx).await?;
-            if !same {return Err(DbError::Json("study_display_manual_terminal_conflict".into()));}
-            crate::study_display::seal_manual_in(&mut tx,id,archive.expect("archive presence checked")).await?;
+            if !same {
+                return Err(DbError::Json(
+                    "study_display_manual_terminal_conflict".into(),
+                ));
+            }
+            crate::study_display::seal_manual_in(
+                &mut tx,
+                id,
+                archive.expect("archive presence checked"),
+            )
+            .await?;
         }
         tx.commit().await?;
         return Ok(());
@@ -480,7 +502,9 @@ pub async fn finish_with_original_archive(
     .bind(&events)
     .execute(&mut *tx)
     .await?;
-    if let Some(archive)=archive {crate::study_display::seal_manual_in(&mut tx,id,archive).await?;}
+    if let Some(archive) = archive {
+        crate::study_display::seal_manual_in(&mut tx, id, archive).await?;
+    }
     tx.commit().await?;
     Ok(())
 }
