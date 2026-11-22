@@ -10,6 +10,7 @@ import type { ContinuousController } from "./use-continuous-study";
 import { summarizeOptimizationStudy, type OptimizationSpec, type OptimizationStudy } from "../lib/optimization-api";
 import { AlgorithmsPage } from "./algorithms-page";
 import type { Algorithm } from "./platform-controls";
+import { actualContinuousFixture } from "../../test/study-actual-fixture";
 
 const algorithm: Algorithm = { id: "future", name: "Stable service name", externalName: "Мой алгоритм", version: "1", description: "Metadata", enabled: false,
   params: { futureThreshold: "2.5", opaqueFixed: "kept" }, fields: [{ key: "futureThreshold", label: "Новый порог", type: "decimal", min: 0, max: 100, unit: "%", optimization: { enabledByDefault: true, values: ["1.5", "2.5"] } }] };
@@ -48,6 +49,7 @@ beforeEach(() => {
     requests.push({ path, method, body });
     const json = (data: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(data), { status }));
     if (path === "/v1/algorithms") return json({ algorithms: [algorithm] });
+    if (path.startsWith("/v1/optimization-studies/actual/continuous?")) return json(actualContinuousFixture(new URL(path, "http://localhost").searchParams.get("algorithmId")!));
     if (path === "/v1/instruments") return json({ instruments: [{ id: 1, exchange: "bybit", category: "linear", symbol: "OLDUSDT", status: "Delisted" }] });
     if (path === "/v1/settings/ui") return json({ value: { replay: { symbols: "OLDUSDT" } } });
     const draft = /^\/v1\/optimization-drafts\/(.+)$/.exec(path);
@@ -335,7 +337,7 @@ it("clears candidate errors and obsolete candidate badges after promotion, ready
 
 it("keeps the enabled research status above left-aligned controls and renders its phase in a semantic badge", () => {
   render(<ContinuousResearch algorithm={algorithm} controller={profileController({}, { phase: "searching" })} />);
-  const research = within(screen.getByRole("region", { name: "Непрерывные исследования" }));
+  const research = within(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" }));
   const status = research.getByRole("status");
   const controls = research.getByRole("region", { name: "Управление непрерывным исследованием" });
   expect(status.compareDocumentPosition(controls) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
@@ -368,7 +370,7 @@ it.each([
   { status: "running", phase: "__proto__", label: "__proto__", color: "muted-foreground" },
 ] as const)("renders research phase $phase in state $status with $color semantics", ({ status, phase, label, color }) => {
   render(<ContinuousResearch algorithm={algorithm} controller={profileController({}, { status, phase })} />);
-  const research = within(screen.getByRole("region", { name: "Непрерывные исследования" }));
+  const research = within(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" }));
   expect(research.getByText(label).closest('[data-slot="badge"]')).toHaveClass(`text-${color}`);
   expect(research.getByRole("status").querySelector("svg") !== null).toBe(status === "running");
   if (status === "stopped") expect(research.getByRole("button", { name: "Запустить непрерывное исследование" }).querySelector("svg")).toHaveAttribute("fill", "currentColor");
@@ -453,7 +455,7 @@ it("explains an unconfirmed snapshot without recoloring the saved live status an
 it("puts research commands and history cleanup only in Continuous Research, outside adaptive profiles", async () => {
   render(<AlgorithmsPage />);
   const controls = await screen.findByRole("region", { name: "Управление непрерывным исследованием" });
-  const research = screen.getByRole("region", { name: "Непрерывные исследования" });
+  const research = screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" });
   expect(research).toContainElement(controls);
   for (const name of ["Обновить статус непрерывного процесса", "Настроить непрерывное исследование", "Запустить непрерывное исследование", "Удалить историю непрерывных исследований…"]) {
     expect(within(controls).getByRole("button", { name })).toBeInTheDocument();
@@ -728,20 +730,23 @@ it("keeps finalized and incumbent provenance while new research starts, complete
   const saved = { finalizedGenerationId: 8, studyId: 42, activeStudyId: 41, activeStatus: "active" as const,
     pendingGenerationId: 8, pendingStudyId: 42, pendingStatus: "warming" };
   const view = render(<ContinuousResearch algorithm={algorithm} controller={profileController(saved, { activeStudyId: 43, phase: "acquiring" })} />);
-  const research = () => within(screen.getByRole("cell", { name: /Сохранённое исследование #42/ }));
+  const research = () => within(screen.getByRole("cell", { name: "Исследование #42 принято" }));
   const unchanged = () => {
-    expect(research().getByText("Сохранённое исследование #42")).toBeInTheDocument();
-    expect(research().getByText("Полностью завершённое поколение #8")).toBeInTheDocument();
-    expect(screen.queryByText("Сохранённое исследование #43")).not.toBeInTheDocument();
+    expect(research().getByText("Исследование #42 принято")).toHaveClass("text-success");
+    expect(research().getByText("Исследование #42 принято")).toHaveAttribute("data-slot", "badge");
+    expect(research().getAllByText(/./)).toHaveLength(1);
+    expect(screen.queryByText("Сохранённое исследование #42")).not.toBeInTheDocument();
+    expect(screen.queryByText("Полностью завершённое поколение #8")).not.toBeInTheDocument();
+    expect(screen.queryByText("Исследование #43 принято")).not.toBeInTheDocument();
     expect(liveDetails().getByText("Источник метрик и рекомендации: исследование #41 · поколение #7")).toBeInTheDocument();
     expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Исследование кандидата #42");
     expect(screen.getByText("SHORT · TP 14% / SL 4% · 0.32 R")).toBeInTheDocument();
   };
-  expect(screen.getByRole("region", { name: "Непрерывные исследования" })).toHaveTextContent("Исследование #43"); unchanged();
+  expect(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" })).toHaveTextContent("Исследование #43"); unchanged();
   view.rerender(<ContinuousResearch algorithm={algorithm} controller={profileController(saved, { activeStudyId: 43, phase: "analytics" })} />);
-  expect(screen.getByRole("region", { name: "Непрерывные исследования" })).toHaveTextContent("Исследование #43"); unchanged();
+  expect(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" })).toHaveTextContent("Исследование #43"); unchanged();
   view.rerender(<ContinuousResearch algorithm={algorithm} controller={profileController(saved, { status: "error", activeStudyId: null })} />);
-  expect(screen.getByRole("region", { name: "Непрерывные исследования" })).not.toHaveTextContent("Исследование #43"); unchanged();
+  expect(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" })).not.toHaveTextContent("Исследование #43"); unchanged();
   expect(requests).toHaveLength(0);
 });
 it("never uses unfinalized or legacy research slots as a fallback for the independent profiles endpoint", async () => {
@@ -751,20 +756,20 @@ it("never uses unfinalized or legacy research slots as a fallback for the indepe
   standaloneProfiles = [];
   render(<AlgorithmsPage />);
   await screen.findByText(/Принятых адаптивных профилей пока нет/);
-  expect(screen.getByRole("region", { name: "Непрерывные исследования" })).toHaveTextContent("Исследование #26");
-  expect(screen.queryByText("Сохранённое исследование #26")).not.toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" })).toHaveTextContent("Исследование #26");
+  expect(screen.queryByText("Исследование #26 принято")).not.toBeInTheDocument();
   process = profileController({ studyId: 26 }).process;
   await userEvent.click(screen.getByRole("button", { name: "Обновить статус непрерывного процесса" }));
   expect(screen.getByRole("table", { name: "Адаптивные профили · Мой алгоритм" })).not.toHaveTextContent("#26");
-  expect(screen.queryByText("Сохранённое исследование #26")).not.toBeInTheDocument();
+  expect(screen.queryByText("Исследование #26 принято")).not.toBeInTheDocument();
 });
 it("separates successful research, incumbent live and the warming candidate without relabelling its study as the incumbent", () => {
   render(profileView({ activeStatus: "active", pendingGenerationId: 8, pendingStatus: "warming", readinessFrontier: null, pendingError: null, liveWatermark: closedBoundary }));
   const table = within(screen.getByRole("table", { name: "Адаптивные профили · Мой алгоритм" }));
   const incumbent = table.getByRole("cell", { name: /Действующее поколение #7/ });
   const candidate = table.getByRole("cell", { name: /Кандидат #8/ });
-  expect(table.getByText("Исследование принято")).toBeInTheDocument();
-  expect(table.getByText("Сохранённое исследование #42")).toBeInTheDocument();
+  expect(table.getByText("Исследование #42 принято")).toHaveClass("text-success");
+  expect(table.queryByText("Сохранённое исследование #42")).not.toBeInTheDocument();
   expect(incumbent).not.toHaveTextContent("#8"); expect(incumbent).not.toHaveTextContent("#42");
   expect(candidate).toHaveTextContent("Инициализация live по текущим данным");
   expect(candidate.querySelector('[data-slot="badge"]')).toHaveClass("text-info");
@@ -813,8 +818,8 @@ it("does not turn a first successful candidate into an active generation before 
 it("keeps accepted research visible but explicitly shows no adaptive emission after the first live initialization fails", () => {
   render(profileView({ minSetupsPerDay: 1, studyId: 16, activeGenerationId: null, activeStatus: "inactive", pendingGenerationId: 8,
     pendingStatus: "error", readinessFrontier: null, pendingError: { code: "current_data_unavailable", message: "Недостаточно текущих закрытых свечей." }, liveWatermark: null }));
-  expect(screen.getByText("Исследование принято")).toBeInTheDocument();
-  expect(screen.getByText("Сохранённое исследование #16")).toBeInTheDocument();
+  expect(screen.getByText("Исследование #16 принято")).toHaveClass("text-success");
+  expect(screen.queryByText("Сохранённое исследование #16")).not.toBeInTheDocument();
   expect(liveDetails().getByText("Адаптивные сигналы этого профиля не формируются.")).toBeInTheDocument();
   expect(screen.getByRole("cell", { name: /Кандидат #8/ })).toHaveTextContent("Ошибка инициализации live");
   expect(within(screen.getByRole("cell", { name: /Кандидат #8/ })).getByRole("alert")).toHaveTextContent("current_data_unavailable");

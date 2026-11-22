@@ -10,6 +10,7 @@ import { createStore } from "../store";
 import { RouteActiveContext } from "./route-active";
 import { usePlatformPoll } from "./use-platform-poll";
 import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
+import { actualContinuousFixture } from "../../test/study-actual-fixture";
 
 const requests: string[] = [];
 const mutations: string[] = [];
@@ -31,6 +32,7 @@ beforeEach(() => {
     let data: unknown = {};
     if (path === "/v1/status") data = { platform: "ready", marketData: "ready" };
     if (path === "/v1/settings/ui") data = { value: {} };
+    if (path.startsWith("/v1/optimization-studies/actual/continuous?")) data = actualContinuousFixture(new URL(path, "http://localhost").searchParams.get("algorithmId")!);
     if (path === "/v1/algorithms") data = { algorithms: [{
       id: "price_volume_spike", name: "Рост цены и объёма", version: "1", description: "Общие настройки", enabled: true,
       params: { priceGrowthPct: "12" },
@@ -70,11 +72,15 @@ describe("keep-alive navigation tabs", () => {
     await user.click(screen.getByRole("link", { name: "Алгоритмы" }));
     await screen.findByRole("tab", { name: "Рост цены и объёма" });
     expect(main.matches(selector)).toBe(true);
+    expect(main).toHaveClass("px-4", "sm:px-6");
+    expect(main.querySelector('[data-slot="page-card"]')).toHaveAttribute("class", "min-w-0");
     expect(main.querySelector('[data-slot="page-sidebar"]')).toHaveClass("md:right-0", "md:fixed", "md:w-56");
     await user.click(screen.getByRole("link", { name: "Обзор" }));
     expect(main.matches(selector)).toBe(false);
     expect(main.querySelector('[data-page-path="/algorithms"]')).toHaveAttribute("hidden");
     expect(main).toHaveClass("max-w-7xl");
+    const sidebarSelector = '[data-slot="app-main"]:has([data-page-path]:not([hidden]) [data-slot="page-sidebar"])';
+    expect(main.matches(sidebarSelector)).toBe(false);
     expect(scrollTo).toHaveBeenCalled();
   });
 

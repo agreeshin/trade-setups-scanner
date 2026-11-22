@@ -169,11 +169,8 @@ function SlotPending({ slot }: { slot: ContinuousSlot }) {
 }
 
 function SlotResearch({ slot }: { slot: ContinuousSlot }) {
-  return <div className="grid gap-1 text-xs">
-    <Badge>Исследование принято</Badge>
-    <span>{slot.studyId === null ? "Исследование принятой версии неизвестно" : `Сохранённое исследование #${slot.studyId}`}</span>
-    {slot.finalizedGenerationId != null && <span>Полностью завершённое поколение #{slot.finalizedGenerationId}</span>}
-  </div>;
+  return slot.studyId === null ? <span className="text-xs text-muted-foreground">Исследование принятой версии неизвестно</span>
+    : <Badge variant="success">Исследование #{slot.studyId} принято</Badge>;
 }
 
 
@@ -322,8 +319,9 @@ function ContinuousForm({ algorithm, controller, onSaved }: { algorithm: Algorit
 
 export function ContinuousResearch({ controller, children }: { algorithm?: Algorithm; controller: ContinuousController; children?: ReactNode }) {
   const process = controller.process;
-  return <section aria-label="Непрерывные исследования" className="grid min-w-0 gap-3">
-    <div className="flex items-center justify-center gap-2 text-center"><h4 className="font-semibold">Непрерывные исследования</h4>
+  const headingId = useId();
+  return <section aria-labelledby={headingId} className="grid min-w-0 gap-3">
+    <div className="flex items-center justify-center gap-2 text-center"><h4 id={headingId} className="font-semibold">Непрерывные исследования оптимальных параметров</h4>
       <InfoNote label="Об остановке и расчёте доходности">Stop отменяет только исследовательскую цепочку и очищает её незавершённые данные после drain. Профили и завершённая история сохраняются. Следующий Start создаёт новое исследование; техническое восстановление — отдельное действие. R рассчитан только по наблюдавшимся закрытым TP/SL-сделкам, без вымышленных нулей или SL на правом краю.</InfoNote></div>
     {controller.available && <p role="status" className="flex items-center gap-2 text-sm">{process?.status === "running" && <CircleCheck aria-hidden="true" className="size-5 shrink-0 fill-success text-success-foreground" />}{process ? statuses[process.status] : "Процесс не настроен. Исследование не запущено."}</p>}
     {children}

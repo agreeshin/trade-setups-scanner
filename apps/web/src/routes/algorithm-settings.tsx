@@ -153,7 +153,7 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     </ContinuousResearch>
     <Separator />
     <section aria-labelledby={`${optimizerTriggerId}-optimizations`} className="grid min-w-0 gap-4">
-    <h4 id={`${optimizerTriggerId}-optimizations`} className="text-center font-semibold">Исследования оптимальных параметров</h4>
+    <h4 id={`${optimizerTriggerId}-optimizations`} className="text-center font-semibold">Список проведённых исследований</h4>
     {optimization.error && <Alert variant="destructive" role="alert">{optimization.error}<Button type="button" variant="outline" onClick={optimization.refresh}>Обновить статус оптимизации</Button></Alert>}
     <OptimizationHistory id={historyRegionId} algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} active={selected && liveMode === "flexible" && selectedHistory?.open !== true && selectedDeleteTarget === null} onSelect={selectHistory} onDelete={requestDelete} actions={<div className="flex flex-wrap gap-2">
       <Button id={optimizerTriggerId} type="button" variant="outline" aria-label={`Запустить новое исследование ${displayName}`} onClick={() => { setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setOptimizationOpen(true); }}>Запустить новое исследование</Button>

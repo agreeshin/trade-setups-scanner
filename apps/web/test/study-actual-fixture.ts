@@ -1,4 +1,12 @@
 import type { StudyActualDetail, StudyActualReport, StudyActualSetup, StudyActualSummary } from "../src/lib/study-actual-api";
+import type { StudyActualContinuous } from "../src/lib/study-actual-continuous-api";
+
+/** CamelCase Settings plus queue from study_actual_continuous::state. */
+export function actualContinuousFixture(algorithmId = "spike", patch: Partial<StudyActualContinuous> = {}): StudyActualContinuous {
+  return { algorithmId, enabled: true, fromDate: "2026-11-22", fromBoundary: "2026-11-22T00:00:00Z", timeZone: "UTC", revision: 1,
+    cursorStudyId: null, cursorExecutionStartedAt: null, nextDueAt: "2026-11-22T00:00:00Z", lastSkipReason: null,
+    queue: { manualQueued: 0, automaticQueued: 0, running: null }, ...patch };
+}
 
 export function studyActualFixture(studyId = 49, patch: Partial<StudyActualSummary> = {}): StudyActualSummary {
   return { studyId, eligibility: { eligible: true, reason: null }, jobId: null, revision: 0, status: "not_calculated", stage: null,

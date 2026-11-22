@@ -10,6 +10,7 @@ import { forecastRecipeLabel } from "../lib/forecast-recipe";
 import { isActiveStudy, isContinuousStudy, listOptimizationStudies, type OptimizationStudyAction, type OptimizationStudyPage, type OptimizationStudySummary } from "../lib/optimization-api";
 import { isStudyActualPending } from "../lib/study-actual-api";
 import { StudyActualFact, StudyActualRefreshButton } from "./study-actual-controls";
+import { StudyActualContinuousControls } from "./study-actual-continuous";
 import { useStudyActualAction } from "./use-study-actual-action";
 import { errorText } from "./platform-controls";
 import { RouteActiveContext } from "./route-active";
@@ -18,6 +19,11 @@ import type { OptimizationController } from "./use-optimization-studies";
 const scoreFormatter = new Intl.NumberFormat("en-US", {
   notation: "standard", useGrouping: false, minimumFractionDigits: 2, maximumFractionDigits: 2,
 });
+const headers = [
+  ["ID"], ["Происхождение"], ["Диапазон", "дат"], ["Время", "исследования"], ["Минимум сетапов", "в день"],
+  ["Оптимизация", "матожидания"], ["Лучшая ячейка", "TP/SL"], ["Лучший Score", "матрицы"],
+  ["Лучший прогноз", "для ячейки"], ["Матожидание", "факт"], ["Действия"],
+];
 
 export function OptimizationTrashIcon() {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6" /></svg>;
@@ -31,7 +37,7 @@ function OptimizationExpectationSummary({ spec }: { spec: OptimizationStudySumma
   const method = spec.forecast?.method === "decayed_probability"
     ? `Вероятность TP с памятью · H ${spec.forecast.halfLifeDays} дней`
     : `Тренд · ${bend === "linear" ? "прямая" : `перегиб ${bend} дней`}`;
-  return <div className="grid gap-1 text-xs">
+  return <div className="grid max-w-48 gap-1 break-words text-xs">
     <span>{mode === "blend" ? "Смесь" : "Прогноз"} · λ {Number.isFinite(lambda) ? lambda : "—"}{mode === "forecast" ? " (не применяется)" : ""}</span>
     <span title={forecastRecipeLabel(spec.forecast, bend)}>{method}</span>
   </div>;
@@ -47,7 +53,7 @@ function OptimizationHistoryRow({ study, latest, controller, busy, instanceId, o
   return <TableRow>
     <TableCell><Button id={`${instanceId}-study-${study.id}`} type="button" variant="outline" size="sm" aria-label={`Результат исследования ${study.id}`} onClick={() => onSelect(study.id, `${instanceId}-study-${study.id}`, isContinuousStudy(study))}>#{study.id}</Button></TableCell>
     <TableCell><Badge>{isContinuousStudy(study) ? "Непрерывное" : "Ручное"}</Badge></TableCell>
-    <TableCell className="whitespace-nowrap" title="Начало включительно; конец исключительно."><span className="block">{formatUnix(study.spec.fromUnix)} -</span><span className="block">{formatUnix(study.spec.toUnix)}</span></TableCell>
+    <TableCell className="whitespace-nowrap text-xs" title="Начало включительно; конец исключительно."><span className="block">{formatUnix(study.spec.fromUnix)} -</span><span className="block">{formatUnix(study.spec.toUnix)}</span></TableCell>
     <TableCell className="whitespace-nowrap">{formatElapsedDuration(study.progress.elapsedSeconds)}</TableCell>
     <TableCell>{study.spec.minSetupsPerDay ?? "Гейт не применялся"}</TableCell>
     <TableCell><OptimizationExpectationSummary spec={study.spec} /></TableCell>
@@ -56,7 +62,7 @@ function OptimizationHistoryRow({ study, latest, controller, busy, instanceId, o
     <TableCell>{study.bestScore === null || !Number.isFinite(study.bestScore) ? "—" : `${scoreFormatter.format(study.bestScore)} R`}</TableCell>
     <TableCell>{study.forecastBest == null || !Number.isFinite(study.forecastBest.forecastR) ? "—" : `${scoreFormatter.format(study.forecastBest.forecastR)} R`}</TableCell>
     <TableCell><StudyActualFact action={actual} /></TableCell>
-    <TableCell><div className="flex items-center gap-1">
+    <TableCell className="w-px whitespace-nowrap pr-0"><div className="flex items-center gap-1">
       <StudyActualRefreshButton studyId={study.id} action={actual} />
       {isActiveStudy(study) && !isContinuousStudy(study)
         ? <Button type="button" variant="outline" size="sm" disabled={busy || study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested")} aria-label={`Остановить исследование ${study.id}`} onClick={() => { void controller.stop(study); }}>{study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested") ? "Остановка запрошена" : controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить"}</Button>
@@ -156,13 +162,12 @@ export function OptimizationHistory({ id, algorithmId, algorithmName, controller
   const padding = placeholders ? 0 : Math.max(0, pageSize - (currentPage?.studies.length ?? 0));
   return <section id={id} tabIndex={-1} aria-label={`История оптимизации · ${algorithmName}`} className="grid min-w-0 gap-3">
     {error && <Alert variant="destructive" role="alert">{error}<Button type="button" variant="outline" onClick={() => setRetry((value) => value + 1)}>Повторить загрузку истории</Button></Alert>}
-    {actions}
+    {actions && <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">{actions}<StudyActualContinuousControls algorithmId={algorithmId} active={active && controller.ready} onChanged={() => refreshPage.current()} /></div>}
     {/* Reserve 20 h-13 rows plus a header outside the table; real rows never inherit its height. */}
     <div className={pageSize === 20 ? "min-h-[68.25rem] overflow-x-auto" : "overflow-x-auto"}>
-      <Table aria-label={`Исследования · ${algorithmName}`} aria-busy={fetching || placeholders} className="table-fixed min-w-7xl">
-        <colgroup>{["w-20", "w-28", "w-96", "w-48", "w-40", "w-72", "w-48", "w-32", "w-44", "w-52", "w-60"].map((width, index) => <col key={index} className={width} />)}</colgroup>
-        <TableHeader><TableRow>{["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Оптимизация матожидания", "Лучшая ячейка TP/SL", "Лучший Score матрицы", "Лучший прогноз для ячейки", "Матожидание факт", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
-        <TableBody className="[&_td]:py-1.5 [&_td]:align-middle">{placeholders ? <TableSkeletonRows rows={pageSize} columns={11} /> : <>
+      <Table aria-label={`Исследования · ${algorithmName}`} aria-busy={fetching || placeholders} className="table-auto">
+        <TableHeader><TableRow>{headers.map((lines, index) => <TableHead key={index} aria-label={lines.join(" ")} className={index === 10 ? "w-px px-2 pr-0" : "px-2"}>{lines.map((line) => <span key={line} className="block whitespace-nowrap">{line}</span>)}</TableHead>)}</TableRow></TableHeader>
+        <TableBody className="[&_td]:px-2 [&_td]:py-1.5 [&_td]:align-middle [&_td:last-child]:pr-0">{placeholders ? <TableSkeletonRows rows={pageSize} columns={11} /> : <>
           {currentPage?.studies.map((study) => <OptimizationHistoryRow key={study.id} study={study} latest={latest} controller={controller} busy={busy} instanceId={instanceId} onSelect={onSelect} onDelete={onDelete} onActualChanged={() => setRetry((value) => value + 1)} />)}
           {Array.from({ length: padding }, (_, index) => <TableRow key={`padding-${index}`} aria-hidden="true" className="h-13 hover:bg-transparent"><TableCell colSpan={11} /></TableRow>)}
         </>}</TableBody>

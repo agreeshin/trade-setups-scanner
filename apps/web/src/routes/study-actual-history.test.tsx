@@ -1,7 +1,7 @@
 import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { actualCountsFixture, studyActualFixture } from "../../test/study-actual-fixture";
+import { actualContinuousFixture, actualCountsFixture, studyActualFixture } from "../../test/study-actual-fixture";
 import producerPagesJson from "../../test/study-actual-producer-pages.json?raw";
 import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
 import type { OptimizationStudySummary } from "../lib/optimization-api";
@@ -66,6 +66,25 @@ it("mounts under StrictMode without any calculation or per-row discovery, keepin
   expect(within(tableRow()).getByText("0.70 R")).toBeInTheDocument();
   expect(within(tableRow()).getByText("Не рассчитано")).toBeInTheDocument();
   expect(posts()).toHaveLength(0); expect(requests.every((request) => request.path.includes("?"))).toBe(true);
+});
+
+it("uses content-sized columns, bounded header lines and an unpadded controls-width action column inside the scroll/reserve wrapper", async () => {
+  surface(false, 20); await settle();
+  const table = screen.getByRole("table");
+  expect(table).toHaveClass("table-auto"); expect(table).not.toHaveClass("table-fixed", "min-w-7xl");
+  expect(table.querySelector("colgroup")).toBeNull();
+  expect(table.parentElement).toHaveClass("overflow-x-auto", "min-h-[68.25rem]");
+  for (const header of within(table).getAllByRole("columnheader")) {
+    expect(header.children.length).toBeLessThanOrEqual(3);
+    for (const line of header.children) expect(line).toHaveClass("block", "whitespace-nowrap");
+  }
+  expect(screen.getByRole("columnheader", { name: "Время исследования" }).children).toHaveLength(2);
+  const actionHeader = screen.getByRole("columnheader", { name: "Действия" });
+  expect(actionHeader).toHaveClass("w-px", "pr-0");
+  expect(within(tableRow()).getAllByRole("cell").at(-1)).toHaveClass("w-px", "pr-0");
+  const padding = table.querySelectorAll('tbody tr[aria-hidden="true"]');
+  expect(padding).toHaveLength(18);
+  expect(tableRow()).not.toHaveClass("h-13");
 });
 
 it("shows the exact saved TP/SL levels from the same forecastBest cell as its forecast, independently of score and current search axes", async () => {
@@ -208,6 +227,40 @@ it("restores a persisted queued job after reload and observes completion using o
   expect(within(tableRow()).getByText("123/176")).toHaveClass("text-ambient-violet");
   expect(posts()).toHaveLength(0);
   const count = requests.length; await settle(9000); expect(requests).toHaveLength(count);
+});
+
+it("keeps a persisted automatic row loader after switch-off and reload, without cancelling or scheduling work in the browser", async () => {
+  rows[0] = row(49, studyActualFixture(49, { status: "running", stage: "evaluating", revision: 2, jobId: "automatic-job" }));
+  let state = actualContinuousFixture("spike", { queue: { manualQueued: 1, automaticQueued: 0,
+    running: { studyId: 49, algorithmId: "spike", jobId: "automatic-job", status: "running", requestOrigin: "automatic" } } });
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    if (!path.startsWith("/v1/optimization-studies/actual/continuous?")) return original(path, init);
+    const method = init?.method ?? "GET";
+    requests.push({ path, method, body: init?.body, ...(init?.signal ? { signal: init.signal } : {}) });
+    if (method === "PUT") {
+      expect(JSON.parse(init!.body as string)).toEqual({ enabled: false, fromDate: "2026-11-22", timeZone: "UTC", revision: 1 });
+      state = { ...state, enabled: false, revision: 2 };
+    }
+    return Promise.resolve(json(state));
+  }));
+  const page = () => <OptimizationHistory algorithmId="spike" algorithmName="Всплеск" controller={controller}
+    onSelect={vi.fn()} onDelete={vi.fn()} actions={<button type="button">Запустить новое исследование</button>} />;
+  const view = render(page()); await settle();
+  const trigger = screen.getByRole("button", { name: "Результат исследования 49" });
+  act(() => { trigger.focus(); });
+  expect(button()).toBeDisabled(); expect(button().querySelector("svg")).toHaveClass("motion-safe:animate-spin");
+  const toggle = screen.getByRole("switch", { name: "Включить непрерывный пересчёт факт матожидания" });
+  expect(toggle).toBeChecked(); fireEvent.click(toggle); await settle();
+  expect(toggle).not.toBeChecked(); expect(button()).toBeDisabled(); expect(button()).toHaveAttribute("aria-busy", "true");
+  expect(within(tableRow()).getByRole("status")).toHaveTextContent("Расчёт исходов");
+  expect(screen.getByRole("button", { name: "Результат исследования 49" })).toBe(trigger); expect(trigger).toHaveFocus();
+  view.unmount(); render(page()); await settle();
+  expect(screen.getByRole("switch", { name: "Включить непрерывный пересчёт факт матожидания" })).not.toBeChecked();
+  expect(button()).toBeDisabled(); expect(button().querySelector("svg")).toHaveClass("motion-safe:animate-spin");
+  expect(within(tableRow()).getByRole("status")).toHaveTextContent("Расчёт исходов");
+  await settle(9000);
+  expect(requests.filter((request) => request.method === "PUT")).toHaveLength(1); expect(posts()).toHaveLength(0);
 });
 
 it("uses closed/all counts, displays null as unavailable rather than zero, and exposes the exact count tooltip", async () => {

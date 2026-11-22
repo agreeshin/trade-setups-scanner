@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { summarizeOptimizationStudy, type OptimizationSpec, type OptimizationStudy } from "../lib/optimization-api";
-import { notCalculatedActualResponse } from "../../test/study-actual-fixture";
+import { actualContinuousFixture, notCalculatedActualResponse } from "../../test/study-actual-fixture";
 import { applyInterfaceSettings, formatUnix, interfaceSettings } from "../lib/datetime-format";
 import { AlgorithmsPage } from "./algorithms-page";
 import type { Algorithm } from "./platform-controls";
@@ -90,6 +90,7 @@ beforeEach(() => {
     requests.push({ path, method, body, ...(init?.signal ? { signal: init.signal } : {}) });
     const json = (value: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(value), { status }));
     if (path === "/v1/algorithms") return json({ algorithms: listedAlgorithms });
+    if (path.startsWith("/v1/optimization-studies/actual/continuous?")) return json(actualContinuousFixture(new URL(path, "http://localhost").searchParams.get("algorithmId")!));
     if (path === "/v1/instruments") return json({ instruments });
     if (path === "/v1/continuous-studies/cleanup") {
       if (method === "GET") return json(cleanupPreview);
@@ -175,11 +176,12 @@ it("shows retained Radix live panels and keeps fixed controls independent when c
   expect(flexible.getByRole("button", { name: "Сохранить разрешение адаптивного live" })).toBeDisabled();
   expect(first.getByRole("button", { name: "Запустить новое исследование Новый алгоритм" })).toHaveTextContent("Запустить новое исследование");
   expect(first.queryByRole("button", { name: "Посмотреть весь список" })).not.toBeInTheDocument();
-  expect(first.getByRole("heading", { name: "Исследования оптимальных параметров" })).toBeInTheDocument();
+  expect(first.getByRole("heading", { name: "Список проведённых исследований" })).toBeInTheDocument();
   expect(screen.queryByText("Статус / результат оптимизации")).not.toBeInTheDocument();
   const history = first.getByRole("region", { name: "История оптимизации · Новый алгоритм" });
   expect(within(history).queryByRole("heading", { name: "Последние исследования" })).not.toBeInTheDocument();
-  expect(within(history).getByRole("button", { name: "Запустить новое исследование Новый алгоритм" }).closest("div")?.nextElementSibling).toContainElement(within(history).getByRole("table"));
+  expect(within(history).getByRole("switch", { name: "Включить непрерывный пересчёт факт матожидания" })).toBeInTheDocument();
+  expect(within(history).getByRole("button", { name: "Запустить новое исследование Новый алгоритм" }).closest("div")?.parentElement?.nextElementSibling).toContainElement(within(history).getByRole("table"));
   await userEvent.click(first.getByRole("tab", { name: "Live-сканирование с постоянными параметрами" }));
   expect(flexiblePanel).toBeInTheDocument(); expect(flexiblePanel).not.toBeVisible();
   expect(flexiblePanel).toHaveAttribute("hidden");
@@ -872,7 +874,7 @@ it("shows the full inline history in server pages of twenty, preserving summary 
   const table = within(element);
   await historyButton("Результат исследования 50", table);
   expect(screen.queryByText("Загрузка истории исследований…")).not.toBeInTheDocument();
-  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Оптимизация матожидания", "Лучшая ячейка TP/SL", "Лучший Score матрицы", "Лучший прогноз для ячейки", "Матожидание факт", "Действия"]);
+  expect(table.getAllByRole("columnheader").map((header) => header.getAttribute("aria-label"))).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Оптимизация матожидания", "Лучшая ячейка TP/SL", "Лучший Score матрицы", "Лучший прогноз для ячейки", "Матожидание факт", "Действия"]);
   expect(table.getAllByRole("row")).toHaveLength(21);
   const first = within(table.getAllByRole("row")[1]!);
   expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#50", "Ручное", `${formatUnix(spec.fromUnix)} -${formatUnix(spec.toUnix)}`, "Менее 1 мин", "0", "Среднее", "TP 6% / SL 4%", "0.00 R", "0.00 R", "Не рассчитано—", ""]);
@@ -887,8 +889,9 @@ it("shows the full inline history in server pages of twenty, preserving summary 
   expect(table.getAllByRole("row")[5]).toHaveTextContent("1000000000000000000000.00 R");
   const section = within(screen.getByRole("region", { name: "История оптимизации · Новый алгоритм" }));
   expect(section.getByRole("button", { name: /Предыдущая страница/ })).toBeDisabled();
-  expect(element).toHaveClass("table-fixed", "min-w-7xl");
-  expect(element.querySelectorAll("colgroup col")).toHaveLength(11);
+  expect(element).toHaveClass("table-auto");
+  expect(element).not.toHaveClass("table-fixed", "min-w-7xl");
+  expect(element.querySelector("colgroup")).toBeNull();
   expect(element.querySelector("tbody")).toHaveClass("[&_td]:py-1.5", "[&_td]:align-middle");
   expect(element.querySelector("tbody")).not.toHaveClass("[&_tr]:h-20");
   expect(element.parentElement).toHaveClass("min-h-[68.25rem]");
@@ -1031,7 +1034,7 @@ it("shows a stop mutation error above the inline history", async () => {
   const card = within((await screen.findByText("Новый алгоритм · 2.0")).closest("form")!);
   const list = within(card.getByRole("region", { name: "История оптимизации · Новый алгоритм" }));
   await userEvent.click(await historyButton("Остановить исследование 17", list));
-  const manual = within(card.getByRole("heading", { name: "Исследования оптимальных параметров" }).closest("section")!);
+  const manual = within(card.getByRole("heading", { name: "Список проведённых исследований" }).closest("section")!);
   expect(await manual.findByRole("alert")).toHaveTextContent("HTTP 503");
   expect(list.getByRole("button", { name: "Остановить исследование 17" })).toBeEnabled();
   expect(requests.filter((request) => request.path.endsWith("/cancel"))).toHaveLength(1);
@@ -1164,7 +1167,7 @@ it("previews owner-wide continuous cleanup once, cancels safely, and preserves d
   fireEvent.change(fixed, { target: { value: "8.5" } });
   fireEvent.mouseDown(screen.getByRole("tab", { name: "Live-сканирование с гибкими параметрами" }), { button: 0, ctrlKey: false });
   expect(screen.getAllByRole("button", { name: "Удалить историю непрерывных исследований…" })).toHaveLength(1);
-  const controls = within(screen.getByRole("region", { name: "Непрерывные исследования" })).getByRole("region", { name: "Управление непрерывным исследованием" });
+  const controls = within(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" })).getByRole("region", { name: "Управление непрерывным исследованием" });
   expect(within(controls).getByRole("button", { name: "Удалить историю непрерывных исследований…" })).toHaveTextContent(/^$/);
   expect(requests.some((request) => request.path === "/v1/continuous-studies/cleanup")).toBe(false);
   await userEvent.click(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…" }));

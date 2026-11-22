@@ -4,15 +4,21 @@ import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, expect, it, vi } from "vitest";
 import { AppLayout, useApplicationLoad } from "../../routes/app-layout";
 import { AppFrame } from "./app-frame";
+import { Card } from "./card";
 import { PageSidebar } from "./page-sidebar";
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-it("retains the separate rounded central card and edge navigation", () => {
-  const { container } = render(<AppFrame navigation="Меню" status="Готов"><PageSidebar label="Разделы" items={[{ id: "one", label: "Первый" }]} value="one" onValueChange={vi.fn()}>Центральная зона</PageSidebar></AppFrame>);
-  expect(container.querySelector('[data-slot="page-card"]')).toHaveClass("rounded-xl", "bg-card");
+it("removes only the outer card visual and its second padding, retaining nested cards and edge navigation", () => {
+  const { container } = render(<AppFrame navigation="Меню" status="Готов"><PageSidebar label="Разделы" items={[{ id: "one", label: "Первый" }]} value="one" onValueChange={vi.fn()}><Card>Центральная зона</Card></PageSidebar></AppFrame>);
+  expect(container.querySelector('[data-slot="page-card"]')).toHaveAttribute("class", "min-w-0");
+  expect(container.querySelector('[data-slot="card"]')).toHaveClass("rounded-xl", "bg-muted/40", "p-5");
   expect(container.querySelector('[data-slot="page-sidebar"]')).toHaveClass("rounded-none", "md:right-0", "md:fixed");
   expect(screen.getByRole("main")).toHaveAttribute("data-slot", "app-main");
+  expect(screen.getByRole("main")).toHaveClass("max-w-7xl", "px-4", "sm:px-6", "min-w-0");
+  const styles = readFileSync("src/styles/global.css", "utf8");
+  expect(styles).toContain("max-width: calc(80rem + 14rem);");
+  expect(styles).toContain("padding-right: calc(14rem + 1.5rem);");
 });
 
 it("measures a wrapping header and releases its sole observer on unmount", () => {

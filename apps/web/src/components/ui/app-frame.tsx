@@ -46,8 +46,8 @@ export function AppFrame({ navigation, status, children }: { navigation: ReactNo
         </div>
       </div>
     </header>
-    <main data-slot="app-main" className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6 sm:py-8">
-      <div data-slot="page-card" className="rounded-xl border border-input/60 bg-card p-5 sm:p-8">{children}</div>
+    <main data-slot="app-main" className="mx-auto min-w-0 w-full max-w-7xl flex-1 px-4 py-6 sm:px-6 sm:py-8">
+      <div data-slot="page-card" className="min-w-0">{children}</div>
     </main>
   </div>;
 }
