@@ -157,7 +157,7 @@ it("computes matrices only after the button press and honours subsections", asyn
   expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2023-11-14");
   expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2023-11-15");
   expect(screen.getByRole("heading", { name: "Среднее матожидание сетапов" })).toBeInTheDocument();
-  expect(screen.getByRole("heading", { name: "Матожидание по сетапам" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Расчёт ячейки" })).toBeInTheDocument();
   expect(screen.queryByRole("heading", { name: "Кеш аналитики" })).not.toBeInTheDocument();
   expect(calls.some((call) => call.path.startsWith("/v1/analytics/matrix"))).toBe(false);
 

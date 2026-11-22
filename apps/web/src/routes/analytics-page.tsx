@@ -686,7 +686,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
 
   return <section className="grid min-w-0 gap-4">
       <div className="flex items-center gap-2">
-        <h2 className="text-lg font-semibold">Матожидание по сетапам</h2>
+        <h2 className="text-lg font-semibold">Расчёт ячейки</h2>
         <InfoNote>{description}</InfoNote>
       </div>
       <div className="flex flex-wrap items-end gap-3">
