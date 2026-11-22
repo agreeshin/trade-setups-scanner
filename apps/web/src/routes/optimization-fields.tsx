@@ -1,3 +1,4 @@
+import { useId, type ReactNode } from "react";
 import { Checkbox } from "../components/ui/checkbox";
 import { AnalyticsTrendControls } from "../components/analytics-trend-controls";
 import { Field } from "../components/ui/field";
@@ -29,11 +30,12 @@ function DomainControls({ fields, value, onChange }: { fields: SearchField[]; va
 
 /** Identical metadata/baseline/domain controls for manual and continuous research.
  * Only the period, frequency-list and locked causal maturity differ. */
-export function OptimizationFields({ algorithm, scope, onScopeChange, catalog, ready, disabled, algorithmDomains, onAlgorithmDomainsChange, analyticsDomains, onAnalyticsDomainsChange, continuous = false }: {
+export function OptimizationFields({ algorithm, scope, onScopeChange, catalog, ready, disabled, algorithmDomains, onAlgorithmDomainsChange, analyticsDomains, onAnalyticsDomainsChange, continuous = false, expectationControls }: {
   algorithm: Algorithm; scope: ScopeDraft; onScopeChange: (patch: Partial<ScopeDraft>) => void; catalog: CatalogInstrument[];
   ready: boolean; disabled: boolean; algorithmDomains: DomainDrafts; onAlgorithmDomainsChange: (next: DomainDrafts) => void;
-  analyticsDomains: DomainDrafts; onAnalyticsDomainsChange: (next: DomainDrafts) => void; continuous?: boolean;
+  analyticsDomains: DomainDrafts; onAnalyticsDomainsChange: (next: DomainDrafts) => void; continuous?: boolean; expectationControls?: ReactNode;
 }) {
+  const expectationId = useId();
   const numericFields: { key: "setupMaturity" | "horizonMinutes" | "minClosedPerCell" | "minSetupsPerDay" | "seed" | "maxTrials" | "maxSeconds"; label: string; min: number; max?: number; step?: number; hint?: string }[] = [
     { key: "setupMaturity", label: "Зрелость (фиксирована)", min: 0, max: 1, step: 0.1 },
     { key: "horizonMinutes", label: "Горизонт сделки, мин (фиксирован)", min: 1, max: 43200 },
@@ -65,16 +67,19 @@ export function OptimizationFields({ algorithm, scope, onScopeChange, catalog, r
     {Object.entries(algorithm.params).filter(([key]) => !algorithm.fields.some((field) => field.key === key)).map(([key, value]) => <p key={key} className="text-sm">{key}: {value} (фиксирован)</p>)}
     <h3 className="font-semibold">Параметры аналитики</h3>
     <DomainControls fields={ANALYTICS_SEARCH_FIELDS} value={analyticsDomains} onChange={onAnalyticsDomainsChange} />
-    <div className="flex items-center gap-2"><h3 className="font-semibold">Оптимизируемое матожидание</h3>
-    <InfoNote>Фиксированная метрика всего исследования, не поисковый параметр. Среднее за период, чистый прогноз выбранного метода и decisionR смеси различаются. H, κ, prior и λ не подбираются по той же обучающей выборке. Если ячейка неоценима, она не заменяется нулём и не исчезает из матрицы.</InfoNote></div>
-    <AnalyticsTrendControls mode={scope.trendMode ?? "mean"} bend={scope.trendBendDays ?? "linear"} disableMeanBend
-      onBlendModeChange={() => onScopeChange({ trendMode: "blend" })} blendLambda={scope.trendBlendLambda ?? "0.7"}
-      onBlendLambdaChange={(trendBlendLambda) => onScopeChange({ trendBlendLambda })}
-      forecast={scope.forecast} onForecastChange={(forecast) => onScopeChange({ forecast, ...(forecast.method === "trend" ? { trendBendDays: forecast.bendDays } : {}) })}
-      onModeChange={(trendMode) => onScopeChange({ trendMode })} onBendChange={(trendBendDays) => onScopeChange({ trendBendDays })} />
-    <Field label="Минимальный прогноз матрицы, R" hint="Отдельный порог forecast/blend: score всей матрицы должен быть строго выше него. Default 0. Mean использует прежний mean-гейт.">
-      {(control) => <Input {...control} type="number" min={0} max={100} step="any" value={scope.minForecastExpectancy ?? "0"} onChange={(event) => onScopeChange({ minForecastExpectancy: event.target.value })} />}
-    </Field>
+    <section aria-labelledby={expectationId} className="grid min-w-0 gap-3">
+      <div className="flex items-center gap-2"><h3 id={expectationId} className="font-semibold">Оптимизируемое матожидание</h3>
+      <InfoNote>Фиксированная метрика всего исследования, не поисковый параметр. Среднее за период, чистый прогноз выбранного метода и decisionR смеси различаются. H, κ, prior и λ не подбираются по той же обучающей выборке. Если ячейка неоценима, она не заменяется нулём и не исчезает из матрицы.</InfoNote></div>
+      <AnalyticsTrendControls mode={scope.trendMode ?? "mean"} bend={scope.trendBendDays ?? "linear"} disableMeanBend
+        onBlendModeChange={() => onScopeChange({ trendMode: "blend" })} blendLambda={scope.trendBlendLambda ?? "0.7"}
+        onBlendLambdaChange={(trendBlendLambda) => onScopeChange({ trendBlendLambda })}
+        forecast={scope.forecast} onForecastChange={(forecast) => onScopeChange({ forecast, ...(forecast.method === "trend" ? { trendBendDays: forecast.bendDays } : {}) })}
+        onModeChange={(trendMode) => onScopeChange({ trendMode })} onBendChange={(trendBendDays) => onScopeChange({ trendBendDays })} />
+      {expectationControls}
+      <Field label="Минимальный прогноз матрицы, R" hint="Отдельный порог forecast/blend: score всей матрицы должен быть строго выше него. Default 0. Mean использует прежний mean-гейт.">
+        {(control) => <Input {...control} type="number" min={0} max={100} step="any" value={scope.minForecastExpectancy ?? "0"} onChange={(event) => onScopeChange({ minForecastExpectancy: event.target.value })} />}
+      </Field>
+    </section>
   </fieldset>;
 }
 import { InfoNote } from "../components/ui/info-note";

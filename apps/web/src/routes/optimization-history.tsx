@@ -1,11 +1,12 @@
-import { useContext, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useContext, useEffect, useId, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow, TableSkeletonRows } from "../components/ui/table";
-import { formatUnix } from "../lib/datetime-format";
+import { formatUnix, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
 import { formatElapsedDuration } from "../lib/format-duration";
+import { forecastRecipeLabel } from "../lib/forecast-recipe";
 import { isActiveStudy, isContinuousStudy, listOptimizationStudies, type OptimizationStudyAction, type OptimizationStudyPage, type OptimizationStudySummary } from "../lib/optimization-api";
 import { isStudyActualPending } from "../lib/study-actual-api";
 import { StudyActualFact, StudyActualRefreshButton } from "./study-actual-controls";
@@ -22,25 +23,45 @@ export function OptimizationTrashIcon() {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6" /></svg>;
 }
 
+function OptimizationExpectationSummary({ spec }: { spec: OptimizationStudySummary["spec"] }) {
+  const mode = spec.trendMode ?? "mean";
+  if (mode === "mean") return <>Среднее</>;
+  const lambda = spec.trendBlendLambda ?? 0.7;
+  const bend = spec.forecast?.method === "trend" ? spec.forecast.bendDays : spec.trendBendDays ?? "linear";
+  const method = spec.forecast?.method === "decayed_probability"
+    ? `Вероятность TP с памятью · H ${spec.forecast.halfLifeDays} дней`
+    : `Тренд · ${bend === "linear" ? "прямая" : `перегиб ${bend} дней`}`;
+  return <div className="grid gap-1 text-xs">
+    <span>{mode === "blend" ? "Смесь" : "Прогноз"} · λ {Number.isFinite(lambda) ? lambda : "—"}{mode === "forecast" ? " (не применяется)" : ""}</span>
+    <span title={forecastRecipeLabel(spec.forecast, bend)}>{method}</span>
+  </div>;
+}
+
 function OptimizationHistoryRow({ study, latest, controller, busy, instanceId, onSelect, onDelete, onActualChanged }: {
   study: OptimizationStudySummary; latest: OptimizationStudySummary | undefined; controller: OptimizationController; busy: boolean; instanceId: string;
   onSelect: (id: number, triggerId: string, continuous: boolean) => void; onDelete: (study: OptimizationStudyAction) => void; onActualChanged: () => void;
 }) {
   const actual = useStudyActualAction(study.id, study.actual, onActualChanged);
+  const activeContinuous = isActiveStudy(study) && isContinuousStudy(study);
+  const deleteReasonId = `${instanceId}-study-${study.id}-delete-reason`;
   return <TableRow>
     <TableCell><Button id={`${instanceId}-study-${study.id}`} type="button" variant="outline" size="sm" aria-label={`Результат исследования ${study.id}`} onClick={() => onSelect(study.id, `${instanceId}-study-${study.id}`, isContinuousStudy(study))}>#{study.id}</Button></TableCell>
     <TableCell><Badge>{isContinuousStudy(study) ? "Непрерывное" : "Ручное"}</Badge></TableCell>
-    <TableCell className="whitespace-nowrap">[{formatUnix(study.spec.fromUnix)}, {formatUnix(study.spec.toUnix)})</TableCell>
+    <TableCell className="whitespace-nowrap" title="Начало включительно; конец исключительно."><span className="block">{formatUnix(study.spec.fromUnix)} -</span><span className="block">{formatUnix(study.spec.toUnix)}</span></TableCell>
     <TableCell className="whitespace-nowrap">{formatElapsedDuration(study.progress.elapsedSeconds)}</TableCell>
     <TableCell>{study.spec.minSetupsPerDay ?? "Гейт не применялся"}</TableCell>
+    <TableCell><OptimizationExpectationSummary spec={study.spec} /></TableCell>
+    <TableCell className="whitespace-nowrap">{study.forecastBest == null || !Number.isFinite(study.forecastBest.tpPct) || !Number.isFinite(study.forecastBest.slPct)
+      ? "—" : `TP ${study.forecastBest.tpPct}% / SL ${study.forecastBest.slPct}%`}</TableCell>
     <TableCell>{study.bestScore === null || !Number.isFinite(study.bestScore) ? "—" : `${scoreFormatter.format(study.bestScore)} R`}</TableCell>
     <TableCell>{study.forecastBest == null || !Number.isFinite(study.forecastBest.forecastR) ? "—" : `${scoreFormatter.format(study.forecastBest.forecastR)} R`}</TableCell>
     <TableCell><StudyActualFact action={actual} /></TableCell>
     <TableCell><div className="flex items-center gap-1">
       <StudyActualRefreshButton studyId={study.id} action={actual} />
-      {isActiveStudy(study)
-        ? isContinuousStudy(study) ? <span className="text-xs text-muted-foreground">Общая остановка в настройках алгоритма</span> : <Button type="button" variant="outline" size="sm" disabled={busy || study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested")} aria-label={`Остановить исследование ${study.id}`} onClick={() => { void controller.stop(study); }}>{study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested") ? "Остановка запрошена" : controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить"}</Button>
-        : <Button type="button" variant="outline" size="sm" disabled={busy} aria-label={`Удалить исследование ${study.id}`} onClick={() => onDelete(study)}><OptimizationTrashIcon /></Button>}
+      {isActiveStudy(study) && !isContinuousStudy(study)
+        ? <Button type="button" variant="outline" size="sm" disabled={busy || study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested")} aria-label={`Остановить исследование ${study.id}`} onClick={() => { void controller.stop(study); }}>{study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested") ? "Остановка запрошена" : controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить"}</Button>
+        : <Button type="button" variant="outline" size="sm" disabled={busy || activeContinuous} aria-label={`Удалить исследование ${study.id}`} aria-describedby={activeContinuous ? deleteReasonId : undefined} onClick={() => onDelete(study)}><OptimizationTrashIcon /></Button>}
+      {activeContinuous && <span id={deleteReasonId} className="sr-only">Удаление недоступно, пока непрерывное исследование выполняется.</span>}
     </div></TableCell>
   </TableRow>;
 }
@@ -53,12 +74,14 @@ export function OptimizationHistory({ id, algorithmId, algorithmName, controller
   pageSize?: number; pagination?: boolean; active?: boolean; actions?: ReactNode;
 }) {
   const instanceId = useId();
+  useSyncExternalStore(subscribeInterfaceSettings, interfaceSettings);
   const routeActive = useContext(RouteActiveContext);
   const [offset, setOffset] = useState(0);
-  const [page, setPage] = useState<OptimizationStudyPage | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState<(OptimizationStudyPage & { algorithmId: string }) | null>(null);
+  const [fetching, setFetching] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
+  const refreshPage = useRef<() => void>(() => undefined);
   const latest = controller.latestByAlgorithm[algorithmId] ?? controller.byAlgorithm[algorithmId];
   // Active first-page rows follow compact discovery polling; terminal pages do not
   // refetch just because unrelated polling produced a new object identity.
@@ -72,58 +95,83 @@ export function OptimizationHistory({ id, algorithmId, algorithmName, controller
     let request: AbortController | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let watchActual = false;
+    let inFlight = false;
+    let refreshQueued = false;
     async function load() {
+      if (disposed || document.visibilityState === "hidden") return;
       clearTimeout(timer);
-      request?.abort();
-      if (document.visibilityState === "hidden") return;
+      // Discovery and row actions invalidate this page, but do not own its read.
+      // Coalesce updates into one follow-up rather than aborting useful work.
+      if (inFlight) { refreshQueued = true; return; }
+      inFlight = true;
       const current = new AbortController(); request = current;
-      setLoading(true); setError(null);
+      setFetching(true); setError(null);
       // Keep same-page buttons mounted during refresh so close-focus restoration
       // and polling cannot lose the originating ID. Never keep another page.
-      setPage((previous) => previous?.offset === offset && previous.limit === pageSize ? previous : null);
+      setPage((previous) => previous?.algorithmId === algorithmId && previous.offset === offset && previous.limit === pageSize ? previous : null);
       try {
         const next = await listOptimizationStudies(algorithmId, current.signal, pageSize, offset);
         if (disposed || current.signal.aborted) return;
         if (offset > 0 && offset >= next.total) {
+          refreshQueued = false; watchActual = false;
           setOffset(next.total === 0 ? 0 : Math.floor((next.total - 1) / pageSize) * pageSize);
           return;
         }
-        setPage(next);
+        setPage({ ...next, algorithmId });
         watchActual = next.studies.some((study) => isStudyActualPending(study.actual));
       } catch (cause) {
         if (!disposed && !current.signal.aborted) setError(`История оптимизации недоступна: ${errorText(cause)}`);
       } finally {
         if (!disposed && !current.signal.aborted) {
-          setLoading(false);
-          if (watchActual) timer = setTimeout(() => { void load(); }, 3000);
+          inFlight = false;
+          if (refreshQueued) { refreshQueued = false; void load(); }
+          else {
+            setFetching(false);
+            if (watchActual) timer = setTimeout(() => { void load(); }, 3000);
+          }
         }
       }
     }
-    const visibility = () => { clearTimeout(timer); request?.abort(); if (document.visibilityState !== "hidden") void load(); };
-    void load(); document.addEventListener("visibilitychange", visibility);
-    return () => { disposed = true; clearTimeout(timer); request?.abort(); document.removeEventListener("visibilitychange", visibility); };
+    const refresh = () => { void load(); };
+    refreshPage.current = refresh;
+    const visibility = () => {
+      clearTimeout(timer); request?.abort(); inFlight = false; refreshQueued = false;
+      if (document.visibilityState !== "hidden") refresh();
+    };
+    document.addEventListener("visibilitychange", visibility);
+    return () => {
+      disposed = true; clearTimeout(timer); request?.abort();
+      document.removeEventListener("visibilitychange", visibility);
+      if (refreshPage.current === refresh) refreshPage.current = () => undefined;
+    };
+  }, [algorithmId, offset, controller.ready, routeActive, active, pageSize]);
+  // Refresh triggers share the stable displayed-page owner above. Only a scope
+  // change or deactivation tears it down and fences its late responses.
+  useEffect(() => {
+    refreshPage.current();
   }, [algorithmId, offset, controller.ready, controller.revision, observed, latestId, latestStatus, retry, routeActive, active, pageSize]);
-  const currentPage = page?.offset === offset && page.limit === pageSize ? page : null;
-  const placeholders = currentPage === null && (loading || page !== null);
+  const currentPage = page?.algorithmId === algorithmId && page.offset === offset && page.limit === pageSize ? page : null;
+  // A missing requested page blocks interaction; refreshing valid rows does not.
+  const placeholders = currentPage === null && (fetching || page !== null);
   const padding = placeholders ? 0 : Math.max(0, pageSize - (currentPage?.studies.length ?? 0));
   return <section id={id} tabIndex={-1} aria-label={`История оптимизации · ${algorithmName}`} className="grid min-w-0 gap-3">
     {error && <Alert variant="destructive" role="alert">{error}<Button type="button" variant="outline" onClick={() => setRetry((value) => value + 1)}>Повторить загрузку истории</Button></Alert>}
     {actions}
     {/* Reserve 20 h-13 rows plus a header outside the table; real rows never inherit its height. */}
     <div className={pageSize === 20 ? "min-h-[68.25rem] overflow-x-auto" : "overflow-x-auto"}>
-      <Table aria-label={`Исследования · ${algorithmName}`} aria-busy={loading || placeholders} className="table-fixed min-w-7xl">
-        <colgroup>{["w-20", "w-28", "w-96", "w-48", "w-40", "w-32", "w-44", "w-52", "w-60"].map((width, index) => <col key={index} className={width} />)}</colgroup>
-        <TableHeader><TableRow>{["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучший Score", "Лучший прогноз матожидания", "Матожидание факт", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
-        <TableBody className="[&_td]:py-1.5 [&_td]:align-middle">{placeholders ? <TableSkeletonRows rows={pageSize} columns={9} /> : <>
+      <Table aria-label={`Исследования · ${algorithmName}`} aria-busy={fetching || placeholders} className="table-fixed min-w-7xl">
+        <colgroup>{["w-20", "w-28", "w-96", "w-48", "w-40", "w-72", "w-48", "w-32", "w-44", "w-52", "w-60"].map((width, index) => <col key={index} className={width} />)}</colgroup>
+        <TableHeader><TableRow>{["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Оптимизация матожидания", "Лучшая ячейка TP/SL", "Лучший Score матрицы", "Лучший прогноз для ячейки", "Матожидание факт", "Действия"].map((label) => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
+        <TableBody className="[&_td]:py-1.5 [&_td]:align-middle">{placeholders ? <TableSkeletonRows rows={pageSize} columns={11} /> : <>
           {currentPage?.studies.map((study) => <OptimizationHistoryRow key={study.id} study={study} latest={latest} controller={controller} busy={busy} instanceId={instanceId} onSelect={onSelect} onDelete={onDelete} onActualChanged={() => setRetry((value) => value + 1)} />)}
-          {Array.from({ length: padding }, (_, index) => <TableRow key={`padding-${index}`} aria-hidden="true" className="h-13 hover:bg-transparent"><TableCell colSpan={9} /></TableRow>)}
+          {Array.from({ length: padding }, (_, index) => <TableRow key={`padding-${index}`} aria-hidden="true" className="h-13 hover:bg-transparent"><TableCell colSpan={11} /></TableRow>)}
         </>}</TableBody>
       </Table>
     </div>
     {pagination && <div className="flex min-h-8 flex-wrap items-center gap-2 text-sm" aria-label={`Страницы исследований · ${algorithmName}`}>
-      <Button type="button" variant="outline" size="sm" disabled={loading || placeholders || currentPage === null || offset === 0} aria-label={`Предыдущая страница исследований · ${algorithmName}`} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Назад</Button>
+      <Button type="button" variant="outline" size="sm" disabled={placeholders || currentPage === null || offset === 0} aria-label={`Предыдущая страница исследований · ${algorithmName}`} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Назад</Button>
       <span>Страница {Math.floor(offset / pageSize) + 1} · всего {page?.total ?? "—"}</span>
-      <Button type="button" variant="outline" size="sm" disabled={loading || placeholders || currentPage === null || offset + pageSize >= currentPage.total} aria-label={`Следующая страница исследований · ${algorithmName}`} onClick={() => setOffset(offset + pageSize)}>Далее</Button>
+      <Button type="button" variant="outline" size="sm" disabled={placeholders || currentPage === null || offset + pageSize >= currentPage.total} aria-label={`Следующая страница исследований · ${algorithmName}`} onClick={() => setOffset(offset + pageSize)}>Далее</Button>
     </div>}
     {currentPage?.total === 0 && <p className="text-sm text-muted-foreground">Исследований пока нет.</p>}
   </section>;

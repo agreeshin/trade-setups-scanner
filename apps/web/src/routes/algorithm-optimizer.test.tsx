@@ -141,6 +141,12 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); applyInterfaceSettings(initialInterfaceSettings); });
 
+// Discovery and paged history are separate reads. The larger inline table can
+// exhaust the library's 1s query default before either read finishes in a full run.
+function historyButton(name: string, queries: Pick<typeof screen, "findByRole"> = screen) {
+  return queries.findByRole("button", { name }, { timeout: 5000 });
+}
+
 async function openOptimizer() {
   const flexible = await screen.findByRole("tab", { name: "Live-сканирование с гибкими параметрами" });
   if (flexible.getAttribute("aria-selected") !== "true") fireEvent.click(flexible);
@@ -240,6 +246,9 @@ it("builds unknown fields from metadata and submits the complete typed scope onl
   expect(controls.getByLabelText("Подбирать: Новый порог")).toBeChecked();
   expect(controls.getByLabelText("Подбирать: Новое окно")).not.toBeChecked();
   expect(controls.getByLabelText("OLDUSDT (Delisted)")).toBeChecked();
+  const expectation = within(controls.getByRole("region", { name: "Оптимизируемое матожидание" }));
+  expect(expectation.getByLabelText("Минимальный прогноз матрицы, R")).toHaveValue(0);
+  expect(controls.queryByLabelText("Минимальное среднее матожидание, R")).not.toBeInTheDocument();
   const frequency = controls.getByLabelText("Минимум сетапов в день");
   expect(frequency).toHaveValue(4);
   expect(frequency).toHaveAttribute("type", "number");
@@ -263,6 +272,7 @@ it("builds unknown fields from metadata and submits the complete typed scope onl
   expect(await screen.findByText("Исследование #17")).toBeInTheDocument();
   const creates = requests.filter((request) => request.method === "POST");
   expect(creates).toHaveLength(1);
+  expect(creates[0]?.body).not.toHaveProperty("minMeanExpectancy");
   expect(creates[0]?.body).toEqual({
     ...spec, fromUnix: new Date(2026, 9, 1).getTime() / 1000, toUnix: new Date(2026, 9, 3).getTime() / 1000,
     direction: "long", tpLevels: [4, 25], slLevels: [0.5, 6], minSetupsPerDay: 4,
@@ -530,8 +540,8 @@ it.each([0, -0.126])("opens the exact history ID and shows its server forecast p
   studies = [saved];
   render(<AlgorithmsPage />);
   const table = within(await screen.findByRole("table", { name: "Исследования · Новый алгоритм" }));
-  const trigger = await table.findByRole("button", { name: "Результат исследования 17" }, { timeout: 5000 });
-  expect(within(trigger.closest("tr")!).getAllByRole("cell")[6]).toHaveTextContent(`${forecastR.toFixed(2)} R`);
+  const trigger = await historyButton("Результат исследования 17", table);
+  expect(within(trigger.closest("tr")!).getAllByRole("cell")[8]).toHaveTextContent(`${forecastR.toFixed(2)} R`);
   fireEvent.click(trigger);
   const dialog = within(await screen.findByRole("dialog", { name: "Исследование #17 · Новый алгоритм" }));
   const pair = within(await dialog.findByRole("region", { name: "Лучшая forecast-пара" }));
@@ -540,6 +550,30 @@ it.each([0, -0.126])("opens the exact history ID and shows its server forecast p
   expect(requests.filter((request) => /^\/v1\/optimization-studies\/\d+$/.test(request.path)).map((request) => request.path)).toEqual(["/v1/optimization-studies/17"]);
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
+
+it("keeps the table's saved optimization recipe unchanged while the current research form edits another mode, lambda and method", async () => {
+  studies = [winnerRecord("blend")];
+  render(<AlgorithmsPage />);
+  const trigger = await historyButton("Результат исследования 17");
+  const summary = within(trigger.closest("tr")!).getAllByRole("cell")[5]!;
+  expect(summary).toHaveTextContent("Смесь · λ 0.6"); expect(summary).toHaveTextContent("Тренд · перегиб 30 дней");
+  const original = summary.textContent;
+  const dialog = within(await openOptimizer());
+  fireEvent.click(await dialog.findByRole("button", { name: "Новое исследование" }));
+  await dialog.findByLabelText("Baseline: Новый порог");
+  fireEvent.click(dialog.getByRole("button", { name: "Смесь среднего и прогноза" }));
+  fireEvent.change(dialog.getByLabelText("Доля прогноза λ"), { target: { value: "0.9" } });
+  expect(dialog.getByLabelText("Метод прогноза")).toHaveValue("decayed_probability");
+  fireEvent.change(dialog.getByLabelText("Память модели H, дней"), { target: { value: "7.5" } });
+  fireEvent.click(dialog.getByRole("button", { name: "Прогноз" }));
+  fireEvent.blur(dialog.getByLabelText("Память модели H, дней"));
+  await waitFor(() => expect(drafts[algorithm.id]).toMatchObject({ shared: { scope: { trendMode: "forecast", trendBlendLambda: "0.9", forecast: { method: "decayed_probability", halfLifeDays: "7.5" } } } }));
+  expect(summary.textContent).toBe(original);
+  await userEvent.click(dialog.getByRole("button", { name: "Закрыть" }));
+  expect(within(trigger.closest("tr")!).getAllByRole("cell")[5]).toBe(summary);
+  expect(summary.textContent).toBe(original);
+  expect(requests.some((request) => request.method === "POST")).toBe(false);
+}, 15000);
 
 it("submits blend lambda and forward gate, persists and restores them on reopen", async () => {
   render(<AlgorithmsPage />); let dialog = within(await openOptimizer());
@@ -809,9 +843,9 @@ it("reserves twenty skeleton rows, column widths and pagination throughout initi
   render(<AlgorithmsPage />); await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   const table = screen.getByRole("table", { name: "Исследования · Новый алгоритм" });
   expect(finish).toBeDefined(); expect(table).toHaveAttribute("aria-busy", "true");
-  expect(within(table).getAllByRole("columnheader")).toHaveLength(9);
+  expect(within(table).getAllByRole("columnheader")).toHaveLength(11);
   expect(table.querySelectorAll("tbody tr")).toHaveLength(20);
-  expect(table.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(180);
+  expect(table.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(220);
   const next = screen.getByRole("button", { name: /Следующая страница исследований/ });
   expect(next).toBeDisabled(); expect(next.parentElement).toHaveClass("min-h-8");
   await act(async () => { finish?.(); await vi.advanceTimersByTimeAsync(0); });
@@ -830,24 +864,25 @@ it("shows the full inline history in server pages of twenty, preserving summary 
   render(<AlgorithmsPage />);
   const element = await screen.findByRole("table", { name: "Исследования · Новый алгоритм" });
   const table = within(element);
-  await table.findByRole("button", { name: "Результат исследования 50" });
+  await historyButton("Результат исследования 50", table);
   expect(screen.queryByText("Загрузка истории исследований…")).not.toBeInTheDocument();
-  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Лучший Score", "Лучший прогноз матожидания", "Матожидание факт", "Действия"]);
+  expect(table.getAllByRole("columnheader").map((header) => header.textContent)).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Оптимизация матожидания", "Лучшая ячейка TP/SL", "Лучший Score матрицы", "Лучший прогноз для ячейки", "Матожидание факт", "Действия"]);
   expect(table.getAllByRole("row")).toHaveLength(21);
   const first = within(table.getAllByRole("row")[1]!);
-  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#50", "Ручное", `[${formatUnix(spec.fromUnix)}, ${formatUnix(spec.toUnix)})`, "Менее 1 мин", "0", "0.00 R", "0.00 R", "Не рассчитано—", ""]);
+  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#50", "Ручное", `${formatUnix(spec.fromUnix)} -${formatUnix(spec.toUnix)}`, "Менее 1 мин", "0", "Среднее", "TP 6% / SL 4%", "0.00 R", "0.00 R", "Не рассчитано—", ""]);
   expect(table.getAllByRole("row")[2]).toHaveTextContent("Гейт не применялся");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("—");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("1 дн 1 ч 1 мин");
   expect(table.getAllByRole("row")[3]).toHaveTextContent("0.25 R");
-  expect(within(table.getAllByRole("row")[2]!).getAllByRole("cell")[6]).toHaveTextContent("—");
-  expect(within(table.getAllByRole("row")[3]!).getAllByRole("cell")[6]).toHaveTextContent("0.88 R");
+  expect(within(table.getAllByRole("row")[2]!).getAllByRole("cell")[6]).toHaveTextContent(/^—$/);
+  expect(within(table.getAllByRole("row")[2]!).getAllByRole("cell")[8]).toHaveTextContent(/^—$/);
+  expect(within(table.getAllByRole("row")[3]!).getAllByRole("cell")[8]).toHaveTextContent("0.88 R");
   expect(table.getAllByRole("row")[4]).toHaveTextContent("-0.13 R");
   expect(table.getAllByRole("row")[5]).toHaveTextContent("1000000000000000000000.00 R");
   const section = within(screen.getByRole("region", { name: "История оптимизации · Новый алгоритм" }));
   expect(section.getByRole("button", { name: /Предыдущая страница/ })).toBeDisabled();
   expect(element).toHaveClass("table-fixed", "min-w-7xl");
-  expect(element.querySelectorAll("colgroup col")).toHaveLength(9);
+  expect(element.querySelectorAll("colgroup col")).toHaveLength(11);
   expect(element.querySelector("tbody")).toHaveClass("[&_td]:py-1.5", "[&_td]:align-middle");
   expect(element.querySelector("tbody")).not.toHaveClass("[&_tr]:h-20");
   expect(element.parentElement).toHaveClass("min-h-[68.25rem]");
@@ -858,13 +893,14 @@ it("shows the full inline history in server pages of twenty, preserving summary 
   fireEvent.click(section.getByRole("button", { name: /Следующая страница/ }));
   expect(screen.queryByText("Загрузка истории исследований…")).not.toBeInTheDocument();
   expect(element).toHaveAttribute("aria-busy", "true");
-  expect(element.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(180);
+  expect(element.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(220);
   expect(section.getByRole("button", { name: /Следующая страница/ })).toBeDisabled();
-  await table.findByRole("button", { name: "Результат исследования 30" });
+  await historyButton("Результат исследования 30", table);
   expect(table.getAllByRole("row")).toHaveLength(6);
   expect(element.querySelectorAll("tbody tr")).toHaveLength(20);
   expect(element.querySelectorAll('tbody tr[aria-hidden="true"]')).toHaveLength(15);
   expect([...element.querySelectorAll('tbody tr[aria-hidden="true"]')].every((row) => row.classList.contains("h-13"))).toBe(true);
+  expect([...element.querySelectorAll('tbody tr[aria-hidden="true"] td')].every((cell) => cell.getAttribute("colspan") === "11")).toBe(true);
   expect(element.parentElement).toHaveClass("min-h-[68.25rem]");
   expect(section.getByRole("button", { name: /Следующая страница/ })).toBeDisabled();
   expect(requests.some((request) => new URL(request.path, "http://localhost").searchParams.get("offset") === "20")).toBe(true);
@@ -880,9 +916,9 @@ it("keeps the inline page underneath exact-ID detail and restores its page and u
   const card = within((await screen.findByText("Новый алгоритм · 2.0")).closest("form")!);
   const listDialog = card.getByRole("region", { name: "История оптимизации · Новый алгоритм" });
   const list = within(listDialog);
-  await list.findByRole("button", { name: "Результат исследования 50" });
+  await historyButton("Результат исследования 50", list);
   await userEvent.click(list.getByRole("button", { name: /Следующая страница/ }));
-  const idTrigger = await list.findByRole("button", { name: "Результат исследования 29" });
+  const idTrigger = await historyButton("Результат исследования 29", list);
   await userEvent.click(idTrigger);
   const detail = within(await screen.findByRole("dialog", { name: "Исследование #29 · Новый алгоритм" }));
   expect(await detail.findByText("Исследование #29")).toBeInTheDocument();
@@ -954,9 +990,9 @@ it("corrects inline pagination after deletion and restores the underlying list a
   const card = within((await screen.findByText("Новый алгоритм · 2.0")).closest("form")!);
   const listDialog = card.getByRole("region", { name: "История оптимизации · Новый алгоритм" });
   const list = within(listDialog);
-  await list.findByRole("button", { name: "Результат исследования 50" });
+  await historyButton("Результат исследования 50", list);
   await userEvent.click(list.getByRole("button", { name: /Следующая страница/ }));
-  await userEvent.click(await list.findByRole("button", { name: "Результат исследования 30" }));
+  await userEvent.click(await historyButton("Результат исследования 30", list));
   await screen.findByText("Исследование #30");
   await userEvent.click(screen.getByRole("button", { name: "Удалить исследование 30" }));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #30?" }));
@@ -975,7 +1011,7 @@ it("preserves stop and pending actions in the inline history", async () => {
   render(<AlgorithmsPage />);
   const card = within((await screen.findByText("Новый алгоритм · 2.0")).closest("form")!);
   const list = within(card.getByRole("region", { name: "История оптимизации · Новый алгоритм" }));
-  const stop = await list.findByRole("button", { name: "Остановить исследование 17" });
+  const stop = await historyButton("Остановить исследование 17", list);
   fireEvent.click(stop); fireEvent.click(stop);
   await list.findByText("Остановка запрошена");
   expect(list.getByRole("button", { name: "Остановить исследование 17" })).toBeDisabled();
@@ -988,7 +1024,7 @@ it("shows a stop mutation error above the inline history", async () => {
   render(<AlgorithmsPage />);
   const card = within((await screen.findByText("Новый алгоритм · 2.0")).closest("form")!);
   const list = within(card.getByRole("region", { name: "История оптимизации · Новый алгоритм" }));
-  await userEvent.click(await list.findByRole("button", { name: "Остановить исследование 17" }));
+  await userEvent.click(await historyButton("Остановить исследование 17", list));
   const manual = within(card.getByRole("heading", { name: "Исследования оптимальных параметров" }).closest("section")!);
   expect(await manual.findByRole("alert")).toHaveTextContent("HTTP 503");
   expect(list.getByRole("button", { name: "Остановить исследование 17" })).toBeEnabled();
@@ -998,7 +1034,7 @@ it("shows a stop mutation error above the inline history", async () => {
 it("opens the requested older ID independently from latest discovery without nested optimizer dialogs", async () => {
   studies = [{ ...record("completed"), id: 20 }, { ...record("cancelled"), id: 17 }];
   render(<AlgorithmsPage />);
-  fireEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }));
+  fireEvent.click(await historyButton("Результат исследования 17"));
   expect(await screen.findByText("Исследование #17")).toBeInTheDocument();
   expect(screen.getAllByRole("dialog")).toHaveLength(1);
   studies.unshift({ ...record("completed"), id: 21 });
@@ -1009,7 +1045,7 @@ it("opens the requested older ID independently from latest discovery without nes
   expect(screen.getByText("Исследование #17")).toBeInTheDocument();
   expect(requests.some((request) => request.path === "/v1/optimization-studies/20" || request.path === "/v1/optimization-studies/21")).toBe(false);
   await userEvent.click(screen.getByRole("button", { name: "Закрыть" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }));
+  fireEvent.click(await historyButton("Результат исследования 17"));
   expect(await screen.findByText("Исследование #17")).toBeInTheDocument();
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
@@ -1017,7 +1053,7 @@ it("opens the requested older ID independently from latest discovery without nes
 it.each(["queued", "running"] as const)("stops an active %s history row once without submitting settings", async (status) => {
   studies = [record(status)];
   render(<AlgorithmsPage />);
-  const stop = await screen.findByRole("button", { name: "Остановить исследование 17" });
+  const stop = await historyButton("Остановить исследование 17");
   fireEvent.click(stop); fireEvent.click(stop);
   await waitFor(() => expect(screen.getByRole("button", { name: "Остановить исследование 17" })).toBeDisabled());
   expect(await screen.findByText("Остановка запрошена")).toBeInTheDocument();
@@ -1028,7 +1064,7 @@ it.each(["queued", "running"] as const)("stops an active %s history row once wit
 it("does not offer repeated stop or deletion for cancel_requested", async () => {
   studies = [record("cancel_requested")];
   render(<AlgorithmsPage />);
-  const stop = await screen.findByRole("button", { name: "Остановить исследование 17" });
+  const stop = await historyButton("Остановить исследование 17");
   expect(stop).toBeDisabled(); fireEvent.click(stop);
   expect(screen.queryByRole("button", { name: "Удалить исследование 17" })).not.toBeInTheDocument();
   expect(requests.every((request) => request.method === "GET")).toBe(true);
@@ -1039,7 +1075,7 @@ it.each(["completed", "cancelled", "failed"] as const)("confirms terminal %s del
   render(<AlgorithmsPage />);
   // Initial mount + discovery + history are distinct async steps; the 1s query
   // default can expire before history is requested on the larger Algorithms page.
-  fireEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }, { timeout: 5000 }));
+  fireEvent.click(await historyButton("Результат исследования 17"));
   await screen.findByText("Исследование #17");
   fireEvent.click(screen.getByRole("button", { name: "Удалить исследование 17" }));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
@@ -1047,7 +1083,7 @@ it.each(["completed", "cancelled", "failed"] as const)("confirms terminal %s del
   const confirm = confirmation.getByRole("button", { name: "Удалить" });
   fireEvent.click(confirm); fireEvent.click(confirm);
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-  await screen.findByRole("button", { name: "Результат исследования 20" });
+  await historyButton("Результат исследования 20");
   expect(screen.queryByRole("button", { name: "Результат исследования 17" })).not.toBeInTheDocument();
   expect(requests.filter((request) => request.method === "DELETE").map((request) => request.path)).toEqual(["/v1/optimization-studies/17"]);
   expect(requests.some((request) => request.method === "PUT")).toBe(false);
@@ -1056,12 +1092,12 @@ it.each(["completed", "cancelled", "failed"] as const)("confirms terminal %s del
 it("retains the history row and shows a deletion conflict without claiming success", async () => {
   studies = [record("completed")]; deleteStatus = 409;
   render(<AlgorithmsPage />);
-  fireEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }));
+  fireEvent.click(await historyButton("Удалить исследование 17"));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
   fireEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
   expect(await confirmation.findByRole("alert")).toHaveTextContent("Нельзя удалить активное исследование");
   fireEvent.click(confirmation.getByRole("button", { name: "Отмена" }));
-  expect(await screen.findByRole("button", { name: "Результат исследования 17" })).toBeInTheDocument();
+  expect(await historyButton("Результат исследования 17")).toBeInTheDocument();
 });
 
 it.each(["completed", "cancelled", "failed"] as const)("allows explicit deletion of an archived continuous %s study without touching other rows or fixed drafts", async (status) => {
@@ -1072,7 +1108,7 @@ it.each(["completed", "cancelled", "failed"] as const)("allows explicit deletion
   const fixed = await screen.findByRole("spinbutton", { name: "Новый порог (%)" });
   fireEvent.change(fixed, { target: { value: "8.5" } });
   fireEvent.click(screen.getByRole("tab", { name: "Live-сканирование с гибкими параметрами" }));
-  await userEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }));
+  await userEvent.click(await historyButton("Удалить исследование 17"));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
   expect(requests.every((request) => request.method === "GET")).toBe(true);
   await userEvent.click(confirmation.getByRole("button", { name: "Отмена" }));
@@ -1091,7 +1127,7 @@ it.each(["completed", "cancelled", "failed"] as const)("allows explicit deletion
 it("explains study deletion authentication failure and retains the confirmation and row", async () => {
   studies = [record("failed")]; deleteStatus = 401;
   render(<AlgorithmsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }, { timeout: 5000 }));
+  await userEvent.click(await historyButton("Удалить исследование 17"));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
   await userEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
   expect(await confirmation.findByRole("alert")).toHaveTextContent(/Сессия истекла|Войдите/);
@@ -1104,7 +1140,7 @@ it("distinguishes retained-chain deletion conflict and refreshes study discovery
   studies = [{ ...record("failed"), origin: "continuous", continuousGenerationId: 7, continuousSlotId: 5 }];
   deleteStatus = 409; deleteErrorCode = "continuous_history_referenced";
   render(<AlgorithmsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Удалить исследование 17" }, { timeout: 5000 }));
+  await userEvent.click(await historyButton("Удалить исследование 17"));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
   const readsBefore = requests.filter((request) => request.path.startsWith("/v1/optimization-studies?")).length;
   await userEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
@@ -1182,7 +1218,7 @@ it("requires a new explicit confirmation with the replacement fingerprint after 
 it("keeps the exact selected manual detail open across continuous cleanup", async () => {
   studies = [{ ...record("completed"), id: 20, origin: "manual" }, { ...record("failed"), origin: "continuous" }];
   render(<AlgorithmsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Результат исследования 20" }));
+  await userEvent.click(await historyButton("Результат исследования 20"));
   await screen.findByRole("dialog", { name: "Исследование #20 · Новый алгоритм" });
   // Simulates an owner-wide cleanup completing while an existing selection is retained.
   fireEvent.click(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…", hidden: true }));
@@ -1217,7 +1253,7 @@ it("preserves the mounted manual form and its shared saved draft when cleanup re
 it("closes a deleted continuous selection without closing retained manual optimizer state", async () => {
   studies = [{ ...record("completed"), id: 20, origin: "manual" }, { ...record("failed"), origin: "continuous" }];
   render(<AlgorithmsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Результат исследования 17" }, { timeout: 5000 }));
+  await userEvent.click(await historyButton("Результат исследования 17"));
   await screen.findByRole("dialog", { name: "Исследование #17 · Новый алгоритм" });
   fireEvent.click(screen.getByRole("button", { name: "Удалить историю непрерывных исследований…", hidden: true }));
   const confirmation = within(await screen.findByRole("dialog", { name: "Удалить всю историю непрерывных исследований?" }));
@@ -1225,7 +1261,7 @@ it("closes a deleted continuous selection without closing retained manual optimi
   await userEvent.click(confirmation.getByRole("button", { name: "Удалить историю" }));
   await screen.findByText(/История непрерывных исследований удалена/);
   expect(screen.queryByRole("dialog", { name: "Исследование #17 · Новый алгоритм" })).not.toBeInTheDocument();
-  expect(await screen.findByRole("button", { name: "Результат исследования 20" })).toBeInTheDocument();
+  expect(await historyButton("Результат исследования 20")).toBeInTheDocument();
 });
 
 it("blocks a new study for another algorithm while the platform already has active work", async () => {

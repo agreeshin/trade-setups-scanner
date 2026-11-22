@@ -160,6 +160,41 @@ it("shows retained studies and standalone profiles when selecting the algorithm 
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
 
+it("locates the existing mean gate in optimized expectancy and retains its default, draft, mode guards and config payload", async () => {
+  render(<AlgorithmsPage />);
+  let dialog = await configure();
+  let expectation = within(dialog.getByRole("region", { name: "Оптимизируемое матожидание" }));
+  const period = within(dialog.getByRole("group", { name: "Период и отдельные пороговые профили" }));
+  expect(period.queryByLabelText("Минимальное среднее матожидание, R")).not.toBeInTheDocument();
+  const mean = expectation.getByLabelText("Минимальное среднее матожидание, R");
+  expect(dialog.getAllByLabelText("Минимальное среднее матожидание, R")).toHaveLength(1);
+  expect(mean).toHaveValue(0.15); expect(mean).toBeEnabled(); expect(mean).toHaveAttribute("step", "any");
+  expect(mean).toHaveAccessibleDescription(/score >= minMeanExpectancy/);
+  expect(expectation.getByLabelText("Минимальный прогноз матрицы, R")).toHaveValue(0);
+  fireEvent.change(mean, { target: { value: "-0.125" } }); fireEvent.blur(mean);
+  await waitFor(() => expect(drafts.future).toMatchObject({ continuous: { minMeanExpectancy: "-0.125" } }));
+  expect(drafts.future).not.toHaveProperty("shared.scope.minMeanExpectancy");
+  expect(drafts.future).not.toHaveProperty("manual.minMeanExpectancy");
+  await userEvent.click(dialog.getByRole("button", { name: "Закрыть" }));
+  dialog = await configure();
+  expectation = within(dialog.getByRole("region", { name: "Оптимизируемое матожидание" }));
+  const restored = expectation.getByLabelText("Минимальное среднее матожидание, R");
+  expect(restored).toHaveValue(-0.125);
+  for (const mode of ["Прогноз", "Смесь среднего и прогноза"]) {
+    fireEvent.click(expectation.getByRole("button", { name: mode }));
+    expect(restored).toBeDisabled(); expect(restored).toHaveValue(-0.125);
+    expect(restored).toHaveAccessibleDescription(/score > minForecastExpectancy/);
+  }
+  fireEvent.click(expectation.getByRole("button", { name: "Среднее" }));
+  expect(restored).toBeEnabled(); expect(restored).toHaveValue(-0.125);
+  await userEvent.click(dialog.getByRole("button", { name: "Сохранить параметры" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  const saved = requests.find((request) => request.path === "/v1/continuous-studies/future" && request.method === "PUT");
+  expect(saved?.body).toMatchObject({ minMeanExpectancy: -0.125, study: { trendMode: "mean", minForecastExpectancy: 0 } });
+  expect(saved?.body).not.toHaveProperty("study.minMeanExpectancy");
+  expect(requests.some((request) => request.path.endsWith("/start") || request.method === "POST")).toBe(false);
+}, 15000);
+
 it("saves and restores forecast settings and separates the forward gate from the mean threshold", async () => {
   render(<AlgorithmsPage />);
   let dialog = await configure();
