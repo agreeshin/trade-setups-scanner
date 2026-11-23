@@ -228,7 +228,7 @@ export function HistoryPage() {
         <Button type="button" variant="outline" disabled={busy} onClick={() => { void importListing(); }}>Импортировать текущий листинг Bybit (линейные USDT perpetual)</Button>
         <Button type="button" variant="outline" disabled={busy || symbols.trim().length === 0} onClick={() => { setSymbols(""); setMessage(null); }}>Очистить выбор</Button>
       </div>
-      <InstrumentPicker catalog={instruments} symbols={symbols} onChange={(value) => { setSymbols(value); setMessage(null); }} disabled={busy || catalog.kind !== "ready"} />
+      <InstrumentPicker catalog={instruments} symbols={symbols} onChange={(value) => { setSymbols(value); setMessage(null); }} disabled={busy || catalog.kind !== "ready"} limit={null} />
       <form className="grid gap-3" onSubmit={(event) => { void enqueue(event); }}>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="Начало загрузки">{(control) => <Input type="datetime-local" required value={from} onChange={(event) => setFrom(utcMidnightOnDateChange(from, event.target.value))} {...control} />}</Field>

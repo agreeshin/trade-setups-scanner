@@ -70,6 +70,8 @@ it("imports the bybit listing, keeps the list editable and submits one confirmed
   const posts = stubFetch();
   render(<HistoryPage />);
   await screen.findByText(/Выбрано инструментов: 0/);
+  expect(screen.queryByText(/Лимит одного запуска/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/Уменьшите список/)).not.toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "Импортировать текущий листинг Bybit (линейные USDT perpetual)" }));
   expect(await screen.findByText(/Импортирован текущий листинг Bybit: 2/)).toBeInTheDocument();
   expect(await screen.findByText(/Выбрано инструментов: 2/)).toBeInTheDocument();
