@@ -21,7 +21,7 @@ fn parts() -> (StudyRecord, db::SavedSource, db::Artifact, core::ContinuousRepla
     let effective=json!({"clusterEnabled":false,"clusterGapMinutes":null,"timeShiftMinutes":0,"priceChangePct":null,"horizonMinutes":3,"setupMaturity":0});
     let best=json!({"params":params,"analytics":effective,"provenance":provenance});
     let epoch=chrono::DateTime::from_timestamp(0,0).unwrap();
-    let record=StudyRecord {id:36,status:"completed".into(),spec:json!(spec),progress:json!({}),result:Some(json!({"best":best})),error:None,created_at:epoch,updated_at:epoch,events:json!([]),origin:"continuous".into(),owner_id:"fixture".into(),continuous_generation_id:Some(32),continuous_slot_id:Some(6)};
+    let record=StudyRecord {id:36,status:"completed".into(),spec:json!(spec),progress:json!({}),result:Some(json!({"best":best})),error:None,created_at:epoch,updated_at:epoch,events:json!([]),origin:"continuous".into(),owner_id:"fixture".into(),continuous_generation_id:Some(32),continuous_slot_id:Some(6),manual_control:None};
     let saved=db::SavedSource {generation_id:32,study_id:36,slot_id:6,observation_cutoff:360,spec:json!(spec),
         result:json!({"best":best,"selectedCell":{"tpPct":4,"slPct":4},"analytics":{"evaluation":{"matrix":[{"tpPct":4,"slPct":4,"tpCount":1,"slCount":0,"closedCount":1}]}}}),replay_manifest:Some(json!({"retained":"immutable-manifest"}))};
     let identity=db::ArtifactIdentity {owner_id:"fixture".into(),generation_id:32,study_id:36,slot_id:6,calculation_version:"2".into(),tp_pct:4.0,sl_pct:4.0,

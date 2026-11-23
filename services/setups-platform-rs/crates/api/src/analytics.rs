@@ -13,7 +13,8 @@ use serde_json::{Map, Value, json};
 #[cfg(test)]
 use setups_analytics::manual_trend::trend_matrix_scope;
 use setups_analytics::manual_trend::{
-    TrendBendDays, TrendInput, TrendMode, fit_daily_outcomes, fit_weighted_trend,
+    DailyTrendTarget, TrendBendDays, TrendInput, TrendMode, fit_daily_outcomes_with_target,
+    fit_weighted_trend,
 };
 use setups_analytics::{
     AnalyticsSetup, DEFAULT_CLUSTER_GAP_HOURS, DEFAULT_HORIZON_MINUTES, EvaluateLimitOptions,
@@ -978,11 +979,13 @@ fn aggregate_payload(
                 payload.insert("probabilityDays".into(), json!(daily));
                 (value, None)
             } else {
-                let bend = match params.forecast {
-                    Some(ForecastRecipe::Trend { bend_days, .. }) => bend_days,
-                    _ => params.trend_bend_days,
+                let (bend, target) = match params.forecast {
+                    Some(ForecastRecipe::Trend { bend_days, .. }) => (bend_days, DailyTrendTarget::MeanR),
+                    Some(ForecastRecipe::TrendSumR { bend_days, .. }) => (bend_days, DailyTrendTarget::SumR),
+                    None => (params.trend_bend_days, DailyTrendTarget::MeanR),
+                    Some(ForecastRecipe::DecayedProbability { .. }) => unreachable!("probability evaluated above"),
                 };
-                let trend = fit_daily_outcomes(
+                let trend = fit_daily_outcomes_with_target(
                     selection
                         .rows
                         .iter()
@@ -996,9 +999,15 @@ fn aggregate_payload(
                             })
                         }),
                     bend,
+                    target,
                 )
                 .map_err(|error| error.to_string())?;
                 let endpoint = trend.as_ref().map(|fit| fit.endpoint());
+                // Additive only for the new method: old persisted payload bytes
+                // (including explicit legacy trend) keep their original shape.
+                if target == DailyTrendTarget::SumR {
+                    payload.insert("target".into(), json!(target.key()));
+                }
                 (
                     endpoint.map(|point| point.value),
                     endpoint.and_then(|point| point.se),
@@ -1290,6 +1299,7 @@ fn project_forecast_fields(item: &mut Value, payload: &Value) {
         "forecastR",
         "decisionR",
         "forecastEstimate",
+        "target",
         "tpCount",
         "slCount",
         "closedCount",
@@ -1763,6 +1773,66 @@ struct TrendRequest {
     points: Vec<TrendInput>,
     #[serde(default)]
     trend_bend_days: TrendBendDays,
+    projection: Option<TrendProjectionRequest>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TrendProjectionRequest {
+    forecast: ForecastRecipe,
+    // Required field, nullable value. Number avoids serde's buffered f64
+    // decoding changing the immutable recipe projection by an ULP.
+    mean_r: serde_json::Value,
+    trend_mode: TrendMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trend_blend_lambda: Option<TrendBlendLambda>,
+}
+
+impl TrendRequest {
+    fn evaluate(self) -> Result<Value, String> {
+        let projection = self.projection.as_ref().map(|projection| {
+            let bend = match projection.forecast {
+                ForecastRecipe::Trend { bend_days, .. } | ForecastRecipe::TrendSumR { bend_days, .. } => bend_days,
+                ForecastRecipe::DecayedProbability { .. } => return Err("projection requires a trend forecast".to_owned()),
+            };
+            projection.forecast.validate().map_err(|error| error.to_string())?;
+            if bend != self.trend_bend_days { return Err("projection bendDays must match trendBendDays".into()); }
+            let mean = if projection.mean_r.is_null() { None } else {
+                Some(projection.mean_r.as_f64().filter(|value| value.is_finite())
+                    .ok_or("projection meanR must be finite or null")?)
+            };
+            Ok((mean, projection.trend_blend_lambda.unwrap_or_default()))
+        }).transpose()?;
+        let trend = fit_weighted_trend(&self.points, self.trend_bend_days)
+            .map_err(|error| error.to_string())?.map(|fit| fit.summary());
+        let mut response = json!({ "trend": trend });
+        if let (Some(request), Some((mean, lambda))) = (self.projection, projection) {
+            let forecast = trend.as_ref().map(|trend| trend.end.value);
+            let decision = |forecast| decision_r(request.trend_mode, mean, forecast, lambda)
+                .map_err(|error| error.to_string());
+            let mut curve = Vec::new();
+            if let Some(trend) = &trend {
+                for point in &trend.curve {
+                    curve.push(json!({"day":point.day,"value":decision(Some(point.value))?}));
+                }
+            } else if request.trend_mode == TrendMode::Mean && mean.is_some() {
+                // A period mean does not require a fit or invented observations.
+                // The solver above already validated these supplied day bounds.
+                if let Some(first) = self.points.first() {
+                    curve.push(json!({"day":first.day,"value":decision(None)?}));
+                    if let Some(last) = self.points.last().filter(|last| last.day != first.day) {
+                        curve.push(json!({"day":last.day,"value":decision(None)?}));
+                    }
+                }
+            }
+            let mut projected = serde_json::to_value(&request).map_err(|error| error.to_string())?;
+            projected["forecastR"] = json!(forecast);
+            projected["decisionR"] = json!(decision(forecast)?);
+            projected["curve"] = json!(curve);
+            response["projection"] = projected;
+        }
+        Ok(response)
+    }
 }
 
 /// One domain solver for matrix forecasts and UI curves; no market or DB access.
@@ -1778,13 +1848,10 @@ async fn analytics_trend(
     if request.points.len() > setups_analytics::manual_trend::MAX_TREND_DAYS {
         return error_response(StatusCode::BAD_REQUEST, "trend: TooManyDays");
     }
-    match tokio::task::spawn_blocking(move || {
-        fit_weighted_trend(&request.points, request.trend_bend_days)
-            .map(|fit| fit.map(|fit| fit.summary()))
-    })
+    match tokio::task::spawn_blocking(move || request.evaluate())
     .await
     {
-        Ok(Ok(trend)) => Json(json!({ "trend": trend })).into_response(),
+        Ok(Ok(response)) => Json(response).into_response(),
         Ok(Err(error)) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
         Err(error) => {
             eprintln!("analytics trend computation failed: {error}");
@@ -1989,6 +2056,80 @@ mod tests {
             serde_json::from_value::<TrendRequest>(json!({"points":[],"unrecognized":true}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn sum_matrix_blend_and_curve_share_period_mean_endpoint_and_distinct_cache_identity() {
+        let mut query = raw("run-2");
+        query.tp_pct = Some("2".into()); query.sl_pct = Some("1".into());
+        let mut params = parse_analytics_query(&query, true).unwrap();
+        let days_status = [(0, LimitStatus::Sl), (0, LimitStatus::Sl), (1, LimitStatus::Tp),
+            (3, LimitStatus::Tp), (3, LimitStatus::Tp), (3, LimitStatus::Tp),
+            (4, LimitStatus::Unclosed), (4, LimitStatus::PriceChangeFiltered)];
+        let selection = SelectionResult {
+            rows: days_status.iter().map(|(day, _)| AnalyticsSetup { exchange_code:"bybit".into(), category:"linear".into(), symbol:"FIXTURE".into(),
+                open_time_unix:day*86400, close_time_unix:day*86400+60, close_price:"100".into() }).collect(),
+            avg_selection_ordinal:None,avg_selection_delay_minutes:None,total_clusters_count:None,cached_selection:false,
+        };
+        let evaluations: Vec<_> = days_status.iter().map(|(_, status)| LimitEvaluation { status:*status,
+            move_pct:risk_return(*status,2.0,1.0), ..no_data_evaluation() }).collect();
+        let mean = aggregate_payload(&params,&selection,8,7,1,&evaluations).unwrap();
+        assert_eq!(mean["riskExpectancy"],1.0);
+        params.forecast = Some(ForecastRecipe::TrendSumR { version:1,bend_days:TrendBendDays::Linear });
+        params.observation_cutoff = Some(5*86400);
+        assert_eq!(params.matrix_key("old"),"old");
+        assert_eq!(aggregate_payload(&params,&selection,8,7,1,&evaluations).unwrap(),mean,"mean cache/payload stays byte-compatible");
+        params.trend_mode = TrendMode::Forecast;
+        let sum = aggregate_payload(&params,&selection,8,7,1,&evaluations).unwrap();
+        assert_eq!(params.matrix_key("old"),"old:forecast:v1:trend_sum_r:linear:c432000:forecast");
+        assert_eq!(sum["target"],"daily_sum_r"); assert_eq!(sum["meanR"],1.0);
+        assert_eq!(sum["riskExpectancy"],sum["forecastR"]);
+        let points = json!([{"day":0,"value":-2,"weight":2},{"day":1,"value":2,"weight":1},
+            {"day":3,"value":6,"weight":3},{"day":4,"value":null,"weight":1}]);
+        for mode in [TrendMode::Forecast,TrendMode::Blend] {
+            params.trend_mode = mode;
+            for lambda in [0.05,0.7,0.95] {
+                params.trend_blend_lambda = TrendBlendLambda::try_from(lambda).unwrap();
+                let matrix = aggregate_payload(&params,&selection,8,7,1,&evaluations).unwrap();
+                let request: TrendRequest = serde_json::from_value(json!({"points":points,"trendBendDays":"linear",
+                    "projection":{"forecast":params.forecast,"meanR":1,"trendMode":mode,"trendBlendLambda":lambda}})).unwrap();
+                let graph = request.evaluate().unwrap();
+                assert_eq!(graph["projection"]["forecastR"],matrix["forecastR"]);
+                assert_eq!(graph["projection"]["decisionR"],matrix["decisionR"]);
+                assert_eq!(graph["projection"]["curve"].as_array().unwrap().last().unwrap()["value"],matrix["riskExpectancy"]);
+                assert_eq!(graph["trend"]["end"]["day"],3.0);
+                assert_eq!(grid_item(2.0,1.0,&matrix,false)["target"],"daily_sum_r");
+            }
+        }
+        params.trend_mode=TrendMode::Forecast;
+        params.forecast=Some(ForecastRecipe::Trend {version:1,bend_days:TrendBendDays::Linear});
+        assert_eq!(params.matrix_key("old"),"old:forecast:v1:trend:linear:c432000:forecast");
+        let legacy=aggregate_payload(&params,&selection,8,7,1,&evaluations).unwrap();
+        assert_ne!(sum["forecastR"],legacy["forecastR"]); assert!(legacy.get("target").is_none());
+        params.forecast=None;
+        assert_eq!(params.matrix_key("old"),"old:trend:v1:forecast:linear");
+    }
+
+    #[test]
+    fn projection_mean_works_without_fit_and_missing_forecast_never_falls_back() {
+        for points in [json!([]), json!([{"day":5,"value":0,"weight":1}]),
+            json!([{"day":3,"value":null,"weight":1},{"day":5,"value":0,"weight":1},{"day":7,"value":null,"weight":1}])] {
+            for mode in [TrendMode::Mean,TrendMode::Forecast,TrendMode::Blend] {
+                for mean in [json!(0.4),Value::Null] {
+                    let request:TrendRequest=serde_json::from_value(json!({"points":points,"projection":{
+                        "forecast":{"method":"trend_sum_r","version":1,"bendDays":"linear"},"meanR":mean,"trendMode":mode}})).unwrap();
+                    let value=request.evaluate().unwrap();
+                    assert!(value["trend"].is_null()); assert!(value["projection"]["forecastR"].is_null());
+                    let expected=if mode==TrendMode::Mean {mean.clone()} else {Value::Null};
+                    assert_eq!(value["projection"]["decisionR"],expected);
+                    let curve=value["projection"]["curve"].as_array().unwrap();
+                    let expected_len=if expected.is_null() {0} else {points.as_array().unwrap().len().min(2)};
+                    assert_eq!(curve.len(),expected_len);
+                    assert!(curve.iter().all(|point|point["value"]==expected));
+                    if points.as_array().unwrap().len()>1 && !curve.is_empty() {assert_eq!(curve[0]["day"],3.0);assert_eq!(curve[1]["day"],7.0);}
+                }
+            }
+        }
     }
 
     #[test]

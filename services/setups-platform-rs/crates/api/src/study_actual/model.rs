@@ -212,6 +212,7 @@ fn source_objective(spec: &StudyRequest) -> Result<ExpectancyObjective, &'static
     // Same method dispatch as optimizer::trend::effective_bend: the legacy
     // spec bend is inactive for explicit recipes. Never rewrite the saved spec.
     let bend = match spec.forecast {
+        Some(setups_domain::forecast::ForecastRecipe::TrendSumR { .. }) => return Err("unsupported_study_forecast"),
         Some(setups_domain::forecast::ForecastRecipe::Trend { bend_days, .. }) => bend_days,
         Some(setups_domain::forecast::ForecastRecipe::DecayedProbability { .. }) => {
             setups_domain::trend::TrendBendDays::Linear

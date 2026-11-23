@@ -45,6 +45,21 @@ fn continuous_config_locks_owned_coordinates_and_normalizes_manual_defaults() {
 }
 
 #[tokio::test]
+async fn continuous_config_rejects_web_sum_recipe_before_database_admission() {
+    let pool=PgPoolOptions::new().connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test").unwrap();
+    let router=continuous_router(state(pool));
+    for mode in ["mean","forecast","blend"] {
+        let mut body=config();body["study"]["forecast"]=json!({"method":"trend_sum_r","version":1,"bendDays":"7"});
+        body["study"]["trendMode"]=json!(mode);
+        let limits=ContinuousRuntimeConfig::default().optimizer;
+        let error=normalize_config(serde_json::from_value(body.clone()).unwrap(),ALGORITHM,&limits).unwrap_err();
+        assert!(error.contains("WrongMethod"));
+        let (status,_)=request(&router,"PUT",&path(""),body).await;
+        assert_eq!(status,StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
 async fn continuous_routes_authenticate_and_validate_before_database() {
     let pool=PgPoolOptions::new().connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test").unwrap();
     let router=continuous_router(state(pool));

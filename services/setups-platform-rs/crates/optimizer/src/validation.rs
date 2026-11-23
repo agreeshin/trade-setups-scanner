@@ -303,7 +303,7 @@ pub(crate) fn validate_request_mode(
         return Err(invalid("minForecastExpectancy must be finite and in 0..100 R"));
     }
     if let Some(recipe) = spec.forecast {
-        recipe.validate().map_err(|error| invalid(error.to_string()))?;
+        recipe.validate_for_study().map_err(|error| invalid(error.to_string()))?;
     }
     for levels in [&spec.tp_levels, &spec.sl_levels] {
         if levels.is_empty() || levels.len() > 64 {

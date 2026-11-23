@@ -36,6 +36,22 @@ fn fixture() -> (StudyRequest, StudyInput, StudyCandidate) {
 }
 
 #[test]
+fn direct_sum_recipe_never_enters_manual_or_continuous_legacy_mean_execution() {
+    let (mut spec,input,candidate)=fixture();
+    spec.forecast=Some(ForecastRecipe::TrendSumR {version:1,bend_days:TrendBendDays::Seven});
+    let limits=StudyLimits::default();let cancel=CancelToken::new();
+    for mode in [TrendMode::Mean,TrendMode::Forecast,TrendMode::Blend] {
+        spec.trend_mode=mode;
+        assert!(validate_request(&spec,&default_parameter_descriptors(&spec.algorithm_id).unwrap()).is_err());
+        assert!(evaluate_candidate(&spec,&input,&candidate,&limits,&cancel).unwrap_err().to_string().contains("WrongMethod"));
+        let context=ContinuousContext {observation_cutoff:spec.to_unix};
+        assert!(validate_continuous_request(&spec,context).is_err());
+        assert!(materialize_continuous(&spec,&input,&candidate,context,&limits,&cancel).unwrap_err().to_string().contains("WrongMethod"));
+        assert!(run_study(&spec,&input,&limits,&cancel,|_|{}).unwrap_err().to_string().contains("WrongMethod"));
+    }
+}
+
+#[test]
 fn manual_and_continuous_rank_declining_cells_by_the_chosen_metric_deterministically() {
     let (mut spec, input, candidate) = fixture();
     let limits = StudyLimits::default();

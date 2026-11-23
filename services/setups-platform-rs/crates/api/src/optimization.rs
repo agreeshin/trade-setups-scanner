@@ -180,6 +180,14 @@ async fn put_draft(
         }
         Err(_) => return response(StatusCode::BAD_REQUEST, json!({"error":"invalid_body"})),
     };
+    // Drafts carry string-valued form numbers (not the submitted recipe DTO).
+    // Reject unknown/new methods at both supported shape boundaries without
+    // rewriting old saved draft bytes or coercing draft values to a study.
+    for forecast in [value.get("forecast"), value.pointer("/shared/scope/forecast")].into_iter().flatten().filter(|value| !value.is_null()) {
+        if !matches!(forecast.get("method").and_then(Value::as_str), Some("trend" | "decayed_probability")) {
+            return response(StatusCode::BAD_REQUEST, json!({"error":"unsupported_study_forecast"}));
+        }
+    }
     // Replace only this algorithm's draft atomically; never merge the shared UI settings.
     let key = format!("optimization-draft:{algorithm}");
     match setups_db::settings_set(&state.pool, &key, &value).await {

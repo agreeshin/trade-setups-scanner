@@ -82,6 +82,7 @@ impl LiveProfile {
             None=>spec.trend_bend_days,
             Some(setups_domain::forecast::ForecastRecipe::DecayedProbability {..})=>setups_domain::trend::TrendBendDays::Linear,
             Some(setups_domain::forecast::ForecastRecipe::Trend {bend_days,..})=>bend_days,
+            Some(setups_domain::forecast::ForecastRecipe::TrendSumR {..})=>return Err(invalid("unsupported study forecast")),
         };
         let expected:BTreeSet<_>=spec.instruments.iter().cloned().collect();
         if params.algorithm_id()!=slot.algorithm_id || params.algorithm_version()!=spec.algorithm_version

@@ -349,7 +349,7 @@ fn compute(
             }
             (value, reason, "decayed_probability", "closed_trade_r")
         }
-        ForecastRecipe::Trend { bend_days, .. } => {
+        ForecastRecipe::Trend { bend_days, .. } | ForecastRecipe::TrendSumR { bend_days, .. } => {
             let input: Vec<_> = daily
                 .into_iter()
                 .map(|(day, (weight, count, sum))| TrendInput {
@@ -699,6 +699,16 @@ mod tests {
         assert!((view.forecast_r.unwrap() - 5.4).abs() < 1e-12);
         assert_eq!(view.model.target, "daily_sum_r");
         assert_eq!(view.closed, 5);
+        let sum_view = compute(
+            request(super::snapshot(&parsed, &outcomes, cutoff), ForecastRecipe::TrendSumR {
+                version: FORECAST_RECIPE_VERSION, bend_days: TrendBendDays::Linear,
+            }, TrendMode::Forecast), &parsed, &outcomes, &calendar, cutoff + 60, "fixture".into(),
+        ).unwrap();
+        assert_eq!(sum_view.mean_r,view.mean_r);
+        assert_eq!(sum_view.forecast_r,view.forecast_r);
+        assert_eq!(sum_view.decision_r,view.decision_r);
+        assert_eq!(sum_view.model.target,"daily_sum_r");
+        assert_eq!(serde_json::to_value(sum_view.model).unwrap(),serde_json::to_value(view.model).unwrap());
     }
 
     #[test]

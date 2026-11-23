@@ -1254,6 +1254,7 @@ fn plot_forecast(
         .as_ref()
         .ok_or(RenderError::NoFiniteDays)?;
     match recipe {
+        ForecastRecipe::TrendSumR { .. } => Err(RenderError::ForecastMismatch),
         ForecastRecipe::DecayedProbability { .. } => {
             let probability = model
                 .probability

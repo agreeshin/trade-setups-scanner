@@ -6,11 +6,29 @@ pub use setups_domain::trend::{
 };
 use std::collections::BTreeMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DailyTrendTarget { MeanR, SumR }
+impl DailyTrendTarget {
+    pub fn key(self) -> &'static str {
+        match self { Self::MeanR => "daily_mean_r", Self::SumR => "daily_sum_r" }
+    }
+}
+
 /// Caller supplies the same selected, non-price-filtered population as the UI.
 /// Timestamp is signal close, never trade exit. Null returns still count as setups.
 pub fn fit_daily_outcomes(
     outcomes: impl IntoIterator<Item = (i64, Option<f64>)>,
     bend: TrendBendDays,
+) -> Result<Option<WeightedTrend>, TrendError> {
+    fit_daily_outcomes_with_target(outcomes, bend, DailyTrendTarget::MeanR)
+}
+
+/// Only the daily response changes; both targets use the same population,
+/// setup-count weights, calendar, solver, fallback and last-finite endpoint.
+pub fn fit_daily_outcomes_with_target(
+    outcomes: impl IntoIterator<Item = (i64, Option<f64>)>,
+    bend: TrendBendDays,
+    target: DailyTrendTarget,
 ) -> Result<Option<WeightedTrend>, TrendError> {
     let mut daily = BTreeMap::<i64, (u32, u32, f64)>::new();
     for (signal_close, value) in outcomes {
@@ -35,7 +53,10 @@ pub fn fit_daily_outcomes(
         .into_iter()
         .map(|(day, (weight, closed, sum))| TrendInput {
             day: day as f64,
-            value: (closed > 0).then(|| sum / f64::from(closed)),
+            value: (closed > 0).then(|| match target {
+                DailyTrendTarget::MeanR => sum / f64::from(closed),
+                DailyTrendTarget::SumR => sum,
+            }),
             weight,
         })
         .collect();
@@ -45,6 +66,51 @@ pub fn fit_daily_outcomes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sum_target_reuses_setup_weights_and_calendar_without_mean_normalization() {
+        let outcomes = [(0, Some(2.0)), (0, Some(2.0)), (0, None),
+            (86400, Some(-1.0)), (3 * 86400, Some(2.0)), (3 * 86400, Some(2.0)),
+            (3 * 86400, Some(2.0)), (4 * 86400, None)];
+        let expected = [TrendInput { day: 0.0, value: Some(4.0), weight: 3 },
+            TrendInput { day: 1.0, value: Some(-1.0), weight: 1 },
+            TrendInput { day: 3.0, value: Some(6.0), weight: 3 },
+            TrendInput { day: 4.0, value: None, weight: 1 }];
+        for bend in [TrendBendDays::Linear, TrendBendDays::Seven, TrendBendDays::Fourteen, TrendBendDays::Thirty] {
+            let sum = fit_daily_outcomes_with_target(outcomes, bend, DailyTrendTarget::SumR).unwrap().unwrap();
+            assert_eq!(sum.summary(), fit_weighted_trend(&expected, bend).unwrap().unwrap().summary());
+            assert_ne!(sum.endpoint().value, fit_daily_outcomes(outcomes, bend).unwrap().unwrap().endpoint().value);
+            assert_eq!(sum.endpoint().day, 3.0, "no missing/empty-day observations or extrapolation");
+        }
+    }
+
+    #[test]
+    fn sum_true_zero_is_observed_but_empty_and_one_finite_day_stay_unavailable() {
+        let outcomes = [(0, Some(-1.0)), (0, Some(1.0)), (86400, None), (3 * 86400, Some(2.0))];
+        let fit = fit_daily_outcomes_with_target(outcomes, TrendBendDays::Seven, DailyTrendTarget::SumR).unwrap().unwrap();
+        assert!(fit.summary().start.value.abs() < 1e-12);
+        assert_eq!(fit.summary().start.day, 0.0);
+        assert!((fit.endpoint().value - 2.0).abs() < 1e-12);
+        for outcomes in [vec![], vec![(0, None), (86400, None)], vec![(0, Some(0.0)), (86400, None)]] {
+            assert!(fit_daily_outcomes_with_target(outcomes, TrendBendDays::Linear, DailyTrendTarget::SumR).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn sum_true_bend_is_the_same_shared_pspline_not_another_solver() {
+        let mut outcomes = Vec::new();
+        let mut expected = Vec::new();
+        for day in 0..=42 {
+            let count = (day % 3 + 1) as u32;
+            let value = if day < 20 { -1.0 } else { 2.0 };
+            for _ in 0..count { outcomes.push((day * 86400, Some(value))); }
+            expected.push(TrendInput { day: day as f64, value: Some(value * f64::from(count)), weight: count });
+        }
+        for bend in [TrendBendDays::Seven, TrendBendDays::Fourteen, TrendBendDays::Thirty] {
+            let fit = fit_daily_outcomes_with_target(outcomes.clone(), bend, DailyTrendTarget::SumR).unwrap().unwrap().summary();
+            assert_eq!(fit.method, "p_spline");
+            assert_eq!(fit, fit_weighted_trend(&expected, bend).unwrap().unwrap().summary());
+        }
+    }
     #[test]
     fn forecast_is_endpoint_of_signal_day_series_not_mean_or_exit_time() {
         let outcomes = [

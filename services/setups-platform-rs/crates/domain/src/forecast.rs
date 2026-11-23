@@ -12,7 +12,7 @@ const DAY_SECONDS: i64 = 86_400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ForecastMethod { DecayedProbability, Trend }
+pub enum ForecastMethod { DecayedProbability, Trend, TrendSumR }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +32,11 @@ pub enum ForecastRecipe {
         prior_policy: PriorPolicy,
     },
     Trend {
+        version: u32,
+        #[serde(rename = "bendDays")]
+        bend_days: TrendBendDays,
+    },
+    TrendSumR {
         version: u32,
         #[serde(rename = "bendDays")]
         bend_days: TrendBendDays,
@@ -58,6 +63,8 @@ impl<'de> Deserialize<'de> for ForecastRecipe {
                 Self::DecayedProbability { version: w.version, half_life_days, kappa, prior_policy },
             (ForecastMethod::Trend, None, None, None, Some(bend_days)) =>
                 Self::Trend { version: w.version, bend_days },
+            (ForecastMethod::TrendSumR, None, None, None, Some(bend_days)) =>
+                Self::TrendSumR { version: w.version, bend_days },
             _ => return Err(serde::de::Error::custom("forecast settings do not match method")),
         };
         recipe.validate().map_err(serde::de::Error::custom)?;
@@ -75,16 +82,29 @@ impl ForecastRecipe {
             kappa: 10.0, prior_policy: PriorPolicy::GrossBreakEven }
     }
     pub fn method(self) -> ForecastMethod {
-        match self { Self::DecayedProbability { .. } => ForecastMethod::DecayedProbability, Self::Trend { .. } => ForecastMethod::Trend }
+        match self {
+            Self::DecayedProbability { .. } => ForecastMethod::DecayedProbability,
+            Self::Trend { .. } => ForecastMethod::Trend,
+            Self::TrendSumR { .. } => ForecastMethod::TrendSumR,
+        }
     }
     pub fn validate(self) -> Result<(), ForecastError> {
-        let version = match self { Self::DecayedProbability { version, .. } | Self::Trend { version, .. } => version };
+        let version = match self { Self::DecayedProbability { version, .. } | Self::Trend { version, .. } | Self::TrendSumR { version, .. } => version };
         if version != FORECAST_RECIPE_VERSION { return Err(ForecastError::UnsupportedVersion); }
         if let Self::DecayedProbability { half_life_days, kappa, .. } = self
             && (!half_life_days.is_finite() || half_life_days <= 0.0 || !kappa.is_finite() || kappa <= 0.0) {
             return Err(ForecastError::InvalidRecipe);
         }
         Ok(())
+    }
+    /// The shared web recipe also serves manual Analytics/Setups. A new web
+    /// method must not silently become an optimizer or Telegram objective.
+    pub fn validate_for_study(self) -> Result<(), ForecastError> {
+        self.validate()?;
+        match self {
+            Self::DecayedProbability { .. } | Self::Trend { .. } => Ok(()),
+            Self::TrendSumR { .. } => Err(ForecastError::WrongMethod),
+        }
     }
     /// Model fragment only. The owner also keys data/population, cutoff, q,
     /// mode/lambda and outcome policy; this alone is not a result cache key.
@@ -94,6 +114,7 @@ impl ForecastRecipe {
             Self::DecayedProbability { version, half_life_days, kappa, .. } =>
                 format!("forecast:v{version}:decayed_probability:h{half_life_days}:k{kappa}:gross_break_even"),
             Self::Trend { version, bend_days } => format!("forecast:v{version}:trend:{}", bend_days.key()),
+            Self::TrendSumR { version, bend_days } => format!("forecast:v{version}:trend_sum_r:{}", bend_days.key()),
         })
     }
 }
@@ -407,7 +428,21 @@ mod tests {
         assert_eq!(serde_json::from_str::<ForecastRecipe>(&serde_json::to_string(&r).unwrap()).unwrap(), r);
         let trend: ForecastRecipe = serde_json::from_value(json!({"method":"trend","version":1,"bendDays":"7"})).unwrap();
         assert_eq!(trend.method(), ForecastMethod::Trend);
+        assert_eq!(serde_json::to_string(&trend).unwrap(), r#"{"method":"trend","version":1,"bendDays":"7"}"#);
+        assert_eq!(trend.identity_key().unwrap(), "forecast:v1:trend:7");
+        let sum_wire = r#"{"method":"trend_sum_r","version":1,"bendDays":"7"}"#;
+        let sum: ForecastRecipe = serde_json::from_str(sum_wire).unwrap();
+        assert_eq!(sum, ForecastRecipe::TrendSumR { version: 1, bend_days: TrendBendDays::Seven });
+        assert_eq!(sum.method(), ForecastMethod::TrendSumR);
+        assert_eq!(serde_json::to_string(&sum).unwrap(), sum_wire);
+        assert_eq!(sum.identity_key().unwrap(), "forecast:v1:trend_sum_r:7");
+        assert_ne!(sum.identity_key().unwrap(), trend.identity_key().unwrap());
+        assert_eq!(sum.validate_for_study(), Err(ForecastError::WrongMethod));
+        assert!(trend.validate_for_study().is_ok());
         for invalid in [json!({}), json!({"method":"trend","version":2,"bendDays":"linear"}),
+            json!({"method":"trend_sum_r","version":2,"bendDays":"linear"}),
+            json!({"method":"trend_sum_r","version":1,"bendDays":"linear","kappa":10}),
+            json!({"method":"unsupported","version":1,"bendDays":"linear"}),
             json!({"method":"trend","version":1,"bendDays":"7","kappa":10}),
             json!({"method":"decayed_probability","version":1,"halfLifeDays":0,"kappa":10,"priorPolicy":"gross_break_even"}),
             json!({"method":"decayed_probability","version":1,"halfLifeDays":14,"kappa":-1,"priorPolicy":"gross_break_even"}),

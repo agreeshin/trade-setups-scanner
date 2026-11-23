@@ -20,6 +20,9 @@ impl DailyMatrix {
     /// Includes one shared design, solver scratch, compact input and grouping
     /// metadata; none survives the evaluation or a cancelled/failed call.
     pub fn working_bytes(spec: &StudyRequest) -> Result<usize, StudyError> {
+        if let Some(recipe) = spec.forecast {
+            recipe.validate_for_study().map_err(|error| StudyError::InvalidRequest(error.to_string()))?;
+        }
         if spec.trend_mode == TrendMode::Mean { return Ok(0); }
         let days = Self::day_count(spec)?;
         if spec.forecast.is_some_and(|r| r.method() == ForecastMethod::DecayedProbability) {
@@ -43,6 +46,9 @@ impl DailyMatrix {
         Self::with_cutoff(spec, limits, spec.to_unix)
     }
     pub fn with_cutoff(spec: &StudyRequest, limits: &StudyLimits, cutoff: i64) -> Result<Self, StudyError> {
+        if let Some(recipe) = spec.forecast {
+            recipe.validate_for_study().map_err(|error| StudyError::InvalidRequest(error.to_string()))?;
+        }
         // Every counter is bounded by the already enforced candidate setup cap.
         limit("forecast_setup_counter", limits.max_setups_per_candidate, u32::MAX as usize)?;
         let days = Self::day_count(spec)?;
@@ -84,6 +90,9 @@ impl DailyMatrix {
         bucket.sum_r += value;
     }
     pub fn apply(&self, spec: &StudyRequest, matrix: &mut [MatrixCell], control: &Control<'_>) -> Result<bool, StudyError> {
+        if let Some(recipe) = spec.forecast {
+            recipe.validate_for_study().map_err(|error| StudyError::InvalidRequest(error.to_string()))?;
+        }
         if let Some(error) = self.probability_error { return Err(StudyError::Execution(error.to_string())); }
         if !self.probability.is_empty() {
             if matrix.len()!=self.probability.len() {
@@ -158,6 +167,7 @@ pub(crate) fn effective_bend(spec:&StudyRequest) -> crate::TrendBendDays {
     match spec.forecast {
         Some(ForecastRecipe::Trend {bend_days,..}) => bend_days,
         Some(ForecastRecipe::DecayedProbability {..}) => crate::TrendBendDays::Linear,
+        Some(ForecastRecipe::TrendSumR {..}) => panic!("unsupported study forecast must be rejected before evaluation"),
         None => spec.trend_bend_days,
     }
 }

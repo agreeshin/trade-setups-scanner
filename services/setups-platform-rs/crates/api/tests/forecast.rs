@@ -162,6 +162,47 @@ struct TestDb {
     pool: PgPool,
     name: String,
 }
+
+#[tokio::test]
+async fn trend_projection_wire_fixture_omission_identity_nulls_and_blend_endpoint() {
+    let pool = PgPoolOptions::new().connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test").unwrap();
+    let app = analytics_router(state(pool,"http://127.0.0.1:1"));
+    let points = json!([{"day":0,"value":0,"weight":2},{"day":1,"value":2,"weight":1}]);
+    let (status, legacy) = request(&app,"POST","/v1/analytics/trend",json!({"points":points})).await;
+    assert_eq!(status,StatusCode::OK);
+    let expected_trend = json!({"method":"linear","start":{"day":0.0,"value":0.0,"se":null},
+        "end":{"day":1.0,"value":2.0,"se":null},"endpointSe":null,"curve":[
+        {"day":0.0,"value":0.0,"se":null},{"day":0.25,"value":0.5,"se":null},
+        {"day":0.5,"value":1.0,"se":null},{"day":0.75,"value":1.5,"se":null},{"day":1.0,"value":2.0,"se":null}]});
+    assert_eq!(legacy,json!({"trend":expected_trend}),"omitting projection keeps the exact old response shape");
+    let projection = json!({"forecast":{"method":"trend_sum_r","version":1,"bendDays":"linear"},
+        "meanR":0.4,"trendMode":"blend","trendBlendLambda":0.7});
+    let (status, projected) = request(&app,"POST","/v1/analytics/trend",json!({"points":points,"trendBendDays":"linear","projection":projection})).await;
+    assert_eq!(status,StatusCode::OK);
+    assert_eq!(projected["trend"],expected_trend);
+    for key in ["forecast","meanR","trendMode","trendBlendLambda"] { assert_eq!(projected["projection"][key],projection[key]); }
+    assert_eq!(projected["projection"]["forecastR"],2.0);
+    let decision=projected["projection"]["decisionR"].as_f64().unwrap();
+    assert!((decision-1.52).abs()<1e-12);
+    assert_eq!(projected["projection"]["curve"].as_array().unwrap().last().unwrap()["value"],projected["projection"]["decisionR"]);
+    let (status, single) = request(&app,"POST","/v1/analytics/trend",json!({"points":[{"day":9,"value":null,"weight":1}],
+        "projection":{"forecast":{"method":"trend","version":1,"bendDays":"linear"},"meanR":0.4,"trendMode":"mean"}})).await;
+    assert_eq!(status,StatusCode::OK); assert!(single["trend"].is_null());
+    assert_eq!(single["projection"]["curve"],json!([{"day":9.0,"value":0.4}]));
+    assert!(single["projection"]["forecastR"].is_null());
+    assert!(single["projection"].get("trendBlendLambda").is_none());
+    for (field,value) in [("meanR",json!("NaN")),("meanR",json!(true)),("trendBlendLambda",json!(0.0)),
+        ("trendBlendLambda",json!(1.0)),("trendBlendLambda",json!(0.701)),("forecast",json!({"method":"trend_sum_r","version":2,"bendDays":"linear"})),
+        ("forecast",json!({"method":"unknown","version":1,"bendDays":"linear"})),
+        ("forecast",json!({"method":"decayed_probability","version":1,"halfLifeDays":14,"kappa":10,"priorPolicy":"gross_break_even"})),
+        ("forecast",json!({"method":"trend_sum_r","version":1,"bendDays":"7"}))] {
+        let mut bad=projection.clone(); bad[field]=value;
+        let response=app.clone().oneshot(Request::builder().method("POST").uri("/v1/analytics/trend")
+            .header("x-api-key","fixture-key").header("content-type","application/json")
+            .body(Body::from(json!({"points":points,"projection":bad}).to_string())).unwrap()).await.unwrap();
+        assert!(response.status().is_client_error(),"{field}: {}",response.status());
+    }
+}
 impl TestDb {
     async fn new() -> Self {
         let options = PgConnectOptions::from_str(
@@ -321,6 +362,41 @@ async fn manual_http_fixed_cutoff_late_closures_curve_scalar_grid_and_legacy_cac
         assert_eq!(repeated["probabilityDays"],before["probabilityDays"],"later C does not mutate the frozen earlier cell");
         query.retain(|(key,_)|key!="observationCutoff");
         assert_eq!(request(&app,"GET",&uri("/v1/analytics/matrix-cell",&query),Value::Null).await.0,StatusCode::BAD_REQUEST);
+
+        // Two TP closures in the last raw-signal day: a sum target cannot be
+        // mistaken for a mean target, despite retaining the same count weights.
+        let sum_run:i32=sqlx::query_scalar("insert into replay_runs(exchange_code,category,symbol,algorithm_id,algorithm_version,params,from_ts,to_ts,status,setups) values('bybit','linear','FIXTUREUSDT','price_volume_spike','1.1.1','{}',to_timestamp(0),to_timestamp(172800),'done',$1) returning id")
+            .bind(json!([{"openTimeUnix":0,"closeTimeUnix":60,"closePrice":"100"},
+                {"openTimeUnix":86400,"closeTimeUnix":86460,"closePrice":"100"},
+                {"openTimeUnix":86460,"closeTimeUnix":86520,"closePrice":"100"}])).fetch_one(&pool).await.unwrap();
+        set(&mut query,"set",format!("run-{sum_run}"));
+        set(&mut query,"trendMode","mean");
+        let mean=cell(&app,&query).await;
+        let sum_recipe=json!({"method":"trend_sum_r","version":1,"bendDays":"linear"});
+        set(&mut query,"forecast",sum_recipe.to_string());set(&mut query,"observationCutoff",172920);
+        let inactive=cell(&app,&query).await;
+        let mut cached_mean=mean.clone();cached_mean["cached"]=json!(true);
+        assert_eq!(inactive,cached_mean,"sum identity is inactive in the byte-compatible mean path");
+        set(&mut query,"trendMode","forecast");
+        let summed=cell(&app,&query).await;
+        assert_eq!(summed["cached"],false);assert_eq!(summed["target"],"daily_sum_r");
+        assert!((summed["forecastR"].as_f64().unwrap()-5.0).abs()<1e-12);
+        assert_eq!(summed["meanR"],mean["riskExpectancy"]);
+        set(&mut query,"forecast",json!({"method":"trend","version":1,"bendDays":"linear"}).to_string());
+        let old_trend=cell(&app,&query).await;
+        assert_eq!(old_trend["cached"],false);assert_ne!(old_trend["forecastR"],summed["forecastR"]);
+        set(&mut query,"forecast",sum_recipe.to_string());
+        assert_eq!(cell(&app,&query).await["cached"],true,"explicit recipes never share cache entries");
+        for mode in ["forecast","blend"] {
+            set(&mut query,"trendMode",mode);set(&mut query,"trendBlendLambda",0.7);
+            let matrix=cell(&app,&query).await;
+            let (status,projection)=request(&app,"POST","/v1/analytics/trend",json!({"trendBendDays":"linear",
+                "points":[{"day":0,"value":-1,"weight":1},{"day":1,"value":5,"weight":2}],
+                "projection":{"forecast":sum_recipe,"meanR":matrix["meanR"],"trendMode":mode,"trendBlendLambda":0.7}})).await;
+            assert_eq!(status,StatusCode::OK);assert_eq!(projection["projection"]["forecastR"],matrix["forecastR"]);
+            assert_eq!(projection["projection"]["decisionR"],matrix["decisionR"]);
+            assert_eq!(projection["projection"]["curve"].as_array().unwrap().last().unwrap()["value"],matrix["riskExpectancy"]);
+        }
     }).await;
     server.abort();
     let _ = server.await;

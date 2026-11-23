@@ -475,6 +475,7 @@ fn explicit_recipes_resume_exactly_and_method_settings_cutoff_changes_fail_close
         let recovered=finished(search_continuous_resumable(&spec,&input,context,&limits,control(&cancel,&pause,Some(&bytes)),|_|{},|_,_|Ok(CheckpointAction::Continue)).unwrap());
         assert_eq!(comparable(recovered),comparable(reference));
         for recipe in [None,Some(ForecastRecipe::Trend{version:1,bend_days:TrendBendDays::Linear}),
+            Some(ForecastRecipe::TrendSumR{version:1,bend_days:TrendBendDays::Linear}),
             Some(serde_json::from_value(json!({"method":"decayed_probability","version":1,"halfLifeDays":7,"kappa":10,"priorPolicy":"gross_break_even"})).unwrap()),
             Some(serde_json::from_value(json!({"method":"decayed_probability","version":1,"halfLifeDays":14,"kappa":20,"priorPolicy":"gross_break_even"})).unwrap())] {
             let changed=StudyRequest{forecast:recipe,..spec.clone()};
@@ -482,6 +483,31 @@ fn explicit_recipes_resume_exactly_and_method_settings_cutoff_changes_fail_close
         }
         assert!(search_continuous_resumable(&spec,&input,ContinuousContext{observation_cutoff:context.observation_cutoff-60},&limits,
             control(&cancel,&pause,Some(&bytes)),|_|{},|_,_|panic!("changed cutoff must not restart")).is_err());
+    }
+}
+
+#[test]
+fn appended_web_recipe_preserves_legacy_tagged_cbor_checkpoint_recipe_bytes() {
+    // Actual checkpoints use ciborium, not enum ordinals. Compare the legacy
+    // two-variant wire representation directly, including field ordering.
+    #[derive(serde::Serialize)]
+    #[serde(tag="method",rename_all="snake_case")]
+    enum Before {
+        DecayedProbability {version:u32,#[serde(rename="halfLifeDays")] half_life_days:f64,kappa:f64,
+            #[serde(rename="priorPolicy")] prior_policy:setups_domain::forecast::PriorPolicy},
+        Trend {version:u32,#[serde(rename="bendDays")] bend_days:TrendBendDays},
+    }
+    let baseline=ForecastRecipe::engineering_baseline();
+    let old=Before::DecayedProbability {version:1,half_life_days:14.0,kappa:10.0,prior_policy:setups_domain::forecast::PriorPolicy::GrossBreakEven};
+    let mut current=Vec::new();let mut previous=Vec::new();
+    ciborium::ser::into_writer(&baseline,&mut current).unwrap();ciborium::ser::into_writer(&old,&mut previous).unwrap();
+    assert_eq!(current,previous);
+    for bend_days in [TrendBendDays::Linear,TrendBendDays::Seven,TrendBendDays::Fourteen,TrendBendDays::Thirty] {
+        current.clear();previous.clear();
+        ciborium::ser::into_writer(&ForecastRecipe::Trend {version:1,bend_days},&mut current).unwrap();
+        ciborium::ser::into_writer(&Before::Trend {version:1,bend_days},&mut previous).unwrap();
+        assert_eq!(current,previous);
+        assert_eq!(ciborium::de::from_reader::<ForecastRecipe,_>(current.as_slice()).unwrap(),ForecastRecipe::Trend {version:1,bend_days});
     }
 }
 

@@ -664,6 +664,7 @@ impl ValidatedArtifact {
         let frozen_forecast = artifact.source.forecast.map(|recipe| {
             use setups_domain::forecast::{ForecastUnavailableReason, ProbabilityForecast};
             match (&artifact.forecast, recipe) {
+                (_, ForecastRecipe::TrendSumR { .. }) => unreachable!("study artifact validator rejects trend_sum_r"),
                 (Some(model), ForecastRecipe::DecayedProbability { .. }) => match model
                     .probability
                     .as_ref()

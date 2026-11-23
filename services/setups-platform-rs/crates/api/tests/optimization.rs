@@ -83,6 +83,26 @@ async fn request_raw(app: &Router, method: &str, path: &str, body: String) -> (S
 }
 
 #[tokio::test]
+async fn sum_web_recipe_is_rejected_before_new_study_or_draft_database_admission() {
+    let pool = PgPoolOptions::new().connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test").unwrap();
+    let app = app(pool, OptimizationConfig::default());
+    let recipe=json!({"method":"trend_sum_r","version":1,"bendDays":"linear"});
+    for mode in ["mean","forecast","blend"] {
+        let mut body=spec();body["forecast"]=recipe.clone();body["trendMode"]=json!(mode);
+        let (status,error)=request(&app,"POST","/v1/optimization-studies",body).await;
+        assert_eq!(status,StatusCode::BAD_REQUEST);assert_eq!(error["error"],"invalid_request");
+        assert!(error["message"].as_str().unwrap().contains("WrongMethod"));
+    }
+    for method in ["trend_sum_r","unknown"] {
+        for value in [json!({"forecast":{"method":method,"version":1,"bendDays":"linear"}}),
+            json!({"version":1,"shared":{"scope":{"forecast":{"method":method,"version":1,"bendDays":"linear"}}}})] {
+            let (status,error)=request(&app,"PUT","/v1/optimization-drafts/price_volume_spike",json!({"value":value})).await;
+            assert_eq!(status,StatusCode::BAD_REQUEST);assert_eq!(error["error"],"unsupported_study_forecast");
+        }
+    }
+}
+
+#[tokio::test]
 async fn routes_validate_without_database_access() {
     let pool = PgPoolOptions::new()
         .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test")

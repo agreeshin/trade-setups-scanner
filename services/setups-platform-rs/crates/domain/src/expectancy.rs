@@ -243,10 +243,11 @@ impl ExpectancyObjective {
     pub fn validate(self) -> Result<(), ExpectancyError> {
         if self.version != 1 { return Err(ExpectancyError::UnsupportedVersion); }
         if let Some(recipe) = self.forecast {
-            recipe.validate().map_err(|_| ExpectancyError::InvalidForecast)?;
+            recipe.validate_for_study().map_err(|_| ExpectancyError::InvalidForecast)?;
             if !self.trend_mode.is_mean() && self.trend_bend_days != match recipe {
                 ForecastRecipe::Trend { bend_days, .. } => bend_days,
                 ForecastRecipe::DecayedProbability { .. } => TrendBendDays::Linear,
+                ForecastRecipe::TrendSumR { .. } => return Err(ExpectancyError::InvalidForecast),
             } { return Err(ExpectancyError::InvalidForecast); }
         }
         Ok(())
@@ -377,7 +378,7 @@ pub fn utc_day_coordinate(origin_unix: i64, timestamp: i64) -> f64 {
 
 fn validate_source(source: &ExpectancySource) -> Result<(i64, f64), ExpectancyError> {
     if let Some(recipe) = source.forecast {
-        recipe.validate().map_err(|_| ExpectancyError::InvalidForecast)?;
+        recipe.validate_for_study().map_err(|_| ExpectancyError::InvalidForecast)?;
         utc_date(source.provenance.observation_cutoff)?;
         if source.provenance.observation_cutoff < source.provenance.from_unix { return Err(ExpectancyError::InvalidSource); }
     }
@@ -574,6 +575,7 @@ pub fn build_expectancy_artifact(
     let forecast = match (input.source.forecast, daily.as_ref()) {
         (Some(recipe), Some(points)) => {
             let model = match recipe {
+                ForecastRecipe::TrendSumR { .. } => return Err(ExpectancyError::InvalidForecast),
                 ForecastRecipe::DecayedProbability { .. } => ExpectancyForecast {
                     probability: Some(probability_curve(&ProbabilityCurveRequest {
                         recipe, q: input.source.tp_pct / input.source.sl_pct,
@@ -801,6 +803,7 @@ impl ExpectancyArtifact {
             if raw_signal_at_unix < self.source.provenance.observation_cutoff { return Err(ExpectancyError::InvalidForecast); }
             if let Some(model) = &self.forecast {
                 match recipe.method() {
+                    ForecastMethod::TrendSumR => return Err(ExpectancyError::InvalidForecast),
                     ForecastMethod::DecayedProbability => match model.probability.as_ref().ok_or(ExpectancyError::InconsistentArtifact)?.estimate {
                         ProbabilityForecast::Available { value } => return Ok(MetricAvailability::Available { value: value.forecast_r }),
                         ProbabilityForecast::Unavailable { reason } => return Ok(MetricAvailability::Unavailable { reason: match reason {
