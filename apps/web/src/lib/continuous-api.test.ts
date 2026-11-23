@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { getContinuousStudy, listContinuousStudies, saveContinuousStudy, startContinuousStudy, stopContinuousStudy, type ContinuousConfig, type ContinuousProcess } from "./continuous-api";
+import { getContinuousStudy, listContinuousStudies, pauseContinuousStudy, saveContinuousStudy, startContinuousStudy, stopContinuousStudy, type ContinuousConfig, type ContinuousProcess } from "./continuous-api";
 import { cancelOptimizationStudy, deleteOptimizationStudy, getOptimizationStudy, listOptimizationStudies, summarizeOptimizationStudy, type OptimizationStudy } from "./optimization-api";
 
 const config: ContinuousConfig = { lookbackDays: 30, minSetupsPerDay: [0, 0.6, 4], minMeanExpectancy: 0.15, adaptiveEnabled: false, study: {
@@ -28,6 +28,51 @@ it("uses authenticated real endpoints and preserves the date-free configuration"
   if (typeof body !== "string") throw new Error("Expected JSON request body");
   expect(JSON.parse(body)).toEqual(config);
   expect(config.study).not.toHaveProperty("setupMaturity");
+});
+it("pauses through the authenticated algorithm endpoint and uses Start to resume without a new payload", async () => {
+  const pausing = { ...process, status: "running", desiredRunning: true, activeStudyId: 17, pauseRequested: true, pauseState: "pausing" };
+  const running = { ...pausing, pauseRequested: false, pauseState: null };
+  const fetch = vi.fn((_path: string, init?: RequestInit) => Promise.resolve(new Response(JSON.stringify(init?.method === "POST" && _path.endsWith("/pause") ? pausing : running), { status: 202 })));
+  vi.stubGlobal("fetch", fetch);
+  const signal = new AbortController().signal;
+  expect(await pauseContinuousStudy("future", signal)).toEqual(pausing);
+  expect(await startContinuousStudy("future", signal)).toEqual(running);
+  expect(fetch.mock.calls.map(([path]) => path)).toEqual(["/v1/continuous-studies/future/pause", "/v1/continuous-studies/future/start"]);
+  for (const [, init] of fetch.mock.calls) {
+    expect(init).toMatchObject({ method: "POST", signal, credentials: "same-origin" });
+    expect(new Headers(init?.headers).get("x-platform-request")).toBe("1");
+    expect(init?.body).toBeUndefined();
+  }
+});
+it.each([
+  { pauseRequested: false, pauseState: null },
+  { pauseRequested: true, pauseState: "pausing" },
+  { pauseRequested: true, pauseState: "paused" },
+])("accepts additive pause state without replacing the independent process status: %j", async (pause) => {
+  const configured = { ...process, status: "error", error: { code: "source_unavailable", message: "Retry pending" }, ...pause };
+  vi.stubGlobal("fetch", vi.fn((path: string) => Promise.resolve(new Response(JSON.stringify(path.includes("?") ? { processes: [configured] } : configured)))));
+  const signal = new AbortController().signal;
+  expect(await getContinuousStudy("future", signal)).toEqual(configured);
+  expect(await listContinuousStudies("future", signal)).toEqual([configured]);
+});
+it.each([
+  { pauseRequested: "true", pauseState: "pausing" },
+  { pauseRequested: null, pauseState: null },
+  { pauseRequested: true, pauseState: "stopped" },
+  { pauseRequested: false, pauseState: "pausing" },
+  { pauseRequested: true, pauseState: null },
+  { pauseRequested: true },
+  { pauseState: "paused" },
+])("rejects malformed or mismatching additive pause fields: %j", async (pause) => {
+  const invalid = { ...process, ...pause };
+  vi.stubGlobal("fetch", vi.fn((path: string) => Promise.resolve(new Response(JSON.stringify(path.includes("?") ? { processes: [invalid] } : invalid)))));
+  const signal = new AbortController().signal;
+  await expect(pauseContinuousStudy("future", signal)).rejects.toThrow("неподдерживаемый статус");
+  await expect(listContinuousStudies("future", signal)).rejects.toThrow("не поддерживает контракт");
+});
+it("rejects a cross-algorithm pause ACK", async () => {
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ ...process, algorithmId: "other", pauseRequested: true, pauseState: "paused" })))));
+  await expect(pauseContinuousStudy("future", new AbortController().signal)).rejects.toThrow("неподдерживаемый статус");
 });
 it.each([404, 501])("reports endpoint unavailable (%s), not a successful stopped process", async (status) => {
   vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("{}", { status }))));

@@ -81,7 +81,8 @@ beforeEach(() => {
         slots: config.minSetupsPerDay.map((threshold, index) => ({ id: index + 1, minSetupsPerDay: threshold, status: "idle", activeGenerationId: null, studyId: null, meanExpectancy: null, selectedCell: null, updatedAt: "2026-11-12T12:00:00Z" })) };
       return json(process);
     }
-    if (path.endsWith("/future/start") && process) { process = { ...process, status: "running", phase: "queued" }; return json(process, 202); }
+    if (path.endsWith("/future/pause") && process) { process = { ...process, pauseRequested: true, pauseState: process.activeStudyId === null ? "paused" : "pausing" }; return json(process, 202); }
+    if (path.endsWith("/future/start") && process) { process = { ...process, status: "running", pauseRequested: false, pauseState: null, phase: process.pauseRequested ? process.phase : "queued" }; return json(process, 202); }
     if (path.endsWith("/future/stop") && process) { process = { ...process, status: "stopping", phase: "cleanup" }; return json(process, 202); }
     if (path.endsWith("/future/recovery/retry") && process) { process = { ...process, status: "running", error: null }; return json(process, 202); }
     if (path.startsWith("/v1/optimization-studies?")) {
@@ -281,7 +282,7 @@ function profileController(patch: Partial<ContinuousSlot> = {}, processPatch: Pa
         runningStudyId: null, finalizedGenerationId: 8, activeStudyId: 41, pendingStudyId: null, meanExpectancy: 0.21,
         selectedCell: { tpPct: 14, slPct: 4, rawR: 0.32, meanR: 0.21, robustScore: 0.01 }, updatedAt: "2026-11-12T12:00:00Z", ...patch }], ...processPatch },
     available: true, loading: false, error: null, busy: null, revision: 0,
-    refresh: vi.fn(), save: vi.fn(() => Promise.resolve(true)), start: vi.fn(() => Promise.resolve(true)), stop: vi.fn(() => Promise.resolve(true)), retryRecovery: vi.fn(() => Promise.resolve(true)),
+    refresh: vi.fn(), save: vi.fn(() => Promise.resolve(true)), start: vi.fn(() => Promise.resolve(true)), pause: vi.fn(() => Promise.resolve(true)), stop: vi.fn(() => Promise.resolve(true)), retryRecovery: vi.fn(() => Promise.resolve(true)),
     ...controllerPatch,
   };
   return controller;
@@ -346,6 +347,176 @@ it("keeps the enabled research status above left-aligned controls and renders it
   expect(within(controls).queryByText("Исследование")).not.toBeInTheDocument();
   expect(screen.queryByText("Изменение очереди не удаляет адаптивные профили.", { exact: false })).not.toBeInTheDocument();
   expect(within(controls).getByRole("button", { name: "Остановить непрерывное исследование" }).querySelector("svg")).toHaveAttribute("fill", "currentColor");
+});
+
+it("places the standard icon-only Pause beside settings and sends only an explicit pause command", async () => {
+  const controller = profileController();
+  render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
+  const controls = screen.getByRole("region", { name: "Управление непрерывным исследованием" });
+  const settings = within(controls).getByRole("button", { name: "Настроить непрерывное исследование" });
+  const pause = within(controls).getByRole("button", { name: "Приостановить непрерывное исследование" });
+  expect(settings.compareDocumentPosition(pause) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  expect(pause).toHaveClass("size-9");
+  expect(pause.querySelector("svg")).toHaveClass("size-4");
+  expect(pause.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+  expect(pause.textContent).toBe("");
+  expect(pause).toBeEnabled();
+  await userEvent.click(pause);
+  expect(controller.pause).toHaveBeenCalledOnce();
+  expect(controller.stop).not.toHaveBeenCalled();
+  expect(controller.start).not.toHaveBeenCalled();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+});
+
+it.each([
+  { status: "stopped" as const }, { status: "stopping" as const }, { status: "error" as const },
+  { desiredRunning: false }, { config: null },
+  { pauseRequested: true, pauseState: "pausing" as const }, { pauseRequested: true, pauseState: "paused" as const },
+])("disables Pause outside confirmed unpaused running work: %j", (patch) => {
+  const controller = profileController({}, patch);
+  render(<ContinuousControls algorithm={algorithm} controller={controller} />);
+  const pause = screen.getByRole("button", { name: "Приостановить непрерывное исследование" });
+  expect(pause).toBeDisabled();
+  fireEvent.click(pause);
+  expect(controller.pause).not.toHaveBeenCalled();
+});
+
+it.each([
+  { process: null }, { available: false }, { busy: "pause" as const }, { busy: "save" as const }, { error: "Обновите статус." },
+])("blocks Pause while unavailable, stale, or mutating: %j", (patch) => {
+  const controller = profileController({}, {}, patch);
+  render(<ContinuousControls algorithm={algorithm} controller={controller} />);
+  const pause = screen.getByRole("button", { name: "Приостановить непрерывное исследование" });
+  expect(pause).toBeDisabled();
+  fireEvent.click(pause);
+  expect(controller.pause).not.toHaveBeenCalled();
+});
+
+it.each(["pausing", "paused"] as const)("keeps Stop and a separate Resume Play available during %s", async (pauseState) => {
+  const controller = profileController({}, { pauseRequested: true, pauseState, activeStudyId: pauseState === "pausing" ? 17 : null });
+  render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
+  const controls = screen.getByRole("region", { name: "Управление непрерывным исследованием" });
+  expect(within(controls).getByText(pauseState === "pausing" ? "Постановка на паузу" : "На паузе")).toBeInTheDocument();
+  expect(controls.querySelector('[data-slot="spinner"]') !== null).toBe(pauseState === "pausing");
+  const resume = within(controls).getByRole("button", { name: "Возобновить непрерывное исследование" });
+  expect(resume).toBeEnabled();
+  expect(resume.querySelector("svg")).toHaveAttribute("fill", "currentColor");
+  const stop = within(controls).getByRole("button", { name: "Остановить непрерывное исследование" });
+  expect(stop).toBeEnabled();
+  await userEvent.click(resume);
+  expect(controller.start).toHaveBeenCalledOnce();
+  expect(controller.pause).not.toHaveBeenCalled();
+  expect(controller.stop).not.toHaveBeenCalled();
+  await userEvent.click(stop);
+  const dialog = within(screen.getByRole("dialog", { name: "Остановить непрерывное исследование?" }));
+  expect(dialog.getByRole("button", { name: "Отмена" })).toHaveFocus();
+  expect(dialog.getByRole("button", { name: "Остановить исследование" })).toBeEnabled();
+  await userEvent.click(dialog.getByRole("button", { name: "Отмена" }));
+  expect(stop).toHaveFocus();
+});
+
+it.each([
+  { available: false }, { busy: "start" as const }, { error: "Снимок не подтверждён." },
+])("blocks Resume and stops the waiting loader for stale or mutating commands: %j", (patch) => {
+  const controller = profileController({}, { pauseRequested: true, pauseState: "pausing", activeStudyId: 17 }, patch);
+  render(<ContinuousControls algorithm={algorithm} controller={controller} />);
+  expect(screen.getByRole("button", { name: "Возобновить непрерывное исследование" })).toBeDisabled();
+  if (patch.available === false || patch.error) expect(document.querySelector('[data-slot="spinner"]')).not.toBeInTheDocument();
+});
+
+it.each(["pausing", "paused"] as const)("preserves research errors instead of claiming a successful %s or endless loading", (pauseState) => {
+  const controller = profileController({}, { status: "error", pauseRequested: true, pauseState, error: { code: "source_unavailable", message: "Нужна проверка источника" } });
+  render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
+  const research = within(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" }));
+  expect(research.getByText("Ошибка непрерывного исследования")).toBeInTheDocument();
+  expect(research.getByText(/source_unavailable: Нужна проверка источника/)).toBeInTheDocument();
+  expect(research.queryByText("На паузе")).not.toBeInTheDocument();
+  expect(research.queryByText("Постановка на паузу")).not.toBeInTheDocument();
+  expect(research.getByRole("button", { name: "Возобновить непрерывное исследование" })).toBeDisabled();
+  expect(research.getByRole("button", { name: "Остановить непрерывное исследование" })).toBeEnabled();
+  expect(document.querySelector('[data-slot="spinner"]')).not.toBeInTheDocument();
+});
+
+it("restores a pausing server snapshot on reload and resumes through one Start without cancelling research", async () => {
+  process = profileController({}, { desiredRunning: true, pauseRequested: true, pauseState: "pausing", activeStudyId: 17, phase: "analytics" }).process;
+  const original = process;
+  render(<AlgorithmsPage />);
+  const resume = await screen.findByRole("button", { name: "Возобновить непрерывное исследование" });
+  await waitFor(() => expect(resume).toBeEnabled());
+  expect(screen.getByText("Постановка на паузу")).toBeInTheDocument();
+  expect(requests.some((request) => request.method === "POST")).toBe(false);
+  await userEvent.click(resume);
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Возобновить непрерывное исследование" })).not.toBeInTheDocument());
+  expect(requests.filter((request) => request.method === "POST")).toEqual([{ path: "/v1/continuous-studies/future/start", method: "POST", body: null }]);
+  expect(process).toMatchObject({ configRevision: original?.configRevision, activeStudyId: 17, phase: "analytics", pauseRequested: false, pauseState: null });
+  expect(screen.getByRole("button", { name: "Приостановить непрерывное исследование" })).toBeEnabled();
+});
+
+it("shows pending Pause feedback before ACK, then server pausing until the full chain is confirmed paused", async () => {
+  process = profileController({}, { desiredRunning: true, activeStudyId: 17, phase: "analytics" }).process;
+  const originalFetch = globalThis.fetch;
+  let resolvePause: ((response: Response) => void) | undefined;
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    if (path === "/v1/continuous-studies/future/pause") {
+      requests.push({ path, method: init?.method ?? "GET", body: null });
+      return new Promise<Response>((resolve) => { resolvePause = resolve; });
+    }
+    return originalFetch(path, init);
+  }));
+  render(<AlgorithmsPage />);
+  const controls = within(await screen.findByRole("region", { name: "Управление непрерывным исследованием" }));
+  const pause = controls.getByRole("button", { name: "Приостановить непрерывное исследование" });
+  await waitFor(() => expect(pause).toBeEnabled());
+  await userEvent.click(pause);
+  expect(controls.getByText("Запрашиваем паузу…")).toBeInTheDocument();
+  expect(controls.getByRole("status", { name: "Ожидание завершения текущей исследовательской цепочки" })).toHaveAttribute("data-slot", "spinner");
+  expect(controls.queryByText("На паузе")).not.toBeInTheDocument();
+  expect(controls.queryByRole("button", { name: "Возобновить непрерывное исследование" })).not.toBeInTheDocument();
+  expect(pause).toBeDisabled();
+  fireEvent.click(pause);
+  expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
+  process = { ...process!, pauseRequested: true, pauseState: "pausing" };
+  await act(async () => { resolvePause?.(new Response(JSON.stringify(process), { status: 202 })); await Promise.resolve(); });
+  await waitFor(() => expect(controls.queryByText("Запрашиваем паузу…")).not.toBeInTheDocument());
+  expect(controls.getByText("Постановка на паузу")).toBeInTheDocument();
+  expect(controls.getByRole("status", { name: "Ожидание завершения текущей исследовательской цепочки" })).toBeInTheDocument();
+  expect(controls.getByRole("button", { name: "Возобновить непрерывное исследование" })).toBeEnabled();
+  process = { ...process, pauseState: "paused", activeStudyId: null };
+  await userEvent.click(controls.getByRole("button", { name: "Обновить статус непрерывного процесса" }));
+  await waitFor(() => expect(controls.getByText("На паузе")).toBeInTheDocument());
+  expect(controls.queryByRole("status", { name: "Ожидание завершения текущей исследовательской цепочки" })).not.toBeInTheDocument();
+  expect(requests.filter((request) => request.method === "POST")).toEqual([{ path: "/v1/continuous-studies/future/pause", method: "POST", body: null }]);
+});
+
+it("removes pending Pause feedback after a network error without fabricating a paused snapshot or retry", async () => {
+  process = profileController({}, { desiredRunning: true, activeStudyId: 17 }).process;
+  const original = process;
+  const originalFetch = globalThis.fetch;
+  let rejectPause: ((cause: Error) => void) | undefined;
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    if (path === "/v1/continuous-studies/future/pause") {
+      requests.push({ path, method: init?.method ?? "GET", body: null });
+      return new Promise<Response>((_resolve, reject) => { rejectPause = reject; });
+    }
+    return originalFetch(path, init);
+  }));
+  render(<AlgorithmsPage />);
+  const controls = within(await screen.findByRole("region", { name: "Управление непрерывным исследованием" }));
+  const pause = controls.getByRole("button", { name: "Приостановить непрерывное исследование" });
+  await waitFor(() => expect(pause).toBeEnabled());
+  await userEvent.click(pause);
+  expect(controls.getByText("Запрашиваем паузу…")).toBeInTheDocument();
+  await act(async () => { rejectPause?.(new Error("pause_connection_lost")); await Promise.resolve(); });
+  expect(await screen.findByRole("alert")).toHaveTextContent("pause_connection_lost");
+  expect(controls.queryByText("Запрашиваем паузу…")).not.toBeInTheDocument();
+  expect(controls.queryByRole("status", { name: "Ожидание завершения текущей исследовательской цепочки" })).not.toBeInTheDocument();
+  expect(controls.queryByText("На паузе")).not.toBeInTheDocument();
+  expect(pause).toBeDisabled();
+  expect(process).toEqual(original);
+  expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
+  await userEvent.click(controls.getByRole("button", { name: "Обновить статус непрерывного процесса" }));
+  await waitFor(() => expect(pause).toBeEnabled());
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
 it("clears a failed first-initialization badge on confirmed ready without claiming ACTIVE before promotion", () => {

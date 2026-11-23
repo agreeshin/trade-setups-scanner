@@ -70,6 +70,9 @@ export interface ContinuousProcess {
   // The unconfigured detail response has no persisted owner yet.
   ownerId?: string;
   desiredRunning?: boolean;
+  /** Missing together on older servers means no user pause; independent of errors/maintenance. */
+  pauseRequested?: boolean;
+  pauseState?: "pausing" | "paused" | null;
   algorithmId: string;
   status: "stopped" | "running" | "stopping" | "error";
   configRevision: number;
@@ -83,6 +86,8 @@ export interface ContinuousProcess {
 
 /** Research work only: profile replacement/readiness has its own observer. */
 export function isContinuousWorkActive(process: ContinuousProcess | null): boolean {
+  // A completed user pause retains desired-running intent, but has no research left to observe quickly.
+  if (process?.status === "running" && process.pauseState === "paused" && process.activeStudyId === null) return false;
   return process !== null && (process.desiredRunning === true || process.status !== "stopped" || process.activeStudyId !== null);
 }
 
@@ -105,6 +110,9 @@ function isLiveReadinessSummary(value: unknown): value is LiveReadinessSummary {
 function isProcess(value: unknown): value is ContinuousProcess {
   if (value === null || typeof value !== "object") return false;
   const process = value as Partial<ContinuousProcess>;
+  const validPause = process.pauseRequested === undefined && process.pauseState === undefined
+    || process.pauseRequested === false && process.pauseState === null
+    || process.pauseRequested === true && (process.pauseState === "pausing" || process.pauseState === "paused");
   const nullableId = (id: unknown) => id === null || (typeof id === "number" && Number.isSafeInteger(id) && id > 0);
   const optionalClosedBoundary = (time: unknown) => time === undefined || time === null || (typeof time === "number"
     && Number.isSafeInteger(time) && time >= 0 && time % 60 === 0 && Number.isFinite(new Date(time * 1000).getTime()));
@@ -121,6 +129,7 @@ function isProcess(value: unknown): value is ContinuousProcess {
     && Array.isArray(config.study.instruments) && (config.study.direction === "short" || config.study.direction === "long"));
   return typeof process.algorithmId === "string" && ["stopped", "running", "stopping", "error"].includes(process.status ?? "")
     && (process.desiredRunning === undefined || typeof process.desiredRunning === "boolean")
+    && validPause
     && Number.isSafeInteger(process.configRevision) && validConfig && nullableId(process.activeStudyId)
     && (process.phase === null || typeof process.phase === "string")
     && (process.error === null || (process.error !== undefined && typeof process.error === "object" && typeof process.error.code === "string" && typeof process.error.message === "string"))
@@ -169,5 +178,6 @@ export async function listContinuousStudies(algorithmId: string, signal: AbortSi
 export const getContinuousStudy = (algorithmId: string, signal: AbortSignal): Promise<ContinuousProcess> => processRequest(algorithmId, signal);
 export const saveContinuousStudy = (algorithmId: string, config: ContinuousConfig, signal: AbortSignal): Promise<ContinuousProcess> => processRequest(algorithmId, signal, "PUT", config);
 export const startContinuousStudy = (algorithmId: string, signal: AbortSignal): Promise<ContinuousProcess> => processRequest(algorithmId, signal, "POST", undefined, "/start");
+export const pauseContinuousStudy = (algorithmId: string, signal: AbortSignal): Promise<ContinuousProcess> => processRequest(algorithmId, signal, "POST", undefined, "/pause");
 export const stopContinuousStudy = (algorithmId: string, signal: AbortSignal): Promise<ContinuousProcess> => processRequest(algorithmId, signal, "POST", undefined, "/stop");
 export const retryContinuousRecovery = (algorithmId: string, signal: AbortSignal): Promise<ContinuousProcess> => processRequest(algorithmId, signal, "POST", undefined, "/recovery/retry");

@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { CircleCheck, Play, RefreshCw, Settings, Square } from "lucide-react";
+import { CircleCheck, Pause, Play, RefreshCw, Settings, Square } from "lucide-react";
 import type { AdaptiveProfilesController } from "./use-adaptive-profiles";
 import type { AdaptiveProfile } from "../lib/adaptive-profiles-api";
 import { Alert } from "../components/ui/alert";
@@ -322,8 +322,8 @@ export function ContinuousResearch({ controller, children }: { algorithm?: Algor
   const headingId = useId();
   return <section aria-labelledby={headingId} className="grid min-w-0 gap-3">
     <div className="flex items-center justify-center gap-2 text-center"><h4 id={headingId} className="font-semibold">Непрерывные исследования оптимальных параметров</h4>
-      <InfoNote label="Об остановке и расчёте доходности">Stop отменяет только исследовательскую цепочку и очищает её незавершённые данные после drain. Профили и завершённая история сохраняются. Следующий Start создаёт новое исследование; техническое восстановление — отдельное действие. R рассчитан только по наблюдавшимся закрытым TP/SL-сделкам, без вымышленных нулей или SL на правом краю.</InfoNote></div>
-    {controller.available && <p role="status" className="flex items-center gap-2 text-sm">{process?.status === "running" && <CircleCheck aria-hidden="true" className="size-5 shrink-0 fill-success text-success-foreground" />}{process ? statuses[process.status] : "Процесс не настроен. Исследование не запущено."}</p>}
+      <InfoNote label="Об остановке и расчёте доходности">Pause даёт текущей цепочке завершиться и блокирует следующие исследования; Play снимает только пользовательскую паузу, не обслуживание. Stop отменяет только исследовательскую цепочку и очищает её незавершённые данные после drain. Профили и завершённая история сохраняются. Следующий Start после Stop создаёт новое исследование; техническое восстановление — отдельное действие. R рассчитан только по наблюдавшимся закрытым TP/SL-сделкам, без вымышленных нулей или SL на правом краю.</InfoNote></div>
+    {controller.available && !(process?.status === "running" && process.pauseRequested === true) && <p role="status" className="flex items-center gap-2 text-sm">{process?.status === "running" && <CircleCheck aria-hidden="true" className="size-5 shrink-0 fill-success text-success-foreground" />}{process ? statuses[process.status] : "Процесс не настроен. Исследование не запущено."}</p>}
     {children}
     {controller.loading && <Spinner label="Проверка непрерывного процесса" />}
     {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
@@ -346,6 +346,10 @@ export function ContinuousControls({ algorithm, controller, children }: { algori
   const stopCancelId = useId();
   const process = controller.process;
   const canStop = controller.available && controller.busy === null && !stopPending && process !== null && process.status !== "stopped" && process.status !== "stopping";
+  const running = process?.status === "running" && process.desiredRunning !== false && process.config !== null;
+  const canCommandPause = controller.available && controller.error === null && controller.busy === null && !stopPending && running;
+  const paused = process?.pauseRequested === true;
+  const requestingPause = controller.busy === "pause";
   const recoveryExhausted = process?.status === "error" && process.error?.code === "durable_resume_retry_exhausted"
     && process.config !== null && process.activeStudyId !== null;
   async function confirmStop() {
@@ -361,8 +365,14 @@ export function ContinuousControls({ algorithm, controller, children }: { algori
     <div className="flex flex-wrap items-center justify-start gap-3">
       <IconButton label="Обновить статус непрерывного процесса" icon={RefreshCw} onClick={controller.refresh} disabled={controller.busy !== null} />
       <IconButton label="Настроить непрерывное исследование" icon={Settings} onClick={() => setOpen(true)} disabled={!controller.available || controller.busy !== null} />
+      <IconButton label="Приостановить непрерывное исследование" icon={Pause} filled disabled={!canCommandPause || paused} onClick={() => { void controller.pause(); }} />
       {process && process.status !== "stopped" ? <IconButton id={stopTriggerId} label={process.status === "stopping" ? "Остановка запрошена · ожидаем drain" : "Остановить непрерывное исследование"} icon={Square} filled disabled={!canStop} onClick={() => setStopOpen(true)} />
         : <IconButton id={stopTriggerId} label="Запустить непрерывное исследование" icon={Play} filled disabled={!controller.available || !process?.config || controller.busy !== null} onClick={() => { void controller.start(); }} />}
+      {paused && process.status !== "stopped" && process.status !== "stopping" && <IconButton label="Возобновить непрерывное исследование" icon={Play} filled disabled={!canCommandPause} onClick={() => { void controller.start(); }} />}
+      {(paused || requestingPause) && process?.status === "running" && <div role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
+        {(requestingPause || process.pauseState === "pausing") && controller.available && controller.error === null && <Spinner label="Ожидание завершения текущей исследовательской цепочки" />}
+        <span>{requestingPause ? "Запрашиваем паузу…" : process.pauseState === "pausing" ? "Постановка на паузу" : "На паузе"}</span>
+      </div>}
       {recoveryExhausted && <Button type="button" variant="outline" disabled={!controller.available || controller.busy !== null} onClick={() => { void controller.retryRecovery(); }}>Повторить восстановление исследования</Button>}
       {children}
     </div>

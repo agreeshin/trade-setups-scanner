@@ -70,6 +70,97 @@ it("changes a continuous observer idle → running between children → stopping
   await tick(1); expect(continuousReads()).toBe(6);
 });
 
+it("observes running → pausing at three seconds → paused at fifteen seconds and releases its timer", async () => {
+  processes.first = { ...emptyProcess(), status: "running", desiredRunning: true, activeStudyId: 17 };
+  const view = renderHook(() => useContinuousStudy("first"));
+  await tick(); expect(continuousReads()).toBe(1);
+  processes.first = { ...processes.first, pauseRequested: true, pauseState: "pausing" };
+  await tick(3000); expect(continuousReads()).toBe(2);
+  expect(view.result.current.process?.pauseState).toBe("pausing");
+  const pausingRevision = view.result.current.revision;
+  expect(pausingRevision).toBeGreaterThan(0);
+  processes.first = { ...processes.first, pauseState: "paused", activeStudyId: null };
+  await tick(3000); expect(continuousReads()).toBe(3);
+  expect(view.result.current.process?.pauseState).toBe("paused");
+  expect(view.result.current.revision).toBeGreaterThan(pausingRevision);
+  await tick(14999); expect(continuousReads()).toBe(3);
+  await tick(1); expect(continuousReads()).toBe(4);
+  view.unmount(); expect(vi.getTimerCount()).toBe(0);
+});
+
+it("keeps an errored pausing chain visible to recovery observation rather than treating it as idle", async () => {
+  processes.first = { ...emptyProcess(), status: "error", desiredRunning: true, pauseRequested: true, pauseState: "pausing", activeStudyId: 17, error: { code: "source_unavailable", message: "Retry pending" } };
+  renderHook(() => useContinuousStudy("first"));
+  await tick(); await tick(3000);
+  expect(continuousReads()).toBe(2);
+});
+
+it("serializes Pause with other commands and fences a late pre-pause read before observing the ACK", async () => {
+  const running: ContinuousProcess = { ...emptyProcess(), status: "running", desiredRunning: true, activeStudyId: 17 };
+  processes.first = running;
+  const originalFetch = globalThis.fetch;
+  let resolveOldRead: ((response: Response) => void) | undefined;
+  let resolvePause: ((response: Response) => void) | undefined;
+  let delayRead = false;
+  const commandPaths: string[] = [];
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      commandPaths.push(path);
+      return new Promise<Response>((resolve) => { resolvePause = resolve; });
+    }
+    if (delayRead) {
+      delayRead = false;
+      return new Promise<Response>((resolve) => { resolveOldRead = resolve; });
+    }
+    return originalFetch(path, init);
+  }));
+  const view = renderHook(() => useContinuousStudy("first"));
+  await tick();
+  delayRead = true;
+  act(() => { view.result.current.refresh(); });
+  let pauseCommand: Promise<boolean> | undefined;
+  act(() => { pauseCommand = view.result.current.pause(); });
+  expect(view.result.current.busy).toBe("pause");
+  expect(await view.result.current.pause()).toBe(false);
+  expect(await view.result.current.stop()).toBe(false);
+  const pausing: ContinuousProcess = { ...running, pauseRequested: true, pauseState: "pausing" };
+  processes.first = pausing;
+  await act(async () => { resolveOldRead?.(json({ processes: [{ ...running, configRevision: 999 }] })); await Promise.resolve(); });
+  expect(view.result.current.process).toEqual(running);
+  await act(async () => { resolvePause?.(json(pausing)); expect(await pauseCommand).toBe(true); });
+  expect(view.result.current.process).toEqual(pausing);
+  expect(view.result.current.busy).toBeNull();
+  expect(commandPaths).toEqual(["/v1/continuous-studies/first/pause"]);
+  expect(continuousReads()).toBe(2);
+  view.unmount(); expect(vi.getTimerCount()).toBe(0);
+});
+
+it("aborts an in-flight Pause on unmount and does not retain observer timers or accept its late ACK", async () => {
+  const running: ContinuousProcess = { ...emptyProcess(), status: "running", activeStudyId: 17 };
+  processes.first = running;
+  const originalFetch = globalThis.fetch;
+  let resolvePause: ((response: Response) => void) | undefined;
+  let commandSignal: AbortSignal | null | undefined;
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      commandSignal = init.signal;
+      return new Promise<Response>((resolve) => { resolvePause = resolve; });
+    }
+    return originalFetch(path, init);
+  }));
+  const view = renderHook(() => useContinuousStudy("first"));
+  await tick();
+  let command: Promise<boolean> | undefined;
+  act(() => { command = view.result.current.pause(); });
+  expect(commandSignal?.aborted).toBe(false);
+  view.unmount();
+  expect(commandSignal?.aborted).toBe(true);
+  expect(vi.getTimerCount()).toBe(0);
+  await act(async () => { resolvePause?.(json({ ...running, pauseRequested: true, pauseState: "pausing" })); expect(await command).toBe(false); });
+  expect(continuousReads()).toBe(1);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
 it.each([
   { status: "error" as const, error: { code: "source_unavailable", message: "Retry pending" } },
   { desiredRunning: true }, { activeStudyId: 17 },

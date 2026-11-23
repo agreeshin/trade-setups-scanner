@@ -1,5 +1,5 @@
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
-import { isContinuousWorkActive, listContinuousStudies, retryContinuousRecovery, saveContinuousStudy, startContinuousStudy, stopContinuousStudy, type ContinuousConfig, type ContinuousProcess } from "../lib/continuous-api";
+import { isContinuousWorkActive, listContinuousStudies, pauseContinuousStudy, retryContinuousRecovery, saveContinuousStudy, startContinuousStudy, stopContinuousStudy, type ContinuousConfig, type ContinuousProcess } from "../lib/continuous-api";
 import { errorText } from "./platform-controls";
 import { RouteActiveContext } from "./route-active";
 
@@ -10,7 +10,7 @@ export function useContinuousStudy(algorithmId: string, refreshRevision = 0, act
   const [available, setAvailable] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<"save" | "start" | "stop" | "recovery" | null>(null);
+  const [busy, setBusy] = useState<"save" | "start" | "pause" | "stop" | "recovery" | null>(null);
   const [revision, setRevision] = useState(0);
   const mounted = useRef(false);
   const version = useRef(0);
@@ -37,7 +37,8 @@ export function useContinuousStudy(algorithmId: string, refreshRevision = 0, act
         const processes = await listContinuousStudies(algorithmId, current.signal);
         if (disposed || current.signal.aborted || observedVersion !== version.current) return;
         const next = processes[0] ?? null;
-        if (observed.current && (snapshot.current?.status !== next?.status || snapshot.current?.activeStudyId !== next?.activeStudyId)) setRevision((value) => value + 1);
+        if (observed.current && (snapshot.current?.status !== next?.status || snapshot.current?.activeStudyId !== next?.activeStudyId
+          || snapshot.current?.pauseState !== next?.pauseState)) setRevision((value) => value + 1);
         observed.current = true; snapshot.current = next;
         setProcess(next); setAvailable(true); setError(null); succeeded = true;
       } catch (cause) {
@@ -62,7 +63,7 @@ export function useContinuousStudy(algorithmId: string, refreshRevision = 0, act
     };
   }, [algorithmId, routeActive, refreshRevision, active]);
 
-  async function command(action: "save" | "start" | "stop" | "recovery", config?: ContinuousConfig): Promise<boolean> {
+  async function command(action: "save" | "start" | "pause" | "stop" | "recovery", config?: ContinuousConfig): Promise<boolean> {
     if (action === "save" && !config) throw new Error("Continuous save requires its configuration.");
     if (!available || mutation.current) return false;
     const current = new AbortController(); mutation.current = current;
@@ -70,6 +71,7 @@ export function useContinuousStudy(algorithmId: string, refreshRevision = 0, act
     try {
       const next = action === "save" && config ? await saveContinuousStudy(algorithmId, config, current.signal)
         : action === "start" ? await startContinuousStudy(algorithmId, current.signal)
+        : action === "pause" ? await pauseContinuousStudy(algorithmId, current.signal)
         : action === "recovery" ? await retryContinuousRecovery(algorithmId, current.signal) : await stopContinuousStudy(algorithmId, current.signal);
       if (!mounted.current || current.signal.aborted) return false;
       version.current += 1; observed.current = true; snapshot.current = next; setProcess(next); setAvailable(true); setRevision((value) => value + 1);
@@ -86,6 +88,6 @@ export function useContinuousStudy(algorithmId: string, refreshRevision = 0, act
   }
   const refresh = useCallback(() => refreshRef.current(), []);
   return { process, available, loading, error, busy, revision, refresh,
-    save: (config: ContinuousConfig) => command("save", config), start: () => command("start"), stop: () => command("stop"), retryRecovery: () => command("recovery") };
+    save: (config: ContinuousConfig) => command("save", config), start: () => command("start"), pause: () => command("pause"), stop: () => command("stop"), retryRecovery: () => command("recovery") };
 }
 export type ContinuousController = ReturnType<typeof useContinuousStudy>;
