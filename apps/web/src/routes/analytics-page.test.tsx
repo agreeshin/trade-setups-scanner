@@ -476,6 +476,48 @@ it.each([
 });
 
 it.each([
+  { name: "dense", offsets: Array.from({ length: 16 }, (_, index) => index) },
+  { name: "sparse", offsets: [0, 5, 15] },
+])("keeps a full daily grid behind the $name legacy series without filling missing observations", async ({ offsets }) => {
+  applyInterfaceSettings({ timezone: "America/New_York" });
+  const first = Date.parse("2026-01-01T00:00:00Z") / 1000;
+  const rows = offsets.map((offset, index) => utcTrade(new Date((first + offset * 86400) * 1000).toISOString(), offset === 5 ? null : offset % 2 === 0 ? 1 : -1, index));
+  const calls = stubFetch({ ...utcChartOptions(rows),
+    sets: [{ ...setFixture, fromUnix: first, toUnix: first + 16 * 86400 }], trend: null });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByText(`Сделок: ${rows.length} / ${rows.length}`);
+  const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
+  const grid = within(chart).getByTestId("daily-calendar-grid");
+  const lines = [...grid.querySelectorAll("line")];
+  expect(lines).toHaveLength(16);
+  expect(lines.map((line) => Number(line.getAttribute("data-day-start-unix")))).toEqual(Array.from({ length: 16 }, (_, offset) => first + offset * 86400));
+  expect(lines.map((line) => Number(line.getAttribute("x1")))).toEqual(Array.from({ length: 16 }, (_, offset) => 64 + offset / 15 * 672));
+  for (const line of lines) {
+    expect(line.getAttribute("x2")).toBe(line.getAttribute("x1"));
+    expect(line).toHaveAttribute("y1", "24"); expect(line).toHaveAttribute("y2", "224");
+  }
+  const circles = [...chart.querySelectorAll("circle")];
+  const closed = rows.filter((row) => row.riskReturn !== null);
+  expect(circles).toHaveLength(closed.length);
+  closed.forEach((row, index) => {
+    const line = grid.querySelector(`line[data-day-start-unix="${row.setup.closeTimeUnix}"]`)!;
+    expect(circles[index]!.getAttribute("cx")).toBe(line.getAttribute("x1"));
+  });
+  expect(circles.some((circle) => circle.getAttribute("cx") === lines[5]!.getAttribute("x1"))).toBe(false);
+  expect(chart.querySelectorAll('text[y="254"]')).toHaveLength(offsets.length > 8 ? 9 : offsets.length);
+  if (offsets.length > 8) expect(grid.compareDocumentPosition(chart.querySelector("polyline")!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  await waitFor(() => expect(calls.filter((call) => call.path === "/v1/analytics/trend")).toHaveLength(1));
+  const request = JSON.parse(calls.find((call) => call.path === "/v1/analytics/trend")!.body!) as { points: TrendInput[] };
+  expect(request.points).toEqual(rows.map((row) => ({ day: row.setup.closeTimeUnix / 86400, value: row.riskReturn, weight: 1 })));
+  const geometry = [...lines.map((line) => line.getAttribute("x1")), ...circles.map((circle) => circle.getAttribute("cx"))];
+  act(() => { applyInterfaceSettings({ timezone: "Pacific/Auckland" }); });
+  expect([...grid.querySelectorAll("line"), ...chart.querySelectorAll("circle")].map((element) => element.getAttribute(element.tagName === "line" ? "x1" : "cx"))).toEqual(geometry);
+  expect(calls.filter((call) => call.path === "/v1/analytics/trend")).toHaveLength(1);
+  expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(1);
+});
+
+it.each([
   { risk: 1, label: "+1.00R", color: "text-success" },
   { risk: -1, label: "-1.00R", color: "text-danger" },
   { risk: 0, label: "+0.00R", color: "text-muted-foreground" },
@@ -533,6 +575,9 @@ it("renders a single UTC-day point centered without a fabricated trend or endpoi
   await screen.findByText("Сделок: 1 / 1");
   const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
   expect(chart.querySelectorAll("circle")).toHaveLength(1); expect(chart.querySelector("circle")).toHaveAttribute("cx", "400");
+  const grid = within(chart).getByTestId("daily-calendar-grid");
+  expect(grid.querySelectorAll("line")).toHaveLength(1);
+  expect(grid.querySelector("line")).toHaveAttribute("x1", "400");
   expect(chart.querySelector('line[stroke-dasharray]')).toBeNull();
   expect(screen.queryByLabelText(/^Начало тренда:/)).not.toBeInTheDocument(); expect(screen.queryByLabelText(/^Конец тренда:/)).not.toBeInTheDocument();
 });

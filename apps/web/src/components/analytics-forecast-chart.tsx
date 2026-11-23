@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useId, useState, useSyncExternalStore } from "react";
 import { fetchForecastCurve, type ForecastCurveRequest, type ForecastCurveResponse } from "../lib/forecast-api";
 import { forecastRecipeLabel } from "../lib/forecast-recipe";
 import { buildDailyExpectancyModel, type DailyExpectancyPoint } from "../lib/daily-expectancy";
@@ -17,6 +17,33 @@ function finiteSegments<T>(points: readonly T[], value: (point: T) => number | n
   }
   if (current.length > 0) segments.push(current);
   return segments;
+}
+
+/** Request-owned geometry only: absent dates get grid lines, never observations.
+ * Long cutoff/future spans use a repeating SVG tile instead of unbounded DOM. */
+export function DailyCalendarGrid({ fromUnix, toUnix, x, top, bottom }: {
+  fromUnix: number; toUnix: number; x: (atUnix: number) => number; top: number; bottom: number;
+}) {
+  const patternId = useId();
+  const first = Math.ceil(fromUnix / 86400) * 86400;
+  const count = Math.max(0, Math.floor((toUnix - first) / 86400) + 1);
+  if (count > 3661) {
+    const firstX = x(first);
+    const step = x(first + 86400) - firstX;
+    return <g aria-hidden="true" data-testid="daily-calendar-grid">
+      <defs><pattern id={patternId} patternUnits="userSpaceOnUse" x={firstX} y={top} width={step} height={bottom - top} viewBox={`0 0 ${step} ${bottom - top}`}>
+        <path d={`M 0 0 V ${bottom - top}`} className="fill-none stroke-muted-foreground/20" />
+      </pattern></defs>
+      <rect x={x(fromUnix)} y={top} width={x(toUnix) - x(fromUnix)} height={bottom - top} fill={`url(#${patternId})`} />
+    </g>;
+  }
+  return <g aria-hidden="true" data-testid="daily-calendar-grid">
+    {Array.from({ length: count }, (_, index) => {
+      const day = first + index * 86400;
+      const at = x(day);
+      return <line key={day} data-day-start-unix={day} className="stroke-muted-foreground/20" x1={at} x2={at} y1={top} y2={bottom} />;
+    })}
+  </g>;
 }
 
 /** Geometry only: F, B, period mean and flat continuation are all server values. */
@@ -76,6 +103,7 @@ export function AnalyticsForecastChart({ request, days }: { request: ForecastCur
         <line className="stroke-muted-foreground/20" x1={left} y1={y(value)} x2={width - right} y2={y(value)} />
         <text className="fill-muted-foreground text-[10px]" x={left - 8} y={y(value) + 4} textAnchor="end">{risk(value)}</text>
       </g>)}
+      <DailyCalendarGrid fromUnix={from} toUnix={to} x={x} top={top} bottom={height - bottom} />
       {response?.meanR != null && <line data-testid="period-mean" className="stroke-muted-foreground" strokeDasharray="2 4" x1={left} x2={width - right} y1={y(response.meanR)} y2={y(response.meanR)}><title>Среднее за период M: {risk(response.meanR)}</title></line>}
       {model.segments.filter((segment) => segment.length > 1).map((segment, index) => <polyline key={index} className="fill-none stroke-primary" points={segment.map((point) => `${x(point.dayStartUnix)},${y(point.riskExpectancy!)}`).join(" ")} />)}
       {forecastSegments.map((segment, index) => segment.length > 1

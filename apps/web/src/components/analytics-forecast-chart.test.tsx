@@ -73,6 +73,75 @@ it("uses the configured calendar across midnight and updates mounted labels with
   expect(fetch).toHaveBeenCalledTimes(1);
 });
 
+it.each([
+  { name: "dense", offsets: Array.from({ length: 16 }, (_, index) => index) },
+  { name: "sparse", offsets: [0, 5, 15] },
+])("draws every calendar day behind the $name observed series independently of date labels", async ({ offsets }) => {
+  applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "America/New_York" });
+  const observed = offsets.map((offset): DailyExpectancyPoint => {
+    const dayStartUnix = fromUnix + offset * 86400;
+    const value = offset === 5 ? null : offset % 2 === 0 ? 1 : -1;
+    return { day: new Date(dayStartUnix * 1000).toISOString().slice(0, 10), dayStartUnix,
+      riskExpectancy: value, closedCount: value === null ? 0 : 1,
+      tpCount: value === 1 ? 1 : 0, slCount: value === -1 ? 1 : 0, computedCount: 1, cachedCount: 1 };
+  });
+  const chartRequest: ForecastCurveRequest = { ...request, toUnix: fromUnix + 16 * 86400,
+    observationCutoff: fromUnix + 16 * 86400, atUnix: fromUnix + 17 * 86400,
+    daily: observed.map((point) => ({ dayStartUnix: point.dayStartUnix, tpCount: point.tpCount, slCount: point.slCount })) };
+  const fetch = vi.fn<typeof globalThis.fetch>(() => Promise.resolve(new Response(JSON.stringify(forecastFixture(chartRequest)))));
+  vi.stubGlobal("fetch", fetch);
+  render(<AnalyticsForecastChart request={chartRequest} days={observed} />);
+  const curve = await screen.findByTestId("forecast-model-curve");
+  const chart = screen.getByRole("img", { name: "Дневное матожидание и вероятностная модель" });
+  const grid = within(chart).getByTestId("daily-calendar-grid");
+  const lines = [...grid.querySelectorAll("line")];
+  const expectedX = (offset: number) => 66 + offset / 17 * 666;
+  expect(lines).toHaveLength(18);
+  expect(lines.map((line) => Number(line.getAttribute("data-day-start-unix")))).toEqual(Array.from({ length: 18 }, (_, index) => fromUnix + index * 86400));
+  expect(lines.map((line) => Number(line.getAttribute("x1")))).toEqual(Array.from({ length: 18 }, (_, index) => expectedX(index)));
+  for (const line of lines) {
+    expect(line.getAttribute("x2")).toBe(line.getAttribute("x1"));
+    expect(line).toHaveAttribute("y1", "30"); expect(line).toHaveAttribute("y2", "244");
+  }
+  const circles = [...chart.querySelectorAll("circle")];
+  const finite = observed.filter((point) => point.riskExpectancy !== null);
+  expect(circles).toHaveLength(finite.length);
+  finite.forEach((point, index) => {
+    const line = grid.querySelector(`line[data-day-start-unix="${point.dayStartUnix}"]`)!;
+    expect(circles[index]!.getAttribute("cx")).toBe(line.getAttribute("x1"));
+  });
+  expect(circles.some((circle) => circle.getAttribute("cx") === lines[5]!.getAttribute("x1"))).toBe(false);
+  expect(chart.querySelectorAll('text[y="273"]')).toHaveLength(offsets.length > 7 ? 6 : offsets.length);
+  expect(grid.compareDocumentPosition(chart.querySelector("polyline")!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  const geometry = [curve.getAttribute("points"), ...lines.map((line) => line.getAttribute("x1")), ...circles.map((circle) => circle.getAttribute("cx"))];
+  act(() => { applyInterfaceSettings({ timezone: "Pacific/Auckland" }); });
+  expect([curve.getAttribute("points"), ...[...grid.querySelectorAll("line")].map((line) => line.getAttribute("x1")), ...[...chart.querySelectorAll("circle")].map((circle) => circle.getAttribute("cx"))]).toEqual(geometry);
+  expect(JSON.parse(fetch.mock.calls[0]![1]!.body as string)).toEqual(chartRequest);
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it("keeps a long future grid bounded with a daily SVG tile instead of truncating days or adding observations", async () => {
+  const chartRequest = { ...request, atUnix: fromUnix + 4000 * 86400 };
+  const fetch = vi.fn<typeof globalThis.fetch>(() => Promise.resolve(new Response(JSON.stringify(forecastFixture(chartRequest)))));
+  vi.stubGlobal("fetch", fetch);
+  render(<AnalyticsForecastChart request={chartRequest} days={days} />);
+  await screen.findByTestId("forecast-model-curve");
+  const chart = screen.getByRole("img", { name: "Дневное матожидание и вероятностная модель" });
+  const grid = within(chart).getByTestId("daily-calendar-grid");
+  expect(grid.querySelectorAll("line")).toHaveLength(0);
+  const tile = grid.querySelector("pattern")!;
+  expect(tile).toHaveAttribute("patternUnits", "userSpaceOnUse");
+  expect(tile).toHaveAttribute("x", "66");
+  expect(Number(tile.getAttribute("width"))).toBeCloseTo(666 / 4000, 12);
+  expect(tile.getAttribute("viewBox")).toBe(`0 0 ${tile.getAttribute("width")} 214`);
+  expect(grid.querySelector("rect")).toHaveAttribute("fill", `url(#${tile.id})`);
+  expect(grid.querySelector("rect")).toHaveAttribute("width", "666");
+  expect(grid.querySelectorAll("*").length).toBeLessThan(6);
+  expect(chart.querySelectorAll("circle")).toHaveLength(days.length);
+  expect(JSON.parse(fetch.mock.calls[0]![1]!.body as string)).toEqual(chartRequest);
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
 it("resolves auto to the browser timezone for calendar labels", async () => {
   mockBrowserTimezone();
   applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS);

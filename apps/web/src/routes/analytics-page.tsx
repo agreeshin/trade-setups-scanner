@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AnalyticsTrendControls } from "../components/analytics-trend-controls";
-import { AnalyticsForecastChart } from "../components/analytics-forecast-chart";
+import { AnalyticsForecastChart, DailyCalendarGrid } from "../components/analytics-forecast-chart";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -492,6 +492,8 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
           <text className="fill-muted-foreground text-[10px]" x={left - 10} y={yForValue(value) + 4} textAnchor="end">{formatRisk(value)}</text>
         </g>
       ))}
+      <DailyCalendarGrid fromUnix={model.points[0]!.dayStartUnix} toUnix={model.points[model.points.length - 1]!.dayStartUnix}
+        x={(atUnix) => xForDay((atUnix - model.originUnix) / 86400)} top={top} bottom={height - bottom} />
       {model.segments.map((segment, index) => segment.length > 1
         ? <polyline key={index} className="fill-none stroke-primary stroke-2" points={segment.map((point) => `${xForDay(point.x)},${yForValue(point.riskExpectancy!)}`).join(" ")} /> : null)}
       {trend !== null ? <>
