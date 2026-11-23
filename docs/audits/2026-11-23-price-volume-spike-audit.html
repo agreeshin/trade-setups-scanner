@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="Аудит стратегии «Всплеск цены и оборота» по состоянию на 23 ноября 2026: 26 исследований, калибровка прогноза, проверенные причины разрыва и предложения без изменения торговой логики.">
+  <title>Всплеск цены и оборота: аудит бэктеста · 23.11.2026</title>
+  <style>
+    :root {
+      --paper: #f6f3eb;
+      --surface: #fffdf8;
+      --ink: #242f32;
+      --muted: #58666a;
+      --line: #d7d9cf;
+      --teal: #24635e;
+      --teal-tint: #e9f0e9;
+      --rust: #88472e;
+      --rust-tint: #f7eae0;
+      --neutral-tint: #eceee8;
+      --serif: Georgia, "Times New Roman", serif;
+      --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+      --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-padding-top: 1.5rem; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 17px/1.7 var(--sans); }
+    a { color: var(--teal); text-underline-offset: .2em; }
+    a:hover { color: var(--rust); }
+    :focus-visible { outline: 3px solid var(--rust); outline-offset: 5px; border-radius: 2px; }
+    ::selection { background: #d7e8df; color: var(--ink); }
+    h1, h2, h3, p, ul, ol, dl, figure { margin-top: 0; }
+    h1, h2 { font-family: var(--serif); font-weight: 400; line-height: 1.13; letter-spacing: -.025em; }
+    h1 { max-width: 15ch; margin-bottom: 1.1rem; font-size: clamp(2.6rem, 5.4vw, 4.5rem); }
+    h2 { margin-bottom: 1rem; font-size: clamp(1.85rem, 3vw, 2.5rem); }
+    h3 { margin-bottom: .65rem; font-size: 1.08rem; line-height: 1.4; }
+    p { margin-bottom: 1rem; }
+    p:last-child, ul:last-child, ol:last-child, dl:last-child { margin-bottom: 0; }
+    ul, ol { padding-left: 1.3rem; }
+    li + li { margin-top: .45rem; }
+    strong { font-weight: 650; }
+    small, .small { font-size: .85rem; }
+    code { font-family: var(--mono); font-size: .88em; overflow-wrap: anywhere; }
+    time, .number { font-variant-numeric: tabular-nums; }
+    svg { display: block; width: 100%; height: auto; }
+    [id] { scroll-margin-top: 1.5rem; }
+    .wrap { width: min(1100px, calc(100% - 64px)); margin-inline: auto; }
+    .skip-link { position: absolute; top: 12px; left: 12px; z-index: 10; padding: .7rem 1rem; background: var(--surface); transform: translateY(-180%); }
+    .skip-link:focus { transform: translateY(0); }
+    .masthead { padding-block: 2.1rem 1.1rem; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+    .eyebrow { font-size: .71rem; font-weight: 700; letter-spacing: .13em; text-transform: uppercase; }
+    .masthead .eyebrow { margin: 0; }
+    .masthead time { color: var(--muted); font-size: .83rem; }
+    .hero { padding-block: 3rem 2.2rem; }
+    .hero .eyebrow { color: var(--rust); margin-bottom: 1.1rem; }
+    .dek { max-width: 47rem; color: var(--muted); font-size: 1.16rem; line-height: 1.6; }
+    .metadata { display: flex; gap: 1.2rem 2rem; flex-wrap: wrap; margin-bottom: 0; font-size: .8rem; }
+    .metadata div { min-width: 0; }
+    .metadata dt { color: var(--muted); }
+    .metadata dd { margin: .15rem 0 0; font-weight: 600; }
+    .audit-notice { margin-bottom: 2.3rem; padding: 1.3rem 1.5rem; background: var(--teal-tint); border: 1px solid #afc8bf; border-left: 4px solid var(--teal); }
+    .audit-notice strong { color: var(--teal); }
+    .audit-notice p + p { margin-top: .55rem; }
+    .layout { display: grid; grid-template-columns: 205px minmax(0, 1fr); gap: 3.1rem; align-items: start; }
+    .sidebar { position: sticky; top: 1.5rem; padding-bottom: 2rem; }
+    .sidebar h2 { margin-bottom: .9rem; font: 700 .7rem/1.5 var(--sans); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+    .toc { list-style: none; margin: 0; padding: 0; }
+    .toc li + li { margin-top: .2rem; }
+    .toc a { display: flex; align-items: baseline; gap: .65rem; padding: .5rem .25rem; font-size: .82rem; line-height: 1.5; text-decoration: none; color: var(--ink); }
+    .toc a:hover { background: var(--neutral-tint); color: var(--teal); }
+    .toc .index { flex: none; min-width: 2ch; white-space: nowrap; color: var(--muted); font: .68rem/1.5 var(--mono); }
+    .sidebar-note { margin: 1.6rem 0 0; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .77rem; line-height: 1.65; }
+    main { min-width: 0; }
+    .report-section { padding-block: 0 2.6rem; margin-bottom: 2.4rem; border-bottom: 1px solid var(--line); }
+    .section-kicker { margin-bottom: .7rem; color: var(--teal); }
+    .section-intro { color: var(--muted); }
+    .placeholder { color: var(--muted); }
+    .callout { margin-block: 1.4rem; padding: 1rem 1.2rem; background: var(--teal-tint); border-left: 3px solid var(--teal); }
+    .metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .8rem; margin-top: 1.2rem; }
+    .metric { padding: 1rem; border-top: 2px solid var(--line); background: var(--surface); }
+    .metric dt { color: var(--muted); font-size: .78rem; }
+    .metric dd { margin: .5rem 0 0; font-size: .95rem; font-weight: 600; }
+    .metric dd.metric-value { font: 2rem/1.2 var(--serif); }
+    .metric dd small { display: block; margin-top: .55rem; font: .78rem/1.6 var(--sans); color: var(--muted); }
+    .negative { color: var(--rust); }
+    .positive { color: var(--teal); }
+    .lead-finding { font: 1.45rem/1.5 var(--serif); }
+    .evidence-ref { font-size: .8rem; white-space: nowrap; }
+    .reading-map { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-block: 1.3rem; }
+    .reading-map article { padding: 1.2rem; background: var(--surface); border-top: 2px solid var(--teal); }
+    .reading-map p { font-size: .88rem; }
+    .status-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6rem; margin-block: 1rem; }
+    .status-item { padding: .8rem 1rem; background: var(--surface); border: 1px solid var(--line); font-size: .85rem; }
+    .status-item strong { display: block; font-size: 1.1rem; }
+    .subsection { margin-top: 1.8rem; }
+    .finding-item { margin-block: 1.4rem; padding-top: 1.1rem; border-top: 1px solid var(--line); }
+    .finding-item h3 { margin-top: .7rem; }
+    .finding-item p { font-size: .94rem; }
+    .report-figure { margin: 1.5rem 0; padding: 1.1rem; background: var(--surface); border: 1px solid var(--line); }
+    .report-figure svg { max-width: 540px; margin-inline: auto; }
+    .report-figure figcaption { margin-top: 1rem; color: var(--muted); font-size: .85rem; }
+    .chart-grid { stroke: var(--line); stroke-width: 1; }
+    .chart-label { fill: var(--muted); font-family: var(--sans); font-size: 16px; }
+    .chart-number { fill: var(--ink); font-family: var(--sans); font-size: 16px; font-weight: 600; }
+    .chart-up { fill: var(--teal); }
+    .chart-down { fill: var(--rust); }
+    .scroll-table { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; border: 1px solid var(--line); }
+    .wide-table { min-width: 820px; }
+    .wide-table td { font-variant-numeric: tabular-nums; font-size: .8rem; }
+    .wide-table td small, .wide-table th small { display: block; font-size: .72rem; color: var(--muted); }
+    .wide-table .study-id { width: 90px; }
+    .wide-table tr.highlight td { background: var(--teal-tint); }
+    .wide-table tfoot td { border-top: 2px solid var(--ink); font-weight: 650; }
+    .table-key { padding: .7rem 1rem; margin: 0; background: var(--neutral-tint); font-size: .78rem; color: var(--muted); }
+    .method-list { padding: 0; list-style: none; }
+    .method-list > li { margin: 0; padding-block: 1rem; border-top: 1px solid var(--line); }
+    .method-list h3 { margin-bottom: .5rem; }
+    .method-list p { font-size: .92rem; }
+    .priority-list { padding: 0; list-style: none; counter-reset: proposal; }
+    .priority-list > li { counter-increment: proposal; padding: 1.3rem 0; margin: 0; border-top: 1px solid var(--line); }
+    .priority-list h3 { margin-block: .65rem; }
+    .priority-list p { font-size: .92rem; }
+    .priority-list .acceptance { color: var(--muted); font-size: .85rem; }
+    .mono-note { font-family: var(--mono); font-size: .72rem; overflow-wrap: anywhere; }
+    .glossary { margin-block: 1.4rem 0; }
+    .glossary > div { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 1rem; padding-block: .9rem; border-top: 1px solid var(--line); }
+    .glossary dt { font-weight: 650; }
+    .glossary dd { margin: 0; color: var(--muted); }
+    .formula { margin-block: 1.3rem; padding: 1.2rem; background: var(--surface); border: 1px solid var(--line); }
+    .formula p { margin-bottom: .5rem; }
+    .formula .expression { font: 1.15rem/1.65 var(--serif); }
+    .table-shell { margin-block: 1.3rem; }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: .83rem; }
+    caption { text-align: left; caption-side: top; font-weight: 650; margin-bottom: .8rem; }
+    th, td { text-align: left; vertical-align: top; padding: .85rem .65rem; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+    th { color: var(--muted); font-size: .73rem; line-height: 1.55; font-weight: 650; background: var(--neutral-tint); }
+    td { background: var(--surface); }
+    .empty-table { padding: 1.4rem; color: var(--muted); text-align: center; }
+    .table-note { margin: .75rem 0 0; color: var(--muted); font-size: .8rem; }
+    .evidence-legend { display: grid; gap: .8rem; margin-block: 1.3rem; }
+    .evidence-legend > div { display: grid; grid-template-columns: 155px minmax(0, 1fr); gap: 1rem; align-items: baseline; }
+    .evidence-legend p { font-size: .87rem; color: var(--muted); }
+    .badge { display: inline-block; width: fit-content; padding: .15rem .6rem; border: 1px solid currentColor; border-radius: 3px; font-size: .71rem; font-weight: 650; line-height: 1.6; }
+    .confirmed { color: var(--teal); background: var(--teal-tint); }
+    .probable { color: var(--rust); background: var(--rust-tint); }
+    .unproven { color: var(--muted); background: var(--neutral-tint); }
+    .comparison-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-block: 1.4rem; }
+    .comparison-card { padding: 1.4rem; background: var(--surface); border: 1px solid var(--line); }
+    .comparison-card .eyebrow { color: var(--muted); margin-bottom: .4rem; }
+    .comparison-card h3 { font: 2rem/1.2 var(--serif); margin-bottom: 1rem; }
+    .comparison-card p { font-size: .88rem; }
+    .source-list { margin-block: 1rem; padding-left: 1.5rem; font-size: .87rem; }
+    .source-list li { padding-left: .2rem; }
+    details { margin-block: 1rem; border-block: 1px solid var(--line); padding-block: .9rem; }
+    summary { cursor: pointer; font-size: .9rem; font-weight: 600; }
+    details[open] summary { margin-bottom: .9rem; }
+    .report-footer { padding-block: .2rem 2.5rem; color: var(--muted); font-size: .78rem; display: flex; flex-wrap: wrap; justify-content: space-between; gap: .6rem 1.5rem; }
+    .report-footer p { margin: 0; }
+    .wrap, .metadata, .sidebar, .report-section, .metric, .comparison-card { overflow-wrap: anywhere; }
+
+    @media (max-width: 850px) {
+      .wrap { width: min(1100px, calc(100% - 40px)); }
+      .layout { grid-template-columns: minmax(0, 1fr); gap: 1.8rem; }
+      .sidebar { position: static; padding-bottom: 1.5rem; border-bottom: 1px solid var(--line); }
+      .toc { display: grid; grid-template-columns: 1fr 1fr; column-gap: 1.2rem; }
+      .sidebar-note { display: none; }
+      .hero { padding-top: 2.3rem; }
+    }
+    @media (max-width: 520px) {
+      body { font-size: 16px; }
+      .wrap { width: calc(100% - 32px); }
+      .masthead { padding-top: 1.4rem; }
+      .hero { padding-block: 2rem 1.6rem; }
+      h1 { font-size: 2.65rem; }
+      .dek { font-size: 1.05rem; }
+      .audit-notice, .comparison-card { padding: 1rem; }
+      .toc { grid-template-columns: minmax(0, 1fr); }
+      .toc a { padding-block: .6rem; font-size: .88rem; }
+      .metric-grid, .comparison-grid { grid-template-columns: minmax(0, 1fr); }
+      .reading-map, .status-grid { grid-template-columns: minmax(0, 1fr); }
+      .metric dd.metric-value { font-size: 1.8rem; }
+      .report-figure { padding: .6rem; }
+      .glossary > div, .evidence-legend > div { grid-template-columns: minmax(0, 1fr); gap: .35rem; }
+      .report-section { padding-bottom: 2rem; margin-bottom: 1.8rem; }
+      .table-shell table { font-size: .78rem; }
+      th, td { padding: .65rem .35rem; }
+      th { font-size: .68rem; }
+    }
+    @media print {
+      @page { size: A4; margin: 17mm 15mm; }
+      :root { --paper: #fff; --surface: #fff; --ink: #172124; --muted: #465155; --line: #b9bfb8; }
+      html { scroll-padding-top: 0; }
+      body { font-size: 10.5pt; line-height: 1.5; }
+      .wrap { width: 100%; }
+      .masthead { padding-top: 0; }
+      .hero { padding-block: 1.2rem; }
+      h1 { max-width: none; font-size: 32pt; }
+      h2 { font-size: 21pt; }
+      h3 { font-size: 12pt; }
+      .dek { font-size: 12pt; }
+      .layout { display: block; }
+      .sidebar, .skip-link, .back-to-top { display: none; }
+      .audit-notice { margin-bottom: 1.5rem; }
+      .report-section { padding-bottom: 1.3rem; margin-bottom: 1.3rem; }
+      h2, h3, caption, summary { break-after: avoid; }
+      p, li { orphans: 3; widows: 3; }
+      tr, .metric, .formula, .comparison-card, .audit-notice { break-inside: avoid; }
+      thead { display: table-header-group; }
+      a { color: inherit; }
+      .badge { background: none; }
+      details > * { display: block; }
+      details::details-content { content-visibility: visible; }
+      .scroll-table { overflow: visible; border: 0; }
+      .wide-table { min-width: 0; font-size: 7.5pt; }
+      .wide-table td, .wide-table td small { font-size: 7.5pt; }
+      .wide-table th, .wide-table td { padding: .4rem .25rem; }
+      .wide-table .study-id { width: 48px; }
+      .report-figure { break-inside: avoid; }
+      .report-figure svg { max-width: 110mm; }
+      .reading-map { break-inside: avoid; }
+      .report-footer { padding-bottom: 0; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#report">Перейти к отчёту</a>
+  <header class="masthead wrap" id="top">
+    <p class="eyebrow">Исследовательский аудит / Бэктест</p>
+    <time datetime="2026-11-23">23 ноября 2026</time>
+  </header>
+
+  <div class="hero wrap">
+    <p class="eyebrow">Аудит завершён · срез на 23 ноября 2026</p>
+    <h1>Всплеск цены и&nbsp;оборота</h1>
+    <p class="dek">Положительная оценка после подбора параметров и отрицательный результат последующих сигналов: что уже видно в данных и чего они пока не доказывают.</p>
+    <dl class="metadata">
+      <div><dt>Предмет</dt><dd>Проверка результатов стратегии</dd></div>
+      <div><dt>Алгоритм</dt><dd><code>price_volume_spike 1.1.1</code></dd></div>
+      <div><dt>Статус</dt><dd>Аудит завершён, ограничения сохранены</dd></div>
+      <div><dt>Изменения в системе</dt><dd>Не выполнялись в рамках отчёта</dd></div>
+    </dl>
+  </div>
+
+  <div class="wrap">
+    <aside class="audit-notice" aria-label="Статус документа">
+      <p><strong>Аудит завершён по доступному срезу.</strong> Интегрированы данные, проверка формул, сверка входов и независимая рецензия. Подтверждённой текущей программной регрессии не найдено. Это не означает, что прибыльность доказана или модель «исправлена».</p>
+      <p class="small">Все результаты ниже — моделирование гипотетических сделок по свечам, не подтверждённые исполнения на бирже. Пустое значение не заменяется нулём. Предложения не реализованы.</p>
+    </aside>
+
+    <div class="layout">
+      <aside class="sidebar">
+        <nav aria-label="Содержание отчёта">
+          <h2>В этом отчёте</h2>
+          <ol class="toc">
+            <li><a href="#finding"><span class="index" aria-hidden="true">01</span><span>Главный вывод</span></a></li>
+            <li><a href="#comparison"><span class="index" aria-hidden="true">02</span><span>Что сравниваем и что такое R</span></a></li>
+            <li><a href="#metrics"><span class="index" aria-hidden="true">03</span><span>Четыре разных метрики</span></a></li>
+            <li><a href="#studies"><span class="index" aria-hidden="true">04</span><span>Все 26 исследований</span></a></li>
+            <li><a href="#causes"><span class="index" aria-hidden="true">05</span><span>Факты и гипотезы</span></a></li>
+            <li><a href="#study-34-35"><span class="index" aria-hidden="true">06</span><span>№ 34, № 35 и № 36</span></a></li>
+            <li><a href="#timing"><span class="index" aria-hidden="true">07</span><span>Время, повторы, replay</span></a></li>
+            <li><a href="#practices"><span class="index" aria-hidden="true">08</span><span>Мировые практики</span></a></li>
+            <li><a href="#proposals"><span class="index" aria-hidden="true">09</span><span>Предлагаемые изменения</span></a></li>
+            <li><a href="#limits-sources"><span class="index" aria-hidden="true">10</span><span>Ограничения и источники</span></a></li>
+          </ol>
+        </nav>
+        <p class="sidebar-note">Сначала — результат и основания. Затем — сопоставимость, возможные причины и предложения. Статус доказательств обозначается словами, а не только цветом.</p>
+      </aside>
+
+      <main id="report" tabindex="-1">
+        <section class="report-section" id="finding" aria-labelledby="finding-title">
+          <p class="section-kicker eyebrow">01 / Коротко</p>
+          <h2 id="finding-title">Главный вывод</h2>
+          <div data-slot="executive-finding">
+            <p class="lead-finding">Система подтверждает лучший исторический результат в рамках своего поиска, но пока не подтверждает преимущество на будущем.</p>
+            <p>Разрыв измерен на <strong>одних и тех же 147 закрытых исходах с их собственными TP/SL</strong>: сохранённая смешанная оценка рекомендованной пары в среднем равна <strong>+0,570979 R</strong>, наблюдаемый результат равен <strong>−0,119501 R</strong>. Разность составляет <strong>0,690481 R на исход</strong>. Это не артефакт сравнения максимума матрицы с другой парой.</p>
+            <p>Самые обоснованные объяснения: отбор победителя без независимой будущей проверки и короткая, зависимая выборка с меняющимися календарными условиями. Разделить их вклад на проценты нельзя. Проверки <strong>не выявили арифметической ошибки или ошибки входного фильтра</strong>; различие соседних цен входа для выданной когорты исключено. При этом № 35 и № 36 положительны в выдаче и replay, а № 34 в replay отрицателен.</p>
+          </div>
+          <dl class="metric-grid" aria-label="Сводка проверки">
+            <div class="metric"><dt>Выданные сигналы: закрытые исходы</dt><dd class="metric-value" data-slot="backtest-summary">147 <small>Из 1 761 записи; 36 TP и 111 SL.</small></dd></div>
+            <div class="metric"><dt>Сохранённая оценка B тех же пар</dt><dd class="metric-value positive">+0,5710 R <small>Среднее по тем же 147 закрытым строкам.</small></dd></div>
+            <div class="metric"><dt>Наблюдаемый модельный результат</dt><dd class="metric-value negative">−0,1195 R <small>−17,5667 R суммарно. Не доходность счёта.</small></dd></div>
+          </dl>
+          <p class="table-note">Основание: <a href="#source-data">статистический срез</a>, <a href="#source-calibration">построчная калибровка</a> и <a href="#source-code">проверка исходников</a>. Это наблюдаемый разрыв условного среднего по закрытым исходам, не оценка будущего убытка.</p>
+        </section>
+
+        <section class="report-section" id="comparison" aria-labelledby="comparison-title">
+          <p class="section-kicker eyebrow">02 / Как читать результаты</p>
+          <h2 id="comparison-title">Что сравниваем и&nbsp;что такое R</h2>
+          <p class="section-intro">Главная единица наблюдения здесь — не исполненная на бирже сделка, а запись сигнала и рассчитанный для неё свечной исход.</p>
+          <div class="reading-map" data-slot="comparison-contract">
+            <article><h3>Выданные сигналы — «live»</h3><p>Сигналы, которые система действительно выдала. Далее для них моделируются вход, цель и стоп по свечам. Слово «live» относится к выдаче сигнала, а не к факту биржевого исполнения.</p></article>
+            <article><h3>Повторный расчёт — «replay»</h3><p>Стратегия ещё раз прогоняется по сохранённой истории. В выгрузке этот слой называется <code>actual</code>. Это не «фактическая торговля»: он включает события вне исходного окна выдачи.</p></article>
+          </div>
+          <dl class="glossary">
+            <div><dt>Исследование</dt><dd>Один запуск подбора и оценки правил стратегии. Разные номера могут использовать пересекающуюся историю и реагировать на одни и те же рыночные события.</dd></div>
+            <div><dt>TP и SL</dt><dd><span lang="en">Take profit</span> — цель по прибыли; <span lang="en">stop loss</span> — ограничение убытка. Здесь это уровни в модели, а не отчёты биржи о выполненных ордерах.</dd></div>
+            <div><dt>SHORT</dt><dd>Короткая позиция: расчёт на последующее падение цены. Дополнительный рост перед таким входом является условием допуска сигнала, а не направлением ожидаемой прибыли.</dd></div>
+            <div><dt>R — единица риска</dt><dd>Исходный риск одной гипотетической сделки. Если цель TP и стоп SL заданы как расстояния в процентах, прибыльный исход даёт +TP/SL единиц R, а стоп — −1 R.</dd></div>
+            <div><dt>Среднее R</dt><dd>Сумма R только завершённых исходов, делённая на их число. Ни отказ входного фильтра, ни ещё открытый исход не являются нулевой сделкой для этого среднего.</dd></div>
+          </dl>
+          <div class="formula" aria-label="Расчёт R в предоставленном срезе">
+            <p class="expression">TP-исход: +TP/SL R · SL-исход: −1 R</p>
+            <p class="expression">Среднее R = сумма R / число закрытых исходов</p>
+            <p class="small">Например, у № 34 TP = 20%, SL = 8%: цель даёт +2,5 R. Две цели и четыре стопа дают +1 R суммарно, или +0,1667 R на шесть закрытых исходов.</p>
+          </div>
+          <div class="callout" data-slot="r-interpretation">
+            <p><strong>Это не процент прибыли на счёт.</strong> Для перевода в деньги нужны размер позиции, капитал, перекрывающиеся позиции, комиссии, проскальзывание и другие торговые издержки. Приведённые R не следует читать как результат реального портфеля.</p>
+          </div>
+          <h3 class="subsection">Куда делись остальные записи из 1 761?</h3>
+          <div class="status-grid">
+            <div class="status-item"><strong>1 592 — фильтр входа не пройден</strong><code>gate_failed</code>: нет завершённой модельной сделки.</div>
+            <div class="status-item"><strong>147 — исход закрыт</strong>36 целей и 111 стопов. Именно это знаменатель среднего R.</div>
+            <div class="status-item"><strong>21 — исход ещё открыт</strong>Результат неизвестен на доступном горизонте; это не ноль.</div>
+            <div class="status-item"><strong>1 — расчёт отсутствует</strong>В данном срезе относится к исследованию № 58.</div>
+          </div>
+          <p>Даже 1 761 исходная запись не означает 1 761 независимое событие: уникальных пар «инструмент + время сигнала» всего <strong>1 140</strong>. В 352 общих группах находятся 973 записи, иногда одно событие отражается в шести профилях. Это не основание удалять строки из описательной суммы, но основание не считать их независимыми наблюдениями при оценке уверенности.</p>
+          <p>После фильтра остаётся <strong>168 входов</strong>, из них закрыты 147, то есть <strong>87,5%</strong>. Оставшийся 21 исход ещё не известен. Условное среднее по закрытым не тождественно ожидаемому результату всех входов.</p>
+        </section>
+
+        <section class="report-section" id="metrics" aria-labelledby="metrics-title">
+          <p class="section-kicker eyebrow">03 / Не смешивать значения</p>
+          <h2 id="metrics-title">Рейтинг, прогноз и проверка на тех же исходах</h2>
+          <p class="section-intro">Сопоставление «в интерфейсе было положительно, позже стало отрицательно» требует сначала установить, какое именно положительное число было показано.</p>
+          <dl class="glossary">
+            <div><dt>Максимум F</dt><dd><code>forecastBest</code>, или <code>highestF</code> в таблице: наибольшее прогнозное значение среди пар TP/SL. Это максимум выбранной матрицы, а не среднее по ней и не обязательно рекомендуемая пара.</dd></div>
+            <div><dt>Score</dt><dd>Рейтинг кандидата при подборе: равновесное агрегирование матрицы, а не её максимальная ячейка. Сравнивать его напрямую с исходом одной выбранной пары некорректно.</dd></div>
+            <div><dt>F и B выбранной пары</dt><dd><code>selectedF</code>: прогнозное F у рекомендованной пары TP/SL. M обозначает историческое среднее, B (<span lang="en">blend</span>) смешивает M и F по заданному весу. Выбор устойчивого соседства параметров использует ту же историю, не независимое будущее.</dd></div>
+            <div><dt>F у выданного сигнала</dt><dd>Прогноз, записанный непосредственно при выдаче. В старых версиях он может отличаться от значения выбранной ячейки в сохранённой матрице. Это отдельный артефакт, который нужно сверять по версии расчёта.</dd></div>
+          </dl>
+          <div class="callout">
+            <p><strong>Наглядно — № 34.</strong> Score = <strong>0,4424</strong>; максимум и F выбранной пары = <strong>1,2616</strong>; в выданных сигналах F находится примерно в диапазоне <strong>0,5803–0,5861</strong>. Это не четыре независимых подтверждения прибыли, а разные уровни расчёта.</p>
+          </div>
+          <p>У № 35 различие видно даже внутри матрицы: максимум F = 0,9139 у пары 12%/6%, а рекомендованная пара 12%/4% имеет F = 0,7699. Положительный максимум не означает, что именно он использовался в сигнале. F также не является вероятностью: число больше единицы нельзя читать как «вероятность больше 100%».</p>
+          <div data-slot="forecast-calibration">
+            <h3 class="subsection">Более сильная проверка: те же 147 строк и те же пары</h3>
+            <p>Для каждого закрытого выданного исхода сопоставлены сохранённые M, F и рекомендованная B с фактическим модельным R. Каждая строка имеет одинаковый вес; это не среднее из средних исследований. Получено: <strong>M = +0,470916 R; F = +0,607158 R; B = +0,570979 R</strong> против <strong>−0,119501 R</strong> наблюдаемого результата.</p>
+            <figure class="report-figure">
+              <h3>Сохранённая оценка и наблюдение, одна когорта</h3>
+              <svg viewBox="0 0 400 245" role="img" aria-labelledby="calibration-chart-title calibration-chart-desc">
+                <title id="calibration-chart-title">Средняя B плюс 0,570979 R и наблюдаемые минус 0,119501 R</title>
+                <desc id="calibration-chart-desc">Сравнение сохранённой смешанной оценки рекомендованной пары с модельным результатом на тех же 147 закрытых исходах. Разница 0,690481 R. Слева от нуля отрицательные значения, справа положительные. Это описательная проверка, не доверительный интервал.</desc>
+                <line x1="165" y1="40" x2="165" y2="192" stroke="#58666a"/>
+                <text x="165" y="26" text-anchor="middle" class="chart-label">0 R</text>
+                <text x="10" y="72" class="chart-label">Оценка B</text>
+                <rect x="165" y="84" width="159.8742" height="23" class="chart-up"/>
+                <text x="334" y="101" class="chart-number">+0,571</text>
+                <text x="10" y="143" class="chart-label">Результат</text>
+                <rect x="131.5397" y="155" width="33.4603" height="23" class="chart-down"/>
+                <text x="177" y="173" class="chart-number">−0,120</text>
+                <text x="10" y="224" class="chart-label">Разность: 0,690481 R на исход</text>
+              </svg>
+              <figcaption>В обоих столбцах одна и та же выбранная пара TP/SL для каждой из 147 строк. B взята из сохранённого рекомендованного решения, а не из максимума F. Не включает 21 открытый исход и не доказывает размер ошибки будущего прогноза.</figcaption>
+            </figure>
+            <p>Для проверки вероятностей каждая оценка переведена с использованием <strong>собственного q = TP/SL</strong>: вероятность TP = (оценка R + 1) / (q + 1). Средняя подразумеваемая вероятность B равна <strong>39,2926%</strong>, наблюдаемая доля TP равна <strong>24,4898%</strong>. Все полученные вероятности допустимы, искусственное обрезание к диапазону 0–100% не применялось.</p>
+            <details>
+              <summary>Почему из этого нельзя заключить, что blend лучше или хуже mean</summary>
+              <p><strong>Оценка Брайера</strong> измеряет среднюю квадратичную ошибку вероятности: прогноз сравнивается с 1 для TP и с 0 для SL; меньше означает лучше. На этих же строках M даёт 0,190158, F даёт 0,189809, B даёт 0,187834. Различия малы, нестабильны и не доказывают превосходство метода.</p>
+              <p>Все 24 завершённых исследования использовали режим blend. Нет отдельных экспериментальных веток pure mean и pure forecast. Здесь сравниваются расчётные оценки на одной когорте, а не результаты трёх независимо запущенных политик торговли. Заменять blend на mean по этим числам нельзя.</p>
+              <p>64 закрытых строки относятся к старому трендовому методу № 34–36, 83 к вероятностному методу № 40 и позднее. Одновременно изменились даты, параметры и зрелость исходов. Сравнение не изолирует эффект новой формулы.</p>
+            </details>
+            <p class="table-note">Текстовый прогноз, сохранённый в выдаче, доступен для 140 из 147 закрытых строк; его среднее +0,585173 R относится к иной доступности и версиям расчёта. Его нельзя вычитать из факта по всем 147 строкам как парную ошибку, и нельзя утверждать, что все сообщения показывали именно B. Данные: <a href="#source-calibration">supplemental-calibration.json</a>.</p>
+          </div>
+        </section>
+
+        <section class="report-section" id="studies" aria-labelledby="studies-title">
+          <p class="section-kicker eyebrow">04 / Полная картина</p>
+          <h2 id="studies-title">Все 26 исследований: № 34–59</h2>
+          <p class="section-intro">Выборка не ограничена удачными № 34 и № 35. В таблице сохранены также неудавшиеся запуски, отсутствие закрытых исходов и незавершённый replay.</p>
+          <p>В парных ячейках сначала указано <strong>N — число закрытых исходов</strong>, ниже — <strong>среднее R</strong>. Обучение — исходная историческая оценка выбранной пары; выданные сигналы и replay — другие наборы событий. Числа округлены до четырёх знаков, агрегаты рассчитаны до округления.</p>
+          <div class="table-shell" data-slot="study-evidence-table">
+            <p class="table-key" id="study-table-help">На узком экране прокручивается только таблица. Клавиатура: Tab переводит фокус на её область, стрелки влево/вправо прокручивают. «Нет закрытых» и «не опубликован» — не нулевой результат.</p>
+            <div class="scroll-table" tabindex="0" role="region" aria-label="Полная таблица 26 исследований" aria-describedby="study-table-help">
+            <table class="wide-table" id="study-table">
+              <caption>Срез на 23 ноября 2026 · источник: studies.csv и study-details.json</caption>
+              <thead>
+                <tr><th scope="col" class="study-id">№ / статус</th><th scope="col">Обучение: N / среднее R</th><th scope="col">Score</th><th scope="col">Максимум F</th><th scope="col">F выбранной пары</th><th scope="col">TP / SL, %</th><th scope="col">Выданные: N / среднее R</th><th scope="col">Replay: N / среднее R</th></tr>
+              </thead>
+              <tbody>
+                <tr class="highlight" data-study="34"><th scope="row">34<small>Завершено</small></th><td>66<small>+0,3788 R</small></td><td>0,4424</td><td>1,2616</td><td>1,2616</td><td>20 / 8</td><td>6<small>+0,1667 R</small></td><td>26<small>−0,1923 R</small></td></tr>
+                <tr class="highlight" data-study="35"><th scope="row">35<small>Завершено</small></th><td>106<small>+0,0943 R</small></td><td>0,3434</td><td>0,9139</td><td>0,7699</td><td>12 / 4</td><td>15<small>+0,6000 R</small></td><td>47<small>+0,4468 R</small></td></tr>
+                <tr class="highlight" data-study="36"><th scope="row">36<small>Завершено</small></th><td>113<small>+0,1947 R</small></td><td>0,2315</td><td>0,6227</td><td>0,6010</td><td>8 / 4</td><td>43<small>+0,2558 R</small></td><td>65<small>+0,3385 R</small></td></tr>
+                <tr data-study="37"><th scope="row">37<small>Завершено</small></th><td>18<small>+0,6667 R</small></td><td>0,9569</td><td>4,2997</td><td>4,2997</td><td>20 / 4</td><td>0<small>Нет закрытых</small></td><td>7<small>−0,1429 R</small></td></tr>
+                <tr data-study="38"><th scope="row">38<small>Ошибка</small></th><td colspan="5">Ресурсный лимит: более 10 000 сетапов на кандидата. Результат обучения не получен.</td><td>—<small>Нет выдачи</small></td><td>—<small>Нет результата</small></td></tr>
+                <tr data-study="39"><th scope="row">39<small>Ошибка</small></th><td colspan="5">Ресурсный лимит: более 10 000 сетапов на кандидата. Результат обучения не получен.</td><td>—<small>Нет выдачи</small></td><td>—<small>Нет результата</small></td></tr>
+                <tr data-study="40"><th scope="row">40<small>Завершено</small></th><td>18<small>+1,4444 R</small></td><td>0,4043</td><td>0,9400</td><td>0,9259</td><td>18 / 4</td><td>2<small>+1,7500 R</small></td><td>6<small>−0,0833 R</small></td></tr>
+                <tr data-study="41"><th scope="row">41<small>Завершено</small></th><td>32<small>+0,8750 R</small></td><td>0,3744</td><td>0,7810</td><td>0,6531</td><td>20 / 4</td><td>6<small>−1,0000 R</small></td><td>9<small>−1,0000 R</small></td></tr>
+                <tr data-study="42"><th scope="row">42<small>Завершено</small></th><td>47<small>+0,7277 R</small></td><td>0,3080</td><td>0,5956</td><td>0,5577</td><td>18 / 10</td><td>3<small>+0,8667 R</small></td><td>9<small>−0,3778 R</small></td></tr>
+                <tr data-study="43"><th scope="row">43<small>Завершено</small></th><td>125<small>+0,6000 R</small></td><td>0,2998</td><td>0,4954</td><td>0,4353</td><td>16 / 4</td><td>12<small>−0,5833 R</small></td><td>35<small>−0,8571 R</small></td></tr>
+                <tr data-study="44"><th scope="row">44<small>Завершено</small></th><td>128<small>+0,5625 R</small></td><td>0,2805</td><td>0,4712</td><td>0,4115</td><td>16 / 4</td><td>11<small>−0,5455 R</small></td><td>33<small>−0,6970 R</small></td></tr>
+                <tr data-study="45"><th scope="row">45<small>Завершено</small></th><td>25<small>+1,2000 R</small></td><td>0,3129</td><td>0,8390</td><td>0,8390</td><td>18 / 4</td><td>2<small>−1,0000 R</small></td><td>Не опубликован<small>Replay выполняется</small></td></tr>
+                <tr data-study="46"><th scope="row">46<small>Завершено</small></th><td>64<small>+0,7813 R</small></td><td>0,3190</td><td>0,7656</td><td>0,7115</td><td>20 / 4</td><td>0<small>Нет закрытых</small></td><td>11<small>+0,0909 R</small></td></tr>
+                <tr data-study="47"><th scope="row">47<small>Завершено</small></th><td>69<small>+0,6667 R</small></td><td>0,2847</td><td>0,4957</td><td>0,4957</td><td>16 / 4</td><td>4<small>−1,0000 R</small></td><td>10<small>−1,0000 R</small></td></tr>
+                <tr data-study="48"><th scope="row">48<small>Завершено</small></th><td>87<small>+0,4253 R</small></td><td>0,2790</td><td>0,5143</td><td>0,4025</td><td>12 / 4</td><td>6<small>−0,3333 R</small></td><td>6<small>−0,3333 R</small></td></tr>
+                <tr data-study="49"><th scope="row">49<small>Завершено</small></th><td>86<small>+0,4419 R</small></td><td>0,2869</td><td>0,5244</td><td>0,4120</td><td>12 / 4</td><td>5<small>−0,2000 R</small></td><td>6<small>−0,3333 R</small></td></tr>
+                <tr data-study="50"><th scope="row">50<small>Завершено</small></th><td>127<small>+0,7717 R</small></td><td>0,2725</td><td>0,7528</td><td>0,7009</td><td>14 / 4</td><td>6<small>−1,0000 R</small></td><td>15<small>−1,0000 R</small></td></tr>
+                <tr data-study="51"><th scope="row">51<small>Завершено</small></th><td>21<small>+1,5714 R</small></td><td>0,4513</td><td>0,9224</td><td>0,9224</td><td>20 / 4</td><td>2<small>−1,0000 R</small></td><td>3<small>−1,0000 R</small></td></tr>
+                <tr data-study="52"><th scope="row">52<small>Завершено</small></th><td>39<small>+1,1154 R</small></td><td>0,2877</td><td>0,7578</td><td>0,7578</td><td>18 / 4</td><td>3<small>+0,8333 R</small></td><td>4<small>+0,3750 R</small></td></tr>
+                <tr data-study="53"><th scope="row">53<small>Завершено</small></th><td>114<small>+0,5439 R</small></td><td>0,2756</td><td>0,5363</td><td>0,4309</td><td>18 / 4</td><td>4<small>+0,3750 R</small></td><td>8<small>+0,3750 R</small></td></tr>
+                <tr data-study="54"><th scope="row">54<small>Завершено</small></th><td>113<small>+0,6490 R</small></td><td>0,2813</td><td>0,5460</td><td>0,5419</td><td>20 / 6</td><td>5<small>−0,1333 R</small></td><td>7<small>+0,2381 R</small></td></tr>
+                <tr data-study="55"><th scope="row">55<small>Завершено</small></th><td>189<small>+0,4815 R</small></td><td>0,2528</td><td>0,4959</td><td>0,4759</td><td>16 / 4</td><td>5<small>−1,0000 R</small></td><td>6<small>−1,0000 R</small></td></tr>
+                <tr data-study="56"><th scope="row">56<small>Завершено</small></th><td>211<small>+0,6682 R</small></td><td>0,2558</td><td>0,5608</td><td>0,5608</td><td>18 / 4</td><td>4<small>−1,0000 R</small></td><td>5<small>−1,0000 R</small></td></tr>
+                <tr data-study="57"><th scope="row">57<small>Завершено</small></th><td>30<small>+0,8000 R</small></td><td>0,3323</td><td>0,7091</td><td>0,6784</td><td>20 / 4</td><td>1<small>−1,0000 R</small></td><td>1<small>−1,0000 R</small></td></tr>
+                <tr data-study="58"><th scope="row">58<small>Завершено</small></th><td>64<small>+0,4219 R</small></td><td>0,4165</td><td>1,0842</td><td>0,9923</td><td>20 / 6</td><td>0<small>Нет закрытых</small></td><td>0<small>Нет закрытых</small></td></tr>
+                <tr data-study="59"><th scope="row">59<small>Завершено</small></th><td>187<small>+0,6043 R</small></td><td>0,2170</td><td>0,4530</td><td>0,4530</td><td>20 / 4</td><td>2<small>−1,0000 R</small></td><td>3<small>−1,0000 R</small></td></tr>
+              </tbody>
+              <tfoot><tr><td>Всего</td><td colspan="5">Среднее взвешено по числу закрытых исходов, не по числу исследований.</td><td>147<small>−0,1195 R</small></td><td>322<small>−0,2135 R</small></td></tr></tfoot>
+            </table>
+            </div>
+            <p class="table-note">«Завершено» — статус самого исследования, не всех исходов и не всех аналитических заданий. У № 45 исследование завершено, но replay ещё выполняется. У № 58 replay завершён, но закрытых исходов нет. Ошибки № 38 и № 39 — ресурсные, а не торговые убытки.</p>
+          </div>
+        </section>
+
+        <section class="report-section" id="causes" aria-labelledby="causes-title">
+          <p class="section-kicker eyebrow">05 / Объяснения, а не догадки</p>
+          <h2 id="causes-title">Причины и степень уверенности</h2>
+          <p class="section-intro">Наличие разрыва подтверждается числами. Какая доля объясняется подбором, календарём или незрелостью исходов, не установлено. Проверенные версии о технической причине нужно отделить от правдоподобных статистических объяснений.</p>
+          <div class="evidence-legend" aria-label="Как обозначается сила доказательств">
+            <div><span class="badge confirmed">Подтверждено</span><p>Есть прямая проверяемая опора: исходные данные, воспроизведение или конкретный участок реализации.</p></div>
+            <div><span class="badge probable">Вероятно</span><p>Объяснение согласуется с наблюдениями, но остаются альтернативы или не выполнена решающая проверка.</p></div>
+            <div><span class="badge unproven">Не доказано</span><p>Гипотеза ещё не проверена либо имеющихся данных недостаточно для вывода.</p></div>
+          </div>
+          <div data-slot="causal-findings">
+            <article class="finding-item"><span class="badge confirmed">Подтверждено данными</span><h3>Прогноз переоценивает наблюдаемую закрытую когорту</h3><p>На тех же 147 строках B = +0,570979 R против −0,119501 R наблюдения. Кроме того, у всех завершённых исследований выбранные F положительны. У № 37 F = 4,2997 при 18 обучающих исходах, но replay даёт −0,1429 R на семи закрытых исходах. У № 37 нет закрытых исходов выдачи: пример иллюстрирует нестабильность исторической оценки, но не является причиной разрыва по 147 строкам.</p></article>
+            <article class="finding-item"><span class="badge confirmed">Подтверждено дизайном</span><h3>Независимого контроля перед выбором нет</h3><p>Исторические исходы используются для поиска и оценки победителя. Ни трендовая, ни вероятностная формула не отделяют нетронутое будущее до принятия решения. Отбор устойчивого соседства параметров остаётся работой на той же истории. Это установленное ограничение процесса; размер его финансового эффекта не установлен.</p></article>
+            <article class="finding-item"><span class="badge confirmed">Риск дизайна подтверждён</span><h3>Отбор победителя: вклад переоценки не измерен</h3><p>В 24 завершённых исследованиях оценено от <strong>1 043 до 2 513 кандидатов</strong> на запуск, медиана 1 973,5. Матрица имеет 81 ячейку; минимальное число закрытых исходов для рассчитываемой ячейки равно одному. У выбранной пары обучающих закрытых исходов от 18 до 211, медиана 77,5.</p><p>Чем больше вариантов выбирают на одной истории, тем легче отобрать удачные совпадения. Независимого holdout перед выбором нет. Это подтверждённый риск дизайна; вклад в наблюдаемый разрыв не измерен. Ни число кандидатов, ни разрыв 0,690481 R не являются процентом переобучения.</p><p class="small">Суммарные 45 714 оценок кандидатов зависимы; истории исследований перекрываются. Это не 45 714 независимых экспериментов. Основание: training-review.json и <a href="#source-code">код подбора и прогноза</a>.</p></article>
+            <article class="finding-item"><span class="badge confirmed">Подтверждено данными</span><h3>Календарь и состав выборки меняют сравнение</h3><p>Преимущество № 34 и № 35 над остальными заметно сокращается при сравнении общего календарного окна. Их исходные окна не включают плохие дни 20–21 ноября. Это важный смешивающий фактор: одновременно различаются и стратегия, и время её наблюдения.</p></article>
+            <article class="finding-item"><span class="badge confirmed">Подтверждено на сверенных строках</span><h3>Совпавшие закрытые исходы не выявили расхождений R</h3><p>У 145 точно сопоставленных закрытых строк выдачи и повторного расчёта — ноль расхождений статуса или R. Это поддерживает согласованность проверенного пути расчёта, но не исключает общую ошибку обоих путей, проблемы несовпавших событий или отличие от обучения.</p></article>
+            <article class="finding-item"><span class="badge probable">Вероятно, вклад не измерен</span><h3>Совместный эффект отбора, рынка и зрелости</h3><p>Переоценка выбранного победителя, изменение рыночных условий и неравная зрелость когорт согласуются с наблюдениями. Но этот срез не позволяет разделить их причинные вклады или назвать один из них доказанно главным. Незрелость всей когорты не отменяет достоверность уже закрытых TP/SL.</p></article>
+            <article class="finding-item"><span class="badge unproven">Не доказано</span><h3>Единая причина всего минуса</h3><p>Не установлены ни «всё объясняет режим BTC», ни конкретная доля переобучения. Нет доказательства, что изменение одной формулы автоматически сделает стратегию прибыльной. Комиссии и проскальзывание исключены с обеих сравниваемых сторон: они важны для реальной торговли, но не объясняют этот разрыв модельного результата без издержек с прогнозом без издержек.</p></article>
+          </div>
+          <div data-slot="source-audit-details">
+            <h3 class="subsection">Проверено и не объясняет основной разрыв</h3>
+            <article class="finding-item"><span class="badge confirmed">Исключено для выданной когорты</span><h3>Соседние цены входа и входной фильтр</h3><p>Для всех <strong>1 761</strong> сигналов предыдущее закрытие свечи <strong>точно равно следующему открытию</strong>. Во всех 1 760 рассчитанных записях сохранённая цена входа равна этому открытию. Проверены 2 667 уникальных свечей, пропусков нет. Получены те же 1 592 отказа и 168 допусков; переключений фильтра и расхождений сохранённого статуса нет.</p><p>Это одна временная граница, а не автоматическая минутная задержка. Данный ценовой мост не объясняет результат этой выданной когорты. Проверка не является полным повтором исходного обучающего оценщика и не переоценивает весь будущий горизонт.</p></article>
+            <article class="finding-item"><span class="badge confirmed">Проверено на исходниках</span><h3>Обычное среднее и восстановление прогнозов</h3><p>Среднее R считается корректно. По переданному результату целевой проверки исходников: <strong>89 тестов прошли, 2 проигнорированы</strong>. Текущая ошибка суммирования, входного фильтра или «лишней минуты» не продемонстрирована. Штатный Rust-решатель точно воспроизводит сохранённые F и B у № 34, 35, 36, 37 и 58.</p></article>
+            <article class="finding-item"><span class="badge confirmed">Измеренная чувствительность</span><h3>Вес дневных строк тренда не оказался главной причиной</h3><p>Замена дневного веса <code>rowCount</code> на число закрытых TP + SL у выбранной пары меняет F № 34 с 1,261552 до 1,231092, а B с 0,996723 до 0,975401. У № 58 F меняется с 0,992325 до 0,891050, B с 0,821190 до 0,750298. У № 35, № 36 и № 37 значения не меняются. Все B остаются положительными.</p><p>Проверка относится только к выбранным парам, не к повторному поиску по всей матрице. Вероятностный метод вообще не использует rowCount. Поэтому объявлять этот вес основной причиной наблюдаемого разрыва нельзя.</p></article>
+            <p>Высокое F № 37 опирается на <strong>18 закрытых исходов в 11 днях с рассчитываемым средним</strong>. На последних двух таких днях только три TP по +5 R, без SL; последняя конечная точка ряда приходится на 15 ноября при отсечке 17 ноября. Это разреженный конец ряда, а не доказанный эффект веса незакрытых исходов.</p>
+          </div>
+        </section>
+
+        <section class="report-section" id="study-34-35" aria-labelledby="study-34-35-title">
+          <p class="section-kicker eyebrow">06 / Почему ранние запуски выглядят лучше</p>
+          <h2 id="study-34-35-title">№ 34 и № 35 — с оглядкой на № 36</h2>
+          <p class="section-intro">№ 34 и № 35 вместе положительны. Но № 34 сам по себе отрицателен в replay, а № 36 тоже положителен и имеет больше закрытых выданных исходов, чем они вместе.</p>
+          <div class="comparison-grid">
+            <article class="comparison-card" data-slot="study-34">
+              <p class="eyebrow">Исследование</p><h3>№ 34</h3>
+              <p>Выдача: <strong>6 исходов, +0,1667 R</strong> в среднем. Replay: <strong>26, −0,1923 R</strong>.</p>
+              <p>Пара TP/SL: 20% / 8%. Детектор: рост 4% за 3 минуты, множитель объёма 7. Для входа SHORT требуется дополнительный рост +4% после сигнала со сдвигом 2 минуты. Кластеризация выключена.</p>
+              <p>Обучение: 66 исходов, +0,3788 R. F выбранной пары: 1,2616. Это не значение F, сохранённое в выдаче старой версии.</p>
+            </article>
+            <article class="comparison-card" data-slot="study-35">
+              <p class="eyebrow">Исследование</p><h3>№ 35</h3>
+              <p>Выдача: <strong>15 исходов, +0,6000 R</strong> в среднем. Replay: <strong>47, +0,4468 R</strong>.</p>
+              <p>Пара TP/SL: 12% / 4%. Детектор: рост 5% за 12 минут, множитель объёма 7. Для входа SHORT требуется дополнительный рост +9% после сигнала со сдвигом 14 минут. Кластеризация выключена.</p>
+              <p>Обучение: 106 исходов, +0,0943 R. F выбранной пары: 0,7699; максимум матрицы — 0,9139 у другой пары.</p>
+            </article>
+          </div>
+          <div class="callout"><p><strong>Не пропустить № 36:</strong> в выдаче 43 закрытых исхода, +0,2558 R; в replay 65, +0,3385 R. Пара 8% / 4%, детектор роста 4% за 12 минут, множитель объёма 20. Для входа SHORT нужен дополнительный рост +7% со сдвигом 14 минут, кластеризация выключена. Положительны не только № 34 и № 35.</p></div>
+          <p>У № 35 и № 36 общие признаки: нет кластеризации, сдвиг 14 минут, более строгий дополнительный рост перед SHORT и старый трендовый blend с 17 днями обучения. У большинства поздних запусков кластеризация включена, входной порог 1–5%, цели 16–20% при стопе 4%. С № 53 обучающее окно увеличено до 30 дней. Это <strong>гипотезы для контролируемого будущего сравнения</strong>, не рекомендация новых оптимальных параметров.</p>
+          <div class="table-shell">
+            <table>
+              <caption>№ 34 + № 35 против остальных: среднее R и число закрытых исходов</caption>
+              <thead><tr><th scope="col">Условия сравнения</th><th scope="col">№ 34 + № 35</th><th scope="col">Остальные</th></tr></thead>
+              <tbody>
+                <tr><th scope="row">Весь период выдачи</th><td>21 / <strong>+0,4762 R</strong></td><td>126 / <strong>−0,2188 R</strong></td></tr>
+                <tr><th scope="row">Общее календарное окно</th><td>19 / <strong>+0,4211 R</strong></td><td>37 / <strong>+0,2730 R</strong></td></tr>
+                <tr><th scope="row">Общие события «инструмент + время»</th><td>11 / <strong>+0,3636 R</strong></td><td>18 / <strong>+0,8111 R</strong></td></tr>
+              </tbody>
+            </table>
+            <p class="table-note">Общее окно выдачи: 17 ноября 11:51 — 19 ноября 06:09 UTC. В третьей строке исходные события общие, но фильтры, параметры и доля закрытых исходов различаются. Это не парный эксперимент на одинаковых сделках.</p>
+          </div>
+          <div data-slot="study-34-35-verdict">
+            <p><strong>Что можно сказать:</strong> у этой пары запусков положительный наблюдаемый результат, особенно у № 35. Однако сырое сравнение с остальными преувеличивает изолированность эффекта параметров: при общей дате обе группы уже положительны, а на общих исходных событиях порядок групп меняется.</p>
+            <p><strong>Чего нельзя сказать:</strong> что найден устойчиво лучший вариант или что рынок объясняет весь разрыв. Для этого нужны сопоставимые будущие окна, единый набор событий, учёт различий входного фильтра и независимая проверка.</p>
+          </div>
+        </section>
+
+        <section class="report-section" id="timing" aria-labelledby="timing-title">
+          <p class="section-kicker eyebrow">07 / Проверка альтернативных объяснений</p>
+          <h2 id="timing-title">Время наблюдения и повторный расчёт</h2>
+          <p class="section-intro">Разница между ранними и поздними запусками — не чистый тест качества их параметров. Сами наблюдаемые дни тоже сильно различаются.</p>
+          <figure class="report-figure" data-slot="study-figure">
+            <h3>Результат выданных сигналов по дате сигнала</h3>
+            <svg viewBox="0 0 400 330" role="img" aria-labelledby="daily-chart-title daily-chart-desc">
+              <title id="daily-chart-title">Суммарные R по дням 17–23 ноября 2026 UTC</title>
+              <desc id="daily-chart-desc">Сумма R закрытых исходов, сгруппированных по дате сигнала: 17 ноября минус 1,5; 18 ноября плюс 5; 19 ноября плюс 12,6; 20 ноября минус 19; 21 ноября минус 10; 22 ноября плюс 0,3333; 23 ноября минус 5. Это не дневной денежный результат портфеля.</desc>
+              <g class="chart-grid"><line x1="35" y1="60" x2="385" y2="60"/><line x1="35" y1="110" x2="385" y2="110"/><line x1="35" y1="210" x2="385" y2="210"/><line x1="35" y1="260" x2="385" y2="260"/></g>
+              <line x1="35" y1="160" x2="385" y2="160" stroke="#58666a" stroke-width="1.5"/>
+              <g class="chart-label"><text x="2" y="65">+20</text><text x="2" y="115">+10</text><text x="19" y="165">0</text><text x="2" y="215">−10</text><text x="2" y="265">−20</text></g>
+              <g class="chart-down"><rect x="47" y="160" width="26" height="7.5"/><rect x="191" y="160" width="26" height="95"/><rect x="239" y="160" width="26" height="50"/><rect x="335" y="160" width="26" height="25"/></g>
+              <g class="chart-up"><rect x="95" y="135" width="26" height="25"/><rect x="143" y="97" width="26" height="63"/><rect x="287" y="158.3333" width="26" height="1.6667"/></g>
+              <g class="chart-number" text-anchor="middle"><text x="60" y="193">−1,5</text><text x="108" y="123">+5</text><text x="156" y="84">+12,6</text><text x="204" y="280">−19</text><text x="252" y="235">−10</text><text x="300" y="145">+0,33</text><text x="348" y="211">−5</text></g>
+              <g class="chart-label" text-anchor="middle"><text x="60" y="311">17</text><text x="108" y="311">18</text><text x="156" y="311">19</text><text x="204" y="311">20</text><text x="252" y="311">21</text><text x="300" y="311">22</text><text x="348" y="311">23</text></g>
+            </svg>
+            <figcaption>Единицы — сумма R завершённых модельных исходов. Группировка по дате исходного сигнала, ноябрь 2026, UTC; не по дате закрытия и не по движению капитала. Последний день неполный; открытые исходы не включены. Источник: <code>statistics.json → live.byDay</code>.</figcaption>
+          </figure>
+          <p>20 ноября все <strong>19 закрытых исходов</strong> этой когорты закончились стопом: <strong>−19 R</strong>. 21 ноября — <strong>18 закрытых исходов, −10 R</strong>. Вместе это −29 R, то есть больше по модулю, чем общий минус −17,5667 R; остальные дни частично его компенсируют. Ни № 34, ни № 35 не представлены в выдаче этих двух дат.</p>
+          <p>Под «режимом рынка» понимаются меняющиеся условия — направленность, волатильность, ликвидность и совместные движения инструментов. Календарное различие делает такое объяснение значимым кандидатом, но не доказывает, что причина именно в BTC или в конкретном режиме.</p>
+          <h3 class="subsection">Replay отрицателен, но не заменяет честное будущее</h3>
+          <p>Повторное моделирование содержит <strong>3 981 запись, 322 закрытых исхода, −68,7333 R суммарно и −0,213458 R в среднем</strong>. При ограничении событиями после завершения исследования остаются 294 закрытых исхода со средним −0,1941 R. Это полезная дополнительная проверка, но не те же 147 исходов выдачи и не независимый будущий тест всего оптимизатора.</p>
+          <p>Границы replay неодинаковы: отсечки данных приходятся на <strong>23 ноября 08:09–10:34 UTC</strong>. Для № 45 результат ещё не опубликован; в опубликованном наборе есть 58 незакрытых исходов и 6 записей без данных. Незавершённые исходы нельзя объявлять ни нулевыми, ни убытками.</p>
+          <h3 class="subsection">Что именно показала сверка путей</h3>
+          <p>Для выдачи и replay сопоставлены <strong>1 729 записей</strong>. Среди них 145 закрытых в обоих слоях: 36 целей и 109 стопов. <strong>Расхождений статуса или R среди этих 145 — нет.</strong> Ещё у одной записи входной отказ в выдаче сопоставился с отсутствием данных в replay; это другой класс случая, не расхождение двух закрытых сделок.</p>
+          <div class="callout"><p>Такая сверка сужает проблему: наблюдаемый минус нельзя просто списать на несовпадение R у проверенных закрытых строк. Но проверка не доказывает точность исполнения, отсутствие общей свечной ошибки или эквивалентность обучающей модели.</p></div>
+          <div data-slot="supplemental-statistics">
+            <h3 class="subsection">Закрытые исходы известны; вся когорта ещё не дозрела</h3>
+            <p>В срезе семь календарных дней UTC, первый и последний неполные. Самому старому входу 5,9749 дня: ни один ещё не наблюдался полный семидневный горизонт. <strong>Это не делает уже закрытые 147 TP/SL предварительными.</strong> Но среднее по ним не определяет итог оставшегося 21 входа и может отличаться от результата всей будущей зрелой когорты.</p>
+            <p>Чувствительность видна без сложной статистики: у сигналов 17–18 ноября закрыты все 46 входов, среднее +0,076087 R. Для 17–19 ноября закрыты 90, среднее +0,178889 R, ещё 4 открыты. Ранний положительный результат и поздний минус совместимы с существенным эффектом календаря.</p>
+            <details>
+              <summary>Сценарии для 21 открытого исхода, не прогноз и не интервал уверенности</summary>
+              <p>Если все 21 открытый исход впоследствии достигнут стопа, среднее по 168 входам составит −0,229563 R. Если все достигнут своих целей с их собственными TP/SL, среднее составит +0,418254 R. Эти два условных сценария не задают вероятность и не являются доверительным интервалом.</p>
+              <p>Некоторые входы могут не коснуться ни цели, ни стопа до конца горизонта. Поэтому сценарии нельзя называть гарантированными границами окончательного среднего только по закрытым исходам.</p>
+            </details>
+            <p>Повторная выборка синхронных блоков по дням показывает высокую чувствительность к составу короткого периода; она не даёт надёжного скорректированного доверительного интервала или оценки переобучения. При одинаковом весе 50 групп «инструмент × день» среднее остаётся отрицательным, −0,130381 R, но это уже другая схема взвешивания, не исправление исходной оценки.</p>
+          </div>
+        </section>
+
+        <section class="report-section" id="practices" aria-labelledby="practices-title">
+          <p class="section-kicker eyebrow">08 / Внешний контекст</p>
+          <h2 id="practices-title">Мировые практики проверки</h2>
+          <p class="section-intro">Внешняя методика полезна только с объяснением её связи с конкретной проверкой. Само наличие известного подхода не доказывает ошибку текущей системы.</p>
+          <ul class="method-list" data-slot="world-practices">
+            <li><h3>Отделять подбор от проверки</h3><p><strong>Вложенная проверка</strong> означает, что параметры подбираются во внутреннем контуре, а весь процесс выбора проверяется на другом, нетронутом участке. Во временном ряду порядок сохраняют: прошлое обучает, будущее проверяет. Иначе можно переобучить даже сам способ оценки. Основа: <a href="https://www.jmlr.org/papers/v11/cawley10a.html">Cawley &amp; Talbot, 2010</a>.</p><p><strong>Здесь:</strong> проверять не только фиксированный TP/SL, но и всю процедуру, которая выбирает детектор, матрицу и рекомендуемый вариант. Это метод проверки, не обещание получить лучшую прибыль.</p><p><strong>Доступность исхода:</strong> результат старого сигнала можно использовать для обучения только после наблюдаемого TP/SL. Если информационный интервал сделки пересекает границу теста, такую обучающую метку исключают. Это <strong>purging</strong>, исключение перекрывающихся по информации сделок. Временная отсечка общая для всех инструментов. <strong>Embargo</strong> означает защитный временной промежуток, когда он обоснован зависимостью данных; универсальные «семь дней» или фиксированный процент не требуются. У проверки может быть хвост для дозревания исходов, но сведения из этого хвоста нельзя возвращать в прошлое обучение.</p></li>
+            <li><h3>Учитывать, сколько вариантов искали</h3><p><strong>Множественное тестирование</strong> — ситуация, когда хороший результат легче найти просто потому, что попробовали много вариантов. <a href="https://www.davidhbailey.com/dhbpapers/backtest-prob.pdf">Probability of Backtest Overfitting</a> исследует риск такого отбора. <a href="https://www.econometricsociety.org/publications/econometrica/2000/09/01/reality-check-data-snooping">White’s Reality Check</a> и <a href="https://arch.readthedocs.io/en/latest/multiple-comparison/generated/arch.bootstrap.SPA.html">SPA</a> помогают сравнивать семейства правил с базовым вариантом, учитывая поиск.</p><p><strong>Граница применимости:</strong> нужно сохранять результаты кандидатов и учитывать их зависимость. Нельзя просто считать все оценки независимыми и умножать или делить на число запусков.</p></li>
+            <li><h3>Не переносить готовую поправку на чужую метрику</h3><p><a href="https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf">Deflated Sharpe Ratio</a> корректирует интерпретацию коэффициента Шарпа с учётом отбора и свойств доходностей. <strong>Шарп</strong> сопоставляет среднюю избыточную доходность с её изменчивостью. Текущий F — не Шарп, а список R без модели капитала — не автоматически ряд портфельной доходности.</p><p><strong>Здесь:</strong> сначала определить корректный временной ряд и метрику, затем выбирать поправку. Само название метода не делает текущий прогноз откалиброванным.</p></li>
+            <li><h3>Сохранять зависимость при оценке уверенности</h3><p><strong>Блочный bootstrap</strong> — повторная выборка не отдельных сделок, а целых последовательных блоков. Так лучше сохраняются временные серии убытков и общие рыночные движения. Примеры методов: <a href="https://arch.readthedocs.io/en/latest/bootstrap/timeseries-bootstraps.html">bootstrap для временных рядов</a>.</p><p><strong>Здесь:</strong> учитывать день, инструмент и одинаковые события нескольких профилей. Доверительный интервал — диапазон неопределённости при допущениях метода, а не гарантия будущей прибыли.</p></li>
+            <li><h3>Проверять калибровку, а не только красивый рейтинг</h3><p><strong>Калибровка</strong> — соответствие прогнозируемых величин наблюдаемым частотам или средним на новых данных. <a href="https://sites.stat.washington.edu/raftery/Research/PDF/Gneiting2007jasa.pdf">Gneiting &amp; Raftery, 2007</a> объясняют правильные правила оценки вероятностных прогнозов: прогнозу не должно быть выгодно систематически искажать свою уверенность.</p><p><strong>Здесь:</strong> если модель выдаёт вероятность TP, проверять её как вероятность; если ожидаемое R — проверять среднее R в будущих группах. Это разные задачи. Уменьшение прогнозов к более консервативной базе может помочь, но требует отдельной проверки.</p></li>
+            <li><h3>Моделировать достижимость исполнения</h3><p>Реальные сделки зависят от комиссии, разницы между ценами покупки и продажи, проскальзывания, частичного исполнения, задержек и доступности инструмента в тот момент. Обзор: <a href="https://www.quantconnect.com/docs/v2/writing-algorithms/reality-modeling/key-concepts">QuantConnect: Reality Modeling</a>.</p><p><strong>Здесь:</strong> сравнить свечную модель с явным сценарием достижимого входа и выхода. Более реалистичный сценарий — инструмент проверки чувствительности, не доказательство того, что текущий минус вызван только издержками.</p></li>
+          </ul>
+          <p class="table-note">Это методические ориентиры, не ранжирование «лучших» алгоритмов. Методы требуют подходящих данных и допущений. Ни одна из ссылок не обещает положительной доходности этой стратегии.</p>
+        </section>
+
+        <section class="report-section" id="proposals" aria-labelledby="proposals-title">
+          <p class="section-kicker eyebrow">09 / Только предложения</p>
+          <h2 id="proposals-title">Предлагаемые изменения</h2>
+          <p class="section-intro"><strong>Изменения не реализованы.</strong> Этот раздел предназначен для рекомендаций по итогам аудита, а не для фиксации выполненных доработок.</p>
+          <ol class="priority-list" data-slot="prioritized-proposals">
+            <li><span class="badge probable">P0 · до усложнения моделей</span><h3>Хронологический walk-forward всей процедуры</h3><p><strong>Walk-forward</strong>: обучить на прошлом, зафиксировать победителя и проверить на следующем будущем окне. Прогонять весь оптимизатор, включая выбор детектора и TP/SL, а не только одну фиксированную пару. Режим оценки сейчас не является отдельным параметром поиска оптимизатора: mean, forecast и blend следует сравнивать как заранее зафиксированные рецепты. Если по экспериментам выбираются режим, горизонт H, коэффициент сглаживания κ или вес смешивания λ, этот выбор относится к более ранней разработке, не к финальному тесту.</p><p>Начало допустимой выдачи наступает после завершения расчёта; учитывать обычную примерно четырёхчасовую задержку исследования. Допускать в обучение только уже доступные к общей отсечке исходы, исключая пересекающиеся информационные интервалы. Дозревание тестовых исходов не даёт права использовать их в прошлом обучении.</p><p class="acceptance"><strong>Критерий:</strong> будущие окна не участвуют в подборе. Уже просмотренный период этого аудита не является нетронутым holdout, то есть отложенным контрольным отрезком. Сначала зафиксировать протокол, затем собирать новые shadow-сигналы: теневое наблюдение без реальных торговых заявок и без подстройки по исходам. Цена: вычисления и ожидание нового периода; прибыль не гарантируется.</p></li>
+            <li><span class="badge probable">P1 · достоверная статистика</span><h3>Зрелые когорты и зависимые исходы</h3><p><strong>Когорта</strong> — сигналы одного периода, у которых одинаково определена возможность дождаться результата. Сравнивать такие группы, отдельно показывать открытые, отказы фильтра и отсутствие данных. Для неопределённости учитывать повторы инструмента/времени, общие дни и серийные исходы; не приписывать открытому сигналу 0 R.</p><p class="acceptance"><strong>Критерий:</strong> у каждого среднего видны знаменатель, временная отсечка и правила зрелости; интервалы учитывают выбранную зависимость. Цена — доработка учёта и накопление наблюдений; узкий интервал нельзя обещать заранее.</p></li>
+            <li><span class="badge probable">P1 · интерпретация прогноза</span><h3>Разделить рейтинг, выбранную оценку и калибровку</h3><p>Показывать отдельно score, максимум F, F рекомендованной пары и F в выданном сигнале с версией формулы. Проверять соответствие прогноза будущему среднему R, а не только порядку кандидатов. При необходимости исследовать <strong>shrinkage</strong> — уменьшение оценок к консервативной базе — и <strong>decay</strong> — ослабление вклада старых наблюдений.</p><p class="acceptance"><strong>Критерий:</strong> качество калибровки измерено вне подбора, а новое сглаживание сравнивается с прежней формулой на отложенных данных. Ни «затухание вероятности», ни консервативный коэффициент сами по себе не гарантируют улучшения.</p></li>
+            <li><span class="badge confirmed">P1 · сохранить доказанные проверки</span><h3>Регрессии для семантики входа, без обязательного переписывания</h3><p>Использовать проверенный ценовой мост и согласованные закрытые строки как опору для будущих изменений: время сигнала, цена, фильтр и TP/SL должны сохранять заданный контракт. Переписывать оценщик, веса тренда или фильтр только из-за факта отрицательного результата не требуется.</p><p class="acceptance"><strong>Критерий:</strong> будущая модификация проходит сравнение с эталонными примерами либо имеет явно согласованный новый контракт. Цена: компактные целевые тесты; они не заменяют проверку будущего преимущества.</p></li>
+            <li><span class="badge unproven">P2 · после базовых проверок</span><h3>Соседство параметров и реализм издержек</h3><p>Сохранить идею устойчивого соседства кандидата как защиту от одиночного пика на истории, но не называть её независимым holdout. Затем проверить чувствительность к издержкам, доступности рынков в прошлом и консервативным сценариям внутри свечи.</p><p class="acceptance"><strong>Критерий:</strong> показаны отдельно локальная устойчивость на обучении и результат на будущем. Цена — более сложное моделирование; приоритет ниже проверки самого процесса выбора.</p></li>
+          </ol>
+          <div class="callout"><p><strong>Практический следующий шаг:</strong> согласовать и зафиксировать один воспроизводимый протокол хронологической проверки всей процедуры, затем проверить его на новых shadow-сигналах. Не выбирать новый «лучший» вариант на уже просмотренном отрезке и не заменять blend на mean без отдельного доказательства.</p></div>
+        </section>
+
+        <section class="report-section" id="limits-sources" aria-labelledby="limits-sources-title">
+          <p class="section-kicker eyebrow">10 / Границы доказанности</p>
+          <h2 id="limits-sources-title">Ограничения и источники</h2>
+          <div data-slot="audit-limitations">
+            <ul>
+              <li>Это небольшой исторический срез 17–23 ноября 2026 с зависимыми наблюдениями. Срез не доказывает долгосрочную прибыльность или убыточность идеи.</li>
+              <li>Исходы выдачи проверялись в разное время. Весь поток сигналов доходит до 23 ноября 10:41 UTC, но 21 открытый исход оценён по отсечке 10:21 UTC; даты отдельных закрытых проверок ещё более ранние.</li>
+              <li>Replay использует неодинаковые отсечки, пропуски минут и не подтверждает состав рынка в каждый исторический момент. Например, у № 34 указаны 28 326 отсутствующих минут из 7 612 542 ожидаемых по инструментам и времени. Это ограничение покрытия, а не измеренная доля финансовой ошибки.</li>
+              <li>Расчёты по свечам не доказывают достижимость биржевой цены и не задают реальный портфель, плечо или одновременные позиции.</li>
+              <li>Сверка 145 закрытых строк не покрывает все этапы обучения и не исключает одинаковую ошибку двух путей.</li>
+              <li>Независимая рецензия поддержала выводы в пределах этого среза. Не установлены точные доли причин, превосходство mean/forecast/blend или будущий эффект предлагаемых изменений.</li>
+            </ul>
+          </div>
+          <h3>Реестр доказательств</h3>
+          <ol class="source-list" data-slot="sources">
+            <li id="source-data"><strong>Статистический срез:</strong> <code>studies.csv</code> — 26 строк; <code>study-details.json</code> — параметры, статусы и детализация запусков; <code>statistics.json</code> — агрегаты и сопоставимые подвыборки; <code>supplement.json</code> — отсечки и сверка выдачи с replay. Эти файлы переданы из отдельной read-only проверки данных; ссылки на закрытую инфраструктуру не публикуются.</li>
+            <li><strong>Исходный снимок:</strong> <time datetime="2026-11-23T10:44:49.878990Z">23 ноября 2026, 10:44:49.878990 UTC</time>. Переданный SHA-256: <span class="mono-note">bb668c00880b1cfcf3b6a6a370a926f14106ac3b2dac9fa193eb95d4bf5b97d5</span>. Это идентификатор исходного read-only снимка, не контрольная сумма HTML.</li>
+            <li id="source-calibration"><strong>Калибровка и зрелость:</strong> <code>supplemental-calibration.json</code>, воспроизводящий скрипт <code>supplemental-calibration.py</code> и 147 сопоставленных закрытых строк. Обучающие объёмы и настройки: <code>training-review.json</code>. Ценовой мост: <code>entry-bridge-summary.json</code>, read-only снимок <time datetime="2026-11-23T10:53:50.197476Z">23 ноября, 10:53:50.197476 UTC</time>; свечи и построчная сверка сохранены отдельно.</li>
+            <li id="source-code"><strong>Проверка исходников:</strong> в <code>services/setups-platform-rs/crates/</code> проверены <a href="../../services/setups-platform-rs/crates/optimizer/src/evaluation.rs#L294-L307"><code>optimizer/src/evaluation.rs:294–307</code></a> (агрегирование), <a href="../../services/setups-platform-rs/crates/optimizer/src/continuous.rs#L1343-L1470"><code>optimizer/src/continuous.rs:1343–1470</code></a> (отбор), <a href="../../services/setups-platform-rs/crates/domain/src/forecast.rs#L260-L343"><code>domain/src/forecast.rs:260–343</code></a> (прогноз), <a href="../../services/setups-platform-rs/crates/optimizer/src/trend.rs#L62-L139"><code>optimizer/src/trend.rs:62–139</code></a> и <a href="../../services/setups-platform-rs/crates/domain/src/trend.rs#L235-L282"><code>domain/src/trend.rs:235–282</code></a> (тренд). Контракт: <a href="../prd/analytics.md"><code>docs/prd/analytics.md, § 10–13</code></a>. Ссылки ведут в локальный репозиторий; при отдельной копии HTML ориентируйтесь на напечатанные пути и номера строк. Целевая проверка исходников: 89 тестов прошли, 2 проигнорированы; выбранные пары пяти исследований воспроизведены штатным Rust-решателем. Это переданные результаты исходникового аудита, не заявление о полном тестировании системы.</li>
+            <li><strong>Методические публикации:</strong> прямые ссылки даны рядом с подходами в <a href="#practices">разделе 08</a>. Они не являются эмпирическим доказательством эффективности предложений для этой стратегии.</li>
+          </ol>
+          <details>
+            <summary>Сведения о подготовке документа</summary>
+            <dl class="glossary">
+              <div><dt>Подготовлено</dt><dd><time datetime="2026-11-23">23 ноября 2026</time>. Аудит по доступному срезу завершён; независимая рецензия учтена.</dd></div>
+              <div><dt>Срез данных</dt><dd data-slot="data-snapshot">Read-only снимок от 10:44:49.878990 UTC; границы наблюдений и проверки отдельных исходов различаются.</dd></div>
+              <div><dt>Формат</dt><dd>Самодостаточный HTML, встроенные стили и две статические SVG-диаграммы. Внешние шрифты, скрипты и библиотеки не используются. Для чтения документа сеть не нужна; для перехода к публикациям нужна.</dd></div>
+              <div><dt>Границы работы</dt><dd>Созданы отчёт и рабочие материалы аудита; приложение, PRD и production не менялись.</dd></div>
+            </dl>
+          </details>
+        </section>
+      </main>
+    </div>
+
+    <footer class="report-footer">
+      <p>Всплеск цены и оборота · Аудит завершён · 23 ноября 2026</p>
+      <a class="back-to-top" href="#top">К началу ↑</a>
+    </footer>
+  </div>
+</body>
+</html>
