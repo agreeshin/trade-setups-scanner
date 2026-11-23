@@ -1,5 +1,12 @@
 # План разработки продукта
 
+### 23 ноября 2026 - Общая очередь исследований и ручная пауза
+
+- **completed / решение владельца:** подтверждены общая per-owner research FIFO с приоритетом manual после полной текущей continuous-цепочки, сохранение continuous rotation, несколько queued, queued DELETE, настоящая durable manual Pause с освобождением lane и Play в manual FIFO tail. Queue/explicit pause не расходуют maxSeconds; Stop irreversible с partial result, paused не удаляется до Stop. Live/replay/actual независимы. Сначала PRD и отдельный commit, затем source, проверки, commit/push; деплой запрещён.
+- **in_progress / PRD checkpoint:** решение 47, analytics §10.4.1, UX, capacity и decisions заменяют прежние parallel/manual RAM-only/singleton/terminal-only queued-delete ограничения. До docs commit source workers read-only.
+- **Владение:** backend lifecycle/runtime/DB/API `ses_df71a991effeaK7x35PAnRQ5Ql`, frontend `ses_df71a9f7effeFwhUQHlCHTbLUL`; main - контракт, docs/Git, интеграция и приёмка. Generalization optimizer/checkpoint будет отдельным непересекающимся slice после закрепления API. Smart advice один раз по scheduler/checkpoint/budget/compatibility; независимый read-only audit по готовому решению.
+- **pending / критерий:** executable full-chain → manuals A/B FIFO → original continuous cursor; paused освобождает lane, Play same ID/input/frontier tail и budget; Stop/delete/claim races, restart/queued/paused, storage bounds/orphan cleanup, seeded/manual/continuous science parity, UI statuses/Actions/focus/polling/mobile. Затем scope-only commit/push, no deploy.
+
 ### 23 ноября 2026 - Пользовательская пауза непрерывных исследований
 
 - **completed / реализация:** Pause выбранного алгоритма на странице «Алгоритмы», disabled вне running; видимые pausing/loader и paused; Play продолжает обход после паузы либо начинает новый после Stop. Пауза сохраняется в PostgreSQL, не отменяет текущую полную цепочку и не меняет live/maintenance/actual. Разрешены commit/push, деплой запрещён.
