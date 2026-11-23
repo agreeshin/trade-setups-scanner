@@ -212,7 +212,7 @@ fn failure(operation: &str, error: impl std::fmt::Display) -> Response {
     )
 }
 fn unconfigured(algorithm: &str) -> Value {
-    json!({"algorithmId":algorithm,"status":"stopped","configRevision":0,"config":null,"activeStudyId":null,"phase":null,"error":null,"slots":[]})
+    json!({"algorithmId":algorithm,"status":"stopped","desiredRunning":false,"pauseRequested":false,"pauseState":null,"configRevision":0,"config":null,"activeStudyId":null,"phase":null,"error":null,"slots":[]})
 }
 async fn current_response(
     state: &ContinuousState,
@@ -239,6 +239,7 @@ pub fn continuous_router(state: Arc<ContinuousState>) -> Router {
             get(detail).put(configure),
         )
         .route("/v1/continuous-studies/{algorithm}/start", post(start))
+        .route("/v1/continuous-studies/{algorithm}/pause", post(pause))
         .route("/v1/continuous-studies/{algorithm}/stop", post(stop))
         .route("/v1/continuous-studies/{algorithm}/recovery/retry",post(retry_recovery))
         .route("/v1/continuous-studies/{algorithm}/slots/{slot}/live-readmission",post(live_readmission))
@@ -508,6 +509,26 @@ async fn start(
             json!({"error":"configure_required_or_stopping"}),
         ),
         Err(e) => failure("start", e),
+    }
+}
+async fn pause(
+    State(state): State<Arc<ContinuousState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(error) = guard_auth(&state.auth, &headers, true) {
+        return error;
+    }
+    if !registered(&id) {
+        return response(StatusCode::BAD_REQUEST, json!({"error":"unknown_algorithm"}));
+    }
+    match db::pause(&state.pool, ADMIN_OWNER, &id).await {
+        Ok(true) => {
+            state.notify.notify_waiters();
+            current_response(&state, &id, StatusCode::ACCEPTED).await
+        }
+        Ok(false) => response(StatusCode::CONFLICT, json!({"error":"research_pause_not_running"})),
+        Err(error) => failure("pause", error),
     }
 }
 async fn stop(

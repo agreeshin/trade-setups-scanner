@@ -21,6 +21,7 @@ const STUDY_ACTUAL: &str = "0026_study_actual.sql";
 const STUDY_ORIGINAL_OUTCOMES: &str = "0027_study_original_outcomes.sql";
 const MANUAL_ORIGINAL_OUTCOMES: &str = "0028_manual_original_outcomes.sql";
 const STUDY_ACTUAL_CONTINUOUS: &str = "0029_study_actual_continuous.sql";
+const CONTINUOUS_USER_PAUSE: &str = "0030_continuous_user_pause.sql";
 const MIGRATIONS: &[&str] = &[
     BASELINE,
     RUN_NAMES,
@@ -42,6 +43,7 @@ const MIGRATIONS: &[&str] = &[
     STUDY_ORIGINAL_OUTCOMES,
     MANUAL_ORIGINAL_OUTCOMES,
     STUDY_ACTUAL_CONTINUOUS,
+    CONTINUOUS_USER_PAUSE,
 ];
 
 fn migration_source(name: &str) -> &'static str {
@@ -72,6 +74,7 @@ fn migration_source(name: &str) -> &'static str {
         STUDY_ORIGINAL_OUTCOMES => include_str!("../migrations/0027_study_original_outcomes.sql"),
         MANUAL_ORIGINAL_OUTCOMES => include_str!("../migrations/0028_manual_original_outcomes.sql"),
         STUDY_ACTUAL_CONTINUOUS => include_str!("../migrations/0029_study_actual_continuous.sql"),
+        CONTINUOUS_USER_PAUSE => include_str!("../migrations/0030_continuous_user_pause.sql"),
         other => unreachable!("unknown migration {other}"),
     }
 }

@@ -24,11 +24,9 @@ where
         .connect_with(options.clone())
         .await
         .unwrap();
-    let name = format!(
-        "continuous_resume_{}_{}_test",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap()
-    );
+    // Clock resolution may produce equal nanosecond timestamps in parallel cases.
+    let backend: i32 = sqlx::query_scalar("select pg_backend_pid()").fetch_one(&admin).await.unwrap();
+    let name = format!("continuous_resume_{}_{}_test", std::process::id(), backend);
     sqlx::query(&format!("create database {name}"))
         .execute(&admin)
         .await
@@ -91,6 +89,182 @@ async fn expire(pool: &PgPool) {
         .execute(pool)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn user_pause_finishes_full_chain_and_recovers_same_head_before_becoming_paused() {
+    isolated(|pool| async move {
+        let old = job(&pool).await;
+        snapshot(&pool, &old).await;
+        recovery::save_checkpoint(&pool, &old, &identity(), b"pause-boundary", 2 * 1024 * 1024).await.unwrap();
+        let before: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p").fetch_one(&pool).await.unwrap();
+        assert!(db::pause(&pool, OWNER, ALGORITHM).await.unwrap());
+        assert!(db::pause(&pool, OWNER, ALGORITHM).await.unwrap());
+        let after: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p").fetch_one(&pool).await.unwrap();
+        let mut expected = before;
+        expected["pause_requested"] = json!(true);
+        expected["updated_at"] = after["updated_at"].clone();
+        assert_eq!(after, expected, "Pause only changes admission intent");
+        let process = db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap();
+        assert_eq!(process.pause_state, Some("pausing"));
+        assert_eq!(process.status, "running");
+        assert!(process.desired_running && process.pause_requested);
+        assert!(scheduler::current(&pool, &old).await.unwrap());
+        assert!(scheduler::phase(&pool, &old, "searching", None).await.unwrap());
+        assert!(scheduler::prepare_next(&pool, &old.lease).await.unwrap().is_none());
+
+        expire(&pool).await;
+        let lease = scheduler::claim_owner(&pool, "paused-replacement").await.unwrap().expect("already admitted recovery ignores user pause");
+        scheduler::recover_owner(&pool, &lease).await.unwrap();
+        let same = recovery::active_job(&pool, &lease).await.unwrap().unwrap();
+        assert_eq!((same.study_id, same.generation_id, same.config_revision), (old.study_id, old.generation_id, old.config_revision));
+        assert_eq!(same.execution_started_at, old.execution_started_at);
+        assert_eq!(same.research_deadline, old.research_deadline);
+        assert_eq!(same.observation_cutoff, old.observation_cutoff);
+        assert_eq!(recovery::load(&pool, &same, &identity()).await.unwrap().checkpoint.unwrap(), b"pause-boundary");
+        scheduler::finish_search(&pool, &same, &json!({"progress":{},"best":{"score":0.2}}), true).await.unwrap();
+        assert_eq!(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap().pause_state, Some("pausing"), "completed search is not full-chain completion");
+        let batch = scheduler::persist_replay(&pool, &same, &json!({}), json!({"instruments":[{}]}), &[scheduler::ServiceReplayRun {
+            exchange: "bybit".into(), category: "linear".into(), symbol: "BTCUSDT".into(), setups: json!([]), warmup_minutes: 0, evaluated_minutes: 1,
+        }]).await.unwrap().unwrap();
+        assert_eq!(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap().pause_state, Some("pausing"), "committed replay still requires analytics/gate/finalize");
+        let gate = recovery::Gate { result: json!({"recommendation":{},"analytics":{},"selectedCell":{"tpPct":1,"slPct":1},"meanExpectancy":0.2}), accepted: true, mean: Some(0.2), selected: Some(json!({"tpPct":1,"slPct":1})) };
+        assert!(recovery::save_gate(&pool, &same, &identity(), &gate).await.unwrap());
+        assert!(scheduler::finalize(&pool, &same, &gate.result, true, gate.mean, gate.selected.as_ref()).await.unwrap());
+        assert!(scheduler::finalize(&pool, &same, &gate.result, true, gate.mean, gate.selected.as_ref()).await.unwrap());
+        let paused = db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap();
+        assert_eq!(paused.pause_state, Some("paused"));
+        assert!(paused.pause_requested && paused.desired_running);
+        assert!(paused.active_study_id.is_none());
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from adaptive_profile_handoffs where generation_id=$1").bind(same.generation_id).fetch_one(&pool).await.unwrap(), 1);
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from replay_runs where batch_id=$1 and status='done'").bind(batch as i32).fetch_one(&pool).await.unwrap(), 1);
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from continuous_runtime_artifacts").fetch_one(&pool).await.unwrap(), 0);
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from continuous_frozen_chunks").fetch_one(&pool).await.unwrap(), 0);
+        scheduler::release(&pool, &lease).await.unwrap();
+        assert!(scheduler::claim_owner(&pool, "paused-no-next").await.unwrap().is_none());
+        let mut edited = old.config.clone();
+        edited["minSetupsPerDay"] = json!([7]);
+        assert!(db::configure(&pool, OWNER, ALGORITHM, &edited, &[7.0]).await.unwrap());
+        assert!(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap().pending_config.is_some());
+        assert!(db::start(&pool, OWNER, ALGORITHM).await.unwrap());
+        sqlx::query("update continuous_processes set next_attempt_at=now()").execute(&pool).await.unwrap();
+        let lease = scheduler::claim_owner(&pool, "paused-edit-next").await.unwrap().unwrap();
+        let edited_job = scheduler::prepare_next(&pool, &lease).await.unwrap().unwrap();
+        assert_eq!(edited_job.spec["minSetupsPerDay"], 7.0);
+        assert_eq!(edited_job.config_revision, old.config_revision + 1);
+        assert_ne!(edited_job.study_id, old.study_id);
+        assert!(db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap().pending_config.is_none());
+        scheduler::release(&pool, &lease).await.unwrap();
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn user_pause_skips_only_its_algorithm_preserves_failure_and_is_independent_of_maintenance() {
+    isolated(|pool| async move {
+        let old = job(&pool).await;
+        assert!(db::pause(&pool, OWNER, ALGORITHM).await.unwrap());
+        let failure = json!({"code":"evaluation_failed","message":"visible technical failure"});
+        scheduler::fail(&pool, &old, &failure).await.unwrap();
+        // A stale pointer to a terminal generation must not project an endless pausing spinner.
+        sqlx::query("update continuous_processes set active_generation_id=$1,active_study_id=$2,next_attempt_at=to_timestamp(123),next_slot=7").bind(old.generation_id).bind(old.study_id).execute(&pool).await.unwrap();
+        let paused = db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap();
+        assert_eq!(paused.pause_state, Some("paused"));
+        assert_eq!(paused.status, "error");
+        assert_eq!(paused.error, Some(failure));
+        assert!(db::pause(&pool, "another-owner", ALGORITHM).await.unwrap() == false);
+        let other = "price_drop_volume_spike";
+        let mut config = old.config.clone();
+        config["study"]["algorithmId"] = json!(other);
+        assert!(db::configure(&pool, OWNER, other, &config, &[0.0]).await.unwrap());
+        assert!(!db::pause(&pool, OWNER, other).await.unwrap(), "stopped process is not started by Pause");
+        assert!(db::start(&pool, OWNER, other).await.unwrap());
+        let next = scheduler::prepare_next(&pool, &old.lease).await.unwrap().expect("paused A must not block B");
+        assert_eq!(next.algorithm_id, other);
+        scheduler::fail(&pool, &next, &json!({"code":"fixture_done","message":"done"})).await.unwrap();
+        assert!(db::pause(&pool, OWNER, other).await.unwrap());
+        scheduler::release(&pool, &old.lease).await.unwrap();
+        assert!(scheduler::claim_owner(&pool, "both-paused").await.unwrap().is_none());
+        maintenance::set_paused(&pool, OWNER, true).await.unwrap();
+        let before: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p where algorithm_id=$1").bind(ALGORITHM).fetch_one(&pool).await.unwrap();
+        assert!(db::start(&pool, OWNER, ALGORITHM).await.unwrap());
+        let after: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p where algorithm_id=$1").bind(ALGORITHM).fetch_one(&pool).await.unwrap();
+        let mut expected = before;
+        expected["pause_requested"] = json!(false);
+        expected["updated_at"] = after["updated_at"].clone();
+        assert_eq!(after, expected, "Play preserves errors/retries/rotation/IDs/config/backoff");
+        assert!(maintenance::status(&pool, OWNER).await.unwrap().admission_paused);
+        assert!(scheduler::claim_owner(&pool, "maintenance-still-closed").await.unwrap().is_none());
+        maintenance::set_paused(&pool, OWNER, false).await.unwrap();
+        assert!(db::get(&pool, OWNER, other).await.unwrap().unwrap().pause_requested);
+        let lease = scheduler::claim_owner(&pool, "only-A-resumed").await.unwrap().unwrap();
+        assert_eq!(scheduler::prepare_next(&pool, &lease).await.unwrap().unwrap().algorithm_id, ALGORITHM);
+        scheduler::release(&pool, &lease).await.unwrap();
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn user_pause_exhausted_head_remains_visible_and_play_does_not_grant_recovery() {
+    isolated(|pool| async move {
+        let old = job(&pool).await;
+        snapshot(&pool, &old).await;
+        let failure = json!({"code":"durable_resume_retry_exhausted","message":"explicit technical recovery required"});
+        sqlx::query("update continuous_processes set status='error',retry_count=3,error=$1,next_attempt_at=to_timestamp(123)").bind(&failure).execute(&pool).await.unwrap();
+        scheduler::release(&pool, &old.lease).await.unwrap();
+        assert!(db::pause(&pool, OWNER, ALGORITHM).await.unwrap());
+        let paused = db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap();
+        assert_eq!(paused.status, "error");
+        assert_eq!(paused.pause_state, Some("pausing"));
+        assert_eq!(paused.error, Some(failure.clone()));
+        assert_eq!(paused.active_study_id, Some(old.study_id));
+        assert!(db::start(&pool, OWNER, ALGORITHM).await.unwrap(), "Play removes only user pause even on a blocked head");
+        let resumed = db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap();
+        assert_eq!(resumed.status, "error");
+        assert_eq!(resumed.pause_state, None);
+        assert!(!resumed.pause_requested);
+        assert_eq!(resumed.error, Some(failure));
+        assert_eq!(resumed.active_study_id, Some(old.study_id));
+        assert_eq!(sqlx::query_scalar::<_, i32>("select retry_count from continuous_processes").fetch_one(&pool).await.unwrap(), 3);
+        assert!(scheduler::claim_owner(&pool, "no-budget-from-play").await.unwrap().is_none());
+        assert!(!db::start(&pool, OWNER, ALGORITHM).await.unwrap(), "ordinary Start remains distinct from explicit recovery");
+        assert_eq!(sqlx::query_scalar::<_, i64>("select count(*) from continuous_runtime_artifacts").fetch_one(&pool).await.unwrap(), 1, "Pause/Play never discard the admitted durable head");
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn user_pause_races_with_admission_and_stop_without_cancelling_or_reusing_heads() {
+    isolated(|pool| async move {
+        let first = job(&pool).await;
+        scheduler::finish_search(&pool, &first, &json!({"progress":{},"best":null}), true).await.unwrap();
+        assert!(scheduler::finalize(&pool, &first, &json!({"reason":"no_winner"}), false, None, None).await.unwrap());
+        let mut previous_study = first.study_id;
+        for _ in 0..6 {
+            sqlx::query("update continuous_processes set next_attempt_at=now() where owner_id=$1").bind(OWNER).execute(&pool).await.unwrap();
+            let (paused, admitted) = tokio::join!(db::pause(&pool, OWNER, ALGORITHM), scheduler::prepare_next(&pool, &first.lease));
+            assert!(paused.unwrap());
+            if let Some(admitted) = admitted.unwrap() {
+                assert_ne!(admitted.study_id, previous_study);
+                previous_study = admitted.study_id;
+                assert!(scheduler::current(&pool, &admitted).await.unwrap(), "Pause must not cancel the admission that won the lock");
+            }
+            assert!(scheduler::prepare_next(&pool, &first.lease).await.unwrap().is_none(), "no new head after committed Pause");
+            let (started, stopped) = tokio::join!(db::start(&pool, OWNER, ALGORITHM), db::stop(&pool, OWNER, ALGORITHM));
+            let _ = started.unwrap();
+            assert!(stopped.unwrap());
+            let stopping = db::get(&pool, OWNER, ALGORITHM).await.unwrap().unwrap();
+            assert_eq!(stopping.status, "stopping");
+            assert!(!stopping.pause_requested);
+            assert_eq!(stopping.pause_state, None);
+            assert!(!db::pause(&pool, OWNER, ALGORITHM).await.unwrap());
+            assert!(!db::start(&pool, OWNER, ALGORITHM).await.unwrap());
+            scheduler::drain_stops(&pool, &first.lease).await.unwrap();
+            assert!(db::start(&pool, OWNER, ALGORITHM).await.unwrap());
+        }
+        scheduler::release(&pool, &first.lease).await.unwrap();
+    }).await;
 }
 
 #[tokio::test]

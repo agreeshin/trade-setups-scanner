@@ -56,6 +56,10 @@ pub struct ContinuousProcess {
     pub owner_id: String,
     pub algorithm_id: String,
     pub status: String,
+    pub desired_running: bool,
+    pub pause_requested: bool,
+    /// Admission intent is separate from operational errors and recovery state.
+    pub pause_state: Option<&'static str>,
     pub config_revision: i64,
     pub config: Value,
     pub pending_config: Option<Value>,
@@ -70,6 +74,13 @@ fn process(row: &PgRow) -> Result<ContinuousProcess, DbError> {
         owner_id: row.try_get("owner_id")?,
         algorithm_id: row.try_get("algorithm_id")?,
         status: row.try_get("status")?,
+        desired_running: row.try_get("desired_running")?,
+        pause_requested: row.try_get("pause_requested")?,
+        pause_state: if row.try_get::<bool, _>("pause_requested")? {
+            Some(if row.try_get::<bool, _>("chain_running")? { "pausing" } else { "paused" })
+        } else {
+            None
+        },
         config_revision: row.try_get("config_revision")?,
         config: row.try_get("config")?,
         pending_config: row.try_get("pending_config")?,
@@ -114,7 +125,7 @@ pub async fn get(
         .execute(&mut *tx)
         .await?;
     let row =
-        sqlx::query("select * from continuous_processes where owner_id=$1 and algorithm_id=$2")
+        sqlx::query("select p.*,exists(select 1 from continuous_generations g where g.owner_id=p.owner_id and g.algorithm_id=p.algorithm_id and g.status='running') chain_running from continuous_processes p where p.owner_id=$1 and p.algorithm_id=$2")
             .bind(owner)
             .bind(algorithm)
             .fetch_optional(&mut *tx)
@@ -326,13 +337,20 @@ pub async fn configure(
 pub async fn start(pool: &PgPool, owner: &str, algorithm: &str) -> Result<bool, DbError> {
     let mut tx = pool.begin().await?;
     owner_lock(&mut tx, owner).await?;
-    if let Some(row)=sqlx::query("select desired_running,status from continuous_processes where owner_id=$1 and algorithm_id=$2 for update")
+    if let Some(row)=sqlx::query("select desired_running,status,pause_requested from continuous_processes where owner_id=$1 and algorithm_id=$2 for update")
         .bind(owner).bind(algorithm).fetch_optional(&mut *tx).await?
         && row.try_get::<bool,_>("desired_running")? {
+        if row.try_get::<bool, _>("pause_requested")? && row.try_get::<String, _>("status")? != "stopping" {
+            // Resume only admission, never an exhausted recovery budget.
+            sqlx::query("update continuous_processes set pause_requested=false,updated_at=now() where owner_id=$1 and algorithm_id=$2")
+                .bind(owner).bind(algorithm).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
         let already_running=row.try_get::<String,_>("status")?=="running";
         tx.commit().await?;return Ok(already_running);
     }
-    let changed = sqlx::query("update continuous_processes set desired_running=true,status='running',error=null,retry_count=0,next_attempt_at=now(),phase=coalesce(phase,'queued'),updated_at=now() where owner_id=$1 and algorithm_id=$2 and status<>'stopping' and not exists(select 1 from continuous_generations g where g.id=continuous_processes.active_generation_id and g.status='running' and continuous_processes.error->>'code'='durable_resume_retry_exhausted')")
+    let changed = sqlx::query("update continuous_processes set desired_running=true,pause_requested=false,status='running',error=null,retry_count=0,next_attempt_at=now(),phase=coalesce(phase,'queued'),updated_at=now() where owner_id=$1 and algorithm_id=$2 and status<>'stopping' and not exists(select 1 from continuous_generations g where g.id=continuous_processes.active_generation_id and g.status='running' and continuous_processes.error->>'code'='durable_resume_retry_exhausted')")
         .bind(owner).bind(algorithm).execute(&mut *tx).await?.rows_affected()>0;
     // Research-only state; live control and retained detector cursors are independent.
     if changed {
@@ -340,6 +358,16 @@ pub async fn start(pool: &PgPool, owner: &str, algorithm: &str) -> Result<bool, 
             .bind(owner).bind(algorithm).execute(&mut *tx).await?;
         scheduler::apply_pending_config(&mut tx, owner, algorithm).await?;
     }
+    tx.commit().await?;
+    Ok(changed)
+}
+
+/// Close only this algorithm's next admission; never fence an admitted chain.
+pub async fn pause(pool: &PgPool, owner: &str, algorithm: &str) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
+    owner_lock(&mut tx, owner).await?;
+    let changed = sqlx::query("update continuous_processes set pause_requested=true,updated_at=case when pause_requested then updated_at else now() end where owner_id=$1 and algorithm_id=$2 and desired_running and status<>'stopping'")
+        .bind(owner).bind(algorithm).execute(&mut *tx).await?.rows_affected() == 1;
     tx.commit().await?;
     Ok(changed)
 }
@@ -368,7 +396,7 @@ pub async fn stop(pool: &PgPool, owner: &str, algorithm: &str) -> Result<bool, D
         .bind(owner).bind(algorithm).fetch_all(&mut *tx).await?;
     let batches: Vec<i32> = sqlx::query_scalar("select b.id from replay_batches b join continuous_generations g on g.id=b.continuous_generation_id where b.owner_id=$1 and b.origin='continuous' and g.algorithm_id=$2 and g.status='running' and not exists(select 1 from replay_runs r where r.batch_id=b.id and r.status='done')")
         .bind(owner).bind(algorithm).fetch_all(&mut *tx).await?;
-    sqlx::query("update continuous_processes set desired_running=false,status='stopping',config_revision=config_revision+1,phase='stopping',cleanup_targets=$3,updated_at=now() where owner_id=$1 and algorithm_id=$2")
+    sqlx::query("update continuous_processes set desired_running=false,pause_requested=false,status='stopping',config_revision=config_revision+1,phase='stopping',cleanup_targets=$3,updated_at=now() where owner_id=$1 and algorithm_id=$2")
         .bind(owner).bind(algorithm).bind(json!({"studies":studies,"runs":runs,"batches":batches})).execute(&mut *tx).await?;
     sqlx::query("update optimization_studies set status='cancel_requested',updated_at=now() where id=any($1)")
         .bind(&studies).execute(&mut *tx).await?;

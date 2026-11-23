@@ -41,7 +41,7 @@ pub async fn claim_owner(pool: &PgPool, worker: &str) -> Result<Option<OwnerLeas
                 and coalesce(p.error->>'code','')<>'durable_resume_retry_exhausted'
                 and exists(select 1 from continuous_slots s where s.owner_id=p.owner_id and s.algorithm_id=p.algorithm_id and s.enabled)
                 and ((g.id is not null and (p.retry_count<3 or (g.resume_version=1 and p.retry_count=3)))
-                    or (g.id is null and p.retry_count<3
+                    or (g.id is null and not p.pause_requested and p.retry_count<3
                         and not exists(select 1 from continuous_generations a where a.owner_id=l.owner_id and a.status='running')
                         and not coalesce((select admission_paused from continuous_maintenance where owner_id=l.owner_id),false)))
             ))) order by l.lease_until nulls first,l.owner_id for update skip locked limit 1"#)
@@ -209,14 +209,23 @@ pub async fn prepare_next(pool: &PgPool, lease: &OwnerLease) -> Result<Option<Ch
     }
     if sqlx::query_scalar::<_,bool>("select exists(select 1 from continuous_generations where owner_id=$1 and status='running')").bind(&lease.owner_id).fetch_one(&mut *tx).await? {return Ok(None);}
     if sqlx::query_scalar::<_,bool>("select coalesce((select admission_paused from continuous_maintenance where owner_id=$1),false)").bind(&lease.owner_id).fetch_one(&mut *tx).await? {return Ok(None);}
-    let row=sqlx::query("select p.* from continuous_processes p join continuous_owner_lanes l using(owner_id) where p.owner_id=$1 and p.desired_running and p.retry_count<3 and p.next_attempt_at<=now() and exists(select 1 from continuous_slots s where s.owner_id=p.owner_id and s.algorithm_id=p.algorithm_id and s.enabled) order by (p.algorithm_id>l.last_algorithm_id) desc,p.algorithm_id for update of p limit 1")
+    let row=sqlx::query("select p.* from continuous_processes p join continuous_owner_lanes l using(owner_id) where p.owner_id=$1 and p.desired_running and not p.pause_requested and p.retry_count<3 and p.next_attempt_at<=now() and exists(select 1 from continuous_slots s where s.owner_id=p.owner_id and s.algorithm_id=p.algorithm_id and s.enabled) order by (p.algorithm_id>l.last_algorithm_id) desc,p.algorithm_id for update of p limit 1")
         .bind(&lease.owner_id).fetch_optional(&mut *tx).await?;
     let Some(row) = row else {
         return Ok(None);
     };
     let algorithm: String = row.try_get("algorithm_id")?;
-    let config: Value = row.try_get("config")?;
+    // An idle user-paused process can receive a deferred save without another
+    // terminal boundary. Apply it here, before the next admitted generation,
+    // through the same helper as finalize/fail and a fresh Start.
+    let pending: Option<Value> = row.try_get("pending_config")?;
     let revision: i64 = row.try_get("config_revision")?;
+    let (config, revision) = if let Some(config) = pending {
+        apply_pending_config(&mut tx, &lease.owner_id, &algorithm).await?;
+        (config, revision + 1)
+    } else {
+        (row.try_get::<Value, _>("config")?, revision)
+    };
     let cursor: i32 = row.try_get("next_slot")?;
     let thresholds = config["minSetupsPerDay"]
         .as_array()

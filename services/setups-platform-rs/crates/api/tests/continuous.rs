@@ -48,11 +48,12 @@ fn continuous_config_locks_owned_coordinates_and_normalizes_manual_defaults() {
 async fn continuous_routes_authenticate_and_validate_before_database() {
     let pool=PgPoolOptions::new().connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test").unwrap();
     let router=continuous_router(state(pool));
-    for (method,url) in [("GET",path("")),("PUT",path("")),("POST",path("/start")),("POST",path("/stop")),("POST",path("/slots/1/live-readmission")),("GET","/v1/continuous-studies/cleanup".into()),("POST","/v1/continuous-studies/cleanup".into()),("GET","/v1/continuous-studies/maintenance".into()),("POST","/v1/continuous-studies/maintenance/drain".into()),("POST","/v1/continuous-studies/maintenance/resume".into())] {
+    for (method,url) in [("GET",path("")),("PUT",path("")),("POST",path("/start")),("POST",path("/pause")),("POST",path("/stop")),("POST",path("/slots/1/live-readmission")),("GET","/v1/continuous-studies/cleanup".into()),("POST","/v1/continuous-studies/cleanup".into()),("GET","/v1/continuous-studies/maintenance".into()),("POST","/v1/continuous-studies/maintenance/drain".into()),("POST","/v1/continuous-studies/maintenance/resume".into())] {
         let response=router.clone().oneshot(Request::builder().method(method).uri(url).header("content-type","application/json").body(Body::from(config().to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
     }
     for url in ["/v1/continuous-studies?ownerId=other","/v1/continuous-studies?algorithmId=missing"] {assert_eq!(request(&router,"GET",url,Value::Null).await.0,StatusCode::BAD_REQUEST);}
+    assert_eq!(request(&router,"POST","/v1/continuous-studies/missing/pause",Value::Null).await.0,StatusCode::BAD_REQUEST);
     let mut invalid=config();invalid["study"]["setupMaturity"]=json!(0);
     assert_eq!(request(&router,"PUT",&path(""),invalid).await.0,StatusCode::BAD_REQUEST);
     for body in [json!({}),json!({"confirm":false,"fingerprint":"0".repeat(32)}),json!({"confirm":true,"fingerprint":"bad"}),json!({"confirm":true,"fingerprint":"0".repeat(32),"ownerId":"other"})] {
@@ -75,7 +76,7 @@ async fn continuous_cleanup_rejects_cookie_mutation_without_browser_origin_befor
     let s=state(pool);
     let setups_api::auth::PostSessionResult::Issued{token,..}=s.auth.post_session(Some("test-key"),setups_api::now_ms()) else {panic!("fixture login failed")};
     let router=continuous_router(s);
-    for path in ["/v1/continuous-studies/cleanup","/v1/continuous-studies/maintenance/drain","/v1/continuous-studies/maintenance/resume","/v1/continuous-studies/price_volume_spike/slots/1/live-readmission","/v1/adaptive-profiles/1/stop","/v1/adaptive-profiles/1/play","/v1/continuous-studies/price_volume_spike/recovery/retry"] {
+    for path in ["/v1/continuous-studies/cleanup","/v1/continuous-studies/maintenance/drain","/v1/continuous-studies/maintenance/resume","/v1/continuous-studies/price_volume_spike/pause","/v1/continuous-studies/price_volume_spike/slots/1/live-readmission","/v1/adaptive-profiles/1/stop","/v1/adaptive-profiles/1/play","/v1/continuous-studies/price_volume_spike/recovery/retry"] {
         let response=router.clone().oneshot(Request::builder().method("POST").uri(path).header("cookie",format!("{}={token}",setups_api::COOKIE_NAME)).header("content-type","application/json").body(Body::from(json!({"confirm":true,"fingerprint":"0".repeat(32)}).to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(),StatusCode::FORBIDDEN);
     }
@@ -99,6 +100,65 @@ impl TestDb {
         Self{admin,pool,name}
     }
     async fn cleanup(self) {self.pool.close().await;sqlx::query(&format!("drop database {} with(force)",self.name)).execute(&self.admin).await.unwrap();self.admin.close().await;}
+}
+
+#[tokio::test]
+#[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn user_pause_http_is_persistent_idempotent_honest_about_errors_and_independent_of_maintenance() {
+    let fixture = TestDb::new().await;
+    let database = state(fixture.pool.clone());
+    let outcome = tokio::spawn(async move {
+        let router = continuous_router(database.clone());
+        let initial = request(&router, "GET", &path(""), Value::Null).await.1;
+        assert_eq!(initial["pauseRequested"], false);
+        assert_eq!(initial["pauseState"], Value::Null);
+        assert_eq!(request(&router, "POST", &path("/pause"), Value::Null).await.0, StatusCode::CONFLICT);
+        assert_eq!(request(&router, "PUT", &path(""), config()).await.0, StatusCode::OK);
+        assert_eq!(request(&router, "POST", &path("/pause"), Value::Null).await.0, StatusCode::CONFLICT);
+        assert_eq!(request(&router, "POST", &path("/start"), Value::Null).await.0, StatusCode::ACCEPTED);
+        let (status, paused) = request(&router, "POST", &path("/pause"), Value::Null).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(paused["status"], "running");
+        assert_eq!(paused["desiredRunning"], true);
+        assert_eq!(paused["pauseRequested"], true);
+        assert_eq!(paused["pauseState"], "paused");
+        assert_eq!(request(&router, "POST", &path("/pause"), Value::Null).await.1, paused);
+        assert_eq!(request(&router, "GET", &path(""), Value::Null).await.1, paused);
+        assert_eq!(request(&router, "GET", "/v1/continuous-studies", Value::Null).await.1["processes"][0], paused);
+        let lease = setups_db::continuous::scheduler::claim_owner(&database.pool, "paused-api").await.unwrap();
+        assert!(lease.is_none());
+        assert_eq!(request(&router, "POST", "/v1/continuous-studies/maintenance/drain", Value::Null).await.0, StatusCode::OK);
+        sqlx::query(r#"update continuous_processes set status='error',retry_count=3,error='{"code":"durable_resume_retry_exhausted","message":"explicit recovery required"}',next_attempt_at=to_timestamp(123)"#)
+            .execute(&database.pool).await.unwrap();
+        let before: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p").fetch_one(&database.pool).await.unwrap();
+        let error = request(&router, "GET", &path(""), Value::Null).await.1;
+        assert_eq!(error["status"], "error");
+        assert_eq!(error["pauseState"], "paused");
+        assert_eq!(error["error"]["code"], "durable_resume_retry_exhausted");
+        let (status, resumed) = request(&router, "POST", &path("/start"), Value::Null).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(resumed["status"], "error");
+        assert_eq!(resumed["pauseRequested"], false);
+        assert_eq!(resumed["pauseState"], Value::Null);
+        assert_eq!(resumed["error"], error["error"]);
+        let after: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p").fetch_one(&database.pool).await.unwrap();
+        let mut expected = before;
+        expected["pause_requested"] = json!(false);
+        expected["updated_at"] = after["updated_at"].clone();
+        assert_eq!(after, expected);
+        assert_eq!(request(&router, "GET", "/v1/continuous-studies/maintenance", Value::Null).await.1["admissionPaused"], true);
+        assert_eq!(request(&router, "POST", &path("/pause"), Value::Null).await.0, StatusCode::ACCEPTED);
+        assert_eq!(request(&router, "POST", "/v1/continuous-studies/maintenance/resume", Value::Null).await.0, StatusCode::OK);
+        assert_eq!(request(&router, "GET", &path(""), Value::Null).await.1["pauseRequested"], true);
+        let stopped = request(&router, "POST", &path("/stop"), Value::Null).await.1;
+        assert_eq!(stopped["status"], "stopping");
+        assert_eq!(stopped["pauseRequested"], false);
+        assert_eq!(stopped["pauseState"], Value::Null);
+        assert_eq!(request(&router, "POST", &path("/pause"), Value::Null).await.0, StatusCode::CONFLICT);
+        assert_eq!(request(&router, "POST", &path("/start"), Value::Null).await.0, StatusCode::CONFLICT);
+    }).await;
+    fixture.cleanup().await;
+    outcome.expect("user Pause HTTP assertions after isolated cleanup");
 }
 
 #[tokio::test]
