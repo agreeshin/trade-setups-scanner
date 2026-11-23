@@ -31,6 +31,13 @@ pub use enrichment::{AdaptiveExpectancySnapshot, ExpectancyOverlayKey};
 const HISTORY_PAGE_LIMIT:u32=5000;
 const IO_CONCURRENCY:usize=4;
 const COMMIT_CONCURRENCY:usize=16;
+fn cold_commit_concurrency(pool:&PgPool)->Result<usize,WorkerError> {
+    // This pool is data-only. Control owns a separate connection in the same
+    // configured live total; pool2 therefore gives us a valid max1 data pool.
+    let capacity=pool.options().get_max_connections();
+    if capacity==0 {return Err(invalid("cold persistence requires a nonempty data pool"));}
+    Ok(COMMIT_CONCURRENCY.min(capacity as usize))
+}
 const WARMUP_TIME_SLICE:Duration=Duration::from_secs(1);
 const JOIN_MAX_PER_TURN:usize=8;
 const JOIN_TIME_SLICE:Duration=Duration::from_millis(100);
@@ -182,7 +189,7 @@ impl AdaptiveLiveRuntime {
         if total>self.state.limits.max_history_bytes {return Err(invalid("complete pending universe plus staging exceeds history byte admission budget"));}
         Ok(())
     }
-    async fn refresh_warmup(&mut self,pool:&PgPool,pending:Vec<live::PendingAdaptiveSlot>,catalog:&[CatalogInstrument],active:&[SymbolPlan],slots:&[Arc<ActiveAdaptiveSlot>],target:i64)->Result<(),WorkerError> {
+    async fn refresh_warmup(&mut self,pool:&PgPool,data_pool:&PgPool,pending:Vec<live::PendingAdaptiveSlot>,catalog:&[CatalogInstrument],active:&[SymbolPlan],slots:&[Arc<ActiveAdaptiveSlot>],target:i64)->Result<(),WorkerError> {
         let cohort:BTreeSet<_>=slots.iter().map(|slot|json!([slot.owner_id,slot.algorithm_id,slot.slot_id,slot.generation_id,slot.config_revision]).to_string()).collect();
         if let Some(warmup)=&self.warmup {
             let current=warmup.cohort==cohort && pending.iter().any(|p|p.profile.slot_id==warmup.lease.slot_id && p.profile.generation_id==warmup.lease.generation_id
@@ -236,7 +243,7 @@ impl AdaptiveLiveRuntime {
             let mut fields=live::warmup_diagnostic_fields(&lease);
             fields["study_id"]=candidate.profile.study_id.into();fields["stage"]="plan_build".into();
             fields["outcome"]="started".into();lifecycle::emit(Level::Info,"adaptive_warmup_started",fields);
-            let build=self.build_warmup_plans(pool,&candidate,active,slots,catalog,supervisor.permit()).await.and_then(|built| {
+            let build=self.build_warmup_plans(data_pool,&candidate,active,slots,catalog,supervisor.permit()).await.and_then(|built| {
                 supervisor.permit().check()?;Ok(built)
             });
             match build {
@@ -433,10 +440,17 @@ impl AdaptiveLiveRuntime {
         self.tick_at(pool,client,stopped,chrono::Utc::now().timestamp()).await
     }
     /// Explicit observation clock for deterministic guarded-tick integration.
-    /// The production loop always uses tick(), which supplies the actual UTC clock.
+    /// Isolated single-pool compatibility; production uses tick_at_on_pools
+    /// with distinct data/control pools and the actual UTC observation clock.
     pub async fn tick_at(&mut self,pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool,observation_unix:i64)->Result<(),WorkerError> {
+        // Compatibility for isolated callers/tests. Production always supplies
+        // distinct pools through tick_at_on_pools, never this shared-pool path.
+        self.tick_at_on_pools(pool,pool,client,stopped,observation_unix).await
+    }
+    pub async fn tick_at_on_pools(&mut self,data_pool:&PgPool,control_pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool,observation_unix:i64)->Result<(),WorkerError> {
+        let pool=control_pool;
         let mut trace=diagnostics::TickTrace::new(&self.worker);
-        let result=self.tick_observed(pool,client,stopped,observation_unix,&mut trace).await;
+        let result=self.tick_observed(pool,data_pool,client,stopped,observation_unix,&mut trace).await;
         let target=observation_unix.div_euclid(60)*60;
         let level=if result.is_err() {Level::Error}
             else if trace.started.elapsed()>=Duration::from_secs(5) || self.diagnostic_summary_at.elapsed()>=Duration::from_secs(30) {Level::Info}
@@ -456,10 +470,12 @@ impl AdaptiveLiveRuntime {
         }
         Err(error)
     }
-    async fn tick_observed(&mut self,pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool,observation_unix:i64,trace:&mut diagnostics::TickTrace)->Result<(),WorkerError> {
+    // `pool` is exclusively serial control: no data task receives/clones it.
+    async fn tick_observed(&mut self,pool:&PgPool,data_pool:&PgPool,client:&MarketDataClient,stopped:&AtomicBool,observation_unix:i64,trace:&mut diagnostics::TickTrace)->Result<(),WorkerError> {
         if stopped.load(Ordering::SeqCst) {return Ok(());}
         self.check_supervision()?;
         continuous::profiles::accept_handoffs(pool,continuous::ADMIN_OWNER).await?;
+        trace.enter("settings");
         if settings_get(pool,"live").await?.unwrap_or(json!({}))["enabled"]!=true {
             self.shutdown_warmup(pool).await?;
             self.state.clear();self.preparation.clear();
@@ -478,8 +494,8 @@ impl AdaptiveLiveRuntime {
         let catalog=client.instruments().await.map_err(|e|invalid(&e.to_string()))?;
         trace.enter("plan_refresh");
         self.check_supervision()?;
-        let active=self.active_plans(pool,&slots,&catalog).await?;
-        self.refresh_warmup(pool,pending,&catalog,&active,&slots,target).await?;
+        let active=self.active_plans(data_pool,&slots,&catalog).await?;
+        self.refresh_warmup(pool,data_pool,pending,&catalog,&active,&slots,target).await?;
         let mut wanted:BTreeMap<String,BTreeSet<String>>=BTreeMap::new();
         for plan in active.iter().chain(self.warmup.iter().flat_map(|w|w.plans.iter())) {
             wanted.entry(plan.epoch.clone()).or_default().extend(plan.specs.iter().map(ProfileSpec::key));
@@ -502,7 +518,7 @@ impl AdaptiveLiveRuntime {
         let mut hot=active.clone();
         if let Some(warmup)=&self.warmup {hot.extend(warmup.plans.iter().filter(|p|!warmup.waiting.contains_key(&instrument_key(&p.instrument)) && self.state.is_current(&p.epoch,target-1800)).cloned());}
         trace.enter("hot_tail");
-        self.hot_tail(pool,client,&hot,target,stopped).await?;
+        self.hot_tail(data_pool,client,&hot,target,stopped).await?;
         for id in preparation_requirements.keys() {
             if preparation_source_ready(&self.state,active.iter().chain(self.warmup.iter().flat_map(|warmup|warmup.plans.iter())),*id,target) {
                 if let Err(code)=self.preparation.retire_ready(*id) {eprintln!("[live-preparation] instrument_id={id} code={code}");}
@@ -528,7 +544,7 @@ impl AdaptiveLiveRuntime {
                 let mut plan=cold[index].clone();
                 if !self.state.has_epoch(&plan.epoch) {
                     for spec in plan.specs.iter_mut().filter(|spec|!spec.pending) {
-                        spec.checkpoint=store::load_checkpoint(pool,spec.fence.slot_id,&plan.instrument).await?;
+                        spec.checkpoint=store::load_checkpoint(data_pool,spec.fence.slot_id,&plan.instrument).await?;
                     }
                 }
                 if let Err(error)=self.check_supervision() {first_error=Some(error);break;}
@@ -564,7 +580,7 @@ impl AdaptiveLiveRuntime {
                 self.state.acknowledge_source(&plan.epoch,page.token)?;
                 let progress=self.warmup.as_ref().filter(|w|plan.specs.iter().any(|s|s.key()==w.candidate_key))
                     .map(|w|(w.supervisor.permit(),w.candidate_key.as_str()));
-                if let Err(error)=process_page(&mut self.state,pool,&plan,&page.bars,target,page.complete,progress).await {
+                if let Err(error)=process_page(&mut self.state,data_pool,&plan,&page.bars,target,page.complete,progress).await {
                     first_error.get_or_insert(error);continue;
                 }
                 if plan.specs.iter().any(|spec|spec.publish_enabled) {
@@ -810,6 +826,7 @@ async fn process_page(state:&mut AdaptiveRuntime,pool:&PgPool,plan:&SymbolPlan,b
     Ok(())
 }
 async fn process_chunk(state:&mut AdaptiveRuntime,pool:&PgPool,plan:&SymbolPlan,bars:&[DetectorBar],target:i64,complete:bool)->Result<(),WorkerError> {
+    let commit_concurrency=cold_commit_concurrency(pool)?;
     let prepared=match state.prepare(&plan.epoch,&plan.instrument,bars,target,complete) {
         Ok(prepared)=>prepared,
         Err(error)=>{state.invalidate(&plan.epoch,None);return Err(error);}
@@ -829,7 +846,7 @@ async fn process_chunk(state:&mut AdaptiveRuntime,pool:&PgPool,plan:&SymbolPlan,
             let result=store::persist(&store,&instrument,&mut prepared).await;
             (prepared,result)
         });
-        if tasks.len()>=COMMIT_CONCURRENCY
+        if tasks.len()>=commit_concurrency
             && let Err(error)=accept_result(state,&plan.epoch,tasks.join_next().await.unwrap()) {first_error.get_or_insert(error);}
     }
     while let Some(result)=tasks.join_next().await {
@@ -857,14 +874,14 @@ pub async fn adaptive_live_tick(pool:&PgPool,market_url:&str,market_key:&str,sto
     Ok(())
 }
 
-pub(crate) async fn adaptive_live_loop(pool:PgPool,market_url:String,market_key:String,stopped:Arc<AtomicBool>,notify:Arc<tokio::sync::Notify>) {
-    let scan_pool=pool.clone();let scan_stopped=stopped.clone();let scan_notify=notify.clone();
+pub(crate) async fn adaptive_live_loop(data_pool:PgPool,control_pool:PgPool,market_url:String,market_key:String,stopped:Arc<AtomicBool>,notify:Arc<tokio::sync::Notify>) {
+    let scan_pool=control_pool;let scan_data_pool=data_pool.clone();let scan_stopped=stopped.clone();let scan_notify=notify.clone();
     let scan=async move {
         let client=MarketDataClient::new(market_url,market_key);
         let mut owner=AdaptiveLiveRuntime::new(AdaptiveRuntimeLimits::default());
         lifecycle::emit(Level::Info,"adaptive_runtime_started",json!({"runtime_instance":owner.worker}));
         while !scan_stopped.load(Ordering::SeqCst) {
-            if let Err(error)=owner.tick(&scan_pool,&client,&scan_stopped).await {
+            if let Err(error)=owner.tick_at_on_pools(&scan_data_pool,&scan_pool,&client,&scan_stopped,chrono::Utc::now().timestamp()).await {
                 if let Some(warmup)=&owner.warmup {
                     let report=json!({"code":"adaptive_warmup_failed","message":error.to_string().chars().take(240).collect::<String>()});
                     let _=live::report_warmup(&scan_pool,&warmup.lease,"error",None,Some(&report)).await;
@@ -888,13 +905,98 @@ pub(crate) async fn adaptive_live_loop(pool:PgPool,market_url:String,market_key:
         fields["history_bytes"]=0.into();fields["profile_bytes"]=0.into();
         lifecycle::emit(if release.is_ok(){Level::Info}else{Level::Error},"adaptive_shutdown_finished",fields);
     };
-    tokio::join!(scan,delivery::run(pool,stopped,notify));
+    tokio::join!(scan,delivery::run(data_pool,stopped,notify));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::adaptive::state::tests::{fixture,feed};
+    #[tokio::test]
+    async fn cold_persistence_uses_only_data_pool_capacity() {
+        for (connections,expected) in [(1,1),(2,2),(3,3),(17,16),(64,16)] {
+            let pool=sqlx::postgres::PgPoolOptions::new().max_connections(connections)
+                .connect_lazy("postgres://test:test@127.0.0.1:1/unreachable_test").unwrap();
+            assert_eq!(cold_commit_concurrency(&pool).unwrap(),expected);
+        }
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+    async fn cold_chunk_six_profiles_reserve_fourth_connection_and_drain_failed_tasks() {
+        use futures::FutureExt;
+        use sqlx::Connection;
+        let options:sqlx::postgres::PgConnectOptions=std::env::var("TEST_DATABASE_URL").unwrap().parse().unwrap();
+        assert!(options.get_database().unwrap_or("").ends_with("_test"));
+        let name=format!("cold_chunk_{}_{}_test",std::process::id(),rand::random::<u32>());
+        let mut admin=sqlx::PgConnection::connect_with(&options).await.unwrap();
+        sqlx::query(&format!("create database {name}")).execute(&mut admin).await.unwrap();
+        let options=options.database(&name);
+        let pool=sqlx::postgres::PgPoolOptions::new().max_connections(3).acquire_timeout(Duration::from_secs(5))
+            .connect_with(options.clone()).await.unwrap();
+        let control_pool=sqlx::postgres::PgPoolOptions::new().max_connections(1).acquire_timeout(Duration::from_secs(5))
+            .connect_with(options.clone()).await.unwrap();
+        let result=std::panic::AssertUnwindSafe(async {
+            // Hold every real settings read, then let the deliberately absent
+            // persistence schema fail so task draining can be observed.
+            sqlx::query("create table settings(key text primary key,value jsonb)").execute(&pool).await.unwrap();
+            let mut blocker=sqlx::PgConnection::connect_with(&options).await.unwrap();
+            let mut held=blocker.begin().await.unwrap();
+            sqlx::query("lock table settings in access exclusive mode").execute(&mut *held).await.unwrap();
+            let f=fixture();
+            let mut state=AdaptiveRuntime::new(AdaptiveRuntimeLimits {max_profiles:6,..f.runtime.limits.clone()});
+            let mut specs=Vec::new();let mut slots=BTreeMap::new();
+            for id in 1..=6 {
+                let mut spec=f.spec.clone();spec.fence.slot_id=id;
+                slots.insert(spec.key(),Arc::new(ActiveAdaptiveSlot {
+                    owner_id:spec.fence.owner_id.clone(),algorithm_id:spec.fence.algorithm_id.clone(),slot_id:id,
+                    generation_id:1,study_id:id,config_revision:1,min_setups_per_day:0.0,
+                    spec:json!({}),result:json!({}),params:json!({}),analytics:json!({}),selected_cell:json!({}),
+                    mean_expectancy:0.2,direction:"short".into(),external_name:"fixture".into(),
+                    live_initialization:None,live_readiness:Vec::new(),
+                }));
+                specs.push(spec);
+            }
+            state.install(&f.epoch,&specs).unwrap();
+            feed(&mut state,&f.epoch,&f.instrument,&f.bars,f.frontier).unwrap();
+            let plan=SymbolPlan {epoch:f.epoch,instrument:f.instrument,catalog_id:1,specs,slots};
+            let mut next=f.bars.last().unwrap().clone();next.open_time_unix=f.frontier;
+            let work_pool=pool.clone();
+            let work=tokio::spawn(async move {
+                let result=process_chunk(&mut state,&work_pool,&plan,&[next],f.frontier+60,true).await;
+                (state,result)
+            });
+            let observed=tokio::time::timeout(Duration::from_secs(3),async {
+                loop {
+                    sqlx::query("select pg_stat_clear_snapshot()").execute(&mut *held).await.unwrap();
+                    let count:i64=sqlx::query_scalar("select count(*) from pg_stat_activity where datname=current_database() and wait_event_type='Lock' and query like 'select value from settings%'")
+                        .fetch_one(&mut *held).await.unwrap();
+                    if count>=3 {break;}
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                sqlx::query("select pg_stat_clear_snapshot()").execute(&mut *held).await.unwrap();
+                sqlx::query_scalar::<_,i64>("select count(*) from pg_stat_activity where datname=current_database() and wait_event_type='Lock' and query like 'select value from settings%'")
+                    .fetch_one(&mut *held).await.unwrap()
+            }).await;
+            let control=tokio::time::timeout(Duration::from_millis(500),sqlx::query_scalar::<_,i32>("select 1").fetch_one(&control_pool)).await;
+            // Release before asserting so a failed admission assertion cannot
+            // leave real blocked SQL/tasks holding the owned test database.
+            held.rollback().await.unwrap();
+            let (state,outcome)=tokio::time::timeout(Duration::from_secs(5),work).await.unwrap().unwrap();
+            assert_eq!(observed.unwrap(),3,"six profiles must own at most three cold operations on data3/control1");
+            assert_eq!(control.unwrap().unwrap(),1,"control query must use the reserved fourth slot");
+            assert!(outcome.is_err(),"missing persistence schema deliberately fails the writes");
+            assert_eq!(state.retained_history_epochs(),0,"failed speculative chunk is invalidated");
+            let mut returned=Vec::new();
+            for _ in 0..3 {returned.push(tokio::time::timeout(Duration::from_secs(1),pool.acquire()).await.unwrap().unwrap());}
+            drop(returned);blocker.close().await.unwrap();
+        }).catch_unwind().await;
+        pool.close().await;
+        control_pool.close().await;
+        sqlx::query(&format!("drop database {name} with (force)")).execute(&mut admin).await.unwrap();
+        admin.close().await.unwrap();
+        if let Err(error)=result {std::panic::resume_unwind(error);}
+    }
     #[tokio::test]
     async fn supervision_loss_drains_owned_reads_stops_admission_and_preserves_incumbent_ram() {
         use axum::{Json,Router,routing::post};
@@ -920,7 +1022,7 @@ mod tests {
         let record=lifecycle::record(Level::Error,"adaptive_warmup_failure_report",&fields);
         assert_eq!(record["failure_report"],"persisted");assert_eq!(record["original_error_code"],"history_lookup_evicted");
         assert_eq!(record["study_id"],2);assert_eq!(record["generation_id"],2);assert_eq!(record["attempt"],1);
-        assert_eq!(record["stage"],"settings");assert!(record.get("fields_truncated").is_none(),"{record}");
+        assert_eq!(record["stage"],"profile_handoff");assert!(record.get("fields_truncated").is_none(),"{record}");
         let canonical=SymbolPlan {specs:vec![f.spec.clone()],..plan.clone()};
         let fields=diagnostics::source_failure_fields(&canonical,&invalid("source unavailable"),"hot_tail_guard",owner.warmup.as_ref());
         let record=lifecycle::record(Level::Error,"adaptive_source_failed",&fields);

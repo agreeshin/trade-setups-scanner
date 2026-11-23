@@ -92,16 +92,61 @@ pub fn emit(level: Level, event: &str, fields: Value) {
         });
     }
 }
+/// Observe acquisition separately from execution, without SQL, keys, URLs or
+/// error messages. Pool counters are instantaneous snapshots, not reservations.
+pub async fn pool_operation<T>(
+    pool: &sqlx::PgPool,
+    operation: &'static str,
+    phase: &'static str,
+    future: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, sqlx::Error> {
+    let started = std::time::Instant::now();
+    let result = future.await;
+    let elapsed = started.elapsed();
+    let level = if result.is_err() {
+        Level::Error
+    } else if elapsed >= std::time::Duration::from_secs(1) {
+        Level::Info
+    } else {
+        Level::Debug
+    };
+    if level != Level::Debug || debug_enabled() {
+        emit(
+            level,
+            "database_pool_operation_finished",
+            pool_operation_fields(pool, operation, phase, elapsed, result.as_ref().err()),
+        );
+    }
+    result
+}
+
+fn pool_operation_fields(
+    pool: &sqlx::PgPool,
+    operation: &str,
+    phase: &str,
+    elapsed: std::time::Duration,
+    error: Option<&sqlx::Error>,
+) -> Value {
+    json!({"component":"database_pool","operation":operation,"phase":phase,
+        "outcome":if error.is_some() {"error"} else {"completed"},
+        "error_code":error.map(sqlx_error_code),"duration_ms":elapsed.as_millis() as u64,
+        "pool_size":pool.size(),"pool_idle":pool.num_idle(),
+        "pool_max":pool.options().get_max_connections()})
+}
+
 /// Do not serialize SQL statements, parameters, remote response bodies or URLs.
 pub fn db_error_code(error: &crate::DbError) -> &'static str {
     match error {
         crate::DbError::Json(_) => "invalid_state",
-        crate::DbError::Sqlx(sqlx::Error::PoolTimedOut) => "pool_timeout",
-        crate::DbError::Sqlx(sqlx::Error::PoolClosed) => "pool_closed",
-        crate::DbError::Sqlx(
-            sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_),
-        ) => "database_transport",
-        crate::DbError::Sqlx(sqlx::Error::Database(error)) => match error.code().as_deref() {
+        crate::DbError::Sqlx(error) => sqlx_error_code(error),
+    }
+}
+fn sqlx_error_code(error: &sqlx::Error) -> &'static str {
+    match error {
+        sqlx::Error::PoolTimedOut => "pool_timeout",
+        sqlx::Error::PoolClosed => "pool_closed",
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_) => "database_transport",
+        sqlx::Error::Database(error) => match error.code().as_deref() {
             Some("55P03") => "lock_timeout",
             Some("57014") => "statement_timeout_or_cancel",
             Some("40P01") => "deadlock",
@@ -111,7 +156,7 @@ pub fn db_error_code(error: &crate::DbError) -> &'static str {
             Some("23514") => "check_violation",
             _ => "database_statement",
         },
-        crate::DbError::Sqlx(_) => "database_decode",
+        _ => "database_decode",
     }
 }
 
@@ -130,5 +175,52 @@ mod tests {
         assert_eq!(record["fields_truncated"], true);
         assert!(!record.to_string().contains("not emitted"));
         assert!(!record.to_string().contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn pool_operation_fields_attribute_timeout_without_query_or_credentials() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy("postgres://user:secret@127.0.0.1:1/signals")
+            .unwrap();
+        let fields = pool_operation_fields(
+            &pool,
+            "profile_handoff",
+            "acquire_transaction",
+            std::time::Duration::from_secs(5),
+            Some(&sqlx::Error::PoolTimedOut),
+        );
+        assert_eq!(fields["operation"], "profile_handoff");
+        assert_eq!(fields["phase"], "acquire_transaction");
+        assert_eq!(fields["error_code"], "pool_timeout");
+        assert_eq!(fields["pool_max"], 4);
+        assert_eq!(fields["duration_ms"], 5000);
+        let rendered_record = record(Level::Error, "database_pool_operation_finished", &fields);
+        for key in [
+            "operation",
+            "phase",
+            "error_code",
+            "pool_size",
+            "pool_idle",
+            "pool_max",
+            "duration_ms",
+        ] {
+            assert_eq!(rendered_record[key], fields[key], "rendering lost {key}");
+        }
+        assert!(rendered_record.get("fields_truncated").is_none());
+        let settings = pool_operation_fields(
+            &pool,
+            "settings_get",
+            "acquire",
+            std::time::Duration::from_secs(5),
+            Some(&sqlx::Error::PoolTimedOut),
+        );
+        let settings = record(Level::Error, "database_pool_operation_finished", &settings);
+        assert_eq!(settings["operation"], "settings_get");
+        assert_eq!(settings["phase"], "acquire");
+        assert_eq!(settings["error_code"], rendered_record["error_code"]);
+        let rendered = rendered_record.to_string();
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("select"));
     }
 }

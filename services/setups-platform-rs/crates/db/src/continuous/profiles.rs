@@ -172,11 +172,18 @@ async fn accept_handoffs_inner(
     owner: &str,
     events: &mut Vec<Value>,
 ) -> Result<usize, DbError> {
-    let due:bool=sqlx::query_scalar("select exists(select 1 from adaptive_profile_handoffs where owner_id=$1 and status='pending')").bind(owner).fetch_one(pool).await?;
+    let mut connection =
+        diagnostics::pool_operation(pool, "profile_handoff", "acquire_probe", pool.acquire())
+            .await?;
+    let due:bool=diagnostics::pool_operation(pool,"profile_handoff","probe",
+        sqlx::query_scalar("select exists(select 1 from adaptive_profile_handoffs where owner_id=$1 and status='pending')").bind(owner).fetch_one(&mut *connection)).await?;
+    drop(connection);
     if !due {
         return Ok(0);
     }
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        diagnostics::pool_operation(pool, "profile_handoff", "acquire_transaction", pool.begin())
+            .await?;
     owner_lock(&mut tx, owner).await?;
     let limits = limits_in(&mut tx, owner).await?;
     let rows=sqlx::query("select h.generation_id,h.slot_id,g.algorithm_id,s.min_setups_per_day::text frequency,g.study_id,g.config_revision,g.live_init_attempts,g.live_init_attempt_limit,(extract(epoch from (clock_timestamp()-h.created_at))*1000)::bigint handoff_age_ms from adaptive_profile_handoffs h join continuous_generations g on g.id=h.generation_id join continuous_slots s on s.id=h.slot_id where h.owner_id=$1 and h.status='pending' and g.status='completed' and g.accepted order by h.generation_id limit 32 for update of h")

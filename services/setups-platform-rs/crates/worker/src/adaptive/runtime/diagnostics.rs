@@ -116,7 +116,7 @@ impl TickTrace {
         let trace = Self {
             worker: worker.into(),
             started: now,
-            stage: "settings",
+            stage: "profile_handoff",
             phase_started: now,
             pages: 0,
             bars: 0,

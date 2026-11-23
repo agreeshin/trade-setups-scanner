@@ -1,6 +1,10 @@
 //! Enforced connection and resident-background-chain budgets, not OS CPU/RAM quotas.
 use crate::continuous::ContinuousRuntimeConfig;
 
+// Four logical lane budgets (live is data+control) exclude these sessions.
+const EXTRA_DB_CONNECTIONS:u32=3; // optimizer, study-actual, warmup supervisor
+const DEFAULT_MAX_DB_CONNECTIONS:u32=21;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeResources {
     pub total_db_connections: u32,
@@ -15,6 +19,11 @@ pub struct RuntimeResources {
 }
 
 impl RuntimeResources {
+    /// Both physical live pools consume the existing LIVE_DB_CONNECTIONS total.
+    pub fn live_pool_connections(&self)->(u32,u32) {
+        assert!(self.live_db_connections>=2,"live DB total must include data and control");
+        (self.live_db_connections-1,1)
+    }
     pub fn from_lookup(get: &mut dyn FnMut(&str)->Option<String>) -> Result<Self,String> {
         fn bounded(get: &mut dyn FnMut(&str)->Option<String>, key: &str, fallback: u64, min: u64, max: u64) -> Result<u64,String> {
             let value = match get(key) {Some(raw)=>raw.parse::<u64>().map_err(|_|format!("{key} must be an integer"))?,None=>fallback};
@@ -23,7 +32,7 @@ impl RuntimeResources {
         }
         let detected = std::thread::available_parallelism().map_or(2,usize::from);
         let result = Self {
-            total_db_connections:bounded(get,"RUNTIME_MAX_DB_CONNECTIONS",20,8,256)? as u32,
+            total_db_connections:bounded(get,"RUNTIME_MAX_DB_CONNECTIONS",DEFAULT_MAX_DB_CONNECTIONS as u64,8,256)? as u32,
             api_db_connections:bounded(get,"API_DB_CONNECTIONS",6,2,128)? as u32,
             live_db_connections:bounded(get,"LIVE_DB_CONNECTIONS",4,2,64)? as u32,
             manual_db_connections:bounded(get,"MANUAL_DB_CONNECTIONS",4,2,64)? as u32,
@@ -33,9 +42,8 @@ impl RuntimeResources {
             notification_max_jobs:bounded(get,"LIVE_NOTIFICATION_MAX_PENDING",10000,1,100000)? as i64,
             notification_max_bytes:bounded(get,"LIVE_NOTIFICATION_MAX_PENDING_BYTES",64*1024*1024,32768,1024*1024*1024)? as i64,
         };
-        // The optimizer's detached advisory-lock socket is outside SQLx's pool count.
-        let connections = result.api_db_connections+result.live_db_connections+result.manual_db_connections+result.continuous_db_connections+1;
-        if connections>result.total_db_connections {return Err(format!("database lane budgets plus one optimizer-owner connection ({connections}) exceed RUNTIME_MAX_DB_CONNECTIONS ({})",result.total_db_connections));}
+        let connections = result.api_db_connections+result.live_db_connections+result.manual_db_connections+result.continuous_db_connections+EXTRA_DB_CONNECTIONS;
+        if connections>result.total_db_connections {return Err(format!("database lane budgets plus {EXTRA_DB_CONNECTIONS} extra connections (optimizer owner, study-actual owner, warmup supervisor) require {connections}, exceeding RUNTIME_MAX_DB_CONNECTIONS ({})",result.total_db_connections));}
         Ok(result)
     }
 
@@ -60,10 +68,31 @@ impl RuntimeResources {
 mod tests {
     use super::*;
     #[test]
-    fn includes_detached_owner_and_refuses_pool_overcommit() {
+    fn includes_all_independent_owners_and_refuses_pool_overcommit() {
         let default = RuntimeResources::from_lookup(&mut |_|None).unwrap();
-        assert_eq!(default.total_db_connections,20);
-        assert!(RuntimeResources::from_lookup(&mut |key| (key=="RUNTIME_MAX_DB_CONNECTIONS").then(||"18".into())).is_err());
+        assert_eq!(default.total_db_connections,21);
+        assert_eq!(default.live_db_connections,4);
+        assert_eq!(default.live_pool_connections(),(3,1));
+        assert_eq!(default.api_db_connections+default.live_db_connections+default.manual_db_connections+default.continuous_db_connections+EXTRA_DB_CONNECTIONS,default.total_db_connections);
+        assert_eq!(RuntimeResources::from_lookup(&mut |key| (key=="RUNTIME_MAX_DB_CONNECTIONS").then(||"21".into())).unwrap().total_db_connections,21);
+        let error=RuntimeResources::from_lookup(&mut |key| (key=="RUNTIME_MAX_DB_CONNECTIONS").then(||"20".into())).unwrap_err();
+        assert!(error.contains("require 21"),"{error}");
+        assert!(RuntimeResources::from_lookup(&mut |key| (key=="API_DB_CONNECTIONS").then(||"7".into())).unwrap_err().contains("require 22"));
+    }
+    #[test]
+    fn live_subpools_preserve_configured_total_and_minimum_control_reserve() {
+        for total in [2,4,64] {
+            let resources=RuntimeResources::from_lookup(&mut |key|match key {
+                "LIVE_DB_CONNECTIONS"=>Some(total.to_string()),
+                "RUNTIME_MAX_DB_CONNECTIONS"=>Some("128".into()),
+                _=>None,
+            }).unwrap();
+            let (data,control)=resources.live_pool_connections();
+            assert_eq!((data,control),(total-1,1));
+            assert_eq!(data+control,resources.live_db_connections);
+            assert_eq!(resources.api_db_connections+data+control+resources.manual_db_connections+resources.continuous_db_connections+EXTRA_DB_CONNECTIONS,total+17);
+        }
+        assert!(RuntimeResources::from_lookup(&mut |key|(key=="LIVE_DB_CONNECTIONS").then(||"1".into())).is_err());
     }
     #[test]
     fn validates_total_resident_background_cpu_and_memory_without_clipping_requests() {

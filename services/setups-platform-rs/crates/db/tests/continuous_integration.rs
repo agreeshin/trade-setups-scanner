@@ -1686,9 +1686,52 @@ async fn adaptive_batch_late_validation_outbox_failure_and_statement_timeout_rol
         let error=db::commit_adaptive_scans_cas(&pool,&profile,&scans).await.err().unwrap();
         assert!(error.to_string().contains("statement timeout"),"{error}");
         assert_eq!(adaptive_batch_state(&pool).await,original,"timed-out bulk checkpoint cannot leave earlier setup/outbox writes");
-        // SET LOCAL does not impose the new batch timeout on a legacy scan.
+        // Cold single scans retain their legacy byte admission, but no longer
+        // retain a live-pool connection through an unbounded statement.
         let scan=&scans[0];
-        assert!(db::commit_adaptive_scan_cas(&pool,&profile,&scan.instrument_key,None,&scan.checkpoint,&scan.setups).await.unwrap().applied);
+        let error=db::commit_adaptive_scan_cas(&pool,&profile,&scan.instrument_key,None,&scan.checkpoint,&scan.setups).await.err().unwrap();
+        assert!(error.to_string().contains("statement timeout"),"{error}");
+        assert_eq!(adaptive_batch_state(&pool).await,original,"timed-out cold checkpoint cannot leave setup/outbox writes");
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
+async fn adaptive_single_scan_lock_timeout_returns_connection_and_exact_retry_is_atomic() {
+    isolated(|pool| async move {
+        let close=chrono::Utc::now().timestamp().div_euclid(60)*60;
+        let profile=adaptive_batch_profile(&pool,close).await;
+        let scan=adaptive_batch_scan(&profile,"BTCUSDT",close);
+        let before=adaptive_batch_state(&pool).await;
+        let mut held=pool.begin().await.unwrap();
+        sqlx::query("select id from continuous_slots where id=$1 for update")
+            .bind(profile.slot_id).execute(&mut *held).await.unwrap();
+        let started=std::time::Instant::now();
+        let outcome=tokio::time::timeout(Duration::from_secs(4),db::commit_adaptive_scan_cas(
+            &pool,&profile,&scan.instrument_key,None,&scan.checkpoint,&scan.setups)).await;
+        // Always release the fixture lock before asserting, even on failure.
+        held.rollback().await.unwrap();
+        let error=outcome.expect("single scan must not retain a connection behind a held row lock").unwrap_err();
+        assert_eq!(setups_db::diagnostics::db_error_code(&error),"lock_timeout");
+        assert!(started.elapsed()<Duration::from_secs(3));
+        assert_eq!(adaptive_batch_state(&pool).await,before,"failed scan leaves no cursor/setup/outbox or budget change");
+        let mut connections=Vec::new();
+        for _ in 0..4 {
+            connections.push(tokio::time::timeout(Duration::from_secs(1),pool.acquire()).await
+                .expect("rolled-back scan must return its connection").unwrap());
+        }
+        drop(connections);
+        let committed=db::commit_adaptive_scan_cas(&pool,&profile,&scan.instrument_key,None,&scan.checkpoint,&scan.setups).await.unwrap();
+        assert!(committed.applied);assert_eq!(committed.inserted.len(),1);
+        let durable=adaptive_batch_state(&pool).await;
+        let repeated=db::commit_adaptive_scan_cas(&pool,&profile,&scan.instrument_key,None,&scan.checkpoint,&scan.setups).await.unwrap();
+        assert!(!repeated.applied && repeated.inserted.is_empty());
+        assert_eq!(adaptive_batch_state(&pool).await,durable,"exact retry cannot duplicate writes");
+        assert_eq!(db::get_adaptive_checkpoint(&pool,profile.slot_id,&scan.instrument_key).await.unwrap(),
+            Some(db::AdaptiveCheckpoint {generation_id:profile.generation_id,state:scan.checkpoint}));
+        for query in ["select count(*) from live_setups", "select count(*) from adaptive_notification_outbox", "select count(*) from adaptive_live_checkpoints"] {
+            assert_eq!(sqlx::query_scalar::<_,i64>(query).fetch_one(&pool).await.unwrap(),1);
+        }
     }).await;
 }
 

@@ -191,7 +191,8 @@ impl LiveHandle {
     }
 }
 
-pub fn start_live_runtime(pool: PgPool, market_url: String, market_key: String) -> LiveHandle {
+/// Data producers never receive the dedicated serial adaptive control pool.
+pub fn start_live_runtime(data_pool: PgPool, control_pool: PgPool, market_url: String, market_key: String) -> LiveHandle {
     let stopped = Arc::new(AtomicBool::new(false));
     let notify = Arc::new(Notify::new());
     let task_stopped = stopped.clone();
@@ -201,20 +202,21 @@ pub fn start_live_runtime(pool: PgPool, market_url: String, market_key: String) 
         // otherwise current adaptive slot waiting for the next closed minute.
         tokio::join!(
             live_loop(
-                pool.clone(),
+                data_pool.clone(),
                 market_url.clone(),
                 market_key.clone(),
                 task_stopped.clone(),
                 task_notify.clone()
             ),
             crate::adaptive::adaptive_live_loop(
-                pool.clone(),
+                data_pool.clone(),
+                control_pool,
                 market_url,
                 market_key,
                 task_stopped.clone(),
                 task_notify.clone()
             ),
-            crate::telegram::run(pool, task_stopped, task_notify),
+            crate::telegram::run(data_pool, task_stopped, task_notify),
         );
     });
     LiveHandle {

@@ -87,6 +87,10 @@ impl PromotionStore for PgPromotion<'_> {
 }
 
 #[cfg(test)]
+#[path = "promotion_cancellation_tests.rs"]
+mod cancellation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize,Ordering};

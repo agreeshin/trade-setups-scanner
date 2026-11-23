@@ -85,12 +85,14 @@ async fn main() {
             std::process::exit(1);
         }
     }
-    let live_pool=connect_lane(&config.database_url,config.resources.live_db_connections,"live").await;
+    let (live_data_connections,live_control_connections)=config.resources.live_pool_connections();
+    let live_data_pool=connect_lane(&config.database_url,live_data_connections,"live-data").await;
+    let live_control_pool=connect_lane(&config.database_url,live_control_connections,"live-control").await;
     setups_api::continuous::configure_profile_limits_from_env(&pool).await
         .unwrap_or_else(|error|{eprintln!("profile limit configuration failed: {error}");std::process::exit(1)});
     let manual_pool=connect_lane(&config.database_url,config.resources.manual_db_connections,"manual").await;
     let continuous_pool=connect_lane(&config.database_url,config.resources.continuous_db_connections,"continuous").await;
-    setups_db::continuous::outbox::configure_limits(&live_pool,config.resources.notification_max_jobs,config.resources.notification_max_bytes)
+    setups_db::continuous::outbox::configure_limits(&live_data_pool,config.resources.notification_max_jobs,config.resources.notification_max_bytes)
         .await.unwrap_or_else(|error|{eprintln!("notification budget configuration failed: {error}");std::process::exit(1)});
     let live_status = json!({
         "running": false,
@@ -131,7 +133,8 @@ async fn main() {
         }
     };
     let live_runtime = setups_worker::live::start_live_runtime(
-        live_pool,
+        live_data_pool,
+        live_control_pool,
         config.market_data_url.clone(),
         config.market_data_api_key.clone(),
     );
@@ -222,7 +225,14 @@ async fn main() {
 }
 
 async fn connect_lane(url: &str, connections: u32, lane: &str) -> sqlx::PgPool {
-    PgPoolOptions::new().max_connections(connections).acquire_timeout(Duration::from_secs(5)).connect(url).await
+    let options=url.parse::<sqlx::postgres::PgConnectOptions>().unwrap_or_else(|_|{eprintln!("{lane} database lane URL is invalid");std::process::exit(1)});
+    let options=if matches!(lane,"live-data"|"live-control") {options.application_name(&format!("setups-{lane}"))}else{options};
+    // End blocked SQL on the server before promotion's 1s attempt/readback
+    // guards; dropping a client future alone can retain the sole connection.
+    let options=if lane=="live-control" {
+        options.options([("lock_timeout","500ms"),("statement_timeout","750ms")])
+    }else{options};
+    PgPoolOptions::new().max_connections(connections).acquire_timeout(Duration::from_secs(5)).connect_with(options).await
         .unwrap_or_else(|error|{eprintln!("{lane} database lane connection failed: {error}");std::process::exit(1)})
 }
 

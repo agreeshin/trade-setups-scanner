@@ -73,8 +73,8 @@ services:
       HOST: 0.0.0.0
       LOG_LEVEL: info
       REPLAY_WORKERS: "2"
-      # Application pool budgets include the optimizer's detached owner connection.
-      RUNTIME_MAX_DB_CONNECTIONS: ${RUNTIME_MAX_DB_CONNECTIONS:-20}
+      # Four lane pools + detached optimizer/study-actual owners + warmup supervisor.
+      RUNTIME_MAX_DB_CONNECTIONS: ${RUNTIME_MAX_DB_CONNECTIONS:-21}
       API_DB_CONNECTIONS: ${API_DB_CONNECTIONS:-6}
       LIVE_DB_CONNECTIONS: ${LIVE_DB_CONNECTIONS:-4}
       FIXED_LIVE_MAX_HISTORY_BYTES: ${FIXED_LIVE_MAX_HISTORY_BYTES:-4294967296}

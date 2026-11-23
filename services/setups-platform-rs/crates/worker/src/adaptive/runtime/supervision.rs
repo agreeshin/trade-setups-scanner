@@ -127,7 +127,8 @@ struct PgHeartbeat {
 }
 impl PgHeartbeat {
     fn new(options: sqlx::postgres::PgConnectOptions, lease: live::WarmupLease) -> Self {
-        let options = options.options([("statement_timeout", "750ms"), ("lock_timeout", "500ms")]);
+        let options = options.application_name("setups-live-warmup-supervisor")
+            .options([("statement_timeout", "750ms"), ("lock_timeout", "500ms")]);
         Self {
             pool: sqlx::postgres::PgPoolOptions::new()
                 .max_connections(1)

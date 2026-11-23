@@ -722,13 +722,15 @@ async fn commit_adaptive_scan_refs(
     pool: &PgPool,
     expected: &ActiveAdaptiveSlot,
     scans: &[AdaptiveScanRef<'_>],
-    bounded: bool,
+    aggregate_byte_limit: bool,
 ) -> Result<Vec<AdaptiveCommit>, DbError> {
-    let keys = validate_adaptive_scan_batch(scans, bounded)?;
-    let deadline = bounded.then(|| {
+    // Single scans retain their existing per-item admission. Transaction/lock
+    // budgets apply equally to cold reconstruction and hot microbatches.
+    let keys = validate_adaptive_scan_batch(scans, aggregate_byte_limit)?;
+    let deadline = Some(
         std::time::Instant::now()
-            + std::time::Duration::from_millis(ADAPTIVE_COMMIT_TRANSACTION_BUDGET_MS)
-    });
+            + std::time::Duration::from_millis(ADAPTIVE_COMMIT_TRANSACTION_BUDGET_MS),
+    );
     let mut results = vec![
         AdaptiveCommit {
             applied: false,
@@ -737,17 +739,15 @@ async fn commit_adaptive_scan_refs(
         scans.len()
     ];
     let mut tx = pool.begin().await?;
-    if bounded {
-        // PG16 has no transaction_timeout. Bound server statements/locks, then
-        // check the transaction budget between operations, never drop COMMIT.
-        sqlx::query(
-            "select set_config('statement_timeout',$1,true),set_config('lock_timeout',$2,true)",
-        )
-        .bind(ADAPTIVE_COMMIT_STATEMENT_TIMEOUT_MS.to_string())
-        .bind(ADAPTIVE_COMMIT_LOCK_TIMEOUT_MS.to_string())
-        .execute(&mut *tx)
-        .await?;
-    }
+    // PG16 has no transaction_timeout. Bound server statements/locks, then
+    // check the transaction budget between operations, never drop COMMIT.
+    sqlx::query(
+        "select set_config('statement_timeout',$1,true),set_config('lock_timeout',$2,true)",
+    )
+    .bind(ADAPTIVE_COMMIT_STATEMENT_TIMEOUT_MS.to_string())
+    .bind(ADAPTIVE_COMMIT_LOCK_TIMEOUT_MS.to_string())
+    .execute(&mut *tx)
+    .await?;
     adaptive_commit_budget(deadline)?;
     // Same process -> slot lock order as atomic promotion; no locks are held during CPU/I/O.
     let process = sqlx::query("select desired_running,config,config_revision from adaptive_live_controls where id=$3 and owner_id=$1 and algorithm_id=$2 for share")

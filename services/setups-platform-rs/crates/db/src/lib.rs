@@ -245,10 +245,17 @@ pub async fn cache_store(
 }
 
 pub async fn settings_get(pool: &PgPool, key: &str) -> Result<Option<Value>, DbError> {
-    let row = sqlx::query("select value from settings where key = $1")
-        .bind(key)
-        .fetch_optional(pool)
-        .await?;
+    let mut connection =
+        diagnostics::pool_operation(pool, "settings_get", "acquire", pool.acquire()).await?;
+    let row = diagnostics::pool_operation(
+        pool,
+        "settings_get",
+        "query",
+        sqlx::query("select value from settings where key = $1")
+            .bind(key)
+            .fetch_optional(&mut *connection),
+    )
+    .await?;
     row.map(|row| row.try_get("value"))
         .transpose()
         .map_err(DbError::Sqlx)
