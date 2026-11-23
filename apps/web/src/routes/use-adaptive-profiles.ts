@@ -4,6 +4,12 @@ import { RouteActiveContext } from "./route-active";
 import { errorText } from "./platform-controls";
 
 type Action = "stop" | "play";
+function profileRequestId(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  // getRandomValues also works on HTTP origins; 128 random bits become 32 hex characters.
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 /** One bounded page plus per-visible-row requests. No scientific payload/history in RAM. */
 export function useAdaptiveProfiles(algorithmId: string, active = true, refreshRevision = 0) {
   const routeActive = useContext(RouteActiveContext);
@@ -65,12 +71,12 @@ export function useAdaptiveProfiles(algorithmId: string, active = true, refreshR
   async function command(profile: AdaptiveProfile, action: Action) {
     if (!available || requests.current.has(profile.id)) return;
     const current = new AbortController(); requests.current.set(profile.id, current);
-    const previous = retries.current.get(profile.id);
-    const command = previous?.action === action && previous.command.expectedRevision === profile.controlRevision && previous.command.expectedGenerationId === profile.acceptedGenerationId
-      ? previous.command : { expectedRevision: profile.controlRevision, expectedGenerationId: profile.acceptedGenerationId, requestId: crypto.randomUUID() };
-    retries.current.set(profile.id, { action, command });
-    version.current += 1; setBusy((rows) => ({ ...rows, [profile.id]: action })); setRowErrors((rows) => { const next = { ...rows }; delete next[profile.id]; return next; });
     try {
+      const previous = retries.current.get(profile.id);
+      const command = previous?.action === action && previous.command.expectedRevision === profile.controlRevision && previous.command.expectedGenerationId === profile.acceptedGenerationId
+        ? previous.command : { expectedRevision: profile.controlRevision, expectedGenerationId: profile.acceptedGenerationId, requestId: profileRequestId() };
+      retries.current.set(profile.id, { action, command });
+      version.current += 1; setBusy((rows) => ({ ...rows, [profile.id]: action })); setRowErrors((rows) => { const next = { ...rows }; delete next[profile.id]; return next; });
       await commandAdaptiveProfile(profile, action, command, current.signal);
       // A receipt confirms intent, NOT ACTIVE. Keep the saved row until GET.
     } catch (cause) {

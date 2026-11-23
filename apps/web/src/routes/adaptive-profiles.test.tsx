@@ -139,7 +139,23 @@ it("row Stop uses the profile revision and latest accepted generation, then rere
   expect(screen.getByRole("button", { name: "Запустить адаптивный профиль 1" })).toBeEnabled();
 });
 
-it("exhausted Play grants via the profile endpoint, retries a lost ACK with the exact same idempotency key, and never resets research", async () => {
+it("sends exactly one Play POST with a secure fallback ID when randomUUID is unavailable", async () => {
+  const getRandomValues = vi.fn(crypto.getRandomValues.bind(crypto));
+  vi.stubGlobal("crypto", { getRandomValues });
+  rows = [{ ...profile(), desiredRunning: false, status: "stopped" }];
+  render(<Surface />); await tick();
+  fireEvent.click(screen.getByRole("button", { name: "Запустить адаптивный профиль 1" })); await tick();
+  expect(getRandomValues).toHaveBeenCalledTimes(1);
+  expect(writes()).toHaveLength(1);
+  expect(writes()[0]).toMatchObject({ path: "/v1/adaptive-profiles/1/play", method: "POST", body: { expectedRevision: 7, expectedGenerationId: 22 } });
+  expect((writes()[0]!.body as { requestId: string }).requestId).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
+  expect(reads()).toHaveLength(2);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("exhausted Play retries a lost ACK with the exact same fallback idempotency key and never resets research", async () => {
+  const getRandomValues = vi.fn(crypto.getRandomValues.bind(crypto));
+  vi.stubGlobal("crypto", { getRandomValues });
   rows = [{ ...profile(), desiredRunning: false, status: "stopped", activeStatus: "inactive", pendingGenerationId: null, pendingStatus: null, pendingAttempts: 3, initializationStatus: "exhausted" }];
   const view = renderHook(() => useAdaptiveProfiles("test")); await tick();
   loseAck = true;
@@ -149,8 +165,31 @@ it("exhausted Play grants via the profile endpoint, retries a lost ACK with the 
   loseAck = false;
   await act(async () => { await view.result.current.command(rows[0]!, "play"); }); await tick();
   expect(writes()).toHaveLength(2); expect(writes()[1]!.body).toEqual(writes()[0]!.body);
+  expect(getRandomValues).toHaveBeenCalledTimes(1);
   expect(writes().every((call) => call.path === "/v1/adaptive-profiles/1/play")).toBe(true);
   expect(view.result.current.page?.profiles[0]).toMatchObject({ status: "warming", initializationStatus: "retry", desiredRunning: true });
+});
+
+it.each(["randomUUID", "getRandomValues"])("shows %s generation failures and releases the row for a valid Play attempt", async (method) => {
+  const getRandomValues = vi.fn(crypto.getRandomValues.bind(crypto));
+  const fail = vi.fn(() => { throw new Error("Secure randomness failed"); });
+  vi.stubGlobal("crypto", { [method]: fail });
+  rows = [{ ...profile(), desiredRunning: false, status: "stopped" }];
+  render(<Surface />); await tick();
+  const play = screen.getByRole("button", { name: "Запустить адаптивный профиль 1" });
+  fireEvent.click(play); await tick();
+  expect(fail).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("alert")).toHaveTextContent("Secure randomness failed");
+  expect(writes()).toHaveLength(0);
+  expect(reads()).toHaveLength(2);
+  expect(play).toBeEnabled();
+  vi.stubGlobal("crypto", { getRandomValues });
+  fireEvent.click(play); await tick();
+  expect(getRandomValues).toHaveBeenCalledTimes(1);
+  expect(writes()).toHaveLength(1);
+  expect(writes()[0]).toMatchObject({ path: "/v1/adaptive-profiles/1/play", method: "POST" });
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(reads()).toHaveLength(3);
 });
 
 it("keeps Stop available for an active incumbent while separately offering Play for an exhausted replacement", async () => {
