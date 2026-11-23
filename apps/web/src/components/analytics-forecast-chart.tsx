@@ -1,10 +1,21 @@
-import { useEffect, useId, useState, useSyncExternalStore } from "react";
+import { useEffect, useId, useMemo, useState, useSyncExternalStore } from "react";
 import { fetchForecastCurve, type ForecastCurveRequest, type ForecastCurveResponse } from "../lib/forecast-api";
 import { forecastRecipeLabel } from "../lib/forecast-recipe";
-import { buildDailyExpectancyModel, type DailyExpectancyPoint } from "../lib/daily-expectancy";
+import { buildDailyExpectancyModel, observedDailyPoints, type ObservedDailyMode, type DailyExpectancyPoint } from "../lib/daily-expectancy";
 import { effectiveTimezone, formatUnix, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
+import { Field } from "./ui/field";
+import { Select } from "./ui/select";
 
 const risk = (value: number | null) => value === null ? "—" : `${Number(value.toFixed(3))} R`;
+
+export function DailyObservedControls({ value, onChange }: { value: ObservedDailyMode; onChange: (value: ObservedDailyMode) => void }) {
+  return <Field label="Фактический ряд по дням" className="w-80 max-w-full" hint="Только точки и их шкала. Обучение, прогноз и матрица не меняются.">
+    {(control) => <Select {...control} value={value} onChange={(event) => onChange(event.target.value === "sum" ? "sum" : "mean")}>
+      <option value="mean">Среднее R закрытых сделок дня</option>
+      <option value="sum">Сумма R закрытых сделок дня</option>
+    </Select>}
+  </Field>;
+}
 
 /** Null model prefixes/gaps are unavailable, not zeros and not interpolated bridges. */
 function finiteSegments<T>(points: readonly T[], value: (point: T) => number | null): T[][] {
@@ -47,9 +58,15 @@ export function DailyCalendarGrid({ fromUnix, toUnix, x, top, bottom }: {
 }
 
 /** Geometry only: F, B, period mean and flat continuation are all server values. */
-export function AnalyticsForecastChart({ request, days }: { request: ForecastCurveRequest; days: DailyExpectancyPoint[] }) {
+export function AnalyticsForecastChart({ request, days, observedMode: controlledMode, onObservedModeChange }: {
+  request: ForecastCurveRequest; days: DailyExpectancyPoint[]; observedMode?: ObservedDailyMode; onObservedModeChange?: (mode: ObservedDailyMode) => void;
+}) {
   useSyncExternalStore(subscribeInterfaceSettings, interfaceSettings, interfaceSettings);
   const timezone = effectiveTimezone();
+  const [localObservedMode, setLocalObservedMode] = useState<ObservedDailyMode>("mean");
+  const observedMode = controlledMode ?? localObservedMode;
+  const setObservedMode = (mode: ObservedDailyMode) => { setLocalObservedMode(mode); onObservedModeChange?.(mode); };
+  const observed = useMemo(() => observedDailyPoints(days, observedMode), [days, observedMode]);
   const [result, setResult] = useState<{ request: ForecastCurveRequest; response: ForecastCurveResponse | null; error: string | null } | null>(null);
   useEffect(() => {
     const controller = new AbortController();
@@ -62,8 +79,8 @@ export function AnalyticsForecastChart({ request, days }: { request: ForecastCur
   }, [request]);
   const current = result?.request === request ? result : null;
   const response = current?.response ?? null;
-  const model = buildDailyExpectancyModel(days, request.fromUnix);
-  const values = days.flatMap((day) => day.riskExpectancy === null ? [] : [day.riskExpectancy]);
+  const model = buildDailyExpectancyModel(observed, request.fromUnix);
+  const values = observed.flatMap((day) => day.riskExpectancy === null ? [] : [day.riskExpectancy]);
   if (response) {
     for (const point of response.curve) if (point.forecastR !== null) values.push(point.forecastR);
     for (const point of response.blendCurve ?? []) if (point.decisionR !== null) values.push(point.decisionR);
@@ -89,14 +106,15 @@ export function AnalyticsForecastChart({ request, days }: { request: ForecastCur
     {response?.estimate.status === "unavailable" && <p role="status" className="text-xs text-muted-foreground">Прогноз недоступен: {response.estimate.reason === "no_closed_outcomes" ? "нет наблюдавшихся закрытых TP/SL" : "нет положительного веса наблюдений"}. Prior не заменяет реальные закрытия.</p>}
     {estimate && <p className="text-xs text-muted-foreground">Реальные закрытия: TP {estimate.tpCount}, SL {estimate.slCount}. Взвешенные: TP {estimate.weightedTp.toFixed(3)}, SL {estimate.weightedSl.toFixed(3)}, W {estimate.weightSum.toFixed(3)}. Вероятность TP {(estimate.tpProbability * 100).toFixed(2)}%; эвристический prior {(estimate.priorProbability * 100).toFixed(2)}%. κ не считается реальными сделками.</p>}
     <div className="flex flex-wrap gap-3 text-xs" aria-label="Легенда графика">
-      <span>Факт: дневные средние</span><span className="text-warning">F: ретроспективная модель</span><span className="text-muted-foreground">M: среднее за период</span>
+      <span>Факт: {observedMode === "mean" ? "дневные средние R" : "дневные суммы R"}</span><span className="text-warning">F: ретроспективная модель</span><span className="text-muted-foreground">M: среднее за период</span>
       {response?.blendCurve && <span className="text-primary">B: смесь среднего и прогноза</span>}
       <span>За C: плоское продолжение без новых исходов</span>
     </div>
+    <DailyObservedControls value={observedMode} onChange={setObservedMode} />
     <p className="text-xs text-muted-foreground sm:hidden">На узком экране график прокручивается по горизонтали.</p>
     <div data-testid="forecast-plot-viewport" role="region" aria-label="Область графика с горизонтальной прокруткой" tabIndex={0} className="min-w-0 overflow-x-auto">
     <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание и вероятностная модель" className="w-full min-w-[640px]">
-      <desc>Фактические серверные дневные средние с календарными подписями {timezone} без пересчёта агрегатов, серверная модель F, горизонталь периодного среднего M, отдельная смесь B при её наличии и cutoff C. Моменты модельной кривой не смещены. После C модель постоянна без новых исходов. История ретроспективна.</desc>
+      <desc>Фактические серверные {observedMode === "mean" ? "дневные средние" : "дневные суммы R"} с календарными подписями {timezone} без пересчёта агрегатов, серверная модель F, горизонталь периодного среднего M, отдельная смесь B при её наличии и cutoff C. Моменты модельной кривой не смещены. После C модель постоянна без новых исходов. История ретроспективна.</desc>
       <line className="stroke-muted-foreground/40" x1={left} y1={top} x2={left} y2={height - bottom} />
       <line className="stroke-muted-foreground/40" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
       {[low, 0, high].filter((value, index, all) => all.indexOf(value) === index).map((value) => <g key={value}>
@@ -117,10 +135,11 @@ export function AnalyticsForecastChart({ request, days }: { request: ForecastCur
       <line data-testid="forecast-cutoff" className="stroke-muted-foreground" strokeDasharray="3 3" x1={x(request.observationCutoff)} x2={x(request.observationCutoff)} y1={top} y2={height - bottom} />
       <text className="fill-muted-foreground text-[10px]" x={Math.min(width - right, x(request.observationCutoff))} y={top - 10} textAnchor="end">C · cutoff</text>
       {model.points.map((point, index) => <g key={point.day}>
-        {point.riskExpectancy !== null && <circle className={point.riskExpectancy >= 0 ? "fill-success" : "fill-danger"} cx={x(point.dayStartUnix)} cy={y(point.riskExpectancy)} r={4}><title>{formatUnix(point.dayStartUnix, { time: false })} ({timezone}): {risk(point.riskExpectancy)}, TP {point.tpCount}, SL {point.slCount}</title></circle>}
+        {point.riskExpectancy !== null && <circle className={point.riskExpectancy >= 0 ? "fill-success" : "fill-danger"} cx={x(point.dayStartUnix)} cy={y(point.riskExpectancy)} r={4}><title>{formatUnix(point.dayStartUnix, { time: false })} ({timezone}): {observedMode === "sum" ? "сумма " : ""}{risk(point.riskExpectancy)}, TP {point.tpCount}, SL {point.slCount}</title></circle>}
         {(index % labelStep === 0 || index === model.points.length - 1) && <text className="fill-muted-foreground text-[10px]" x={x(point.dayStartUnix)} y={height - 27} textAnchor="middle">{formatUnix(point.dayStartUnix, { time: false })}</text>}
       </g>)}
       <text className="fill-muted-foreground text-[10px]" x={(left + width - right) / 2} y={height - 8} textAnchor="middle">Дата исходного сигнала ({timezone}); пунктир за C — без новых исходов</text>
+      <text className="fill-muted-foreground text-[10px]" x={left} y={top - 10}>{observedMode === "mean" ? "Среднее R дня" : "Сумма R дня"}</text>
     </svg>
     </div>
   </section>;

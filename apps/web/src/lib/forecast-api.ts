@@ -46,7 +46,7 @@ export function sameForecastRecipe(value: unknown, expected: ForecastRecipe): bo
   if (actual.version !== expected.version || actual.method !== expected.method) return false;
   return actual.method === "decayed_probability" && expected.method === "decayed_probability"
     ? actual.halfLifeDays === expected.halfLifeDays && actual.kappa === expected.kappa && actual.priorPolicy === expected.priorPolicy
-    : actual.method === "trend" && expected.method === "trend" && actual.bendDays === expected.bendDays;
+    : (actual.method === "trend" || actual.method === "trend_sum_r") && expected.method !== "decayed_probability" && actual.bendDays === expected.bendDays;
 }
 
 function validResponse(value: unknown, request: ForecastCurveRequest): value is ForecastCurveResponse {

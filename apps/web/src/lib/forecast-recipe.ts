@@ -3,12 +3,14 @@ import type { TrendBendDays } from "./analytics-api";
 /** Mirrors domain::forecast::ForecastRecipe. Absence is legacy trend, never a new default. */
 export type ForecastRecipe =
   | { method: "decayed_probability"; version: 1; halfLifeDays: number; kappa: number; priorPolicy: "gross_break_even" }
-  | { method: "trend"; version: 1; bendDays: TrendBendDays };
+  | TrendRecipe;
+
+export interface TrendRecipe { method: "trend" | "trend_sum_r"; version: 1; bendDays: TrendBendDays }
 
 /** Form-owned text preserves unfinished edits; convert to the wire recipe only on submit. */
 export type ForecastRecipeDraft =
   | { method: "decayed_probability"; version: 1; halfLifeDays: string; kappa: string; priorPolicy: "gross_break_even" }
-  | { method: "trend"; version: 1; bendDays: TrendBendDays };
+  | TrendRecipe;
 
 /** Explicit engineering baseline, not a calibrated optimum. Only for genuinely new forms. */
 export function initialForecastRecipeDraft(): ForecastRecipeDraft {
@@ -25,8 +27,8 @@ export function restoreForecastRecipeDraft(value: unknown): ForecastRecipeDraft 
   if (typeof value !== "object" || Array.isArray(value)) throw new Error("Некорректный сохранённый рецепт прогноза.");
   const recipe = value as Record<string, unknown>;
   const only = (keys: string[]) => Object.keys(recipe).every((key) => keys.includes(key));
-  if (recipe.version === 1 && recipe.method === "trend" && isTrendBendDays(recipe.bendDays) && only(["method", "version", "bendDays"])) {
-    return { method: "trend", version: 1, bendDays: recipe.bendDays };
+  if (recipe.version === 1 && (recipe.method === "trend" || recipe.method === "trend_sum_r") && isTrendBendDays(recipe.bendDays) && only(["method", "version", "bendDays"])) {
+    return { method: recipe.method, version: 1, bendDays: recipe.bendDays };
   }
   if (recipe.version === 1 && recipe.method === "decayed_probability" && recipe.priorPolicy === "gross_break_even"
     && only(["method", "version", "halfLifeDays", "kappa", "priorPolicy"])
@@ -44,7 +46,7 @@ function positiveFiniteInput(raw: string, label: string): number {
 
 export function buildForecastRecipe(draft: ForecastRecipeDraft): ForecastRecipe {
   if (draft.version !== 1) throw new Error("Неподдерживаемая версия рецепта прогноза.");
-  if (draft.method === "trend" && isTrendBendDays(draft.bendDays)) return { method: "trend", version: 1, bendDays: draft.bendDays };
+  if ((draft.method === "trend" || draft.method === "trend_sum_r") && isTrendBendDays(draft.bendDays)) return { method: draft.method, version: 1, bendDays: draft.bendDays };
   if (draft.method === "decayed_probability" && draft.priorPolicy === "gross_break_even") {
     return { method: "decayed_probability", version: 1,
       halfLifeDays: positiveFiniteInput(draft.halfLifeDays, "Память модели H"),
@@ -55,6 +57,6 @@ export function buildForecastRecipe(draft: ForecastRecipeDraft): ForecastRecipe 
 
 export function forecastRecipeLabel(recipe: ForecastRecipe | undefined, legacyBend: TrendBendDays): string {
   if (recipe?.method === "decayed_probability") return `Вероятность TP с памятью · v${recipe.version} · H ${recipe.halfLifeDays} дней · κ ${recipe.kappa} · prior: эвристический gross-break-even`;
-  const bend = recipe?.method === "trend" ? recipe.bendDays : legacyBend;
-  return `Прогноз по тренду · ${bend === "linear" ? "∞ — прямая" : `перегиб ${bend} дней`}${recipe ? ` · v${recipe.version}` : ""}`;
+  const bend = recipe ? recipe.bendDays : legacyBend;
+  return `${recipe?.method === "trend_sum_r" ? "Тренд сумм в рисках" : "Прогноз по тренду"} · ${bend === "linear" ? "∞ — прямая" : `перегиб ${bend} дней`}${recipe ? ` · v${recipe.version}` : ""}`;
 }

@@ -42,6 +42,14 @@ it("requests the entire fixed cohort fingerprint and original filters, without p
   expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
 });
 
+it("accepts the explicit sum-R recipe only with the same contextual daily-sum target as legacy Setups trend", async () => {
+  const explicit = { ...request, forecast: { method: "trend_sum_r", version: 1, bendDays: "linear" } } as const;
+  stub(forecastViewFixture(explicit));
+  expect(await fetchSetupsProjection(explicit, new AbortController().signal)).toMatchObject({ forecastTarget: "daily_sum_r", forecastR: 3.75 });
+  const invalid = forecastViewFixture(explicit); invalid.model.target = "daily_mean_r"; stub(invalid);
+  await expect(fetchSetupsProjection(explicit, new AbortController().signal)).rejects.toThrow("target");
+});
+
 it.each(["snapshot", "recipe", "lambda", "target", "selected", "endpoint"])("rejects a mismatched %s rather than plotting a stale/incompatible model", async (field) => {
   const value = forecastViewFixture(request);
   if (field === "snapshot") value.snapshot = { ...value.snapshot, fingerprint: "c".repeat(64) };

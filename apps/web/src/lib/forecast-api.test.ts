@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { fetchForecastCurve, type ForecastCurveRequest } from "./forecast-api";
-import { fetchMatrixCell, fetchMatrixCells, fetchMatrixGrid } from "./analytics-api";
+import { fetchDailyTrend, fetchMatrixCell, fetchMatrixCells, fetchMatrixGrid, type TrendProjectionRequest } from "./analytics-api";
 import { forecastFixture } from "../../test/forecast-fixture";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -84,4 +84,36 @@ it("forwards the identical recipe, mode, lambda and seconds cutoff to all existi
 it("does not accept an old mean-only matrix payload as proof of a newly requested forecast recipe", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ items: [{ tpPct: 2, slPct: 1, riskExpectancy: 0.8 }] }))));
   await expect(fetchMatrixGrid({ set: "run-1", forecast: request.forecast, trendMode: "forecast", observationCutoff: request.observationCutoff }, [2], [1])).rejects.toThrow("не подтвердил");
+});
+
+it.each(["mean", "forecast", "blend"] as const)("accepts the exact Rust no-fit projection wire fixture in %s without manufacturing F", async (trendMode) => {
+  // Same request/response case as analytics.rs::projection_mean_works_without_fit_and_missing_forecast_never_falls_back.
+  const points = [{ day: 3, value: null, weight: 1 }, { day: 5, value: 0, weight: 1 }, { day: 7, value: null, weight: 1 }];
+  const projection: TrendProjectionRequest = { forecast: { method: "trend_sum_r", version: 1, bendDays: "linear" }, meanR: 0.4, trendMode };
+  const response = { trend: null, projection: { ...projection, forecastR: null, decisionR: trendMode === "mean" ? 0.4 : null,
+    curve: trendMode === "mean" ? [{ day: 3, value: 0.4 }, { day: 7, value: 0.4 }] : [] } };
+  const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(response))); vi.stubGlobal("fetch", fetch);
+  expect(await fetchDailyTrend(points, "linear", new AbortController().signal, projection)).toEqual(response);
+  const [, init] = fetch.mock.calls[0] as [string, RequestInit];
+  expect(JSON.parse(init.body as string)).toEqual({ points, trendBendDays: "linear", projection });
+});
+
+it("preserves the omitted-projection old trend wire exactly", async () => {
+  const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ trend: null }))); vi.stubGlobal("fetch", fetch);
+  expect(await fetchDailyTrend([], "linear", new AbortController().signal)).toBeNull();
+  const [, init] = fetch.mock.calls[0] as [string, RequestInit];
+  expect(JSON.parse(init.body as string)).toEqual({ points: [], trendBendDays: "linear" });
+});
+
+it.each(["method", "bend", "mode", "mean", "lambda", "endpoint"])("rejects mismatched trend projection %s without rendering a stale decision curve", async (field) => {
+  const projection: TrendProjectionRequest = { forecast: { method: "trend_sum_r", version: 1, bendDays: "linear" }, meanR: 0.4, trendMode: "mean" };
+  const actual = { ...projection, forecast: { ...projection.forecast }, forecastR: null, decisionR: 0.4, curve: [{ day: 3, value: 0.4 }, { day: 7, value: 0.4 }] };
+  if (field === "method") actual.forecast.method = "trend";
+  if (field === "bend") actual.forecast.bendDays = "7";
+  if (field === "mode") actual.trendMode = "forecast";
+  if (field === "mean") actual.meanR = 0.5;
+  if (field === "lambda") actual.trendBlendLambda = 0.5;
+  if (field === "endpoint") actual.curve[1]!.value = 0.5;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ trend: null, projection: actual }))));
+  await expect(fetchDailyTrend([{ day: 3, value: null, weight: 1 }, { day: 7, value: null, weight: 1 }], "linear", new AbortController().signal, projection)).rejects.toThrow("не подтвердил");
 });

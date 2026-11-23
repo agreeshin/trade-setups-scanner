@@ -34,3 +34,15 @@ it("rejects invalid source bounds instead of presenting fabricated history", () 
   expect(() => buildObservedForecastDays([], day, day, day)).toThrow("границы");
   expect(() => buildObservedForecastDays([], day, day + 60, NaN)).toThrow("cutoff");
 });
+
+it("uses exact shifted-entry candle-close availability before excluding a gate failure, without changing raw outcomes", () => {
+  const cutoff = day + 86400;
+  const unknownGate = row(cutoff - 60, null, "price_change_filtered");
+  const knownGate = row(cutoff - 120, null, "price_change_filtered");
+  const knownTp = row(cutoff - 180, cutoff - 60);
+  const original = structuredClone([unknownGate, knownGate, knownTp]);
+  const days = buildObservedForecastDays(original, day, cutoff + 1, cutoff, { timeShiftMinutes: 2, retainFutureCohorts: true });
+  expect(days[0]).toMatchObject({ computedCount: 2, closedCount: 1, tpCount: 1, riskExpectancy: 2 });
+  expect(original).toEqual([unknownGate, knownGate, knownTp]);
+  expect(buildObservedForecastDays([unknownGate], day, cutoff + 1, cutoff + 60, { timeShiftMinutes: 2 })).toEqual([]);
+});

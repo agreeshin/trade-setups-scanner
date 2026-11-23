@@ -2,7 +2,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AnalyticsPage } from "./analytics-page";
-import type { MatrixCellRef, TradeRow, TrendInput, TrendSummary } from "../lib/analytics-api";
+import { SharedForecastControls } from "../components/shared-forecast-controls";
+import type { MatrixCellRef, TradeRow, TrendInput, TrendSummary, TrendProjectionRequest } from "../lib/analytics-api";
 import { applyInterfaceSettings } from "../lib/datetime-format";
 import type { ForecastCurveRequest, ForecastCurveResponse } from "../lib/forecast-api";
 import { forecastFixture } from "../../test/forecast-fixture";
@@ -38,6 +39,7 @@ interface StubOptions {
   trend?: TrendSummary | null;
   trendError?: boolean;
   interceptTrend?: (signal: AbortSignal | undefined) => Promise<Response>;
+  interceptTradeRows?: () => Promise<Response> | undefined;
   forecast?: (request: ForecastCurveRequest, signal: AbortSignal | undefined) => Promise<Response>;
 }
 
@@ -70,8 +72,19 @@ function stubFetch(options: StubOptions = {}) {
     if (path === "/v1/analytics/trend") {
       if (options.interceptTrend) return options.interceptTrend(init?.signal ?? undefined);
       if (options.trendError) return json({ error: "trend unavailable" }, 503);
-      const request = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as { points: TrendInput[] };
-      return json({ trend: options.trend === undefined ? fixtureTrend(request.points) : options.trend });
+      const request = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as { points: TrendInput[]; projection?: TrendProjectionRequest };
+      const trend = options.trend === undefined ? fixtureTrend(request.points) : options.trend;
+      if (!request.projection) return json({ trend });
+      const projection = request.projection;
+      // Transport fixture only; exact linear/spline/M-F-B parity belongs to Rust.
+      const decision = (forecast: number | null) => projection.trendMode === "mean" ? projection.meanR : forecast === null ? null
+        : projection.trendMode === "forecast" ? forecast : projection.meanR === null ? null
+          : (1 - projection.trendBlendLambda!) * projection.meanR + projection.trendBlendLambda! * forecast;
+      const decisionR = decision(trend?.end.value ?? null);
+      const coordinates = trend?.curve ?? (projection.trendMode === "mean" && request.points.length > 0
+        ? [request.points[0]!, ...(request.points.length > 1 ? [request.points.at(-1)!] : [])] : []);
+      return json({ trend, projection: { ...projection, forecastR: trend?.end.value ?? null, decisionR,
+        curve: decisionR === null ? [] : coordinates.map((point) => ({ day: point.day, value: decision(point.value) })) } });
     }
     if (path.startsWith("/v1/settings/web-analytics")) {
       if (method === "PUT") return json({ settings: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : {} });
@@ -106,6 +119,8 @@ function stubFetch(options: StubOptions = {}) {
       const pathname = path.split("?")[0]!;
       const symbol = decodeURIComponent(pathname.split("/")[4] ?? "");
       const closeTimeUnix = Number(pathname.split("/")[5]);
+      const fixture = options.tradeRows?.find((row) => row.setup.symbol === symbol && row.setup.closeTimeUnix === closeTimeUnix);
+      if (fixture !== undefined) return json({ ...fixture, cached: false });
       const status = symbol === "BTCUSDT" ? "tp" : "sl";
       return json({
         setup: { ...setupA, symbol, closeTimeUnix },
@@ -115,6 +130,8 @@ function stubFetch(options: StubOptions = {}) {
       });
     }
     if (path.startsWith("/v1/analytics/trades")) {
+      const intercepted = options.interceptTradeRows?.();
+      if (intercepted !== undefined) return intercepted;
       if (options.tradeRows) return json({ items: options.tradeRows, cachedCount: options.tradeRows.length });
       return json({
         items: [{
@@ -137,6 +154,62 @@ function stubFetch(options: StubOptions = {}) {
 
 const fullShortGrid = shortLevels.flatMap((tp) => shortLevels.map((sl) => matrixCell(tp, sl, tp === 6 && sl === 6 ? 0.17 : 0.05)));
 const fullLongGrid = longTpLevels.flatMap((tp) => longSlLevels.map((sl) => matrixCell(tp, sl, -0.3)));
+
+it("uses one matrix-owned selection per direction, ignores conflicting legacy list filters and preserves cell-only controls", async () => {
+  const calls = stubFetch({ tradeRows: [], savedSettings: { trendMode: "mean", clusterize: false, sections: {
+    "short-matrix": { timeRange: { mode: "month", month: "2024-01" }, timeShiftInput: "7", considerPriceChange: true, priceChangeInput: "0" },
+    "long-matrix": { timeRange: { mode: "custom", fromDay: "2024-01-02", toDay: "2024-01-03" }, timeShiftInput: "9", considerPriceChange: true, priceChangeInput: "-1.25" },
+    "short-trades": { timeRange: { mode: "month", month: "1999-01" }, timeShiftInput: "999", considerPriceChange: true, priceChangeInput: "999", tpInput: "6", slInput: "2", riskPctInput: "3" },
+    "long-trades": { timeRange: { mode: "month", month: "1998-01" }, timeShiftInput: "998", considerPriceChange: false, tpInput: "8", slInput: "1", riskPctInput: "4" },
+  } } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  expect(screen.getAllByLabelText("Период")).toHaveLength(2);
+  expect(screen.getAllByLabelText("Time-shift, мин")).toHaveLength(2);
+  expect(screen.getAllByLabelText("Риск на сделку, %")[0]).toHaveValue("3");
+  expect(calls.some((call) => call.method === "POST" || call.path.includes("/trades"))).toBe(false);
+  for (const direction of ["short", "long"] as const) {
+    if (direction === "long") await userEvent.click(screen.getByRole("tab", { name: "LONG" }));
+    await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+    await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+    const scoped = calls.filter((call) => ["/v1/analytics/matrix-grid", "/v1/analytics/setups", "/v1/analytics/trades"].includes(call.path)
+      && new URLSearchParams(call.search).get("direction") === direction);
+    expect(scoped).toHaveLength(3);
+    for (const call of scoped) {
+      const query = new URLSearchParams(call.search);
+      expect(query.get("timeShiftMinutes")).toBe(direction === "short" ? "7" : "9");
+      expect(query.get("priceChangePct")).toBe(direction === "short" ? "0" : "-1.25");
+      expect(query.get("month")).toBe(direction === "short" ? "2024-01" : null);
+      expect(query.get("fromDay")).toBe(direction === "long" ? "2024-01-02" : null);
+      expect(query.get("toDay")).toBe(direction === "long" ? "2024-01-03" : null);
+      expect(query.has("setupMaturity")).toBe(false);
+      if (call.path !== "/v1/analytics/matrix-grid") {
+        expect(query.get("tpPct")).toBe(direction === "short" ? "6" : "8");
+        expect(query.get("slPct")).toBe(direction === "short" ? "2" : "1");
+      }
+    }
+  }
+});
+
+it.each(["short", "long"] as const)("uses the old all/shift0/gate-off matrix defaults for %s, never missing-matrix list fallback", async (direction) => {
+  const calls = stubFetch({ tradeRows: [], savedSettings: { trendMode: "mean", sections: {
+    [`${direction}-trades`]: { timeRange: { mode: "month", month: "1999-01" }, timeShiftInput: "9", considerPriceChange: true, priceChangeInput: "-5", tpInput: "6", slInput: "2" },
+  } } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  if (direction === "long") await userEvent.click(screen.getByRole("tab", { name: "LONG" }));
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  const query = new URLSearchParams(calls.find((call) => call.path === "/v1/analytics/trades")!.search);
+  for (const key of ["month", "fromDay", "toDay", "timeShiftMinutes", "priceChangePct"]) expect(query.has(key)).toBe(false);
+  expect(query.get("tpPct")).toBe("6"); expect(query.get("slPct")).toBe("2");
+  const count = calls.filter((call) => call.path.includes("/trades") || call.method === "POST").length;
+  const panel = within(screen.getByRole("tabpanel"));
+  fireEvent.change(panel.getByLabelText("Time-shift, мин"), { target: { value: "8" } });
+  fireEvent.click(panel.getByRole("checkbox", { name: "Учитывать смещение цены" }));
+  expect(panel.getByLabelText("Смещение цены, %")).toHaveValue("0"); // On-zero is not off.
+  expect(calls.filter((call) => call.path.includes("/trades") || call.method === "POST")).toHaveLength(count);
+  await userEvent.click(panel.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  const next = new URLSearchParams(calls.filter((call) => call.path === "/v1/analytics/trades").at(-1)!.search);
+  expect(next.get("priceChangePct")).toBe("0"); expect(next.get("timeShiftMinutes")).toBe("8");
+});
 
 it("computes matrices only after the button press and honours subsections", async () => {
   const calls = stubFetch({ shortBulk: fullShortGrid, longBulk: fullLongGrid });
@@ -177,7 +250,7 @@ it("computes matrices only after the button press and honours subsections", asyn
   expect(screen.getAllByLabelText("Зелёный при")[1]).toHaveValue("0.5");
   await userEvent.click(screen.getByRole("tab", { name: "SHORT" }));
   expect(shortShift).toBeVisible(); expect(shortShift).toHaveValue("7");
-  expect(screen.getByText("Ячеек: 196 / 196")).toBeVisible();
+  expect(screen.queryByText("0.17")).not.toBeInTheDocument(); // Scope edits invalidate, not restore, the old result.
   expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
   expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid")).toHaveLength(2);
 }, 15_000);
@@ -244,7 +317,7 @@ it("syncs the month selector with the date pair", async () => {
   const calls = stubFetch({ shortBulk: fullShortGrid });
   render(<AnalyticsPage />);
   await screen.findByText("#12 · Утренний прогон");
-  await waitFor(() => expect(screen.getAllByText("2024-02")).toHaveLength(4));
+  await waitFor(() => expect(screen.getAllByText("2024-02")).toHaveLength(2));
   fireEvent.change(screen.getAllByLabelText("Период")[0]!, { target: { value: "2024-01" } });
   expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2024-01-01");
   expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2024-01-31");
@@ -317,7 +390,7 @@ it("autoruns matrices only for matrix-relevant changes", async () => {
   await waitFor(() => expect(calls.filter((call) => call.method === "PUT" && call.path === "/v1/settings/web-analytics")).toHaveLength(1), { timeout: 3000 });
   expect(calls.filter((call) => call.path.startsWith("/v1/analytics/matrix")).length).toBe(matrixCallsAfterEntry);
   expect(calls.every((call) => !call.path.startsWith("/v1/analytics/setups") && !call.path.startsWith("/v1/analytics/trades"))).toBe(true);
-  await waitFor(() => expect(screen.getAllByText("2024-02")).toHaveLength(4), { timeout: 5000 });
+  await waitFor(() => expect(screen.getAllByText("2024-02")).toHaveLength(2), { timeout: 5000 });
   fireEvent.change(screen.getAllByLabelText("Период")[0]!, { target: { value: "2024-01" } });
   await waitFor(() => expect(calls.filter((call) => call.path.startsWith("/v1/analytics/matrix")).length).toBeGreaterThan(matrixCallsAfterEntry), { timeout: 5000 });
 }, 30_000);
@@ -376,8 +449,8 @@ it("filters trades by the display date range", async () => {
   stubFetch();
   render(<AnalyticsPage />);
   await screen.findByText("#12 · Утренний прогон");
-  fireEvent.change(screen.getAllByLabelText("С даты")[1]!, { target: { value: "2124-01-01" } });
-  expect(screen.getAllByLabelText("Период")[1]).toHaveValue("custom");
+  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2124-01-01" } });
+  expect(screen.getAllByLabelText("Период")[0]).toHaveValue("custom");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
   expect(await screen.findByText(/Сделок: 2 \/ 2/)).toBeInTheDocument();
   expect(screen.queryByText("BTCUSDT")).not.toBeInTheDocument();
@@ -563,9 +636,12 @@ it("updates the chart mean and TP/(TP+SL) win rate for only the visible period",
   const heading = screen.getByRole("heading", { name: /^Дневное матожидание в рисках/ });
   expect(heading).toHaveTextContent("Среднее МО: +1.00R · Винрейт: 66.7%");
   expect(within(heading).getByLabelText("Среднее МО за период")).toHaveClass("text-success");
-  fireEvent.change(screen.getAllByLabelText("С даты")[1]!, { target: { value: "2026-01-04" } });
-  expect(heading).toHaveTextContent("Среднее МО: -1.00R · Винрейт: 0.0%");
-  expect(within(heading).getByLabelText("Среднее МО за период")).toHaveClass("text-danger");
+  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2026-01-04" } });
+  expect(screen.queryByRole("img", { name: "Дневное матожидание в рисках" })).not.toBeInTheDocument();
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  const updated = await screen.findByRole("heading", { name: /^Дневное матожидание в рисках/ });
+  expect(updated).toHaveTextContent("Среднее МО: -1.00R · Винрейт: 0.0%");
+  expect(within(updated).getByLabelText("Среднее МО за период")).toHaveClass("text-danger");
 });
 
 it("renders a single UTC-day point centered without a fabricated trend or endpoint labels", async () => {
@@ -817,4 +893,159 @@ it("blocks unsupported saved recipe versions rather than replacing them with the
   expect(screen.getByRole("button", { name: "Прогноз" })).toBeDisabled();
   expect(screen.queryAllByRole("button", { name: "Рассчитать" })).toHaveLength(0);
   expect(calls.every((call) => call.method === "GET")).toBe(true);
+});
+
+it.each(["legacy", "trend", "trend_sum_r", "decayed_probability"] as const)("fences late matrix/list results after a shared scope edit for %s, with no automatic replacement run", async (method) => {
+  const current = utcTrade("2026-01-04T12:00:00Z", -1, 0);
+  const stale = { ...current, setup: { ...current.setup, symbol: "STALEUSDT" }, riskReturn: 9.99 };
+  const gridReply: { resolve?: (value: Response) => void } = {};
+  const tradesReply: { resolve?: (value: Response) => void } = {};
+  let tradeAttempts = 0;
+  const forecast = method === "legacy" ? undefined : method === "decayed_probability" ? probabilityRecipe
+    : { method, version: 1, bendDays: "linear" };
+  const calls = stubFetch({ ...utcChartOptions([current]), savedSettings: { trendMode: "forecast", ...(forecast ? { forecast } : {}) },
+    interceptMatrixGrid: () => new Promise<Response>((resolve) => { gridReply.resolve = resolve; }),
+    interceptTradeRows: () => ++tradeAttempts === 1 ? new Promise<Response>((resolve) => { tradesReply.resolve = resolve; }) : undefined });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await userEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
+  await waitFor(() => expect(tradesReply.resolve).toBeDefined());
+  fireEvent.change(screen.getAllByLabelText("Time-shift, мин")[0]!, { target: { value: "7" } });
+  expect(screen.queryByRole("button", { name: "Остановить" })).not.toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: "Рассчитать" })).toHaveLength(2);
+  expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(1);
+  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid")).toHaveLength(1);
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByText(current.setup.symbol);
+  const oldQuery = new URLSearchParams(calls.find((call) => call.path === "/v1/analytics/matrix-grid")!.search);
+  const cell = { ...matrixCell(4, 4, 9.99), ...(forecast ? { forecast, observationCutoff: Number(oldQuery.get("observationCutoff")), meanR: 0.8, forecastR: 9.99, decisionR: 9.99 } : {}) };
+  await act(async () => {
+    gridReply.resolve!(new Response(JSON.stringify({ items: [cell], ...selectionMetrics })));
+    tradesReply.resolve!(new Response(JSON.stringify({ items: [stale], cachedCount: 1 })));
+    await Promise.resolve();
+  });
+  expect(screen.queryByText("STALEUSDT")).not.toBeInTheDocument();
+  expect(screen.queryByText("9.99")).not.toBeInTheDocument();
+  expect(screen.getAllByLabelText("Time-shift, мин")[0]).toHaveValue("7");
+  expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(2);
+  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid")).toHaveLength(1);
+});
+
+it("keeps observed mean/sum local and independent across sum/mean/probability recipes, using genuine closed targets and per-trade M", async () => {
+  vi.spyOn(Date, "now").mockReturnValue(probabilityCutoff * 1000);
+  const rows = [utcTrade("2026-01-01T12:00:00Z", 2, 0), utcTrade("2026-01-01T13:00:00Z", 2, 1),
+    utcTrade("2026-01-04T12:00:00Z", -1, 2), utcTrade("2026-01-06T12:00:00Z", null, 3),
+    utcTrade("2026-01-10T12:00:00Z", 2, 4), utcTrade("2026-01-10T13:00:00Z", 2, 5)].map((row) => ({ ...row, tpPct: 2, slPct: 1 }));
+  const calls = stubFetch({ ...utcChartOptions(rows), savedSettings: { trendMode: "blend", trendBlendLambda: "0.5",
+    forecast: { method: "trend_sum_r", version: 1, bendDays: "linear" }, sections: { "short-trades": { tpInput: "2", slInput: "1" } } } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  expect(calls.some((call) => call.method === "POST")).toBe(false);
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  const line = await screen.findByTestId("trend-decision-curve");
+  const sumDecision = Number(line.getAttribute("data-decision-r"));
+  const initial = JSON.parse(calls.find((call) => call.path === "/v1/analytics/trend")!.body!) as { points: TrendInput[]; projection: TrendProjectionRequest };
+  expect(initial.points.map((point) => [point.value, point.weight])).toEqual([[4, 2], [-1, 1], [null, 1], [4, 2]]);
+  expect(initial.projection).toEqual({ forecast: { method: "trend_sum_r", version: 1, bendDays: "linear" }, meanR: 1.4, trendMode: "blend", trendBlendLambda: 0.5 });
+  expect(screen.getByLabelText("Фактический ряд по дням")).toHaveValue("mean");
+  const initialCount = calls.length;
+  fireEvent.change(screen.getByLabelText("Фактический ряд по дням"), { target: { value: "sum" } });
+  expect(calls).toHaveLength(initialCount);
+  expect(screen.getByTestId("trend-decision-curve")).toHaveAttribute("data-decision-r", String(sumDecision));
+  const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
+  expect(chart.querySelectorAll("circle")).toHaveLength(3);
+  expect(chart.querySelector("circle title")).toHaveTextContent("сумма +4.00R, закрыто 2");
+  fireEvent.change(screen.getByLabelText("Метод прогноза"), { target: { value: "trend" } });
+  await waitFor(() => expect(calls.filter((call) => call.path === "/v1/analytics/trend")).toHaveLength(2));
+  await screen.findByTestId("trend-decision-curve");
+  const meanRequest = JSON.parse(calls.filter((call) => call.path === "/v1/analytics/trend").at(-1)!.body!) as typeof initial;
+  expect(meanRequest.points.map((point) => [point.value, point.weight])).toEqual([[2, 2], [-1, 1], [null, 1], [2, 2]]);
+  expect(meanRequest.projection.meanR).toBe(1.4);
+  expect(Number(screen.getByTestId("trend-decision-curve").getAttribute("data-decision-r"))).not.toBe(sumDecision);
+  expect(screen.getByLabelText("Фактический ряд по дням")).toHaveValue("sum");
+  fireEvent.change(screen.getByLabelText("Метод прогноза"), { target: { value: "decayed_probability" } });
+  await screen.findByTestId("forecast-model-curve");
+  expect(screen.getByLabelText("Фактический ряд по дням")).toHaveValue("sum");
+  const modelCalls = calls.filter((call) => call.method === "POST").length;
+  fireEvent.change(screen.getByLabelText("Фактический ряд по дням"), { target: { value: "mean" } });
+  expect(calls.filter((call) => call.method === "POST")).toHaveLength(modelCalls);
+  expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(1);
+  expect(calls.some((call) => call.path.startsWith("/v1/analytics/trades/"))).toBe(false);
+});
+
+it("does not let a pending model response reset the observed selection or refetch the model", async () => {
+  vi.spyOn(Date, "now").mockReturnValue(probabilityCutoff * 1000);
+  const pending: { request?: ForecastCurveRequest; signal?: AbortSignal | undefined; resolve?: (response: Response) => void } = {};
+  const calls = stubFetch({ ...probabilityOptions(), forecast: (request, signal) => {
+    pending.request = request; pending.signal = signal;
+    return new Promise<Response>((resolve) => { pending.resolve = resolve; });
+  } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await waitFor(() => expect(pending.resolve).toBeDefined());
+  fireEvent.change(screen.getByLabelText("Фактический ряд по дням"), { target: { value: "sum" } });
+  expect(pending.signal?.aborted).toBe(false);
+  await act(async () => { pending.resolve!(new Response(JSON.stringify(forecastFixture(pending.request!)))); await Promise.resolve(); });
+  await screen.findByTestId("forecast-model-curve");
+  expect(screen.getByLabelText("Фактический ряд по дням")).toHaveValue("sum");
+  expect(screen.getByRole("img").querySelector("circle title")).toHaveTextContent("сумма 4 R");
+  expect(calls.filter((call) => call.path === "/v1/analytics/forecast")).toHaveLength(1);
+});
+
+it.each(["trend", "trend_sum_r"] as const)("retains a post-cutoff shifted-entry gate rejection as null setup weight in actual %s list assembly", async (method) => {
+  const cutoff = Date.parse("2026-01-03T12:00:00Z") / 1000;
+  vi.spyOn(Date, "now").mockReturnValue(cutoff * 1000);
+  const rows = [utcTrade("2026-01-01T12:00:00Z", 1, 0), utcTrade("2026-01-02T12:00:00Z", -1, 1),
+    utcTrade("2026-01-03T11:50:00Z", 1, 2), { ...utcTrade("2026-01-03T11:59:00Z", null, 3), status: "price_change_filtered" }]
+    .map((row) => ({ ...row, closeTimeUnix: row.status === "price_change_filtered" ? null : row.setup.closeTimeUnix + 300 }));
+  const calls = stubFetch({ ...utcChartOptions(rows),
+    sets: [{ ...setFixture, fromUnix: rows[0]!.setup.closeTimeUnix, toUnix: rows.at(-1)!.setup.closeTimeUnix }],
+    ...(method === "trend_sum_r" ? { interceptTradeRows: () => Promise.resolve(new Response(JSON.stringify({ items: [], cachedCount: 0 }))) } : {}),
+    savedSettings: { trendMode: "forecast", forecast: { method, version: 1, bendDays: "linear" },
+    sections: { "short-matrix": { timeShiftInput: "2", considerPriceChange: true, priceChangeInput: "0" } } } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByTestId("trend-decision-curve");
+  const request = JSON.parse(calls.find((call) => call.path === "/v1/analytics/trend")!.body!) as { points: TrendInput[]; projection: TrendProjectionRequest };
+  expect(request.points.map((point) => [point.value, point.weight])).toEqual([[1, 1], [-1, 1], [1, 2]]);
+  expect(request.projection.meanR).toBeCloseTo(1 / 3);
+  expect(Number(screen.getByTestId("trend-decision-curve").getAttribute("data-decision-r"))).toBeCloseTo(7 / 11, 12);
+  expect(screen.queryByText(rows[3]!.setup.symbol)).not.toBeInTheDocument();
+  expect(screen.getByText("Отфильтровано смещением цены: 1")).toBeInTheDocument();
+  expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(1);
+  expect(calls.filter((call) => call.path.startsWith("/v1/analytics/trades/"))).toHaveLength(method === "trend_sum_r" ? 4 : 0);
+});
+
+it("coalesces shared Setups forecast commits into one replacement matrix run per direction, with no list autorun", async () => {
+  const calls = stubFetch({ shortBulk: fullShortGrid, longBulk: fullLongGrid, savedSettings: { autoCalc: true, trendMode: "forecast",
+    forecast: { method: "trend", version: 1, bendDays: "linear" } } });
+  render(<><AnalyticsPage /><SharedForecastControls /></>);
+  await screen.findByText("#12 · Утренний прогон");
+  const gridCalls = () => calls.filter((call) => call.path === "/v1/analytics/matrix-grid");
+  await waitFor(() => expect(gridCalls()).toHaveLength(2));
+  const shared = within(screen.getByRole("region", { name: "Общий прогноз Analytics и Сетапов" }));
+  fireEvent.change(shared.getByLabelText("Метод прогноза"), { target: { value: "trend_sum_r" } });
+  await waitFor(() => expect(gridCalls()).toHaveLength(4), { timeout: 1500 });
+  fireEvent.change(shared.getByLabelText("Перегиб на N дней"), { target: { value: "7" } });
+  await waitFor(() => expect(gridCalls()).toHaveLength(6), { timeout: 1500 });
+  fireEvent.click(shared.getByRole("button", { name: "Смесь" }));
+  await waitFor(() => expect(gridCalls()).toHaveLength(8), { timeout: 1500 });
+  fireEvent.change(shared.getByLabelText("Доля прогноза λ"), { target: { value: "0.4" } });
+  await waitFor(() => expect(gridCalls()).toHaveLength(10), { timeout: 1500 });
+  // A local Analytics commit must not add a second run through the shared observer.
+  const local = within(screen.getByRole("region", { name: "Аналитика" }));
+  fireEvent.change(local.getByLabelText("Доля прогноза λ"), { target: { value: "0.6" } });
+  await waitFor(() => expect(gridCalls()).toHaveLength(12), { timeout: 1500 });
+  expect(calls.some((call) => call.path === "/v1/analytics/setups" || call.path.includes("/trades") || call.method === "POST")).toBe(false);
+}, 15_000);
+
+it("keeps shared Setups forecast edits manual when Analytics auto-calc is off", async () => {
+  const calls = stubFetch({ savedSettings: { autoCalc: false, trendMode: "forecast", forecast: { method: "trend", version: 1, bendDays: "linear" } } });
+  render(<><AnalyticsPage /><SharedForecastControls /></>); await screen.findByText("#12 · Утренний прогон");
+  const shared = within(screen.getByRole("region", { name: "Общий прогноз Analytics и Сетапов" }));
+  fireEvent.change(shared.getByLabelText("Метод прогноза"), { target: { value: "trend_sum_r" } });
+  fireEvent.change(shared.getByLabelText("Перегиб на N дней"), { target: { value: "7" } });
+  fireEvent.click(shared.getByRole("button", { name: "Смесь" }));
+  fireEvent.change(shared.getByLabelText("Доля прогноза λ"), { target: { value: "0.4" } });
+  await act(async () => { await new Promise((resolve) => { setTimeout(resolve, 950); }); });
+  expect(calls.some((call) => call.path.includes("/matrix") || call.path === "/v1/analytics/setups" || call.path.includes("/trades") || call.method === "POST")).toBe(false);
 });

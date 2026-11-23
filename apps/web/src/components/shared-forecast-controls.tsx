@@ -14,7 +14,7 @@ export function SharedForecastControls() {
         onBlendModeChange={() => updateSharedAnalyticsSettings({ trendMode: "blend" })}
         onBendChange={(bend) => updateSharedAnalyticsSettings({ trendBendDays: bend })}
         onBlendLambdaChange={(lambda) => updateSharedAnalyticsSettings({ trendBlendLambda: lambda })}
-        onForecastChange={(forecast) => updateSharedAnalyticsSettings({ forecast, ...(forecast.method === "trend" ? { trendBendDays: forecast.bendDays } : {}) })} />
+        onForecastChange={(forecast) => updateSharedAnalyticsSettings({ forecast, ...(forecast.method !== "decayed_probability" ? { trendBendDays: forecast.bendDays } : {}) })} />
     </fieldset>
     {(state.status === "idle" || state.status === "loading") && <p role="status" className="text-xs text-muted-foreground">Загрузка общих настроек прогноза…</p>}
     {state.error !== null && <p role="alert" className="text-sm text-danger">Не удалось загрузить общие настройки: {state.error} <Button variant="outline" size="sm" onClick={loadSharedAnalyticsSettings}>Повторить загрузку настроек</Button></p>}

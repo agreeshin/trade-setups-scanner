@@ -5,6 +5,8 @@ export interface DailyExpectancyPoint {
   day: string;
   dayStartUnix: number;
   riskExpectancy: number | null;
+  /** Exact sum from the calculated closed rows; optional for older chart consumers. */
+  sumR?: number | null;
   closedCount: number;
   tpCount: number;
   slCount: number;
@@ -37,9 +39,17 @@ export function buildDailyExpectancy(rows: readonly (TradeRow & { fromCache: boo
   return [...buckets.entries()].sort(([left], [right]) => left - right).map(([dayStartUnix, bucket]) => ({
     day: new Date(dayStartUnix * 1000).toISOString().slice(0, 10), dayStartUnix,
     riskExpectancy: bucket.closedCount > 0 ? bucket.sum / bucket.closedCount : null,
+    sumR: bucket.closedCount > 0 ? bucket.sum : null,
     closedCount: bucket.closedCount, tpCount: bucket.tpCount, slCount: bucket.slCount,
     computedCount: bucket.computedCount, cachedCount: bucket.cachedCount,
   }));
+}
+
+export type ObservedDailyMode = "mean" | "sum";
+/** Presentation only: never pass this projection back as model training data. */
+export function observedDailyPoints(items: readonly DailyExpectancyPoint[], mode: ObservedDailyMode): DailyExpectancyPoint[] {
+  return items.map((point) => ({ ...point, riskExpectancy: mode === "mean" ? point.riskExpectancy
+    : point.sumR !== undefined ? point.sumR : point.riskExpectancy === null ? null : point.riskExpectancy * point.closedCount }));
 }
 
 export function utcDayStart(unix: number): number {

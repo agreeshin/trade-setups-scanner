@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AnalyticsTrendControls } from "../components/analytics-trend-controls";
-import { AnalyticsForecastChart, DailyCalendarGrid } from "../components/analytics-forecast-chart";
+import { AnalyticsForecastChart, DailyCalendarGrid, DailyObservedControls } from "../components/analytics-forecast-chart";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -28,7 +28,8 @@ import {
   fetchDailyTrend,
   type TrendBendDays,
   type TrendMode,
-  type TrendSummary,
+  type TrendProjectionRequest,
+  type TrendProjectionResponse,
   type AnalyticsSet,
   type MatrixCellRef,
   type SelectionMetrics,
@@ -40,7 +41,7 @@ import {
 } from "../lib/analytics-settings";
 import { updateSharedAnalyticsSettings, useSharedAnalyticsSettings } from "../lib/analytics-settings-store";
 import { effectiveTimezone, formatUnix, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
-import { buildDailyExpectancy, buildDailyExpectancyModel, type DailyExpectancyPoint } from "../lib/daily-expectancy";
+import { buildDailyExpectancy, buildDailyExpectancyModel, observedDailyPoints, type ObservedDailyMode, type DailyExpectancyPoint } from "../lib/daily-expectancy";
 import { buildForecastRecipe, forecastRecipeLabel, type ForecastRecipeDraft } from "../lib/forecast-recipe";
 import { buildObservedForecastDays } from "../lib/forecast-observations";
 import type { ForecastCurveRequest } from "../lib/forecast-api";
@@ -87,6 +88,8 @@ function matrixCellTextStep(value: number, min: number, max: number): number {
 }
 
 interface MatrixSectionProps {
+  scope: AnalyticsSelectionScope;
+  onScopeChange: (next: AnalyticsSelectionScope) => void;
   trendBendDays: TrendBendDays;
   trendMode: TrendMode;
   forecast: ForecastRecipeDraft | undefined;
@@ -113,25 +116,35 @@ interface MatrixSectionProps {
 function MatrixSection({
   setId, description, direction, tpLevels, slLevels, enablePriceChange,
   gradientMinDefault, gradientMaxDefault, clusterize, maturity, clusterGapHours, setBounds,
-  initial, reportState, onCommit, runToken, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff,
+  initial, reportState, onCommit, runToken, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff, scope, onScopeChange,
 }: MatrixSectionProps) {
-  const [timeRange, setTimeRange] = useState<TimeRangeValue>(() => normalizeTimeRange(initial?.timeRange));
-  const [timeShiftInput, setTimeShiftInput] = useState(() => savedString(initial?.timeShiftInput, "0"));
-  const [considerPriceChange, setConsiderPriceChange] = useState(() => initial?.considerPriceChange === true);
-  const [priceChangeInput, setPriceChangeInput] = useState(() => savedString(initial?.priceChangeInput, "0"));
+  const { timeRange, timeShiftInput, considerPriceChange, priceChangeInput } = scope;
+  const setTimeRange = (value: TimeRangeValue) => onScopeChange({ ...scope, timeRange: value });
   const [gradientMinDraft, setGradientMinDraft] = useState(() => savedNumber(initial?.gradientMin, gradientMinDefault));
   const [gradientMaxDraft, setGradientMaxDraft] = useState(() => savedNumber(initial?.gradientMax, gradientMaxDefault));
   const [gradientMin, setGradientMin] = useState(() => savedNumber(initial?.gradientMin, gradientMinDefault));
   const [gradientMax, setGradientMax] = useState(() => savedNumber(initial?.gradientMax, gradientMaxDefault));
   const [cells, setCells] = useState<Map<string, MatrixCellRef>>(new Map());
   const [resultIdentity, setResultIdentity] = useState<string | null>(null);
-  const modelIdentity = JSON.stringify({ mode: trendMode, ...(trendMode === "mean" ? {} : { bend: trendBendDays, forecast, lambda: trendMode === "blend" ? trendBlendLambda : undefined, cutoff: forecast ? observationCutoff : undefined }) });
+  const modelIdentity = JSON.stringify({ setId, direction, timeRange: timeRangeParams(timeRange), shift: appliedTimeShift(scope), gate: appliedPriceGate(scope),
+    clusterize, ...(clusterize ? { maturity, clusterGapHours } : {}),
+    mode: trendMode, bend: trendBendDays, forecast, lambda: trendBlendLambda, cutoff: forecast ? observationCutoff : undefined });
+  const currentIdentity = useRef(modelIdentity);
   const [metrics, setMetrics] = useState<SelectionMetrics | null>(null);
   const [running, setRunning] = useState(false);
   const [pendingCell, setPendingCell] = useState<string | null>(null);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [error, setError] = useState<string | null>(null);
   const runIdRef = useRef(0);
+  const [displayIdentity, setDisplayIdentity] = useState(modelIdentity);
+  if (displayIdentity !== modelIdentity) {
+    setDisplayIdentity(modelIdentity);
+    setRunning(false); setPendingCell(null); setProgress({ done: 0, total: 0 }); setError(null);
+  }
+  useLayoutEffect(() => {
+    currentIdentity.current = modelIdentity;
+    return () => { runIdRef.current += 1; };
+  }, [modelIdentity]);
 
   useEffect(() => {
     reportState?.({ timeRange, timeShiftInput, considerPriceChange, priceChangeInput, gradientMin, gradientMax });
@@ -151,7 +164,7 @@ function MatrixSection({
     setRunning(true);
     setError(null);
     setPendingCell(null);
-    const stale = () => runIdRef.current !== runId;
+    const stale = () => runIdRef.current !== runId || currentIdentity.current !== modelIdentity;
     try {
     const recipe = forecast !== undefined && trendMode !== "mean" ? buildForecastRecipe(forecast) : undefined;
     const lambda = Number(trendBlendLambda);
@@ -213,16 +226,16 @@ function MatrixSection({
       <div className="flex flex-wrap items-end gap-3">
         <TimeRangeControls setId={setId} setBounds={setBounds} value={timeRange} onChange={setTimeRange} onCommit={onCommit} />
         <Field label="Time-shift, мин" className="w-32">
-          {(control) => <Input {...control} inputMode="numeric" value={timeShiftInput} onBlur={() => onCommit?.()} onChange={(event) => setTimeShiftInput(event.target.value)} />}
+          {(control) => <Input {...control} inputMode="numeric" value={timeShiftInput} onBlur={() => onCommit?.()} onChange={(event) => onScopeChange({ ...scope, timeShiftInput: event.target.value })} />}
         </Field>
         {enablePriceChange && (
           <>
             <label className="flex items-center gap-2 text-sm">
-              <Checkbox checked={considerPriceChange} onCheckedChange={(checked) => { setConsiderPriceChange(checked === true); onCommit?.(); }} />
+              <Checkbox checked={considerPriceChange} onCheckedChange={(checked) => { onScopeChange({ ...scope, considerPriceChange: checked === true }); onCommit?.(); }} />
               Учитывать смещение цены
             </label>
             <Field label="Смещение цены, %" className="w-36">
-              {(control) => <Input {...control} inputMode="decimal" disabled={!considerPriceChange} value={priceChangeInput} onBlur={() => onCommit?.()} onChange={(event) => setPriceChangeInput(event.target.value)} />}
+              {(control) => <Input {...control} inputMode="decimal" disabled={!considerPriceChange} value={priceChangeInput} onBlur={() => onCommit?.()} onChange={(event) => onScopeChange({ ...scope, priceChangeInput: event.target.value })} />}
             </Field>
           </>
         )}
@@ -268,7 +281,7 @@ function MatrixSection({
         </label>
       </div>
       {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
-      {metrics !== null && (
+      {metrics !== null && resultIdentity === modelIdentity && (
         <div className="flex flex-wrap gap-2 text-xs">
           <Badge>{clusterize ? "После кластеризации" : "Сетапов"}: {metrics.totalMatchingSetups}</Badge>
           {metrics.avgSelectionOrdinal !== null && <Badge>Средний номер: {metrics.avgSelectionOrdinal.toFixed(2)}</Badge>}
@@ -332,6 +345,19 @@ interface TimeRangeValue {
   fromDay: string | null;
   toDay: string | null;
 }
+
+interface AnalyticsSelectionScope {
+  timeRange: TimeRangeValue;
+  timeShiftInput: string;
+  considerPriceChange: boolean;
+  priceChangeInput: string;
+}
+function restoreSelectionScope(saved?: Record<string, unknown>): AnalyticsSelectionScope {
+  return { timeRange: normalizeTimeRange(saved?.timeRange), timeShiftInput: savedString(saved?.timeShiftInput, "0"),
+    considerPriceChange: saved?.considerPriceChange === true, priceChangeInput: savedString(saved?.priceChangeInput, "0") };
+}
+const appliedTimeShift = (scope: AnalyticsSelectionScope) => Math.max(0, Math.round(parseNumberInput(scope.timeShiftInput) ?? 0));
+const appliedPriceGate = (scope: AnalyticsSelectionScope) => scope.considerPriceChange ? parseNumberInput(scope.priceChangeInput) ?? 0 : null;
 
 function timeRangeParams(value: TimeRangeValue): { month?: string; fromDay?: string; toDay?: string } {
   if (value.mode === "month") return { month: value.month };
@@ -427,31 +453,51 @@ interface TradeRowWithSource extends TradeRow {
 }
 
 /** Interface calendar presentation of unchanged UTC aggregates and the shared Rust curve. */
-function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendDays }: { items: DailyExpectancyPoint[]; originUnix: number; meanRisk: number | null; winRate: number | null; trendBendDays: TrendBendDays }) {
-  const [result, setResult] = useState<{ items: DailyExpectancyPoint[]; bend: TrendBendDays; trend: TrendSummary | null; error: string | null } | null>(null);
+function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendDays, forecast, trendMode, trendBlendLambda, observedMode, onObservedModeChange }: {
+  items: DailyExpectancyPoint[]; originUnix: number; meanRisk: number | null; winRate: number | null; trendBendDays: TrendBendDays;
+  forecast: ForecastRecipeDraft | undefined; trendMode: TrendMode; trendBlendLambda: string;
+  observedMode: ObservedDailyMode; onObservedModeChange: (mode: ObservedDailyMode) => void;
+}) {
+  const observed = useMemo(() => observedDailyPoints(items, observedMode), [items, observedMode]);
+  const modelInput = useMemo(() => {
+    try {
+      const recipe = buildForecastRecipe(forecast ?? { method: "trend", version: 1, bendDays: trendBendDays });
+      if (recipe.method === "decayed_probability") throw new Error("Для тренда требуется trend-рецепт.");
+      const lambda = Number(trendBlendLambda);
+      if (trendMode === "blend" && !isTrendBlendLambda(lambda)) throw new Error("Доля прогноза λ: 0.05–0.95 с шагом 0.01.");
+      const projection: TrendProjectionRequest = { forecast: recipe, meanR: meanRisk, trendMode,
+        ...(trendMode === "blend" ? { trendBlendLambda: lambda } : {}) };
+      return { points: items.map((item) => ({ day: item.dayStartUnix / 86400,
+        value: recipe.method === "trend_sum_r" ? item.sumR ?? (item.riskExpectancy === null ? null : item.riskExpectancy * item.closedCount) : item.riskExpectancy,
+        weight: item.computedCount })), bend: recipe.bendDays, projection, error: null };
+    } catch (cause) { return { error: cause instanceof Error ? cause.message : "Некорректный рецепт тренда." }; }
+  }, [items, meanRisk, trendBendDays, forecast, trendMode, trendBlendLambda]);
+  const [result, setResult] = useState<{ input: typeof modelInput; response: TrendProjectionResponse | null; error: string | null } | null>(null);
   useEffect(() => {
-    if (items.filter((item) => item.riskExpectancy !== null && item.computedCount > 0).length < 2) return;
+    if (modelInput.error !== null || !modelInput.points || !modelInput.projection || modelInput.bend === undefined || items.length === 0) return;
     const controller = new AbortController();
     // Coalesce progress flushes, retaining at most one request/result per chart.
     const timer = window.setTimeout(() => {
-      void fetchDailyTrend(items.map((item) => ({ day: item.dayStartUnix / 86400, value: item.riskExpectancy, weight: item.computedCount })), trendBendDays, controller.signal)
-        .then((trend) => { if (!controller.signal.aborted) setResult({ items, bend: trendBendDays, trend, error: null }); })
-        .catch((error: unknown) => { if (!controller.signal.aborted) setResult({ items, bend: trendBendDays, trend: null, error: error instanceof Error ? error.message : "ошибка расчёта" }); });
+      void fetchDailyTrend(modelInput.points, modelInput.bend, controller.signal, modelInput.projection)
+        .then((response) => { if (!controller.signal.aborted) setResult({ input: modelInput, response, error: null }); })
+        .catch((error: unknown) => { if (!controller.signal.aborted) setResult({ input: modelInput, response: null, error: error instanceof Error ? error.message : "ошибка расчёта" }); });
     }, 250);
     return () => { window.clearTimeout(timer); controller.abort(); };
-  }, [items, trendBendDays]);
-  const current = result?.items === items && result.bend === trendBendDays ? result : null;
-  const trend = current?.trend ?? null;
+  }, [modelInput, items.length]);
+  const current = result?.input === modelInput ? result : null;
+  const trend = current?.response?.trend ?? null;
+  const projection = current?.response?.projection ?? null;
   if (items.length === 0) {
     return <p className="text-xs text-muted-foreground">График появится после расчёта первых строк.</p>;
   }
-  const model = buildDailyExpectancyModel(items, originUnix);
-  const values = items.map((item) => item.riskExpectancy).filter((value): value is number => value !== null && Number.isFinite(value));
+  const model = buildDailyExpectancyModel(observed, originUnix);
+  const values = observed.map((item) => item.riskExpectancy).filter((value): value is number => value !== null && Number.isFinite(value));
   if (values.length === 0) {
     return <p className="text-xs text-muted-foreground">Пока нет дней с закрытыми TP/SL сделками.</p>;
   }
   // Scale to displayed values only, including fitted extrema but not hidden uncertainty.
   if (trend) for (const point of trend.curve) values.push(point.value);
+  if (projection) for (const point of projection.curve) if (point.value !== null) values.push(point.value);
   const width = 760;
   const height = 280;
   const left = 64;
@@ -479,7 +525,11 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
   return (
     <div className="grid gap-2">
     <h3 className="text-sm font-medium">Дневное матожидание в рисках · Среднее МО: <span aria-label="Среднее МО за период" className={meanRisk !== null && meanRisk > 0 ? "text-success" : meanRisk !== null && meanRisk < 0 ? "text-danger" : "text-muted-foreground"}>{meanRisk === null ? "—" : fittedLabel(meanRisk)}</span> · Винрейт: <span aria-label="Винрейт за период">{winRate === null ? "—" : `${winRate.toFixed(1)}%`}</span></h3>
-    {current?.error && <p role="status" className="text-xs text-danger">Не удалось рассчитать тренд: {current.error}</p>}
+    <DailyObservedControls value={observedMode} onChange={onObservedModeChange} />
+    <p className="text-xs text-muted-foreground">Точки: {observedMode === "mean" ? "среднее R закрытых сделок дня" : "сумма R закрытых сделок дня"}. Модель: {forecast?.method === "trend_sum_r" ? "тренд дневной суммы R, не результата одной сделки" : "тренд среднего по дням"}. {trendMode === "mean" ? "Основная линия M: среднее за период." : trendMode === "blend" ? `Основная линия B: смесь M/F, λ ${trendBlendLambda}.` : "Основная линия F: чистый прогноз."}</p>
+    {projection && <p className="text-xs text-muted-foreground">Чистый F: <span aria-label="Чистый прогноз тренда">{projection.forecastR === null ? "—" : fittedLabel(projection.forecastR)}</span> · decisionR: <span aria-label="Метрика решения тренда">{projection.decisionR === null ? "—" : fittedLabel(projection.decisionR)}</span></p>}
+    {(modelInput.error ?? current?.error) && <p role="status" className="text-xs text-danger">Не удалось рассчитать тренд: {modelInput.error ?? current?.error}</p>}
+    {projection?.decisionR === null && <p role="status" className="text-xs text-muted-foreground">Выбранная модель недоступна: недостаточно конечных дневных данных.</p>}
     <svg className="w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание в рисках">
       <desc>Серверные дневные агрегаты показаны по календарным суткам {timezone} без пересчёта исходных значений. Расстояния по оси X соответствуют календарным суткам; дни без закрытых сделок не равны нулю.</desc>
       <line className="stroke-muted-foreground/40" x1={left} y1={top} x2={left} y2={height - bottom} />
@@ -504,6 +554,10 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
         <text className="fill-warning font-mono text-[10px]" x={xForTrend(trend.start.day)} y={yForValue(trend.start.value) - 10} textAnchor="start" aria-label={`Начало тренда: ${fittedLabel(trend.start.value)}`}>{fittedLabel(trend.start.value)}</text>
         <text className="fill-warning font-mono text-[10px]" x={xForTrend(trend.end.day)} y={yForValue(trend.end.value) - 10} textAnchor="end" aria-label={`Конец тренда: ${fittedLabel(trend.end.value)}`}>{fittedLabel(trend.end.value)}</text>
       </> : null}
+      {projection?.decisionR != null && <polyline data-testid="trend-decision-curve" data-decision-r={projection.decisionR} className="fill-none stroke-warning stroke-2"
+        points={projection.curve.filter((point) => point.value !== null).map((point) => `${xForTrend(point.day)},${yForValue(point.value!)}`).join(" ")}>
+        <title>{`${projection.trendMode === "mean" ? "M: среднее за период" : projection.trendMode === "blend" ? "B: смесь среднего и прогноза" : "F: чистый прогноз"}: ${fittedLabel(projection.decisionR)}`}</title>
+      </polyline>}
       {model.points.map((item, index) => {
         const x = xForDay(item.x);
         const showLabel = index % labelStep === 0 || index === items.length - 1;
@@ -511,7 +565,7 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
           <g key={item.day}>
             {item.riskExpectancy !== null && Number.isFinite(item.riskExpectancy) ? (
               <circle className={item.riskExpectancy >= 0 ? "fill-success" : "fill-danger"} cx={x} cy={yForValue(item.riskExpectancy)} r={4}>
-                <title>{`${formatUnix(item.dayStartUnix, { time: false })} (${timezone}): ${formatRisk(item.riskExpectancy)}, закрыто ${item.closedCount}, TP ${item.tpCount}, SL ${item.slCount}, из кеша ${item.cachedCount}/${item.computedCount}`}</title>
+                <title>{`${formatUnix(item.dayStartUnix, { time: false })} (${timezone}): ${observedMode === "sum" ? "сумма " : ""}${formatRisk(item.riskExpectancy)}, закрыто ${item.closedCount}, TP ${item.tpCount}, SL ${item.slCount}, из кеша ${item.cachedCount}/${item.computedCount}`}</title>
               </circle>
             ) : null}
             {showLabel ? <text className="fill-muted-foreground text-[10px]" x={x} y={height - 26} textAnchor="middle">{formatUnix(item.dayStartUnix, { time: false })}</text> : null}
@@ -519,12 +573,14 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
         );
       })}
       <text className="fill-muted-foreground text-[10px]" x={left + plotWidth / 2} y={height - 8} textAnchor="middle">Дата сетапа ({timezone})</text>
+      <text className="fill-muted-foreground text-[10px]" x={left} y={top - 10}>{observedMode === "mean" ? "Среднее R дня" : "Сумма R дня"}</text>
     </svg>
     </div>
   );
 }
 
 interface TradesSectionProps {
+  scope: AnalyticsSelectionScope;
   trendBendDays: TrendBendDays;
   trendMode: TrendMode;
   forecast: ForecastRecipeDraft | undefined;
@@ -534,7 +590,6 @@ interface TradesSectionProps {
   setId: string;
   description: string;
   direction: "short" | "long";
-  enablePriceChange: boolean;
   clusterize: boolean;
   maturity: number;
   clusterGapHours: number | null;
@@ -544,15 +599,15 @@ interface TradesSectionProps {
   onCommit?: (() => void) | undefined;
 }
 
-function TradesSection({ setId, description, direction, enablePriceChange, clusterize, maturity, clusterGapHours, setBounds, initial, reportState, onCommit, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff, setPeriod }: TradesSectionProps) {
+function TradesSection({ setId, description, direction, clusterize, maturity, clusterGapHours, setBounds, initial, reportState, onCommit, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff, setPeriod, scope }: TradesSectionProps) {
   const [tpInput, setTpInput] = useState(() => savedString(initial?.tpInput, "4"));
   const [slInput, setSlInput] = useState(() => savedString(initial?.slInput, "4"));
-  const [timeShiftInput, setTimeShiftInput] = useState(() => savedString(initial?.timeShiftInput, "0"));
-  const [timeRange, setTimeRange] = useState<TimeRangeValue>(() => normalizeTimeRange(initial?.timeRange));
-  const [considerPriceChange, setConsiderPriceChange] = useState(() => initial?.considerPriceChange === true);
-  const [priceChangeInput, setPriceChangeInput] = useState(() => savedString(initial?.priceChangeInput, "0"));
+  const { timeRange } = scope;
+  const shift = appliedTimeShift(scope);
+  const gate = appliedPriceGate(scope);
   const [riskPctInput, setRiskPctInput] = useState(() => savedString(initial?.riskPctInput, "1"));
   const [rows, setRows] = useState<TradeRowWithSource[]>([]);
+  const [observedMode, setObservedMode] = useState<ObservedDailyMode>("mean");
   const [resultParamsKey, setResultParamsKey] = useState<string | null>(null);
   const [filteredCount, setFilteredCount] = useState(0);
   const [running, setRunning] = useState(false);
@@ -561,23 +616,33 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
   const runIdRef = useRef(0);
 
   useEffect(() => {
-    reportState?.({ timeRange, tpInput, slInput, timeShiftInput, considerPriceChange, priceChangeInput, riskPctInput });
-  }, [reportState, timeRange, tpInput, slInput, timeShiftInput, considerPriceChange, priceChangeInput, riskPctInput]);
+    reportState?.({ tpInput, slInput, riskPctInput });
+  }, [reportState, tpInput, slInput, riskPctInput]);
 
   const params = useMemo(() => ({
     set: setId,
     direction,
     tpPct: parseNumberInput(tpInput) ?? 4,
     slPct: parseNumberInput(slInput) ?? 4,
-    ...(Math.max(0, Math.round(parseNumberInput(timeShiftInput) ?? 0)) > 0 ? { timeShiftMinutes: Math.max(0, Math.round(parseNumberInput(timeShiftInput) ?? 0)) } : {}),
+    ...(shift > 0 ? { timeShiftMinutes: shift } : {}),
     ...timeRangeParams(timeRange),
     ...(clusterize ? {
       setupMaturity: maturity,
       ...(clusterGapHours !== null && clusterGapHours > 0 ? { clusterGapHours } : {}),
     } : {}),
-    ...(enablePriceChange && considerPriceChange ? { priceChangePct: parseNumberInput(priceChangeInput) ?? 0 } : {}),
-  }), [setId, direction, tpInput, slInput, timeShiftInput, timeRange, clusterize, maturity, clusterGapHours, enablePriceChange, considerPriceChange, priceChangeInput]);
+    ...(gate !== null ? { priceChangePct: gate } : {}),
+  }), [setId, direction, tpInput, slInput, shift, timeRange, clusterize, maturity, clusterGapHours, gate]);
   const paramsKey = JSON.stringify({ ...params, observationCutoff });
+  const currentParamsKey = useRef(paramsKey);
+  const [displayParamsKey, setDisplayParamsKey] = useState(paramsKey);
+  if (displayParamsKey !== paramsKey) {
+    setDisplayParamsKey(paramsKey);
+    setRunning(false); setRows([]); setFilteredCount(0); setProgress({ done: 0, total: 0 }); setError(null);
+  }
+  useLayoutEffect(() => {
+    currentParamsKey.current = paramsKey;
+    return () => { runIdRef.current += 1; };
+  }, [paramsKey]);
 
   const run = useCallback(async () => {
     const runId = runIdRef.current + 1;
@@ -587,7 +652,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
     setRows([]);
     setResultParamsKey(paramsKey);
     setFilteredCount(0);
-    const stale = () => runIdRef.current !== runId;
+    const stale = () => runIdRef.current !== runId || currentParamsKey.current !== paramsKey;
     try {
       const selection = await fetchAnalyticsSetups(params);
       if (stale()) return;
@@ -619,9 +684,10 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
         done += 1;
         if (row.status === "price_change_filtered") {
           filtered += 1;
-        } else {
-          collected.push({ ...row, fromCache });
         }
+        // One calculation-owned raw collection. Display excludes gate failures,
+        // while cutoff-aware model assembly may still require their null weight.
+        collected.push({ ...row, fromCache });
         flush();
       }
     } catch (cause) {
@@ -634,13 +700,14 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
   const effectiveDays = timeRangeBounds(timeRange, setBounds);
   const effectiveFromDay = effectiveDays?.from;
   const effectiveToDay = effectiveDays?.to;
-  const visibleRows = useMemo(() => {
-    if (forecast?.method === "decayed_probability" && resultParamsKey !== paramsKey) return [];
+  const scopedRows = useMemo(() => {
+    if (resultParamsKey !== paramsKey) return [];
     if (effectiveFromDay === undefined || effectiveToDay === undefined) return rows;
     const from = Math.floor(new Date(`${effectiveFromDay}T00:00:00Z`).getTime() / 1000);
     const to = Math.floor(new Date(`${effectiveToDay}T23:59:59Z`).getTime() / 1000);
     return rows.filter((row) => row.setup.closeTimeUnix >= from && row.setup.closeTimeUnix <= to);
-  }, [rows, effectiveFromDay, effectiveToDay, forecast?.method, resultParamsKey, paramsKey]);
+  }, [rows, effectiveFromDay, effectiveToDay, resultParamsKey, paramsKey]);
+  const visibleRows = useMemo(() => scopedRows.filter((row) => row.status !== "price_change_filtered"), [scopedRows]);
 
   const deposit = useMemo(() => {
     const riskPct = parseNumberInput(riskPctInput);
@@ -670,21 +737,40 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
 
   const dailyPoints = useMemo(() => buildDailyExpectancy(visibleRows), [visibleRows]);
   const chartOriginUnix = effectiveDays !== null ? Date.parse(`${effectiveDays.from}T00:00:00Z`) / 1000 : dailyPoints[0]?.dayStartUnix ?? 0;
+  const chartFromUnix = timeRange.mode === "all" && setPeriod ? setPeriod.fromUnix : chartOriginUnix;
+  // Set bounds are inclusive raw-signal timestamps; the model API uses [from,to).
+  const chartToUnix = timeRange.mode === "all" && setPeriod ? setPeriod.toUnix + 1 : effectiveToDay ? Date.parse(`${effectiveToDay}T00:00:00Z`) / 1000 + 86400 : (dailyPoints.at(-1)?.dayStartUnix ?? chartFromUnix) + 86400;
+  const activeCutoff = forecast !== undefined && trendMode !== "mean";
+  const retainFutureCohorts = forecast?.method !== "decayed_probability";
+  const modelPopulation = useMemo(() => {
+    try {
+      return { days: activeCutoff && scopedRows.length > 0
+        ? buildObservedForecastDays(scopedRows, chartFromUnix, chartToUnix, observationCutoff,
+          { timeShiftMinutes: shift, retainFutureCohorts }) : dailyPoints, error: null };
+    } catch (cause) { return { days: [], error: cause instanceof Error ? cause.message : "Не удалось подтвердить популяцию модели." }; }
+  }, [activeCutoff, scopedRows, chartFromUnix, chartToUnix, observationCutoff, shift, retainFutureCohorts, dailyPoints]);
+  const modelDays = modelPopulation.days;
+  const modelMean = useMemo(() => {
+    const closed = modelDays.reduce((sum, day) => sum + day.closedCount, 0);
+    const tp = modelDays.reduce((sum, day) => sum + day.tpCount, 0);
+    return { mean: closed > 0 ? modelDays.reduce((sum, day) => sum + (day.sumR ?? 0), 0) / closed : null,
+      winRate: closed > 0 ? 100 * tp / closed : null };
+  }, [modelDays]);
   const probabilityChart = useMemo((): { request: ForecastCurveRequest; days: DailyExpectancyPoint[]; error?: never } | { error: string } | null => {
-    if (forecast?.method !== "decayed_probability" || running || visibleRows.length === 0) return null;
+    if (forecast?.method !== "decayed_probability" || running || scopedRows.length === 0 || modelPopulation.error !== null) return null;
     try {
       const recipe = buildForecastRecipe(forecast);
       const q = params.tpPct / params.slPct;
       if (!Number.isFinite(q) || q <= 0) throw new Error("TP и SL должны быть конечными числами больше 0.");
       const lambda = Number(trendBlendLambda);
       if (trendMode === "blend" && !isTrendBlendLambda(lambda)) throw new Error("Доля прогноза λ: 0.05–0.95 с шагом 0.01.");
-      const fromUnix = timeRange.mode === "all" && setPeriod ? setPeriod.fromUnix : chartOriginUnix;
-      const toUnix = timeRange.mode === "all" && setPeriod ? setPeriod.toUnix : effectiveToDay ? Date.parse(`${effectiveToDay}T00:00:00Z`) / 1000 + 86400 : (dailyPoints.at(-1)?.dayStartUnix ?? fromUnix) + 86400;
-      const days = buildObservedForecastDays(visibleRows, fromUnix, toUnix, observationCutoff);
+      const fromUnix = chartFromUnix;
+      const toUnix = chartToUnix;
+      const days = modelDays;
       return { days, request: { forecast: recipe, trendMode, trendBlendLambda: trendMode === "blend" ? lambda : 0.7, q, fromUnix, toUnix, observationCutoff,
         atUnix: observationCutoff + 86400, daily: days.map((day) => ({ dayStartUnix: day.dayStartUnix, tpCount: day.tpCount, slCount: day.slCount })) } };
     } catch (cause) { return { error: cause instanceof Error ? cause.message : "Некорректные входы модели." }; }
-  }, [forecast, running, visibleRows, params.tpPct, params.slPct, trendBlendLambda, trendMode, timeRange.mode, setPeriod, chartOriginUnix, effectiveToDay, dailyPoints, observationCutoff]);
+  }, [forecast, running, scopedRows, modelPopulation.error, params.tpPct, params.slPct, trendBlendLambda, trendMode, chartFromUnix, chartToUnix, modelDays, observationCutoff]);
 
   return <section className="grid min-w-0 gap-4">
       <div className="flex items-center gap-2">
@@ -698,21 +784,6 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
         <Field label="SL, %" className="w-28">
           {(control) => <Input {...control} inputMode="decimal" value={slInput} onBlur={() => onCommit?.()} onChange={(event) => setSlInput(event.target.value)} />}
         </Field>
-        <Field label="Time-shift, мин" className="w-32">
-          {(control) => <Input {...control} inputMode="numeric" value={timeShiftInput} onBlur={() => onCommit?.()} onChange={(event) => setTimeShiftInput(event.target.value)} />}
-        </Field>
-        <TimeRangeControls setId={setId} setBounds={setBounds} value={timeRange} onChange={setTimeRange} onCommit={onCommit} />
-        {enablePriceChange && (
-          <>
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox checked={considerPriceChange} onCheckedChange={(checked) => { setConsiderPriceChange(checked === true); onCommit?.(); }} />
-              Учитывать смещение цены
-            </label>
-            <Field label="Смещение цены, %" className="w-36">
-              {(control) => <Input {...control} inputMode="decimal" disabled={!considerPriceChange} value={priceChangeInput} onBlur={() => onCommit?.()} onChange={(event) => setPriceChangeInput(event.target.value)} />}
-            </Field>
-          </>
-        )}
         <Field label="Риск на сделку, %" className="w-32">
           {(control) => <Input {...control} inputMode="decimal" value={riskPctInput} onBlur={() => onCommit?.()} onChange={(event) => setRiskPctInput(event.target.value)} />}
         </Field>
@@ -723,6 +794,7 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
       </div>
       {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
       {deposit.error && visibleRows.length > 0 && <p role="status" className="text-sm text-danger">{deposit.error}</p>}
+      {modelPopulation.error !== null && <p role="status" className="text-sm text-danger">Модель недоступна: {modelPopulation.error}</p>}
       <div className="flex flex-wrap gap-2 text-xs">
         {summary.winRate !== null && <Badge variant={summary.avgRisk !== null && summary.avgRisk >= 0 ? "success" : "danger"}>Win rate: {summary.winRate.toFixed(1)}%</Badge>}
         {summary.avgRisk !== null && <Badge>Матожидание: {formatRisk(summary.avgRisk)} по {summary.closed} закрытым</Badge>}
@@ -730,8 +802,10 @@ function TradesSection({ setId, description, direction, enablePriceChange, clust
       </div>
       {forecast?.method === "decayed_probability" ? probabilityChart && ("error" in probabilityChart
         ? <p role="status" className="text-sm text-danger">Модель недоступна: {probabilityChart.error}</p>
-        : <AnalyticsForecastChart request={probabilityChart.request} days={probabilityChart.days} />)
-        : rows.length > 0 && <DailyExpectancyChart items={dailyPoints} originUnix={chartOriginUnix} meanRisk={summary.avgRisk} winRate={summary.winRate} trendBendDays={forecast?.method === "trend" ? forecast.bendDays : trendBendDays} />}
+        : <AnalyticsForecastChart request={probabilityChart.request} days={probabilityChart.days} observedMode={observedMode} onObservedModeChange={setObservedMode} />)
+        : scopedRows.length > 0 && modelPopulation.error === null && <DailyExpectancyChart items={modelDays} originUnix={chartOriginUnix} meanRisk={modelMean.mean} winRate={modelMean.winRate}
+          trendBendDays={trendBendDays} forecast={forecast} trendMode={trendMode} trendBlendLambda={trendBlendLambda} observedMode={observedMode} onObservedModeChange={setObservedMode} />}
+      {visibleRows.length === 0 && !running && <p className="text-xs text-muted-foreground">График появится после ручного расчёта строк с закрытыми TP/SL сделками.</p>}
       {rows.length === 0 && !running && !error && <EmptyState title="Нет рассчитанных сделок" description="Выберите параметры и нажмите «Рассчитать». Сначала загружаются кешированные строки, затем досчитываются остальные." />}
       {rows.length > 0 && (
         <div className="overflow-x-auto">
@@ -858,6 +932,8 @@ export function AnalyticsPage() {
   const [sets, setSets] = useState<AnalyticsSet[]>([]);
   const [setsState, setSetsState] = useState<"loading" | "ready" | "error">("loading");
   const [savedSettings, setSavedSettings] = useState<AnalyticsUserSettings | null>(null);
+  const [shortScope, setShortScope] = useState<AnalyticsSelectionScope>(() => restoreSelectionScope());
+  const [longScope, setLongScope] = useState<AnalyticsSelectionScope>(() => restoreSelectionScope());
   const [setId, setSetId] = useState("");
   const [section, setSection] = useState<AnalyticsSection>("short");
   const [clusterize, setClusterize] = useState(true);
@@ -895,6 +971,8 @@ export function AnalyticsPage() {
     setClusterGapInput(settings.clusterGapInput);
     setAutoCalc(settings.autoCalc);
     setSavedSettings(settings);
+    setShortScope(restoreSelectionScope(settings.sections["short-matrix"]));
+    setLongScope(restoreSelectionScope(settings.sections["long-matrix"]));
     if (settings.autoCalc) setRunToken(1);
     setHydrated(true);
   }
@@ -918,17 +996,43 @@ export function AnalyticsPage() {
   /** Debounced autosave: coalesces slider commits and rapid consecutive changes.
    * matrixRelevant=false (edits inside the trade-list sections) saves without re-running matrices. */
   const commitTimerRef = useRef<number | null>(null);
+  const pendingCommitRef = useRef({ saveOwned: false, matrixRelevant: false });
   useEffect(() => () => {
     if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
   }, []);
-  const onSettingsCommit = useCallback((matrixRelevant = true) => {
-    if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
+  const onSettingsCommit = useCallback((matrixRelevant = true, saveOwned = true) => {
+    // Shared forecast fields already have their own writer/debounce. Observing
+    // them must not save unrelated drafts or postpone an owned-settings commit
+    // behind that writer, which would cause a stale first PUT and a second PUT.
+    if (!saveOwned && !collectRef.current().autoCalc) return;
+    pendingCommitRef.current.saveOwned ||= saveOwned;
+    pendingCommitRef.current.matrixRelevant ||= matrixRelevant;
+    if (commitTimerRef.current !== null) {
+      if (!saveOwned) return;
+      window.clearTimeout(commitTimerRef.current);
+    }
     commitTimerRef.current = window.setTimeout(() => {
       commitTimerRef.current = null;
-      updateSharedAnalyticsSettings(collectRef.current(), 0);
-      if (matrixRelevant && collectRef.current().autoCalc) setRunToken((token) => token + 1);
+      const pending = pendingCommitRef.current;
+      pendingCommitRef.current = { saveOwned: false, matrixRelevant: false };
+      if (pending.saveOwned) updateSharedAnalyticsSettings(collectRef.current(), 0);
+      if (pending.matrixRelevant && collectRef.current().autoCalc) setRunToken((token) => token + 1);
     }, 800);
   }, []);
+
+  const sharedForecastIdentity = JSON.stringify({ trendMode, ...(trendMode === "mean" ? {} : {
+    forecast, bend: forecast?.method === "decayed_probability" ? undefined : trendBendDays,
+    lambda: trendMode === "blend" ? trendBlendLambda : undefined,
+  }) });
+  const lastSharedForecastIdentity = useRef<string | null>(null);
+  useEffect(() => {
+    if (!hydrated || settingsState !== "ready") return;
+    const previous = lastSharedForecastIdentity.current;
+    lastSharedForecastIdentity.current = sharedForecastIdentity;
+    // Seed without an extra hydration run. Local and keep-alive Setups commits
+    // use the same existing timer, so one commit produces one matrix batch/run.
+    if (previous !== null && previous !== sharedForecastIdentity) onSettingsCommit(true, false);
+  }, [hydrated, settingsState, sharedForecastIdentity, onSettingsCommit]);
 
   const commitMaturity = () => {
     setMaturity(maturityDraft);
@@ -1017,12 +1121,12 @@ export function AnalyticsPage() {
         <div className="grid gap-3">
           <div className="flex items-center gap-2"><h3 className="text-sm font-semibold text-muted-foreground">Матожидание и модель прогноза</h3>
           <InfoNote>Режим mean по умолчанию. Среднее M, чистый прогноз F и decisionR смеси различаются. Probability использует только наблюдавшиеся TP/SL и единый cutoff C; за C продолжение плоское. Прежний trend доступен отдельно для сравнения; его fitted endpoint не является probability-моделью или третьей компонентой смеси. Ретроспективная кривая не доказывает OOS-качество.</InfoNote></div>
-          <AnalyticsTrendControls mode={trendMode} bend={trendBendDays}
-            forecast={forecast} onForecastChange={(next) => { updateSharedAnalyticsSettings({ forecast: next, ...(next.method === "trend" ? { trendBendDays: next.bendDays } : {}) }); onSettingsCommit(); }}
-            onBlendModeChange={() => { updateSharedAnalyticsSettings({ trendMode: "blend" }); onSettingsCommit(); }} blendLambda={trendBlendLambda}
-            onBlendLambdaChange={(lambda) => { updateSharedAnalyticsSettings({ trendBlendLambda: lambda }); onSettingsCommit(); }}
-            onModeChange={(mode) => { updateSharedAnalyticsSettings({ trendMode: mode }); onSettingsCommit(); }}
-            onBendChange={(bend) => { updateSharedAnalyticsSettings({ trendBendDays: bend }); onSettingsCommit(); }} />
+          <AnalyticsTrendControls scope="analytics" mode={trendMode} bend={trendBendDays}
+            forecast={forecast} onForecastChange={(next) => { updateSharedAnalyticsSettings({ forecast: next, ...(next.method !== "decayed_probability" ? { trendBendDays: next.bendDays } : {}) }); onSettingsCommit(true, false); }}
+            onBlendModeChange={() => { updateSharedAnalyticsSettings({ trendMode: "blend" }); onSettingsCommit(true, false); }} blendLambda={trendBlendLambda}
+            onBlendLambdaChange={(lambda) => { updateSharedAnalyticsSettings({ trendBlendLambda: lambda }); onSettingsCommit(true, false); }}
+            onModeChange={(mode) => { updateSharedAnalyticsSettings({ trendMode: mode }); onSettingsCommit(true, false); }}
+            onBendChange={(bend) => { updateSharedAnalyticsSettings({ trendBendDays: bend }); onSettingsCommit(true, false); }} />
           {forecast && <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
             <span>Cutoff C: {formatUnix(observationCutoff)} ({effectiveTimezone()}) · зафиксирован для матриц и модельного графика, не двигается по часам.</span>
             <Button type="button" variant="outline" onClick={() => { setObservationCutoff(Math.floor(Date.now() / 1000)); onSettingsCommit(); }}>Новый cutoff C</Button>
@@ -1039,6 +1143,7 @@ export function AnalyticsPage() {
     {settingsState === "ready" && hydrated && (<>
     <PageSidebarPanel value="short">
       <MatrixSection
+        scope={shortScope} onScopeChange={setShortScope}
         trendBendDays={trendBendDays}
         trendMode={trendMode}
         forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff}
@@ -1061,12 +1166,12 @@ export function AnalyticsPage() {
       />
       <Separator />
       <TradesSection
+        scope={shortScope}
         trendBendDays={trendBendDays}
         trendMode={trendMode} forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff} setPeriod={setPeriod}
         setId={setId}
         description="SHORT: построчные сделки — вход по close свечи через time-shift, закрытие по TP или SL за 7 дней. Сначала показываются кешированные строки, недостающие досчитываются."
         direction="short"
-        enablePriceChange
         clusterize={clusterize}
         maturity={maturity}
         clusterGapHours={appliedClusterGapHours}
@@ -1078,6 +1183,7 @@ export function AnalyticsPage() {
     </PageSidebarPanel>
     <PageSidebarPanel value="long">
       <MatrixSection
+        scope={longScope} onScopeChange={setLongScope}
         trendBendDays={trendBendDays}
         trendMode={trendMode}
         forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff}
@@ -1100,12 +1206,12 @@ export function AnalyticsPage() {
       />
       <Separator />
       <TradesSection
+        scope={longScope}
         trendBendDays={trendBendDays}
         trendMode={trendMode} forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff} setPeriod={setPeriod}
         setId={setId}
         description="LONG: построчные закрытия по уровням TP/SL с ценой входа, временем касания и результатом в рисках."
         direction="long"
-        enablePriceChange={false}
         clusterize={clusterize}
         maturity={maturity}
         clusterGapHours={appliedClusterGapHours}

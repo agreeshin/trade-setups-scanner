@@ -33,13 +33,25 @@ export async function fetchAnalyticsSettings(signal?: AbortSignal): Promise<Anal
     maturity: typeof partial.maturity === "number" && Number.isFinite(partial.maturity) ? partial.maturity : 0.5,
     clusterGapInput: typeof partial.clusterGapInput === "string" && partial.clusterGapInput !== "" ? partial.clusterGapInput : "8",
     autoCalc: partial.autoCalc === true,
-    trendBendDays: forecast?.method === "trend" ? forecast.bendDays
+    trendBendDays: forecast && forecast.method !== "decayed_probability" ? forecast.bendDays
       : partial.trendBendDays === "7" || partial.trendBendDays === "14" || partial.trendBendDays === "30" ? partial.trendBendDays : "linear",
     trendMode: partial.trendMode === "forecast" || partial.trendMode === "blend" ? partial.trendMode : "mean",
     trendBlendLambda: typeof partial.trendBlendLambda === "string" || typeof partial.trendBlendLambda === "number" ? String(partial.trendBlendLambda) : "0.7",
     forecast,
-    sections: partial.sections !== null && typeof partial.sections === "object" ? partial.sections : {},
+    sections: normalizeAnalyticsSections(partial.sections),
   };
+}
+
+/** Retired list filters never become a fallback or get dual-written on autosave. */
+function normalizeAnalyticsSections(value: AnalyticsUserSettings["sections"] | undefined): AnalyticsUserSettings["sections"] {
+  const sections = value !== null && typeof value === "object" ? { ...value } : {};
+  for (const key of ["short-trades", "long-trades"] as const) {
+    if (sections[key] === undefined) continue;
+    const saved = { ...sections[key] };
+    for (const field of ["timeRange", "timeShiftInput", "considerPriceChange", "priceChangeInput"]) delete saved[field];
+    sections[key] = saved;
+  }
+  return sections;
 }
 
 export async function saveAnalyticsSettings(settings: AnalyticsUserSettings): Promise<void> {

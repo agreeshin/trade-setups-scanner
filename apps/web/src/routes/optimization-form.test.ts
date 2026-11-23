@@ -95,6 +95,14 @@ it("uses the explicit trend recipe bend as the authoritative fixed setting", () 
     .toMatchObject({ trendBendDays: "30", forecast: { method: "trend", version: 1, bendDays: "30" } });
 });
 
+it.each(["mean", "forecast", "blend"] as const)("rejects unsupported sum-R studies even in %s instead of coercing them to legacy trend", (trendMode) => {
+  const selected = { trendMode, forecast: { method: "trend_sum_r", version: 1, bendDays: "linear" } } as const;
+  expect(() => build(selected)).toThrow("не для исследований");
+  expect(() => buildContinuousConfig(algorithm, { ...scope, ...selected }, catalog,
+    initialDomains(algorithm.fields, algorithm.params), initialDomains(ANALYTICS_SEARCH_FIELDS, { ...ANALYTICS_BASELINE }),
+    { lookbackDays: "30", minSetupsPerDay: "4", minMeanExpectancy: "0.15", adaptiveEnabled: false })).toThrow("не для исследований");
+});
+
 it("uses the same fixed blend lambda and forward gate for manual and continuous specs", () => {
   const selected = { trendMode: "blend" as const, trendBlendLambda: "0.6", minForecastExpectancy: "0.2" };
   const continuous = buildContinuousConfig(algorithm, { ...scope, ...selected }, catalog,

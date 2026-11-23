@@ -1,5 +1,5 @@
 import { apiFetch } from "./platform-api";
-import type { ForecastRecipe } from "./forecast-recipe";
+import type { ForecastRecipe, TrendRecipe } from "./forecast-recipe";
 import type { ProbabilityForecast } from "./forecast-api";
 import { sameForecastRecipe } from "./forecast-api";
 
@@ -15,14 +15,59 @@ export interface TrendSummary {
 }
 export interface TrendInput { day: number; value: number | null; weight: number }
 
+export interface TrendProjectionRequest {
+  forecast: TrendRecipe;
+  meanR: number | null;
+  trendMode: TrendMode;
+  trendBlendLambda?: number;
+}
+export interface TrendProjection extends TrendProjectionRequest {
+  forecastR: number | null;
+  decisionR: number | null;
+  curve: { day: number; value: number | null }[];
+}
+export interface TrendProjectionResponse { trend: TrendSummary | null; projection: TrendProjection }
+
+const metric = (value: unknown): value is number | null => value === null || typeof value === "number" && Number.isFinite(value);
+const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+const curvePoint = (value: unknown): value is { day: number; value: number | null } => record(value) && finite(value.day) && metric(value.value);
+function validProjectionCurve(value: unknown): value is TrendProjection["curve"] {
+  if (!Array.isArray(value) || value.length > 3662) return false;
+  const points: unknown[] = value;
+  return points.every((point, index) => {
+    const previous = points[index - 1];
+    return curvePoint(point) && (index === 0 || curvePoint(previous) && point.day > previous.day);
+  });
+}
+function validTrend(value: unknown): value is TrendSummary | null {
+  if (value === null) return true;
+  const point = (item: unknown): item is TrendPoint => record(item) && finite(item.day) && finite(item.value) && metric(item.se);
+  return record(value) && (value.method === "linear" || value.method === "p_spline") && point(value.start) && point(value.end)
+    && metric(value.endpointSe) && validProjectionCurve(value.curve) && value.curve.length > 0 && value.curve.every(point);
+}
+
 /** Same Rust solver as forecast matrices. Abort on changed data/unmount. */
-export async function fetchDailyTrend(points: TrendInput[], trendBendDays: TrendBendDays, signal: AbortSignal): Promise<TrendSummary | null> {
+export function fetchDailyTrend(points: TrendInput[], trendBendDays: TrendBendDays, signal: AbortSignal): Promise<TrendSummary | null>;
+export function fetchDailyTrend(points: TrendInput[], trendBendDays: TrendBendDays, signal: AbortSignal, projection: TrendProjectionRequest): Promise<TrendProjectionResponse>;
+export async function fetchDailyTrend(points: TrendInput[], trendBendDays: TrendBendDays, signal: AbortSignal, projection?: TrendProjectionRequest): Promise<TrendSummary | null | TrendProjectionResponse> {
   const response = await apiFetch("/v1/analytics/trend", {
     method: "POST", signal, headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ points, trendBendDays }),
+    body: JSON.stringify({ points, trendBendDays, ...(projection ? { projection } : {}) }),
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 120)}`);
-  return ((await response.json()) as { trend: TrendSummary | null }).trend;
+  const body: unknown = await response.json();
+  if (!record(body) || !validTrend(body.trend)) throw new Error("Сервер вернул несовместимую кривую тренда.");
+  if (!projection) return body.trend;
+  const actual = body.projection;
+  if (!record(actual) || !sameForecastRecipe(actual.forecast, projection.forecast) || actual.meanR !== projection.meanR
+    || actual.trendMode !== projection.trendMode || actual.trendBlendLambda !== projection.trendBlendLambda
+    || !metric(actual.forecastR) || !metric(actual.decisionR) || !validProjectionCurve(actual.curve)
+    || actual.forecastR !== (body.trend?.end.value ?? null)
+    || (actual.decisionR !== null && (actual.curve.length === 0 ? points.length > 0 : actual.curve.at(-1)?.value !== actual.decisionR))) {
+    throw new Error("Сервер не подтвердил рецепт, M, режим, λ или endpoint кривой решения.");
+  }
+  return body as unknown as TrendProjectionResponse;
 }
 
 export interface AnalyticsSet {

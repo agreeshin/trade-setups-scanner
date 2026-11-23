@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import type { TradeRow } from "./analytics-api";
-import { buildDailyExpectancy, buildDailyExpectancyModel, utcDayStart, type DailyExpectancyPoint } from "./daily-expectancy";
+import { buildDailyExpectancy, buildDailyExpectancyModel, observedDailyPoints, utcDayStart, type DailyExpectancyPoint } from "./daily-expectancy";
 
 const unix = (value: string) => Date.parse(value) / 1000;
 function row(at: string, riskReturn: number | null, status = riskReturn === null ? "unclosed" : riskReturn < 0 ? "sl" : "tp"): TradeRow & { fromCache: boolean } {
@@ -77,4 +77,15 @@ it("rejects invalid timestamps, duplicate days and reversed inputs rather than f
   expect(() => utcDayStart(NaN)).toThrow(RangeError);
   expect(() => buildDailyExpectancyModel([point("2026-01-01", 1), point("2026-01-01", 2)], 0)).toThrow("unique ascending");
   expect(() => buildDailyExpectancyModel([point("2026-01-10", 1), point("2026-01-01", 2)], 0)).toThrow("unique ascending");
+});
+
+it("projects independent mean/sum observations without mutating training days, counts, nulls or true zero", () => {
+  const days = buildDailyExpectancy([row("2026-01-01T12:00:00Z", 2), row("2026-01-01T13:00:00Z", 2),
+    row("2026-01-03T12:00:00Z", null), row("2026-01-04T12:00:00Z", 1), row("2026-01-04T13:00:00Z", -1)]);
+  const original = structuredClone(days);
+  expect(days.map((day) => day.riskExpectancy)).toEqual([2, null, 0]);
+  expect(observedDailyPoints(days, "sum").map((day) => day.riskExpectancy)).toEqual([4, null, 0]);
+  expect(observedDailyPoints(days, "mean")).toEqual(original);
+  expect(days).toEqual(original);
+  expect(days.map((day) => [day.computedCount, day.closedCount, day.sumR])).toEqual([[2, 2, 4], [1, 0, null], [2, 2, 0]]);
 });

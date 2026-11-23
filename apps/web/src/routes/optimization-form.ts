@@ -119,6 +119,7 @@ export function restoreDomains(fields: SearchField[], baseline: Record<string, O
 }
 
 function buildStudyParameters(algorithm: Algorithm, scope: ScopeDraft, catalog: CatalogInstrument[], params: DomainDrafts, analytics: DomainDrafts): ContinuousStudySpec {
+  if (scope.forecast?.method === "trend_sum_r") throw new Error("Тренд сумм в рисках доступен только для ручной Аналитики и графика Сетапов, не для исследований.");
   const trendMode = scope.trendMode ?? "mean";
   const trendBendDays = scope.forecast?.method === "trend" ? scope.forecast.bendDays : scope.trendBendDays ?? "linear";
   if (!["mean", "forecast", "blend"].includes(trendMode) || !["7", "14", "30", "linear"].includes(trendBendDays)) throw new Error("Проверьте тип матожидания и перегиб тренда.");

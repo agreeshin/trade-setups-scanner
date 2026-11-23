@@ -10,6 +10,6 @@ export const forecastViewFixture = (input: Input) => {
     selected: input.expectedSelected, closed: 2, availability: { status: "available" }, forecastAvailability: { status: "available" },
     meanR: 1.25, forecastR: 3.75, decisionR, trendMode: input.trendMode, trendBlendLambda: input.trendBlendLambda,
     forecast: input.forecast, timeZone: input.timeZone, observationCutoff: input.snapshot.observationCutoff, nowUnix, retrospective: true,
-    model: { target: input.forecast.method === "trend" ? "daily_sum_r" : "closed_trade_r", method: "linear",
+    model: { target: input.forecast.method !== "decayed_probability" ? "daily_sum_r" : "closed_trade_r", method: "linear",
       points: [{ atUnix: input.snapshot.observationCutoff - 86400, forecastR: 3.75, decisionR }, endpoint], endpoint } };
 };

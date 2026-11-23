@@ -50,7 +50,7 @@ interface ModelPoint { atUnix: number; forecastR: number | null; decisionR: numb
 const point = (v: unknown): v is ModelPoint => record(v) && count(v.atUnix) && metric(v.forecastR) && metric(v.decisionR);
 
 export async function fetchSetupsProjection(request: SetupsProjectionRequest, signal: AbortSignal): Promise<SetupsProjection> {
-  const expectedTarget = request.forecast.method === "trend" ? "daily_sum_r" : "closed_trade_r";
+  const expectedTarget = request.forecast.method !== "decayed_probability" ? "daily_sum_r" : "closed_trade_r";
   const query = new URLSearchParams({ algorithmId: request.algorithmId, fromUnix: String(request.fromUnix), toUnix: String(request.toUnix) });
   if (request.studies !== null) query.set("studies", request.studies.join(","));
   if (request.q !== "") query.set("q", request.q);

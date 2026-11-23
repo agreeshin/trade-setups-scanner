@@ -17,6 +17,13 @@ it.each(["7", "14", "30", "linear"] as const)("round-trips the actual string tre
   expect(buildForecastRecipe(restoreForecastRecipeDraft(recipe)!)).toEqual(recipe);
 });
 
+it.each(["7", "14", "30", "linear"] as const)("keeps sum-R v1 separate from old mean-trend identity with bend %s", (bendDays) => {
+  const recipe = { method: "trend_sum_r", version: 1, bendDays } as const;
+  expect(buildForecastRecipe(restoreForecastRecipeDraft(recipe)!)).toEqual(recipe);
+  expect(forecastRecipeLabel(recipe, "linear")).toContain("Тренд сумм в рисках");
+  expect(() => restoreForecastRecipeDraft({ ...recipe, version: 2 })).toThrow("не поддерживается");
+});
+
 it.each(["halfLifeDays", "kappa"] as const)("accepts positive finite %s without fabricated numerical bounds", (key) => {
   const draft = initialForecastRecipeDraft();
   if (draft.method !== "decayed_probability") throw new Error("Expected probability baseline");

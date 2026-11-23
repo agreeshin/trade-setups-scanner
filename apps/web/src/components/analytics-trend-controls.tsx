@@ -15,7 +15,7 @@ export function AnalyticsTrendControls({ mode, bend, onModeChange, onBendChange,
   disableMeanBend?: boolean;
   onBlendModeChange?: () => void; blendLambda?: string; onBlendLambdaChange?: (value: string) => void;
   forecast?: ForecastRecipeDraft | undefined; onForecastChange?: (value: ForecastRecipeDraft) => void;
-  scope?: "study" | "shared";
+  scope?: "study" | "shared" | "analytics";
 }) {
   const recipeEnabled = onForecastChange !== undefined;
   const showRecipe = recipeEnabled && mode !== "mean";
@@ -28,20 +28,21 @@ export function AnalyticsTrendControls({ mode, bend, onModeChange, onBendChange,
         <Button type="button" variant={mode === "forecast" ? "default" : "outline"} aria-pressed={mode === "forecast"} onClick={() => onModeChange("forecast")}>{recipeEnabled ? "Прогноз" : "Прогноз по тренду"}</Button>
         {onBlendModeChange && <Button type="button" variant={mode === "blend" ? "default" : "outline"} aria-pressed={mode === "blend"} onClick={onBlendModeChange}>{scope === "shared" ? "Смесь" : "Смесь среднего и прогноза"}</Button>}
       </div>
-      {showRecipe && <Field label="Метод прогноза" className="w-64 max-w-full" hint={forecast === undefined ? "Метод не был сохранён: используется прежний тренд, без подстановки нового default." : scope === "shared" ? "Общие настройки представления Analytics и Сетапов; запечатанные исследования не меняются." : "Фиксированный рецепт исследования, не поисковая координата."}>
-        {(control) => <Select {...control} value={forecast?.method ?? "trend"} onChange={(event) => onForecastChange?.(event.target.value === "decayed_probability" ? initialForecastRecipeDraft() : { method: "trend", version: 1, bendDays: bend })}>
+      {showRecipe && <Field label="Метод прогноза" className="w-64 max-w-full" hint={forecast === undefined ? "Метод не был сохранён: используется прежний тренд, без подстановки нового default." : scope !== "study" ? "Общие настройки представления Analytics и Сетапов; запечатанные исследования не меняются." : "Фиксированный рецепт исследования, не поисковая координата."}>
+        {(control) => <Select {...control} value={forecast?.method ?? "trend"} onChange={(event) => onForecastChange?.(event.target.value === "decayed_probability" ? initialForecastRecipeDraft() : { method: scope !== "study" && event.target.value === "trend_sum_r" ? "trend_sum_r" : "trend", version: 1, bendDays: bend })}>
           <option value="decayed_probability">Вероятность TP с памятью</option>
-          <option value="trend">{scope === "shared" ? "Тренд" : "Прежний тренд (сравнение)"}</option>
+          <option value="trend">{scope === "shared" ? "Тренд дневной суммы R (прежний)" : "Тренд среднего по дням"}</option>
+          {scope !== "study" && <option value="trend_sum_r">Тренд сумм в рисках</option>}
         </Select>}
       </Field>}
       {showRecipe && probability && <Field label="Память модели H, дней" className="w-64 max-w-full" hint="Период полураспада веса UTC-когорт. Конечное число больше 0.">
         {(control) => <Input {...control} type="number" min={0} step="any" value={probability.halfLifeDays} onChange={(event) => onForecastChange?.({ ...probability, halfLifeDays: event.target.value })} />}
       </Field>}
       {showBend && <Field label="Перегиб на N дней" className="w-48">
-        {(control) => <Select {...control} disabled={disableMeanBend && mode === "mean"} value={forecast?.method === "trend" ? forecast.bendDays : bend}
+        {(control) => <Select {...control} disabled={disableMeanBend && mode === "mean"} value={forecast && forecast.method !== "decayed_probability" ? forecast.bendDays : bend}
           onChange={(event) => {
             const next = event.target.value as TrendBendDays;
-            if (forecast?.method === "trend") onForecastChange?.({ ...forecast, bendDays: next });
+            if (forecast && forecast.method !== "decayed_probability") onForecastChange?.({ ...forecast, bendDays: next });
             else onBendChange(next);
           }}>
           <option value="7">7 дней</option><option value="14">14 дней</option><option value="30">30 дней</option><option value="linear">∞ — прямая</option>
@@ -62,7 +63,7 @@ export function AnalyticsTrendControls({ mode, bend, onModeChange, onBendChange,
             <option value="gross_break_even">Gross-break-even (эвристический)</option>
           </Select>}
         </Field>
-        <p className="text-xs text-muted-foreground sm:col-span-2">Рецепт v{probability.version}. H 14 дней и κ 10 — инженерный baseline, не калиброванный оптимум. {scope === "shared" ? "Переоценка использует готовый снимок, без новых исходов. Настройки не меняют optimization draft, исследования или Telegram." : "H, κ, prior и λ фиксированы до исследования и не подбираются этим оптимизатором. Telegram наследует сохранённый рецепт, отдельных настроек модели нет."}</p>
+        <p className="text-xs text-muted-foreground sm:col-span-2">Рецепт v{probability.version}. H 14 дней и κ 10 — инженерный baseline, не калиброванный оптимум. {scope !== "study" ? "Переоценка использует готовый снимок, без новых исходов. Настройки не меняют optimization draft, исследования или Telegram." : "H, κ, prior и λ фиксированы до исследования и не подбираются этим оптимизатором. Telegram наследует сохранённый рецепт, отдельных настроек модели нет."}</p>
       </CollapsibleContent>
     </Collapsible>}
   </div>;
