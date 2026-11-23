@@ -109,10 +109,12 @@ afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstub
 
 describe("platform screens", () => {
   it.each([
-    { isBatch: false, path: "/v1/replay-runs/7", trigger: "enter" },
-    { isBatch: true, path: "/v1/replay-batches/7", trigger: "blur" },
-  ])("renames a run through $path on $trigger and reloads the list", async ({ isBatch, path, trigger }) => {
-    replayRunsResponse = { runs: [{ ...runFixture, isBatch }] };
+    { isBatch: false, path: "/v1/replay-runs/7", trigger: "enter", origin: "manual" },
+    { isBatch: true, path: "/v1/replay-batches/7", trigger: "blur", origin: "manual" },
+    { isBatch: false, path: "/v1/replay-runs/7", trigger: "enter", origin: "study_actual" },
+    { isBatch: true, path: "/v1/replay-batches/7", trigger: "blur", origin: "study_actual" },
+  ])("renames a $origin run through $path on $trigger and reloads the list", async ({ isBatch, path, trigger, origin }) => {
+    replayRunsResponse = { runs: [{ ...runFixture, isBatch, origin, actualStudyId: 41, actualRevision: 9 }] };
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
     await userEvent.click(await screen.findByRole("button", { name: "Переименовать запуск 7" }));
     const input = screen.getByRole("textbox", { name: "Имя запуска 7" });
@@ -234,7 +236,27 @@ describe("platform screens", () => {
     expect(input).toHaveFocus();
   });
 
-  it.each([false, true])("aligns seven run columns without changing names, provenance or responsive wrappers (batch=%s)", async (isBatch) => {
+  it("keeps research display names stable across polling without PATCH or a hidden-name editor", async () => {
+    vi.useFakeTimers();
+    replayRunsResponse = { runs: [{ ...runFixture, origin: "continuous", continuousStudyId: 41 }] };
+    render(<MemoryRouter><RunsPage /></MemoryRouter>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    const resultButton = screen.getByRole("button", { name: "Результаты запуска 7" });
+    resultButton.focus();
+    expect(screen.getByTitle("Исследование #41")).toHaveTextContent("Исследование #41");
+    expect(screen.queryByRole("button", { name: "Переименовать запуск 7" })).not.toBeInTheDocument();
+    replayRunsResponse = { runs: [{ ...runFixture, name: "Новое сохранённое имя", origin: "continuous", continuousStudyId: 41, setupCount: 17 }] };
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(requests.filter((request) => request.path === "/v1/replay-runs")).toHaveLength(2);
+    expect(screen.getByText("17")).toBeInTheDocument();
+    expect(screen.getByTitle("Исследование #41")).toHaveTextContent("Исследование #41");
+    expect(screen.queryByText("Новое сохранённое имя")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Результаты запуска 7" })).toBe(resultButton);
+    expect(resultButton).toHaveFocus();
+    expect(requests.every((request) => request.method === "GET")).toBe(true);
+  });
+
+  it.each([false, true])("aligns seven run columns with display-only research names and responsive wrappers (batch=%s)", async (isBatch) => {
     const listedRuns = [
       { ...runFixture, isBatch, origin: "manual", cacheHit: true },
       { ...runFixture, isBatch, id: 8, status: "running", origin: "manual" },
@@ -256,8 +278,14 @@ describe("platform screens", () => {
       const cells = within(row).getAllByRole("cell");
       expect(cells).toHaveLength(7);
       expect(within(cells[0]!).getByRole("button", { name: `Результаты запуска ${run.id}` })).toBeInTheDocument();
-      expect(within(cells[1]!).getByTitle(run.name)).toHaveTextContent(run.name);
-      expect(within(cells[1]!).getByRole("button", { name: `Переименовать запуск ${run.id}` })).toBeInTheDocument();
+      if (run.origin === "continuous") {
+        expect(cells[1]).toHaveTextContent(/^Исследование #40$/);
+        expect(within(cells[1]!).queryByRole("button", { name: `Переименовать запуск ${run.id}` })).not.toBeInTheDocument();
+        expect(within(cells[1]!).queryByText(run.name)).not.toBeInTheDocument();
+      } else {
+        expect(within(cells[1]!).getByTitle(run.name)).toHaveTextContent(run.name);
+        expect(within(cells[1]!).getByRole("button", { name: `Переименовать запуск ${run.id}` })).toBeInTheDocument();
+      }
       expect(cells[2]?.textContent).toBe(`${run.algorithmId} · ${run.algorithmVersion}`);
       expect(cells[3]?.textContent).toBe(run.symbol);
       expect(cells[4]).toHaveTextContent(run.status === "running" ? "Выполняется" : run.status);
@@ -266,10 +294,9 @@ describe("platform screens", () => {
       expect(cells[5]).not.toHaveClass("text-right");
       expect(cells[6]?.firstElementChild).toHaveClass("flex", "items-center", "justify-center");
       expect(within(cells[6]!).getByRole("button", { name: `${run.status === "running" ? "Отменить" : "Удалить"} запуск ${run.id}` })).toBeInTheDocument();
-      if (run.origin === "study_actual") {
-        expect(within(cells[0]!).getByText("После исследования")).toBeInTheDocument();
-        expect(within(cells[0]!).getByText("Исследование #41 · ревизия 9")).toBeInTheDocument();
-      } else expect(within(cells[0]!).queryByText("После исследования")).not.toBeInTheDocument();
+      expect(cells[0]).toHaveTextContent(new RegExp(`^#${run.id}$`));
+      expect(within(cells[0]!).queryByText("После исследования")).not.toBeInTheDocument();
+      expect(within(cells[0]!).queryByText(/ревизия/)).not.toBeInTheDocument();
     });
     expect(table.parentElement).toHaveClass("overflow-x-auto");
     expect(screen.getByLabelText("Начало").closest("form")?.className).not.toMatch(/max-w-/);
@@ -444,7 +471,7 @@ describe("platform screens", () => {
   ])("explicitly deletes an archived continuous $status output (batch=$isBatch), preserving other rows, caches and replay form", async ({ isBatch, status }) => {
     replayRunsResponse = { runs: [
       // Archived DTOs can still report source IDs; only the server's real live references block deletion.
-      { ...runFixture, status, isBatch, origin: "continuous", continuousGenerationId: 7, continuousSlotId: 5 },
+      { ...runFixture, status, isBatch, origin: "continuous", continuousStudyId: 41, continuousGenerationId: 7, continuousSlotId: 5 },
       { ...runFixture, id: 20, name: "Сохранить ручной запуск", origin: "manual" },
     ] };
     render(<MemoryRouter><RunsPage /></MemoryRouter>);

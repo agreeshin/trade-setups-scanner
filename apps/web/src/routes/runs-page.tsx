@@ -43,6 +43,7 @@ interface RunRow {
   doneInstruments?: number;
   failedInstruments?: number;
   origin?: string;
+  continuousStudyId?: number | null;
   actualStudyId?: number | null;
   actualRevision?: number | null;
   actualJobId?: string | null;
@@ -51,9 +52,14 @@ interface ReplayForm { symbols: string; from: string; to: string; algorithmId: s
 interface RunDetail { run: RunRow; setups: SetupRow[]; offset: number; limit: number; total: number }
 const RUN_STATUS_LABELS: Record<string, string> = { queued: "В очереди", running: "Выполняется", cancel_requested: "Отмена запрошена" };
 
-/** Structured replay provenance from run_json/batch_json, never inferred from an editable name. */
-export function RunOriginBadge({ origin, actualStudyId, actualRevision }: Pick<RunRow, "origin" | "actualStudyId" | "actualRevision">) {
-  return origin === "study_actual" ? <div className="mt-1 grid gap-1"><Badge className="bg-ambient-violet/15 text-ambient-violet">После исследования</Badge><span className="text-xs text-muted-foreground">{actualStudyId == null ? "Исходное исследование недоступно" : `Исследование #${actualStudyId}`}{actualRevision != null ? ` · ревизия ${actualRevision}` : ""}</span></div> : null;
+/** Original research provenance survives archiving; never persist this display-only name. */
+function RunName({ run, onSaved }: { run: RunRow; onSaved: () => void }) {
+  const studyId = run.continuousStudyId;
+  if (run.origin === "continuous" && typeof studyId === "number" && Number.isSafeInteger(studyId) && studyId > 0) {
+    const name = `Исследование #${studyId}`;
+    return <div className="w-56 truncate" title={name}>{name}</div>;
+  }
+  return <RunNameEditor run={run} onSaved={onSaved} />;
 }
 
 function RunResultPage({ id, isBatch, offset, revision, onPage, qualityPanel, onQualityPanel }: { id: number; isBatch: boolean; offset: number; revision: number; onPage: (offset: number) => void; qualityPanel: QualityPanelState; onQualityPanel: (value: QualityPanelState) => void }) {
@@ -367,8 +373,8 @@ export function RunsPage() {
         <caption className="text-left text-muted-foreground">До 200 последних запусков. Время: {localTimezoneLabel()}</caption>
         <TableHeader><TableRow><TableHead>ID</TableHead><TableHead>Имя</TableHead><TableHead>Алгоритм</TableHead><TableHead>Инструмент</TableHead><TableHead>Статус</TableHead><TableHead className="text-center">Сетапов</TableHead><TableHead className="text-center">Действие</TableHead></TableRow></TableHeader>
         <TableBody>{runs.data.runs.slice(0, 200).map((run) => <TableRow key={`${run.isBatch === true ? "batch" : "run"}-${run.id}`}>
-          <TableCell><Button variant="outline" size="sm" onClick={() => setSelected({ id: run.id, isBatch: run.isBatch === true })} aria-label={`Результаты запуска ${run.id}`}>#{run.id}</Button><RunOriginBadge {...run} /></TableCell>
-          <TableCell><RunNameEditor run={run} onSaved={() => setReload((value) => value + 1)} /></TableCell>
+          <TableCell><Button variant="outline" size="sm" onClick={() => setSelected({ id: run.id, isBatch: run.isBatch === true })} aria-label={`Результаты запуска ${run.id}`}>#{run.id}</Button></TableCell>
+          <TableCell><RunName run={run} onSaved={() => setReload((value) => value + 1)} /></TableCell>
           <TableCell className="text-muted-foreground">{run.algorithmId} · {run.algorithmVersion}</TableCell>
           <TableCell className="font-medium">{run.symbol}</TableCell>
           <TableCell><Badge variant={runStatusVariant(run.status)}>{RUN_STATUS_LABELS[run.status] ?? run.status}{run.isBatch === true && run.status === "running" ? ` (${run.doneInstruments ?? 0}/${run.instrumentCount ?? 0})` : ""}</Badge><p className="mt-1 text-xs text-muted-foreground">{qualityLabel(run.quality)}</p></TableCell>
