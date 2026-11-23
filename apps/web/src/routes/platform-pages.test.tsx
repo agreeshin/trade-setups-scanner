@@ -234,20 +234,46 @@ describe("platform screens", () => {
     expect(input).toHaveFocus();
   });
 
-  it("centers setup counts and run actions and leaves the launch card full width", async () => {
-    replayRunsResponse = { runs: [runFixture, { ...runFixture, id: 8, status: "running" }] };
+  it.each([false, true])("aligns seven run columns without changing names, provenance or responsive wrappers (batch=%s)", async (isBatch) => {
+    const listedRuns = [
+      { ...runFixture, isBatch, origin: "manual", cacheHit: true },
+      { ...runFixture, isBatch, id: 8, status: "running", origin: "manual" },
+      { ...runFixture, isBatch, id: 9, name: "Сохранённое имя после исследования", origin: "study_actual", actualStudyId: 41, actualRevision: 9, actualJobId: "fixture-job" },
+      // Archived continuous outputs retain structured source IDs without a live generation.
+      { ...runFixture, isBatch, id: 10, name: "Сохранённое имя служебного запуска", origin: "continuous", continuousStudyId: 40, continuousGenerationId: 39 },
+    ];
+    replayRunsResponse = { runs: listedRuns };
     render(<MemoryRouter><RunsPage /></MemoryRouter>);
     const table = await screen.findByRole("table");
-    expect(within(table).getAllByRole("columnheader").map((head) => head.textContent)).toEqual(["ID", "Имя", "Инструмент", "Алгоритм", "Статус", "Кеш", "Сетапов", "Действие"]);
+    expect(within(table).getAllByRole("columnheader").map((head) => head.textContent)).toEqual(["ID", "Имя", "Алгоритм", "Инструмент", "Статус", "Сетапов", "Действие"]);
+    expect(within(table).queryByRole("columnheader", { name: "Кеш" })).not.toBeInTheDocument();
     expect(within(table).getByRole("columnheader", { name: "Сетапов" })).toHaveClass("text-center");
     expect(within(table).getByRole("columnheader", { name: "Действие" })).toHaveClass("text-center");
-    for (const row of within(table).getAllByRole("row").slice(1)) {
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(rows).toHaveLength(listedRuns.length);
+    listedRuns.forEach((run, index) => {
+      const row = rows[index]!;
       const cells = within(row).getAllByRole("cell");
-      expect(cells[6]).toHaveClass("text-center", "tabular-nums");
-      expect(cells[6]).not.toHaveClass("text-right");
-      expect(cells[7]?.firstElementChild).toHaveClass("flex", "items-center", "justify-center");
-    }
+      expect(cells).toHaveLength(7);
+      expect(within(cells[0]!).getByRole("button", { name: `Результаты запуска ${run.id}` })).toBeInTheDocument();
+      expect(within(cells[1]!).getByTitle(run.name)).toHaveTextContent(run.name);
+      expect(within(cells[1]!).getByRole("button", { name: `Переименовать запуск ${run.id}` })).toBeInTheDocument();
+      expect(cells[2]?.textContent).toBe(`${run.algorithmId} · ${run.algorithmVersion}`);
+      expect(cells[3]?.textContent).toBe(run.symbol);
+      expect(cells[4]).toHaveTextContent(run.status === "running" ? "Выполняется" : run.status);
+      expect(cells[5]).toHaveTextContent(String(run.setupCount));
+      expect(cells[5]).toHaveClass("text-center", "tabular-nums");
+      expect(cells[5]).not.toHaveClass("text-right");
+      expect(cells[6]?.firstElementChild).toHaveClass("flex", "items-center", "justify-center");
+      expect(within(cells[6]!).getByRole("button", { name: `${run.status === "running" ? "Отменить" : "Удалить"} запуск ${run.id}` })).toBeInTheDocument();
+      if (run.origin === "study_actual") {
+        expect(within(cells[0]!).getByText("После исследования")).toBeInTheDocument();
+        expect(within(cells[0]!).getByText("Исследование #41 · ревизия 9")).toBeInTheDocument();
+      } else expect(within(cells[0]!).queryByText("После исследования")).not.toBeInTheDocument();
+    });
+    expect(table.parentElement).toHaveClass("overflow-x-auto");
     expect(screen.getByLabelText("Начало").closest("form")?.className).not.toMatch(/max-w-/);
+    expect(requests.every((request) => request.method === "GET")).toBe(true);
   });
 
   it("keeps settings sections full width on one surface with a shared sidebar", async () => {

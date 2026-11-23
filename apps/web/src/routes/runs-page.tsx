@@ -365,14 +365,13 @@ export function RunsPage() {
     {runs.kind === "ready" && <div className="mt-4 overflow-x-auto">
       <Table>
         <caption className="text-left text-muted-foreground">До 200 последних запусков. Время: {localTimezoneLabel()}</caption>
-        <TableHeader><TableRow><TableHead>ID</TableHead><TableHead>Имя</TableHead><TableHead>Инструмент</TableHead><TableHead>Алгоритм</TableHead><TableHead>Статус</TableHead><TableHead>Кеш</TableHead><TableHead className="text-center">Сетапов</TableHead><TableHead className="text-center">Действие</TableHead></TableRow></TableHeader>
+        <TableHeader><TableRow><TableHead>ID</TableHead><TableHead>Имя</TableHead><TableHead>Алгоритм</TableHead><TableHead>Инструмент</TableHead><TableHead>Статус</TableHead><TableHead className="text-center">Сетапов</TableHead><TableHead className="text-center">Действие</TableHead></TableRow></TableHeader>
         <TableBody>{runs.data.runs.slice(0, 200).map((run) => <TableRow key={`${run.isBatch === true ? "batch" : "run"}-${run.id}`}>
           <TableCell><Button variant="outline" size="sm" onClick={() => setSelected({ id: run.id, isBatch: run.isBatch === true })} aria-label={`Результаты запуска ${run.id}`}>#{run.id}</Button><RunOriginBadge {...run} /></TableCell>
           <TableCell><RunNameEditor run={run} onSaved={() => setReload((value) => value + 1)} /></TableCell>
-          <TableCell className="font-medium">{run.symbol}</TableCell>
           <TableCell className="text-muted-foreground">{run.algorithmId} · {run.algorithmVersion}</TableCell>
+          <TableCell className="font-medium">{run.symbol}</TableCell>
           <TableCell><Badge variant={runStatusVariant(run.status)}>{RUN_STATUS_LABELS[run.status] ?? run.status}{run.isBatch === true && run.status === "running" ? ` (${run.doneInstruments ?? 0}/${run.instrumentCount ?? 0})` : ""}</Badge><p className="mt-1 text-xs text-muted-foreground">{qualityLabel(run.quality)}</p></TableCell>
-          <TableCell>{run.cacheHit ? "да" : "нет"}</TableCell>
           <TableCell numeric className="text-center">{run.setupCount}</TableCell>
               <TableCell>
                 <div className="flex items-center justify-center gap-1">
