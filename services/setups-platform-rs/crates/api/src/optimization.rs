@@ -1,5 +1,7 @@
 //! Server-owned optimizer lifecycle, isolated from ordinary replay and analytics.
 pub(crate) mod snapshot;
+mod manual_runtime;
+mod manual_frozen;
 
 use crate::{
     auth::SessionAuth, config::OptimizationConfig, controls::optimization_descriptors,
@@ -79,6 +81,8 @@ pub fn optimization_router(state: Arc<OptimizationState>) -> Router {
             get(get_study).delete(delete_study),
         )
         .route("/v1/optimization-studies/{id}/cancel", post(cancel_study))
+        .route("/v1/optimization-studies/{id}/pause",post(pause_study))
+        .route("/v1/optimization-studies/{id}/play",post(play_study))
         .route(
             "/v1/optimization-drafts/{algorithm}",
             get(get_draft)
@@ -213,6 +217,13 @@ async fn create_study(
     if let Err(error) = guard_auth(&state.auth, &headers, true) {
         return error;
     }
+    let key=match headers.get("idempotency-key") {
+        None=>None,
+        Some(value)=>match value.to_str() {
+            Ok(value) if db::manual::valid_key(value)=>Some(value),
+            _=>return response(StatusCode::BAD_REQUEST,json!({"error":"invalid_idempotency_key"})),
+        }
+    };
     let spec: StudyRequest = match serde_json::from_str(&body) {
         Ok(spec) => spec,
         Err(_) => return response(StatusCode::BAD_REQUEST, json!({"error":"invalid_body"})),
@@ -263,6 +274,15 @@ async fn create_study(
         Ok(value) => value,
         Err(error) => return internal_error("serialize_spec", error),
     };
+    if let Some(key)=key {
+        match db::manual::receipt(&state.pool,"admin",key,&normalized).await {
+            Ok(Some(Admission::Created(record)))=>return record_response(StatusCode::ACCEPTED,*record),
+            Ok(Some(Admission::IdempotencyConflict))=>return response(StatusCode::CONFLICT,json!({"error":"idempotency_key_conflict"})),
+            Ok(None)=>{},
+            Ok(Some(_))=>unreachable!("receipt cannot perform admission"),
+            Err(error)=>return internal_error("idempotency_receipt",error),
+        }
+    }
     if !state.available.load(Ordering::SeqCst) {
         return response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -285,11 +305,14 @@ async fn create_study(
             );
         }
     }
-    match db::create(
+    match db::manual::create(
         &state.pool,
+        "admin",
         &spec.algorithm_id,
         &normalized,
         &json!(initial_progress(&spec)),
+        key,
+        &state.config.manual,
     )
     .await
     {
@@ -301,6 +324,8 @@ async fn create_study(
             StatusCode::CONFLICT,
             json!({"error":"study_active","activeStudyId":id}),
         ),
+        Ok(Admission::IdempotencyConflict)=>response(StatusCode::CONFLICT,json!({"error":"idempotency_key_conflict"})),
+        Ok(Admission::Resource{resource,limit,requested})=>resource_error(resource,limit as usize,requested as usize),
         Err(error) => internal_error("create", error),
     }
 }
@@ -425,6 +450,28 @@ async fn cancel_study(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct ManualCommand { expected_control_revision:i64 }
+async fn manual_command(state:Arc<OptimizationState>,headers:HeaderMap,id:i64,body:Result<Json<ManualCommand>,JsonRejection>,play:bool)->Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,true) {return error;}
+    let Ok(Json(command))=body else{return response(StatusCode::BAD_REQUEST,json!({"error":"invalid_body"}));};
+    if id<1 || command.expected_control_revision<1 {return response(StatusCode::BAD_REQUEST,json!({"error":"invalid_request"}));}
+    match db::manual::control(&state.pool,"admin",id,command.expected_control_revision,play).await {
+        Ok(db::manual::Control::Changed(record))=>{state.notify.notify_one();record_response(StatusCode::ACCEPTED,*record)},
+        Ok(db::manual::Control::Missing)=>response(StatusCode::NOT_FOUND,json!({"error":"not_found"})),
+        Ok(db::manual::Control::Stale)=>response(StatusCode::CONFLICT,json!({"error":"study_control_changed"})),
+        Ok(db::manual::Control::Invalid)=>response(StatusCode::CONFLICT,json!({"error":"invalid_study_transition"})),
+        Err(error)=>internal_error("manual_control",error),
+    }
+}
+async fn pause_study(State(state):State<Arc<OptimizationState>>,headers:HeaderMap,Path(id):Path<i64>,body:Result<Json<ManualCommand>,JsonRejection>)->Response {
+    manual_command(state,headers,id,body,false).await
+}
+async fn play_study(State(state):State<Arc<OptimizationState>>,headers:HeaderMap,Path(id):Path<i64>,body:Result<Json<ManualCommand>,JsonRejection>)->Response {
+    manual_command(state,headers,id,body,true).await
+}
+
 /// Owns one advisory-locked connection for the runtime lifetime. Detaching it
 /// ensures dropping the owner closes the socket rather than leaking a session
 /// lock back into the general connection pool.
@@ -456,6 +503,12 @@ pub async fn start_optimization_runtime(
     let healthy = available.clone();
     let task = tokio::spawn(async move {
         let mut owns_lock = true;
+        // One bounded settlement future, not an unbounded task queue. Poll it
+        // concurrently with research and the lock-owner watchdog: a paused
+        // study's terminal outage must not stall another active CPU future.
+        let settlements=manual_runtime::settle_stops(&pool,&config,&stopped,&healthy);
+        tokio::pin!(settlements);
+        let mut settlements_done=false;
         loop {
             if stopped.is_cancelled() {
                 break;
@@ -463,13 +516,14 @@ pub async fn start_optimization_runtime(
             // Detect loss of the lock-owning connection before admitting work.
             if let Err(error) = owner.ping().await {
                 healthy.store(false, Ordering::SeqCst);
+                stopped.cancel();
                 eprintln!("optimization runtime ownership lost: {error}");
                 break;
             }
             healthy.store(true, Ordering::SeqCst);
-            match db::claim(&pool).await {
+            match db::manual::claim(&pool,Some(&json!(config))).await {
                 Ok(Some(record)) => {
-                    let execution = execute(
+                    let execution = manual_runtime::execute(
                         &pool,
                         record,
                         &market_url,
@@ -484,6 +538,7 @@ pub async fn start_optimization_runtime(
                     loop {
                         tokio::select! {
                             _=&mut execution=>break,
+                            _=&mut settlements,if !settlements_done=>{settlements_done=true;},
                             _=monitor.tick()=>{
                                 if !matches!(tokio::time::timeout(Duration::from_secs(1),owner.ping()).await,Ok(Ok(()))) {
                                     // Lease loss is a failure, not an explicit user Stop.
@@ -498,6 +553,7 @@ pub async fn start_optimization_runtime(
                     }
                 }
                 Ok(None) => tokio::select! {
+                    _=&mut settlements,if !settlements_done=>{settlements_done=true;},
                     _ = stopped.cancelled() => {},
                     _ = wake.notified() => {},
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {},
@@ -509,6 +565,7 @@ pub async fn start_optimization_runtime(
                 }
             }
         }
+        if !settlements_done {settlements.await;}
         healthy.store(false, Ordering::SeqCst);
         if stopped.is_cancelled()
             && owns_lock
@@ -771,6 +828,10 @@ async fn finish_retry(
 
 fn settle_archive_failure(payload:&mut TerminalPayload,error:&setups_db::DbError)->bool {
     if payload.archive.is_none() || setups_db::continuous::recovery::is_transient(error) {return false;}
+    // Database availability/trigger failures are not evidence that the paired
+    // scientific archive is invalid. Only explicit archive validation/quota
+    // failures may discard it; all other failures retain the retry payload.
+    if !matches!(error,setups_db::DbError::Json(message) if message.starts_with("study_display_")) {return false;}
     // Drop the bounded archive exactly once. Only the small visible failure
     // continues through DB availability retry; immutable/quota errors do not.
     let message:String=error.to_string().chars().take(400).map(|c|if c.is_control(){' '}else{c}).collect();

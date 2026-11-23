@@ -78,7 +78,7 @@ const cleanupFixture = { eligible: true, blockers: [] as string[], fingerprint: 
   retained: { runs: 9, batches: 4, qualityIntervals: 20, analyticsResults: 4, liveSetups: 19, configuredProcesses: 2, configuredSlots: 6 } };
 let cleanupPreview = cleanupFixture;
 let cleanupStatus = 200;
-const requests: { path: string; method: string; body: unknown; signal?: AbortSignal | null }[] = [];
+const requests: { path: string; method: string; body: unknown; signal?: AbortSignal | null; key?: string | null }[] = [];
 const initialInterfaceSettings = interfaceSettings();
 beforeEach(() => {
   studies = []; createStatus = 202; deleteStatus = 200; deleteErrorCode = "delete_failed"; cancelStatus = 202; draftStatus = 200; drafts = {}; requests.length = 0;
@@ -87,7 +87,7 @@ beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : null;
-    requests.push({ path, method, body, ...(init?.signal ? { signal: init.signal } : {}) });
+    requests.push({ path, method, body, key: new Headers(init?.headers).get("Idempotency-Key"), ...(init?.signal ? { signal: init.signal } : {}) });
     const json = (value: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(value), { status }));
     if (path === "/v1/algorithms") return json({ algorithms: listedAlgorithms });
     if (path.startsWith("/v1/optimization-studies/actual/continuous?")) return json(actualContinuousFixture(new URL(path, "http://localhost").searchParams.get("algorithmId")!));
@@ -110,14 +110,14 @@ beforeEach(() => {
     }
     if (path === "/v1/optimization-studies" && method === "POST") {
       if (createStatus === 409) { studies = [record()]; return json({ error: "optimization_busy", activeStudyId: 17 }, 409); }
-      const created = { ...record("queued"), spec: body as typeof spec };
-      studies = [created]; return json(created, 202);
+      const created = { ...record("queued"), id: Math.max(16, ...studies.map((study) => study.id)) + 1, spec: body as typeof spec, manualControl: { revision: 0, supportsPause: true } };
+      studies = [created, ...studies]; return json(created, 202);
     }
     if (path.startsWith("/v1/optimization-studies?")) {
       const query = new URL(path, "http://localhost").searchParams;
       const id = query.get("algorithmId");
       const limit = Number(query.get("limit")); const offset = Number(query.get("offset"));
-      const ordered = studies.filter((study) => !id || study.spec.algorithmId === id).sort((a, b) => Number(["queued", "running", "cancel_requested"].includes(b.status)) - Number(["queued", "running", "cancel_requested"].includes(a.status)) || b.id - a.id);
+      const ordered = studies.filter((study) => !id || study.spec.algorithmId === id).sort((a, b) => Number(["queued", "running", "pausing", "paused", "cancel_requested"].includes(b.status)) - Number(["queued", "running", "pausing", "paused", "cancel_requested"].includes(a.status)) || b.id - a.id);
       return json({ studies: ordered.slice(offset, offset + limit).map(summarizeOptimizationStudy), total: ordered.length, limit, offset });
     }
     const cancel = /^\/v1\/optimization-studies\/(\d+)\/cancel$/.exec(path);
@@ -148,11 +148,21 @@ function historyButton(name: string, queries: Pick<typeof screen, "findByRole"> 
   return queries.findByRole("button", { name }, { timeout: 5000 });
 }
 
-async function openOptimizer() {
+async function openOptimizer(intent: "new" | "saved" = "saved") {
   const flexible = await screen.findByRole("tab", { name: "Live-сканирование с гибкими параметрами" });
   if (flexible.getAttribute("aria-selected") !== "true") fireEvent.mouseDown(flexible, { button: 0, ctrlKey: false });
+  const saved = intent === "saved" ? studies.find((study) => study.origin !== "continuous" && study.spec.algorithmId === algorithm.id) : undefined;
+  if (saved) {
+    fireEvent.click(await historyButton(`Результат исследования ${saved.id}`));
+    return screen.findByRole("dialog", { name: `Исследование #${saved.id} · Новый алгоритм` });
+  }
   await userEvent.click(await screen.findByRole("button", { name: "Запустить новое исследование Новый алгоритм" }));
   return screen.findByRole("dialog", { name: "Оптимизация · Новый алгоритм" });
+}
+async function confirmManualStop(id = 17) {
+  const confirmation = within(await screen.findByRole("dialog", { name: `Остановить исследование #${id}?` }));
+  const confirm = confirmation.getByRole("button", { name: "Остановить исследование" });
+  fireEvent.click(confirm); fireEvent.click(confirm);
 }
 function enterDates() {
   fireEvent.change(screen.getByLabelText("Начало периода сигналов"), { target: { value: "2026-10-01T00:00" } });
@@ -416,7 +426,7 @@ it.each([
   expect(help).toHaveAttribute("aria-describedby", tooltip.id);
   fireEvent.pointerDown(heading);
   expect(screen.queryByText(explanation)).not.toBeInTheDocument();
-  expect(screen.getByRole("dialog", { name: "Оптимизация · Новый алгоритм" })).toBeInTheDocument();
+  expect(screen.getByRole("dialog", { name: "Исследование #17 · Новый алгоритм" })).toBeInTheDocument();
   const reason = screen.getByText(`Причина завершения: ${partial ? "Явная остановка" : "Исчерпан бюджет времени"}.`);
   expect(reason.nextElementSibling).toHaveAttribute("data-slot", "separator");
   const parameters = screen.getByRole("region", { name: "Полные параметры результата" });
@@ -566,8 +576,7 @@ it("keeps the table's saved optimization recipe unchanged while the current rese
   const summary = within(trigger.closest("tr")!).getAllByRole("cell")[5]!;
   expect(summary).toHaveTextContent("Смесь · λ 0.6"); expect(summary).toHaveTextContent("Тренд · перегиб 30 дней");
   const original = summary.textContent;
-  const dialog = within(await openOptimizer());
-  fireEvent.click(await dialog.findByRole("button", { name: "Новое исследование" }));
+  const dialog = within(await openOptimizer("new"));
   await dialog.findByLabelText("Baseline: Новый порог");
   fireEvent.click(dialog.getByRole("button", { name: "Смесь среднего и прогноза" }));
   fireEvent.change(dialog.getByLabelText("Доля прогноза λ"), { target: { value: "0.9" } });
@@ -680,7 +689,7 @@ it("restores the same server study after remount without starting or cancelling 
   expect(screen.getByText("Подготовка снимка данных")).toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "Закрыть" }));
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  await waitFor(() => expect(screen.getByRole("button", { name: "Запустить новое исследование Новый алгоритм" })).toHaveFocus());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Результат исследования 17" })).toHaveFocus());
   await openOptimizer();
   expect(screen.getByText("Исследование #17")).toBeInTheDocument();
   first.unmount();
@@ -698,14 +707,17 @@ it("explicitly requests Stop once and observes cancellation until the server is 
   await openOptimizer();
   const stop = await screen.findByRole("button", { name: "Остановить исследование" });
   fireEvent.click(stop); fireEvent.click(stop);
+  expect(requests.filter((request) => request.path.endsWith("/cancel"))).toHaveLength(0);
+  await confirmManualStop();
   expect(await screen.findByText("Отмена запрошена")).toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: "Новое исследование" })).not.toBeInTheDocument();
   expect(requests.filter((request) => request.path.endsWith("/cancel"))).toHaveLength(1);
   studies = [{ ...record("cancelled"), result: { progress, best: null, reason: "cancelled" } }];
-  await userEvent.click(screen.getByRole("button", { name: "Обновить статус" }));
-  expect(await screen.findByText("Отменено")).toBeInTheDocument();
+  await userEvent.click(await screen.findByRole("button", { name: "Обновить статус" }));
+  expect(await within(screen.getByRole("dialog", { name: "Исследование #17 · Новый алгоритм" })).findByText("Отменено")).toBeInTheDocument();
   expect(screen.getByText(/Нет оценимого кандидата/)).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Новое исследование" })).toBeEnabled();
+  fireEvent.click(screen.getByRole("button", { name: "Закрыть" }));
+  const form = within(await openOptimizer("new"));
+  expect(await form.findByRole("button", { name: "Начать исследование" })).toBeEnabled();
 });
 
 it.each(["", "0, 4", "101", "4, 4", "NaN", Array.from({ length: 65 }, (_, i) => String(i + 1)).join(",")])("rejects invalid independent TP axes before creation: %s", async (levels) => {
@@ -722,8 +734,9 @@ it("handles a cross-client 409 by discovering the active ID instead of retrying 
   render(<AlgorithmsPage />);
   await openOptimizer(); enterDates();
   await userEvent.click(screen.getByRole("button", { name: "Начать исследование" }));
-  expect(await screen.findByText("Исследование #17")).toBeInTheDocument();
-  expect(screen.getByRole("alert")).toHaveTextContent(/уже выполняется/);
+  expect(await screen.findByRole("alert")).toHaveTextContent(/уже выполняется/);
+  expect(screen.getByRole("button", { name: "Начать исследование" })).toBeInTheDocument();
+  expect(requests.some((request) => request.path === "/v1/optimization-studies/17")).toBe(true);
   expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
 });
 
@@ -822,17 +835,17 @@ it("discovers compact summaries without loading matrices until a dialog opens an
   expect(lists.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "5")).toHaveLength(0);
   expect(lists.filter((request) => new URL(request.path, "http://localhost").searchParams.get("limit") === "10")).toHaveLength(0);
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(0);
-  fireEvent.click(screen.getByRole("button", { name: "Запустить новое исследование Новый алгоритм" }));
+  fireEvent.click(screen.getByRole("button", { name: "Результат исследования 17" }));
   await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(1);
   await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
   expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(1);
   studies = [{ ...studies[0]!, updatedAt: "2026-11-10T00:02:00Z" }];
   await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
-  expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(2);
+  expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(1);
   fireEvent.click(screen.getByRole("button", { name: "Закрыть" }));
   await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
-  expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(2);
+  expect(requests.filter((request) => request.path === "/v1/optimization-studies/17")).toHaveLength(1);
 });
 
 it("reserves twenty skeleton rows, column widths and pagination throughout initial history loading", async () => {
@@ -877,7 +890,7 @@ it("shows the full inline history in server pages of twenty, preserving summary 
   expect(table.getAllByRole("columnheader").map((header) => header.getAttribute("aria-label"))).toEqual(["ID", "Происхождение", "Диапазон дат", "Время исследования", "Минимум сетапов в день", "Оптимизация матожидания", "Лучшая ячейка TP/SL", "Лучший Score матрицы", "Лучший прогноз для ячейки", "Матожидание факт", "Действия"]);
   expect(table.getAllByRole("row")).toHaveLength(21);
   const first = within(table.getAllByRole("row")[1]!);
-  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#50", "Ручное", `${formatUnix(spec.fromUnix)} -${formatUnix(spec.toUnix)}`, "Менее 1 мин", "0", "Среднее", "TP 6% / SL 4%", "0.00 R", "0.00 R", "Не рассчитано—", ""]);
+  expect(first.getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["#50Завершено", "Ручное", `${formatUnix(spec.fromUnix)} -${formatUnix(spec.toUnix)}`, "Менее 1 мин", "0", "Среднее", "TP 6% / SL 4%", "0.00 R", "0.00 R", "Не рассчитано—", ""]);
   expect(table.getAllByRole("row")[2]).toHaveTextContent("Гейт не применялся");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("—");
   expect(table.getAllByRole("row")[2]).toHaveTextContent("1 дн 1 ч 1 мин");
@@ -1022,6 +1035,7 @@ it("preserves stop and pending actions in the inline history", async () => {
   const list = within(card.getByRole("region", { name: "История оптимизации · Новый алгоритм" }));
   const stop = await historyButton("Остановить исследование 17", list);
   fireEvent.click(stop); fireEvent.click(stop);
+  await confirmManualStop();
   await list.findByText("Остановка запрошена");
   expect(list.getByRole("button", { name: "Остановить исследование 17" })).toBeDisabled();
   expect(requests.filter((request) => request.path.endsWith("/cancel"))).toHaveLength(1);
@@ -1034,6 +1048,10 @@ it("shows a stop mutation error above the inline history", async () => {
   const card = within((await screen.findByText("Новый алгоритм · 2.0")).closest("form")!);
   const list = within(card.getByRole("region", { name: "История оптимизации · Новый алгоритм" }));
   await userEvent.click(await historyButton("Остановить исследование 17", list));
+  await confirmManualStop();
+  const confirmation = within(await screen.findByRole("dialog", { name: "Остановить исследование #17?" }));
+  expect(await confirmation.findByRole("alert")).toHaveTextContent("HTTP 503");
+  fireEvent.click(confirmation.getByRole("button", { name: "Отмена" }));
   const manual = within(card.getByRole("heading", { name: "Список проведённых исследований" }).closest("section")!);
   expect(await manual.findByRole("alert")).toHaveTextContent("HTTP 503");
   expect(list.getByRole("button", { name: "Остановить исследование 17" })).toBeEnabled();
@@ -1059,11 +1077,12 @@ it("opens the requested older ID independently from latest discovery without nes
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
 
-it.each(["queued", "running"] as const)("stops an active %s history row once without submitting settings", async (status) => {
+it.each(["running", "pausing", "paused"] as const)("stops an active %s history row once without submitting settings", async (status) => {
   studies = [record(status)];
   render(<AlgorithmsPage />);
   const stop = await historyButton("Остановить исследование 17");
   fireEvent.click(stop); fireEvent.click(stop);
+  await confirmManualStop();
   await waitFor(() => expect(screen.getByRole("button", { name: "Остановить исследование 17" })).toBeDisabled());
   expect(await screen.findByText("Остановка запрошена")).toBeInTheDocument();
   expect(requests.filter((request) => request.path.endsWith("/cancel"))).toHaveLength(1);
@@ -1075,11 +1094,11 @@ it("does not offer repeated stop or deletion for cancel_requested", async () => 
   render(<AlgorithmsPage />);
   const stop = await historyButton("Остановить исследование 17");
   expect(stop).toBeDisabled(); fireEvent.click(stop);
-  expect(screen.queryByRole("button", { name: "Удалить исследование 17" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Удалить исследование 17" })).toBeDisabled();
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
 
-it.each(["completed", "cancelled", "failed"] as const)("confirms terminal %s deletion, closes selected detail and refreshes history", async (status) => {
+it.each(["queued", "completed", "cancelled", "failed"] as const)("confirms deletable %s deletion, closes selected detail and refreshes history", async (status) => {
   studies = [{ ...record("completed"), id: 20 }, record(status)];
   render(<AlgorithmsPage />);
   // Initial mount + discovery + history are distinct async steps; the 1s query
@@ -1273,11 +1292,40 @@ it("closes a deleted continuous selection without closing retained manual optimi
   expect(await historyButton("Результат исследования 20")).toBeInTheDocument();
 });
 
-it("blocks a new study for another algorithm while the platform already has active work", async () => {
+it("opens a new form while another algorithm has active work and enqueues another immutable spec", async () => {
   studies = [{ ...record(), spec: { ...spec, algorithmId: "second_algorithm" } }];
   render(<AlgorithmsPage />);
-  const dialog = await openOptimizer();
-  expect(await within(dialog).findByText(/В платформе допускается только одно активное исследование/)).toBeInTheDocument();
-  expect(within(dialog).getByRole("button", { name: "Начать исследование" })).toBeDisabled();
-  expect(requests.every((request) => request.method === "GET")).toBe(true);
+  const dialog = within(await openOptimizer("new")); enterDates();
+  await waitFor(() => expect(dialog.getByRole("button", { name: "Начать исследование" })).toBeEnabled());
+  fireEvent.click(dialog.getByRole("button", { name: "Начать исследование" }));
+  await screen.findByText("Исследование #18");
+  expect(studies).toHaveLength(2); expect(studies.find((study) => study.id === 17)?.spec.algorithmId).toBe("second_algorithm");
+  expect(studies.find((study) => study.id === 18)?.spec.algorithmId).toBe("future_algorithm");
+});
+
+it("opens explicit new intent for the same active algorithm and can enqueue another job from its accepted detail", async () => {
+  studies = [record()]; render(<AlgorithmsPage />);
+  let dialog = within(await openOptimizer("new"));
+  expect(await dialog.findByLabelText("Начало периода сигналов")).toBeInTheDocument(); enterDates();
+  fireEvent.click(dialog.getByRole("button", { name: "Начать исследование" })); await screen.findByText("Исследование #18");
+  fireEvent.click(await screen.findByRole("button", { name: "Новое исследование" }));
+  dialog = within(screen.getByRole("dialog", { name: "Оптимизация · Новый алгоритм" }));
+  const seed = await dialog.findByLabelText("Seed"); fireEvent.change(seed, { target: { value: "99" } }); enterDates();
+  fireEvent.click(dialog.getByRole("button", { name: "Начать исследование" })); await screen.findByText("Исследование #19");
+  expect(studies).toHaveLength(3); expect(studies.find((study) => study.id === 18)?.spec.seed).toBe(42); expect(studies[0]?.spec.seed).toBe(99);
+  const creates = requests.filter((request) => request.path === "/v1/optimization-studies" && request.method === "POST");
+  expect(creates).toHaveLength(2); expect(creates[0]?.key).toBeTruthy(); expect(creates[1]?.key).not.toBe(creates[0]?.key);
+});
+
+it("deletes a queued manual through confirmation, but refreshes a claim conflict without issuing Stop", async () => {
+  studies = [record("queued")]; render(<AlgorithmsPage />);
+  fireEvent.click(await historyButton("Удалить исследование 17"));
+  const confirmation = within(await screen.findByRole("dialog", { name: "Удалить исследование #17?" }));
+  studies = [record("running")]; deleteStatus = 409;
+  fireEvent.click(confirmation.getByRole("button", { name: "Удалить" }));
+  expect(await confirmation.findByRole("alert")).toHaveTextContent("Нельзя удалить активное исследование");
+  fireEvent.click(confirmation.getByRole("button", { name: "Отмена" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Удалить исследование 17" })).toBeDisabled());
+  expect(requests.filter((request) => request.method === "DELETE")).toHaveLength(1);
+  expect(requests.some((request) => request.path.endsWith("/cancel"))).toBe(false);
 });

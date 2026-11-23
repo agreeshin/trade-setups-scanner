@@ -19,7 +19,7 @@ pub struct PlatformConfig {
     pub resources: crate::resources::RuntimeResources,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OptimizationConfig {
     pub cpu_threads: usize,
     pub batch_size: usize,
@@ -29,6 +29,8 @@ pub struct OptimizationConfig {
     pub max_instruments: usize,
     pub max_request_bytes: usize,
     pub max_domain_values: usize,
+    #[serde(default)]
+    pub manual: setups_db::optimization::manual::Limits,
 }
 
 impl Default for OptimizationConfig {
@@ -44,6 +46,7 @@ impl Default for OptimizationConfig {
             max_instruments: 1000,
             max_request_bytes: 256 * 1024,
             max_domain_values: 4096,
+            manual: Default::default(),
         }
     }
 }
@@ -58,7 +61,7 @@ impl OptimizationConfig {
             }
             Ok(value as usize)
         };
-        Ok(Self {
+        let config = Self {
             cpu_threads: bounded("OPTIMIZATION_CPU_THREADS", defaults.cpu_threads, 64)?,
             batch_size: bounded("OPTIMIZATION_BATCH_SIZE", defaults.batch_size, 64)?,
             max_snapshot_bytes: bounded(
@@ -91,7 +94,16 @@ impl OptimizationConfig {
                 defaults.max_domain_values,
                 4096,
             )?,
-        })
+            manual: setups_db::optimization::manual::Limits {
+                max_pending: bounded("OPTIMIZATION_MANUAL_MAX_PENDING",64,64)? as i64,
+                max_spec_bytes: bounded("OPTIMIZATION_MANUAL_MAX_SPEC_BYTES",8*1024*1024,8*1024*1024)? as i64,
+                max_checkpoint_bytes: bounded("OPTIMIZATION_MANUAL_MAX_CHECKPOINT_BYTES",16*1024*1024,16*1024*1024)? as i64,
+                max_runtime_bytes: bounded("OPTIMIZATION_MANUAL_MAX_RUNTIME_BYTES",16*1024*1024*1024,16*1024*1024*1024)? as i64,
+                max_database_bytes: positive_integer(get,"OPTIMIZATION_MANUAL_MAX_DATABASE_BYTES",48*1024*1024*1024)?,
+            },
+        };
+        if !config.manual.validate() {return Err("invalid manual execution storage limits".into());}
+        Ok(config)
     }
 
     pub fn study_limits(&self) -> setups_optimizer::StudyLimits {

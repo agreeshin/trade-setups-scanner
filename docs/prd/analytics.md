@@ -357,6 +357,8 @@ Paused **освобождает research lane**: следующие ручные
 
 Приёмка: continuous full-chain → manual A/B FIFO → прежний continuous cursor; дополнительные manual во время running/cleanup; queued delete/claim race и restart survival; pause/search/acquisition/final capture, same-ID/input/frontier resume и elapsed budget; Play tail/idempotency; paused освобождает lane; Stop во всех фазах без воскресших callbacks; terminal/queued-only DELETE, auth/owner isolation; storage bounds/cleanup, corrupt/legacy failure; mean/forecast/blend и original-ledger parity; сохранность live, replay, post-study actual и maintenance. PRD commit предшествует source edits; после локальной проверки — commit/push, **без deploy**.
 
+Приоритет manual означает обслуживание до опустошения готовой ручной FIFO: непрерывный режим может ждать дольше при постоянном добавлении ручных заданий. Скрытое чередование или сброс обхода не вводятся. Для нового create браузер передаёт owner-scoped `Idempotency-Key`: тот же ключ и нормализованный spec возвращают прежний ID, несовпадение spec даёт 409. Новый осознанный submit использует новый ключ; явное удаление записи завершает срок жизни её receipt. Прежние API-клиенты без ключа сохраняют обычный create, polling не повторяет POST.
+
 ### 10.5. Приёмка
 
 - При закрытом браузере сервер продвигает работу; после reload UI обнаруживает то же исследование и его результат без повторного POST. Закрытие модалки не равно Stop.

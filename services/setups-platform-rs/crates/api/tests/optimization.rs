@@ -24,6 +24,10 @@ use std::{
     time::Duration,
 };
 use tower::ServiceExt;
+#[path="optimization/manual.rs"]
+mod manual_tests;
+#[path="optimization/manual_recovery_faults.rs"]
+mod manual_recovery_faults;
 
 fn spec() -> Value {
     json!({"algorithmId":"price_volume_spike","algorithmVersion":"1.1.1",
@@ -673,7 +677,7 @@ async fn frequency_gate_legacy_running_and_completed_records_remain_raw() {
         .unwrap()
     {
         Admission::Created(row) => row,
-        Admission::Busy(_) => panic!("fresh legacy fixture must be admitted"),
+        _ => panic!("fresh legacy fixture must be admitted"),
     };
     let id = created.id;
     db::claim(&db.pool).await.unwrap().unwrap();
@@ -724,7 +728,8 @@ async fn frequency_gate_legacy_running_and_completed_records_remain_raw() {
                         "id":before.id,"status":before.status,"spec":before.spec,
                         "progress":before.progress,"error":before.error,
                         "createdAt":before.created_at,"updatedAt":before.updated_at,"bestScore":1.0,"forecastBest":null,
-                        "origin":"manual","ownerId":"admin","continuousGenerationId":null,"continuousSlotId":null
+                        "origin":"manual","ownerId":"admin","continuousGenerationId":null,"continuousSlotId":null,
+                        "manualControl":before.manual_control,"actual":record["actual"]
                     })
                 );
             } else {
@@ -769,7 +774,7 @@ async fn insert_history_study(
         json!({"best":score.map(|score|json!({"score":score,"matrix":[{"payload":"matrix-marker".repeat(5000)}]}))})
     });
     let error = (status == "failed").then(|| json!({"code":"fixture","message":"history error"}));
-    sqlx::query_scalar("insert into optimization_studies (algorithm_id,status,spec,progress,result,error,events) values ($1,$2,$3,$4,$5,$6,$7) returning id")
+    sqlx::query_scalar("insert into optimization_studies (algorithm_id,status,spec,progress,result,error,events,manual_execution_reserved) values ($1,$2,$3,$4,$5,$6,$7,$2::text in ('running','pausing','cancel_requested')) returning id")
         .bind(algorithm).bind(status).bind(body).bind(progress).bind(result).bind(error)
         .bind(json!([{"at":"fixture","kind":"fixture","message":"event-marker".repeat(100)}]))
         .fetch_one(pool).await.unwrap()
@@ -810,7 +815,8 @@ async fn history_list_is_paginated_filtered_ordered_and_compact() {
         [active, drop, failed, cancelled, completed]
     );
     for summary in summaries {
-        assert_eq!(summary.as_object().unwrap().len(), 13);
+        assert_eq!(summary.as_object().unwrap().len(), 15);
+        assert!(summary["actual"].is_object());assert!(summary["manualControl"].is_object());
         for field in [
             "id",
             "status",
@@ -896,7 +902,7 @@ async fn history_list_is_paginated_filtered_ordered_and_compact() {
         );
     }
     for status in ["queued", "running", "cancel_requested"] {
-        sqlx::query("update optimization_studies set status=$2 where id=$1")
+        sqlx::query("update optimization_studies set status=$2,manual_execution_reserved=$2::text in ('running','pausing','cancel_requested') where id=$1")
             .bind(active)
             .bind(status)
             .execute(&db.pool)
@@ -1038,10 +1044,12 @@ async fn history_delete_rejects_active_removes_terminal_and_preserves_adjacent_d
             StatusCode::NOT_FOUND
         );
     }
+    let queued=insert_history_study(&db.pool,"price_volume_spike","queued",None,Some(1.0)).await;
+    assert_eq!(request(&router,"DELETE",&format!("/v1/optimization-studies/{queued}"),Value::Null).await.0,StatusCode::OK);
     let active =
-        insert_history_study(&db.pool, "price_volume_spike", "queued", None, Some(1.0)).await;
-    for status in ["queued", "running", "cancel_requested"] {
-        sqlx::query("update optimization_studies set status=$2 where id=$1")
+        insert_history_study(&db.pool, "price_volume_spike", "running", None, Some(1.0)).await;
+    for status in ["running", "pausing", "paused", "cancel_requested"] {
+        sqlx::query("update optimization_studies set status=$2,manual_execution_reserved=$2::text in ('running','pausing','cancel_requested') where id=$1")
             .bind(active)
             .bind(status)
             .execute(&db.pool)
@@ -1111,7 +1119,7 @@ async fn history_delete_checks_status_under_the_row_lock() {
     // Hold a concurrent status transition. DELETE must wait and inspect the
     // committed status under its own lock, not act on a stale terminal read.
     let mut transition = db.pool.begin().await.unwrap();
-    sqlx::query("update optimization_studies set status='running',result=null where id=$1")
+    sqlx::query("update optimization_studies set status='running',manual_execution_reserved=true,result=null where id=$1")
         .bind(id)
         .execute(&mut *transition)
         .await
@@ -1130,7 +1138,7 @@ async fn history_delete_checks_status_under_the_row_lock() {
         "running"
     );
     let mut transition = db.pool.begin().await.unwrap();
-    sqlx::query("update optimization_studies set status='completed' where id=$1")
+    sqlx::query("update optimization_studies set status='completed',manual_execution_reserved=false where id=$1")
         .bind(id)
         .execute(&mut *transition)
         .await
@@ -1231,6 +1239,7 @@ async fn market(
 #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
 async fn detached_execution_reload_discovery_and_cache_isolation() {
     let db = TestDb::new().await;
+    let settings_before:Value=sqlx::query_scalar("select coalesce(jsonb_object_agg(key,value),'{}') from settings").fetch_one(&db.pool).await.unwrap();
     let (url, _, server) = market(Duration::from_millis(20), 0).await;
     let runtime = start_optimization_runtime(
         db.pool.clone(),
@@ -1293,7 +1302,9 @@ async fn detached_execution_reload_discovery_and_cache_isolation() {
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
-            assert_eq!(count, 0, "{table}");
+            if table=="settings" {
+                let after:Value=sqlx::query_scalar("select coalesce(jsonb_object_agg(key,value),'{}') from settings").fetch_one(&db.pool).await.unwrap();assert_eq!(after,settings_before);
+            }else{assert_eq!(count, 0, "{table}");}
         }
     }
     runtime.stop().await;
@@ -1326,9 +1337,10 @@ async fn acquisition_cancel_keeps_active_slot_and_is_idempotent() {
     .await
     .unwrap();
     for _ in 0..3 {
-        let (status, busy) = request(&router, "POST", "/v1/optimization-studies", spec()).await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(busy["activeStudyId"], id);
+        let (status, queued) = request(&router, "POST", "/v1/optimization-studies", spec()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(queued["status"],"queued");assert_ne!(queued["id"],id);
+        assert_eq!(request(&router,"DELETE",&format!("/v1/optimization-studies/{}",queued["id"]),Value::Null).await.0,StatusCode::OK);
     }
     assert_eq!(
         request(
@@ -1417,13 +1429,15 @@ async fn admission_race_restart_recovery_and_late_cancel_finalize() {
         db::create(&db.pool, "price_volume_spike", &body, &progress),
         db::create(&db.pool, "price_volume_spike", &body, &progress)
     );
-    let (id, busy) = match (a.unwrap(), b.unwrap()) {
-        (Admission::Created(row), Admission::Busy(id))
-        | (Admission::Busy(id), Admission::Created(row)) => (row.id, id),
-        _ => panic!("exactly one admission"),
+    let (id, waiting) = match (a.unwrap(), b.unwrap()) {
+        (Admission::Created(a), Admission::Created(b)) => (a.id.min(b.id),a.id.max(b.id)),
+        _ => panic!("both intentional submissions must be admitted"),
     };
-    assert_eq!(id, busy);
+    assert_ne!(id, waiting);
     db::claim(&db.pool).await.unwrap().unwrap();
+    // Only a genuinely legacy, RAM-only interrupted head fails on restart.
+    sqlx::query("update optimization_studies set manual_format_version=null where id=$1").bind(id).execute(&db.pool).await.unwrap();
+    db::cancel(&db.pool,waiting).await.unwrap();
     let runtime = start_optimization_runtime(
         db.pool.clone(),
         "http://127.0.0.1:1".into(),
@@ -1661,7 +1675,10 @@ async fn compute_deadline_is_normal_completion_and_does_not_mark_winner_partial(
         .unwrap();
     let router = app_with_health(db.pool.clone(), config, runtime.available.clone());
     let mut body = compute_spec();
-    body["maxSeconds"] = json!(2);
+    // Frozen input is now durably encoded before search. Keep enough budget
+    // for a baseline on a loaded debug host while the large domain still
+    // guarantees termination by time rather than trial exhaustion.
+    body["maxSeconds"] = json!(8);
     let (_, created) = request(&router, "POST", "/v1/optimization-studies", body).await;
     let row = wait_for(&db.pool, created["id"].as_i64().unwrap(), |r| !r.active()).await;
     assert_eq!(row.status, "completed", "{:?}", row.error);
@@ -1680,7 +1697,7 @@ async fn compute_deadline_is_normal_completion_and_does_not_mark_winner_partial(
 
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn graceful_shutdown_fails_acquisition_and_cpu_work_instead_of_user_cancel() {
+async fn graceful_shutdown_preserves_resumable_acquisition_and_cpu_work_without_user_cancel() {
     let db = TestDb::new().await;
     for computing in [false, true] {
         let (url, requests, server) = market(
@@ -1725,9 +1742,9 @@ async fn graceful_shutdown_fails_acquisition_and_cpu_work_instead_of_user_cancel
             .await
             .expect("shutdown drains cooperative work");
         let row = db::get(&db.pool, id).await.unwrap().unwrap();
-        assert_eq!(row.status, "failed");
+        assert_eq!(row.status, "queued");
         assert!(row.result.is_none());
-        assert_eq!(row.error.unwrap()["code"], "interrupted_by_restart");
+        assert!(row.error.is_none());
         assert!(
             row.events
                 .as_array()
@@ -1741,6 +1758,7 @@ async fn graceful_shutdown_fails_acquisition_and_cpu_work_instead_of_user_cancel
                 .0,
             StatusCode::SERVICE_UNAVAILABLE
         );
+        assert_eq!(db::delete(&db.pool,id).await.unwrap(),Some(db::DeleteStudyOutcome::Deleted));
         server.abort();
     }
     db.cleanup().await;
@@ -1825,7 +1843,7 @@ async fn transient_terminal_failure_retries_compact_payload_and_dead_owner_rejec
 
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn lease_loss_during_acquisition_and_compute_cancels_and_drains_owned_work() {
+async fn lease_loss_drains_work_but_preserves_logical_manual_reservation_until_fenced_takeover() {
     let db = TestDb::new().await;
     for computing in [false, true] {
         let (url, _, server) = market(
@@ -1865,10 +1883,12 @@ async fn lease_loss_during_acquisition_and_compute_cancels_and_drains_owned_work
             .execute(&db.pool)
             .await
             .unwrap();
-        let row = wait_for(&db.pool, id, |r| !r.active()).await;
-        assert_eq!(row.status, "failed");
+        tokio::time::timeout(Duration::from_secs(5),async {while runtime.available.load(Ordering::SeqCst){tokio::time::sleep(Duration::from_millis(20)).await;}}).await.unwrap();
+        let row=db::get(&db.pool,id).await.unwrap().unwrap();
+        assert!(row.active());
         assert!(row.result.is_none());
-        assert_eq!(row.error.unwrap()["code"], "interrupted_by_restart");
+        assert!(row.error.is_none());
+        assert!(sqlx::query_scalar::<_,bool>("select manual_execution_reserved from optimization_studies where id=$1").bind(id).fetch_one(&db.pool).await.unwrap());
         assert!(!runtime.available.load(Ordering::SeqCst));
         assert_eq!(
             request(&router, "POST", "/v1/optimization-studies", spec())
@@ -1876,13 +1896,13 @@ async fn lease_loss_during_acquisition_and_compute_cancels_and_drains_owned_work
                 .0,
             StatusCode::SERVICE_UNAVAILABLE
         );
-        assert!(
-            db::cancellation_requested(&db.pool, id).await.is_err(),
-            "a terminal row is ownership loss, not continue"
-        );
         tokio::time::timeout(Duration::from_secs(5), runtime.stop())
             .await
             .unwrap();
+        let mut takeover=db.pool.begin().await.unwrap();sqlx::query("select pg_advisory_xact_lock($1)").bind(db::RUNTIME_LOCK).execute(&mut *takeover).await.unwrap();
+        db::interrupt(&db.pool).await.unwrap();assert_eq!(db::get(&db.pool,id).await.unwrap().unwrap().status,"queued");
+        assert!(db::cancellation_requested(&db.pool,id).await.is_err(),"old execution cannot continue after takeover");
+        takeover.rollback().await.unwrap();db::delete(&db.pool,id).await.unwrap();
         server.abort();
     }
     db.cleanup().await;
@@ -1940,10 +1960,10 @@ async fn shutdown_with_unavailable_terminal_storage_is_bounded_and_next_start_re
     )
     .await
     .unwrap();
-    let recovered = db::get(&db.pool, id).await.unwrap().unwrap();
-    assert_eq!(recovered.status, "failed");
-    assert_eq!(recovered.error.unwrap()["code"], "interrupted_by_restart");
-    assert!(recovered.result.is_none());
+    let recovered = wait_for(&db.pool, id, |r|!r.active()).await;
+    assert_eq!(recovered.status, "completed","{:?}",recovered.error);
+    assert!(recovered.error.is_none());
+    assert!(recovered.result.unwrap()["best"].is_object());
     resumed.stop().await;
     server.abort();
     db.cleanup().await;

@@ -5,8 +5,22 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row, postgres::PgRow};
 
-const ADMISSION_LOCK: i64 = 72_423_413;
 pub const RUNTIME_LOCK: i64 = 72_423_414;
+pub mod manual;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualControl {
+    pub revision: i64,
+    pub supports_pause: bool,
+}
+
+fn manual_control(row: &PgRow) -> Result<Option<ManualControl>, DbError> {
+    Ok((row.try_get::<String, _>("origin")? == "manual").then(|| ManualControl {
+        revision: row.get("manual_control_revision"),
+        supports_pause: row.get::<Option<i32>, _>("manual_format_version") == Some(1),
+    }))
+}
 
 pub async fn runtime_owned(pool: &PgPool) -> Result<bool, DbError> {
     Ok(sqlx::query_scalar("select exists(select 1 from pg_locks where locktype='advisory' and database=(select oid from pg_database where datname=current_database()) and classid=0 and objid=$1::bigint::oid and objsubid=1 and granted)")
@@ -29,19 +43,21 @@ pub struct StudyRecord {
     pub owner_id: String,
     pub continuous_generation_id: Option<i64>,
     pub continuous_slot_id: Option<i64>,
+    pub manual_control: Option<ManualControl>,
 }
 
 impl StudyRecord {
     pub fn active(&self) -> bool {
         matches!(
             self.status.as_str(),
-            "queued" | "running" | "cancel_requested"
+            "queued" | "running" | "pausing" | "paused" | "cancel_requested"
         )
     }
 }
 
 fn record(row: PgRow) -> Result<StudyRecord, DbError> {
     Ok(StudyRecord {
+        manual_control: manual_control(&row)?,
         id: row.try_get("id")?,
         status: row.try_get("status")?,
         spec: row.try_get("spec")?,
@@ -61,6 +77,8 @@ fn record(row: PgRow) -> Result<StudyRecord, DbError> {
 pub enum Admission {
     Created(Box<StudyRecord>),
     Busy(i64),
+    IdempotencyConflict,
+    Resource { resource: &'static str, limit: i64, requested: i64 },
 }
 
 pub async fn create(
@@ -69,23 +87,7 @@ pub async fn create(
     spec: &Value,
     progress: &Value,
 ) -> Result<Admission, DbError> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("select pg_advisory_xact_lock($1)")
-        .bind(ADMISSION_LOCK)
-        .execute(&mut *tx)
-        .await?;
-    let active: Option<i64> = sqlx::query_scalar(
-        "select id from optimization_studies where origin='manual' and owner_id='admin' and status in ('queued','running','cancel_requested') limit 1",
-    ).fetch_optional(&mut *tx).await?;
-    if let Some(id) = active {
-        tx.commit().await?;
-        return Ok(Admission::Busy(id));
-    }
-    let row = sqlx::query(
-        "insert into optimization_studies (algorithm_id,spec,progress) values ($1,$2,$3) returning *",
-    ).bind(algorithm_id).bind(spec).bind(progress).fetch_one(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(Admission::Created(Box::new(record(row)?)))
+    manual::create(pool, "admin", algorithm_id, spec, progress, None, &Default::default()).await
 }
 
 pub async fn get(pool: &PgPool, id: i64) -> Result<Option<StudyRecord>, DbError> {
@@ -162,6 +164,7 @@ pub struct StudySummary {
     pub continuous_generation_id: Option<i64>,
     pub continuous_slot_id: Option<i64>,
     pub actual: Option<Value>,
+    pub manual_control: Option<ManualControl>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,8 +202,8 @@ pub async fn list(
     // current handoff does not change client eligibility or add SQL round-trips.
     let rows = sqlx::query(&[
         "select page.id,page.status,page.spec,page.progress,page.error,page.created_at,page.updated_at, \
-         page.origin,page.owner_id,page.continuous_generation_id,page.continuous_slot_id, \
-         (case when page.status in ('queued','running','cancel_requested') \
+         page.origin,page.owner_id,page.continuous_generation_id,page.continuous_slot_id,page.manual_format_version,page.manual_control_revision, \
+         (case when page.status in ('queued','running','pausing','paused','cancel_requested') \
           then page.progress->>'bestScore' else page.result#>>'{best,score}' end)::double precision as best_score, \
          coalesce(page.result#>'{best,trendMode}',page.spec->'trendMode') as forecast_mode, \
          winner.cell as best_forecast_cell, \
@@ -218,7 +221,7 @@ pub async fn list(
             and jsonb_typeof(page.spec->'instruments')='array' and page.spec->'instruments'<>'[]'::jsonb),false) then 'trade_conditions_unavailable' \
            else null end)) as actual \
          from (select * from optimization_studies where ($1::text is null or algorithm_id=$1) \
-          order by (status in ('queued','running','cancel_requested')) desc, id desc limit $2 offset $3) page \
+          order by (status in ('queued','running','pausing','paused','cancel_requested')) desc, id desc limit $2 offset $3) page \
          left join lateral ( \
           select entry.cell from jsonb_array_elements(case when jsonb_typeof(page.result#>'{best,matrix}')='array' \
            then page.result#>'{best,matrix}' else '[]'::jsonb end) with ordinality entry(cell,position) \
@@ -234,7 +237,7 @@ pub async fn list(
             and (entry.cell->>'slPct')::numeric <= 100 else false end \
           order by (metric.forecast#>>'{}')::numeric desc,entry.position limit 1 \
          ) winner on true \
-         order by (page.status in ('queued','running','cancel_requested')) desc,page.id desc",
+         order by (page.status in ('queued','running','pausing','paused','cancel_requested')) desc,page.id desc",
     ].concat())
     .bind(algorithm)
     .bind(limit)
@@ -250,6 +253,7 @@ pub async fn list(
             let cell: Option<Value> = row.try_get("best_forecast_cell")?;
             let mode: Option<Value> = row.try_get("forecast_mode")?;
             Ok(StudySummary {
+                manual_control: manual_control(&row)?,
                 id: row.try_get("id")?,
                 status: row.try_get("status")?,
                 spec: row.try_get("spec")?,
@@ -288,8 +292,12 @@ pub enum DeleteStudyOutcome {
 
 pub async fn delete(pool: &PgPool, id: i64) -> Result<Option<DeleteStudyOutcome>, DbError> {
     let mut tx = pool.begin().await?;
+    let owner: Option<String> = sqlx::query_scalar("select owner_id from optimization_studies where id=$1")
+        .bind(id).fetch_optional(&mut *tx).await?;
+    let Some(owner) = owner else { return Ok(None); };
+    crate::continuous::owner_lock(&mut tx, &owner).await?;
     let head = sqlx::query(
-        "select status,owner_id from optimization_studies where id=$1 for no key update",
+        "select status,owner_id,origin from optimization_studies where id=$1 for no key update",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -300,7 +308,8 @@ pub async fn delete(pool: &PgPool, id: i64) -> Result<Option<DeleteStudyOutcome>
     };
     let status: String = head.try_get("status")?;
     let owner: String = head.try_get("owner_id")?;
-    if !matches!(status.as_str(), "completed" | "cancelled" | "failed") {
+    if !matches!(status.as_str(), "completed" | "cancelled" | "failed")
+        && !(status == "queued" && head.get::<String, _>("origin") == "manual") {
         tx.commit().await?;
         return Ok(Some(DeleteStudyOutcome::Active));
     }
@@ -325,18 +334,15 @@ pub async fn delete(pool: &PgPool, id: i64) -> Result<Option<DeleteStudyOutcome>
 }
 
 pub async fn claim(pool: &PgPool) -> Result<Option<StudyRecord>, DbError> {
-    sqlx::query(
-        "update optimization_studies set status='running',execution_started_at=clock_timestamp(),updated_at=now() \
-         where id=(select id from optimization_studies where origin='manual' and status='queued' order by id \
-         for update skip locked limit 1) and status='queued' returning *",
-    )
-    .fetch_optional(pool)
-    .await?
-    .map(record)
-    .transpose()
+    Ok(manual::claim(pool, None).await?.map(|job| job.study))
 }
 
 pub async fn cancel(pool: &PgPool, id: i64) -> Result<Option<(StudyRecord, bool)>, DbError> {
+    manual::cancel(pool, id).await
+}
+
+#[allow(dead_code)]
+async fn legacy_cancel(pool: &PgPool, id: i64) -> Result<Option<(StudyRecord, bool)>, DbError> {
     // Queued work has no retained input or admitted CPU work. Running work keeps
     // its active slot until its owner drains and calls finish.
     let mut tx = pool.begin().await?;
@@ -427,8 +433,24 @@ pub async fn finish_with_original_archive(
     events: &Value,
     archive: Option<&crate::study_display::ManualArchive>,
 ) -> Result<(), DbError> {
+    finish_fenced(pool,id,None,status,progress,result,error,events,archive).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn finish_fenced(
+    pool:&PgPool,id:i64,epoch:Option<i64>,status:&str,progress:&Value,
+    result:Option<&Value>,error:Option<&Value>,events:&Value,
+    archive:Option<&crate::study_display::ManualArchive>,
+) -> Result<(),DbError> {
     assert!(matches!(status, "completed" | "cancelled" | "failed"));
     let mut tx = pool.begin().await?;
+    let owner:Option<String>=sqlx::query_scalar("select owner_id from optimization_studies where id=$1").bind(id).fetch_optional(&mut *tx).await?;
+    let Some(owner)=owner else {return Err(DbError::Json("manual study missing during finalization".into()));};
+    crate::continuous::owner_lock(&mut tx,&owner).await?;
+    if let Some(epoch)=epoch {
+        let current:i64=sqlx::query_scalar("select manual_execution_epoch from optimization_studies where id=$1 for update").bind(id).fetch_one(&mut *tx).await?;
+        if current!=epoch {return Err(DbError::Json("manual execution epoch lost".into()));}
+    }
     let previous: Option<String> =
         sqlx::query_scalar("select status from optimization_studies where id=$1 for update")
             .bind(id)
@@ -436,7 +458,7 @@ pub async fn finish_with_original_archive(
             .await?;
     if !previous
         .as_deref()
-        .is_some_and(|status| matches!(status, "running" | "cancel_requested"))
+        .is_some_and(|status| matches!(status, "running" | "pausing" | "cancel_requested"))
     {
         if archive.is_some() {
             // A lost COMMIT ACK must verify what was committed, not turn an
@@ -491,8 +513,10 @@ pub async fn finish_with_original_archive(
     }
     sqlx::query(
         "update optimization_studies set status=$2, \
-         progress=$3,result=$4,error=$5,events=$6,updated_at=now() \
-         where id=$1 and status in ('running','cancel_requested')",
+         progress=$3,result=$4,error=$5,events=$6,manual_execution_reserved=false, \
+         manual_spent_ms=manual_spent_ms+greatest(0,coalesce((extract(epoch from(clock_timestamp()-manual_segment_started_at))*1000)::bigint,0)), \
+         manual_segment_started_at=null,updated_at=now() \
+         where id=$1 and status in ('running','pausing','cancel_requested')",
     )
     .bind(id)
     .bind(status)
@@ -505,21 +529,16 @@ pub async fn finish_with_original_archive(
     if let Some(archive) = archive {
         crate::study_display::seal_manual_in(&mut tx, id, archive).await?;
     }
+    // Private state is detached only AFTER science + paired original archive
+    // have succeeded in this same transaction, and callers have joined work.
+    sqlx::query("delete from manual_runtime_artifacts where study_id=$1").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
 
 /// Call only while owning RUNTIME_LOCK. The previous process's RAM is gone.
 pub async fn interrupt(pool: &PgPool) -> Result<u64, DbError> {
-    let error = json!({"code":"interrupted_by_restart","message":"Исследование прервано перезапуском сервера; запустите новое исследование."});
-    Ok(sqlx::query(
-        "update optimization_studies set status='failed',result=null,error=$1,updated_at=now() \
-         where origin='manual' and status in ('queued','running','cancel_requested')",
-    )
-    .bind(error)
-    .execute(pool)
-    .await?
-    .rows_affected())
+    manual::recover(pool).await
 }
 
 #[cfg(test)]

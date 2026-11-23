@@ -5,7 +5,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Spinner } from "../components/ui/spinner";
 import { InfoNote } from "../components/ui/info-note";
 import { fetchPlatform } from "../lib/platform-api";
-import { getOptimizationDraft, isActiveStudy, type OptimizationStudyAction } from "../lib/optimization-api";
+import { canDeleteStudy, getOptimizationDraft, isActiveStudy, type OptimizationStudyAction } from "../lib/optimization-api";
 import type { CatalogInstrument } from "./instrument-picker";
 import { algorithmDisplayName, errorText, localDateInput, type Algorithm } from "./platform-controls";
 import { ANALYTICS_BASELINE, ANALYTICS_SEARCH_FIELDS, buildOptimizationSpec, initialDomains, initialScope, type ScopeDraft } from "./optimization-form";
@@ -18,6 +18,7 @@ import type { OptimizationController } from "./use-optimization-studies";
 import { applyOptimizationDraftScope, createOptimizationDraft, restoreOptimizationDraft, useOptimizationDraftSave, type OptimizationFormDraft } from "./optimization-draft";
 
 function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algorithm; controller: OptimizationController; onStarted: () => void }) {
+  const mutationBusy = controller.creating || controller.cancelling !== null || controller.deleting !== null || controller.controlling != null;
   const [algorithmDomains, setAlgorithmDomains] = useState(() => initialDomains(algorithm.fields, algorithm.params));
   const [analyticsDomains, setAnalyticsDomains] = useState(() => initialDomains(ANALYTICS_SEARCH_FIELDS, { ...ANALYTICS_BASELINE }));
   const [scope, setScope] = useState<ScopeDraft>(initialScope);
@@ -64,7 +65,7 @@ function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algori
   const change = (patch: Partial<ScopeDraft>) => { setScope({ ...scope, ...patch }); setError(null); };
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!ready || controller.creating || controller.active || !controller.ready) return;
+    if (!ready || mutationBusy || !controller.ready) return;
     setError(null);
     try {
       const spec = buildOptimizationSpec(algorithm, scope, catalog, algorithmDomains, analyticsDomains);
@@ -84,7 +85,7 @@ function OptimizerForm({ algorithm, controller, onStarted }: { algorithm: Algori
     {loadError && <Alert variant="destructive" role="alert">{loadError}<Button type="button" variant="outline" onClick={() => setRevision((value) => value + 1)}>Повторить загрузку</Button></Alert>}
     <OptimizationFields algorithm={algorithm} scope={scope} onScopeChange={change} catalog={catalog} ready={ready} disabled={controller.creating} algorithmDomains={algorithmDomains} onAlgorithmDomainsChange={setAlgorithmDomains} analyticsDomains={analyticsDomains} onAnalyticsDomainsChange={setAnalyticsDomains} />
     {(error ?? draftSave.saveError) && <Alert variant="destructive" role="alert">{error ?? draftSave.saveError}</Alert>}
-    <div><Button type="submit" disabled={!ready || !controller.ready || controller.creating || controller.active !== null}>{controller.creating ? "Создание исследования…" : "Начать исследование"}</Button></div>
+    <div><Button type="submit" disabled={!ready || !controller.ready || mutationBusy}>{controller.creating ? "Создание исследования…" : "Начать исследование"}</Button></div>
   </form>;
 }
 
@@ -97,7 +98,7 @@ function StudyDetail({ detail, algorithm, controller, onDelete, onNew }: {
     {!detail?.study && !detail?.error && <Spinner label="Загрузка исследования" />}
     {detail?.study && <>
       <OptimizationResults study={detail.study} algorithm={algorithm} controller={controller} {...(onNew ? { onNew } : {})} />
-      {!isActiveStudy(detail.study) && <div><Button type="button" variant="outline" disabled={controller.creating || controller.cancelling !== null || controller.deleting !== null} aria-label={`Удалить исследование ${detail.study.id}`} onClick={() => onDelete(detail.study!)}><OptimizationTrashIcon />Удалить исследование</Button></div>}
+      <div><Button type="button" variant="outline" disabled={!canDeleteStudy(detail.study) || controller.creating || controller.cancelling !== null || controller.deleting !== null || controller.controlling != null || detail.error !== null} aria-label={`Удалить исследование ${detail.study.id}`} onClick={() => onDelete(detail.study!)}><OptimizationTrashIcon />Удалить исследование</Button></div>
     </>}
   </>;
 }
@@ -124,10 +125,10 @@ export function OptimizationStudyDialog({ id, algorithm, controller, open, onOpe
   </Dialog>;
 }
 
-export function AlgorithmOptimizer({ algorithm, controller, open, onOpenChange, returnFocusId, onDelete }: { algorithm: Algorithm; controller: OptimizationController; open: boolean; onOpenChange: (open: boolean) => void; returnFocusId: string; onDelete: (study: OptimizationStudyAction) => void }) {
+export function AlgorithmOptimizer({ algorithm, controller, open, onOpenChange, returnFocusId, onDelete, createNew = false }: { algorithm: Algorithm; controller: OptimizationController; open: boolean; onOpenChange: (open: boolean) => void; returnFocusId: string; onDelete: (study: OptimizationStudyAction) => void; createNew?: boolean }) {
   const study = controller.byAlgorithm[algorithm.id];
-  const [drafting, setDrafting] = useState(false);
-  const showStudy = study && (isActiveStudy(study) || !drafting);
+  const [drafting, setDrafting] = useState(createNew);
+  const showStudy = study && !drafting;
   const detail = useOptimizationDetail(study?.id, open && Boolean(showStudy), controller.revision, study && !isActiveStudy(study) ? study.updatedAt : undefined);
   const headerStudy = showStudy ? detail?.study ?? study : undefined;
   return <Dialog open={open} onOpenChange={(next) => { if (!next) setDrafting(false); onOpenChange(next); }}>
@@ -141,7 +142,6 @@ export function AlgorithmOptimizer({ algorithm, controller, open, onOpenChange, 
       <div className="grid min-w-0 gap-4">
         {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
         {!controller.ready && <div className="flex flex-wrap items-center gap-2 text-sm"><span>Проверяем сохранённые исследования. Новый запуск пока недоступен.</span>{(!showStudy || isActiveStudy(study)) && <Button type="button" variant="outline" onClick={controller.refresh}>Обновить статус</Button>}</div>}
-        {controller.active && controller.active.spec.algorithmId !== algorithm.id && <Alert variant="warning">Исследование #{controller.active.id} для {controller.active.spec.algorithmId} уже выполняется. В платформе допускается только одно активное исследование.</Alert>}
         {showStudy ? <StudyDetail detail={detail} algorithm={algorithm} controller={controller} onDelete={onDelete} onNew={() => setDrafting(true)} />
           : <OptimizerForm algorithm={algorithm} controller={controller} onStarted={() => setDrafting(false)} />}
       </div>

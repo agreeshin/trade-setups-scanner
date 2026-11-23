@@ -703,7 +703,7 @@ async fn real_chain_persists_service_set_recomputes_analytics_activates_and_stop
 
 #[tokio::test]
 #[ignore="requires isolated TEST_DATABASE_URL ending in _test with CREATEDB"]
-async fn continuous_acquisition_does_not_block_real_manual_admission_or_owner_stop() {
+async fn continuous_acquisition_queues_manual_until_full_chain_or_owner_stop_releases_lane() {
     let database=TestDb::new().await;let market=Market::start(true).await;
     let manual=start_optimization_runtime(database.pool.clone(),market.url.clone(),"key".into(),Default::default()).await.unwrap();
     let runtime=start_continuous_runtime(database.pool.clone(),market.url.clone(),"key".into(),ContinuousRuntimeConfig::default()).await.unwrap();
@@ -718,6 +718,10 @@ async fn continuous_acquisition_does_not_block_real_manual_admission_or_owner_st
     let (status,study)=request(&router,"POST","/v1/optimization-studies",spec).await;
     assert_eq!(status,StatusCode::ACCEPTED,"manual admission rejected during continuous work: {study}");
     let manual_id=study["id"].as_i64().unwrap();assert_eq!(study["origin"],"manual");
+    assert_eq!(study["status"],"queued");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(setups_db::optimization::get(&database.pool,manual_id).await.unwrap().unwrap().status,"queued");
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from manual_runtime_artifacts where study_id=$1").bind(manual_id).fetch_one(&database.pool).await.unwrap(),0,"queued manual must not acquire input behind continuous");
     assert_eq!(request(&router,"POST",&format!("/v1/optimization-studies/{continuous_study}/cancel"),Value::Null).await.0,StatusCode::CONFLICT);
     let stop_started=std::time::Instant::now();
     request(&router,"POST",&path("/stop"),Value::Null).await;
@@ -725,6 +729,7 @@ async fn continuous_acquisition_does_not_block_real_manual_admission_or_owner_st
     assert!(stop_started.elapsed()<Duration::from_secs(2),"authoritative Stop was delayed by monitor grace");
     assert!(setups_db::optimization::get(&database.pool,continuous_study).await.unwrap().is_none());
     assert!(setups_db::optimization::get(&database.pool,manual_id).await.unwrap().is_some());
+    wait_sql(&database.pool,&format!("select to_jsonb(s) from optimization_studies s where id={manual_id} and status='running'")).await;
     runtime.stop().await;manual.stop().await;market.task.abort();let _=market.task.await;database.cleanup().await;
 }
 

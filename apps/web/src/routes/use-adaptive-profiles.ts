@@ -2,14 +2,9 @@ import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { adaptivePermission, commandAdaptiveProfile, listAdaptiveProfiles, type AdaptiveProfile, type ProfileCommand, type ProfilePage } from "../lib/adaptive-profiles-api";
 import { RouteActiveContext } from "./route-active";
 import { errorText } from "./platform-controls";
+import { randomRequestId as profileRequestId } from "../lib/utils";
 
 type Action = "stop" | "play";
-function profileRequestId(): string {
-  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
-  // getRandomValues also works on HTTP origins; 128 random bits become 32 hex characters.
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
 /** One bounded page plus per-visible-row requests. No scientific payload/history in RAM. */
 export function useAdaptiveProfiles(algorithmId: string, active = true, refreshRevision = 0) {
   const routeActive = useContext(RouteActiveContext);

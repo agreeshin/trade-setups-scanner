@@ -25,7 +25,7 @@ export function useOptimizationDetail(id: number | undefined, open: boolean, rev
         const study = await getOptimizationStudy(selectedId, current.signal);
         if (disposed || current.signal.aborted) return;
         setState({ id: selectedId, study, error: null });
-        if (isActiveStudy(study)) timer = setTimeout(() => { void load(); }, 3000);
+        if (isActiveStudy(study)) timer = setTimeout(() => { void load(); }, study.status === "paused" ? 15000 : 3000);
       } catch (cause) {
         if (disposed || current.signal.aborted) return;
         setState((previous) => ({ id: selectedId, study: previous?.id === selectedId ? previous.study : null, error: errorText(cause) }));

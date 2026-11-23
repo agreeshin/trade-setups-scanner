@@ -174,7 +174,8 @@ pub(crate) async fn active_reservation_bytes(
     }
     let continuous:i64=sqlx::query_scalar("select coalesce(sum(g.reserved_bytes),0)::bigint + coalesce(sum(greatest(coalesce(a.reserved_bytes,0)-coalesce(a.snapshot_bytes,0)-coalesce(octet_length(a.checkpoint),0),0)),0)::bigint from continuous_generations g left join continuous_runtime_artifacts a on a.generation_id=g.id where g.status='running'").fetch_one(&mut *tx).await?;
     let actual:i64=sqlx::query_scalar("select coalesce(sum(reserved_bytes),0)::bigint from study_actualizations where status in ('queued','running')").fetch_one(&mut *tx).await?;
-    total = total.saturating_add(continuous).saturating_add(actual);
+    let manual:i64=sqlx::query_scalar("select coalesce(sum(greatest(reserved_bytes-snapshot_bytes-coalesce(octet_length(checkpoint),0),0)),0)::bigint from manual_runtime_artifacts").fetch_one(&mut *tx).await?;
+    total = total.saturating_add(continuous).saturating_add(actual).saturating_add(manual);
     Ok(total)
 }
 

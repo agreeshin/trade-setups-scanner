@@ -9,6 +9,40 @@ use std::{future::Future, str::FromStr};
 const OWNER: &str = "admin";
 const ALGORITHM: &str = "price_volume_spike";
 
+async fn queued_manual(pool:&PgPool,owner:&str,key:Option<&str>)->i64 {
+    match setups_db::optimization::manual::create(pool,owner,ALGORITHM,&json!({"maxSeconds":30}),&json!({}),key,&Default::default()).await.unwrap() {
+        setups_db::optimization::Admission::Created(study)=>study.id,
+        _=>panic!("manual admission rejected"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn manual_restart_charges_open_segments_and_does_not_fabricate_paused_state() {
+    use setups_db::optimization::{self as studies,manual};
+    isolated(|pool|async move {
+        for stage in 0..3 {
+            let owner=format!("owner-{stage}");let id=queued_manual(&pool,&owner,None).await;
+            let job=manual::claim(&pool,None).await.unwrap().unwrap();assert_eq!(job.study.id,id);
+            manual::control(&pool,&owner,id,1,false).await.unwrap();
+            sqlx::query("update optimization_studies set manual_spent_ms=2000,manual_segment_started_at=clock_timestamp()-interval '3 seconds' where id=$1").bind(id).execute(&pool).await.unwrap();
+            if stage>0 {
+                let limits=manual::Limits::default();let bytes=b"snapshot";
+                manual::reserve(&pool,&job,&json!({"test":true}),1024,&limits).await.unwrap();manual::write_chunk(&pool,&job,0,bytes,&limits).await.unwrap();
+                let manifest=setups_db::continuous::frozen::SnapshotManifest{version:1,codec:"framed-cbor-1".into(),chunks:1,encoded_bytes:8,sha256:setups_db::continuous::frozen::checksum(bytes),snapshot_hash:"frozen".into(),captured_at:"now".into()};
+                manual::seal(&pool,&job,&manifest,0,&limits).await.unwrap();
+                if stage==2 {manual::checkpoint(&pool,&job,0,b"acknowledged",&limits).await.unwrap();}
+            }
+            studies::interrupt(&pool).await.unwrap();
+            let row=studies::get(&pool,id).await.unwrap().unwrap();
+            assert_eq!(row.status,if stage==2{"paused"}else{"failed"});
+            if stage<2 {assert_eq!(row.error.unwrap()["code"],"manual_pause_checkpoint_incomplete");}
+            let (spent,open):(i64,bool)=sqlx::query_as("select manual_spent_ms,manual_segment_started_at is not null from optimization_studies where id=$1").bind(id).fetch_one(&pool).await.unwrap();assert!(spent>=5000);assert!(!open);
+            assert!(manual::claim(&pool,None).await.unwrap().is_none(),"user pause must not auto-Play");
+        }
+    }).await;
+}
+
 async fn isolated<F, Fut>(body: F)
 where
     F: FnOnce(PgPool) -> Fut + 'static,

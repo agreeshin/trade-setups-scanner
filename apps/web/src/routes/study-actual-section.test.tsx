@@ -15,7 +15,8 @@ const study: OptimizationStudy = { id: 49, status: "completed", origin: "continu
   analyticsParams: { clusterEnabled: true, clusterGapMinutes: 480, timeShiftMinutes: 0, priceChangePct: null }, analyticsSearch: {}, instruments: [], fromUnix: 1794000000, toUnix: 1794086400,
   direction: "short", setupMaturity: 0, horizonMinutes: 10080, tpLevels: [4], slLevels: [4], minClosedPerCell: 1, seed: 1, maxTrials: 10, maxSeconds: 60 },
   progress, result: null, error: null, createdAt: "2026-11-01T00:00:00Z", updatedAt: "2026-11-01T00:01:00Z", events: [] };
-const controller: OptimizationController = { byAlgorithm: {}, latestByAlgorithm: {}, active: null, ready: true, error: null, creating: false, cancelling: null, deleting: null, revision: 0,
+const controller: OptimizationController = { byAlgorithm: {}, latestByAlgorithm: {}, active: null, ready: true, error: null, creating: false, cancelling: null, deleting: null, controlling: null, revision: 0,
+  pause: vi.fn(() => Promise.resolve(true)), play: vi.fn(() => Promise.resolve(true)),
   start: vi.fn(() => Promise.resolve(true)), stop: vi.fn(() => Promise.resolve()), remove: vi.fn(() => Promise.resolve(true)), clearError: vi.fn(), refresh: vi.fn() };
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
 let actual: StudyActualDetail;
@@ -192,7 +193,7 @@ it.each(["mean", "forecast", "blend"] as const)("keeps the saved %s objective ca
 });
 
 it.each([
-  ["queued", "В очереди"], ["running", "Выполняется"], ["cancel_requested", "Отмена запрошена"],
+  ["queued", "В очереди"], ["running", "Выполняется"], ["pausing", "Постановка на паузу"], ["paused", "На паузе"], ["cancel_requested", "Отмена запрошена"],
   ["completed", "Завершено"], ["cancelled", "Отменено"], ["failed", "Ошибка исследования"],
 ] as const)("shows truthful header badges and refresh only for an active saved %s study", async (status, label) => {
   selectedStudy = { ...study, status };
@@ -200,7 +201,7 @@ it.each([
   const dialog = screen.getByRole("dialog", { name: "Исследование #49 · Всплеск" });
   const header = dialog.querySelector('[data-slot="dialog-header"]')!;
   expect(header).toHaveTextContent(label); expect(header).toHaveTextContent("Непрерывное");
-  const active = ["queued", "running", "cancel_requested"].includes(status);
+  const active = ["queued", "running", "pausing", "paused", "cancel_requested"].includes(status);
   expect(within(dialog).queryByRole("button", { name: "Обновить статус" }) !== null).toBe(active);
   expect(within(dialog).queryByRole("button", { name: "Остановить исследование" })).not.toBeInTheDocument();
   if (active) expect(within(dialog).getByText("Непрерывное исследование останавливается только общей командой алгоритма.")).toBeInTheDocument();
@@ -220,6 +221,24 @@ it.each(["completed", "running"] as const)("retains the sole ID/status/origin in
   expect(within(dialog).queryByRole("button", { name: "Обновить статус" }) !== null).toBe(status === "running");
   if (status === "running") expect(within(dialog).getByRole("button", { name: "Остановить исследование" })).toBeEnabled();
   expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it("retains a paused exact-ID manual detail at 15s and observes a cross-client Play without changing its elapsed budget", async () => {
+  selectedStudy = { ...study, status: "paused", origin: "manual", manualControl: { revision: 3, supportsPause: true }, progress: { ...progress, elapsedSeconds: 37 } };
+  const view = modal(); await settle();
+  const detailReads = () => requests.filter((request) => request.path === "/v1/optimization-studies/49").length;
+  expect(detailReads()).toBe(1);
+  const dialog = within(screen.getByRole("dialog", { name: "Исследование #49 · Всплеск" }));
+  expect(dialog.getByText("На паузе")).toBeInTheDocument();
+  expect(dialog.getByRole("button", { name: "Удалить исследование 49" })).toBeDisabled();
+  await settle(14999); expect(detailReads()).toBe(1);
+  selectedStudy = { ...selectedStudy, status: "queued", manualControl: { revision: 4, supportsPause: true } }; await settle(1);
+  expect(detailReads()).toBe(2); expect(dialog.getByText("Ожидает очередь")).toBeInTheDocument();
+  expect(dialog.getByText("Прошло, секунд").nextElementSibling).toHaveTextContent(/^37$/);
+  expect(dialog.getByRole("button", { name: "Удалить исследование 49" })).toBeEnabled();
+  await settle(3000); expect(detailReads()).toBe(3);
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+  view.unmount(); const count = requests.length; await settle(30000); expect(requests).toHaveLength(count);
 });
 
 it("does not calculate or show chart/list controls before the first successful manual job, including StrictMode", async () => {

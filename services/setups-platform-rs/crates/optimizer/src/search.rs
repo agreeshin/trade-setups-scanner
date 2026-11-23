@@ -611,8 +611,26 @@ pub(crate) fn run_study_mode(
 type CheckpointCallback<'a> =
     dyn FnMut(&ContinuousCheckpointInfo, &[u8]) -> Result<CheckpointAction, StudyError> + 'a;
 struct ResumeHooks<'a> {
-    control: ContinuousSearchControl<'a>,
+    control: ResumeControl<'a>,
     checkpoint: &'a mut CheckpointCallback<'a>,
+}
+struct ResumeControl<'a> {
+    pause: &'a CancelToken,
+    remaining_budget: Duration,
+    resume_checkpoint: Option<&'a [u8]>,
+    max_checkpoint_bytes: usize,
+}
+impl<'a> From<ContinuousSearchControl<'a>> for ResumeControl<'a> {
+    fn from(c: ContinuousSearchControl<'a>) -> Self {
+        Self { pause: c.pause, remaining_budget: c.remaining_budget,
+            resume_checkpoint: c.resume_checkpoint, max_checkpoint_bytes: c.max_checkpoint_bytes }
+    }
+}
+impl<'a> From<ManualSearchControl<'a>> for ResumeControl<'a> {
+    fn from(c: ManualSearchControl<'a>) -> Self {
+        Self { pause: c.pause, remaining_budget: c.remaining_budget,
+            resume_checkpoint: c.resume_checkpoint, max_checkpoint_bytes: c.max_checkpoint_bytes }
+    }
 }
 struct EngineMode<'a> {
     continuous: Option<ContinuousContext>,
@@ -647,11 +665,41 @@ pub fn search_continuous_resumable(
             manual_minutes:None,
             #[cfg(test)] manual_capture_observer:None,
             resume: Some(ResumeHooks {
-                control,
+                control: control.into(),
                 checkpoint: &mut checkpoint,
             }),
         },
     )
+}
+
+/// Manual science stays in evaluate_group/evaluate_manual_with_minutes. A
+/// checkpoint callback must durably commit/ack the whole payload before returning
+/// Continue/Suspend; failure is fatal, never a successful pause. Each call owns
+/// only its current frontier, incumbent and matching original scalar ledger.
+pub fn search_manual_resumable(
+    spec: &StudyRequest,
+    input: &StudyInput,
+    limits: &StudyLimits,
+    control: ManualSearchControl<'_>,
+    progress: impl FnMut(StudyUpdate),
+    mut checkpoint: impl FnMut(&ManualCheckpointInfo, &[u8]) -> Result<CheckpointAction, StudyError>,
+) -> Result<ManualSearchExit, StudyError> {
+    let observation_cutoff = manual_forecast_observation_cutoff(spec, input)?;
+    let cancel = control.cancel;
+    let mut minutes = None;
+    let exit = run_engine(spec, input, limits, cancel, progress, EngineMode {
+        continuous: None,
+        resume: Some(ResumeHooks { control: control.into(), checkpoint: &mut checkpoint }),
+        manual_minutes: Some(&mut minutes),
+        #[cfg(test)] manual_capture_observer: None,
+    })?;
+    Ok(match exit {
+        ContinuousSearchExit::Completed(outcome) => ManualSearchExit::Completed {
+            outcome,
+            original_archive: minutes.map(|minutes| ManualOriginalArchive { observation_cutoff, minutes }),
+        },
+        ContinuousSearchExit::Suspended(info) => ManualSearchExit::Suspended(info),
+    })
 }
 
 fn run_engine(
@@ -674,16 +722,7 @@ fn run_engine(
             None => crate::evaluation::manual_forecast_observation_cutoff(spec,input)?,
         })
     } else { None };
-    if limits.cpu_threads == 0
-        || limits.cpu_threads > 64
-        || limits.batch_size == 0
-        || limits.batch_size > 64
-        || limits.max_setups_per_candidate == 0
-        || limits.max_working_bytes == 0
-        || limits.max_snapshot_bytes == 0
-    {
-        return Err(invalid("invalid execution limits"));
-    }
+    validate_limits(limits)?;
     let domain_values: usize = spec
         .algorithm_search
         .values()
@@ -720,6 +759,13 @@ fn run_engine(
         limits.max_working_bytes,
     )?;
     let start = Instant::now();
+    let manual_identity = if continuous.is_none() && mode.resume.is_some() {
+        Some(ManualCheckpointIdentity {
+            snapshot_hash: &input.snapshot_hash,
+            captured_at: &input.captured_at,
+            observation_cutoff: manual_forecast_observation_cutoff(spec, input)?,
+        })
+    } else { None };
     let restored = if let Some(hooks) = &mode.resume {
         if hooks.control.remaining_budget > Duration::from_secs(spec.max_seconds)
             || hooks.control.max_checkpoint_bytes == 0
@@ -730,14 +776,15 @@ fn run_engine(
             .control
             .resume_checkpoint
             .map(|bytes| {
-                decode_checkpoint(
-                    bytes,
-                    spec,
-                    input,
-                    continuous.expect("continuous resume"),
-                    limits,
-                    hooks.control.max_checkpoint_bytes,
-                )
+                if let Some(context) = continuous {
+                    decode_checkpoint(bytes, spec, input, context, limits, hooks.control.max_checkpoint_bytes)
+                } else {
+                    let state = decode_manual_checkpoint(bytes, spec, manual_identity.unwrap(), limits, hooks.control.max_checkpoint_bytes)?;
+                    if let Some(minutes) = mode.manual_minutes.as_deref_mut() {
+                        *minutes = state.original_archive.map(|archive| archive.minutes);
+                    }
+                    Ok(state.state)
+                }
             })
             .transpose()?
     } else {
@@ -788,17 +835,24 @@ fn run_engine(
             0,
         ),
     };
+    // Manual acquisition consumes active budget too. A caller cannot reset
+    // checkpointed compute by accidentally passing a fresh full budget.
+    let elapsed_before = if manual_identity.is_some() {
+        elapsed_before.max(Duration::from_secs(spec.max_seconds).saturating_sub(
+            mode.resume.as_ref().unwrap().control.remaining_budget,
+        ))
+    } else { elapsed_before };
+    let remaining_budget = mode.resume.as_ref().map_or(Duration::from_secs(spec.max_seconds), |h| {
+        if manual_identity.is_some() {
+            h.control.remaining_budget.min(Duration::from_secs(spec.max_seconds).saturating_sub(elapsed_before))
+        } else { h.control.remaining_budget }
+    });
+    snapshot.elapsed_seconds = elapsed_before.as_secs_f64();
     let elapsed = || elapsed_before.saturating_add(start.elapsed());
     let passes = AtomicUsize::new(prior_passes);
     let control = Control {
         cancel,
-        deadline: start
-            + mode
-                .resume
-                .as_ref()
-                .map_or(Duration::from_secs(spec.max_seconds), |h| {
-                    h.control.remaining_budget
-                }),
+        deadline: start + remaining_budget,
         detector_passes: &passes,
     };
     progress(StudyUpdate {
@@ -826,11 +880,13 @@ fn run_engine(
                 sequence,
                 progress: snapshot.clone(),
             };
-            let bytes = encode_checkpoint(
+            let bytes = encode_engine_checkpoint(
                 &search,
                 spec,
                 input,
-                continuous.unwrap(),
+                continuous,
+                manual_identity,
+                mode.manual_minutes.as_deref().and_then(Option::as_ref),
                 limits,
                 &info,
                 &best,
@@ -865,6 +921,16 @@ fn run_engine(
         }
         if snapshot.evaluated_candidates >= spec.max_trials {
             break TerminationReason::TrialBudget;
+        }
+        // Catch a user pause racing the preceding callback's return before
+        // admitting another batch. This state is already durably acknowledged;
+        // no proposals/seen identities have been consumed at this boundary.
+        if continuous.is_none()
+            && mode.resume.as_ref().is_some_and(|hooks| hooks.control.pause.is_cancelled())
+        {
+            return Ok(ContinuousSearchExit::Suspended(ContinuousCheckpointInfo {
+                sequence, progress: snapshot.clone(),
+            }));
         }
         let available = limits
             .batch_size
@@ -1104,11 +1170,13 @@ fn run_engine(
                 sequence,
                 progress: snapshot.clone(),
             };
-            let bytes = encode_checkpoint(
+            let bytes = encode_engine_checkpoint(
                 &search,
                 spec,
                 input,
-                continuous.unwrap(),
+                continuous,
+                manual_identity,
+                mode.manual_minutes.as_deref().and_then(Option::as_ref),
                 limits,
                 &info,
                 &best,
@@ -1122,6 +1190,8 @@ fn run_engine(
             let action = (hooks.checkpoint)(&info, &bytes)?;
             if !cancel.is_cancelled()
                 && !control.stopped()
+                // A finished manual trial budget wins the user-pause race.
+                && (continuous.is_some() || snapshot.evaluated_candidates < spec.max_trials)
                 && (action == CheckpointAction::Suspend || hooks.control.pause.is_cancelled())
             {
                 return Ok(ContinuousSearchExit::Suspended(info));
@@ -1130,23 +1200,7 @@ fn run_engine(
     };
     snapshot.phase = StudyPhase::Cleanup;
     snapshot.elapsed_seconds = elapsed().as_secs_f64();
-    if let Some(best) = &mut best {
-        best.partial = reason == TerminationReason::Cancelled;
-        best.conclusions = search.conclusions(snapshot.evaluated_candidates);
-        let threshold =
-            if spec.min_setups_per_day != 0.0 && !(1e-6..1e9).contains(&spec.min_setups_per_day) {
-                format!("{:.6e}", spec.min_setups_per_day)
-            } else {
-                spec.min_setups_per_day.to_string()
-            };
-        best.conclusions.insert(1, format!(
-            "Допущено после фильтров {} сетапов за {:.6} суток: {:.6} сетапов/сутки; порог {}, требуется не менее {} сетапов.",
-            best.support.selected_setup_count, (spec.to_unix - spec.from_unix) as f64 / 86400.0,
-            best.support.avg_setups_per_day.expect("new completed summary has frequency"), threshold,
-            best.support.required_setup_count.expect("a qualified winner has a representable required count")
-        ));
-        best.conclusions.truncate(6);
-    }
+    finalize_best(spec, &search, &snapshot, &mut best, reason);
     let event = (search.invalid > 0).then(|| StudyEvent {
         at: chrono::Utc::now().to_rfc3339(),
         kind: "invalid_combinations".into(),
@@ -1170,8 +1224,37 @@ fn run_engine(
     }))
 }
 
+fn finalize_best(spec: &StudyRequest, search: &Search, snapshot: &StudyProgress,
+    best: &mut Option<StudyBest>, reason: TerminationReason) {
+    if let Some(best) = best {
+        best.partial = reason == TerminationReason::Cancelled;
+        best.conclusions = search.conclusions(snapshot.evaluated_candidates);
+        let threshold =
+            if spec.min_setups_per_day != 0.0 && !(1e-6..1e9).contains(&spec.min_setups_per_day) {
+                format!("{:.6e}", spec.min_setups_per_day)
+            } else {
+                spec.min_setups_per_day.to_string()
+            };
+        best.conclusions.insert(1, format!(
+            "Допущено после фильтров {} сетапов за {:.6} суток: {:.6} сетапов/сутки; порог {}, требуется не менее {} сетапов.",
+            best.support.selected_setup_count, (spec.to_unix - spec.from_unix) as f64 / 86400.0,
+            best.support.avg_setups_per_day.expect("new completed summary has frequency"), threshold,
+            best.support.required_setup_count.expect("a qualified winner has a representable required count")
+        ));
+        best.conclusions.truncate(6);
+    }
+}
+
 fn checkpoint_error(message: impl std::fmt::Display) -> StudyError {
     StudyError::InvalidInput(format!("continuous checkpoint: {message}"))
+}
+fn validate_limits(limits: &StudyLimits) -> Result<(), StudyError> {
+    if limits.cpu_threads == 0 || limits.cpu_threads > 64
+        || limits.batch_size == 0 || limits.batch_size > 64
+        || limits.max_setups_per_candidate == 0 || limits.max_working_bytes == 0
+        || limits.max_snapshot_bytes == 0
+    { return Err(invalid("invalid execution limits")); }
+    Ok(())
 }
 fn is_false(value: &bool) -> bool { !value }
 
@@ -1218,6 +1301,77 @@ fn checkpoint_cap(limits: &StudyLimits, requested: usize) -> usize {
     // copies. The frozen input is under its SEPARATE max_snapshot_bytes budget.
     requested.min(limits.max_working_bytes / 32)
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManualCheckpoint<S, A> {
+    version: u32,
+    kind: String,
+    state: Checkpoint<S>,
+    original_archive: A,
+}
+#[derive(Serialize)]
+struct ManualArchiveRef<'a> {
+    observation_cutoff: i64,
+    minutes: &'a ContinuousSelectedMinutes,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_engine_checkpoint(
+    search: &Search, spec: &StudyRequest, input: &StudyInput,
+    continuous: Option<ContinuousContext>, manual: Option<ManualCheckpointIdentity<'_>>,
+    minutes: Option<&ContinuousSelectedMinutes>, limits: &StudyLimits,
+    info: &ContinuousCheckpointInfo, best: &Option<StudyBest>, baseline: &Option<TrialSummary>,
+    baseline_infeasible: bool, submitted: usize, elapsed: Duration,
+    detector_passes: usize, max_bytes: usize,
+) -> Result<Vec<u8>, StudyError> {
+    if let Some(context) = continuous {
+        return encode_checkpoint(search, spec, input, context, limits, info, best, baseline,
+            baseline_infeasible, submitted, elapsed, detector_passes, max_bytes);
+    }
+    let identity = manual.ok_or_else(|| checkpoint_error("missing manual identity"))?;
+    let checkpoint = ManualCheckpoint {
+        version: crate::checkpoint::MANUAL_FORMAT_VERSION,
+        kind: "manual".into(),
+        state: checkpoint_state(search, spec, identity, OPTIMIZER_VERSION, limits, info,
+            best, baseline, baseline_infeasible, submitted, elapsed, detector_passes)?,
+        original_archive: minutes.map(|minutes| ManualArchiveRef {
+            observation_cutoff: identity.observation_cutoff, minutes,
+        }),
+    };
+    let mut writer = BoundedBytes { bytes: Vec::new(), limit: checkpoint_cap(limits, max_bytes) };
+    ciborium::ser::into_writer(&checkpoint, &mut writer).map_err(checkpoint_error)?;
+    Ok(writer.bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_state<'a>(search: &'a Search, spec: &StudyRequest,
+    identity: ManualCheckpointIdentity<'_>, optimizer_version: &str,
+    limits: &StudyLimits, info: &ContinuousCheckpointInfo, best: &Option<StudyBest>,
+    baseline: &Option<TrialSummary>, baseline_infeasible: bool, submitted: usize,
+    elapsed: Duration, detector_passes: usize,
+) -> Result<Checkpoint<&'a Search>, StudyError> {
+    Ok(Checkpoint {
+        version: crate::checkpoint::FORMAT_VERSION,
+        optimizer_version: optimizer_version.into(),
+        rng_version: crate::checkpoint::RNG_VERSION.into(),
+        word_bits: usize::BITS,
+        request_hash: request_hash(spec)?,
+        input_hash: identity.snapshot_hash.into(),
+        captured_at: identity.captured_at.into(),
+        observation_cutoff: identity.observation_cutoff,
+        execution_limits: execution_limits(limits),
+        sequence: info.sequence,
+        submitted,
+        progress: info.progress.clone(),
+        best: best.clone(),
+        baseline: baseline.clone(),
+        baseline_infeasible,
+        detector_passes,
+        elapsed_nanos: u64::try_from(elapsed.as_nanos()).map_err(checkpoint_error)?,
+        search,
+    })
+}
 #[allow(clippy::too_many_arguments)]
 fn encode_checkpoint(
     search: &Search,
@@ -1234,26 +1388,11 @@ fn encode_checkpoint(
     detector_passes: usize,
     max_bytes: usize,
 ) -> Result<Vec<u8>, StudyError> {
-    let checkpoint = Checkpoint {
-        version: crate::checkpoint::FORMAT_VERSION,
-        optimizer_version: CONTINUOUS_OPTIMIZER_VERSION.into(),
-        rng_version: crate::checkpoint::RNG_VERSION.into(),
-        word_bits: usize::BITS,
-        request_hash: request_hash(spec)?,
-        input_hash: input.snapshot_hash.clone(),
-        captured_at: input.captured_at.clone(),
+    let checkpoint = checkpoint_state(search, spec, ManualCheckpointIdentity {
+        snapshot_hash: &input.snapshot_hash, captured_at: &input.captured_at,
         observation_cutoff: context.observation_cutoff,
-        execution_limits: execution_limits(limits),
-        sequence: info.sequence,
-        submitted,
-        progress: info.progress.clone(),
-        best: best.clone(),
-        baseline: baseline.clone(),
-        baseline_infeasible,
-        detector_passes,
-        elapsed_nanos: u64::try_from(elapsed.as_nanos()).map_err(checkpoint_error)?,
-        search,
-    };
+    }, CONTINUOUS_OPTIMIZER_VERSION, limits, info, best, baseline, baseline_infeasible,
+        submitted, elapsed, detector_passes)?;
     let mut writer = BoundedBytes {
         bytes: Vec::new(),
         limit: checkpoint_cap(limits, max_bytes),
@@ -1281,15 +1420,179 @@ fn decode_checkpoint(
     if reader.position() != bytes.len() as u64 {
         return Err(checkpoint_error("trailing checkpoint bytes"));
     }
+    validate_checkpoint(&state, spec, ManualCheckpointIdentity {
+        snapshot_hash: &input.snapshot_hash, captured_at: &input.captured_at,
+        observation_cutoff: context.observation_cutoff,
+    }, CONTINUOUS_OPTIMIZER_VERSION, limits)?;
+    Ok(state)
+}
+
+fn decode_manual_checkpoint(bytes: &[u8], spec: &StudyRequest,
+    identity: ManualCheckpointIdentity<'_>, limits: &StudyLimits, max_bytes: usize,
+) -> Result<ManualCheckpoint<Search, Option<ManualOriginalArchive>>, StudyError> {
+    if max_bytes == 0 || limits.max_working_bytes == 0 {
+        return Err(checkpoint_error("invalid manual checkpoint budget"));
+    }
+    limit("checkpoint_bytes", bytes.len(), checkpoint_cap(limits, max_bytes))?;
+    let mut reader = std::io::Cursor::new(bytes);
+    let checkpoint: ManualCheckpoint<Search, Option<ManualOriginalArchive>> =
+        ciborium::de::from_reader(&mut reader).map_err(checkpoint_error)?;
+    if reader.position() != bytes.len() as u64
+        || checkpoint.version != crate::checkpoint::MANUAL_FORMAT_VERSION
+        || checkpoint.kind != "manual"
+    {
+        return Err(checkpoint_error("incompatible manual envelope/version/trailing bytes"));
+    }
+    validate_checkpoint(&checkpoint.state, spec, identity, OPTIMIZER_VERSION, limits)?;
+    validate_manual_checkpoint(&checkpoint, spec, identity, limits)?;
+    Ok(checkpoint)
+}
+
+/// Stop a paused/queued-resume manual study using ONLY its acknowledged private
+/// checkpoint and frozen manifest identity. No pool, market input, detector,
+/// re-evaluation or budget consumption. The caller must verify durable artifact
+/// checksum and study/owner/executor fencing before publishing this terminal pair.
+pub fn export_manual_checkpoint_partial(
+    spec: &StudyRequest,
+    identity: ManualCheckpointIdentity<'_>,
+    limits: &StudyLimits,
+    checkpoint: &[u8],
+    max_checkpoint_bytes: usize,
+) -> Result<(StudyOutcome, Option<ManualOriginalArchive>), StudyError> {
+    validate_request(spec, &default_parameter_descriptors(&spec.algorithm_id)?)?;
+    validate_limits(limits)?;
+    let checkpoint = decode_manual_checkpoint(checkpoint, spec, identity, limits, max_checkpoint_bytes)?;
+    let mut state = checkpoint.state;
+    state.progress.phase = StudyPhase::Cleanup;
+    finalize_best(spec, &state.search, &state.progress, &mut state.best, TerminationReason::Cancelled);
+    Ok((StudyOutcome {
+        progress: state.progress,
+        best: state.best,
+        reason: TerminationReason::Cancelled,
+        baseline: state.baseline,
+        invalid_proposals: state.search.invalid,
+        detector_passes: state.detector_passes,
+    }, checkpoint.original_archive))
+}
+
+fn validate_manual_checkpoint(checkpoint: &ManualCheckpoint<Search, Option<ManualOriginalArchive>>,
+    spec: &StudyRequest, identity: ManualCheckpointIdentity<'_>, limits: &StudyLimits,
+) -> Result<(), StudyError> {
+    let state = &checkpoint.state;
+    if state.baseline_infeasible
+        || state.progress.elapsed_seconds > Duration::from_nanos(state.elapsed_nanos).as_secs_f64()
+        || identity.snapshot_hash.is_empty() || identity.snapshot_hash.len() > 256
+        || identity.captured_at.is_empty() || identity.captured_at.len() > 64
+        || identity.observation_cutoff % 60 != 0
+        || identity.observation_cutoff > crate::validation::input_bounds_inner(spec)?.candles_to_unix
+        || state.best.is_some() != checkpoint.original_archive.is_some()
+    {
+        return Err(checkpoint_error("invalid manual budget/identity/incumbent-archive pair"));
+    }
+    // Prove that the stored winner is exactly the earliest qualifying maximum,
+    // not just an arbitrary finite matrix paired with a progress bestScore.
+    let mut winner: Option<(usize, f64)> = None;
+    let mut consider = |trial, score: Option<f64>| {
+        if let Some(score) = score
+            && (spec.trend_mode.is_mean() || score > spec.min_forecast_expectancy)
+            && winner.is_none_or(|(_, old)| score > old)
+        { winner = Some((trial, score)); }
+    };
+    if state.search.baseline_coordinates.is_none() {
+        consider(0, state.baseline.as_ref().and_then(|b| b.score));
+    }
+    for record in &state.search.records { consider(record.trial, record.score); }
+    if state.best.as_ref().map(|b| (b.trial_index, b.score.to_bits()))
+        != winner.map(|(trial, score)| (trial, score.to_bits()))
+    {
+        return Err(checkpoint_error("manual winner differs from committed observations"));
+    }
+    let Some(best) = &state.best else { return Ok(()); };
+    let candidate = if best.trial_index == 0 {
+        state.search.baseline.clone()
+    } else {
+        let record = state.search.records.iter().find(|r| r.trial == best.trial_index)
+            .ok_or_else(|| checkpoint_error("manual winner record absent"))?;
+        state.search.build(record.coordinates.clone(), StudyPhase::Initial, None)?.candidate
+    };
+    let expected_analytics = EffectiveAnalytics {
+        cluster_enabled: candidate.analytics.cluster_enabled,
+        cluster_gap_minutes: candidate.analytics.cluster_enabled.then_some(candidate.analytics.cluster_gap_minutes),
+        time_shift_minutes: candidate.analytics.time_shift_minutes,
+        price_change_pct: candidate.analytics.price_change_pct,
+        setup_maturity: candidate.analytics.cluster_enabled.then_some(spec.setup_maturity),
+        horizon_minutes: spec.horizon_minutes,
+    };
+    let frequency = crate::frequency::FrequencyGate::new(spec)?;
+    if best.params != candidate.params || best.analytics != expected_analytics
+        || !best.partial || !best.conclusions.is_empty()
+        || best.support.setup_count > limits.max_setups_per_candidate
+        || best.support.selected_setup_count > best.support.setup_count
+        || best.support.avg_setups_per_day != Some(frequency.average(best.support.selected_setup_count))
+        || best.support.required_setup_count != frequency.required_setup_count
+        || !frequency.accepts(best.support.selected_setup_count)
+        || best.matrix.iter().enumerate().any(|(index, cell)| {
+            cell.tp_pct != spec.tp_levels[index / spec.sl_levels.len()]
+                || cell.sl_pct != spec.sl_levels[index % spec.sl_levels.len()]
+                || cell.tp_count.checked_add(cell.sl_count) != Some(cell.closed_count)
+                || cell.closed_count > best.support.selected_setup_count
+        })
+    { return Err(checkpoint_error("manual incumbent differs from original candidate/maturity/matrix")); }
+    let archive = checkpoint.original_archive.as_ref().unwrap();
+    let minutes = &archive.minutes;
+    let selected = if spec.forecast.is_some() {
+        select_robust_cell_for_mode(&best.matrix, &spec.tp_levels, &spec.sl_levels, spec.min_closed_per_cell, spec.trend_mode)
+    } else {
+        select_robust_cell(&best.matrix, &spec.tp_levels, &spec.sl_levels, spec.min_closed_per_cell)
+    }?.ok_or_else(|| checkpoint_error("manual incumbent has no original selected cell"))?;
+    if archive.observation_cutoff != identity.observation_cutoff
+        || minutes.version != CONTINUOUS_SELECTED_MINUTES_VERSION
+        || minutes.evaluator != MANUAL_SELECTED_MINUTES_EVALUATOR
+        || minutes.tp_pct != selected.tp_pct || minutes.sl_pct != selected.sl_pct
+    { return Err(checkpoint_error("manual archive evaluator/cutoff/selected cell mismatch")); }
+    limit("selected_minute_points", minutes.points.len(), limits.max_setups_per_candidate.min(100_000))?;
+    let cell = best.matrix.iter().find(|cell| cell.tp_pct == minutes.tp_pct && cell.sl_pct == minutes.sl_pct)
+        .ok_or_else(|| checkpoint_error("manual archive cell absent"))?;
+    let (mut tp, mut sl, mut closed, mut sum) = (0u64, 0u64, 0u64, 0.0);
+    let mut previous = None;
+    let reward = minutes.tp_pct / minutes.sl_pct;
+    for point in &minutes.points {
+        let expected_sum = point.tp_count as f64 * reward - point.sl_count as f64;
+        let tolerance = 1e-10 * (point.tp_count as f64 * reward + point.sl_count as f64).max(1.0);
+        if point.signal_close_unix < spec.from_unix || point.signal_close_unix >= spec.to_unix
+            || point.signal_close_unix % 60 != 0
+            || previous.is_some_and(|old| old >= point.signal_close_unix)
+            || point.closed_count == 0
+            || point.tp_count.checked_add(point.sl_count) != Some(point.closed_count)
+            || !point.sum_r.is_finite() || (point.sum_r - expected_sum).abs() > tolerance
+        { return Err(checkpoint_error("invalid manual original minute/count/R")); }
+        tp = tp.checked_add(point.tp_count).ok_or_else(|| checkpoint_error("manual TP overflow"))?;
+        sl = sl.checked_add(point.sl_count).ok_or_else(|| checkpoint_error("manual SL overflow"))?;
+        closed = closed.checked_add(point.closed_count).ok_or_else(|| checkpoint_error("manual closed overflow"))?;
+        sum += point.sum_r;
+        previous = Some(point.signal_close_unix);
+    }
+    let tolerance = 1e-10 * (tp as f64 * reward + sl as f64).max(1.0);
+    if (tp, sl, closed) != (cell.tp_count as u64, cell.sl_count as u64, cell.closed_count as u64)
+        || closed > best.support.setup_count.min(100_000) as u64
+        || !sum.is_finite() || (sum - (tp as f64 * reward - sl as f64)).abs() > tolerance
+    { return Err(checkpoint_error("manual original ledger violates cell conservation")); }
+    Ok(())
+}
+
+fn validate_checkpoint(state: &Checkpoint<Search>, spec: &StudyRequest,
+    identity: ManualCheckpointIdentity<'_>, optimizer_version: &str, limits: &StudyLimits,
+) -> Result<(), StudyError> {
+    let manual = optimizer_version == OPTIMIZER_VERSION;
     if state.version != crate::checkpoint::FORMAT_VERSION
-        || state.optimizer_version != CONTINUOUS_OPTIMIZER_VERSION
+        || state.optimizer_version != optimizer_version
         || state.rng_version != crate::checkpoint::RNG_VERSION
         || state.word_bits != usize::BITS
         || state.execution_limits != execution_limits(limits)
-        || state.observation_cutoff != context.observation_cutoff
+        || state.observation_cutoff != identity.observation_cutoff
         || state.request_hash != request_hash(spec)?
-        || state.input_hash != input.snapshot_hash
-        || state.captured_at != input.captured_at
+        || state.input_hash != identity.snapshot_hash
+        || state.captured_at != identity.captured_at
     {
         return Err(checkpoint_error(
             "incompatible version/request/input/context/limits",
@@ -1437,8 +1740,11 @@ fn decode_checkpoint(
             search.baseline_coordinates.is_none()
                 && state.baseline.as_ref().is_some_and(|b| b.score.is_some()),
         );
+    let qualifies = |score: f64| !manual || spec.trend_mode.is_mean() || score > spec.min_forecast_expectancy;
+    let qualified = search.records.iter().any(|r| r.score.is_some_and(qualifies))
+        || (search.baseline_coordinates.is_none() && state.baseline.as_ref().and_then(|b| b.score).is_some_and(qualifies));
     if scorable != state.progress.scorable_candidates
-        || state.best.is_some() != (scorable > 0)
+        || state.best.is_some() != qualified
         || state.best.as_ref().map(|b| b.score.to_bits())
             != state.progress.best_score.map(f64::to_bits)
     {
@@ -1449,7 +1755,7 @@ fn decode_checkpoint(
         if !best.score.is_finite()
             || best.trend_mode != spec.trend_mode
             || best.forecast != spec.forecast
-            || best.observation_cutoff != spec.forecast.map(|_| context.observation_cutoff)
+            || best.observation_cutoff != spec.forecast.map(|_| identity.observation_cutoff)
             || (!spec.trend_mode.is_mean() && best.trend_bend_days != crate::trend::effective_bend(spec))
             || (spec.trend_mode == TrendMode::Blend && best.trend_blend_lambda != spec.trend_blend_lambda)
             || best.mean_score != (!spec.trend_mode.is_mean()).then(|| score_period_mean(&best.matrix, spec.min_closed_per_cell)).flatten()
@@ -1458,10 +1764,10 @@ fn decode_checkpoint(
             || best.support.score != Some(best.score)
             || best.matrix.len() != spec.tp_levels.len() * spec.sl_levels.len()
             || best.conclusions.len() > 6
-            || provenance.optimizer_version != CONTINUOUS_OPTIMIZER_VERSION
+            || provenance.optimizer_version != optimizer_version
             || provenance.seed != spec.seed
-            || provenance.snapshot_hash != input.snapshot_hash
-            || provenance.captured_at != input.captured_at
+            || provenance.snapshot_hash != identity.snapshot_hash
+            || provenance.captured_at != identity.captured_at
             || best
                 .analytics
                 .price_change_pct
@@ -1490,7 +1796,7 @@ fn decode_checkpoint(
         }
         parse_params(&spec.algorithm_id, &best.params).map_err(checkpoint_error)?;
     }
-    Ok(state)
+    Ok(())
 }
 
 #[cfg(test)]

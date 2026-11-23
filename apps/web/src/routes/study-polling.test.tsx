@@ -33,6 +33,97 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
+it("accepts multiple intentional manual submissions and reuses only the uncertain attempt's HTTP-safe key", async () => {
+  const getRandomValues = vi.fn(crypto.getRandomValues.bind(crypto));
+  vi.stubGlobal("crypto", { getRandomValues });
+  const original = globalThis.fetch;
+  const creates: { key: string | null; body: unknown }[] = [];
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    if (path === "/v1/optimization-studies" && init?.method === "POST") {
+      creates.push({ key: new Headers(init.headers).get("Idempotency-Key"), body: JSON.parse(init.body as string) });
+      if (creates.length === 1) return Promise.reject(new TypeError("Lost acknowledgement"));
+      const accepted = { ...summary("queued", "manual"), id: 20 + creates.length, result: null, events: [] };
+      studies.unshift(accepted); return Promise.resolve(json(accepted));
+    }
+    return original(path, init);
+  }));
+  studies = [summary("running", "manual"), { ...summary("running"), id: 18, spec: { ...summary("running").spec, algorithmId: "first" } }];
+  const view = renderHook(() => useOptimizationStudies(["first", "second"], true));
+  await tick();
+  const spec = summary("queued").spec;
+  await act(async () => { expect(await view.result.current.start(spec)).toBe(false); });
+  await tick();
+  expect(creates).toHaveLength(1); expect(creates[0]?.key).toMatch(/^[a-f0-9]{32}$/);
+  await act(async () => { expect(await view.result.current.start(spec)).toBe(true); });
+  await tick();
+  await act(async () => { expect(await view.result.current.start(spec)).toBe(true); });
+  expect(creates).toHaveLength(3);
+  expect(creates[1]?.key).toBe(creates[0]?.key); expect(creates[2]?.key).not.toBe(creates[1]?.key);
+  expect(creates.every((request) => JSON.stringify(request.body) === JSON.stringify(spec))).toBe(true);
+  expect(getRandomValues).toHaveBeenCalledTimes(2);
+  expect(studies).toHaveLength(4);
+  view.unmount(); expect(vi.getTimerCount()).toBe(0);
+});
+
+it("keeps manual paused nonterminal at 15 seconds and observes another client's queued Play", async () => {
+  studies = [summary("paused", "manual")];
+  const view = renderHook(() => useOptimizationStudies(["second"]));
+  await tick(); expect(view.result.current.byAlgorithm.second?.status).toBe("paused");
+  const before = studyReads(); await tick(14999); expect(studyReads()).toBe(before);
+  studies = [summary("queued", "manual")]; await tick(1);
+  expect(view.result.current.byAlgorithm.second?.status).toBe("queued");
+  await tick(3000); expect(studyReads()).toBe(before + 4);
+});
+
+it("serializes manual Pause and releases an unmounted in-flight command", async () => {
+  const running = { ...summary("running", "manual"), manualControl: { revision: 3, supportsPause: true } };
+  studies = [running];
+  const original = globalThis.fetch;
+  let finish: (response: Response) => void = () => undefined;
+  let signal: AbortSignal | null | undefined;
+  const posts: { path: string; body: unknown }[] = [];
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      posts.push({ path, body: JSON.parse(init.body as string) }); signal = init.signal;
+      return new Promise<Response>((resolve) => { finish = resolve; });
+    }
+    return original(path, init);
+  }));
+  const view = renderHook(() => useOptimizationStudies(["second"])); await tick();
+  let pending: Promise<boolean> = Promise.resolve(false);
+  act(() => { pending = view.result.current.pause(running); });
+  expect(view.result.current.controlling).toEqual({ id: 17, action: "pause" });
+  expect(await view.result.current.pause(running)).toBe(false);
+  expect(await view.result.current.stop(running)).toBe(false);
+  expect(posts).toEqual([{ path: "/v1/optimization-studies/17/pause", body: { expectedControlRevision: 3 } }]);
+  view.unmount(); expect(signal?.aborted).toBe(true); expect(vi.getTimerCount()).toBe(0);
+  await act(async () => { finish(json({ ...running, status: "pausing", result: null, events: [] })); expect(await pending).toBe(false); });
+});
+
+it("handles manual Play 409 with one exact-ID GET, preserving progress without another mutation", async () => {
+  const paused = { ...summary("paused", "manual"), manualControl: { revision: 3, supportsPause: true }, progress: { ...summary("paused").progress, evaluatedCandidates: 7, elapsedSeconds: 37 } };
+  studies = [paused];
+  const original = globalThis.fetch;
+  const operations: string[] = [];
+  vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
+    if (path.endsWith("/play")) {
+      operations.push(path);
+      expect(JSON.parse(init?.body as string)).toEqual({ expectedControlRevision: 3 });
+      return Promise.resolve(new Response(JSON.stringify({ error: "manual_control_revision_changed" }), { status: 409 }));
+    }
+    if (path === "/v1/optimization-studies/17") {
+      operations.push(path); studies = [{ ...paused, status: "queued", manualControl: { revision: 4, supportsPause: true } }];
+      return Promise.resolve(json({ ...studies[0], result: null, events: [] }));
+    }
+    return original(path, init);
+  }));
+  const view = renderHook(() => useOptimizationStudies(["second"])); await tick();
+  await act(async () => { expect(await view.result.current.play(paused)).toBe(false); }); await tick();
+  expect(operations).toEqual(["/v1/optimization-studies/17/play", "/v1/optimization-studies/17"]);
+  expect(view.result.current.byAlgorithm.second).toMatchObject({ id: 17, status: "queued", progress: { evaluatedCandidates: 7, elapsedSeconds: 37 } });
+  expect(view.result.current.controlling).toBeNull(); expect(view.result.current.error).toMatch(/Состояние исследования изменилось/);
+});
+
 it("keeps the two-algorithm idle baseline at five reads per 15 seconds, not every three seconds", async () => {
   const view = renderHook(() => { useContinuousStudy("first"); useContinuousStudy("second"); return useOptimizationStudies(["first", "second"]); });
   await tick(); expect(calls).toHaveLength(5); expect(vi.getTimerCount()).toBe(3);

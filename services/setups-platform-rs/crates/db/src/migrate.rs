@@ -22,6 +22,7 @@ const STUDY_ORIGINAL_OUTCOMES: &str = "0027_study_original_outcomes.sql";
 const MANUAL_ORIGINAL_OUTCOMES: &str = "0028_manual_original_outcomes.sql";
 const STUDY_ACTUAL_CONTINUOUS: &str = "0029_study_actual_continuous.sql";
 const CONTINUOUS_USER_PAUSE: &str = "0030_continuous_user_pause.sql";
+const MANUAL_RESUME_QUEUE: &str = "0031_manual_resume_queue.sql";
 const MIGRATIONS: &[&str] = &[
     BASELINE,
     RUN_NAMES,
@@ -44,6 +45,7 @@ const MIGRATIONS: &[&str] = &[
     MANUAL_ORIGINAL_OUTCOMES,
     STUDY_ACTUAL_CONTINUOUS,
     CONTINUOUS_USER_PAUSE,
+    MANUAL_RESUME_QUEUE,
 ];
 
 fn migration_source(name: &str) -> &'static str {
@@ -75,6 +77,7 @@ fn migration_source(name: &str) -> &'static str {
         MANUAL_ORIGINAL_OUTCOMES => include_str!("../migrations/0028_manual_original_outcomes.sql"),
         STUDY_ACTUAL_CONTINUOUS => include_str!("../migrations/0029_study_actual_continuous.sql"),
         CONTINUOUS_USER_PAUSE => include_str!("../migrations/0030_continuous_user_pause.sql"),
+        MANUAL_RESUME_QUEUE => include_str!("../migrations/0031_manual_resume_queue.sql"),
         other => unreachable!("unknown migration {other}"),
     }
 }
@@ -159,7 +162,9 @@ mod tests {
                 STUDY_ACTUAL,
                 STUDY_ORIGINAL_OUTCOMES,
                 MANUAL_ORIGINAL_OUTCOMES,
-                STUDY_ACTUAL_CONTINUOUS
+                STUDY_ACTUAL_CONTINUOUS,
+                CONTINUOUS_USER_PAUSE,
+                MANUAL_RESUME_QUEUE,
             ]
         );
         let source = migration_source(RUN_NAMES);

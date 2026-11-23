@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import producerPagesJson from "../../test/study-actual-producer-pages.json?raw";
-import { deleteOptimizationStudy, listOptimizationStudies, summarizeOptimizationStudy, type OptimizationStudy } from "./optimization-api";
+import { canDeleteStudy, canPauseStudy, canPlayStudy, createOptimizationStudy, deleteOptimizationStudy, getOptimizationStudy, isActiveStudy, listOptimizationStudies, pauseOptimizationStudy, playOptimizationStudy, summarizeOptimizationStudy, type OptimizationStudy } from "./optimization-api";
 
 type ProducerPhase = "idle" | "queued" | "running" | "completed" | "failed";
 // Sanitized real cookie-authenticated HTTP list responses, captured on 2026-11-20.
@@ -12,7 +12,7 @@ const producerPages = JSON.parse(producerPagesJson) as Record<ProducerPhase, {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 it("requests bounded paginated compact summaries and keeps top-level bestScore", async () => {
-  const page = { studies: [{ id: 7, bestScore: 0.25, forecastBest: { forecastR: 0.8, meanR: -0.3, tpPct: 6, slPct: 4 } }], total: 42, limit: 10, offset: 20 };
+  const page = { studies: [{ id: 7, status: "completed", bestScore: 0.25, forecastBest: { forecastR: 0.8, meanR: -0.3, tpPct: 6, slPct: 4 } }], total: 42, limit: 10, offset: 20 };
   const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(page)));
   vi.stubGlobal("fetch", fetch);
   const controller = new AbortController();
@@ -32,6 +32,56 @@ it("deletes by ID with browser mutation guard and never sends settings writes", 
   const init = fetch.mock.calls[0]?.[1] as RequestInit;
   expect(init.method).toBe("DELETE");
   expect(new Headers(init.headers).get("x-platform-request")).toBe("1");
+});
+
+it("sends revision-bound Pause/Play and preserves control metadata in compact responses", async () => {
+  const running = { id: 7, origin: "manual", status: "running", manualControl: { revision: 3, supportsPause: true }, spec: {}, progress: { bestScore: 0.2 }, error: null, result: null, events: [], createdAt: "now", updatedAt: "now" } as unknown as OptimizationStudy;
+  const fetch = vi.fn((path: string) => Promise.resolve(new Response(JSON.stringify({ ...running, status: path.endsWith("/pause") ? "pausing" : "queued", manualControl: { revision: 4, supportsPause: true } }), { status: 202 })));
+  vi.stubGlobal("fetch", fetch);
+  const signal = new AbortController().signal;
+  const pausing = await pauseOptimizationStudy(running, signal);
+  expect(pausing.status).toBe("pausing");
+  expect(summarizeOptimizationStudy(pausing).manualControl).toEqual({ revision: 4, supportsPause: true });
+  const resumed = await playOptimizationStudy({ ...pausing, status: "paused" }, signal);
+  expect(resumed.status).toBe("queued");
+  expect(fetch.mock.calls.map(([path]) => path)).toEqual(["/v1/optimization-studies/7/pause", "/v1/optimization-studies/7/play"]);
+  for (const [index, [, init]] of vi.mocked(globalThis.fetch).mock.calls.entries()) {
+    expect(init).toMatchObject({ method: "POST", signal, credentials: "same-origin" });
+    expect(new Headers(init?.headers).get("x-platform-request")).toBe("1");
+    expect(JSON.parse(init?.body as string)).toEqual({ expectedControlRevision: index === 0 ? 3 : 4 });
+  }
+});
+
+it.each([
+  ["queued", true, false, false], ["running", false, true, false], ["pausing", false, false, false],
+  ["paused", false, false, true], ["cancel_requested", false, false, false],
+  ["completed", true, false, false], ["cancelled", true, false, false], ["failed", true, false, false],
+] as const)("derives narrow manual actions for %s", (status, deletable, pausable, playable) => {
+  const study = { id: 7, status, origin: "manual" as const, manualControl: { revision: 0, supportsPause: true } };
+  expect(canDeleteStudy(study)).toBe(deletable);
+  expect(canPauseStudy(study)).toBe(pausable);
+  expect(canPlayStudy(study)).toBe(playable);
+  expect(isActiveStudy(study)).toBe(!["completed", "cancelled", "failed"].includes(status));
+  expect(canPauseStudy({ ...study, manualControl: null })).toBe(false);
+  expect(canPlayStudy({ id: study.id, status, origin: study.origin })).toBe(false);
+  expect(canPauseStudy({ ...study, origin: "continuous" })).toBe(false);
+  expect(canPlayStudy({ ...study, origin: "continuous" })).toBe(false);
+  if (status === "queued") expect(canDeleteStudy({ ...study, origin: "continuous" })).toBe(false);
+});
+
+it.each([{ revision: -1, supportsPause: true }, { revision: 1.5, supportsPause: true }, { revision: 1, supportsPause: "true" }])("rejects malformed additive manual control metadata: %j", async (manualControl) => {
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ id: 7, status: "paused", manualControl })))));
+  await expect(getOptimizationStudy(7, new AbortController().signal)).rejects.toThrow("статус исследования");
+});
+
+it("keeps the normalized creation body unchanged and passes the optional idempotency header", async () => {
+  const spec = { algorithmId: "future" } as OptimizationStudy["spec"];
+  const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 7, status: "queued", manualControl: { revision: 0, supportsPause: true } }), { status: 202 }));
+  vi.stubGlobal("fetch", fetch);
+  await createOptimizationStudy(spec, new AbortController().signal, "f".repeat(32));
+  const [, init] = fetch.mock.calls[0] as [string, RequestInit];
+  expect(new Headers(init.headers).get("Idempotency-Key")).toBe("f".repeat(32));
+  expect(JSON.parse(init.body as string)).toEqual(spec);
 });
 
 it("preserves an interim bestScore without retaining full mutation-response details", () => {

@@ -230,7 +230,8 @@ pub struct StudyOutcome {
 /// Separate runtime-owned payload; deliberately not part of StudyOutcome JSON.
 /// C is the actual frozen manual OHLC coverage, including the original allowed
 /// post-signal horizon, not spec.toUnix or a new measurement after cleanup.
-#[derive(Debug,Clone,PartialEq)]
+#[derive(Debug,Clone,PartialEq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManualOriginalArchive {
     pub observation_cutoff:i64,
     pub minutes:crate::ContinuousSelectedMinutes,

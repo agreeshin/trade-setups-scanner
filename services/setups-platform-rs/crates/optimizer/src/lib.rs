@@ -10,10 +10,12 @@ mod validation;
 
 pub use checkpoint::{
     CheckpointAction, ContinuousCheckpointInfo, ContinuousSearchControl, ContinuousSearchExit,
+    ManualCheckpointIdentity, ManualCheckpointInfo, ManualSearchControl, ManualSearchExit,
 };
 pub use checkpoint::{
     FORMAT_VERSION as CONTINUOUS_CHECKPOINT_VERSION,
     RNG_VERSION as CONTINUOUS_CHECKPOINT_RNG_VERSION,
+    MANUAL_FORMAT_VERSION as MANUAL_CHECKPOINT_VERSION,
 };
 pub use continuous::*;
 pub use evaluation::{canonical_candidate_key, evaluate_candidate, score_matrix, snapshot_bytes};
@@ -26,6 +28,7 @@ pub use input_codec::{
 pub use search::run_study;
 pub use search::run_study_with_original_minutes;
 pub use search::search_continuous_resumable;
+pub use search::{search_manual_resumable, export_manual_checkpoint_partial};
 pub use setups_replay::CancelToken;
 pub use types::*;
 pub use validation::{default_parameter_descriptors, required_input_bounds, validate_request};

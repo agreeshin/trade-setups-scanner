@@ -17,7 +17,8 @@ function row(id: number, actual: StudyActualSummary | null = studyActualFixture(
     minClosedPerCell: 1, seed: 1, maxTrials: 10, maxSeconds: 60 }, progress: { phase: "done", evaluatedCandidates: 2, scorableCandidates: 2, maxTrials: 10, elapsedSeconds: 60, bestScore: 0.5 },
     bestScore: 0.5, forecastBest: { forecastR: 0.7, meanR: 0.1, tpPct: 4, slPct: 4 }, error: null, actual, createdAt: "2026-11-01T00:00:00Z", updatedAt: "2026-11-01T00:01:00Z" };
 }
-const controller: OptimizationController = { byAlgorithm: {}, latestByAlgorithm: {}, active: null, ready: true, error: null, creating: false, cancelling: null, deleting: null, revision: 0,
+const controller: OptimizationController = { byAlgorithm: {}, latestByAlgorithm: {}, active: null, ready: true, error: null, creating: false, cancelling: null, deleting: null, controlling: null, revision: 0,
+  pause: vi.fn(() => Promise.resolve(true)), play: vi.fn(() => Promise.resolve(true)),
   start: vi.fn(() => Promise.resolve(true)), stop: vi.fn(() => Promise.resolve()), remove: vi.fn(() => Promise.resolve(true)), clearError: vi.fn(), refresh: vi.fn() };
 let rows: OptimizationStudySummary[];
 let post: (id: number) => Response | Promise<Response>;
@@ -163,8 +164,8 @@ it.each([
   expect(requests).toHaveLength(1); expect(posts()).toHaveLength(0);
 });
 
-it.each(["queued", "running", "cancel_requested"] as const)("uses disabled trash for a %s continuous child without changing the manual Stop action", async (status) => {
-  rows = [{ ...row(49), status }, { ...row(48), origin: "manual", status }];
+it.each(["queued", "running", "pausing", "paused", "cancel_requested"] as const)("keeps continuous ownership and narrow manual controls for %s", async (status) => {
+  rows = [{ ...row(49), status }, { ...row(48), origin: "manual", status, manualControl: { revision: 2, supportsPause: true } }];
   const stop = vi.fn(() => Promise.resolve()); const onDelete = vi.fn();
   render(<OptimizationHistory algorithmId="spike" algorithmName="Всплеск" controller={{ ...controller, stop }} pageSize={5} onSelect={vi.fn()} onDelete={onDelete} />);
   await settle();
@@ -176,14 +177,25 @@ it.each(["queued", "running", "cancel_requested"] as const)("uses disabled trash
   expect(continuous.queryByRole("button", { name: /Остановить исследование/ })).not.toBeInTheDocument();
   fireEvent.click(trash); expect(onDelete).not.toHaveBeenCalled(); expect(stop).not.toHaveBeenCalled();
   const manual = within(tableRow(48));
+  const manualTrash = manual.getByRole("button", { name: "Удалить исследование 48" });
+  if (status === "queued") {
+    expect(manual.getByText("Ожидает очередь")).toBeInTheDocument();
+    expect(manualTrash).toBeEnabled(); fireEvent.click(manualTrash);
+    expect(onDelete).toHaveBeenCalledExactlyOnceWith(rows[1]);
+    expect(manual.queryByRole("button", { name: /Остановить исследование/ })).not.toBeInTheDocument();
+    return;
+  }
+  expect(manualTrash).toBeDisabled();
   const manualStop = manual.getByRole("button", { name: "Остановить исследование 48" });
-  expect(manual.queryByRole("button", { name: /Удалить исследование/ })).not.toBeInTheDocument();
   if (status === "cancel_requested") {
-    expect(manualStop).toBeDisabled(); expect(manualStop).toHaveTextContent("Остановка запрошена");
+    expect(manualStop).toBeDisabled(); expect(manual.getByText("Остановка запрошена")).toBeInTheDocument();
     fireEvent.click(manualStop); expect(stop).not.toHaveBeenCalled();
   } else {
-    expect(manualStop).toBeEnabled(); expect(manualStop).toHaveTextContent(/^Остановить$/);
-    fireEvent.click(manualStop); expect(stop).toHaveBeenCalledExactlyOnceWith(rows[1]);
+    expect(manualStop).toBeEnabled(); expect(manualStop.querySelector("svg")).not.toBeNull();
+    fireEvent.click(manualStop); expect(stop).not.toHaveBeenCalled();
+    const confirmation = within(screen.getByRole("dialog", { name: "Остановить исследование #48?" }));
+    fireEvent.click(confirmation.getByRole("button", { name: "Остановить исследование" })); await settle();
+    expect(stop).toHaveBeenCalledExactlyOnceWith(rows[1]);
   }
   expect(posts()).toHaveLength(0);
 });
@@ -199,6 +211,22 @@ it.each(["completed", "cancelled", "failed"] as const)("keeps %s manual and cont
     fireEvent.click(trash); expect(onDelete).toHaveBeenLastCalledWith(study);
   }
   expect(onDelete).toHaveBeenCalledTimes(2); expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it("observes a paused manual on a later bounded page at 15s, switches queued to 3s, and preserves row focus", async () => {
+  rows = [row(49), { ...row(48), origin: "manual", status: "paused", manualControl: { revision: 3, supportsPause: true } }];
+  const view = render(<OptimizationHistory algorithmId="spike" algorithmName="Всплеск" controller={controller} pageSize={1} onSelect={vi.fn()} onDelete={vi.fn()} />);
+  await settle(); fireEvent.click(screen.getByRole("button", { name: "Следующая страница исследований · Всплеск" })); await settle();
+  const trigger = screen.getByRole("button", { name: "Результат исследования 48" }); trigger.focus();
+  expect(within(tableRow(48)).getByText("На паузе")).toBeInTheDocument();
+  const count = requests.length; await settle(14999); expect(requests).toHaveLength(count);
+  rows[1] = { ...rows[1]!, status: "queued", manualControl: { revision: 4, supportsPause: true } }; await settle(1);
+  expect(within(tableRow(48)).getByText("Ожидает очередь")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Результат исследования 48" })).toBe(trigger); expect(trigger).toHaveFocus();
+  await settle(3000); expect(requests).toHaveLength(count + 2);
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+  const activeRead = requests[requests.length - 1]; view.unmount(); expect(activeRead?.signal?.aborted).toBe(true);
+  expect(vi.getTimerCount()).toBe(0);
 });
 
 it("blocks only the submitted study, spins its icon, deduplicates clicks, and allows another row in parallel", async () => {
@@ -377,6 +405,25 @@ describe("displayed-page request ownership", () => {
     return pending;
   }
   beforeEach(() => { rows = Array.from({ length: 60 }, (_, index) => row(60 - index)); });
+
+  it("fences a pre-command same-page response without discarding the focused row or queuing more than one follow-up", async () => {
+    rows[0] = { ...rows[0]!, origin: "manual", status: "running", manualControl: { revision: 3, supportsPause: true } };
+    const view = render(history()); await settle();
+    const trigger = screen.getByRole("button", { name: "Результат исследования 60" }); trigger.focus();
+    const pending = deferPages(); await settle(3000);
+    const oldResponse = json({ studies: [{ ...rows[0], bestScore: 9.99 }, ...rows.slice(1, 20)], total: rows.length, offset: 0, limit: 20 });
+    rows[0] = { ...rows[0], status: "pausing", bestScore: 0.75, manualControl: { revision: 4, supportsPause: true } };
+    view.rerender(history({ ...controller, revision: 1, latestByAlgorithm: { spike: rows[0] } })); await settle();
+    await act(async () => { pending[0]!.complete(oldResponse); await Promise.resolve(); }); await settle();
+    expect(within(tableRow(60)).queryByText("9.99 R")).not.toBeInTheDocument();
+    expect(within(tableRow(60)).getByText("0.50 R")).toBeInTheDocument();
+    expect(pending).toHaveLength(2);
+    await act(async () => { pending[1]!.complete(pageResponse()); await Promise.resolve(); }); await settle();
+    expect(within(tableRow(60)).getAllByText("Постановка на паузу").length).toBeGreaterThan(0);
+    expect(within(tableRow(60)).getByText("0.75 R")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Результат исследования 60" })).toBe(trigger); expect(trigger).toHaveFocus();
+    expect(pending).toHaveLength(2); expect(posts()).toHaveLength(0);
+  });
 
   it("keeps both middle-page controls and the focused row usable throughout a deferred same-page actual refresh", async () => {
     rows[20] = row(40, studyActualFixture(40, { status: "queued", stage: "queued", revision: 1, jobId: "pending" }));

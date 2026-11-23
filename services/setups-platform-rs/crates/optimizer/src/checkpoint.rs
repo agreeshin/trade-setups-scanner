@@ -1,4 +1,4 @@
-//! Private continuous checkpoints, never public in-progress study results.
+//! Private search checkpoints, never public in-progress study results.
 use crate::*;
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use rand_chacha::ChaCha12Rng;
@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 pub const FORMAT_VERSION: u32 = 1;
+/// Separate envelope; existing continuous version-1 bytes are unchanged.
+pub const MANUAL_FORMAT_VERSION: u32 = 1;
 // Distribution/shuffle implementation and usize width also affect proposals.
 pub const RNG_VERSION: &str = "chacha12-0.9.0/rand-0.9.5-v1";
 
@@ -18,6 +20,39 @@ pub struct ContinuousSearchControl<'a> {
     pub remaining_budget: Duration,
     pub resume_checkpoint: Option<&'a [u8]>,
     pub max_checkpoint_bytes: usize,
+}
+
+pub struct ManualSearchControl<'a> {
+    pub cancel: &'a CancelToken,
+    /// Cooperative user pause, checked only before admission/after joined batches.
+    pub pause: &'a CancelToken,
+    /// Remaining active budget AFTER acquisition and previously consumed work.
+    /// Queue/user-pause wall time must not be subtracted by the caller.
+    pub remaining_budget: Duration,
+    pub resume_checkpoint: Option<&'a [u8]>,
+    pub max_checkpoint_bytes: usize,
+}
+
+/// Scalar identity from the committed frozen-input manifest. The runtime fences
+/// study/owner/executor identity and verifies the artifact checksum separately.
+/// No input candles or detector allocation is needed for paused Stop.
+#[derive(Debug, Clone, Copy)]
+pub struct ManualCheckpointIdentity<'a> {
+    pub snapshot_hash: &'a str,
+    pub captured_at: &'a str,
+    pub observation_cutoff: i64,
+}
+
+pub type ManualCheckpointInfo = ContinuousCheckpointInfo;
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ManualSearchExit {
+    Completed {
+        outcome: StudyOutcome,
+        original_archive: Option<ManualOriginalArchive>,
+    },
+    Suspended(ManualCheckpointInfo),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +120,7 @@ impl Serialize for SearchRng {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let Self::Durable(rng) = self else {
             return Err(serde::ser::Error::custom(
-                "manual RNG is not checkpointable",
+                "legacy RNG is not checkpointable",
             ));
         };
         RngState {

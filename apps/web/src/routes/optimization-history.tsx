@@ -1,4 +1,4 @@
-import { useContext, useEffect, useId, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useContext, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Alert } from "../components/ui/alert";
 import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
@@ -7,7 +7,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow, TableSke
 import { formatUnix, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
 import { formatElapsedDuration } from "../lib/format-duration";
 import { forecastRecipeLabel } from "../lib/forecast-recipe";
-import { isActiveStudy, isContinuousStudy, listOptimizationStudies, type OptimizationStudyAction, type OptimizationStudyPage, type OptimizationStudySummary } from "../lib/optimization-api";
+import { canDeleteStudy, isActiveStudy, isContinuousStudy, isStudyTransitioning, listOptimizationStudies, type OptimizationStudyAction, type OptimizationStudyPage, type OptimizationStudySummary } from "../lib/optimization-api";
 import { isStudyActualPending } from "../lib/study-actual-api";
 import { StudyActualFact, StudyActualRefreshButton } from "./study-actual-controls";
 import { StudyActualContinuousControls } from "./study-actual-continuous";
@@ -15,6 +15,7 @@ import { useStudyActualAction } from "./use-study-actual-action";
 import { errorText } from "./platform-controls";
 import { RouteActiveContext } from "./route-active";
 import type { OptimizationController } from "./use-optimization-studies";
+import { ManualStudyActions, StudyStatusBadge } from "./optimization-results";
 
 const scoreFormatter = new Intl.NumberFormat("en-US", {
   notation: "standard", useGrouping: false, minimumFractionDigits: 2, maximumFractionDigits: 2,
@@ -48,10 +49,12 @@ function OptimizationHistoryRow({ study, latest, controller, busy, instanceId, o
   onSelect: (id: number, triggerId: string, continuous: boolean) => void; onDelete: (study: OptimizationStudyAction) => void; onActualChanged: () => void;
 }) {
   const actual = useStudyActualAction(study.id, study.actual, onActualChanged);
+  const actionStudy = latest?.id === study.id && isActiveStudy(study)
+    && ((latest.manualControl?.revision ?? -1) > (study.manualControl?.revision ?? -1) || latest.status === "cancel_requested") ? latest : study;
   const activeContinuous = isActiveStudy(study) && isContinuousStudy(study);
   const deleteReasonId = `${instanceId}-study-${study.id}-delete-reason`;
   return <TableRow>
-    <TableCell><Button id={`${instanceId}-study-${study.id}`} type="button" variant="outline" size="sm" aria-label={`Результат исследования ${study.id}`} onClick={() => onSelect(study.id, `${instanceId}-study-${study.id}`, isContinuousStudy(study))}>#{study.id}</Button></TableCell>
+    <TableCell><div className="grid justify-items-start gap-1"><Button id={`${instanceId}-study-${study.id}`} type="button" variant="outline" size="sm" aria-label={`Результат исследования ${study.id}`} onClick={() => onSelect(study.id, `${instanceId}-study-${study.id}`, isContinuousStudy(study))}>#{study.id}</Button><StudyStatusBadge study={actionStudy} /></div></TableCell>
     <TableCell><Badge>{isContinuousStudy(study) ? "Непрерывное" : "Ручное"}</Badge></TableCell>
     <TableCell className="whitespace-nowrap text-xs" title="Начало включительно; конец исключительно."><span className="block">{formatUnix(study.spec.fromUnix)} -</span><span className="block">{formatUnix(study.spec.toUnix)}</span></TableCell>
     <TableCell className="whitespace-nowrap">{formatElapsedDuration(study.progress.elapsedSeconds)}</TableCell>
@@ -64,9 +67,8 @@ function OptimizationHistoryRow({ study, latest, controller, busy, instanceId, o
     <TableCell><StudyActualFact action={actual} /></TableCell>
     <TableCell className="w-px whitespace-nowrap pr-0"><div className="flex items-center gap-1">
       <StudyActualRefreshButton studyId={study.id} action={actual} />
-      {isActiveStudy(study) && !isContinuousStudy(study)
-        ? <Button type="button" variant="outline" size="sm" disabled={busy || study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested")} aria-label={`Остановить исследование ${study.id}`} onClick={() => { void controller.stop(study); }}>{study.status === "cancel_requested" || (latest?.id === study.id && latest.status === "cancel_requested") ? "Остановка запрошена" : controller.cancelling === study.id ? "Запрашиваем остановку…" : "Остановить"}</Button>
-        : <Button type="button" variant="outline" size="sm" disabled={busy || activeContinuous} aria-label={`Удалить исследование ${study.id}`} aria-describedby={activeContinuous ? deleteReasonId : undefined} onClick={() => onDelete(study)}><OptimizationTrashIcon /></Button>}
+      <ManualStudyActions study={actionStudy} controller={controller} compact />
+      <Button type="button" variant="outline" size="sm" disabled={busy || !canDeleteStudy(actionStudy)} aria-label={`Удалить исследование ${study.id}`} aria-describedby={activeContinuous ? deleteReasonId : undefined} onClick={() => onDelete(actionStudy)}><OptimizationTrashIcon /></Button>
       {activeContinuous && <span id={deleteReasonId} className="sr-only">Удаление недоступно, пока непрерывное исследование выполняется.</span>}
     </div></TableCell>
   </TableRow>;
@@ -88,19 +90,23 @@ export function OptimizationHistory({ id, algorithmId, algorithmName, controller
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
   const refreshPage = useRef<() => void>(() => undefined);
+  const mutationRevision = useRef(controller.revision);
+  useLayoutEffect(() => { mutationRevision.current = controller.revision; }, [controller.revision]);
   const latest = controller.latestByAlgorithm[algorithmId] ?? controller.byAlgorithm[algorithmId];
-  // Active first-page rows follow compact discovery polling; terminal pages do not
-  // refetch just because unrelated polling produced a new object identity.
+  // Preserve first-page progress invalidation; later pages observe their own rows.
+  // Discovery refreshes coalesce without discarding useful in-flight reads.
   const observed = offset === 0 && latest && isActiveStudy(latest) ? latest : latest?.updatedAt;
   const latestId = latest?.id;
   const latestStatus = latest?.status;
-  const busy = controller.creating || controller.cancelling !== null || controller.deleting !== null;
+  const busy = controller.creating || controller.cancelling !== null || controller.deleting !== null || controller.controlling != null;
   useEffect(() => {
     if (!active || !routeActive || !controller.ready) return;
     let disposed = false;
     let request: AbortController | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let watchActual = false;
+    let watchStudies = false;
+    let fastStudies = false;
     let inFlight = false;
     let refreshQueued = false;
     async function load() {
@@ -111,13 +117,14 @@ export function OptimizationHistory({ id, algorithmId, algorithmName, controller
       if (inFlight) { refreshQueued = true; return; }
       inFlight = true;
       const current = new AbortController(); request = current;
+      const generation = mutationRevision.current;
       setFetching(true); setError(null);
       // Keep same-page buttons mounted during refresh so close-focus restoration
       // and polling cannot lose the originating ID. Never keep another page.
       setPage((previous) => previous?.algorithmId === algorithmId && previous.offset === offset && previous.limit === pageSize ? previous : null);
       try {
         const next = await listOptimizationStudies(algorithmId, current.signal, pageSize, offset);
-        if (disposed || current.signal.aborted) return;
+        if (disposed || current.signal.aborted || generation !== mutationRevision.current) return;
         if (offset > 0 && offset >= next.total) {
           refreshQueued = false; watchActual = false;
           setOffset(next.total === 0 ? 0 : Math.floor((next.total - 1) / pageSize) * pageSize);
@@ -125,15 +132,17 @@ export function OptimizationHistory({ id, algorithmId, algorithmName, controller
         }
         setPage({ ...next, algorithmId });
         watchActual = next.studies.some((study) => isStudyActualPending(study.actual));
+        watchStudies = next.studies.some(isActiveStudy);
+        fastStudies = next.studies.some(isStudyTransitioning);
       } catch (cause) {
-        if (!disposed && !current.signal.aborted) setError(`История оптимизации недоступна: ${errorText(cause)}`);
+        if (!disposed && !current.signal.aborted && generation === mutationRevision.current) setError(`История оптимизации недоступна: ${errorText(cause)}`);
       } finally {
         if (!disposed && !current.signal.aborted) {
           inFlight = false;
           if (refreshQueued) { refreshQueued = false; void load(); }
           else {
             setFetching(false);
-            if (watchActual) timer = setTimeout(() => { void load(); }, 3000);
+            if (watchActual || watchStudies) timer = setTimeout(() => { void load(); }, watchActual || fastStudies ? 3000 : 15000);
           }
         }
       }

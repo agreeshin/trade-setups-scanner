@@ -48,6 +48,7 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
   const [baseline, setBaseline] = useState(algorithm.params);
   const optimizerAlgorithm = useMemo(() => ({ ...algorithm, params: baseline }), [algorithm, baseline]);
   const [optimizationOpen, setOptimizationOpen] = useState(false);
+  const [optimizationIntent, setOptimizationIntent] = useState(0);
   const [historySelection, setHistorySelection] = useState<{ id: number; open: boolean; triggerId: string; continuous: boolean; cleanupRevision: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<(OptimizationStudyAction & { cleanupRevision: number }) | null>(null);
   const selectedHistory = historySelection?.continuous && historySelection.cleanupRevision !== cleanupRevision ? null : historySelection;
@@ -156,13 +157,13 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
     <h4 id={`${optimizerTriggerId}-optimizations`} className="text-center font-semibold">Список проведённых исследований</h4>
     {optimization.error && <Alert variant="destructive" role="alert">{optimization.error}<Button type="button" variant="outline" onClick={optimization.refresh}>Обновить статус оптимизации</Button></Alert>}
     <OptimizationHistory id={historyRegionId} algorithmId={algorithm.id} algorithmName={displayName} controller={optimization} active={selected && liveMode === "flexible" && selectedHistory?.open !== true && selectedDeleteTarget === null} onSelect={selectHistory} onDelete={requestDelete} actions={<div className="flex flex-wrap gap-2">
-      <Button id={optimizerTriggerId} type="button" variant="outline" aria-label={`Запустить новое исследование ${displayName}`} onClick={() => { setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setOptimizationOpen(true); }}>Запустить новое исследование</Button>
+      <Button id={optimizerTriggerId} type="button" variant="outline" aria-label={`Запустить новое исследование ${displayName}`} onClick={() => { setHistorySelection((previous) => previous ? { ...previous, open: false } : null); setOptimizationIntent((value) => value + 1); setOptimizationOpen(true); }}>Запустить новое исследование</Button>
     </div>} />
     </section>
     </TabsContent>
     </Tabs>
   </form>
-    <AlgorithmOptimizer algorithm={optimizerAlgorithm} controller={optimization} open={optimizationOpen} onOpenChange={setOptimizationOpen} returnFocusId={optimizerTriggerId} onDelete={requestDelete} />
+    <AlgorithmOptimizer key={optimizationIntent} createNew algorithm={optimizerAlgorithm} controller={optimization} open={optimizationOpen} onOpenChange={setOptimizationOpen} returnFocusId={optimizerTriggerId} onDelete={requestDelete} />
     <OptimizationStudyDialog id={selectedHistory?.id} algorithm={algorithm} controller={optimization} open={selectedHistory?.open === true} onOpenChange={(open) => setHistorySelection((previous) => previous ? { ...previous, open } : null)} returnFocusId={selectedHistory?.triggerId ?? historyRegionId} fallbackFocusId={historyRegionId} onDelete={requestDelete} />
     <OptimizationDeleteDialog target={selectedDeleteTarget} controller={optimization} fallbackFocusId={historyRegionId} onClose={() => setDeleteTarget(null)} onDeleted={(id) => {
       if (historySelection?.id === id) setHistorySelection(null);

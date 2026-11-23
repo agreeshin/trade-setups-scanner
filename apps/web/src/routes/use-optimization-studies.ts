@@ -1,10 +1,11 @@
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import {
-  cancelOptimizationStudy, createOptimizationStudy, deleteOptimizationStudy, getOptimizationStudy, isActiveStudy, isContinuousStudy,
+  canDeleteStudy, canPauseStudy, canPlayStudy, canStopStudy, cancelOptimizationStudy, createOptimizationStudy, deleteOptimizationStudy, getOptimizationStudy, isActiveStudy, isContinuousStudy, isStudyTransitioning, pauseOptimizationStudy, playOptimizationStudy,
   listOptimizationStudies, OptimizationApiError, summarizeOptimizationStudy, type OptimizationSpec, type OptimizationStudy, type OptimizationStudyAction, type OptimizationStudySummary,
 } from "../lib/optimization-api";
 import { errorText } from "./platform-controls";
 import { RouteActiveContext } from "./route-active";
+import { randomRequestId } from "../lib/utils";
 
 interface StudySnapshot { byAlgorithm: Record<string, OptimizationStudySummary>; latestByAlgorithm: Record<string, OptimizationStudySummary>; active: OptimizationStudySummary | null }
 
@@ -21,6 +22,7 @@ export function useOptimizationStudies(algorithmIds: string[], continuousWorkAct
   const [creating, setCreating] = useState(false);
   const [cancelling, setCancelling] = useState<number | null>(null);
   const [deleting, setDeleting] = useState<number | null>(null);
+  const [controlling, setControlling] = useState<{ id: number; action: "pause" | "play" } | null>(null);
   const [revision, setRevision] = useState(0);
   const mounted = useRef(false);
   const version = useRef(0);
@@ -28,6 +30,9 @@ export function useOptimizationStudies(algorithmIds: string[], continuousWorkAct
   const refreshRef = useRef<() => void>(() => undefined);
   const activeRef = useRef<OptimizationStudySummary | null>(null);
   const readyRef = useRef(false);
+  // Exactly one uncertain attempt, released after an ACK/definite rejection, a changed
+  // spec, or unmount. No browser queue and no automatic POST retries.
+  const pendingCreate = useRef<{ body: string; key: string } | null>(null);
 
   const accept = useCallback((study: OptimizationStudy) => {
     const summary = summarizeOptimizationStudy(study);
@@ -45,7 +50,7 @@ export function useOptimizationStudies(algorithmIds: string[], continuousWorkAct
 
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; mutation.current?.abort(); };
+    return () => { mounted.current = false; mutation.current?.abort(); pendingCreate.current = null; };
   }, []);
 
   useEffect(() => {
@@ -59,8 +64,8 @@ export function useOptimizationStudies(algorithmIds: string[], continuousWorkAct
       controller?.abort(); clearTimeout(timer);
       const current = new AbortController(); controller = current;
       const revision = version.current;
-      // Manual admission intentionally excludes continuous jobs; observer cadence must not.
-      let workActive = continuousWorkActive || Object.values(snapshotRef.current.latestByAlgorithm).some(isActiveStudy) || activeRef.current !== null;
+      let workActive = continuousWorkActive || Object.values(snapshotRef.current.latestByAlgorithm).some(isStudyTransitioning)
+        || (activeRef.current !== null && isStudyTransitioning(activeRef.current));
       try {
         const [global, ...lists] = await Promise.all([
           listOptimizationStudies(undefined, current.signal),
@@ -76,7 +81,7 @@ export function useOptimizationStudies(algorithmIds: string[], continuousWorkAct
         });
         if (activeSummary && !selected.some((study) => study.id === activeSummary.id)) selected.push(activeSummary);
         if (disposed || current.signal.aborted || revision !== version.current) return;
-        workActive = continuousWorkActive || global.studies.some(isActiveStudy) || lists.some((list) => list.studies.some(isActiveStudy));
+        workActive = continuousWorkActive || global.studies.some(isStudyTransitioning) || lists.some((list) => list.studies.some(isStudyTransitioning));
         const active = selected.find((study) => isActiveStudy(study) && !isContinuousStudy(study)) ?? null;
         const byAlgorithm: Record<string, OptimizationStudySummary> = {};
         const latestByAlgorithm: Record<string, OptimizationStudySummary> = {};
@@ -111,14 +116,19 @@ export function useOptimizationStudies(algorithmIds: string[], continuousWorkAct
   }, [idsKey, routeActive, continuousWorkActive]);
 
   async function start(spec: OptimizationSpec): Promise<boolean> {
-    if (mutation.current || activeRef.current || !readyRef.current) return false;
+    if (mutation.current || !readyRef.current) return false;
     const controller = new AbortController(); mutation.current = controller;
     version.current += 1; setCreating(true); setError(null);
     try {
-      const study = await createOptimizationStudy(spec, controller.signal);
+      const body = JSON.stringify(spec);
+      const attempt = pendingCreate.current?.body === body ? pendingCreate.current : { body, key: randomRequestId() };
+      pendingCreate.current = attempt;
+      const study = await createOptimizationStudy(spec, controller.signal, attempt.key);
+      pendingCreate.current = null;
       if (mounted.current && !controller.signal.aborted) { version.current += 1; accept(study); setRevision((value) => value + 1); refreshRef.current(); return true; }
     } catch (cause) {
       if (mounted.current && !controller.signal.aborted) {
+        if (cause instanceof OptimizationApiError && cause.status < 500) pendingCreate.current = null;
         if (cause instanceof OptimizationApiError && cause.activeStudyId !== undefined) {
           try {
             const active = await getOptimizationStudy(cause.activeStudyId, controller.signal);
@@ -142,22 +152,53 @@ export function useOptimizationStudies(algorithmIds: string[], continuousWorkAct
     }
     return false;
   }
-  async function stop(study: OptimizationStudyAction) {
-    if (mutation.current || isContinuousStudy(study) || !isActiveStudy(study) || study.status === "cancel_requested") return;
+  async function stop(study: OptimizationStudyAction): Promise<boolean | void> {
+    if (mutation.current || !canStopStudy(study)) return false;
     const controller = new AbortController(); mutation.current = controller;
     version.current += 1; setCancelling(study.id); setError(null);
     try {
       const next = await cancelOptimizationStudy(study.id, controller.signal);
-      if (mounted.current && !controller.signal.aborted) { version.current += 1; accept(next); setRevision((value) => value + 1); refreshRef.current(); }
+      if (mounted.current && !controller.signal.aborted) { version.current += 1; accept(next); setRevision((value) => value + 1); refreshRef.current(); return true; }
     } catch (cause) {
       if (mounted.current && !controller.signal.aborted) setError(errorText(cause));
     } finally {
       if (mutation.current === controller) mutation.current = null;
       if (mounted.current && !controller.signal.aborted) setCancelling(null);
     }
+    return false;
+  }
+  async function control(study: OptimizationStudyAction, action: "pause" | "play"): Promise<boolean> {
+    if (mutation.current || !readyRef.current || !(action === "pause" ? canPauseStudy(study) : canPlayStudy(study))) return false;
+    const controller = new AbortController(); mutation.current = controller;
+    version.current += 1; setControlling({ id: study.id, action }); setError(null);
+    try {
+      const next = await (action === "pause" ? pauseOptimizationStudy : playOptimizationStudy)(study, controller.signal);
+      if (!mounted.current || controller.signal.aborted) return false;
+      version.current += 1; accept(next); setRevision((value) => value + 1); refreshRef.current();
+      return true;
+    } catch (cause) {
+      if (!mounted.current || controller.signal.aborted) return false;
+      setError(errorText(cause));
+      if (cause instanceof OptimizationApiError && cause.status === 409) {
+        try {
+          const next = await getOptimizationStudy(study.id, controller.signal);
+          if (!mounted.current || controller.signal.aborted) return false;
+          version.current += 1; accept(next);
+        } catch (readCause) {
+          if (!mounted.current || controller.signal.aborted) return false;
+          readyRef.current = false; setReady(false);
+          setError(`Команда не подтверждена; статус исследования недоступен: ${errorText(readCause)}`);
+        }
+      }
+      if (mounted.current && !controller.signal.aborted) { version.current += 1; setRevision((value) => value + 1); refreshRef.current(); }
+    } finally {
+      if (mutation.current === controller) mutation.current = null;
+      if (mounted.current && !controller.signal.aborted) setControlling(null);
+    }
+    return false;
   }
   async function remove(study: OptimizationStudyAction): Promise<boolean> {
-    if (mutation.current || isActiveStudy(study)) return false;
+    if (mutation.current || !canDeleteStudy(study)) return false;
     const controller = new AbortController(); mutation.current = controller;
     version.current += 1; setDeleting(study.id); setError(null);
     try {
@@ -165,7 +206,9 @@ export function useOptimizationStudies(algorithmIds: string[], continuousWorkAct
       if (!mounted.current || controller.signal.aborted) return false;
       version.current += 1;
       const previous = snapshotRef.current;
-      const next = { ...previous, byAlgorithm: Object.fromEntries(Object.entries(previous.byAlgorithm).filter(([, item]) => item.id !== study.id)),
+      const active = previous.active?.id === study.id ? null : previous.active;
+      activeRef.current = active;
+      const next = { ...previous, active, byAlgorithm: Object.fromEntries(Object.entries(previous.byAlgorithm).filter(([, item]) => item.id !== study.id)),
         latestByAlgorithm: Object.fromEntries(Object.entries(previous.latestByAlgorithm).filter(([, item]) => item.id !== study.id)) };
       snapshotRef.current = next; setSnapshot(next);
       readyRef.current = false; setReady(false);
@@ -185,7 +228,8 @@ export function useOptimizationStudies(algorithmIds: string[], continuousWorkAct
     return false;
   }
   const refresh = useCallback(() => { version.current += 1; setRevision((value) => value + 1); refreshRef.current(); }, []);
-  return { ...snapshot, ready, error: error ?? discoveryError, creating, cancelling, deleting, revision, start, stop, remove,
+  return { ...snapshot, ready, error: error ?? discoveryError, creating, cancelling, deleting, controlling, revision, start, stop, remove,
+    pause: (study: OptimizationStudyAction) => control(study, "pause"), play: (study: OptimizationStudyAction) => control(study, "play"),
     clearError: () => { setError(null); setDiscoveryError(null); }, refresh };
 }
 export type OptimizationController = ReturnType<typeof useOptimizationStudies>;

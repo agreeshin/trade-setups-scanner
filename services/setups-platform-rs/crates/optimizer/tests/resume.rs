@@ -965,3 +965,296 @@ fn no_winner_can_resume_and_expire_without_fabricating_zero_score() {
     assert_eq!(outcome.progress.best_score, None);
     assert_eq!(outcome.progress.scorable_candidates, 0);
 }
+
+fn manual_fixture() -> (StudyRequest, StudyInput, StudyLimits) {
+    let (mut spec, mut input, _) = fixture();
+    spec.direction = TradeDirection::Long;
+    spec.setup_maturity = 0.6;
+    spec.analytics_params.cluster_enabled = true;
+    spec.analytics_params.cluster_gap_minutes = 10;
+    spec.max_trials = 16;
+    spec.trend_blend_lambda = TrendBlendLambda::try_from(0.6).unwrap();
+    for candle in &mut input.instruments[0].candles {
+        candle.high = candle.close * 1.25;
+        candle.low = candle.close * 0.995;
+    }
+    let limits = StudyLimits { cpu_threads: 1, max_setups_per_candidate: 100, ..StudyLimits::default() };
+    (spec, input, limits)
+}
+fn manual_control<'a>(cancel: &'a CancelToken, pause: &'a CancelToken,
+    checkpoint: Option<&'a [u8]>) -> ManualSearchControl<'a> {
+    ManualSearchControl { cancel, pause, resume_checkpoint: checkpoint,
+        remaining_budget: Duration::from_secs(120), max_checkpoint_bytes: 4 * 1024 * 1024 }
+}
+fn manual_finished(exit: ManualSearchExit) -> (StudyOutcome, Option<ManualOriginalArchive>) {
+    match exit {
+        ManualSearchExit::Completed { outcome, original_archive } => (outcome, original_archive),
+        ManualSearchExit::Suspended(_) => panic!("unexpected manual suspension"),
+    }
+}
+fn manual_identity<'a>(spec: &StudyRequest, input: &'a StudyInput) -> ManualCheckpointIdentity<'a> {
+    ManualCheckpointIdentity { snapshot_hash: &input.snapshot_hash, captured_at: &input.captured_at,
+        observation_cutoff: manual_forecast_observation_cutoff(spec, input).unwrap() }
+}
+fn stable_manual_checkpoint(bytes: &[u8]) -> ciborium::Value {
+    let mut value = ciborium::de::from_reader(bytes).unwrap();
+    replace_path(&mut value, &["state", "elapsed_nanos"], ciborium::Value::Integer(0.into()));
+    replace_path(&mut value, &["state", "progress", "elapsedSeconds"], ciborium::Value::Float(0.0));
+    value
+}
+
+#[test]
+fn manual_joined_resume_preserves_full_frontier_candidate_order_archive_and_legacy_science() {
+    let (mut spec, input, mut limits) = manual_fixture();
+    let cancel = CancelToken::new(); let pause = CancelToken::new();
+    for batch in [1, 4] {
+        limits.batch_size = batch;
+        for recipe in [None, Some(ForecastRecipe::engineering_baseline())] {
+            spec.forecast = recipe;
+            for mode in [TrendMode::Mean, TrendMode::Forecast, TrendMode::Blend] {
+                spec.trend_mode = mode;
+                let legacy = run_study_with_original_minutes(&spec, &input, &limits, &cancel, |_| {}).unwrap();
+                let mut expected = Vec::new();
+                let reference = manual_finished(search_manual_resumable(&spec, &input, &limits,
+                    manual_control(&cancel, &pause, None), |_| {}, |_, bytes| {
+                        expected.push(stable_manual_checkpoint(bytes)); Ok(CheckpointAction::Continue)
+                    }).unwrap());
+                assert_eq!(comparable(reference.0.clone()), comparable(legacy.0));
+                assert_eq!(reference.1, legacy.1, "not a continuous-population ledger");
+                // Legacy fitted trends require at least two distinct UTC
+                // outcome days; this one-day fixture correctly has no F/B.
+                if mode == TrendMode::Mean || recipe.is_some() {
+                    assert!(reference.0.progress.scorable_candidates > 0);
+                }
+                if let Some(best) = &reference.0.best {
+                    assert_eq!(best.provenance.optimizer_version, OPTIMIZER_VERSION);
+                    assert_eq!(best.analytics.setup_maturity, best.analytics.cluster_enabled.then_some(0.6));
+                    assert_eq!(reference.1.as_ref().unwrap().minutes.evaluator, MANUAL_SELECTED_MINUTES_EVALUATOR);
+                }
+                let mut saved = None; let mut actual = Vec::new();
+                let recovered = loop {
+                    let mut committed = None;
+                    let exit = search_manual_resumable(&spec, &input, &limits,
+                        manual_control(&cancel, &pause, saved.as_deref()), |_| {}, |info, bytes| {
+                            actual.push(stable_manual_checkpoint(bytes)); committed = Some(bytes.to_vec());
+                            Ok(if info.sequence > 0 { CheckpointAction::Suspend } else { CheckpointAction::Continue })
+                        }).unwrap();
+                    if let Some(bytes) = committed { saved = Some(bytes); }
+                    assert!(actual.len() <= expected.len(), "no repeated/resampled batch");
+                    if let ManualSearchExit::Completed { outcome, original_archive } = exit {
+                        break (outcome, original_archive);
+                    }
+                };
+                assert_eq!(actual, expected, "full RNG/frontier/ordered records/influence and exact IEEE ledger bits");
+                assert_eq!(comparable(recovered.0), comparable(reference.0));
+                assert_eq!(recovered.1, reference.1);
+            }
+        }
+    }
+}
+
+#[test]
+fn manual_positive_mean_forecast_and_blend_winners_resume_with_the_exact_original_ledger() {
+    let (mut spec, input, limits) = manual_fixture();
+    // The supported explicit probability recipe has real one-day support;
+    // unlike a legacy fitted trend it does not require two UTC outcome days.
+    spec.forecast = Some(ForecastRecipe::engineering_baseline());
+    let cancel = CancelToken::new(); let pause = CancelToken::new();
+    for mode in [TrendMode::Mean, TrendMode::Forecast, TrendMode::Blend] {
+        spec.trend_mode = mode;
+        let reference = manual_finished(search_manual_resumable(&spec, &input, &limits,
+            manual_control(&cancel, &pause, None), |_| {}, |_, _| Ok(CheckpointAction::Continue)).unwrap());
+        assert!(reference.0.best.as_ref().is_some_and(|best| best.score > 0.0), "real positive {mode:?} winner required");
+        assert!(reference.1.as_ref().is_some_and(|archive| !archive.minutes.points.is_empty()), "real original {mode:?} outcomes required");
+        let mut checkpoint = Vec::new();
+        let exit = search_manual_resumable(&spec, &input, &limits,
+            manual_control(&cancel, &pause, None), |_| {}, |info, bytes| {
+                checkpoint = bytes.to_vec();
+                Ok(if info.sequence == 1 { CheckpointAction::Suspend } else { CheckpointAction::Continue })
+            }).unwrap();
+        let ManualSearchExit::Suspended(info) = exit else { panic!("mid-search joined pause required") };
+        assert!(info.progress.best_score.is_some_and(|score| score > 0.0));
+        assert!(info.progress.evaluated_candidates > 0 && info.progress.evaluated_candidates < spec.max_trials);
+        let checkpoint_pair = export_manual_checkpoint_partial(&spec, manual_identity(&spec, &input), &limits,
+            &checkpoint, 4 * 1024 * 1024).unwrap();
+        assert!(checkpoint_pair.0.best.is_some(), "checkpoint must actually contain the {mode:?} incumbent");
+        assert!(checkpoint_pair.1.is_some(), "checkpoint must contain its paired original {mode:?} ledger");
+        let recovered = manual_finished(search_manual_resumable(&spec, &input, &limits,
+            manual_control(&cancel, &pause, Some(&checkpoint)), |_| {}, |_, _| Ok(CheckpointAction::Continue)).unwrap());
+        assert!(recovered.0.best.is_some() && recovered.1.is_some());
+        assert_eq!(comparable(recovered.0), comparable(reference.0), "exact completed {mode:?} scientific outcome");
+        assert_eq!(recovered.1, reference.1, "exact original {mode:?} ledger including IEEE sums");
+    }
+}
+
+#[test]
+fn manual_checkpoint_only_stop_exports_the_committed_pair_without_input_or_search() {
+    let (spec, input, limits) = manual_fixture();
+    let cancel = CancelToken::new(); let pause = CancelToken::new();
+    for sequence in [0, 1, 2] {
+        let mut checkpoint = Vec::new();
+        let exit = search_manual_resumable(&spec, &input, &limits,
+            manual_control(&cancel, &pause, None), |_| {}, |info, bytes| {
+                checkpoint = bytes.to_vec();
+                Ok(if info.sequence == sequence { CheckpointAction::Suspend } else { CheckpointAction::Continue })
+            }).unwrap();
+        let ManualSearchExit::Suspended(info) = exit else { panic!("expected committed pause") };
+        let stopped = export_manual_checkpoint_partial(&spec, manual_identity(&spec, &input), &limits,
+            &checkpoint, 4 * 1024 * 1024).unwrap();
+        assert_eq!(stopped.0.reason, TerminationReason::Cancelled);
+        assert_eq!(stopped.0.progress.phase, StudyPhase::Cleanup);
+        assert_eq!(stopped.0.progress.evaluated_candidates, info.progress.evaluated_candidates);
+        assert_eq!(stopped.0.progress.elapsed_seconds, info.progress.elapsed_seconds);
+        assert!(stopped.0.best.as_ref().is_none_or(|best| best.partial));
+        // An expired/cancelled engine restore is an independent terminal path;
+        // it must return the identical owned ledger, with no detector passes.
+        let stopped_token = CancelToken::new(); stopped_token.cancel();
+        let mut control = manual_control(&stopped_token, &pause, Some(&checkpoint));
+        control.remaining_budget = Duration::ZERO;
+        let restored = manual_finished(search_manual_resumable(&spec, &input, &limits, control,
+            |_| {}, |_, _| panic!("Stop must not admit/commit evaluations")).unwrap());
+        assert_eq!(comparable(stopped.0), comparable(restored.0));
+        assert_eq!(stopped.1, restored.1);
+        if sequence == 0 { assert!(stopped.1.is_none()); }
+    }
+}
+
+#[test]
+fn manual_checkpoint_versions_request_identity_limits_ledger_and_corrupt_bytes_fail_closed() {
+    let (spec, input, limits) = manual_fixture();
+    let cancel = CancelToken::new(); let pause = CancelToken::new();
+    let mut checkpoint = Vec::new();
+    search_manual_resumable(&spec, &input, &limits, manual_control(&cancel, &pause, None), |_| {}, |info, bytes| {
+        checkpoint = bytes.to_vec(); Ok(if info.sequence == 1 { CheckpointAction::Suspend } else { CheckpointAction::Continue })
+    }).unwrap();
+    let reference:ciborium::Value = ciborium::de::from_reader(checkpoint.as_slice()).unwrap();
+    let cases:Vec<(&[&str], ciborium::Value)> = vec![
+        (&["version"], ciborium::Value::Integer(99.into())),
+        (&["kind"], ciborium::Value::Text("continuous".into())),
+        (&["state", "version"], ciborium::Value::Integer(99.into())),
+        (&["state", "rng_version"], ciborium::Value::Text("other".into())),
+        (&["state", "request_hash"], ciborium::Value::Text("other".into())),
+        (&["state", "baseline"], ciborium::Value::Null),
+        (&["state", "best", "support", "avgSetupsPerDay"], ciborium::Value::Null),
+        (&["state", "best", "support", "requiredSetupCount"], ciborium::Value::Null),
+        (&["state", "progress", "elapsedSeconds"], ciborium::Value::Float(f64::NAN)),
+        (&["state", "search", "initial_index"], ciborium::Value::Integer(99999.into())),
+        (&["original_archive"], ciborium::Value::Null),
+        (&["original_archive", "observation_cutoff"], ciborium::Value::Integer(0.into())),
+        (&["original_archive", "minutes", "evaluator"], ciborium::Value::Text(CONTINUOUS_SELECTED_MINUTES_EVALUATOR.into())),
+        (&["original_archive", "minutes", "points"], ciborium::Value::Array(vec![])),
+    ];
+    for (path, replacement) in cases {
+        let mut value = reference.clone(); replace_path(&mut value, path, replacement);
+        let mut bytes = Vec::new(); ciborium::ser::into_writer(&value, &mut bytes).unwrap();
+        assert!(export_manual_checkpoint_partial(&spec, manual_identity(&spec, &input), &limits, &bytes,
+            4 * 1024 * 1024).is_err(), "corrupt {path:?} accepted by exporter");
+        assert!(search_manual_resumable(&spec, &input, &limits, manual_control(&cancel, &pause, Some(&bytes)),
+            |_| {}, |_, _| panic!("corrupt checkpoint committed")).is_err(), "corrupt {path:?} resumed");
+    }
+    for bytes in [&checkpoint[..checkpoint.len()/2], &[checkpoint.as_slice(), &[0]].concat()] {
+        assert!(export_manual_checkpoint_partial(&spec, manual_identity(&spec, &input), &limits, bytes,
+            4 * 1024 * 1024).is_err());
+    }
+    let changed = StudyRequest { seed: spec.seed + 1, ..spec.clone() };
+    assert!(export_manual_checkpoint_partial(&changed, manual_identity(&spec, &input), &limits,
+        &checkpoint, 4 * 1024 * 1024).is_err());
+    let changed = StudyLimits { batch_size: limits.batch_size + 1, ..limits.clone() };
+    assert!(export_manual_checkpoint_partial(&spec, manual_identity(&spec, &input), &changed,
+        &checkpoint, 4 * 1024 * 1024).is_err());
+    let changed = ManualCheckpointIdentity { snapshot_hash: "other", ..manual_identity(&spec, &input) };
+    assert!(export_manual_checkpoint_partial(&spec, changed, &limits, &checkpoint, 4 * 1024 * 1024).is_err());
+    assert!(matches!(export_manual_checkpoint_partial(&spec, manual_identity(&spec, &input), &limits,
+        &checkpoint, checkpoint.len()-1), Err(StudyError::ResourceLimit { resource, .. }) if resource == "checkpoint_bytes"));
+    let mut tiny = manual_control(&cancel, &pause, None); tiny.max_checkpoint_bytes = 10;
+    assert!(search_manual_resumable(&spec, &input, &limits, tiny, |_| {}, |_, _| panic!("oversized checkpoint committed")).is_err());
+}
+
+#[test]
+fn manual_active_budget_accumulates_acquisition_and_compute_without_pause_or_queue_wall_time() {
+    let (spec, input, limits) = manual_fixture();
+    let cancel = CancelToken::new(); let pause = CancelToken::new();
+    let mut control = manual_control(&cancel, &pause, None);
+    control.remaining_budget -= Duration::from_secs(7);
+    let mut saved = Vec::new(); let mut last = None;
+    search_manual_resumable(&spec, &input, &limits, control, |_| {}, |info, bytes| {
+        saved = bytes.to_vec(); last = Some(info.clone());
+        Ok(if info.sequence == 1 { CheckpointAction::Suspend } else { CheckpointAction::Continue })
+    }).unwrap();
+    let elapsed = last.unwrap().progress.elapsed_seconds;
+    assert!((7.0..8.0).contains(&elapsed));
+    std::thread::sleep(Duration::from_millis(50));
+    let mut first = None;
+    let resumed = manual_finished(search_manual_resumable(&spec, &input, &limits,
+        manual_control(&cancel, &pause, Some(&saved)), |update| {
+            first.get_or_insert(update.progress.elapsed_seconds);
+        }, |_, _| Ok(CheckpointAction::Continue)).unwrap());
+    assert!((first.unwrap() - elapsed).abs() < 0.01, "fresh full remaining budget cannot reset spent time");
+    assert!(resumed.0.progress.elapsed_seconds >= elapsed);
+    assert!(resumed.0.progress.elapsed_seconds < elapsed + 1.0, "paused wall time is not counted");
+    let mut expired = manual_control(&cancel, &pause, Some(&saved)); expired.remaining_budget = Duration::ZERO;
+    let expired = manual_finished(search_manual_resumable(&spec, &input, &limits, expired, |_| {},
+        |_, _| panic!("expired resume cannot commit new work")).unwrap());
+    assert_eq!(expired.0.reason, TerminationReason::TimeBudget);
+    assert_eq!(expired.0.detector_passes, export_manual_checkpoint_partial(&spec, manual_identity(&spec, &input),
+        &limits, &saved, 4 * 1024 * 1024).unwrap().0.detector_passes);
+}
+
+#[test]
+fn manual_forecast_gate_keeps_scorable_rejected_trials_without_fabricating_incumbent_or_archive() {
+    let (mut spec, input, limits) = manual_fixture();
+    spec.forecast = Some(ForecastRecipe::engineering_baseline());
+    spec.min_forecast_expectancy = 100.0;
+    let cancel = CancelToken::new(); let pause = CancelToken::new();
+    for mode in [TrendMode::Forecast, TrendMode::Blend] {
+        spec.trend_mode = mode;
+        let mut checkpoint = Vec::new();
+        let exit = search_manual_resumable(&spec, &input, &limits, manual_control(&cancel, &pause, None),
+            |_| {}, |info, bytes| {
+                checkpoint = bytes.to_vec();
+                Ok(if info.sequence == 1 { CheckpointAction::Suspend } else { CheckpointAction::Continue })
+            }).unwrap();
+        let ManualSearchExit::Suspended(info) = exit else { panic!("joined pause expected") };
+        assert!(info.progress.scorable_candidates > 0);
+        assert!(info.progress.best_score.is_none());
+        let partial = export_manual_checkpoint_partial(&spec, manual_identity(&spec, &input), &limits,
+            &checkpoint, 4 * 1024 * 1024).unwrap();
+        assert!(partial.0.best.is_none() && partial.1.is_none());
+        let recovered = manual_finished(search_manual_resumable(&spec, &input, &limits,
+            manual_control(&cancel, &pause, Some(&checkpoint)), |_| {}, |_, _| Ok(CheckpointAction::Continue)).unwrap());
+        let legacy = run_study_with_original_minutes(&spec, &input, &limits, &cancel, |_| {}).unwrap();
+        assert_eq!(comparable(recovered.0), comparable(legacy.0));
+        assert_eq!(recovered.1, legacy.1);
+    }
+}
+
+#[test]
+fn manual_stop_wins_pause_commit_failures_are_not_pause_and_trial_completion_wins() {
+    let (mut spec, input, limits) = manual_fixture();
+    let cancel = CancelToken::new(); let pause = CancelToken::new(); pause.cancel(); cancel.cancel();
+    let stopped = manual_finished(search_manual_resumable(&spec, &input, &limits,
+        manual_control(&cancel, &pause, None), |_| {}, |_, _| Ok(CheckpointAction::Suspend)).unwrap());
+    assert_eq!(stopped.0.reason, TerminationReason::Cancelled);
+    assert_eq!(stopped.0.detector_passes, 0);
+    let cancel = CancelToken::new(); let pause = CancelToken::new();
+    let error = StudyError::Execution("durable commit failed".into());
+    assert_eq!(search_manual_resumable(&spec, &input, &limits, manual_control(&cancel, &pause, None),
+        |_| {}, |_, _| Err(error.clone())).unwrap_err(), error);
+    let mut saved = None;
+    let stopped = manual_finished(search_manual_resumable(&spec, &input, &limits,
+        manual_control(&cancel, &pause, None), |_| {}, |info, bytes| {
+            if info.sequence == 1 { cancel.cancel(); pause.cancel(); saved = Some(bytes.to_vec()); }
+            Ok(if info.sequence > 0 { CheckpointAction::Suspend } else { CheckpointAction::Continue })
+        }).unwrap_or_else(|error| panic!("cancel/pause race: {error:?}")));
+    assert_eq!(stopped.0.reason, TerminationReason::Cancelled);
+    assert_eq!(stopped.1, export_manual_checkpoint_partial(&spec, manual_identity(&spec, &input),
+        &limits, saved.as_ref().unwrap(), 4 * 1024 * 1024).unwrap().1);
+    spec.max_trials = 1;
+    let cancel = CancelToken::new(); let pause = CancelToken::new();
+    let done = manual_finished(search_manual_resumable(&spec, &input, &limits,
+        manual_control(&cancel, &pause, None), |_| {}, |info, _| {
+            Ok(if info.sequence > 0 { CheckpointAction::Suspend } else { CheckpointAction::Continue })
+        }).unwrap());
+    assert_eq!(done.0.reason, TerminationReason::TrialBudget);
+    assert!(!done.0.best.unwrap().partial);
+}
