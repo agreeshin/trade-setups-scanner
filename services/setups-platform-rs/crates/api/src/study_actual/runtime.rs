@@ -7,7 +7,7 @@ use setups_analytics::{
     live_outcomes::{TradeOutcome, TradeTerms, evaluate_with_horizon},
 };
 use setups_db::study_actual::{self as db, Job};
-use setups_mdclient::{CandleDto, CandlesQuery, MarketDataClient};
+use setups_mdclient::{CandleDto, CandlesQuery, CandlesResponse, MarketDataClient, MdClientError};
 use setups_replay::{ArrayCandleSource, CandleBarDto, ReplayRunOptions, replay_run_bounded};
 use sha2::{Digest, Sha256};
 use std::{
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_INSTRUMENT_OUTPUT: usize = 8 * 1024 * 1024;
 const JOB_SECONDS: u64 = 600;
+const MARKET_REQUEST_ATTEMPTS: usize = 4;
 pub struct ActualHandle {
     stop: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -154,6 +155,9 @@ async fn coordinator(
     mut owner: sqlx::PgConnection,
 ) {
     let mut bootstrap_at = tokio::time::Instant::now();
+    let market = MarketDataClient::new(&state.market_url, &state.market_key);
+    let mut market_ready = false;
+    let mut market_retry_at = tokio::time::Instant::now();
     loop {
         let epoch = CancellationToken::new();
         let mut tasks = tokio::task::JoinSet::new();
@@ -175,6 +179,16 @@ async fn coordinator(
                     // would not establish ownership of this advisory-lock session.
                     if !matches!(tokio::time::timeout(Duration::from_secs(2),db::owns_runtime(&mut owner)).await,Ok(Ok(true))) {break;}
                     if tasks.len()<workers.min(2) {
+                        // Docker restart policies do not preserve Compose startup
+                        // ordering. Do not claim a durable job until market-data
+                        // actually serves requests after a host restart.
+                        if !market_ready {
+                            if tokio::time::Instant::now()<market_retry_at {continue;}
+                            match tokio::time::timeout(Duration::from_secs(6),market.ready()).await {
+                                Ok(Ok(true))=>{market_ready=true;eprintln!("study_actual event=market_data_ready");},
+                                _=>{market_retry_at=tokio::time::Instant::now()+Duration::from_secs(1);continue;}
+                            }
+                        }
                         // Durable requests always claim before speculative source
                         // preparation. Slow DB/source reads cannot hold this loop.
                         match tokio::time::timeout(Duration::from_secs(5),db::claim_owned(&mut owner,workers as i64)).await {
@@ -341,19 +355,17 @@ async fn candles(
     let mut bytes = 0;
     let mut hash = Sha256::new();
     for _ in 0..512 {
-        let page = client
-            .candles(
-                &CandlesQuery {
-                    instrument_id: instrument,
-                    from_unix: from,
-                    to_unix: cutoff,
-                    after_unix: after,
-                    limit: Some(5000),
-                },
-                Duration::from_secs(30),
-            )
-            .await
-            .map_err(|_| "study_actual_market_data_unavailable")?;
+        let page = candle_page(
+            client,
+            &CandlesQuery {
+                instrument_id: instrument,
+                from_unix: from,
+                to_unix: cutoff,
+                after_unix: after,
+                limit: Some(5000),
+            },
+        )
+        .await?;
         if page.candles.is_empty() && page.next_cursor_unix.is_some() {
             return Err("study_actual_pagination_incomplete");
         }
@@ -381,6 +393,129 @@ async fn candles(
         }
     }
     Err("study_actual_read_budget_exceeded")
+}
+
+fn transient_market_error(error: &MdClientError) -> bool {
+    match error {
+        MdClientError::Network(_) => true,
+        MdClientError::Http { status, .. } => matches!(*status, 408 | 425 | 429 | 500..=599),
+        MdClientError::Decode(_) => false,
+    }
+}
+
+fn market_retry_delay(attempt: usize) -> Duration {
+    #[cfg(test)]
+    {
+        let _ = attempt;
+        Duration::from_millis(1)
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_millis(250 * (1u64 << attempt.min(3)))
+    }
+}
+
+async fn candle_page(
+    client: &MarketDataClient,
+    query: &CandlesQuery,
+) -> Result<CandlesResponse, &'static str> {
+    for attempt in 0..MARKET_REQUEST_ATTEMPTS {
+        match client.candles(query, Duration::from_secs(30)).await {
+            Ok(page) => {
+                if attempt > 0 {
+                    eprintln!("study_actual event=market_data_request_recovered retries={attempt}");
+                }
+                return Ok(page);
+            }
+            Err(error)
+                if transient_market_error(&error) && attempt + 1 < MARKET_REQUEST_ATTEMPTS =>
+            {
+                tokio::time::sleep(market_retry_delay(attempt)).await;
+            }
+            Err(error) => {
+                eprintln!(
+                    "study_actual event=market_data_request_failed transient={} attempts={}",
+                    transient_market_error(&error),
+                    attempt + 1
+                );
+                return Err("study_actual_market_data_unavailable");
+            }
+        }
+    }
+    Err("study_actual_market_data_unavailable")
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
+    use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    async fn fixture(
+        failures: usize,
+    ) -> (
+        MarketDataClient,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().route("/v1/candles", get(move || {
+            let count = count.clone();
+            async move {
+                let call = count.fetch_add(1, Ordering::SeqCst);
+                if call < failures {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response();
+                }
+                Json(json!({"candles":[{"openTimeUnix":60,"open":"1","high":"1","low":"1","close":"1","volume":"0","quoteTurnover":"0"}],"nextCursorUnix":null})).into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            MarketDataClient::new(format!("http://{address}"), "fixture"),
+            calls,
+            server,
+        )
+    }
+
+    fn query() -> CandlesQuery {
+        CandlesQuery {
+            instrument_id: 1,
+            from_unix: 60,
+            to_unix: 120,
+            after_unix: None,
+            limit: Some(5000),
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_market_failure_retries_then_returns_the_same_page() {
+        let (client, calls, server) = fixture(1).await;
+        let page = candle_page(&client, &query()).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(page.candles.len(), 1);
+        assert_eq!(page.candles[0].open_time_unix, 60);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn persistent_market_failure_exhausts_the_bounded_budget() {
+        let (client, calls, server) = fixture(MARKET_REQUEST_ATTEMPTS).await;
+        assert_eq!(
+            candle_page(&client, &query()).await,
+            Err("study_actual_market_data_unavailable")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), MARKET_REQUEST_ATTEMPTS);
+        server.abort();
+    }
 }
 
 fn ohlc(rows: &[CandleDto]) -> Result<Vec<OhlcCandle>, &'static str> {
