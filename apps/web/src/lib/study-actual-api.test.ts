@@ -192,6 +192,62 @@ it("rejects a post-study refit instead of presenting it as the original objectiv
   await expect(getStudyActual(49, new AbortController().signal)).rejects.toBeInstanceOf(StudyActualApiError);
 });
 
+function combinedDetail() {
+  const detail = actualDetailFixture();
+  return { ...detail, report: { ...detail.report!, combinedProjection: {
+    availability: { status: "available" as const }, method: "decayed_probability", fittedOnPostStudyData: true as const,
+    points: [{ atUnix: detail.report!.projection.points[0]!.atUnix, value: -0.25 }, { atUnix: detail.report!.observedThroughUnix, value: 0.45 }],
+    observationCutoff: detail.report!.observedThroughUnix, revision: detail.revision, jobId: detail.jobId,
+  } } };
+}
+
+it("reads the additive combined projection without replacing or deriving the sealed original", async () => {
+  const body = combinedDetail();
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json(body)));
+  const detail = await getStudyActual(49, new AbortController().signal, "UTC");
+  expect(detail.report!.combinedProjection).toEqual(body.report.combinedProjection);
+  expect(detail.report!.projection).toEqual(body.report.projection);
+  expect(detail.report!.originalObjective).toEqual(body.report.originalObjective);
+});
+
+it.each([{ revision: 2 }, { jobId: "different-job" }])("hides stale combined identity %j but retains the original projection", async (patch) => {
+  const body = combinedDetail();
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json({ ...body, report: { ...body.report, combinedProjection: { ...body.report.combinedProjection, ...patch } } })));
+  const detail = await getStudyActual(49, new AbortController().signal, "UTC");
+  expect(detail.report!.combinedProjection!.availability).toEqual({ status: "unavailable", reason: "post_study_stale" });
+  expect(detail.report!.combinedProjection!.points).toEqual([]);
+  expect(detail.report!.projection).toEqual(body.report.projection);
+});
+
+it("hides a previous-cutoff combined model without suppressing the original line", async () => {
+  const body = combinedDetail();
+  const oldCutoff = body.report.observedThroughUnix - 60;
+  const combinedProjection = { ...body.report.combinedProjection, observationCutoff: oldCutoff,
+    points: body.report.combinedProjection.points.map((point) => ({ ...point, atUnix: Math.min(point.atUnix, oldCutoff) })) };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json({ ...body, report: { ...body.report, combinedProjection } })));
+  const detail = await getStudyActual(49, new AbortController().signal, "UTC");
+  expect(detail.report!.combinedProjection!.availability).toEqual({ status: "unavailable", reason: "post_study_stale" });
+  expect(detail.report!.projection).toEqual(body.report.projection);
+});
+
+it.each([
+  { fittedOnPostStudyData: false }, { revision: 0 }, { observationCutoff: 1 }, { points: [{ atUnix: 0, value: "0.2" }] },
+  { points: Array.from({ length: 3663 }, () => ({ atUnix: 0, value: 1 })) },
+  { points: [{ atUnix: 2, value: 1 }, { atUnix: 1, value: 1 }] },
+])("rejects malformed or oversized diagnostic projection %j", async (patch) => {
+  const body = combinedDetail();
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json({ ...body, report: { ...body.report, combinedProjection: { ...body.report.combinedProjection, ...patch } } })));
+  await expect(getStudyActual(49, new AbortController().signal, "UTC")).rejects.toBeInstanceOf(StudyActualApiError);
+});
+
+it.each(["queued", "running", "failed"] as const)("discards combined model attached to a %s actual replacement and preserves original-only report", async (status) => {
+  const body = combinedDetail();
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json({ ...body, status, stage: status === "running" ? "evaluating" : status })));
+  const detail = await getStudyActual(49, new AbortController().signal, "UTC");
+  expect(detail.report).toBeNull();
+  expect(detail.originalReport!.projection).toEqual(body.originalReport!.projection);
+});
+
 it("never guesses objective field spelling or fills absent recipes with today's defaults", () => {
   expect(() => parseOriginalObjective({ version: 1, trend_mode: "blend", trend_bend_days: "linear", trend_blend_lambda: 0.7, forecast: null })).toThrow();
   expect(parseOriginalObjective(actualReportFixture().originalObjective)).toEqual(actualReportFixture().originalObjective);

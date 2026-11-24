@@ -17,6 +17,56 @@ it("uses the reference study chart palette and responsive SVG geometry", () => {
   expect(chart).toHaveAttribute("data-cutoff", String(actualCutoff));
 });
 
+it.each((["mean", "forecast", "blend"] as const).flatMap((trendMode) => (["decayed_probability", "trend", "legacy"] as const)
+  .map((method) => ({ trendMode, method }))))("draws distinct accessible sealed and combined $trendMode/$method models using only server projections", ({ trendMode, method }) => {
+  const base = actualReportFixture();
+  const forecast = method === "legacy" ? null : method === "trend" ? { method: "trend" as const, version: 1 as const, bendDays: "linear" as const } : base.originalObjective!.forecast;
+  const report = { ...base, originalObjective: { ...base.originalObjective!, trendMode, forecast },
+    combinedProjection: { availability: { status: "available" as const }, method: method === "legacy" ? "linear" : method, fittedOnPostStudyData: true as const,
+      observationCutoff: actualCutoff, revision: 1, jobId: "actual-49-1",
+      points: [{ atUnix: actualDay - 86400, value: -0.3 }, { atUnix: actualCutoff, value: trendMode === "mean" ? -0.3 : 0.4 }] } };
+  const view = render(<StudyActualChart report={report} />);
+  expect(screen.getByTestId("study-original-objective-line")).toHaveAttribute("stroke-dasharray", "6 4");
+  expect(screen.getByTestId("study-combined-objective-line")).not.toHaveAttribute("stroke-dasharray");
+  expect(screen.getByLabelText("Исходная модель (пунктир)")).toBeInTheDocument();
+  expect(screen.getByLabelText("Модель по всем данным (сплошная)")).toBeInTheDocument();
+  expect(screen.getByText("Исходная модель · пунктир")).toBeInTheDocument();
+  expect(screen.getByText("Модель по всем данным · сплошная")).toBeInTheDocument();
+  expect(screen.getByTestId("study-actual-chart")).toHaveAccessibleName(/Исходная модель \(пунктир\), Модель по всем данным \(сплошная\)/);
+  const original = screen.getByTestId("study-original-objective-line").getAttribute("points");
+  const combined = screen.getByTestId("study-combined-objective-line").getAttribute("points");
+  view.rerender(<StudyActualChart report={{ ...report, display: { ...report.display!, daily: [] } }} />);
+  expect(screen.getByTestId("study-original-objective-line")).toHaveAttribute("points", original);
+  expect(screen.getByTestId("study-combined-objective-line")).toHaveAttribute("points", combined);
+});
+
+it("keeps model null gaps separate from a single sparse observed series, with no fake missing-day observations", () => {
+  const base = actualReportFixture();
+  const last = actualDay + 3 * 86400;
+  render(<StudyActualChart report={{ ...base, observedThroughUnix: last,
+    display: { ...base.display!, daily: [base.display!.daily[0]!, { ...base.display!.daily[1]!, dayUnix: last, date: "2026-11-23" }] },
+    combinedProjection: { availability: { status: "available" }, method: "decayed_probability", fittedOnPostStudyData: true,
+      points: [{ atUnix: actualDay - 86400, value: -0.5 }, { atUnix: actualDay, value: null }, { atUnix: last, value: 0.5 }],
+      observationCutoff: last, revision: 1, jobId: "actual-49-1" },
+  }} />);
+  expect(screen.getAllByTestId("study-combined-objective-segment")).toHaveLength(2);
+  expect(screen.queryByTestId("study-combined-objective-line")).not.toBeInTheDocument();
+  const chart = screen.getByTestId("study-actual-chart");
+  expect(chart.querySelectorAll('circle[data-phase="observed"]')).toHaveLength(2);
+  expect(screen.getAllByTestId("study-observed-line")).toHaveLength(1);
+  expect(chart.querySelector(`[data-grid-day="${actualDay + 86400}"]`)).toBeInTheDocument();
+  expect(chart.querySelector(`[data-day-unix="${actualDay + 86400}"]`)).toBeNull();
+});
+
+it.each(["post_study_queued", "post_study_running", "post_study_failed", "post_study_stale", "post_study_not_calculated", "post_study_no_closed_outcomes"])("retains original and explains unavailable combined model: %s", (reason) => {
+  const report = { ...actualReportFixture(), combinedProjection: { availability: { status: "unavailable" as const, reason },
+    method: null, points: [], fittedOnPostStudyData: true as const, observationCutoff: null, revision: null, jobId: null } };
+  render(<StudyActualChart report={report} />);
+  expect(screen.getByTestId("study-original-objective-line")).toBeInTheDocument();
+  expect(screen.queryByTestId("study-combined-objective-line")).not.toBeInTheDocument();
+  expect(screen.getByTestId("study-combined-unavailable")).toHaveTextContent(reason);
+});
+
 it("renders one server-weighted start-day observation on the exact same grid coordinate as the start marker", () => {
   render(<StudyActualChart report={actualReportFixture()} />);
   const chart = screen.getByTestId("study-actual-chart");

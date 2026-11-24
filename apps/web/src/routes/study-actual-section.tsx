@@ -80,7 +80,8 @@ export function StudyActualSection({ studyId, revisionTrigger }: { studyId: numb
         <Button id={id} type="button" variant="outline" className="ml-auto h-auto w-fit max-w-full whitespace-normal text-left" onClick={() => setSelection({ revision: published.revision, jobId: published.jobId! })}>Посмотреть список сетапов после исследования</Button>
       </div>}
     {report && <>
-      <StudyActualChart report={report} />
+      <StudyActualChart report={report} {...(detail.error ? { combinedUnavailableReason: "post_study_stale" }
+        : actual?.status !== "completed" ? { combinedUnavailableReason: `post_study_${actual?.status ?? "unavailable"}` } : {})} />
       {report.display?.historical.availability.status === "unavailable" ? <p className="text-sm text-muted-foreground">Исходная история графика недоступна: {report.display.historical.availability.reason}. Наличие исторического запуска не подтверждает сохранённые исходы сделок.</p>
         : report.historical.availability.status === "unavailable" && <p className="text-sm text-muted-foreground">Исходная история графика недоступна: {report.historical.availability.reason}.</p>}
       {report.display && <p className="text-xs text-muted-foreground">Дневная группировка: {report.display.timeZone}. Исходная история: {report.display.historical.fidelity}{report.display.historical.complete ? "" : " · неполное покрытие"}{report.display.historical.reason ? ` · ${report.display.historical.reason}` : ""}. После исследования: {report.display.actual.fidelity}{report.display.actual.complete ? "" : " · неполное покрытие"}{report.display.actual.reason ? ` · ${report.display.actual.reason}` : ""}.</p>}

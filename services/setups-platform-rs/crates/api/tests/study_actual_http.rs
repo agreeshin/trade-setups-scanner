@@ -860,6 +860,11 @@ async fn exact_display_original_only_weighted_merge_and_refresh_preservation_wir
     assert_eq!(completed["lastSetupAt"],"2026-11-21T00:30:00Z");
     assert_eq!(merged["daily"].as_array().unwrap().len(),1);assert_eq!(merged["daily"][0]["closedCount"],5);assert_eq!(merged["daily"][0]["tpCount"],3);assert_eq!(merged["daily"][0]["slCount"],2);
     assert_eq!(merged["daily"][0]["sumR"],1.0);assert_eq!(merged["daily"][0]["meanR"],0.2);assert_eq!(completed["originalReport"],*original);
+    let combined=&completed["report"]["combinedProjection"];
+    assert_eq!(combined["availability"]["status"],"available","{combined}");assert_eq!(combined["method"],"mean");
+    assert_eq!(combined["revision"],completed["revision"]);assert_eq!(combined["jobId"],completed["jobId"]);
+    assert_eq!(combined["observationCutoff"],start+7200);assert_eq!(combined["fittedOnPostStudyData"],true);
+    assert!(combined["points"].as_array().unwrap().iter().all(|p|p["value"].as_f64()==Some(0.2)),"all-data mean is horizontal; never average the two period means");
     for key in ["originalObjective","originalEndpoint","projection","executionStartedAt"] {assert_eq!(completed["report"][key],report[key],"original model field {key} changed");}
     let (_,old_completed)=http(&app,"GET",&path).await;assert_eq!(old_completed["report"],report,"without timeZone saved wire report stays untouched");assert!(old_completed.get("originalReport").is_none());
     assert_eq!(old_completed["lastSetupAt"],completed["lastSetupAt"]);

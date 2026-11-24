@@ -1,9 +1,10 @@
-//! Presentation only. Reads persisted outcomes; never fits a model or starts replay.
+//! Read-only presentation of persisted outcomes and diagnostic model projections.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use setups_db::study_display::{self as db, DisplayDay};
 use sqlx::PgPool;
 use super::model::{self, Source};
+use super::projection::{self, PublishedActual};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,12 +76,44 @@ pub async fn detail(pool: &PgPool, owner: &str, study: i64, zone: &str) -> Resul
     };
     let original_display = StudyDisplay { time_zone: zone.into(), start_day_unix, daily: snapshot.original_daily.clone(),
         historical: historical.clone(), actual: DisplaySource::unavailable("post_study_not_included", false) };
-    value["originalReport"] = match source {
-        Ok(source) => original_report(&source, &original_display),
+    value["originalReport"] = match &source {
+        Ok(source) => {
+            let mut report=original_report(source, &original_display);
+            // Independent original report is stable through every actual state.
+            // The actual envelope owns queued/running/failed availability reasons.
+            report["combinedProjection"]=json!(projection::CombinedProjection::unavailable("post_study_not_included"));
+            report
+        },
         Err(reason) => { value["originalReportUnavailableReason"] = json!(reason); Value::Null },
     };
     if value["status"] == "completed" && value["report"].is_object() {
-        let actual = DisplaySource::available("persisted_post_study", format!("{}:{}:{}", study, value["revision"], value["jobId"]), true);
+        let stale=source.as_ref().is_ok_and(|source|snapshot.actual_row.as_ref().is_none_or(|row|row["source_identity"].as_str()!=Some(&source.source_identity)));
+        let actual = if stale {DisplaySource::unavailable("post_study_stale",false)} else {
+            DisplaySource::available("persisted_post_study", format!("{}:{}:{}", study, value["revision"], value["jobId"]), true)
+        };
+        let combined=match &source {
+            Ok(source)=>{
+                let metadata=if stale {Err("post_study_stale")}else if source.artifact.as_ref().is_some_and(|a|a.source.tp_pct!=source.tp_pct||a.source.sl_pct!=source.sl_pct) {
+                    Err("original_pair_mismatch")
+                }else{match (value["observedThroughUnix"].as_i64(),value["revision"].as_i64(),value["jobId"].as_str()) {
+                    (Some(cutoff),Some(revision),Some(job_id))=>Ok((cutoff,revision,job_id.to_owned())),
+                    _=>Err("post_study_identity_unavailable"),
+                }};
+                let artifact=source.artifact.clone();let objective=source.objective;
+                let daily=snapshot.actual_utc_daily;
+                // Numerical work owns bounded inputs off the async I/O executor.
+                match tokio::task::spawn_blocking(move||projection::project(artifact.as_ref(),objective,
+                    metadata.as_ref().map(|(cutoff,revision,job_id)|PublishedActual{daily:&daily,cutoff:*cutoff,revision:*revision,job_id}).map_err(|reason|*reason))).await {
+                    Ok(model)=>model,
+                    Err(_)=>{
+                        setups_db::diagnostics::emit(setups_db::diagnostics::Level::Error,"study_combined_projection_failed",json!({"studyId":study,"code":"combined_evaluation_failed"}));
+                        projection::CombinedProjection::unavailable("combined_evaluation_failed")
+                    },
+                }
+            },
+            Err(reason)=>projection::CombinedProjection::unavailable(reason),
+        };
+        value["report"]["combinedProjection"]=json!(combined);
         let display = StudyDisplay { time_zone: zone.into(), start_day_unix,
             daily: snapshot.combined_daily,
             historical, actual };
@@ -91,7 +124,7 @@ pub async fn detail(pool: &PgPool, owner: &str, study: i64, zone: &str) -> Resul
 
 fn original_report(source: &Source, display: &StudyDisplay) -> Value {
     // Frozen model's original through/cutoff, not now or a refresh admission window.
-    let through = source.artifact.as_ref().map(|a| a.to_unix)
+    let through = source.artifact.as_ref().map(|a| a.to_unix.max(a.source.provenance.observation_cutoff))
         .or_else(|| source.original_endpoint["atUnix"].as_i64()).unwrap_or(source.execution_started_at.timestamp());
     let mut report = model::chart(source, through, vec![]);
     report["display"] = json!(display);

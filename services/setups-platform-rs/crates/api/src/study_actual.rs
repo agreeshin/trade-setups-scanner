@@ -4,6 +4,7 @@ pub mod legacy;
 pub mod legacy_cli;
 pub mod legacy_runtime;
 pub(crate) mod model;
+mod projection;
 mod runtime;
 use crate::replay::{ReplayState, guard_auth};
 use axum::{

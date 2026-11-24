@@ -309,6 +309,9 @@ pub struct DisplaySnapshot {
     pub actual_row:Option<Value>, pub start_day_unix:Option<i64>, pub original_identity:Option<String>,
     pub original_fidelity:Option<String>,
     pub raw_replay_available:bool, pub original_daily:Vec<DisplayDay>, pub combined_daily:Vec<DisplayDay>,
+    /// Current published UTC cohorts, including scientific setup-count weights.
+    /// Kept separate from IANA observed buckets; never fitted in the DB layer.
+    pub actual_utc_daily:Vec<setups_domain::expectancy::UtcDailyInput>,
 }
 
 /// Canonical observed projection, independent of scientific daily row weights,
@@ -508,8 +511,9 @@ pub async fn display_snapshot(pool:&PgPool,owner:&str,study:i64,zone:&str,start:
     };
     let raw_replay_available:bool=sqlx::query_scalar("select exists(select 1 from replay_runs r join replay_batches b on b.id=r.batch_id where r.owner_id=$1 and b.owner_id=$1 and r.origin='continuous' and (b.expectancy_artifact_id=$3 or r.continuous_generation_id=(select continuous_generation_id from optimization_studies where id=$2 and owner_id=$1)))")
         .bind(owner).bind(study).bind(artifact).fetch_one(&mut *tx).await?;
-    let actual_daily=if let Some(row)=actual_row.as_ref().filter(|r|r["status"]=="completed") {
-        if source_identity.is_some_and(|id|row["source_identity"].as_str()!=Some(id)) {return Err(invalid("source_changed"));}
+    let published=actual_row.as_ref().filter(|r|r["status"]=="completed"
+        && source_identity.is_none_or(|id|r["source_identity"].as_str()==Some(id)));
+    let actual_daily=if let Some(row)=published {
         let bad:bool=sqlx::query_scalar("select exists(select 1 from study_actual_setups where owner_id=$1 and study_id=$2 and revision=$3 and (signal_close_unix<extract(epoch from $4::timestamptz) or signal_close_unix>$5 or row_data->>'status' not in ('tp','sl','gate_failed','unclosed','no_data') or row_data->>'status' in ('tp','sl') and (row_data->>'riskReturn') is null))")
             .bind(owner).bind(study).bind(row["revision"].as_i64().ok_or_else(||invalid("invalid_revision"))?).bind(start)
             .bind(row["observed_through_unix"].as_i64().ok_or_else(||invalid("invalid_cutoff"))?).fetch_one(&mut *tx).await?;
@@ -518,10 +522,20 @@ pub async fn display_snapshot(pool:&PgPool,owner:&str,study:i64,zone:&str,start:
             .bind(owner).bind(study).bind(row["revision"].as_i64().ok_or_else(||invalid("invalid_revision"))?).bind(zone).fetch_all(&mut *tx).await?;
         decode_days(rows)?
     }else{vec![]};
+    let actual_utc_daily=if let Some(row)=published {
+        let rows=sqlx::query("select floor(signal_close_unix/86400.0)::bigint*86400 as day_start_unix,count(*)::bigint rows,count(*) filter(where row_data->>'status'='tp')::bigint tp,count(*) filter(where row_data->>'status'='sl')::bigint sl,avg((row_data->>'riskReturn')::float8) filter(where row_data->>'status' in ('tp','sl')) mean_r from study_actual_setups where owner_id=$1 and study_id=$2 and revision=$3 group by 1 order by 1 limit 3662")
+            .bind(owner).bind(study).bind(row["revision"].as_i64().ok_or_else(||invalid("invalid_revision"))?).fetch_all(&mut *tx).await?;
+        if rows.len()>3661 {return Err(invalid("daily_resource_limit"));}
+        rows.into_iter().map(|r| Ok(setups_domain::expectancy::UtcDailyInput {
+            day_start_unix:r.try_get("day_start_unix")?,row_count:u64::try_from(r.try_get::<i64,_>("rows")?).map_err(|_|invalid("invalid_counts"))?,
+            tp_count:u64::try_from(r.try_get::<i64,_>("tp")?).map_err(|_|invalid("invalid_counts"))?,
+            sl_count:u64::try_from(r.try_get::<i64,_>("sl")?).map_err(|_|invalid("invalid_counts"))?,mean_r:r.try_get("mean_r")?,
+        })).collect::<Result<Vec<_>,DbError>>()?
+    }else{vec![]};
     let combined_daily=fill_calendar(&mut tx,zone,merge_days(original_daily.clone(),actual_daily)?).await?;
     let original_daily=fill_calendar(&mut tx,zone,original_daily).await?;
     tx.commit().await?;
-    Ok(DisplaySnapshot{actual_row,start_day_unix,original_identity,original_fidelity,raw_replay_available,original_daily,combined_daily})
+    Ok(DisplaySnapshot{actual_row,start_day_unix,original_identity,original_fidelity,raw_replay_available,original_daily,combined_daily,actual_utc_daily})
 }
 
 async fn fill_calendar(tx:&mut Transaction<'_,Postgres>,zone:&str,points:Vec<DisplayDay>)->Result<Vec<DisplayDay>,DbError> {

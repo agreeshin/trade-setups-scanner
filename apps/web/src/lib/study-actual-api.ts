@@ -45,12 +45,20 @@ export interface StudyActualDisplay {
   timeZone: string; startDayUnix: number; daily: StudyActualDisplayDay[];
   historical: StudyActualDisplayQuality; actual: StudyActualDisplayQuality;
 }
+/** Diagnostic curve inherits originalObjective and selected pair; not a new recommendation. */
+export interface StudyActualCombinedProjection {
+  availability: StudyActualAvailability; method: string | null;
+  points: { atUnix: number; value: number | null }[]; fittedOnPostStudyData: true;
+  observationCutoff: number | null; revision: number | null; jobId: string | null;
+}
 export interface StudyActualReport {
   sourceArtifactId: number | null; retrospective: true; executionStartedAt: string; observedThroughUnix: number;
   historical: { availability: StudyActualAvailability; daily: StudyActualDailyPoint[] };
   actual: { daily: StudyActualDailyPoint[] };
   originalObjective: OriginalObjectiveDTO | null;
   projection: { availability: StudyActualAvailability; method: string | null; points: { atUnix: number; value: number | null }[]; fittedOnPostStudyData: false };
+  /** Additive server-owned refit; legacy responses remain readable, never fitted in the browser. */
+  combinedProjection?: StudyActualCombinedProjection;
   originalEndpoint: { meanR: StudyActualNumber; forecastR: StudyActualNumber; decisionR: StudyActualNumber; atUnix: number | null };
   /** Additive read-only grouping; absent only on the unchanged legacy GET path. */
   display?: StudyActualDisplay;
@@ -228,13 +236,35 @@ function parseReport(value: unknown, expectedTimeZone?: string): StudyActualRepo
     if (!record(point) || !finite(point.atUnix) || !(point.value === null || finite(point.value))) throw invalidReport();
     return { atUnix: point.atUnix, value: point.value };
   });
+  const combinedProjection = value.combinedProjection === undefined ? undefined : parseCombinedProjection(value.combinedProjection, value.observedThroughUnix);
   if (expectedTimeZone !== undefined && value.display === undefined) throw invalidReport();
   return { sourceArtifactId: value.sourceArtifactId, retrospective: true, executionStartedAt: value.executionStartedAt, observedThroughUnix: value.observedThroughUnix,
     historical: { availability: availability(value.historical.availability), daily: dailyPoints(value.historical.daily) },
     actual: { daily: dailyPoints(value.actual.daily) }, originalObjective: parseOriginalObjective(value.originalObjective),
     projection: { availability: availability(value.projection.availability), method: value.projection.method, points, fittedOnPostStudyData: false },
+    ...(combinedProjection === undefined ? {} : { combinedProjection }),
     originalEndpoint: { meanR: availableNumber(value.originalEndpoint.meanR), forecastR: availableNumber(value.originalEndpoint.forecastR), decisionR: availableNumber(value.originalEndpoint.decisionR), atUnix: value.originalEndpoint.atUnix },
     ...(value.display === undefined ? {} : { display: parseDisplay(value.display, value.executionStartedAt, expectedTimeZone) }) };
+}
+function parseCombinedProjection(value: unknown, cutoff: number): StudyActualCombinedProjection {
+  if (!record(value) || value.fittedOnPostStudyData !== true || !(value.method === null || typeof value.method === "string")
+    || !Array.isArray(value.points) || value.points.length > 3662
+    || !(value.observationCutoff === null || count(value.observationCutoff))
+    || !(value.revision === null || (count(value.revision) && value.revision > 0))
+    || !(value.jobId === null || (typeof value.jobId === "string" && value.jobId.length > 0 && value.jobId.length <= 256))) throw invalidReport();
+  const state = availability(value.availability);
+  const projectionCutoff = value.observationCutoff ?? cutoff;
+  let previous = -Infinity;
+  const points = value.points.map((point: unknown) => {
+    if (!record(point) || !finite(point.atUnix) || point.atUnix < previous || point.atUnix > projectionCutoff
+      || !(point.value === null || finite(point.value))) throw invalidReport();
+    previous = point.atUnix;
+    return { atUnix: point.atUnix, value: point.value };
+  });
+  if (state.status === "available" ? value.method === null || value.observationCutoff === null || value.revision === null || value.jobId === null || !points.some((point) => point.value !== null)
+    : points.length !== 0) throw invalidReport();
+  return { availability: state, method: value.method, points, fittedOnPostStudyData: true,
+    observationCutoff: value.observationCutoff, revision: value.revision, jobId: value.jobId };
 }
 export async function getStudyActual(studyId: number, signal: AbortSignal, timeZone?: string): Promise<StudyActualDetail> {
   const query = timeZone === undefined ? "" : `?${new URLSearchParams({ timeZone })}`;
@@ -244,7 +274,13 @@ export async function getStudyActual(studyId: number, signal: AbortSignal, timeZ
     || !(body.originalReportUnavailableReason === undefined || body.originalReportUnavailableReason === null
       || (typeof body.originalReportUnavailableReason === "string" && body.originalReportUnavailableReason.length <= 2000))
     || (summary.status === "completed" && (body.report == null || summary.jobId === null || summary.revision < 1 || summary.counts === null))) throw invalidReport();
-  return { ...summary, report: summary.status === "completed" ? parseReport(body.report, timeZone) : null,
+  const report = summary.status === "completed" ? parseReport(body.report, timeZone) : null;
+  const combined = report?.combinedProjection;
+  if (report && combined?.availability.status === "available" && (combined.revision !== summary.revision || combined.jobId !== summary.jobId || combined.observationCutoff !== report.observedThroughUnix)) {
+    report.combinedProjection = { availability: { status: "unavailable", reason: "post_study_stale" }, method: null, points: [],
+      fittedOnPostStudyData: true, observationCutoff: null, revision: null, jobId: null };
+  }
+  return { ...summary, report,
     ...("originalReport" in body ? { originalReport: body.originalReport === null ? null : parseReport(body.originalReport, timeZone) } : {}),
     ...(body.originalReportUnavailableReason === undefined ? {} : { originalReportUnavailableReason: body.originalReportUnavailableReason }) };
 }

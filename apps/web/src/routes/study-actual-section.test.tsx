@@ -67,6 +67,8 @@ it.each(["not_calculated", "queued", "running", "failed"] as const)("renders ori
   expect(chart.querySelectorAll('circle[data-phase="observed"]')).toHaveLength(2);
   expect(chart.querySelector('[data-date="2026-11-20"]')).toHaveAttribute("data-mean-r", "-0.5");
   expect(screen.getByTestId("study-original-end-value")).toHaveTextContent("+0.80R");
+  expect(screen.getByTestId("study-combined-unavailable")).toHaveTextContent(`post_study_${status}`);
+  expect(screen.queryByTestId("study-combined-objective-line")).not.toBeInTheDocument();
   expect(screen.queryByText("Матожидание факт:")).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Посмотреть список сетапов после исследования" })).not.toBeInTheDocument();
   expect(pageCalls()).toHaveLength(0); expect(requests.every((request) => request.method === "GET")).toBe(true);
