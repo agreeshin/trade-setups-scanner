@@ -86,7 +86,7 @@ for (const viewport of [{ width: 2560, height: 1080 }, { width: 375, height: 812
     await expect(history.getByRole("cell", { name: "WATCH", exact: true })).toBeVisible();
     await expect(history.getByRole("cell", { name: "LONG", exact: true })).toBeVisible();
     await expect(history.getByRole("cell", { name: "SHORT", exact: true })).toBeVisible();
-    await expect(history.getByRole("row").filter({ hasText: "SAVED_WATCH" })).toContainText("неприменимо");
+    await expect(history.getByRole("row").filter({ hasText: "SAVED_WATCH" })).toContainText("Неприменимо");
     await expect(history.getByRole("row").filter({ hasText: "SAVED_WATCH" })).not.toContainText("0.00R");
 
     await history.getByRole("button", { name: "Подробности SAVED_WATCH", exact: true }).click();

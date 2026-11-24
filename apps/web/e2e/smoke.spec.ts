@@ -36,19 +36,22 @@ test.describe("application smoke", () => {
     expect(path).not.toBeNull();
     expect(await readFile(path, "utf8")).toBe(csv);
     expect(resourceType).toBe("document");
-    await expect(page.getByRole("heading", { name: "Сетапы", exact: true })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Сетапы", exact: true })).toBeVisible();
   });
 
   test("live feed searches older records and requests bounded server pages", async ({ page }) => {
     let unavailable = false;
     const queries: URLSearchParams[] = [];
+    await page.route("**/v1/setups/outcomes/refresh", (route) => route.fulfill({ json: {
+      snapshotId: 601, observedThroughUnix: 1_700_086_400, processed: 1, computed: 0, updated: 1, nextCursor: null,
+    } }));
     await page.route("**/v1/setups?*", async (route) => {
       if (unavailable) return route.fulfill({ status: 503, json: { error: "unavailable" } });
       const query = new URL(route.request().url()).searchParams;
       queries.push(query);
       const offset = Number(query.get("offset"));
       const limit = Number(query.get("limit"));
-      const rows = Array.from({ length: 601 }, (_, index) => ({ exchange: "bybit", category: "linear",
+      const rows = Array.from({ length: 601 }, (_, index) => ({ id: index + 1, exchange: "bybit", category: "linear",
         symbol: index === 600 ? "ARCHIVEUSDT" : `BTC${index}USDT`, algorithmId: "price_volume_spike",
         openTimeUnix: 1700000000, closeTimeUnix: 1700000060, closePrice: "0.000000001" }));
       const filtered = rows.filter((row) => row.symbol.includes(query.get("q") ?? ""));
@@ -56,27 +59,31 @@ test.describe("application smoke", () => {
     });
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/setups");
-    await expect(page.getByText("Страница 1 из 25 · Найдено: 601")).toBeVisible();
-    await expect(page.locator("tbody tr")).toHaveCount(25);
-    await page.getByRole("button", { name: "Далее", exact: true }).click();
-    await expect(page.getByText("Страница 2 из 25 · Найдено: 601")).toBeVisible();
+    const history = page.getByRole("region", { name: "История сохранённых сетапов" });
+    await expect(history.getByText("Страница 1 из 25", { exact: true })).toBeVisible();
+    await expect(history.getByRole("heading")).toContainText("Найдено: 601");
+    await expect(history.locator("tbody tr")).toHaveCount(25);
+    await history.getByRole("button", { name: "Далее", exact: true }).click();
+    await expect(history.getByText("Страница 2 из 25", { exact: true })).toBeVisible();
     expect(queries.at(-1)?.get("snapshotId")).toBe("601");
-    await page.getByRole("button", { name: "Назад", exact: true }).click();
-    await expect(page.getByText("Страница 1 из 25 · Найдено: 601")).toBeVisible();
+    await history.getByRole("button", { name: "Назад", exact: true }).click();
+    await expect(history.getByText("Страница 1 из 25", { exact: true })).toBeVisible();
     await page.getByLabel("Инструмент, биржа или алгоритм").fill("ARCHIVE");
-    await expect(page.getByText("bybit · ARCHIVEUSDT", { exact: true })).toBeVisible();
-    await expect(page.getByText("Страница 1 из 1 · Найдено: 1")).toBeVisible();
+    await expect(history.getByRole("cell", { name: "ARCHIVEUSDT", exact: true })).toBeVisible();
+    await expect(history.getByText("Страница 1 из 1", { exact: true })).toBeVisible();
+    await expect(history.getByRole("heading")).toContainText("Найдено: 1");
     expect(queries.at(-1)?.has("snapshotId")).toBe(false);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     unavailable = true;
-    await page.getByRole("button", { name: "Обновить", exact: true }).click();
-    await expect(page.getByRole("alert")).toContainText("Ошибка обновления (HTTP 503)");
-    await expect(page.getByRole("alert")).toContainText("Показан последний подтверждённый список; данные могли устареть.");
-    await expect(page.getByText("bybit · ARCHIVEUSDT", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Обновить результаты сетапов", exact: true }).click();
+    await expect(history.getByRole("alert")).toContainText("503");
+    await expect(history.getByRole("alert")).toContainText("Показан последний подтверждённый список.");
+    await expect(history.getByRole("cell", { name: "ARCHIVEUSDT", exact: true })).toBeVisible();
     await expect(page.getByText("Сетапы не найдены.", { exact: true })).toHaveCount(0);
     unavailable = false;
-    await page.getByRole("button", { name: "Обновить", exact: true }).click();
-    await expect(page.getByText("bybit · ARCHIVEUSDT", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Обновить результаты сетапов", exact: true }).click();
+    await expect(history.getByRole("alert")).toHaveCount(0);
+    await expect(history.getByRole("cell", { name: "ARCHIVEUSDT", exact: true })).toBeVisible();
   });
 
   test("theme preference supports system changes, explicit override and reload", async ({ page }) => {
@@ -125,7 +132,7 @@ test.describe("application smoke", () => {
     await theme.selectOption("light");
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
     await expect(page.locator('[data-slot="app-surface"]')).toHaveCSS("background-color", "rgb(251, 251, 253)");
-    await expect(theme).toHaveCSS("background-color", "rgb(251, 251, 253)");
+    await expect(page.locator('[data-slot="select-wrapper"]').filter({ has: theme }).locator('[data-slot="select-trigger"]')).toHaveCSS("background-color", "rgb(251, 251, 253)");
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     await page.screenshot({ path: test.info().outputPath("light-login-mobile.png") });
   });
@@ -149,6 +156,98 @@ test.describe("application smoke", () => {
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
       await page.screenshot({ path: test.info().outputPath(`theme-${width}.png`) });
     }
+  });
+
+  test("shared Select searches literally without side effects and commits only changed Analytics sets in both themes and viewports", async ({ page }) => {
+    test.setTimeout(90_000);
+    const sets = ["Alpha [1]", "Beta [2]", "Gamma [3]"].map((label, index) => ({
+      setId: `run-${index + 1}`, kind: "run", numericId: index + 1, label,
+      algorithmId: "price_volume_spike", algorithmVersion: "1", params: {},
+      exchange: "bybit", category: "linear", symbol: "BTCUSDT", setupCount: 1,
+      fromUnix: 1_700_000_000, toUnix: 1_700_086_400, createdAt: "2024-01-15T00:00:00Z",
+    }));
+    const effects: { method: string; path: string; body: unknown }[] = [];
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.route("**/v1/**", async (route) => {
+      const request = route.request();
+      const path = new URL(request.url()).pathname;
+      const method = request.method();
+      const calculates = path.startsWith("/v1/analytics/") && !["/v1/analytics/sets", "/v1/analytics/months", "/v1/analytics/cache/summary"].includes(path);
+      if (method !== "GET" || calculates) effects.push({ method, path, body: request.postDataJSON() as unknown });
+      if (path === "/v1/settings/web-analytics") return route.fulfill({ json: { settings: method === "GET" ? { setId: "run-1", autoCalc: false, trendMode: "mean" } : request.postDataJSON() as unknown } });
+      if (path === "/v1/analytics/sets") return route.fulfill({ json: { sets } });
+      if (path === "/v1/analytics/months") return route.fulfill({ json: { months: ["2023-11"] } });
+      if (path === "/v1/analytics/cache/summary") return route.fulfill({ json: { tables: [], total: 0 } });
+      return route.fallback();
+    });
+    for (const colorScheme of ["dark", "light"] as const) {
+      for (const width of [1440, 375]) {
+        effects.length = 0;
+        await page.emulateMedia({ colorScheme });
+        await page.setViewportSize({ width, height: 900 });
+        await page.goto("/analytics");
+        const select = page.getByRole("combobox", { name: "Набор сетапов", exact: true });
+        await expect(select).toHaveValue("run-1");
+        await expect(select).toBeEnabled();
+        await select.focus();
+        await page.keyboard.press("ArrowDown");
+        const popup = page.locator('[data-slot="select-content"]');
+        const list = page.getByRole("listbox");
+        const search = page.getByRole("searchbox", { name: "Поиск по вариантам" });
+        await expect(search).toBeFocused();
+        await expect(list.getByRole("option")).toHaveCount(3);
+        await expect(popup).toHaveCSS("border-radius", "16px");
+        await expect(popup).toHaveCSS("background-color", colorScheme === "dark" ? "rgb(22, 23, 26)" : "rgb(255, 255, 255)");
+        await expect(popup).toHaveCSS("color", colorScheme === "dark" ? "rgb(236, 238, 240)" : "rgb(32, 35, 41)");
+        const selected = list.getByRole("option", { name: "Alpha [1]", exact: true });
+        await expect(selected).toHaveAttribute("aria-selected", "true");
+        await expect(selected).toHaveClass(/data-\[selected=true\]:bg-ambient-violet\/25/);
+        await expect(selected).not.toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+        const bounds = await popup.boundingBox();
+        expect(bounds).not.toBeNull();
+        expect(bounds!.x).toBeGreaterThanOrEqual(0);
+        expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+        await page.screenshot({ path: test.info().outputPath(`select-${colorScheme}-${width}.png`) });
+        await search.fill("bEtA [2]");
+        await expect(list.getByRole("option")).toHaveCount(1);
+        await expect(list.getByRole("option", { name: "Beta [2]", exact: true })).toBeVisible();
+        await expect(select).toHaveValue("run-1");
+        await search.fill(".*");
+        await expect(list.getByRole("option")).toHaveCount(0);
+        await expect(popup.getByText("Ничего не найдено", { exact: true })).toBeVisible();
+        // Observe beyond the 800ms settings debounce: filtering must not save or calculate.
+        await page.waitForTimeout(1000);
+        expect(effects).toEqual([]);
+        await page.keyboard.press("Escape");
+        await expect(popup).toHaveCount(0);
+        await expect(select).toBeFocused();
+        await expect(select).toHaveValue("run-1");
+        await page.keyboard.press("Enter");
+        await expect(search).toBeFocused();
+        await expect(search).toHaveValue("");
+        await page.keyboard.press("Enter");
+        await expect(popup).toHaveCount(0);
+        await page.waitForTimeout(1000);
+        expect(effects).toEqual([]);
+        await page.keyboard.press("Enter");
+        await expect(search).toBeFocused();
+        await page.keyboard.press("ArrowDown");
+        await page.keyboard.press("Enter");
+        await expect(select).toHaveValue("run-2");
+        await expect(select).toBeFocused();
+        await expect.poll(() => effects).toEqual([{ method: "PUT", path: "/v1/settings/web-analytics", body: expect.objectContaining({ setId: "run-2", autoCalc: false }) }]);
+        await page.keyboard.press("Enter");
+        await expect(search).toBeFocused();
+        await page.keyboard.press("Enter");
+        await expect(popup).toHaveCount(0);
+        await page.waitForTimeout(1000);
+        expect(effects).toHaveLength(1);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      }
+    }
+    expect(errors).toEqual([]);
   });
 
   test("login uses the same theme and library controls", async ({ page }) => {
