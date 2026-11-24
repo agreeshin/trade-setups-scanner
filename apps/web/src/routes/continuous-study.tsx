@@ -341,13 +341,19 @@ export function ContinuousControls({ algorithm, controller, children }: { algori
   const [open, setOpen] = useState(false);
   const [stopOpen, setStopOpen] = useState(false);
   const [stopPending, setStopPending] = useState(false);
+  const [pauseOpen, setPauseOpen] = useState(false);
+  const [pausePending, setPausePending] = useState(false);
+  const pauseRequest = useRef(false);
+  const pauseTriggerId = useId();
+  const pauseCancelId = useId();
+  const controlsId = useId();
   const stopRequest = useRef(false);
   const stopTriggerId = useId();
   const stopCancelId = useId();
   const process = controller.process;
-  const canStop = controller.available && controller.busy === null && !stopPending && process !== null && process.status !== "stopped" && process.status !== "stopping";
+  const canStop = controller.available && controller.busy === null && !stopPending && !pausePending && process !== null && process.status !== "stopped" && process.status !== "stopping";
   const running = process?.status === "running" && process.desiredRunning !== false && process.config !== null;
-  const canCommandPause = controller.available && controller.error === null && controller.busy === null && !stopPending && running;
+  const canCommandPause = controller.available && controller.error === null && controller.busy === null && !stopPending && !pausePending && running;
   const paused = process?.pauseRequested === true;
   const requestingPause = controller.busy === "pause";
   const recoveryExhausted = process?.status === "error" && process.error?.code === "durable_resume_retry_exhausted"
@@ -361,11 +367,17 @@ export function ContinuousControls({ algorithm, controller, children }: { algori
       stopRequest.current = false; setStopPending(false);
     }
   }
-  return <section aria-label="Управление непрерывным исследованием" className="grid min-w-0 gap-3">
+  async function confirmPause() {
+    if (!canCommandPause || paused || pauseRequest.current) return;
+    pauseRequest.current = true; setPausePending(true); setPauseOpen(false);
+    try { if (await controller.pause()) setPauseOpen(false); }
+    finally { pauseRequest.current = false; setPausePending(false); }
+  }
+  return <section id={controlsId} tabIndex={-1} aria-label="Управление непрерывным исследованием" className="grid min-w-0 gap-3">
     <div className="flex flex-wrap items-center justify-start gap-3">
       <IconButton label="Обновить статус непрерывного процесса" icon={RefreshCw} onClick={controller.refresh} disabled={controller.busy !== null} />
       <IconButton label="Настроить непрерывное исследование" icon={Settings} onClick={() => setOpen(true)} disabled={!controller.available || controller.busy !== null} />
-      <IconButton label="Приостановить непрерывное исследование" icon={Pause} filled disabled={!canCommandPause || paused} onClick={() => { void controller.pause(); }} />
+      <IconButton id={pauseTriggerId} label="Приостановить непрерывное исследование" icon={Pause} filled disabled={!canCommandPause || paused} onClick={() => setPauseOpen(true)} />
       {process && process.status !== "stopped" ? <IconButton id={stopTriggerId} label={process.status === "stopping" ? "Остановка запрошена · ожидаем drain" : "Остановить непрерывное исследование"} icon={Square} filled disabled={!canStop} onClick={() => setStopOpen(true)} />
         : <IconButton id={stopTriggerId} label="Запустить непрерывное исследование" icon={Play} filled disabled={!controller.available || !process?.config || controller.busy !== null} onClick={() => { void controller.start(); }} />}
       {paused && process.status !== "stopped" && process.status !== "stopping" && <IconButton label="Возобновить непрерывное исследование" icon={Play} filled disabled={!canCommandPause} onClick={() => { void controller.start(); }} />}
@@ -377,6 +389,17 @@ export function ContinuousControls({ algorithm, controller, children }: { algori
       {children}
     </div>
     {recoveryExhausted && <InfoNote label="О повторе восстановления">Повтор восстановления сохраняет тот же ID исследования, сохранённый вход и исходный абсолютный дедлайн, без нового окна. Отдельная команда recovery/retry разрешает повтор технического восстановления; возобновление допуска обслуживания его не сбрасывает. Start после Stop создаёт новое исследование.</InfoNote>}
+    <Dialog open={pauseOpen} onOpenChange={(next) => { if (!pauseRequest.current) setPauseOpen(next); }}>
+      <DialogContent className="max-w-2xl" onOpenAutoFocus={(event) => { event.preventDefault(); document.getElementById(pauseCancelId)?.focus(); }} onCloseAutoFocus={(event) => { event.preventDefault(); const trigger = document.getElementById(pauseTriggerId); (trigger && !trigger.matches(":disabled") ? trigger : document.getElementById(controlsId))?.focus(); }}>
+        <DialogHeader><DialogTitle>Приостановить непрерывное исследование?</DialogTitle><DialogDescription>Алгоритм: {algorithmDisplayName(algorithm)}. Текущая исследовательская цепочка полностью завершится, включая replay и аналитику. Новые исследования не начнутся до возобновления. Результаты, live-профили и сбор данных сохраняются.</DialogDescription></DialogHeader>
+        {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
+        {(!canCommandPause || paused) && !pausePending && <p role="status" className="text-sm">Пауза сейчас недоступна: обновите статус исследования.</p>}
+        <div className="flex flex-wrap justify-end gap-2" aria-busy={pausePending}>
+          <Button id={pauseCancelId} type="button" variant="outline" disabled={pausePending} onClick={() => setPauseOpen(false)}>Отмена</Button>
+          <Button type="button" disabled={!canCommandPause || paused} onClick={() => { void confirmPause(); }}>{pausePending ? "Запрашиваем паузу…" : "Приостановить исследование"}</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
     <Dialog open={stopOpen} onOpenChange={(next) => { if (!stopRequest.current) setStopOpen(next); }}>
       <DialogContent className="max-w-2xl" onOpenAutoFocus={(event) => { event.preventDefault(); document.getElementById(stopCancelId)?.focus(); }} onCloseAutoFocus={(event) => { event.preventDefault(); document.getElementById(stopTriggerId)?.focus(); }}>
         <DialogHeader>

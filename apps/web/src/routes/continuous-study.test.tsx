@@ -362,6 +362,14 @@ it("places the standard icon-only Pause beside settings and sends only an explic
   expect(pause.textContent).toBe("");
   expect(pause).toBeEnabled();
   await userEvent.click(pause);
+  expect(controller.pause).not.toHaveBeenCalled();
+  const confirmation = within(screen.getByRole("dialog", { name: "Приостановить непрерывное исследование?" }));
+  expect(confirmation.getByRole("button", { name: "Отмена" })).toHaveFocus();
+  await userEvent.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(pause).toHaveFocus(); expect(controller.pause).not.toHaveBeenCalled();
+  await userEvent.click(pause);
+  await userEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Приостановить исследование" }));
   expect(controller.pause).toHaveBeenCalledOnce();
   expect(controller.stop).not.toHaveBeenCalled();
   expect(controller.start).not.toHaveBeenCalled();
@@ -468,6 +476,7 @@ it("shows pending Pause feedback before ACK, then server pausing until the full 
   const pause = controls.getByRole("button", { name: "Приостановить непрерывное исследование" });
   await waitFor(() => expect(pause).toBeEnabled());
   await userEvent.click(pause);
+  await userEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Приостановить исследование" }));
   expect(controls.getByText("Запрашиваем паузу…")).toBeInTheDocument();
   expect(controls.getByRole("status", { name: "Ожидание завершения текущей исследовательской цепочки" })).toHaveAttribute("data-slot", "spinner");
   expect(controls.queryByText("На паузе")).not.toBeInTheDocument();
@@ -505,6 +514,7 @@ it("removes pending Pause feedback after a network error without fabricating a p
   const pause = controls.getByRole("button", { name: "Приостановить непрерывное исследование" });
   await waitFor(() => expect(pause).toBeEnabled());
   await userEvent.click(pause);
+  await userEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Приостановить исследование" }));
   expect(controls.getByText("Запрашиваем паузу…")).toBeInTheDocument();
   await act(async () => { rejectPause?.(new Error("pause_connection_lost")); await Promise.resolve(); });
   expect(await screen.findByRole("alert")).toHaveTextContent("pause_connection_lost");

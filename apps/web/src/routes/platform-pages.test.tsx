@@ -741,6 +741,7 @@ describe("platform screens", () => {
     await userEvent.click(screen.getByRole("button", { name: "Обновить" }));
     await waitFor(() => expect(detailRequests.filter((path) => path === "/v1/replay-runs/7?offset=100&limit=100")).toHaveLength(2));
     expect(screen.getByText("Всего сетапов: 101. Страница 2 из 2")).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
     await userEvent.click(screen.getByRole("button", { name: "Результаты запуска 8" }));
     await screen.findByText("Всего сетапов: 101. Страница 1 из 2");
     expect(detailRequests).toContain("/v1/replay-runs/8?offset=0&limit=100");
@@ -778,6 +779,7 @@ describe("platform screens", () => {
     await waitFor(() => expect(screen.getByText(/Всего сетапов: 1/)).toBeInTheDocument());
     expect(screen.getByText("Пакетный прогон · 2 инструментов · price_volume_spike · 1.1.1 · running")).toBeVisible();
     expect(requests.some((request) => request.path === "/v1/replay-batches/7?offset=0&limit=100")).toBe(true);
+    await userEvent.keyboard("{Escape}");
     await userEvent.click(screen.getByRole("button", { name: "Отменить запуск 7" }));
     await waitFor(() => expect(requests.some((request) => request.path === "/v1/replay-batches/7/cancel" && request.method === "POST")).toBe(true));
     await screen.findByText(/Отмена запуска #7 запрошена для всех инструментов/);

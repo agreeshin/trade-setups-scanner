@@ -90,7 +90,7 @@ function RunResultPage({ id, isBatch, offset, revision, onPage, qualityPanel, on
   </>;
 }
 
-function RunResults({ id, isBatch, revision }: { id: number; isBatch: boolean; revision: number }) {
+function RunResults({ id, isBatch, revision, onRefresh }: { id: number; isBatch: boolean; revision: number; onRefresh: () => void }) {
   const [offset, setOffset] = useState(0);
   const [qualityPanel, setQualityPanel] = useState<QualityPanelState>({ open: false, offset: 0 });
   const [downloading, setDownloading] = useState(false);
@@ -123,9 +123,9 @@ function RunResults({ id, isBatch, revision }: { id: number; isBatch: boolean; r
     } catch (cause) { if (!controller.signal.aborted) setError(errorText(cause)); }
     finally { if (!controller.signal.aborted) setDownloading(false); }
   }
-  return <section className="mt-8" aria-labelledby="run-results-heading">
+  return <section aria-labelledby="run-results-heading">
     <Card className="grid gap-3">
-      <SectionHeader id="run-results-heading" title={`Результаты запуска #${id}`} actions={<><Button variant="outline" size="sm" disabled={downloading} onClick={() => { void exportCsv(); }}>{downloading ? "Подготовка CSV…" : "Скачать CSV запуска"}</Button><InfoNote>CSV содержит все результаты запуска, не только текущую страницу. Большой файл потребует времени и памяти браузера.</InfoNote></>} />
+      <SectionHeader id="run-results-heading" title="Сетапы и качество данных" actions={<><Button variant="outline" size="sm" onClick={onRefresh}>Обновить</Button><Button variant="outline" size="sm" disabled={downloading} onClick={() => { void exportCsv(); }}>{downloading ? "Подготовка CSV…" : "Скачать CSV запуска"}</Button><InfoNote>CSV содержит все результаты запуска, не только текущую страницу. Большой файл потребует времени и памяти браузера.</InfoNote></>} />
       {error && <Alert variant="destructive" role="alert">{error}</Alert>}
       <RunResultPage key={offset} id={id} isBatch={isBatch} offset={offset} revision={revision} onPage={setOffset} qualityPanel={qualityPanel} onQualityPanel={setQualityPanel} />
     </Card>
@@ -203,6 +203,8 @@ export function RunsPage() {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [selected, setSelected] = useState<{ id: number; isBatch: boolean } | null>(null);
+  const resultTrigger = useRef<HTMLButtonElement | null>(null);
+  const resultsFallback = useRef<HTMLDivElement | null>(null);
   const [reload, setReload] = useState(0);
   const runs = usePlatformPoll<{ runs: RunRow[] }>("/v1/replay-runs", reload);
   const [cancelling, setCancelling] = useState<number | null>(null);
@@ -368,12 +370,12 @@ export function RunsPage() {
     </>} /></div>
     {runs.kind === "loading" && <p className="mt-4 text-sm text-muted-foreground">Загрузка…</p>}
     {runs.kind === "unreachable" && <Alert className="mt-4" variant="destructive" role="alert">Запуски недоступны ({runs.detail})</Alert>}
-    {runs.kind === "ready" && <div className="mt-4 overflow-x-auto">
+    {runs.kind === "ready" && <div ref={resultsFallback} tabIndex={-1} className="mt-4 overflow-x-auto">
       <Table>
         <caption className="text-left text-muted-foreground">До 200 последних запусков. Время: {localTimezoneLabel()}</caption>
         <TableHeader><TableRow><TableHead>ID</TableHead><TableHead>Имя</TableHead><TableHead>Алгоритм</TableHead><TableHead>Инструмент</TableHead><TableHead>Статус</TableHead><TableHead className="text-center">Сетапов</TableHead><TableHead className="text-center">Действие</TableHead></TableRow></TableHeader>
         <TableBody>{runs.data.runs.slice(0, 200).map((run) => <TableRow key={`${run.isBatch === true ? "batch" : "run"}-${run.id}`}>
-          <TableCell><Button variant="outline" size="sm" onClick={() => setSelected({ id: run.id, isBatch: run.isBatch === true })} aria-label={`Результаты запуска ${run.id}`}>#{run.id}</Button></TableCell>
+          <TableCell><Button variant="outline" size="sm" onClick={(event) => { resultTrigger.current = event.currentTarget; setSelected({ id: run.id, isBatch: run.isBatch === true }); }} aria-label={`Результаты запуска ${run.id}`}>#{run.id}</Button></TableCell>
           <TableCell><RunName run={run} onSaved={() => setReload((value) => value + 1)} /></TableCell>
           <TableCell className="text-muted-foreground">{run.algorithmId} · {run.algorithmVersion}</TableCell>
           <TableCell className="font-medium">{run.symbol}</TableCell>
@@ -389,7 +391,12 @@ export function RunsPage() {
       </Table>
       {runs.data.runs.length === 0 && <p className="mt-2 text-sm text-muted-foreground">Запусков пока нет.</p>}
     </div>}
-      {selected !== null && <RunResults key={`${selected.isBatch ? "b" : "r"}-${selected.id}`} id={selected.id} isBatch={selected.isBatch} revision={reload} />}
+      <Dialog open={selected !== null} onOpenChange={(open) => { if (!open) setSelected(null); }}>
+        <DialogContent className="max-w-6xl" onCloseAutoFocus={(event) => { event.preventDefault(); (resultTrigger.current?.isConnected ? resultTrigger.current : resultsFallback.current)?.focus(); }}>
+          <DialogHeader><DialogTitle>Результаты запуска #{selected?.id}</DialogTitle><DialogDescription>Сохранённые результаты и качество данных выбранного запуска.</DialogDescription></DialogHeader>
+          {selected !== null && <RunResults key={`${selected.isBatch ? "b" : "r"}-${selected.id}`} id={selected.id} isBatch={selected.isBatch} revision={reload} onRefresh={() => setReload((value) => value + 1)} />}
+        </DialogContent>
+      </Dialog>
       {deleteTarget !== null && (
         <Dialog open onOpenChange={(open) => { if (!open && !deleting) setDeleteTarget(null); }}>
           <DialogContent>

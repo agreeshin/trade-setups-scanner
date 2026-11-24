@@ -50,12 +50,18 @@ export function StudyStatusBadges({ study }: { study: Pick<OptimizationStudy, "s
 export function ManualStudyActions({ study, controller, compact = false }: { study: OptimizationStudyAction; controller: OptimizationController; compact?: boolean }) {
   const [stopTargetId, setStopTargetId] = useState<number | null>(null);
   const stopOpen = stopTargetId !== null;
+  const [pauseTargetId, setPauseTargetId] = useState<number | null>(null);
+  const pauseOpen = pauseTargetId !== null;
+  const [pausePending, setPausePending] = useState(false);
+  const pauseRequest = useRef(false);
+  const pauseTriggerId = useId(); const pauseCancelId = useId();
   const [stopPending, setStopPending] = useState(false);
   const stopRequest = useRef(false);
   const stopTriggerId = useId(); const cancelId = useId(); const fallbackId = useId();
-  const busy = controller.creating || controller.cancelling !== null || controller.deleting !== null || controller.controlling != null || stopPending;
+  const busy = controller.creating || controller.cancelling !== null || controller.deleting !== null || controller.controlling != null || stopPending || pausePending;
   const available = controller.ready && !busy;
   const canStop = available && canStopStudy(study) && (!stopOpen || stopTargetId === study.id);
+  const canPause = available && canPauseStudy(study) && (!pauseOpen || pauseTargetId === study.id);
   const requestingPause = controller.controlling?.id === study.id && controller.controlling.action === "pause";
   const requestingPlay = controller.controlling?.id === study.id && controller.controlling.action === "play";
   const suffix = compact ? ` ${study.id}` : "";
@@ -65,10 +71,16 @@ export function ManualStudyActions({ study, controller, compact = false }: { stu
     try { if (await controller.stop(study) !== false) setStopTargetId(null); }
     finally { stopRequest.current = false; setStopPending(false); }
   }
-  if (isContinuousStudy(study) || ((!isActiveStudy(study) || study.status === "queued") && !stopOpen)) return null;
+  async function confirmPause() {
+    if (!canPause || pauseRequest.current) return;
+    pauseRequest.current = true; setPausePending(true); setPauseTargetId(null);
+    try { if (await controller.pause(study) !== false) setPauseTargetId(null); }
+    finally { pauseRequest.current = false; setPausePending(false); }
+  }
+  if (isContinuousStudy(study) || ((!isActiveStudy(study) || study.status === "queued") && !stopOpen && !pauseOpen)) return null;
   return <div id={fallbackId} tabIndex={-1} className="flex flex-wrap items-center gap-2">
     {!isContinuousStudy(study) && <>
-      {study.status === "running" && <IconButton label={`Приостановить исследование${suffix}`} icon={Pause} filled disabled={!available || !canPauseStudy(study)} onClick={() => { void controller.pause(study); }} />}
+      {study.status === "running" && <IconButton id={pauseTriggerId} label={`Приостановить исследование${suffix}`} icon={Pause} filled disabled={!canPause} onClick={() => setPauseTargetId(study.id)} />}
       {study.status === "paused" && <IconButton label={`Возобновить исследование${suffix}`} icon={Play} filled disabled={!available || !canPlayStudy(study)} onClick={() => { void controller.play(study); }} />}
       {isActiveStudy(study) && study.status !== "queued" && <IconButton id={stopTriggerId} label={`Остановить исследование${suffix}`} icon={Square} filled disabled={!canStop} onClick={() => setStopTargetId(study.id)} />}
       {(requestingPause || requestingPlay || study.status === "pausing" || study.status === "cancel_requested") && <div role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -76,6 +88,20 @@ export function ManualStudyActions({ study, controller, compact = false }: { stu
         <span>{requestingPause ? "Запрашиваем паузу…" : requestingPlay ? "Возвращаем в очередь…" : study.status === "pausing" ? "Постановка на паузу" : "Остановка запрошена"}</span>
       </div>}
     </>}
+    <Dialog open={pauseOpen} onOpenChange={(open) => { if (!open && !pauseRequest.current) setPauseTargetId(null); }}>
+      <DialogContent onOpenAutoFocus={(event) => { event.preventDefault(); document.getElementById(pauseCancelId)?.focus(); }} onCloseAutoFocus={(event) => {
+        event.preventDefault(); const trigger = document.getElementById(pauseTriggerId);
+        (trigger && !trigger.matches(":disabled") ? trigger : document.getElementById(fallbackId))?.focus();
+      }}>
+        <DialogHeader><DialogTitle>Приостановить исследование #{pauseTargetId ?? study.id}?</DialogTitle><DialogDescription>Вычислительное состояние сохранится на безопасной границе, а очередь освободится для других исследований. После возобновления это же исследование продолжится с сохранённым прогрессом. Live и сбор данных не изменятся.</DialogDescription></DialogHeader>
+        {controller.error && <Alert variant="destructive" role="alert">{controller.error}</Alert>}
+        {!canPause && !pausePending && <p role="status" className="text-sm">Состояние исследования изменилось. Обновите статус перед паузой.</p>}
+        <div className="flex flex-wrap justify-end gap-2" aria-busy={pausePending}>
+          <Button id={pauseCancelId} type="button" variant="outline" disabled={pausePending} onClick={() => setPauseTargetId(null)}>Отмена</Button>
+          <Button type="button" disabled={!canPause} onClick={() => { void confirmPause(); }}>{pausePending ? "Запрашиваем паузу…" : "Приостановить исследование"}</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
     <Dialog open={stopOpen} onOpenChange={(open) => { if (!open && !stopRequest.current) setStopTargetId(null); }}>
       <DialogContent onOpenAutoFocus={(event) => { event.preventDefault(); document.getElementById(cancelId)?.focus(); }} onCloseAutoFocus={(event) => {
         event.preventDefault();

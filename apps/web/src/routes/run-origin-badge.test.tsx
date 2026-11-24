@@ -1,4 +1,5 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router";
 import { RunsPage } from "./runs-page";
@@ -11,6 +12,7 @@ beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
     requests.push({ path, method: init?.method ?? "GET" });
     const data = path === "/v1/replay-runs" ? { runs: [listedRun] }
+      : path.startsWith("/v1/replay-runs/7?") || path.startsWith("/v1/replay-batches/7?") ? { run: listedRun, setups: [], offset: 0, limit: 100, total: 0 }
       : path === "/v1/algorithms" ? { algorithms: [] }
       : path === "/v1/instruments" ? { instruments: [] } : { value: {} };
     return Promise.resolve(new Response(JSON.stringify(data)));
@@ -33,6 +35,24 @@ it.each([
   expect(within(row).getByRole("button", { name: "Результаты запуска 7" })).toBeInTheDocument();
   expect(within(row).getByRole("button", { name: `${status === "running" ? "Отменить" : "Удалить"} запуск 7` })).toBeInTheDocument();
   expect(listedRun.name).toBe(run.name);
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it.each([false, true])("opens results only in a modal and restores the row focus (batch=%s)", async (isBatch) => {
+  listedRun = { ...run, isBatch };
+  render(<MemoryRouter><RunsPage /></MemoryRouter>);
+  const trigger = await screen.findByRole("button", { name: "Результаты запуска 7" });
+  const table = screen.getByRole("table");
+  expect(screen.queryByText("Результаты запуска #7")).not.toBeInTheDocument();
+  await userEvent.click(trigger);
+  const dialog = within(screen.getByRole("dialog", { name: "Результаты запуска #7" }));
+  expect(await dialog.findByRole("button", { name: "Скачать CSV запуска" })).toBeEnabled();
+  expect(await dialog.findByRole("navigation", { name: "Страницы результатов запуска" })).toBeInTheDocument();
+  expect(table.closest('[aria-hidden="true"]')).not.toBeNull();
+  await userEvent.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(trigger).toHaveFocus();
+  expect(await screen.findByRole("table")).toBeVisible();
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });
 

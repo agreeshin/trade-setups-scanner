@@ -30,15 +30,21 @@ it("does not infer Pause/Play support for legacy or continuous records", () => {
   expect(commands.pause).not.toHaveBeenCalled(); expect(commands.play).not.toHaveBeenCalled(); expect(commands.stop).not.toHaveBeenCalled();
 });
 
-it("keeps request feedback distinct from confirmed pausing/paused and never offers Play before paused", () => {
-  const commands = controller();
+it("keeps request feedback distinct from confirmed pausing/paused and never offers Play before paused", async () => {
+  let finish: (ok: boolean) => void = () => undefined;
+  const commands = controller({ pause: vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; })) });
   const view = render(<ManualStudyActions study={study("running")} controller={commands} compact />);
   fireEvent.click(screen.getByRole("button", { name: "Приостановить исследование 7" }));
+  expect(commands.pause).not.toHaveBeenCalled();
+  fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Приостановить исследование" }));
   expect(commands.pause).toHaveBeenCalledExactlyOnceWith(study("running"));
   view.rerender(<ManualStudyActions study={study("running")} controller={controller({ controlling: { id: 7, action: "pause" } })} compact />);
   expect(screen.getByText("Запрашиваем паузу…")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Приостановить исследование 7" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Остановить исследование 7" })).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Возобновить исследование 7" })).not.toBeInTheDocument();
   expect(screen.queryByText("На паузе")).not.toBeInTheDocument();
+  await act(async () => { finish(true); await Promise.resolve(); });
   view.rerender(<ManualStudyActions study={study("pausing")} controller={commands} compact />);
   expect(screen.getByText("Постановка на паузу")).toBeInTheDocument();
   expect(screen.getByRole("status", { name: "Ожидание команды исследования" })).toBeInTheDocument();
@@ -93,4 +99,28 @@ it("never retargets an open irreversible Stop confirmation when latest discovery
   const confirm = confirmation.getByRole("button", { name: "Остановить исследование" });
   expect(confirm).toBeDisabled(); fireEvent.click(confirm);
   expect(commands.stop).not.toHaveBeenCalled();
+});
+
+it("confirms manual Pause with Cancel focus, Escape, stable identity and single-flight", async () => {
+  let finish: (ok: boolean) => void = () => undefined;
+  const pause = vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+  const commands = controller({ pause });
+  const view = render(<ManualStudyActions study={study("running")} controller={commands} compact />);
+  const trigger = screen.getByRole("button", { name: "Приостановить исследование 7" });
+  await userEvent.click(trigger);
+  const dialog = within(screen.getByRole("dialog", { name: "Приостановить исследование #7?" }));
+  expect(dialog.getByText(/Вычислительное состояние/)).toHaveTextContent(/очеред/);
+  expect(dialog.getByRole("button", { name: "Отмена" })).toHaveFocus();
+  await userEvent.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(trigger).toHaveFocus(); expect(pause).not.toHaveBeenCalled();
+  await userEvent.click(trigger);
+  view.rerender(<ManualStudyActions study={{ ...study("running"), id: 8 }} controller={commands} compact />);
+  const confirm = within(screen.getByRole("dialog", { name: "Приостановить исследование #7?" })).getByRole("button", { name: "Приостановить исследование" });
+  expect(confirm).toBeDisabled(); fireEvent.click(confirm); expect(pause).not.toHaveBeenCalled();
+  view.rerender(<ManualStudyActions study={study("running")} controller={commands} compact />);
+  fireEvent.click(confirm); fireEvent.click(confirm);
+  expect(pause).toHaveBeenCalledExactlyOnceWith(study("running"));
+  await act(async () => { finish(true); await Promise.resolve(); });
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
 });
