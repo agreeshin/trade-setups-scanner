@@ -14,11 +14,13 @@
 
 | Lane / Owner | Scope | Status / Acceptance |
 |---|---|---|
-| docs / текущий bounded-владелец | Только PRD/analytics/UX/decisions и активный PLAN | completed: контракт51 и полномочия записаны до feature-кода; без code/tests/Git/production |
-| MAIN / интеграция | Назначение доступных source-владельцев, проверки, поэтапная публикация | in_progress: исторические специалисты обнаружены, но resume из текущего parent отклонён `task_session_not_direct_child`; не считать их запущенными. Source ownership назначается MAIN без дублирования работ |
-| medved / видимость continuous и Algorithms actual | Две отдельные диагностики и post-study gate Switch | pending: доказать причины, исправить в рамках51; IDs/history/retries не сбрасывать |
-| web / Setups и Analytics | Контролы, геометрия, сохранённый objective и разные источники двух study-графиков | pending: выполнять по PRD51; наличие старого кода/тестов не считать новой приёмкой |
-| ops / текущая ветка50 | Только окончание уже начатой medved acceptance/resume | in_progress: отдельный владелец/исходное обслуживание, без повторного cutover; docs-поручение production не меняет |
+| docs / `ses_df1032c31ffeWkUwlfCWNrNPwM` | Только PRD/analytics/UX/decisions и активный PLAN | completed: контракт51 опубликован до feature-кода; без code/tests/production |
+| MAIN / интеграция + `decision51-night-loop` | Проверки, поэтапные commit/push, один следующий пункт за tick | in_progress: broker `simple-loop` 30s, `skip_if_busy=true`; MAIN принимает slices и не дублирует writers |
+| ops / `ses_df1c7b9b5ffekG3aJ4c1Q0U3d1` | Окончание ветки50; read-only причины continuous-start и actual scheduler | in_progress: без повторного build/drain/cutover; сохранить фактический новый user intent и снять только OWN pause после acceptance |
+| Setups web / `ses_df0fcba36ffe2W3x3b3uY9koL5` | 1.1–1.4 frontend/API DTO integration | in_progress: только web Setups files/tests; backend science не редактирует |
+| issued model / `ses_df0fcb9caffenZFzLRzjvc5gcN` | 1.4 server-owned original + issued-combined projection | in_progress: только Rust/API/DB model path; не использовать retrospective replay и не редактировать web |
+| Algorithms filter / `ses_df0fcb95bffegvOVWpA3If0HSd` | 3.2 filtered pagination end-to-end | in_progress: отдельные study-actual API/DB/web files; published totals/model неизменны |
+| Analytics / MAIN назначит после mapping | 2.1–2.8 settings, metadata и UI одним writer-owner | pending: не запускать параллельные правки `analytics-page.tsx`; date selectors сохранить, если focused regressions подтверждают текущий контракт |
 | MAIN + sole ops / новый rollout51 | После всех проверок medved → TV, app-only и сохранение текущих работ | pending: свежие ownership/backup/manual guards и numeric progression, затем только собственный resume |
 
 Ниже сохранены исторические срезы и их исходные статусы. Старые Curator WIP, callbacks и разрешения не являются текущими назначениями решения51 и не запускаются автоматически.
