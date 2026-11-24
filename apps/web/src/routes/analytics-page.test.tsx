@@ -40,6 +40,7 @@ interface StubOptions {
   trendError?: boolean;
   interceptTrend?: (signal: AbortSignal | undefined) => Promise<Response>;
   interceptTradeRows?: () => Promise<Response> | undefined;
+  interceptTradeRow?: (setup: { symbol: string; closeTimeUnix: number }, signal: AbortSignal | undefined) => Promise<Response>;
   forecast?: (request: ForecastCurveRequest, signal: AbortSignal | undefined) => Promise<Response>;
 }
 
@@ -119,6 +120,7 @@ function stubFetch(options: StubOptions = {}) {
       const pathname = path.split("?")[0]!;
       const symbol = decodeURIComponent(pathname.split("/")[4] ?? "");
       const closeTimeUnix = Number(pathname.split("/")[5]);
+      if (options.interceptTradeRow) return options.interceptTradeRow({ symbol, closeTimeUnix }, init?.signal ?? undefined);
       const fixture = options.tradeRows?.find((row) => row.setup.symbol === symbol && row.setup.closeTimeUnix === closeTimeUnix);
       if (fixture !== undefined) return json({ ...fixture, cached: false });
       const status = symbol === "BTCUSDT" ? "tp" : "sl";
@@ -154,6 +156,43 @@ function stubFetch(options: StubOptions = {}) {
 
 const fullShortGrid = shortLevels.flatMap((tp) => shortLevels.map((sl) => matrixCell(tp, sl, tp === 6 && sl === 6 ? 0.17 : 0.05)));
 const fullLongGrid = longTpLevels.flatMap((tp) => longSlLevels.map((sl) => matrixCell(tp, sl, -0.3)));
+
+it("evaluates missing cell trades with bounded parallel requests and stops the admitted batch on cancellation", async () => {
+  const rows = Array.from({ length: 9 }, (_, index): TradeRow => ({ setup: { ...setupA, symbol: `TEST${index}USDT`, closeTimeUnix: setupA.closeTimeUnix + index * 60 }, direction: "short", tpPct: 4, slPct: 4, status: "tp", entryPrice: 100, tpPrice: 96, slPrice: null, closeTimeUnix: setupA.closeTimeUnix + index * 60 + 600, riskReturn: 1 }));
+  const pending: { signal?: AbortSignal | undefined; resolve: (response: Response) => void }[] = [];
+  const calls = stubFetch({ tradeRows: rows, interceptTradeRows: () => Promise.resolve(new Response(JSON.stringify({ items: [], cachedCount: 0 }))),
+    interceptTradeRow: (_setup, signal) => new Promise<Response>((resolve) => { pending.push({ signal, resolve }); }) });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await waitFor(() => expect(pending).toHaveLength(4));
+  expect(calls.filter((call) => call.path.startsWith("/v1/analytics/trades/"))).toHaveLength(4);
+  await userEvent.click(screen.getByRole("button", { name: "Остановить" }));
+  expect(pending.every((item) => item.signal?.aborted)).toBe(true);
+  await act(async () => { pending.forEach((item, index) => item.resolve(new Response(JSON.stringify(rows[index])))); await Promise.resolve(); });
+  expect(calls.filter((call) => call.path.startsWith("/v1/analytics/trades/"))).toHaveLength(4);
+  expect(screen.queryByText("TEST0USDT")).not.toBeInTheDocument();
+});
+
+it("keeps the accepted trend and observed snapshot while a same-scope iteration fits its replacement", async () => {
+  stubFetch(utcChartOptions([utcTrade("2026-01-01T12:00:00Z", -1, 0), utcTrade("2026-01-02T12:00:00Z", 1, 1)]));
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  const curve = await screen.findByTestId("trend-curve");
+  const chart = screen.getByRole("img", { name: "Дневное матожидание в рисках" });
+  const before = chart.innerHTML;
+  const original = globalThis.fetch;
+  let release: (() => void) | undefined;
+  vi.stubGlobal("fetch", vi.fn((url: string, init?: RequestInit) => {
+    const reply = original(url, init);
+    return url === "/v1/analytics/trend" ? new Promise<Response>((resolve) => { void reply.then((response) => { release = () => resolve(response); }); }) : reply;
+  }));
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await waitFor(() => expect(release).toBeDefined());
+  expect(screen.getByTestId("trend-curve")).toBe(curve);
+  expect(chart.innerHTML).toBe(before);
+  await act(async () => { release!(); await Promise.resolve(); });
+  expect(screen.getByTestId("trend-curve")).toHaveAttribute("points", curve.getAttribute("points"));
+});
 
 it("uses one matrix-owned selection per direction, ignores conflicting legacy list filters and preserves cell-only controls", async () => {
   const calls = stubFetch({ tradeRows: [], savedSettings: { trendMode: "mean", clusterize: false, sections: {
@@ -317,7 +356,7 @@ it("syncs the month selector with the date pair", async () => {
   const calls = stubFetch({ shortBulk: fullShortGrid });
   render(<AnalyticsPage />);
   await screen.findByText("#12 · Утренний прогон");
-  await waitFor(() => expect(screen.getAllByText("2024-02")).toHaveLength(2));
+  await waitFor(() => expect(screen.getAllByLabelText<HTMLSelectElement>("Период").every((select) => [...select.options].some((option) => option.value === "2024-02"))).toBe(true));
   fireEvent.change(screen.getAllByLabelText("Период")[0]!, { target: { value: "2024-01" } });
   expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2024-01-01");
   expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2024-01-31");
@@ -390,7 +429,7 @@ it("autoruns matrices only for matrix-relevant changes", async () => {
   await waitFor(() => expect(calls.filter((call) => call.method === "PUT" && call.path === "/v1/settings/web-analytics")).toHaveLength(1), { timeout: 3000 });
   expect(calls.filter((call) => call.path.startsWith("/v1/analytics/matrix")).length).toBe(matrixCallsAfterEntry);
   expect(calls.every((call) => !call.path.startsWith("/v1/analytics/setups") && !call.path.startsWith("/v1/analytics/trades"))).toBe(true);
-  await waitFor(() => expect(screen.getAllByText("2024-02")).toHaveLength(2), { timeout: 5000 });
+  await waitFor(() => expect(screen.getAllByLabelText<HTMLSelectElement>("Период").every((select) => [...select.options].some((option) => option.value === "2024-02"))).toBe(true), { timeout: 5000 });
   fireEvent.change(screen.getAllByLabelText("Период")[0]!, { target: { value: "2024-01" } });
   await waitFor(() => expect(calls.filter((call) => call.path.startsWith("/v1/analytics/matrix")).length).toBeGreaterThan(matrixCallsAfterEntry), { timeout: 5000 });
 }, 30_000);

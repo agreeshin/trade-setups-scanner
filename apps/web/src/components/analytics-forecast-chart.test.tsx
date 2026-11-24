@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { AnalyticsForecastChart } from "./analytics-forecast-chart";
 import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
 import type { DailyExpectancyPoint } from "../lib/daily-expectancy";
@@ -152,4 +152,27 @@ it("resolves auto to the browser timezone for calendar labels", async () => {
   expect(chart).toHaveTextContent("Дата исходного сигнала (Asia/Tokyo)");
   expect(screen.getByText(/Cutoff C:/)).toHaveTextContent("Cutoff C: 03.01.2026, 09:30:00 (Asia/Tokyo)");
   expect(within(chart).getByText("01.01.2026", { selector: "text" })).toBeInTheDocument();
+});
+
+it("publishes observations and model together without dropping the previous curve during same-scope progress", async () => {
+  const nextDays = [...days, { ...days[0]!, day: "2026-01-03", dayStartUnix: fromUnix + 2 * 86400 }];
+  const nextRequest = { ...request, daily: nextDays.map((day) => ({ dayStartUnix: day.dayStartUnix, tpCount: day.tpCount, slCount: day.slCount })) };
+  let finish: ((response: Response) => void) | undefined;
+  const fetch = vi.fn<typeof globalThis.fetch>()
+    .mockResolvedValueOnce(new Response(JSON.stringify(forecastFixture(request))))
+    .mockImplementationOnce(() => new Promise<Response>((resolve) => { finish = resolve; }));
+  vi.stubGlobal("fetch", fetch);
+  const view = render(<AnalyticsForecastChart retainWhileLoading request={request} days={days} />);
+  const curve = await screen.findByTestId("forecast-model-curve");
+  const chart = screen.getByRole("img", { name: "Дневное матожидание и вероятностная модель" });
+  const before = chart.innerHTML;
+  view.rerender(<AnalyticsForecastChart retainWhileLoading request={nextRequest} days={nextDays} />);
+  await waitFor(() => expect(finish).toBeDefined());
+  expect(screen.getByTestId("forecast-model-curve")).toBe(curve);
+  expect(chart.innerHTML).toBe(before);
+  expect(screen.getByText(/Показана предыдущая завершённая итерация/)).toBeInTheDocument();
+  await act(async () => { finish!(new Response(JSON.stringify(forecastFixture(nextRequest)))); await Promise.resolve(); });
+  await waitFor(() => expect(chart.querySelectorAll("circle")).toHaveLength(3));
+  expect(screen.getByTestId("forecast-model-curve")).toBe(curve);
+  expect(screen.queryByText(/Показана предыдущая завершённая итерация/)).not.toBeInTheDocument();
 });

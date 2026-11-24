@@ -58,27 +58,34 @@ export function DailyCalendarGrid({ fromUnix, toUnix, x, top, bottom }: {
 }
 
 /** Geometry only: F, B, period mean and flat continuation are all server values. */
-export function AnalyticsForecastChart({ request, days, observedMode: controlledMode, onObservedModeChange }: {
-  request: ForecastCurveRequest; days: DailyExpectancyPoint[]; observedMode?: ObservedDailyMode; onObservedModeChange?: (mode: ObservedDailyMode) => void;
+export function AnalyticsForecastChart({ request: requested, days: requestedDays, observedMode: controlledMode, onObservedModeChange, retainWhileLoading = false }: {
+  request: ForecastCurveRequest; days: DailyExpectancyPoint[]; observedMode?: ObservedDailyMode; onObservedModeChange?: (mode: ObservedDailyMode) => void; retainWhileLoading?: boolean;
 }) {
   useSyncExternalStore(subscribeInterfaceSettings, interfaceSettings, interfaceSettings);
   const timezone = effectiveTimezone();
   const [localObservedMode, setLocalObservedMode] = useState<ObservedDailyMode>("mean");
   const observedMode = controlledMode ?? localObservedMode;
   const setObservedMode = (mode: ObservedDailyMode) => { setLocalObservedMode(mode); onObservedModeChange?.(mode); };
-  const observed = useMemo(() => observedDailyPoints(days, observedMode), [days, observedMode]);
-  const [result, setResult] = useState<{ request: ForecastCurveRequest; response: ForecastCurveResponse | null; error: string | null } | null>(null);
+  const [result, setResult] = useState<{ request: ForecastCurveRequest; days: DailyExpectancyPoint[]; response: ForecastCurveResponse | null; error: string | null } | null>(null);
   useEffect(() => {
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      void fetchForecastCurve(request, controller.signal)
-        .then((response) => { if (!controller.signal.aborted) setResult({ request, response, error: null }); })
-        .catch((error: unknown) => { if (!controller.signal.aborted) setResult({ request, response: null, error: error instanceof Error ? error.message : "ошибка расчёта" }); });
+      void fetchForecastCurve(requested, controller.signal)
+        .then((response) => { if (!controller.signal.aborted) setResult({ request: requested, days: requestedDays, response, error: null }); })
+        .catch((error: unknown) => { if (!controller.signal.aborted) setResult((previous) => ({
+          request: retainWhileLoading && previous?.response ? previous.request : requested,
+          days: retainWhileLoading && previous?.response ? previous.days : requestedDays,
+          response: retainWhileLoading ? previous?.response ?? null : null,
+          error: error instanceof Error ? error.message : "ошибка расчёта",
+        })); });
     }, 250);
     return () => { window.clearTimeout(timer); controller.abort(); };
-  }, [request]);
-  const current = result?.request === request ? result : null;
+  }, [requested, requestedDays, retainWhileLoading]);
+  const current = retainWhileLoading || result?.request === requested ? result : null;
   const response = current?.response ?? null;
+  const request = retainWhileLoading && response && current ? current.request : requested;
+  const days = retainWhileLoading && response && current ? current.days : requestedDays;
+  const observed = useMemo(() => observedDailyPoints(days, observedMode), [days, observedMode]);
   const model = buildDailyExpectancyModel(observed, request.fromUnix);
   const values = observed.flatMap((day) => day.riskExpectancy === null ? [] : [day.riskExpectancy]);
   if (response) {
@@ -101,7 +108,7 @@ export function AnalyticsForecastChart({ request, days, observedMode: controlled
     <h3 className="text-sm font-medium">Дневное матожидание · Среднее за период M: <span aria-label="Среднее модели за период">{risk(response?.meanR ?? null)}</span> · Чистый прогноз F: <span aria-label="Чистый прогноз модели">{risk(response?.forecastR ?? null)}</span> · decisionR: <span aria-label="Метрика решения">{risk(response?.decisionR ?? null)}</span></h3>
     <p className="text-xs text-muted-foreground">{forecastRecipeLabel(request.forecast, "linear")} · q {request.q}. Cutoff C: {formatUnix(request.observationCutoff)} ({timezone}). Ретроспективная модельная оценка, не causal/OOS-прогноз.</p>
     <p className="text-xs text-muted-foreground">Происхождение: переданные закрытые TP/SL; доступность исходов утверждена на cutoff C. UTC-когорты исходных сигналов показаны в календаре {timezone} без пересчёта агрегатов. Новая ручная выборка может отличаться от frozen-рекомендации Telegram.</p>
-    {!current && <p role="status" className="text-xs text-muted-foreground">Расчёт общей серверной модели…</p>}
+    <p role="status" className={retainWhileLoading ? "min-h-8 text-xs text-muted-foreground" : "text-xs text-muted-foreground"}>{current?.request !== requested && !current?.error ? `Расчёт общей серверной модели…${response ? " Показана предыдущая завершённая итерация." : ""}` : ""}</p>
     {current?.error && <p role="status" className="text-xs text-danger">Модель недоступна: {current.error}. Подстановка тренда или среднего не выполняется.</p>}
     {response?.estimate.status === "unavailable" && <p role="status" className="text-xs text-muted-foreground">Прогноз недоступен: {response.estimate.reason === "no_closed_outcomes" ? "нет наблюдавшихся закрытых TP/SL" : "нет положительного веса наблюдений"}. Prior не заменяет реальные закрытия.</p>}
     {estimate && <p className="text-xs text-muted-foreground">Реальные закрытия: TP {estimate.tpCount}, SL {estimate.slCount}. Взвешенные: TP {estimate.weightedTp.toFixed(3)}, SL {estimate.weightedSl.toFixed(3)}, W {estimate.weightSum.toFixed(3)}. Вероятность TP {(estimate.tpProbability * 100).toFixed(2)}%; эвристический prior {(estimate.priorProbability * 100).toFixed(2)}%. κ не считается реальными сделками.</p>}

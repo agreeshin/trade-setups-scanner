@@ -458,7 +458,6 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
   forecast: ForecastRecipeDraft | undefined; trendMode: TrendMode; trendBlendLambda: string;
   observedMode: ObservedDailyMode; onObservedModeChange: (mode: ObservedDailyMode) => void;
 }) {
-  const observed = useMemo(() => observedDailyPoints(items, observedMode), [items, observedMode]);
   const modelInput = useMemo(() => {
     try {
       const recipe = buildForecastRecipe(forecast ?? { method: "trend", version: 1, bendDays: trendBendDays });
@@ -469,25 +468,29 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
         ...(trendMode === "blend" ? { trendBlendLambda: lambda } : {}) };
       return { points: items.map((item) => ({ day: item.dayStartUnix / 86400,
         value: recipe.method === "trend_sum_r" ? item.sumR ?? (item.riskExpectancy === null ? null : item.riskExpectancy * item.closedCount) : item.riskExpectancy,
-        weight: item.computedCount })), bend: recipe.bendDays, projection, error: null };
+        weight: item.computedCount })), bend: recipe.bendDays, projection, items, meanRisk, winRate, error: null };
     } catch (cause) { return { error: cause instanceof Error ? cause.message : "Некорректный рецепт тренда." }; }
-  }, [items, meanRisk, trendBendDays, forecast, trendMode, trendBlendLambda]);
+  }, [items, meanRisk, winRate, trendBendDays, forecast, trendMode, trendBlendLambda]);
   const [result, setResult] = useState<{ input: typeof modelInput; response: TrendProjectionResponse | null; error: string | null } | null>(null);
   useEffect(() => {
     if (modelInput.error !== null || !modelInput.points || !modelInput.projection || modelInput.bend === undefined || items.length === 0) return;
     const controller = new AbortController();
-    // Coalesce progress flushes, retaining at most one request/result per chart.
-    const timer = window.setTimeout(() => {
-      void fetchDailyTrend(modelInput.points, modelInput.bend, controller.signal, modelInput.projection)
+    void fetchDailyTrend(modelInput.points, modelInput.bend, controller.signal, modelInput.projection)
         .then((response) => { if (!controller.signal.aborted) setResult({ input: modelInput, response, error: null }); })
-        .catch((error: unknown) => { if (!controller.signal.aborted) setResult({ input: modelInput, response: null, error: error instanceof Error ? error.message : "ошибка расчёта" }); });
-    }, 250);
-    return () => { window.clearTimeout(timer); controller.abort(); };
+        .catch((error: unknown) => { if (!controller.signal.aborted) setResult((previous) => ({ input: previous?.response ? previous.input : modelInput, response: previous?.response ?? null, error: error instanceof Error ? error.message : "ошибка расчёта" })); });
+    return () => { controller.abort(); };
   }, [modelInput, items.length]);
-  const current = result?.input === modelInput ? result : null;
+  // The keyed chart owns one scope. Publish observations and fit together, keeping
+  // its last accepted snapshot while the next calculation iteration is fitting.
+  const current = result;
+  const displayed = current?.response ? current.input : modelInput;
+  const displayedItems = displayed.items ?? items;
+  const observed = useMemo(() => observedDailyPoints(displayedItems, observedMode), [displayedItems, observedMode]);
+  const displayedMean = displayed.error === null ? displayed.meanRisk : meanRisk;
+  const displayedWinRate = displayed.error === null ? displayed.winRate : winRate;
   const trend = current?.response?.trend ?? null;
   const projection = current?.response?.projection ?? null;
-  if (items.length === 0) {
+  if (displayedItems.length === 0) {
     return <p className="text-xs text-muted-foreground">График появится после расчёта первых строк.</p>;
   }
   const model = buildDailyExpectancyModel(observed, originUnix);
@@ -518,17 +521,18 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
   const timezone = effectiveTimezone();
   const yForValue = (value: number) => top + ((yMax - value) / yRange) * plotHeight;
   const zeroY = yForValue(0);
-  const labelStep = Math.max(1, Math.ceil(items.length / 8));
+  const labelStep = Math.max(1, Math.ceil(displayedItems.length / 8));
   // Round presentation only so floating-point residuals cannot produce a -0.00R label.
   const fittedLabel = (value: number) => formatRisk(Number(value.toFixed(2)));
 
   return (
     <div className="grid gap-2">
-    <h3 className="text-sm font-medium">Дневное матожидание в рисках · Среднее МО: <span aria-label="Среднее МО за период" className={meanRisk !== null && meanRisk > 0 ? "text-success" : meanRisk !== null && meanRisk < 0 ? "text-danger" : "text-muted-foreground"}>{meanRisk === null ? "—" : fittedLabel(meanRisk)}</span> · Винрейт: <span aria-label="Винрейт за период">{winRate === null ? "—" : `${winRate.toFixed(1)}%`}</span></h3>
+    <h3 className="text-sm font-medium">Дневное матожидание в рисках · Среднее МО: <span aria-label="Среднее МО за период" className={displayedMean !== null && displayedMean > 0 ? "text-success" : displayedMean !== null && displayedMean < 0 ? "text-danger" : "text-muted-foreground"}>{displayedMean === null ? "—" : fittedLabel(displayedMean)}</span> · Винрейт: <span aria-label="Винрейт за период">{displayedWinRate === null ? "—" : `${displayedWinRate.toFixed(1)}%`}</span></h3>
     <DailyObservedControls value={observedMode} onChange={onObservedModeChange} />
     <p className="text-xs text-muted-foreground">Точки: {observedMode === "mean" ? "среднее R закрытых сделок дня" : "сумма R закрытых сделок дня"}. Модель: {forecast?.method === "trend_sum_r" ? "тренд дневной суммы R, не результата одной сделки" : "тренд среднего по дням"}. {trendMode === "mean" ? "Основная линия M: среднее за период." : trendMode === "blend" ? `Основная линия B: смесь M/F, λ ${trendBlendLambda}.` : "Основная линия F: чистый прогноз."}</p>
     {projection && <p className="text-xs text-muted-foreground">Чистый F: <span aria-label="Чистый прогноз тренда">{projection.forecastR === null ? "—" : fittedLabel(projection.forecastR)}</span> · decisionR: <span aria-label="Метрика решения тренда">{projection.decisionR === null ? "—" : fittedLabel(projection.decisionR)}</span></p>}
     {(modelInput.error ?? current?.error) && <p role="status" className="text-xs text-danger">Не удалось рассчитать тренд: {modelInput.error ?? current?.error}</p>}
+    <p role="status" className="min-h-8 text-xs text-muted-foreground">{current?.input !== modelInput && !current?.error ? `Обновление графика…${current?.response ? " Показана предыдущая завершённая итерация." : ""}` : ""}</p>
     {projection?.decisionR === null && <p role="status" className="text-xs text-muted-foreground">Выбранная модель недоступна: недостаточно конечных дневных данных.</p>}
     <svg className="w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Дневное матожидание в рисках">
       <desc>Серверные дневные агрегаты показаны по календарным суткам {timezone} без пересчёта исходных значений. Расстояния по оси X соответствуют календарным суткам; дни без закрытых сделок не равны нулю.</desc>
@@ -560,7 +564,7 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
       </polyline>}
       {model.points.map((item, index) => {
         const x = xForDay(item.x);
-        const showLabel = index % labelStep === 0 || index === items.length - 1;
+        const showLabel = index % labelStep === 0 || index === displayedItems.length - 1;
         return (
           <g key={item.day}>
             {item.riskExpectancy !== null && Number.isFinite(item.riskExpectancy) ? (
@@ -614,6 +618,7 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [error, setError] = useState<string | null>(null);
   const runIdRef = useRef(0);
+  const runRequest = useRef<AbortController | null>(null);
 
   useEffect(() => {
     reportState?.({ tpInput, slInput, riskPctInput });
@@ -641,24 +646,25 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
   }
   useLayoutEffect(() => {
     currentParamsKey.current = paramsKey;
-    return () => { runIdRef.current += 1; };
+    return () => { runIdRef.current += 1; runRequest.current?.abort(); };
   }, [paramsKey]);
 
   const run = useCallback(async () => {
     const runId = runIdRef.current + 1;
     runIdRef.current = runId;
+    runRequest.current?.abort();
+    const controller = new AbortController(); runRequest.current = controller;
     setRunning(true);
     setError(null);
-    setRows([]);
     setResultParamsKey(paramsKey);
-    setFilteredCount(0);
-    const stale = () => runIdRef.current !== runId || currentParamsKey.current !== paramsKey;
+    setProgress({ done: 0, total: 0 });
+    const stale = () => controller.signal.aborted || runIdRef.current !== runId || currentParamsKey.current !== paramsKey;
     try {
-      const selection = await fetchAnalyticsSetups(params);
+      const selection = await fetchAnalyticsSetups(params, controller.signal);
       if (stale()) return;
       const setups = selection.setups;
       setProgress({ done: 0, total: setups.length });
-      const bulk = await fetchTradeRows(params);
+      const bulk = await fetchTradeRows(params, controller.signal);
       if (stale()) return;
       const cachedByKey = new Map(bulk.items.map((row) => [`${row.setup.symbol}:${row.setup.closeTimeUnix}`, row]));
       const collected: TradeRowWithSource[] = [];
@@ -669,31 +675,30 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
         setFilteredCount(filtered);
         setProgress({ done, total: setups.length });
       };
-      for (const setup of setups) {
-        const key = `${setup.symbol}:${setup.closeTimeUnix}`;
-        const cachedRow = cachedByKey.get(key);
-        let row: TradeRow;
-        let fromCache = true;
-        if (cachedRow === undefined) {
-          row = await fetchTradeRow(setup, params);
-          if (stale()) return;
-          fromCache = false;
-        } else {
-          row = cachedRow;
-        }
-        done += 1;
-        if (row.status === "price_change_filtered") {
-          filtered += 1;
-        }
-        // One calculation-owned raw collection. Display excludes gate failures,
-        // while cutoff-aware model assembly may still require their null weight.
-        collected.push({ ...row, fromCache });
+      for (let index = 0; index < setups.length;) {
+        if (stale()) return;
+        // Reuse cached runs in one cheap iteration; cold reads have a fixed fanout
+        // of four. Promise.all preserves source order for the deposit calculation.
+        let end = index;
+        while (end < Math.min(setups.length, index + 64) && cachedByKey.has(`${setups[end]!.symbol}:${setups[end]!.closeTimeUnix}`)) end += 1;
+        if (end === index) end = Math.min(setups.length, index + 4);
+        const batch = await Promise.all(setups.slice(index, end).map(async (setup): Promise<TradeRowWithSource> => {
+          const cached = cachedByKey.get(`${setup.symbol}:${setup.closeTimeUnix}`);
+          return cached ? { ...cached, fromCache: true } : { ...await fetchTradeRow(setup, params, controller.signal), fromCache: false };
+        }));
+        if (stale()) return;
+        collected.push(...batch);
+        filtered += batch.filter((row) => row.status === "price_change_filtered").length;
+        done += batch.length;
         flush();
+        index = end;
       }
+      if (setups.length === 0) flush();
     } catch (cause) {
-      if (!stale()) setError(cause instanceof Error ? cause.message : "ошибка расчёта");
+      controller.abort();
+      if (runIdRef.current === runId && currentParamsKey.current === paramsKey) setError(cause instanceof Error ? cause.message : "ошибка расчёта");
     } finally {
-      if (!stale()) setRunning(false);
+      if (runIdRef.current === runId && currentParamsKey.current === paramsKey) { setRunning(false); runRequest.current = null; }
     }
   }, [params, paramsKey]);
 
@@ -757,7 +762,7 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
       winRate: closed > 0 ? 100 * tp / closed : null };
   }, [modelDays]);
   const probabilityChart = useMemo((): { request: ForecastCurveRequest; days: DailyExpectancyPoint[]; error?: never } | { error: string } | null => {
-    if (forecast?.method !== "decayed_probability" || running || scopedRows.length === 0 || modelPopulation.error !== null) return null;
+    if (forecast?.method !== "decayed_probability" || scopedRows.length === 0 || modelPopulation.error !== null) return null;
     try {
       const recipe = buildForecastRecipe(forecast);
       const q = params.tpPct / params.slPct;
@@ -770,7 +775,8 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
       return { days, request: { forecast: recipe, trendMode, trendBlendLambda: trendMode === "blend" ? lambda : 0.7, q, fromUnix, toUnix, observationCutoff,
         atUnix: observationCutoff + 86400, daily: days.map((day) => ({ dayStartUnix: day.dayStartUnix, tpCount: day.tpCount, slCount: day.slCount })) } };
     } catch (cause) { return { error: cause instanceof Error ? cause.message : "Некорректные входы модели." }; }
-  }, [forecast, running, scopedRows, modelPopulation.error, params.tpPct, params.slPct, trendBlendLambda, trendMode, chartFromUnix, chartToUnix, modelDays, observationCutoff]);
+  }, [forecast, scopedRows, modelPopulation.error, params.tpPct, params.slPct, trendBlendLambda, trendMode, chartFromUnix, chartToUnix, modelDays, observationCutoff]);
+  const chartScopeKey = JSON.stringify([paramsKey, trendMode, forecast, trendBendDays, trendBlendLambda]);
 
   return <section className="grid min-w-0 gap-4">
       <div className="flex items-center gap-2">
@@ -788,7 +794,7 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
           {(control) => <Input {...control} inputMode="decimal" value={riskPctInput} onBlur={() => onCommit?.()} onChange={(event) => setRiskPctInput(event.target.value)} />}
         </Field>
         {running
-          ? <Button variant="outline" onClick={() => { runIdRef.current += 1; setRunning(false); }}>Остановить</Button>
+          ? <Button variant="outline" onClick={() => { runIdRef.current += 1; runRequest.current?.abort(); runRequest.current = null; setRunning(false); }}>Остановить</Button>
           : <Button disabled={setId === ""} onClick={() => { void run(); }}>Рассчитать</Button>}
         {progress.total > 0 && <Badge variant={progress.done >= progress.total ? "success" : "info"}>Сделок: {progress.done} / {progress.total}</Badge>}
       </div>
@@ -802,8 +808,8 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
       </div>
       {forecast?.method === "decayed_probability" ? probabilityChart && ("error" in probabilityChart
         ? <p role="status" className="text-sm text-danger">Модель недоступна: {probabilityChart.error}</p>
-        : <AnalyticsForecastChart request={probabilityChart.request} days={probabilityChart.days} observedMode={observedMode} onObservedModeChange={setObservedMode} />)
-        : scopedRows.length > 0 && modelPopulation.error === null && <DailyExpectancyChart items={modelDays} originUnix={chartOriginUnix} meanRisk={modelMean.mean} winRate={modelMean.winRate}
+        : <AnalyticsForecastChart key={chartScopeKey} retainWhileLoading request={probabilityChart.request} days={probabilityChart.days} observedMode={observedMode} onObservedModeChange={setObservedMode} />)
+        : scopedRows.length > 0 && modelPopulation.error === null && <DailyExpectancyChart key={chartScopeKey} items={modelDays} originUnix={chartOriginUnix} meanRisk={modelMean.mean} winRate={modelMean.winRate}
           trendBendDays={trendBendDays} forecast={forecast} trendMode={trendMode} trendBlendLambda={trendBlendLambda} observedMode={observedMode} onObservedModeChange={setObservedMode} />}
       {visibleRows.length === 0 && !running && <p className="text-xs text-muted-foreground">График появится после ручного расчёта строк с закрытыми TP/SL сделками.</p>}
       {rows.length === 0 && !running && !error && <EmptyState title="Нет рассчитанных сделок" description="Выберите параметры и нажмите «Рассчитать». Сначала загружаются кешированные строки, затем досчитываются остальные." />}
@@ -1057,7 +1063,7 @@ export function AnalyticsPage() {
           <div className="flex flex-wrap items-end gap-3">
             <Field label="Набор сетапов" className="w-full max-w-md">
               {(control) => (
-                <Select {...control} value={setId} disabled={setsState !== "ready"} onChange={(event) => { setSetId(event.target.value); onSettingsCommit(); }}>
+                <Select {...control} searchable searchPlaceholder="Найти набор сетапов" value={setId} disabled={setsState !== "ready"} onChange={(event) => { setSetId(event.target.value); onSettingsCommit(); }}>
                   {sets.length === 0 && <option value="">Нет завершённых запусков</option>}
                   {hydrated && sets.map((set) => <option key={set.setId} value={set.setId}>{set.label}</option>)}
                 </Select>

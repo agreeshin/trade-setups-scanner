@@ -211,8 +211,8 @@ function toQuery(params: AnalyticsQueryParams): URLSearchParams {
   return search;
 }
 
-async function getJson<T>(path: string): Promise<T> {
-  const response = await apiFetch(path);
+async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const response = await apiFetch(path, signal ? { signal } : undefined);
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 120)}`);
   }
@@ -229,8 +229,8 @@ export async function fetchAnalyticsMonths(set: string): Promise<string[]> {
   return body.months;
 }
 
-export async function fetchAnalyticsSetups(params: AnalyticsQueryParams): Promise<{ setups: AnalyticsSetupRow[] } & SelectionMetrics> {
-  return getJson(`/v1/analytics/setups?${toQuery(params)}`);
+export async function fetchAnalyticsSetups(params: AnalyticsQueryParams, signal?: AbortSignal): Promise<{ setups: AnalyticsSetupRow[] } & SelectionMetrics> {
+  return getJson(`/v1/analytics/setups?${toQuery(params)}`, signal);
 }
 
 export async function fetchMatrixCells(params: AnalyticsQueryParams): Promise<{ items: MatrixCellRef[] } & SelectionMetrics> {
@@ -255,13 +255,13 @@ export async function fetchMatrixGrid(params: AnalyticsQueryParams, tpPcts: numb
   return result;
 }
 
-export async function fetchTradeRows(params: AnalyticsQueryParams): Promise<{ items: TradeRow[]; cachedCount: number }> {
-  return getJson(`/v1/analytics/trades?${toQuery(params)}`);
+export async function fetchTradeRows(params: AnalyticsQueryParams, signal?: AbortSignal): Promise<{ items: TradeRow[]; cachedCount: number }> {
+  return getJson(`/v1/analytics/trades?${toQuery(params)}`, signal);
 }
 
-export async function fetchTradeRow(setup: AnalyticsSetupRow, params: AnalyticsQueryParams): Promise<TradeRow & { cached: boolean }> {
+export async function fetchTradeRow(setup: AnalyticsSetupRow, params: AnalyticsQueryParams, signal?: AbortSignal): Promise<TradeRow & { cached: boolean }> {
   return getJson(
-    `/v1/analytics/trades/${encodeURIComponent(setup.symbol)}/${setup.closeTimeUnix}?${toQuery(params)}`,
+    `/v1/analytics/trades/${encodeURIComponent(setup.symbol)}/${setup.closeTimeUnix}?${toQuery(params)}`, signal,
   );
 }
 
