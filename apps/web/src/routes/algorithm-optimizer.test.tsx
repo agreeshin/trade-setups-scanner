@@ -523,6 +523,46 @@ it("labels a forecast winner and keeps its recorded negative period mean separat
   expect(pair.getByText("4% / 4%")).toBeInTheDocument();
 });
 
+it("shows the frozen recommended pair before the separate comparative forecast maximum", async () => {
+  // Scalar golden values corroborated read-only by the parent session for #58/g54.
+  // The remaining scientific fixture is synthetic, not a production DB dump.
+  const saved = Object.assign(winnerRecord(), { id: 58, origin: "continuous" as const, continuousGenerationId: 54,
+    recommendedPair: { tpPct: 20, slPct: 6, meanR: 0.421875, forecastR: 0.9923253, decisionR: 0.8211902, adaptiveAccepted: true } });
+  saved.forecastBest = { tpPct: 18, slPct: 6, forecastR: 1.08, meanR: 0.53 };
+  const before = JSON.stringify(saved);
+  studies = [saved]; render(<AlgorithmsPage />);
+  fireEvent.click(await historyButton("Результат исследования 58"));
+  const dialog = within(await screen.findByRole("dialog", { name: "Исследование #58 · Новый алгоритм" }));
+  const recommended = await dialog.findByRole("region", { name: "Рекомендованная пара" });
+  expect(within(recommended).getAllByRole("definition").map((item) => item.textContent)).toEqual(["20% / 6%", "0.42 R", "0.99 R", "0.82 R"]);
+  const comparison = dialog.getByRole("region", { name: "Лучшая forecast-пара" });
+  expect(within(comparison).getAllByRole("definition").map((item) => item.textContent)).toEqual(["1.08 R", "0.53 R", "18% / 6%"]);
+  expect(recommended.compareDocumentPosition(comparison) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(within(comparison).getByText(/Сравнительный максимум/)).toBeInTheDocument();
+  expect(within(recommended).getByText(/поколение #54/)).toBeInTheDocument();
+  expect(within(recommended).getByText(/Принята для adaptive handoff исходного поколения/)).toBeInTheDocument();
+  expect(JSON.stringify(saved)).toBe(before);
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it.each([false, null] as const)("does not describe a nonaccepted or unknown selected pair as applied (%s)", async (adaptiveAccepted) => {
+  studies = [Object.assign(winnerRecord(), { recommendedPair: { tpPct: 20, slPct: 6, meanR: 0, forecastR: null, decisionR: null, adaptiveAccepted } })];
+  render(<AlgorithmsPage />); await openOptimizer();
+  const pair = within(await screen.findByRole("region", { name: "Рекомендованная пара" }));
+  expect(pair.getAllByRole("definition").map((item) => item.textContent)).toEqual(["20% / 6%", "0.00 R", "—", "—"]);
+  expect(pair.getByText(adaptiveAccepted === false ? /Не принята для adaptive handoff/ : /Допуск в adaptive handoff не подтверждён/)).toBeInTheDocument();
+  expect(pair.queryByText(/Принята для adaptive handoff исходного поколения/)).not.toBeInTheDocument();
+});
+
+it.each([undefined, null])("keeps a missing legacy recommended pair unavailable instead of reusing forecastBest (%s)", async (recommendedPair) => {
+  studies = [Object.assign(winnerRecord(), { recommendedPair })];
+  render(<AlgorithmsPage />); await openOptimizer();
+  const pair = within(await screen.findByRole("region", { name: "Рекомендованная пара" }));
+  expect(pair.getByText(/Сохранённая рекомендованная пара недоступна/)).toBeInTheDocument();
+  expect(pair.queryAllByRole("definition")).toHaveLength(0);
+  expect(pair.queryByText("4% / 6%")).not.toBeInTheDocument();
+});
+
 it("shows an immutable mean result recipe and cutoff without fabricating an uncomputed pure forecast", async () => {
   applyInterfaceSettings({ timezone: "America/New_York" });
   const saved = record("completed");

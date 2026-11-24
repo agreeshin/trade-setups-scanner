@@ -98,15 +98,24 @@ fn response(status: StatusCode, body: Value) -> Response {
 }
 
 fn record_response(status: StatusCode, record: StudyRecord) -> Response {
+    record_response_with_pair(status, record, None)
+}
+
+fn record_response_with_pair(
+    status: StatusCode,
+    record: StudyRecord,
+    recommended_pair: Option<db::RecommendedPair>,
+) -> Response {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct StudyResponse {
         #[serde(flatten)]
         record: StudyRecord,
         forecast_best: Option<db::ForecastBestPair>,
+        recommended_pair: Option<db::RecommendedPair>,
     }
     let forecast_best = db::forecast_best_pair(record.result.as_ref(), &record.spec);
-    (status, [("cache-control", "no-store")], Json(StudyResponse { record, forecast_best })).into_response()
+    (status, [("cache-control", "no-store")], Json(StudyResponse { record, forecast_best, recommended_pair })).into_response()
 }
 
 fn internal_error(operation: &str, error: impl std::fmt::Display) -> Response {
@@ -391,7 +400,10 @@ async fn get_study(
         return response(StatusCode::BAD_REQUEST, json!({"error":"invalid_id"}));
     }
     match db::get(&state.pool, id).await {
-        Ok(Some(record)) => record_response(StatusCode::OK, record),
+        Ok(Some(record)) => match db::get_recommended_pair(&state.pool, &record).await {
+            Ok(pair) => record_response_with_pair(StatusCode::OK, record, pair),
+            Err(error) => internal_error("get_recommended_pair", error),
+        },
         Ok(None) => response(StatusCode::NOT_FOUND, json!({"error":"not_found"})),
         Err(error) => internal_error("get", error),
     }
@@ -1005,6 +1017,45 @@ async fn execute_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn detail_response_keeps_recommendation_and_forecast_comparison_separate() {
+        let at = chrono::DateTime::from_timestamp(1_794_096_000, 0).unwrap();
+        let record = StudyRecord {
+            id: 58,
+            status: "completed".into(),
+            spec: json!({"trendMode":"blend"}),
+            progress: json!({}),
+            result: Some(json!({"best":{"trendMode":"blend","matrix":[
+                {"tpPct":18,"slPct":6,"forecastRiskExpectancy":1.08,"meanRiskExpectancy":0.53}
+            ]}})),
+            error: None,
+            created_at: at,
+            updated_at: at,
+            events: json!([]),
+            origin: "continuous".into(),
+            owner_id: "admin".into(),
+            continuous_generation_id: Some(54),
+            continuous_slot_id: Some(7),
+            manual_control: None,
+        };
+        let recommended = db::RecommendedPair {
+            tp_pct: 20.0,
+            sl_pct: 6.0,
+            mean_r: 0.421875,
+            forecast_r: Some(0.9923253),
+            decision_r: Some(0.8211902),
+            adaptive_accepted: Some(true),
+        };
+        let response = record_response_with_pair(StatusCode::OK, record, Some(recommended));
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["recommendedPair"], json!(recommended));
+        assert_eq!(body["forecastBest"], json!({"tpPct":18.0,"slPct":6.0,"forecastR":1.08,"meanR":0.53}));
+        assert!(body["result"].get("selectedCell").is_none(), "old scientific result need not contain selectedCell");
+    }
+
     fn terminal_archive() -> TerminalPayload {
         TerminalPayload{id:1,status:"completed",progress:json!({}),result:Some(json!({"best":{"score":1.0}})),error:None,events:json!([]),
             archive:Some(setups_db::study_display::ManualArchive{observation_cutoff:120,tp_pct:8.0,sl_pct:4.0,kernel:"original-manual-close-1".into(),

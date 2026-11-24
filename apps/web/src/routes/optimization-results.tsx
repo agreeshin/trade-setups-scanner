@@ -125,6 +125,8 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
   const { progress, spec, result } = study;
   const best = result?.best;
   const pair = study.forecastBest;
+  const recommended = study.recommendedPair;
+  const risk = (value: number | null | undefined) => value != null && Number.isFinite(value) ? `${expectancyFormatter.format(value)} R` : "—";
   const mode = best?.trendMode ?? spec.trendMode ?? "mean";
   const blend = mode === "blend";
   const forecast = mode !== "mean";
@@ -169,8 +171,22 @@ export function OptimizationResults({ study, algorithm, controller, onNew }: { s
       <div className="flex flex-wrap items-center gap-2"><h3 className="font-semibold">Лучший score: {expectancyFormatter.format(best.score)} R</h3>
       <InfoNote label="О лучшем score">{best.partial ? "Частичный итог остановленного исследования." : "Лучший полностью проверенный кандидат в пределах бюджета."} Это не доказанный глобальный оптимум. Score — равное среднее {blend ? "blend R" : forecast ? "прогноза R" : "R"} всех выбранных TP×SL-ячеек, а не выбор лучшей TP/SL-пары.</InfoNote></div>
       {forecast && <p className="text-sm">{blend ? `Выбор по смеси среднего и прогноза (${blendLabel}).` : recipe?.method === "decayed_probability" ? "Выбор по вероятностному прогнозу TP с памятью." : "Выбор по прогнозу тренда."} Среднее всей матрицы за период: {best.meanScore == null ? "Не сохранено" : `${expectancyFormatter.format(best.meanScore)} R`}.{!blend && " Прогноз не является средним за период; ретроспективная оценка не доказывает качество будущих сделок."}</p>}
+      <section aria-label="Рекомендованная пара" className="grid gap-2">
+        <div className="flex flex-wrap items-center gap-2"><h4 className="font-medium">Рекомендованная пара</h4><InfoNote label="О рекомендованной паре">Сохранённый selectedCell исходного исследования, не текущий профиль и не максимум forecast. После допуска именно эти TP/SL передаются в Telegram, а среднее этой пары — в заголовок PNG. Decision R — значение выбранного objective, не robust rank и не score всей матрицы.</InfoNote></div>
+        {recommended == null ? <p className="text-sm text-muted-foreground">Сохранённая рекомендованная пара недоступна. История не пересчитывается, лучшая forecast-пара не подставляется.</p> : <>
+          <dl className="grid gap-2 text-sm sm:grid-cols-2">
+            <div><dt className="text-muted-foreground">TP / SL</dt><dd>{recommended.tpPct}% / {recommended.slPct}%</dd></div>
+            <div><dt className="text-muted-foreground">Среднее МО пары за период</dt><dd>{risk(recommended.meanR)}</dd></div>
+            <div><dt className="text-muted-foreground">Чистый прогноз МО пары</dt><dd>{risk(recommended.forecastR)}</dd></div>
+            <div><dt className="text-muted-foreground">Decision R выбранного objective</dt><dd>{risk(recommended.decisionR)}</dd></div>
+          </dl>
+          <p className="text-xs text-muted-foreground">Источник: selectedCell исследования #{study.id}{study.continuousGenerationId != null ? ` · исходное поколение #${study.continuousGenerationId}` : ""}. Отсутствующие сохранённые метрики — «—».</p>
+          <p className="text-xs text-muted-foreground">{recommended.adaptiveAccepted === true ? "Принята для adaptive handoff исходного поколения. Это не статус текущего профиля." : recommended.adaptiveAccepted === false ? "Не принята для adaptive handoff: выбранная пара не означает применение в live." : "Допуск в adaptive handoff не подтверждён сохранёнными данными."}</p>
+        </>}
+      </section>
       <section aria-label="Лучшая forecast-пара" className="grid gap-2">
         <div className="flex flex-wrap items-center gap-2"><h4 className="font-medium">Лучшая forecast-пара</h4><InfoNote label="О лучшей forecast-паре">Максимальный чистый прогноз ячейки сохранённого победителя, не score всей матрицы. Среднее и TP/SL относятся к этой же ячейке.</InfoNote></div>
+        <p className="text-xs text-muted-foreground">Сравнительный максимум чистого F, не рекомендация: TP/SL и среднее могут отличаться от рекомендованной пары.</p>
         {pair == null ? <p className="text-sm">—</p> : <dl className="grid gap-2 text-sm sm:grid-cols-3">
           <div><dt className="text-muted-foreground">Прогноз матожидания</dt><dd>{expectancyFormatter.format(pair.forecastR)} R</dd></div>
           <div><dt className="text-muted-foreground">Среднее матожидание этой ячейки</dt><dd>{expectancyFormatter.format(pair.meanR)} R</dd></div>

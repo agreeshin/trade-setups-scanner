@@ -84,6 +84,16 @@ export interface OptimizationForecastBestPair {
   tpPct: number;
   slPct: number;
 }
+export interface OptimizationRecommendedPair {
+  tpPct: number;
+  slPct: number;
+  /** Selected-cell rawR: period mean, not the mean of the matrix. */
+  meanR: number;
+  forecastR: number | null;
+  decisionR: number | null;
+  /** Immutable original generation admission, not proof the profile is active now. */
+  adaptiveAccepted: boolean | null;
+}
 export interface OptimizationStudy {
   id: number;
   origin?: "manual" | "continuous";
@@ -98,6 +108,8 @@ export interface OptimizationStudy {
   error: { code: string; message: string } | null;
   /** Read-only server projection; absent on old APIs, null without saved forecast data. */
   forecastBest?: OptimizationForecastBestPair | null;
+  /** Detail-only frozen selectedCell/adaptive handoff; never a fresh winner selection. */
+  recommendedPair?: OptimizationRecommendedPair | null;
   /** Joined compact post-study job state; absent only on older servers. */
   actual?: StudyActualSummary | null;
   createdAt: string;
@@ -105,7 +117,7 @@ export interface OptimizationStudy {
   events: { at: string; kind: string; message: string }[];
 }
 
-export type OptimizationStudySummary = Omit<OptimizationStudy, "result" | "events"> & { bestScore: number | null };
+export type OptimizationStudySummary = Omit<OptimizationStudy, "result" | "events" | "recommendedPair"> & { bestScore: number | null };
 export interface OptimizationStudyPage {
   studies: OptimizationStudySummary[];
   total: number;

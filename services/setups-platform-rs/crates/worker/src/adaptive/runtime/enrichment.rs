@@ -1279,6 +1279,51 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn recommended_pair_identity_drives_telegram_and_png_not_forecast_best() {
+        // Synthetic parity case, not a recovered production study #58 snapshot.
+        let (mut envelope, legacy, instrument, mut setup, mut slot) = fixture();
+        envelope.snapshot.tp_pct = 20.0;
+        envelope.snapshot.sl_pct = 6.0;
+        envelope.snapshot.raw_r = 0.42;
+        let mut source = legacy.source.clone();
+        source.tp_pct = 20.0;
+        source.sl_pct = 6.0;
+        let artifact = build_expectancy_artifact(serde_json::from_value(json!({
+            "source":source,"selectedCell":{"rawR":0.42,"tpCount":426,"slCount":874},
+            "matrixMeanR":envelope.snapshot.mean_r,
+            "daily":{"status":"available","value":[
+                {"dayStartUnix":legacy.origin_unix,"rowCount":650,"tpCount":213,"slCount":437,"meanR":0.42},
+                {"dayStartUnix":legacy.origin_unix+7*86400,"rowCount":650,"tpCount":213,"slCount":437,"meanR":0.42}
+            ]}
+        })).unwrap()).unwrap();
+        setup.recommendation = serde_json::to_value(&envelope).unwrap();
+        setup.recommendation["rawSignalAt"] = json!(setup.raw.close_time_unix);
+        slot.selected_cell = json!({"tpPct":20,"slPct":6,"rawR":0.42});
+        slot.result["recommendation"] = serde_json::to_value(&envelope.snapshot).unwrap();
+        slot.result["best"]["matrix"] = json!([{"tpPct":18,"slPct":6,"forecastRiskExpectancy":1.08,"meanRiskExpectancy":0.53}]);
+        let original_bytes = artifact.to_json().unwrap();
+        attach(&slot, &instrument, &mut setup, Some(&original(&artifact)), Some(23)).unwrap();
+        let saved: AdaptiveExpectancySnapshot = serde_json::from_value(setup.recommendation["expectancy"].clone()).unwrap();
+        assert_eq!(saved.selected_mean_r.as_ref(), Some(&0.42));
+        let key = saved.image_key.as_ref().unwrap();
+        assert_eq!((key.tp_pct, key.sl_pct), (20.0, 6.0));
+        let caption = super::super::caption::recommendation_telegram_caption(&instrument, &setup.raw, &setup.recommendation).unwrap();
+        assert!(caption.text.contains("TP = 20%, SL = 6%"));
+        assert!(!caption.text.contains("TP = 18%"));
+        let objective = saved.objective.as_ref().unwrap();
+        let png = setups_analytics::expectancy_chart::render_png_with_objective(
+            &artifact, objective.settings, setup.raw.close_time_unix, *objective.decision_r.as_ref().unwrap()).unwrap();
+        setups_relay_protocol::v2::validate_png(&png).unwrap();
+        assert_eq!(artifact.to_json().unwrap(), original_bytes);
+        let frozen = serde_json::to_vec(&setup.recommendation).unwrap();
+        attach(&slot, &instrument, &mut setup, None, None).unwrap();
+        assert_eq!(serde_json::to_vec(&setup.recommendation).unwrap(), frozen, "already frozen payload is not reformatted");
+        let mut other = artifact.clone();
+        other.source.tp_pct = 18.0;
+        assert!(freeze(&envelope, setup.raw.close_time_unix, Some(&other)).is_err());
+    }
+
+    #[test]
     fn explicit_recipe_freezes_pure_f_and_scalar_overlay_identity_without_legacy_fallback() {
         let (envelope, artifact, instrument, mut setup, slot) = probability_fixture();
         let sealed = artifact.to_json().unwrap();

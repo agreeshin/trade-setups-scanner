@@ -2547,6 +2547,42 @@ mod tests {
     }
 
     #[test]
+    fn png_title_uses_recommended_period_mean_not_other_cell_or_matrix_mean() {
+        // Synthetic 20/6 recommendation: 213 TP + 437 SL give mean 0.42 R.
+        // The separate 18/6 forecast-max's 0.53 R is not an input to rendering.
+        let mut source = input();
+        source.source.tp_pct = 20.0;
+        source.source.sl_pct = 6.0;
+        source.selected_cell = Some(setups_domain::expectancy::SelectedCellInput {
+            raw_r: Some(0.42),
+            tp_count: 426,
+            sl_count: 874,
+        });
+        source.matrix_mean_r = Some(0.21);
+        let origin = source.source.provenance.from_unix.div_euclid(86400) * 86400;
+        source.daily = MetricAvailability::Available {
+            value: [0, 7]
+                .into_iter()
+                .map(|day| setups_domain::expectancy::UtcDailyInput {
+                    day_start_unix: origin + day * 86400,
+                    row_count: 650,
+                    tp_count: 213,
+                    sl_count: 437,
+                    mean_r: Some(0.42),
+                })
+                .collect(),
+        };
+        let artifact = build_expectancy_artifact(source).unwrap();
+        let frozen = artifact.to_json().unwrap();
+        let svg = render_svg(&artifact).unwrap();
+        assert!(svg.contains("Среднее МО: <tspan fill=\"#18cf98\">+0.42 R</tspan>"));
+        assert!(!svg.contains("+0.53 R</tspan>") && !svg.contains("+0.21 R</tspan>"));
+        let png = render_png(&artifact).unwrap();
+        setups_relay_protocol::v2::validate_png(&png).unwrap();
+        assert_eq!(artifact.to_json().unwrap(), frozen);
+    }
+
+    #[test]
     fn period_mean_is_trade_weighted_and_zero_label_follows_the_axis_in_every_sign() {
         let weighted = with_outcomes(2.0, 1.0, &[(0, 2, 1), (3, 0, 1), (9, 1, 0)]);
         assert!((period_mean_r(&weighted, weighted.daily.as_ref().unwrap()) - 0.8).abs() < 1e-12);

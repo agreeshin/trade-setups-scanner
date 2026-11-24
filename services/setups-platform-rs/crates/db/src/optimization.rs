@@ -147,6 +147,103 @@ pub fn forecast_best_pair(result: Option<&Value>, spec: &Value) -> Option<Foreca
         })
 }
 
+/// Detail-only scalar projection of the persisted selectedCell. `meanR` here
+/// means the pair's period mean (rawR), never selectedCell.meanR (matrix mean).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecommendedPair {
+    pub tp_pct: f64,
+    pub sl_pct: f64,
+    pub mean_r: f64,
+    pub forecast_r: Option<f64>,
+    pub decision_r: Option<f64>,
+    /// Original generation admission, not the mutable current profile status.
+    pub adaptive_accepted: Option<bool>,
+}
+
+fn recommended_pair(result: &Value, spec: &Value) -> Result<Option<RecommendedPair>, DbError> {
+    let invalid = || DbError::Json("recommended_pair_identity_mismatch".into());
+    let Some(cell) = result.get("selectedCell").filter(|value| !value.is_null()) else {
+        return Ok(None); // No persisted choice: do not select a new legacy winner.
+    };
+    let finite = |value: &Value| value.as_f64().filter(|value| value.is_finite());
+    let optional = |key: &str| -> Result<Option<f64>, DbError> {
+        match cell.get(key).filter(|value| !value.is_null()) {
+            None => Ok(None),
+            Some(value) => finite(value).map(Some).ok_or_else(invalid),
+        }
+    };
+    let tp_pct = finite(&cell["tpPct"]).ok_or_else(invalid)?;
+    let sl_pct = finite(&cell["slPct"]).ok_or_else(invalid)?;
+    let mean_r = finite(&cell["rawR"]).ok_or_else(invalid)?;
+    if !(0.0 < tp_pct && tp_pct <= 100.0 && 0.0 < sl_pct && sl_pct <= 100.0) {
+        return Err(invalid());
+    }
+    let forecast_r = optional("forecastR")?;
+    let blend_r = optional("blendR")?;
+    let mode = spec
+        .get("trendMode")
+        .and_then(Value::as_str)
+        .unwrap_or("mean");
+    let decision_r = match mode {
+        "mean" => Some(mean_r),
+        "forecast" => forecast_r,
+        "blend" => blend_r,
+        _ => return Err(invalid()),
+    };
+    if let Some(handoff) = result
+        .get("recommendation")
+        .filter(|value| !value.is_null())
+    {
+        if finite(&handoff["tpPct"]) != Some(tp_pct)
+            || finite(&handoff["slPct"]) != Some(sl_pct)
+            || finite(&handoff["rawR"]) != Some(mean_r)
+            || finite(&handoff["searchForecast"]["cellR"]) != forecast_r
+            || finite(&handoff["searchForecast"]["blend"]["cellR"]) != blend_r
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(Some(RecommendedPair {
+        tp_pct,
+        sl_pct,
+        mean_r,
+        forecast_r,
+        decision_r,
+        adaptive_accepted: None,
+    }))
+}
+
+/// Read only the exact original generation, not current profile pointers. The
+/// SQL projection retains no matrix/candles; scratch lives for this request.
+pub async fn get_recommended_pair(
+    pool: &PgPool,
+    study: &StudyRecord,
+) -> Result<Option<RecommendedPair>, DbError> {
+    let Some(result) = study.result.as_ref() else {
+        return Ok(None);
+    };
+    let Some(generation) = study.continuous_generation_id else {
+        return recommended_pair(result, &study.spec);
+    };
+    let row = sqlx::query("select g.accepted, g.spec=$4 and g.result->'best'=$5 as same_source, jsonb_build_object('selectedCell',g.result->'selectedCell','recommendation',g.result->'recommendation') as selection from continuous_generations g where g.id=$1 and g.study_id=$2 and g.owner_id=$3 and g.status='completed'")
+        .bind(generation).bind(study.id).bind(&study.owner_id).bind(&study.spec).bind(&result["best"])
+        .fetch_optional(pool).await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.try_get::<Option<bool>, _>("same_source")? != Some(true) {
+        return Err(DbError::Json(
+            "recommended_pair_frozen_source_mismatch".into(),
+        ));
+    }
+    let mut pair = recommended_pair(&row.try_get::<Value, _>("selection")?, &study.spec)?;
+    if let Some(pair) = &mut pair {
+        pair.adaptive_accepted = row.try_get("accepted")?;
+    }
+    Ok(pair)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StudySummary {
@@ -548,6 +645,39 @@ mod forecast_tests {
     fn cell(forecast: f64, mean: f64, tp: f64) -> Value {
         json!({"forecastRiskExpectancy":forecast,"meanRiskExpectancy":mean,
             "riskExpectancy":99,"tpPct":tp,"slPct":4})
+    }
+
+    #[test]
+    fn recommended_pair_projects_selected_handoff_not_forecast_max_or_matrix_mean() {
+        let result = json!({"selectedCell":{"tpPct":20,"slPct":6,"rawR":0.42,"meanR":0.1,
+            "forecastR":1.02,"blendR":0.84,"robustScore":0.7},
+            "recommendation":{"tpPct":20,"slPct":6,"rawR":0.42,
+                "searchForecast":{"cellR":1.02,"blend":{"cellR":0.84}}}});
+        let before = result.clone();
+        let pair = recommended_pair(&result, &json!({"trendMode":"blend"})).unwrap().unwrap();
+        assert_eq!(json!(pair), json!({"tpPct":20.0,"slPct":6.0,"meanR":0.42,"forecastR":1.02,"decisionR":0.84,"adaptiveAccepted":null}));
+        assert_eq!(result, before);
+        let mut mismatched = result.clone();
+        mismatched["recommendation"]["tpPct"] = json!(18);
+        assert!(recommended_pair(&mismatched, &json!({"trendMode":"blend"})).is_err());
+        mismatched = result.clone();
+        mismatched["recommendation"]["rawR"] = json!(0.53);
+        assert!(recommended_pair(&mismatched, &json!({"trendMode":"blend"})).is_err());
+    }
+
+    #[test]
+    fn recommended_pair_preserves_missing_legacy_metrics_and_mode_specific_decision() {
+        assert!(recommended_pair(&json!({"best":{"matrix":[cell(1.08,0.53,18.0)]}}), &json!({})).unwrap().is_none());
+        for (mode, expected) in [("mean",Some(-0.2)),("forecast",Some(0.0)),("blend",None)] {
+            let pair = recommended_pair(&json!({"selectedCell":{"tpPct":20,"slPct":6,"rawR":-0.2,"forecastR":0}}),
+                &json!({"trendMode":mode})).unwrap().unwrap();
+            assert_eq!(pair.mean_r, -0.2);
+            assert_eq!(pair.forecast_r, Some(0.0));
+            assert_eq!(pair.decision_r, expected);
+        }
+        let pair = recommended_pair(&json!({"selectedCell":{"tpPct":20,"slPct":6,"rawR":0.42}}), &json!({"trendMode":"forecast"})).unwrap().unwrap();
+        assert_eq!((pair.forecast_r,pair.decision_r),(None,None));
+        assert!(recommended_pair(&json!({"selectedCell":{"tpPct":0,"slPct":6,"rawR":0.42}}),&json!({})).is_err());
     }
 
     #[test]

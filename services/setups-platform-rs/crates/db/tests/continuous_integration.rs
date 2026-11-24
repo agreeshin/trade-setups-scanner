@@ -238,6 +238,44 @@ async fn accepted(pool: &PgPool) -> db::ActiveAdaptiveSlot {
         .remove(0)
 }
 
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn study_recommended_pair_reads_original_generation_not_current_profile_or_forecast_max() {
+    isolated(|pool| async move {
+        setups_db::migrate::ensure_migrations(&pool).await.unwrap();
+        let profile = accepted(&pool).await;
+        let mut frozen_spec = spec(ALGORITHM);
+        frozen_spec["trendMode"] = json!("blend");
+        let best = json!({"trendMode":"blend","score":0.9,"matrix":[
+            {"tpPct":18,"slPct":6,"forecastRiskExpectancy":1.08,"meanRiskExpectancy":0.53},
+            {"tpPct":20,"slPct":6,"forecastRiskExpectancy":1.02,"meanRiskExpectancy":0.42}
+        ]});
+        let selected = json!({"tpPct":20,"slPct":6,"rawR":0.42,"meanR":0.1,"forecastR":1.02,"blendR":0.84});
+        let result = json!({"best":best,"selectedCell":selected,"recommendation":{
+            "tpPct":20,"slPct":6,"rawR":0.42,"searchForecast":{"cellR":1.02,"blend":{"cellR":0.84}}
+        }});
+        sqlx::query("update optimization_studies set spec=$2,result=$3 where id=$1")
+            .bind(profile.study_id).bind(&frozen_spec).bind(json!({"best":best})).execute(&pool).await.unwrap();
+        sqlx::query("update continuous_generations set spec=$2,result=$3 where id=$1")
+            .bind(profile.generation_id).bind(&frozen_spec).bind(&result).execute(&pool).await.unwrap();
+        // Mutable current slot values must not influence historical detail.
+        sqlx::query("update continuous_slots set selected_cell=$2 where id=$1")
+            .bind(profile.slot_id).bind(json!({"tpPct":99,"slPct":1,"rawR":9})).execute(&pool).await.unwrap();
+        let study = optimization::get(&pool, profile.study_id).await.unwrap().unwrap();
+        let before = serde_json::to_value(&study).unwrap();
+        let pair = optimization::get_recommended_pair(&pool, &study).await.unwrap().unwrap();
+        assert_eq!(json!(pair),json!({"tpPct":20.0,"slPct":6.0,"meanR":0.42,"forecastR":1.02,"decisionR":0.84,"adaptiveAccepted":true}));
+        assert_eq!(optimization::forecast_best_pair(study.result.as_ref(), &study.spec).unwrap().tp_pct,18.0);
+        assert_eq!(serde_json::to_value(optimization::get(&pool,profile.study_id).await.unwrap().unwrap()).unwrap(),before);
+        let saved: Value = sqlx::query_scalar("select result from continuous_generations where id=$1")
+            .bind(profile.generation_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(saved,result,"GET projection cannot rewrite the frozen handoff");
+        sqlx::query("update continuous_generations set result=jsonb_set(result,'{recommendation,rawR}','0.53') where id=$1")
+            .bind(profile.generation_id).execute(&pool).await.unwrap();
+        assert!(optimization::get_recommended_pair(&pool,&study).await.is_err(),"same-identity metric conflict must not be hidden");
+    }).await;
+}
+
 fn adaptive_write(open: i64) -> db::AdaptiveSetupWrite {
     db::AdaptiveSetupWrite {
         exchange_code: "bybit".into(),
