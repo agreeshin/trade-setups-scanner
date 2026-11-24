@@ -1,5 +1,15 @@
 # План разработки продукта
 
+### 24 ноября 2026 - Recommendation parity, две study-линии и точный период Analytics
+
+- **in_progress / цель:** выполнить пункты владельца 1–4, поэтапно commit/push, затем hot deploy полного актуального app-набора на medved и TV с сохранением текущих исследований. Решение50 фиксируется в PRD до source. PostgreSQL/market-data/история не перезапускаются; Stop/Start/reset и прерывание manual RAM-only работ не разрешены.
+- **in_progress / маршрутизация:** backend recommendation/Telegram/PNG parity, study chart, Analytics minute range и production actual53/54 разделены. Три старых descriptor route недоступны; ops blocked C60SQL до SSH. MAIN обновляет PRD/интеграцию, source slices переназначаются доступным local tasks, production diagnosis продолжается напрямую read-only.
+- **pending / 1:** доказать persisted identities study58: recommended selected pair/profile/Telegram TP-SL/PNG mean против независимого forecastBest. Исправлять только реальный mismatch; UI явно разделяет «Рекомендованную пару» и сравнительный forecast-max. Frozen delivery bytes не переписывать.
+- **pending / 2:** study-модал сохраняет dashed sealed original model и добавляет solid combined original+published-actual модель тем же objective/method/recipe/λ; combined диагностический, не меняет winner/gate/profile/Telegram.
+- **pending / 3:** read-only восстановить timeline actual53/54 и medved restart/market-data. Terminal ошибки не переписывать без установленного дефекта; исправление recovery/UI либо новая revision только по подтверждённому контракту.
+- **pending / 4:** Analytics SHORT/LONG получают exact minute `[fromUnix,toUnix)` через общие date-time controls; matrix/cell/chart/cache/stale fence используют одинаковые границы, legacy day-only settings загружаются совместимо, расчёт не запускается скрыто.
+- **pending / acceptance/deploy:** focused red→green, full web/native/typecheck/lint/build и browser desktop/mobile. Затем fresh baseline обоих hosts, штатный drain до drained, guards/backup, app-only images, сохранение IDs/frozen inputs/start/cutoff/deadline/retries и фактическое продвижение research/live; resume только собственной паузы.
+
 ### 24 ноября 2026 - Модалы, селекторы и график Analytics
 
 - **completed / цель:** пункты владельца 1.1, 2.1–2.3, 3.1, 4.1 реализованы, проверены, опубликованы и развёрнуты только на medved. PRD49 и UX опубликованы до кода; прежние записи PLAN сохранены. OWN maintenance resume подтверждён, остановленное пользователем исследование не запускалось.
