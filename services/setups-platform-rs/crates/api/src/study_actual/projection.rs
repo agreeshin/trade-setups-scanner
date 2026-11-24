@@ -2,10 +2,8 @@
 //! never writes an artifact, selected cell, profile, recommendation or delivery.
 use serde::Serialize;
 use setups_domain::expectancy::{
-    EXPECTANCY_MAX_POINTS, ExpectancyArtifact, ExpectancyInput, ExpectancyObjective,
-    MetricAvailability, SelectedCellInput, UtcDailyInput, build_expectancy_artifact,
+    ExpectancyArtifact, ExpectancyObjective, UtcDailyInput,
 };
-use std::collections::BTreeMap;
 
 use super::display::DisplayAvailability;
 
@@ -60,70 +58,18 @@ pub fn project(
 fn evaluate(artifact: &ExpectancyArtifact, objective: ExpectancyObjective, actual: &PublishedActual<'_>)
     -> Result<(String, Vec<ModelPoint>), &'static str>
 {
-    artifact.validate().map_err(|_| "original_model_invalid")?;
-    objective.validate().map_err(|_| "original_objective_invalid")?;
-    if artifact.source.forecast != objective.forecast { return Err("original_recipe_mismatch"); }
     if actual.revision <= 0 || actual.job_id.is_empty() || actual.cutoff < artifact.source.provenance.observation_cutoff {
         return Err("post_study_stale");
     }
-    if actual.daily.len() > EXPECTANCY_MAX_POINTS { return Err("combined_series_budget_exceeded"); }
-    if actual.daily.windows(2).any(|days| days[0].day_start_unix >= days[1].day_start_unix) { return Err("combined_daily_invalid"); }
     if !actual.daily.iter().any(|p| p.tp_count > 0 || p.sl_count > 0) { return Err("post_study_no_closed_outcomes"); }
-    let original = artifact.daily.as_ref().ok_or("original_series_unavailable")?;
-    // Keep original scientific setup-count weights (not display archive's closed
-    // counts). New cohorts use the same recipe-dependent price-gate selection;
-    // unclosed/no_data rows still carry weight, never a fabricated zero R.
-    // Merge a shared UTC day BEFORE fitting, never fit two independent curves or
-    // average their means. IANA observed geometry is an independent projection.
-    let mut days = BTreeMap::<i64, UtcDailyInput>::new();
-    let q = artifact.source.tp_pct / artifact.source.sl_pct;
-    for p in original.iter().map(|p| UtcDailyInput { day_start_unix: p.day_start_unix,
-        row_count: p.row_count, tp_count: p.tp_count, sl_count: p.sl_count, mean_r: p.mean_r })
-        .chain(actual.daily.iter().copied())
-    {
-        let closed = p.tp_count.checked_add(p.sl_count).ok_or("combined_count_overflow")?;
-        if p.day_start_unix % 86400 != 0 || p.day_start_unix > actual.cutoff || closed > p.row_count
-            || p.mean_r.is_some() != (closed > 0)
-            || p.mean_r.is_some_and(|value| !value.is_finite() || (value - (q*p.tp_count as f64-p.sl_count as f64)/closed as f64).abs() > 1e-9*value.abs().max(1.0)) {
-            return Err("combined_daily_invalid");
-        }
-        let day = days.entry(p.day_start_unix).or_insert(UtcDailyInput { day_start_unix: p.day_start_unix,
-            row_count: 0, tp_count: 0, sl_count: 0, mean_r: None });
-        day.row_count = day.row_count.checked_add(p.row_count).ok_or("combined_count_overflow")?;
-        day.tp_count = day.tp_count.checked_add(p.tp_count).ok_or("combined_count_overflow")?;
-        day.sl_count = day.sl_count.checked_add(p.sl_count).ok_or("combined_count_overflow")?;
-        let closed = day.tp_count.checked_add(day.sl_count).ok_or("combined_count_overflow")?;
-        day.mean_r = (closed > 0).then(|| (q*day.tp_count as f64-day.sl_count as f64)/closed as f64);
-        if days.len() > EXPECTANCY_MAX_POINTS { return Err("combined_series_budget_exceeded"); }
-    }
-    let (tp, sl) = days.values().try_fold((0u64, 0u64), |(tp, sl), p|
-        Some((tp.checked_add(p.tp_count)?, sl.checked_add(p.sl_count)?))).ok_or("combined_count_overflow")?;
-    let closed = tp.checked_add(sl).ok_or("combined_count_overflow")?;
-    // Ephemeral evaluator input only. The clone is never persisted or returned
-    // as original provenance; all arrays die with this bounded detail request.
-    let mut source = artifact.source.clone();
-    source.provenance.observation_cutoff = actual.cutoff;
-    // Actual signal closes include C (runtime::emitted uses <= C), whereas
-    // artifact provenance uses [from,to). C+1 includes the UTC bucket at an
-    // exact-midnight C without advancing the model's observation cutoff.
-    source.provenance.to_unix = actual.cutoff.checked_add(1).ok_or("combined_cutoff_invalid")?.max(source.provenance.to_unix);
-    let diagnostic = build_expectancy_artifact(ExpectancyInput {
-        source, selected_cell: Some(SelectedCellInput { raw_r: Some((q*tp as f64-sl as f64)/closed as f64), tp_count: tp, sl_count: sl }),
-        matrix_mean_r: None, daily: MetricAvailability::Available { value: days.into_values().collect() },
-    }).map_err(|_| "combined_evaluation_unavailable")?;
-    let series = diagnostic.objective_series(objective).map_err(|_| "combined_evaluation_unavailable")?;
-    if let MetricAvailability::Unavailable { reason } = series.decision_r {
-        return Err(match reason {
-            setups_domain::expectancy::ExpectancyUnavailableReason::InsufficientFiniteDays => "combined_insufficient_finite_days",
-            _ => "combined_objective_unavailable",
-        });
-    }
+    let series = crate::expectancy_projection::evaluate(artifact, objective, actual.daily, actual.cutoff)?;
     Ok((series.method.into(), series.curve.into_iter().map(|(at_unix, value)| ModelPoint { at_unix, value }).collect()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use setups_domain::expectancy::{EXPECTANCY_MAX_POINTS, ExpectancyInput, build_expectancy_artifact};
     use setups_domain::{forecast::ForecastRecipe, trend::{TrendBendDays, TrendBlendLambda, TrendMode}};
 
     fn fixture(recipe: Option<ForecastRecipe>) -> ExpectancyArtifact {

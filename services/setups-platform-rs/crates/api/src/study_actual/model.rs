@@ -208,7 +208,7 @@ async fn load_source(
     Ok(value)
 }
 
-fn source_objective(spec: &StudyRequest) -> Result<ExpectancyObjective, &'static str> {
+pub(crate) fn source_objective(spec: &StudyRequest) -> Result<ExpectancyObjective, &'static str> {
     // Same method dispatch as optimizer::trend::effective_bend: the legacy
     // spec bend is inactive for explicit recipes. Never rewrite the saved spec.
     let bend = match spec.forecast {

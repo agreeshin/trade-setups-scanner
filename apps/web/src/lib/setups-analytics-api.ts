@@ -1,6 +1,8 @@
 import { apiFetch } from "./platform-api";
 import { parseSetupTradeOutcome } from "./setup-outcomes-api";
 import type { SetupRow } from "../routes/platform-controls";
+import { buildForecastRecipe, isTrendBendDays, restoreForecastRecipeDraft, type ForecastRecipe } from "./forecast-recipe";
+import type { TrendBendDays } from "./analytics-api";
 
 export interface SetupsAnalyticsStudyMeta {
   studyId: number;
@@ -336,4 +338,161 @@ export async function fetchStudyExpectancy(studyId: number, live: readonly Study
       points: trend !== null && Array.isArray(trend.points) ? expectArray(trend.points, isStudyTrendPoint, "trend.points") : [],
     },
   };
+}
+
+export type IssuedStudyAvailability = { status: "available" } | { status: "unavailable"; reason: string };
+/** Saved research settings, never inferred from shared controls or forecastBest. */
+export interface IssuedStudyObjective {
+  version: 1; trendMode: "mean" | "forecast" | "blend"; trendBendDays: TrendBendDays;
+  trendBlendLambda: number; forecast: ForecastRecipe | null;
+}
+export interface IssuedStudyProjection {
+  availability: IssuedStudyAvailability;
+  method: string | null;
+  points: { atUnix: number; value: number | null }[];
+  meanR: number | null; forecastR: number | null; decisionR: number | null;
+  fittedOnIssuedData: boolean;
+}
+export interface IssuedStudyFilter { fromUnix?: number | null; toUnix?: number | null; q?: string | null }
+export interface IssuedStudyDay {
+  dayUnix: number; sumR: number | null; meanR: number | null; tpCount: number; slCount: number;
+  closedCount: number; historicalClosedCount: number; issuedClosedCount: number;
+}
+/** Direct DTO for /study-expectancy/{id}/projection, never a post-study job.
+ * GET reads a fixed saved snapshot and sealed curve without combined evaluation.
+ * POST evaluates only that fingerprinted snapshot in RAM using the SAME recipe;
+ * no browser aggregates, refresh, replay, reconstruction or market reads.
+ * One open dialog owns <=3661 days / 10000 points per curve and releases on close. */
+export interface IssuedStudyExpectancy {
+  version: 1; studyId: number; sourceKind: "persisted_issued_setups"; retrospective: false;
+  objective: IssuedStudyObjective;
+  recommendedPair: { tpPct: number; slPct: number };
+  originalSource: { studyIdentity: string; artifactId: number | null; artifactKey: string | null; revisionKey: "original"; observationCutoff: number | null };
+  issuedSource: { availability: IssuedStudyAvailability; outcomePolicy: string; setupCount: number; closedCount: number | null; scientificDay: "raw_signal_close_utc"; observedDay: "entry_utc" };
+  filter: IssuedStudyFilter; snapshot: SetupsAnalyticsSnapshot; startDayUnix: number;
+  /** Server-owned UTC day sums/counts; timezone changes format, never regroup or fit. */
+  originalDaily: IssuedStudyDay[]; daily: IssuedStudyDay[];
+  originalProjection: IssuedStudyProjection;
+  combinedProjection: IssuedStudyProjection;
+}
+
+function invalidIssuedStudy(): SetupsAnalyticsApiError {
+  return new SetupsAnalyticsApiError("Несовместимый сохранённый график исследования: снимок, рецепт, источник или численные поля.");
+}
+function issuedAvailability(value: unknown): IssuedStudyAvailability {
+  if (!isRecord(value)) throw invalidIssuedStudy();
+  if (value.status === "available") return { status: "available" };
+  if (value.status === "unavailable" && typeof value.reason === "string" && value.reason.length > 0 && value.reason.length <= 2000) return { status: "unavailable", reason: value.reason };
+  throw invalidIssuedStudy();
+}
+function issuedObjective(value: unknown): IssuedStudyObjective {
+  if (!isRecord(value) || value.version !== 1 || (value.trendMode !== "mean" && value.trendMode !== "forecast" && value.trendMode !== "blend")
+    || !isTrendBendDays(value.trendBendDays) || !isFiniteNumber(value.trendBlendLambda) || value.trendBlendLambda < 0.05 || value.trendBlendLambda > 0.95) throw invalidIssuedStudy();
+  let forecast: ForecastRecipe | null = null;
+  if (value.forecast !== null) {
+    try {
+      const draft = restoreForecastRecipeDraft(value.forecast);
+      if (draft === undefined) throw invalidIssuedStudy();
+      forecast = buildForecastRecipe(draft);
+    } catch { throw invalidIssuedStudy(); }
+  }
+  return { version: 1, trendMode: value.trendMode, trendBendDays: value.trendBendDays, trendBlendLambda: value.trendBlendLambda, forecast };
+}
+function issuedProjection(value: unknown, cutoff: number, objective: IssuedStudyObjective, fitted: boolean): IssuedStudyProjection {
+  if (!isRecord(value) || value.fittedOnIssuedData !== fitted || !(value.method === null || (typeof value.method === "string" && value.method.length <= 128))
+    || ![value.meanR, value.forecastR, value.decisionR].every((item) => item === null || isFiniteNumber(item))
+    || !Array.isArray(value.points) || value.points.length > 10000) throw invalidIssuedStudy();
+  const availability = issuedAvailability(value.availability);
+  let previous = -Infinity;
+  const points = value.points.map((point: unknown) => {
+    if (!isRecord(point) || !isUnix(point.atUnix) || point.atUnix < previous || point.atUnix > cutoff || !(point.value === null || isFiniteNumber(point.value))) throw invalidIssuedStudy();
+    previous = point.atUnix;
+    return { atUnix: point.atUnix, value: point.value };
+  });
+  if (availability.status === "available" ? value.method === null || !isFiniteNumber(value.decisionR) || !points.some((point) => point.value !== null)
+    || (objective.trendMode === "mean" ? value.method !== "mean" : objective.forecast?.method === "decayed_probability" ? value.method !== "decayed_probability" : !["trend", "ols", "linear", "p_spline"].includes(value.method))
+    : points.length !== 0 || value.meanR !== null || value.forecastR !== null || value.decisionR !== null) throw invalidIssuedStudy();
+  return { availability, method: value.method, points, meanR: value.meanR as number | null,
+    forecastR: value.forecastR as number | null, decisionR: value.decisionR as number | null, fittedOnIssuedData: fitted };
+}
+
+function issuedFilter(value: unknown): IssuedStudyFilter {
+  if (!isRecord(value) || ![value.fromUnix, value.toUnix].every((item) => item === undefined || item === null || isCount(item))
+    || ((value.fromUnix == null) !== (value.toUnix == null)) || (isCount(value.fromUnix) && isCount(value.toUnix) && value.fromUnix >= value.toUnix)
+    || !(value.q === undefined || value.q === null || (typeof value.q === "string" && value.q.length <= 200))) throw invalidIssuedStudy();
+  return { fromUnix: value.fromUnix as number | null | undefined ?? null, toUnix: value.toUnix as number | null | undefined ?? null, q: value.q ?? null };
+}
+function issuedDays(value: unknown, cutoff: number): IssuedStudyDay[] {
+  if (!Array.isArray(value) || value.length > 3661) throw invalidIssuedStudy();
+  let previous = -Infinity;
+  return value.map((point: unknown) => {
+    if (!isRecord(point) || !isUnix(point.dayUnix) || point.dayUnix % 86400 !== 0 || point.dayUnix <= previous || point.dayUnix > cutoff || !isCount(point.closedCount)
+      || !isCount(point.tpCount) || !isCount(point.slCount) || point.tpCount + point.slCount !== point.closedCount
+      || !isCount(point.historicalClosedCount) || !isCount(point.issuedClosedCount) || point.historicalClosedCount + point.issuedClosedCount !== point.closedCount
+      || !(point.sumR === null || isFiniteNumber(point.sumR)) || !(point.meanR === null || isFiniteNumber(point.meanR))
+      || (point.closedCount === 0 ? point.meanR !== null || (point.sumR !== null && point.sumR !== 0)
+        : point.sumR === null || point.meanR === null || Math.abs(point.sumR / point.closedCount - point.meanR) > 1e-9 * Math.max(1, Math.abs(point.meanR)))) throw invalidIssuedStudy();
+    previous = point.dayUnix;
+    return { dayUnix: point.dayUnix, sumR: point.sumR, meanR: point.meanR, closedCount: point.closedCount,
+      tpCount: point.tpCount, slCount: point.slCount, historicalClosedCount: point.historicalClosedCount, issuedClosedCount: point.issuedClosedCount };
+  });
+}
+
+export function parseIssuedStudyExpectancy(value: unknown, studyId: number, filter: IssuedStudyFilter = {}): IssuedStudyExpectancy {
+  if (!isRecord(value) || value.version !== 1 || value.studyId !== studyId || value.sourceKind !== "persisted_issued_setups" || value.retrospective !== false
+    || !isSetupsAnalyticsSnapshot(value.snapshot) || !isUnix(value.startDayUnix) || value.startDayUnix % 86400 !== 0
+    || !isRecord(value.recommendedPair) || !isFiniteNumber(value.recommendedPair.tpPct) || value.recommendedPair.tpPct <= 0
+    || !isFiniteNumber(value.recommendedPair.slPct) || value.recommendedPair.slPct <= 0
+    || !isRecord(value.originalSource) || typeof value.originalSource.studyIdentity !== "string" || value.originalSource.studyIdentity.length > 256
+    || !(value.originalSource.artifactId === null || isId(value.originalSource.artifactId)) || !(value.originalSource.artifactKey === null || (typeof value.originalSource.artifactKey === "string" && value.originalSource.artifactKey.length <= 256))
+    || value.originalSource.revisionKey !== "original" || !(value.originalSource.observationCutoff === null || isCount(value.originalSource.observationCutoff))
+    || !isRecord(value.issuedSource) || value.issuedSource.outcomePolicy !== "issued_open_entry_sl_first_10080m" || !isCount(value.issuedSource.setupCount)
+    || !(value.issuedSource.closedCount === null || (isCount(value.issuedSource.closedCount) && value.issuedSource.closedCount <= value.issuedSource.setupCount))
+    || value.issuedSource.scientificDay !== "raw_signal_close_utc" || value.issuedSource.observedDay !== "entry_utc") throw invalidIssuedStudy();
+  const parsedFilter = issuedFilter(value.filter);
+  if (JSON.stringify(parsedFilter) !== JSON.stringify(issuedFilter(filter))) throw invalidIssuedStudy();
+  const objective = issuedObjective(value.objective);
+  return { version: 1, studyId, sourceKind: "persisted_issued_setups", retrospective: false, objective,
+    recommendedPair: { tpPct: value.recommendedPair.tpPct, slPct: value.recommendedPair.slPct }, filter: parsedFilter,
+    snapshot: value.snapshot, startDayUnix: value.startDayUnix,
+    originalSource: { studyIdentity: value.originalSource.studyIdentity, artifactId: value.originalSource.artifactId, artifactKey: value.originalSource.artifactKey,
+      revisionKey: "original", observationCutoff: value.originalSource.observationCutoff },
+    issuedSource: { availability: issuedAvailability(value.issuedSource.availability), outcomePolicy: value.issuedSource.outcomePolicy, setupCount: value.issuedSource.setupCount,
+      closedCount: value.issuedSource.closedCount, scientificDay: "raw_signal_close_utc", observedDay: "entry_utc" },
+    originalDaily: issuedDays(value.originalDaily, value.snapshot.observationCutoff), daily: issuedDays(value.daily, value.snapshot.observationCutoff),
+    originalProjection: issuedProjection(value.originalProjection, value.snapshot.observationCutoff, objective, false),
+    combinedProjection: issuedProjection(value.combinedProjection, value.snapshot.observationCutoff, objective, true) };
+}
+
+async function issuedStudyBody(response: Response): Promise<unknown> {
+  if (response.status === 409) {
+    const body: unknown = await response.json().catch(() => null);
+    if (isRecord(body) && body.error === "setups_study_projection_snapshot_changed") throw new SetupsAnalyticsApiError("Снимок выпущенных сетапов изменился. Модель по всем данным недоступна; исходная модель сохранена. Откройте исследование заново для нового снимка.", 409);
+    throw new SetupsAnalyticsApiError("Оценка модели сейчас недоступна: HTTP 409. Повторный запрос автоматически не запускается.", 409);
+  }
+  return readBody(response);
+}
+export async function fetchIssuedStudyExpectancy(studyId: number, filter: IssuedStudyFilter, signal: AbortSignal): Promise<IssuedStudyExpectancy> {
+  const query = new URLSearchParams();
+  if (filter.fromUnix != null) query.set("fromUnix", String(filter.fromUnix));
+  if (filter.toUnix != null) query.set("toUnix", String(filter.toUnix));
+  if (filter.q != null) query.set("q", filter.q);
+  const suffix = query.size > 0 ? `?${query}` : "";
+  const response = await apiFetch(`/v1/setups/analytics/study-expectancy/${studyId}/projection${suffix}`, { signal });
+  const parsed = parseIssuedStudyExpectancy(await issuedStudyBody(response), studyId, filter);
+  if (parsed.combinedProjection.availability.status === "available") throw invalidIssuedStudy();
+  return parsed;
+}
+export async function evaluateIssuedStudyExpectancy(saved: IssuedStudyExpectancy, signal: AbortSignal): Promise<IssuedStudyExpectancy> {
+  const filter = Object.fromEntries(Object.entries(saved.filter).filter(([, value]) => value != null));
+  const response = await apiFetch(`/v1/setups/analytics/study-expectancy/${saved.studyId}/projection`, { method: "POST", signal,
+    headers: { "content-type": "application/json" }, body: JSON.stringify({ filter, snapshot: saved.snapshot }) });
+  const parsed = parseIssuedStudyExpectancy(await issuedStudyBody(response), saved.studyId, saved.filter);
+  // No old response can change the sealed prefix, cohort or identity. Only the
+  // diagnostic combined projection is allowed to differ between the two phases.
+  const { combinedProjection: previousCombined, ...previousIdentity } = saved;
+  const { combinedProjection: nextCombined, ...nextIdentity } = parsed;
+  void previousCombined; void nextCombined;
+  if (JSON.stringify(previousIdentity) !== JSON.stringify(nextIdentity)) throw invalidIssuedStudy();
+  return parsed;
 }

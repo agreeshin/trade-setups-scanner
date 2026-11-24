@@ -1,13 +1,16 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import userEvent from "@testing-library/user-event";
 import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
 import { SetupsAnalyticsPanel } from "./setups-analytics-panel";
 import { forecastViewFixture } from "../../test/setups-forecast-fixture";
 import type { SetupsProjectionRequest } from "../lib/setups-projection-api";
 import { AnalyticsPage } from "./analytics-page";
 import { RouteActiveContext } from "./route-active";
+import type { IssuedStudyExpectancy } from "../lib/setups-analytics-api";
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
+const requestPath = (input: RequestInfo | URL): string => typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
 const studyMeta1 = { studyId: 40, externalName: "Всплеск цены и оборота", setupCount: 3, generationId: 36, artifactId: 900 };
 const studyMeta2 = { studyId: 41, externalName: "Всплеск цены и оборота", setupCount: 2, generationId: 37, artifactId: null };
 const setupRow = (id: number, slotId: number, status: string, riskReturn: number | null) => ({
@@ -72,10 +75,24 @@ let settingsResponse: (init?: RequestInit) => Response | Promise<Response>;
 let metadataResponse: () => Response;
 let projectionResponse: (init: RequestInit) => Response | Promise<Response>;
 let studyResponse = () => json(optimizationStudy40);
-let expectancyResponse = () => {
-  const horizonDays = Array.from({ length: 13 }, (_, index) => 1793923200 + index * 86400);
-  return json({ studyId: 40, observationCutoff: 1794009600, meanR: 0.2, daily: horizonDays.map((dayUnix, index) => ({ dayUnix, meanR: index % 2 === 0 ? 0.3 : -0.1, tpCount: 1, slCount: 1 })), trend: { method: "mean", points: [{ dayUnix: horizonDays[0]!, value: 0.2 }, { dayUnix: horizonDays.at(-1)!, value: 0.2 }] } });
-};
+function issuedFixture(path: string, overrides: Partial<IssuedStudyExpectancy> = {}, evaluated = true): IssuedStudyExpectancy {
+  const cutoff = Date.parse("2026-11-13T12:00:00Z") / 1000;
+  const day = { dayUnix: 1793923200, meanR: 0.3, sumR: 0.6, closedCount: 2, tpCount: 1, slCount: 1, historicalClosedCount: 2, issuedClosedCount: 0 };
+  return { version: 1, studyId: Number(/study-expectancy\/(\d+)/.exec(path)?.[1] ?? 40), sourceKind: "persisted_issued_setups", retrospective: false,
+    filter: { fromUnix: null, toUnix: null, q: null }, snapshot: { snapshotId: 5, observationCutoff: cutoff, fingerprint: "a".repeat(64) }, startDayUnix: 1793923200,
+    objective: { version: 1, trendMode: "blend", trendBendDays: "14", trendBlendLambda: 0.35,
+      forecast: { method: "decayed_probability", version: 1, halfLifeDays: 7, kappa: 3, priorPolicy: "gross_break_even" } },
+    recommendedPair: { tpPct: 14, slPct: 4 },
+    originalSource: { studyIdentity: "saved-study-40", artifactId: 900, artifactKey: "sealed-original-900", revisionKey: "original", observationCutoff: 1794009600 },
+    issuedSource: { availability: { status: "available" }, outcomePolicy: "issued_open_entry_sl_first_10080m", setupCount: 3, closedCount: 2, scientificDay: "raw_signal_close_utc", observedDay: "entry_utc" },
+    originalDaily: [day], daily: [day, { ...day, dayUnix: 1794009600, meanR: 0.6, sumR: 2.4, closedCount: 4, tpCount: 3, slCount: 1, historicalClosedCount: 2, issuedClosedCount: 2 }],
+    originalProjection: { availability: { status: "available" }, method: "decayed_probability", meanR: 0.3, forecastR: 0.2, decisionR: 0.2, fittedOnIssuedData: false,
+      points: [{ atUnix: 1793923200, value: 0.2 }, { atUnix: 1794009600, value: 0.2 }] },
+    combinedProjection: evaluated ? { availability: { status: "available" }, method: "decayed_probability", meanR: 0.5, forecastR: 0.45, decisionR: 0.45, fittedOnIssuedData: true,
+      points: [{ atUnix: 1793923200, value: 0.4 }, { atUnix: cutoff, value: 0.45 }] }
+      : { availability: { status: "unavailable", reason: "issued_projection_not_evaluated" }, method: null, points: [], meanR: null, forecastR: null, decisionR: null, fittedOnIssuedData: true }, ...overrides };
+}
+let expectancyResponse = (path: string, init?: RequestInit): Response | Promise<Response> => json(issuedFixture(path, {}, init?.method === "POST"));
 const defaultExpectancyResponse = expectancyResponse;
 
 beforeEach(() => {
@@ -98,14 +115,13 @@ beforeEach(() => {
     if (path.startsWith("/v1/setups?")) return Promise.resolve(json({ setups: [], offset: Number(new URL(path, "http://fixture").searchParams.get("offset")), limit: 25, total: 0, snapshotId: 0 }));
     if (path.startsWith("/v1/setups/analytics/studies")) return Promise.resolve(metadataResponse());
     if (path.startsWith("/v1/setups/analytics/forecast-view?")) return Promise.resolve(projectionResponse(init!));
-    if (path === "/v1/setups/analytics/study-expectancy/40") {
-      return Promise.resolve(expectancyResponse());
+    if (path === "/v1/setups/analytics/study-expectancy/40/projection") {
+      return Promise.resolve(expectancyResponse(path, init));
     }
     if (path === "/v1/optimization-studies/40") return Promise.resolve(studyResponse());
     if (path === "/v1/optimization-studies/35") return Promise.resolve(json(optimizationStudy35));
-    if (path === "/v1/setups/analytics/study-expectancy/35") {
-      const horizonDays = Array.from({ length: 13 }, (_, index) => 1793923200 + index * 86400);
-      return Promise.resolve(json({ studyId: 35, observationCutoff: 1794009600, meanR: 0.2, daily: horizonDays.map((dayUnix, index) => ({ dayUnix, meanR: index % 2 === 0 ? 0.3 : -0.1, tpCount: 1, slCount: 1 })), trend: { method: "mean", points: [{ dayUnix: horizonDays[0]!, value: 0.2 }, { dayUnix: horizonDays.at(-1)!, value: 0.2 }] } }));
+    if (path === "/v1/setups/analytics/study-expectancy/35/projection") {
+      return Promise.resolve(json(issuedFixture(path, { studyId: 35 }, init?.method === "POST")));
     }
     if (path.startsWith("/v1/setups/analytics?")) return Promise.resolve(analyticsResponse());
     return Promise.resolve(json({}));
@@ -291,8 +307,8 @@ it("shows study details with the past-and-live chart in a modal", async () => {
   expect(within(dialog).getByText("Исследование №40")).toBeInTheDocument();
   expect(within(dialog).getByText("Лучший score")).toBeInTheDocument();
   expect(within(dialog).getByText("+1.50 R")).toBeInTheDocument();
-  expect(within(dialog).getByText("Лучшая blend-пара")).toBeInTheDocument();
-  expect(within(dialog).getByText("TP 20% / SL 6% · +0.44 R")).toBeInTheDocument();
+  expect(within(dialog).getByText("Рекомендованная пара исследования")).toBeInTheDocument();
+  expect(within(dialog).getByText("TP 14% / SL 4%")).toBeInTheDocument();
   expect(within(dialog).getByText("Полные параметры алгоритма")).toBeInTheDocument();
   expect(within(dialog).getByText("Множитель объёма (×)")).toBeInTheDocument();
   expect(within(dialog).getByText("Мин. объём котировки (USDT)")).toBeInTheDocument();
@@ -303,64 +319,124 @@ it("shows study details with the past-and-live chart in a modal", async () => {
   expect(within(dialog).getByText("включена")).toBeInTheDocument();
   const chart = within(dialog).getByTestId("study-horizon-chart");
   expect(chart.querySelector("[data-divider-day]")).not.toBeNull();
-  expect(chart.querySelectorAll(".grid-day").length).toBe(13);
-  expect(chart.querySelectorAll(".date").length).toBeGreaterThanOrEqual(2);
-  expect(chart.querySelectorAll('[data-phase="past"]').length).toBe(12);
-  expect(chart.querySelectorAll('[data-phase="release"]').length).toBe(1);
-  expect(chart.querySelectorAll('[data-phase="live"]').length).toBe(0);
-  const releasePoint = chart.querySelector('[data-phase="release"]');
-  expect(releasePoint!.getAttribute("fill")).toBe("#18cf98");
-  expect(releasePoint!.getAttribute("data-mean-r")).toBe("0.73");
-  const pastPoint = chart.querySelector('[data-phase="past"]');
-  expect(pastPoint!.getAttribute("fill")).toMatch(/#18cf98|#f08a7f/);
-  const line = chart.querySelector('[data-testid="expectancy-line"]');
-  expect(line).not.toBeNull();
-  const releaseCx = chart.querySelector('[data-phase="release"]')!.getAttribute("cx");
-  expect(line!.getAttribute("points")).toContain(`${releaseCx},`);
-  const forecast = chart.querySelector('[data-testid="forecast-line"]');
-  expect(forecast).not.toBeNull();
-  expect(forecast!.getAttribute("stroke-dasharray")).toBeNull();
-  const nowValue = chart.querySelector('[data-testid="forecast-now-value"]');
-  expect(nowValue).not.toBeNull();
-  expect(nowValue!.getAttribute("fill")).toBe("#f5b041");
-  expect(nowValue!.textContent).toBe("+0.20R");
+  expect(chart.querySelectorAll('[data-phase="observed"]')).toHaveLength(2);
+  expect(chart.querySelector('[data-closed="4"]')).toHaveAttribute("data-mean-r", "0.6");
+  expect(chart.querySelector('[data-closed="4"]')).toHaveAttribute("data-sum-r", "2.4");
+  expect(within(chart).getByTestId("study-original-objective-line")).toHaveAttribute("stroke-dasharray", "6 4");
+  expect(within(chart).getByTestId("study-combined-objective-line")).not.toHaveAttribute("stroke-dasharray");
+  expect(within(chart).getByTestId("study-original-end-value")).toHaveTextContent("+0.20R");
+  expect(within(chart).getByTestId("study-combined-end-value")).toHaveTextContent("+0.45R");
+  expect(within(dialog).getByTestId("issued-study-recipe")).toHaveTextContent("blend · λ 0.35");
+  expect(within(dialog).getByTestId("issued-study-recipe")).toHaveTextContent("H 7 дней · κ 3");
   expect(dialog.querySelector("img")).toBeNull();
   expect(requests).toContain("/v1/optimization-studies/40");
-  expect(requests.some((path) => path === "/v1/setups/analytics/study-expectancy/40")).toBe(true);
+  expect(requests.filter((path) => path === "/v1/setups/analytics/study-expectancy/40/projection")).toHaveLength(2);
+  expect(analyticsCalls()).toHaveLength(1);
+  const models = vi.mocked(fetch).mock.calls.filter(([path]) => requestPath(path).includes("study-expectancy"));
+  expect(models.map(([, init]) => init?.method ?? "GET")).toEqual(["GET", "POST"]);
+  expect(models[0]![1]?.body).toBeUndefined();
+  expect(JSON.parse(models[1]![1]!.body as string)).toEqual({ filter: {}, snapshot: issuedFixture(requestPath(models[0]![0])).snapshot });
 });
 
-it("reports a busy live-outcome read and does not request a misleading historical-only combined chart", async () => {
+it("keeps original-only geometry and provenance when saved issued data are unavailable, without reading or refreshing outcomes", async () => {
   await rendered();
   fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
   await settle();
-  analyticsResponse = () => json({ error: "setups_outcomes_busy" }, 409);
+  expectancyResponse = (path) => {
+    const data = issuedFixture(path, {}, false);
+    return json({ ...data, issuedSource: { ...data.issuedSource, availability: { status: "unavailable", reason: "outcomes_missing" } },
+      combinedProjection: { ...data.combinedProjection, availability: { status: "unavailable", reason: "outcomes_missing" } } });
+  };
   fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" }));
   await settle(); await settle();
   const dialog = within(screen.getByRole("dialog"));
-  expect(requests.filter((path) => path === "/v1/setups/analytics/study-expectancy/40")).toHaveLength(0);
-  expect(dialog.getByRole("alert")).toHaveTextContent("HTTP 409");
-  expect(dialog.queryByTestId("study-horizon-chart")).not.toBeInTheDocument();
+  expect(analyticsCalls()).toHaveLength(1);
+  expect(dialog.getByTestId("study-original-objective-line")).toHaveAttribute("stroke-dasharray", "6 4");
+  expect(dialog.queryByTestId("study-combined-objective-line")).not.toBeInTheDocument();
+  expect(dialog.getByText(/Модель по всем данным: недоступно — outcomes_missing/)).toBeInTheDocument();
+  expect(dialog.getByText(/Выпущенные сетапы: недоступно — outcomes_missing/)).toBeInTheDocument();
+  expect(vi.mocked(fetch).mock.calls.filter(([path, init]) => requestPath(path).includes("/projection") && init?.method === "POST")).toHaveLength(0);
   expect(dialog.queryByText("Загрузка графика…")).not.toBeInTheDocument();
   expect(dialog.getByText("Полные параметры алгоритма")).toBeInTheDocument();
-  expect(dialog.getByText("TP 20% / SL 6% · +0.44 R")).toBeInTheDocument();
+  expect(dialog.getByText("TP 14% / SL 4%")).toBeInTheDocument();
 });
 
-it("accepts a successful empty live population and still requests the saved study series with live=[]", async () => {
+it("shows GET's sealed dashed curve immediately while POST evaluation is pending, then adds the solid issued curve without changing the original", async () => {
+  let finish: ((response: Response) => void) | undefined;
+  expectancyResponse = (path, init) => init?.method === "POST"
+    ? new Promise<Response>((resolve) => { finish = resolve; })
+    : json(issuedFixture(path, {}, false));
+  await rendered(); fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  const trigger = screen.getByRole("button", { name: "Подробности исследования 40" });
+  fireEvent.click(trigger); await settle();
+  const dialog = within(screen.getByRole("dialog"));
+  const original = dialog.getByTestId("study-original-objective-line");
+  expect(original).toHaveAttribute("stroke-dasharray", "6 4");
+  expect(dialog.getByTestId("study-original-end-value")).toHaveTextContent("+0.20R");
+  expect(dialog.getByRole("status")).toHaveTextContent("Вычисление диагностической модели готового снимка");
+  expect(dialog.queryByTestId("study-combined-objective-line")).toBeNull();
+  const modelCalls = vi.mocked(fetch).mock.calls.filter(([path]) => requestPath(path).includes("study-expectancy"));
+  expect(modelCalls.map(([, init]) => init?.method ?? "GET")).toEqual(["GET", "POST"]);
+  await act(async () => { finish!(json(issuedFixture(requestPath(modelCalls[0]![0])))); await Promise.resolve(); });
+  expect(dialog.getByTestId("study-original-objective-line")).toBe(original);
+  expect(dialog.getByTestId("study-original-end-value")).toHaveTextContent("+0.20R");
+  expect(dialog.getByTestId("study-combined-objective-line")).not.toHaveAttribute("stroke-dasharray");
+  expect(dialog.getByTestId("study-combined-end-value")).toHaveTextContent("+0.45R");
+  expect(dialog.queryByRole("status")).toBeNull();
+  expect(analyticsCalls()).toHaveLength(1);
+});
+
+it.each(["stale fingerprint", "identity mismatch"])("retains the sealed original and reports a %s without retrying, refreshing or accepting the combined response", async (failure) => {
+  expectancyResponse = (path, init) => init?.method !== "POST" ? json(issuedFixture(path, {}, false))
+    : failure === "stale fingerprint" ? json({ error: "setups_study_projection_snapshot_changed" }, 409)
+    : json({ ...issuedFixture(path), snapshot: { ...issuedFixture(path).snapshot, fingerprint: "b".repeat(64) } });
+  await rendered(); fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" })); await settle();
+  const dialog = within(screen.getByRole("dialog"));
+  expect(dialog.getByRole("alert")).toHaveTextContent(failure === "stale fingerprint" ? "Снимок выпущенных сетапов изменился" : "Несовместимый сохранённый график");
+  expect(dialog.getByTestId("study-original-objective-line")).toHaveAttribute("stroke-dasharray", "6 4");
+  expect(dialog.queryByTestId("study-combined-objective-line")).toBeNull();
+  expect(dialog.queryByRole("status")).toBeNull();
+  const count = requests.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+  expect(requests).toHaveLength(count); expect(analyticsCalls()).toHaveLength(1);
+  expect(vi.mocked(fetch).mock.calls.filter(([path]) => requestPath(path).includes("study-expectancy"))).toHaveLength(2);
+  expect(requests.some((path) => /study-actual|replay|outcomes\/refresh/.test(path))).toBe(false);
+});
+
+it("aborts both read/evaluation ownership on close and ignores a late evaluated curve", async () => {
+  let finish: ((response: Response) => void) | undefined;
+  expectancyResponse = (path, init) => init?.method === "POST"
+    ? new Promise<Response>((resolve) => { finish = resolve; }) : json(issuedFixture(path, {}, false));
+  await rendered(); fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" })); await settle();
+  const calls = vi.mocked(fetch).mock.calls.filter(([path]) => requestPath(path).includes("study-expectancy"));
+  expect(calls).toHaveLength(2);
+  fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Закрыть" })); await settle();
+  expect(calls[0]![1]?.signal?.aborted).toBe(true); expect(calls[1]![1]?.signal?.aborted).toBe(true);
+  await act(async () => { finish!(json(issuedFixture(requestPath(calls[0]![0])))); await Promise.resolve(); });
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(screen.queryByTestId("study-combined-objective-line")).toBeNull();
+});
+
+it("does not silently fall back to the legacy fit payload or POST when the additive server DTO is missing", async () => {
   await rendered();
   fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
   await settle();
-  analyticsResponse = () => json({ totals: { selected: 0, gatePassed: 0, closed: 0, meanR: null }, studies: [], setups: [] });
+  expectancyResponse = () => json({ studyId: 40, daily: [], trend: { method: "mean", points: [] } });
   fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" }));
   await settle(); await settle();
   const dialog = within(screen.getByRole("dialog"));
-  const seriesCalls = vi.mocked(globalThis.fetch).mock.calls.filter(([path]) => path === "/v1/setups/analytics/study-expectancy/40");
+  const seriesCalls = vi.mocked(globalThis.fetch).mock.calls.filter(([path]) => requestPath(path).startsWith("/v1/setups/analytics/study-expectancy/40/projection"));
   expect(seriesCalls).toHaveLength(1);
-  expect(seriesCalls[0]?.[1]?.body).toBe(JSON.stringify({ live: [] }));
-  expect(dialog.queryByRole("alert")).not.toBeInTheDocument();
-  const chart = dialog.getByTestId("study-horizon-chart");
-  expect(chart.querySelectorAll('[data-phase="past"]').length).toBeGreaterThan(0);
-  expect(chart.querySelectorAll('[data-phase="live"]')).toHaveLength(0);
-  expect(dialog.getByText("TP 20% / SL 6% · +0.44 R")).toBeInTheDocument();
+  expect(seriesCalls[0]?.[1]?.body).toBeUndefined();
+  expect(seriesCalls[0]?.[1]?.method ?? "GET").toBe("GET");
+  expect(dialog.getByRole("alert")).toHaveTextContent("Несовместимый сохранённый график");
+  expect(dialog.queryByTestId("study-horizon-chart")).not.toBeInTheDocument();
+  expect(analyticsCalls()).toHaveLength(1);
+  const before = requests.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
+  expect(requests).toHaveLength(before);
 });
 
 it("opens legacy study details with null analytics without white screen", async () => {
@@ -521,70 +597,34 @@ it("redraws mounted daily outcomes on interface timezone changes without recalcu
   expect(analyticsCalls()).toHaveLength(1);
 });
 
-it("maps modal buckets and release continuity to the configured day but preserves exact forecast instants and UTC model inputs", async () => {
-  applyInterfaceSettings({ timezone: "Asia/Yekaterinburg" });
-  vi.setSystemTime(new Date("2026-11-21T12:00:00Z"));
-  storeRange("2026-11-19T00:00", "2026-11-21T17:00");
-  analyticsResponse = () => json({ ...analyticsResult, setups: [rowAt(1, "2026-11-19T22:00:00Z", "tp", 3), rowAt(2, "2026-11-20T01:00:00Z", "sl", -1)] });
-  studyResponse = () => json({ ...optimizationStudy40, createdAt: "2026-11-19T22:00:00Z" });
-  const trend = [
-    { dayUnix: unix("2026-11-19T02:30:00Z"), value: 0.1 },
-    { dayUnix: unix("2026-11-19T22:15:00Z"), value: 0.4 },
-    { dayUnix: unix("2026-11-20T12:45:00Z"), value: 0.6 },
-    { dayUnix: unix("2026-11-21T13:00:00Z"), value: 0.8 },
-  ];
-  expectancyResponse = () => json({ studyId: 40, observationCutoff: unix("2026-11-20T00:00:00Z"), meanR: 0.3, daily: [
-    { dayUnix: unix("2026-11-19T00:00:00Z"), meanR: 0.4, tpCount: 1, slCount: 1 },
-    { dayUnix: unix("2026-11-20T00:00:00Z"), meanR: 0.2, tpCount: 1, slCount: 1 },
-  ], trend: { method: "probability", points: trend } });
-  await rendered();
-  fireEvent.click(screen.getByRole("button", { name: "Рассчитать" }));
-  await settle();
-  fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" }));
-  await settle();
-  await settle();
-  const chart = within(screen.getByRole("dialog")).getByTestId("study-horizon-chart");
-  expect(chart.querySelector("[data-divider-day]")).toHaveAttribute("data-divider-day", String(unix("2026-11-19T19:00:00Z")));
-  expect(chart.querySelector('[data-phase="past"]')).toHaveAttribute("data-day", "19.11.2026");
-  expect(chart.querySelector('[data-phase="past"]')).toHaveAttribute("data-mean-r", "0.40");
-  expect(chart.querySelector('[data-phase="release"]')).toHaveAttribute("data-day", "20.11.2026");
-  expect(chart.querySelector('[data-phase="release"]')).toHaveAttribute("data-closed", "4");
-  expect(chart.querySelector('[data-phase="release"]')).toHaveAttribute("data-mean-r", "0.60");
-  const releaseX = chart.querySelector('[data-phase="release"]')!.getAttribute("cx");
-  expect(chart.querySelector('[data-testid="expectancy-line"]')!.getAttribute("points")).toContain(`${releaseX},`);
-  const firstDay = unix("2026-11-18T19:00:00Z");
-  const now = unix("2026-11-21T12:00:00Z");
-  const expectedX = (instant: number) => 80 + (instant - firstDay) / (now - firstDay) * (872 - 80);
-  const forecast = chart.querySelector('[data-testid="forecast-line"]')!;
-  const forecastX = forecast.getAttribute("points")!.split(" ").map((point) => Number(point.split(",")[0]));
-  expect(forecastX).toHaveLength(4);
-  [...trend.slice(0, 3).map((point) => point.dayUnix), now].forEach((instant, index) => expect(forecastX[index]).toBeCloseTo(expectedX(instant), 7));
-  expect(forecast).not.toHaveAttribute("stroke-dasharray");
-  expect(forecast).toHaveAttribute("stroke", "#f5b041");
-  expect(chart.querySelector('[data-testid="forecast-now-value"]')).toHaveAttribute("x", "872");
-  expect(chart.querySelector('[data-testid="forecast-now-value"]')).toHaveTextContent("+0.79R");
-  const modelCalls = vi.mocked(fetch).mock.calls.filter(([path]) => path === "/v1/setups/analytics/study-expectancy/40");
-  expect(modelCalls).toHaveLength(1);
-  expect(JSON.parse(modelCalls[0]![1]!.body as string)).toEqual({ live: [
-    { dayUnix: unix("2026-11-19T00:00:00Z"), meanR: 3, closedCount: 1 },
-    { dayUnix: unix("2026-11-20T00:00:00Z"), meanR: -1, closedCount: 1 },
-  ] });
-  const callsBeforeChange = analyticsCalls().length;
+it("preserves the modal's fixed cutoff, snapshot and UTC geometry on presentation-only timezone changes", async () => {
+  await rendered(); fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" })); await settle();
+  const dialog = within(screen.getByRole("dialog"));
+  const snapshot = issuedFixture("/40").snapshot;
+  const mountedChart = dialog.getByTestId("study-horizon-chart");
+  const originalPath = dialog.getByTestId("study-original-objective-line").getAttribute("points");
+  const combinedPath = dialog.getByTestId("study-combined-objective-line").getAttribute("points");
+  const originalValues = dialog.getByTestId("study-original-end-value").textContent;
+  expect(dialog.getByTestId("study-horizon-chart")).toHaveAttribute("data-cutoff", String(snapshot.observationCutoff));
   vi.setSystemTime(new Date("2026-11-22T12:00:00Z"));
-  act(() => { applyInterfaceSettings({ timezone: "America/Los_Angeles" }); });
-  await settle();
-  expect(within(screen.getByRole("dialog")).getByTestId("study-horizon-chart")).toBe(chart);
-  // Original UTC midnight on the 19th maps to the 18th, not to local midnight of the 19th.
-  expect(chart.querySelector('[data-phase="past"]')).toHaveAttribute("data-day", "18.11.2026");
-  expect(chart.querySelector('[data-phase="past"]')).toHaveAttribute("data-mean-r", "0.40");
-  expect(chart.querySelector('[data-phase="past"]')).toHaveAttribute("data-closed", "2");
-  expect(chart.querySelector("[data-divider-day]")).toHaveAttribute("data-divider-day", String(unix("2026-11-19T08:00:00Z")));
-  expect(chart.querySelector('[data-phase="release"]')).toHaveAttribute("data-day", "19.11.2026");
-  expect(chart.querySelector('[data-phase="release"]')).toHaveAttribute("data-mean-r", "0.60");
-  expect(chart.querySelector('[data-testid="forecast-now-value"]')).toHaveTextContent("+0.79R");
-  expect(gridDays(chart).at(-1)).toBe(unix("2026-11-21T08:00:00Z"));
-  expect(analyticsCalls()).toHaveLength(callsBeforeChange);
-  expect(vi.mocked(fetch).mock.calls.filter(([path]) => path === "/v1/setups/analytics/study-expectancy/40")).toHaveLength(1);
+  act(() => { applyInterfaceSettings({ timezone: "America/Los_Angeles" }); }); await settle();
+  const chart = dialog.getByTestId("study-horizon-chart");
+  expect(chart).toBe(mountedChart);
+  expect(chart).toHaveAttribute("data-cutoff", String(snapshot.observationCutoff));
+  expect(chart).toHaveAttribute("data-snapshot-id", "5");
+  expect(chart.querySelector('[data-phase="observed"]')).toHaveAttribute("data-day", "05.11.2026");
+  expect(chart.querySelector('[data-phase="observed"]')).toHaveAttribute("data-mean-r", "0.3");
+  expect(dialog.getByTestId("study-original-objective-line")).toHaveAttribute("points", originalPath);
+  expect(dialog.getByTestId("study-combined-objective-line")).toHaveAttribute("points", combinedPath);
+  expect(dialog.getByTestId("study-original-end-value")).toHaveTextContent(originalValues);
+  const calls = vi.mocked(fetch).mock.calls.filter(([path]) => requestPath(path).includes("study-expectancy/40/projection"));
+  expect(calls).toHaveLength(2);
+  expect(calls[0]![0]).toBe("/v1/setups/analytics/study-expectancy/40/projection");
+  expect(calls[0]![1]?.method ?? "GET").toBe("GET"); expect(calls[0]![1]?.body).toBeUndefined();
+  expect(JSON.parse(calls[1]![1]!.body as string)).toEqual({ filter: {}, snapshot });
+  expect(analyticsCalls()).toHaveLength(1);
+  expect(requests.some((path) => /outcomes\/refresh|study-actual|replay/.test(path))).toBe(false);
 });
 
 type ForecastBody = Pick<SetupsProjectionRequest, "snapshot" | "forecast" | "trendMode" | "trendBlendLambda" | "timeZone">;
@@ -626,6 +666,135 @@ it("renders the server M/F/B projection from the full calculated snapshot indepe
   await act(async () => { await vi.advanceTimersByTimeAsync(600000); });
   expect(screen.getByLabelText("Конец")).toHaveValue(originalEnd); expect(analyticsCalls()).toHaveLength(1); expect(projectionCalls()).toHaveLength(2);
   expect(requests.some((path) => /outcomes\/refresh|study-actual|replay|maintenance|optimization-studies/.test(path))).toBe(false);
+});
+
+it("shows an accessible keyboard disclosure triangle with stable full-width ownership and retains settings without disclosure-triggered requests", async () => {
+  enableSnapshotForecast();
+  settingsResponse = () => json({ settings: { trendMode: "forecast", trendBendDays: "linear",
+    forecast: { method: "decayed_probability", version: 1, halfLifeDays: "7", kappa: "3", priorPolicy: "gross_break_even" } } });
+  const user = userEvent.setup({ delay: null });
+  render(<SetupsAnalyticsPanel initialLoad={{ loadedAtUnix: Math.floor(Date.now() / 1000), interfaceReady: true, ready: true }} />);
+  await settle(); await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  const wrapper = screen.getByTestId("setups-model-controls");
+  const section = screen.getByRole("region", { name: "Аналитика выпущенных сетапов" });
+  const trigger = screen.getByRole("button", { name: "Расширенные настройки модели" });
+  const stableClass = wrapper.className;
+  expect(section).toHaveClass("w-full", "min-w-0", "max-w-full");
+  expect(wrapper).toHaveClass("w-full", "min-w-0", "max-w-full");
+  expect(stableClass).toContain("before:border-l-[6px]");
+  expect(stableClass).toContain("[aria-expanded=true]]:before:rotate-90");
+  expect(trigger).toHaveAttribute("aria-expanded", "false");
+  const before = requests.length;
+  // user-event's RTL async wrapper uses a real zero-delay macrotask; the
+  // snapshot/model debounce has already settled before keyboard interaction.
+  vi.useRealTimers();
+  trigger.focus(); await user.keyboard("{Enter}");
+  expect(trigger).toHaveFocus(); expect(trigger).toHaveAttribute("aria-expanded", "true");
+  const contentId = trigger.getAttribute("aria-controls")!;
+  expect(document.getElementById(contentId)).toContainElement(screen.getByLabelText("Сила prior κ"));
+  expect(screen.getByLabelText("Сила prior κ")).toHaveValue(3);
+  await user.keyboard(" ");
+  expect(trigger).toHaveAttribute("aria-expanded", "false");
+  await user.keyboard("{Enter}");
+  expect(screen.getByLabelText("Сила prior κ")).toHaveValue(3);
+  expect(wrapper.className).toBe(stableClass);
+  vi.useFakeTimers();
+  await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+  expect(requests).toHaveLength(before);
+  expect(analyticsCalls()).toHaveLength(1); expect(projectionCalls()).toHaveLength(1);
+  fireEvent.change(screen.getByLabelText("Сила prior κ"), { target: { value: "4" } });
+  fireEvent.click(trigger); fireEvent.click(trigger);
+  expect(screen.getByLabelText("Сила prior κ")).toHaveValue(4);
+});
+
+it("switches only observed values, maximum, tooltips and aria between daily mean and sum, without refitting or changing M/F/B", async () => {
+  const snapshot = enableSnapshotForecast();
+  analyticsResponse = () => json({ ...analyticsResult, snapshot, setups: [
+    rowAt(1, "2026-11-10T01:00:00Z", "tp", 3), rowAt(2, "2026-11-10T02:00:00Z", "sl", -1),
+    rowAt(3, "2026-11-11T01:00:00Z", "tp", 1.5), rowAt(4, "2026-11-12T01:00:00Z", "gate_failed", null),
+    rowAt(5, "2026-11-12T02:00:00Z", "unclosed", null),
+  ] });
+  render(<SetupsAnalyticsPanel initialLoad={{ loadedAtUnix: Math.floor(Date.now() / 1000), interfaceReady: true, ready: true }} />);
+  await settle(); await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  const chart = screen.getByTestId("setups-daily-outcomes");
+  const model = screen.getByTestId("setups-model-line");
+  const modelValue = screen.getByTestId("setups-model-now-value").textContent;
+  const end = screen.getByLabelText<HTMLInputElement>("Конец").value;
+  expect(chart.querySelector('[data-observed-max-r="1.5"]')).not.toBeNull();
+  const before = requests.length;
+  fireEvent.change(screen.getByLabelText("Наблюдаемые результаты"), { target: { value: "sum" } });
+  expect(screen.getByTestId("setups-daily-outcomes")).toBe(chart);
+  expect(chart).toHaveAttribute("aria-label", "Сумма R за день: закрытые сделки по дням входа");
+  expect(chart.querySelector('[data-observed-max-r="2"]')).not.toBeNull();
+  expect(chart.querySelector('[data-observed-max-r="1.5"]')).toBeNull();
+  expect(chart.querySelector('[data-closed="2"]')).toHaveAttribute("data-observed-r", "2.00");
+  expect(chart.querySelector('[data-closed="2"] title')).toHaveTextContent("Сумма R за день +2.00R · закрытых 2");
+  expect(chart.querySelectorAll("circle[data-day]")).toHaveLength(2);
+  expect(screen.getByTestId("setups-model-line")).toBe(model);
+  expect(screen.getByTestId("setups-model-now-value")).toHaveTextContent(modelValue);
+  expect(screen.getByTestId("setups-analytics-mean")).toHaveTextContent("+1.25R");
+  expect(screen.getByRole("button", { name: "Прогноз" })).toHaveAttribute("aria-pressed", "true");
+  fireEvent.change(screen.getByLabelText("Наблюдаемые результаты"), { target: { value: "mean" } });
+  expect(chart.querySelector('[data-closed="2"]')).toHaveAttribute("data-observed-r", "1.00");
+  expect(chart.querySelector('[data-closed="2"] title')).toHaveTextContent("Среднее R за день +1.00R");
+  expect(chart).toHaveAttribute("aria-label", "Среднее R за день: закрытые сделки по дням входа");
+  await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+  expect(requests).toHaveLength(before);
+  expect(screen.getByLabelText("Конец")).toHaveValue(end);
+});
+
+it.each([
+  ["mean", "trend"], ["forecast", "trend"], ["blend", "trend"],
+  ["mean", "decayed_probability"], ["forecast", "decayed_probability"], ["blend", "decayed_probability"],
+] as const)("renders the saved %s/%s recipe and exact two server curves, independently of shared settings or forecastBest", async (mode, method) => {
+  expectancyResponse = (path, init) => {
+    const data = issuedFixture(path, {}, init?.method === "POST");
+    const modelMethod = mode === "mean" ? "mean" : method;
+    return json({ ...data,
+      objective: { version: 1, trendMode: mode, trendBendDays: "14", trendBlendLambda: 0.35,
+        forecast: method === "trend" ? { method, version: 1, bendDays: "14" } : { method, version: 1, halfLifeDays: 7, kappa: 3, priorPolicy: "gross_break_even" } },
+      originalProjection: { ...data.originalProjection, method: modelMethod },
+      combinedProjection: { ...data.combinedProjection, method: init?.method === "POST" ? modelMethod : null },
+    });
+  };
+  await rendered(); fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" })); await settle();
+  const dialog = within(screen.getByRole("dialog"));
+  const chart = dialog.getByTestId("study-horizon-chart");
+  expect(chart).toHaveAttribute("data-objective", mode);
+  expect(chart).toHaveAttribute("data-method", mode === "mean" ? "mean" : method);
+  expect(dialog.getByTestId("issued-study-recipe")).toHaveTextContent(`Сохранённый objective: ${mode}`);
+  expect(dialog.getByTestId("issued-study-recipe")).toHaveTextContent(method === "trend" ? "перегиб 14 дней" : "H 7 дней · κ 3");
+  if (mode === "blend") expect(dialog.getByTestId("issued-study-recipe")).toHaveTextContent("λ 0.35");
+  expect(dialog.getByText("TP 14% / SL 4%")).toBeInTheDocument();
+  expect(dialog.queryByText(/TP 20% \/ SL 6%/)).toBeNull();
+  expect(dialog.getByTestId("study-original-objective-line")).toHaveAttribute("stroke", "#f5b041");
+  expect(dialog.getByTestId("study-original-objective-line")).toHaveAttribute("stroke-dasharray", "6 4");
+  expect(dialog.getByTestId("study-combined-objective-line")).toHaveAttribute("stroke", "#f5b041");
+  expect(dialog.getByTestId("study-combined-objective-line")).not.toHaveAttribute("stroke-dasharray");
+  expect(dialog.getByTestId("study-original-end-value")).toHaveTextContent("+0.20R");
+  expect(dialog.getByTestId("study-combined-end-value")).toHaveTextContent("+0.45R");
+  expect(chart.querySelector("[data-combined-revision]")).toBeNull();
+  const before = requests.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+  expect(requests).toHaveLength(before); expect(analyticsCalls()).toHaveLength(1);
+  expect(requests.some((path) => /study-actual|replay|outcomes\/refresh/.test(path))).toBe(false);
+});
+
+it("preserves explicit null gaps in both model curves instead of joining them or fitting the observed values", async () => {
+  expectancyResponse = (path, init) => {
+    const data = issuedFixture(path, {}, init?.method === "POST");
+    const gap = { atUnix: 1794009600, value: null };
+    return json({ ...data, originalProjection: { ...data.originalProjection, points: [data.originalProjection.points[0], gap, data.originalProjection.points[1]] },
+      combinedProjection: init?.method === "POST" ? { ...data.combinedProjection, points: [data.combinedProjection.points[0], gap, data.combinedProjection.points[1]] } : data.combinedProjection });
+  };
+  await rendered(); fireEvent.click(screen.getByRole("button", { name: "Рассчитать" })); await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Подробности исследования 40" })); await settle();
+  const dialog = within(screen.getByRole("dialog"));
+  expect(dialog.queryByTestId("study-original-objective-line")).toBeNull();
+  expect(dialog.queryByTestId("study-combined-objective-line")).toBeNull();
+  expect(dialog.getAllByTestId("study-original-objective-point")).toHaveLength(2);
+  expect(dialog.getAllByTestId("study-combined-objective-point")).toHaveLength(2);
 });
 
 it.each(["success", "failure"])("ignores an older projection's late %s after a newer control change and response", async (outcome) => {

@@ -15,21 +15,20 @@ import { Spinner } from "../components/ui/spinner";
 import { Switch } from "../components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { fetchPlatform, PLATFORM_URL } from "../lib/platform-api";
-import { effectiveTimezone, interfaceSettings, nextZonedDay, subscribeInterfaceSettings, zonedDateLabel, zonedDayStart } from "../lib/datetime-format";
-import { getOptimizationStudy, isTrendBlendLambda, type OptimizationMatrixCell, type OptimizationStudy } from "../lib/optimization-api";
+import { effectiveTimezone, interfaceSettings, subscribeInterfaceSettings, zonedDateLabel, zonedDayStart } from "../lib/datetime-format";
+import { getOptimizationStudy, isTrendBlendLambda, type OptimizationStudy } from "../lib/optimization-api";
 import { useSharedAnalyticsSettings } from "../lib/analytics-settings-store";
-import { buildForecastRecipe } from "../lib/forecast-recipe";
+import { buildForecastRecipe, forecastRecipeLabel } from "../lib/forecast-recipe";
 import { fetchSetupsProjection, type SetupsProjection, type SetupsProjectionRequest } from "../lib/setups-projection-api";
 import {
   fetchSetupsAnalytics,
   fetchSetupsAnalyticsStudies,
-  fetchStudyExpectancy,
+  fetchIssuedStudyExpectancy,
+  evaluateIssuedStudyExpectancy,
   type SetupsAnalyticsResult,
   type SetupsAnalyticsSetup,
   type SetupsAnalyticsStudyMeta,
-  type StudyExpectancyPoint,
-  type StudyExpectancySeries,
-  type StudyTrendPoint,
+  type IssuedStudyExpectancy,
 } from "../lib/setups-analytics-api";
 import {
   algorithmDisplayName,
@@ -96,7 +95,9 @@ interface DailyOutcome {
   dayUnix: number;
   closedCount: number;
   meanR: number;
+  sumR: number;
 }
+type ObservedMetric = "mean" | "sum";
 
 interface AnalyticsRange {
   fromUnix: number;
@@ -122,13 +123,15 @@ function dailyOutcomes(setups: readonly SetupsAnalyticsSetup[], dayStart: (unix:
     byDay.set(day, bucket);
   }
   return [...byDay.entries()]
-    .map(([dayUnix, bucket]) => ({ dayUnix, closedCount: bucket.count, meanR: bucket.sum / bucket.count }))
+    .map(([dayUnix, bucket]) => ({ dayUnix, closedCount: bucket.count, meanR: bucket.sum / bucket.count, sumR: bucket.sum }))
     .filter((point) => Number.isFinite(point.meanR))
     .sort((left, right) => left.dayUnix - right.dayUnix);
 }
 
-export function DailyOutcomesChart({ setups, range, projection = null, modelLabel = "Модель" }: { setups: readonly SetupsAnalyticsSetup[]; range: AnalyticsRange; projection?: SetupsProjection | null; modelLabel?: string }) {
+export function DailyOutcomesChart({ setups, range, projection = null, modelLabel = "Модель", observedMetric = "mean" }: { setups: readonly SetupsAnalyticsSetup[]; range: AnalyticsRange; projection?: SetupsProjection | null; modelLabel?: string; observedMetric?: ObservedMetric }) {
   const outcomes = dailyOutcomes(setups);
+  const observedValue = (point: DailyOutcome) => observedMetric === "sum" ? point.sumR : point.meanR;
+  const observedLabel = observedMetric === "sum" ? "Сумма R за день" : "Среднее R за день";
   const model = projection?.availability.status === "available" ? projection : null;
   const firstDay = Math.min(zonedDayStart(range.fromUnix), outcomes[0]?.dayUnix ?? Infinity, model?.points[0] ? zonedDayStart(model.points[0].atUnix) : Infinity);
   // The API interval is [from, to): an exact midnight end does not add an empty next day.
@@ -141,7 +144,7 @@ export function DailyOutcomesChart({ setups, range, projection = null, modelLabe
   if (timeSpan > 3662 * DAY_SECONDS) return <p role="status" className="text-sm text-muted-foreground">График дней недоступен: диапазон календарной сетки превышает десять лет. Сузьте диапазон.</p>;
   const xOf = (dayUnix: number) => CHART_STYLE.left + ((dayUnix - firstDay) / timeSpan) * (CHART_STYLE.right - CHART_STYLE.left);
   const allDays = calendarDays(firstDay, zonedDayStart(lastInstant));
-  const observedValues = outcomes.map((point) => point.meanR);
+  const observedValues = outcomes.map(observedValue);
   const observedMax = observedValues.length ? Math.max(...observedValues) : null;
   const values = [...observedValues, ...(model?.points.map((point) => point.value) ?? [])];
   const rawMin = Math.min(0, ...values);
@@ -156,9 +159,9 @@ export function DailyOutcomesChart({ setups, range, projection = null, modelLabe
   for (let level = Math.ceil(yMin); level <= Math.floor(yMax); level += levelStep) {
     if (level !== 0 && (observedMax === null || Math.abs(yOf(level) - yOf(observedMax)) >= 14)) gridLevels.push(level);
   }
-  return <svg data-testid="setups-daily-outcomes" data-from-unix={range.fromUnix} data-to-unix={range.toUnix} viewBox={`0 0 ${CHART_STYLE.width} ${CHART_STYLE.height}`} role="img" aria-label="Средний результат закрытых сделок по дням входа" className="w-full rounded-md border border-input/60">
+  return <svg data-testid="setups-daily-outcomes" data-observed-metric={observedMetric} data-from-unix={range.fromUnix} data-to-unix={range.toUnix} viewBox={`0 0 ${CHART_STYLE.width} ${CHART_STYLE.height}`} role="img" aria-label={`${observedLabel}: закрытые сделки по дням входа`} className="w-full rounded-md border border-input/60">
     <rect width={CHART_STYLE.width} height={CHART_STYLE.height} fill={CHART_STYLE.background} />
-    <text x={CHART_STYLE.width / 2} y={28} textAnchor="middle" fontSize={14} fill={CHART_STYLE.foreground}>Результаты торговли по дням</text>
+    <text x={CHART_STYLE.width / 2} y={28} textAnchor="middle" fontSize={14} fill={CHART_STYLE.foreground}>Результаты торговли по дням · {observedLabel}</text>
     {allDays.map((dayUnix, index) => <g key={`day-${dayUnix}`} data-grid-day={dayUnix}>
       <line x1={xOf(dayUnix)} y1={CHART_STYLE.top} x2={xOf(dayUnix)} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.grid} strokeWidth={1} />
       {(index % labelStep === 0 || index === allDays.length - 1) && <text x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{zonedDateLabel(dayUnix)}</text>}
@@ -173,10 +176,10 @@ export function DailyOutcomesChart({ setups, range, projection = null, modelLabe
       <line x1={CHART_STYLE.left} x2={CHART_STYLE.right} y1={yOf(observedMax)} y2={yOf(observedMax)} stroke={CHART_STYLE.grid} />
       <text x={CHART_STYLE.left - 8} y={yOf(observedMax) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis} aria-label={`Фактический максимум: ${observedMax} R`}>{formatRisk(observedMax)}</text>
     </g>}
-    {outcomes.length > 1 && <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={outcomes.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
+    {outcomes.length > 1 && <polyline fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={outcomes.map((point) => `${xOf(point.dayUnix)},${yOf(observedValue(point))}`).join(" ")} />}
     {outcomes.length === 0 && <text x={CHART_STYLE.width / 2} y={CHART_STYLE.top + 20} textAnchor="middle" fontSize={12} fill={CHART_STYLE.axis}>Нет закрытых сделок для графика по дням.</text>}
-    {outcomes.map((point) => <circle key={`point-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={zonedDateLabel(point.dayUnix)} data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)}>
-      <title>{`${zonedDateLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title>
+    {outcomes.map((point) => <circle key={`point-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(observedValue(point))} r={3} fill={observedValue(point) >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={zonedDateLabel(point.dayUnix)} data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)} data-sum-r={point.sumR.toFixed(2)} data-observed-r={observedValue(point).toFixed(2)}>
+      <title>{`${zonedDateLabel(point.dayUnix)}: ${observedLabel} ${formatRisk(observedValue(point))} · закрытых ${point.closedCount}`}</title>
     </circle>)}
     {model !== null && <>
       <polyline data-testid="setups-model-line" fill="none" stroke={CHART_STYLE.trend} strokeWidth={2} points={model.points.map((point) => `${xOf(point.atUnix)},${yOf(point.value)}`).join(" ")} />
@@ -187,111 +190,58 @@ export function DailyOutcomesChart({ setups, range, projection = null, modelLabe
   </svg>;
 }
 
-function bestMeanPair(matrix: OptimizationMatrixCell[]): { tpPct: number; slPct: number; meanR: number } | null {
-  let best: { tpPct: number; slPct: number; meanR: number } | null = null;
-  for (const cell of matrix) {
-    const value = cell.meanRiskExpectancy;
-    if (value === null || value === undefined || !Number.isFinite(value)) continue;
-    if (best === null || value > best.meanR) best = { tpPct: cell.tpPct, slPct: cell.slPct, meanR: value };
-  }
-  return best;
-}
-
-function studyPointWithMean(point: StudyExpectancyPoint): point is StudyExpectancyPoint & { meanR: number } {
-  return point.meanR !== null;
-}
-
-function trendValueAt(points: readonly StudyTrendPoint[], unix: number): number | null {
-  if (points.length === 0) return null;
-  const first = points[0]!;
-  if (unix <= first.dayUnix) return first.value;
-  const last = points.at(-1)!;
-  if (unix >= last.dayUnix) return last.value;
-  for (let index = 1; index < points.length; index += 1) {
-    const point = points[index]!;
-    if (point.dayUnix >= unix) {
-      const previous = points[index - 1]!;
-      const share = (unix - previous.dayUnix) / (point.dayUnix - previous.dayUnix);
-      return previous.value + (point.value - previous.value) * share;
+/** Decision50 rendering pattern: geometry only, explicit gaps, two server-owned curves.
+ * Issued sources deliberately have no retrospective job/revision identity. */
+function StudyHorizonChart({ series }: { series: IssuedStudyExpectancy }) {
+  const original = series.originalProjection.points;
+  const combined = series.combinedProjection.points;
+  const observed = series.daily.filter((point) => point.meanR !== null);
+  const startDay = series.startDayUnix;
+  const first = Math.min(startDay, ...series.daily.map((point) => point.dayUnix), ...original.map((point) => point.atUnix), ...combined.map((point) => point.atUnix));
+  const firstDay = Math.floor(first / DAY_SECONDS) * DAY_SECONDS;
+  const last = Math.max(series.snapshot.observationCutoff, startDay);
+  if (last - firstDay > 3662 * DAY_SECONDS) return <p role="status">Период графика превышает десять лет.</p>;
+  const span = Math.max(1, last - firstDay);
+  const x = (at: number) => CHART_STYLE.left + ((at - firstDay) / span) * (CHART_STYLE.right - CHART_STYLE.left);
+  const values = [...observed.map((point) => point.meanR!), ...original.map((point) => point.value), ...combined.map((point) => point.value)].filter((value): value is number => value !== null);
+  const low = Math.min(0, ...values); const high = Math.max(0, ...values);
+  const pad = high - low < 1e-9 ? 0.5 : (high - low) * 0.08;
+  const y = (value: number) => CHART_STYLE.bottom - ((value - low + pad) / (high - low + 2 * pad)) * (CHART_STYLE.bottom - CHART_STYLE.top);
+  // UTC bucket positions are server-owned. Interface timezone changes labels only.
+  const days = Array.from({ length: Math.floor((last - firstDay) / DAY_SECONDS) + 1 }, (_, index) => firstDay + index * DAY_SECONDS);
+  const step = Math.max(1, Math.ceil((days.length - 1) / 8));
+  const levels: number[] = [];
+  const levelStep = Math.max(1, Math.ceil((high - low + 2 * pad) / 12));
+  for (let level = Math.ceil((low - pad) / levelStep) * levelStep; level <= high + pad; level += levelStep) if (level !== 0) levels.push(level);
+  const path = (points: { atUnix: number; value: number }[]) => points.map((point) => `${x(point.atUnix)},${y(point.value)}`).join(" ");
+  const curve = (points: typeof original, kind: "original" | "combined") => {
+    const segments: { atUnix: number; value: number }[][] = [];
+    let segment: { atUnix: number; value: number }[] = [];
+    for (const point of points) {
+      if (point.value === null) { if (segment.length) segments.push(segment); segment = []; }
+      else segment.push({ atUnix: point.atUnix, value: point.value });
     }
-  }
-  return last.value;
-}
-
-function StudyHorizonChart({ series, live, dividerDay, nowUnix }: { series: StudyExpectancySeries; live: readonly DailyOutcome[]; dividerDay: number | null; nowUnix: number }) {
-  // Legacy daily means/counts stay frozen: map each original bucket instant to its display day only.
-  const allPast = series.daily.filter(studyPointWithMean).map((point) => ({ ...point, dayUnix: zonedDayStart(point.dayUnix) }));
-  const releasePast = dividerDay === null ? null : allPast.find((point) => point.dayUnix === dividerDay) ?? null;
-  const releaseLive = dividerDay === null ? null : live.find((point) => point.dayUnix === dividerDay) ?? null;
-  const releaseClosed = (releasePast !== null ? releasePast.tpCount + releasePast.slCount : 0) + (releaseLive !== null ? releaseLive.closedCount : 0);
-  const releaseMean = releaseClosed > 0
-    ? ((releasePast !== null ? releasePast.meanR * (releasePast.tpCount + releasePast.slCount) : 0) + (releaseLive !== null ? releaseLive.meanR * releaseLive.closedCount : 0)) / releaseClosed
-    : null;
-  const past = dividerDay === null || releasePast === null ? allPast : allPast.filter((point) => point.dayUnix !== dividerDay);
-  const livePoints = dividerDay === null || releaseLive === null ? live : live.filter((point) => point.dayUnix !== dividerDay);
-  if (past.length === 0 && livePoints.length === 0 && releaseMean === null) {
-    return <p className="text-sm text-muted-foreground">Нет данных для графика.</p>;
-  }
-  const releaseLineValue = releaseMean ?? releasePast?.meanR ?? releaseLive?.meanR ?? null;
-  const linePoints = [...past, ...(dividerDay !== null && releaseLineValue !== null ? [{ dayUnix: dividerDay, meanR: releaseLineValue }] : []), ...livePoints].sort((a, b) => a.dayUnix - b.dayUnix);
-  const trendVisible = series.trend.points.filter((point) => point.dayUnix <= nowUnix);
-  const trendEndValue = trendValueAt(series.trend.points, nowUnix);
-  const trendLine = trendVisible.length > 0 && trendEndValue !== null ? [...trendVisible, { dayUnix: nowUnix, value: trendEndValue }] : [];
-  const dayNumbers = linePoints.map((point) => point.dayUnix);
-  if (dividerDay !== null) dayNumbers.push(dividerDay);
-  dayNumbers.push(nowUnix);
-  const firstDay = zonedDayStart(Math.min(...dayNumbers));
-  const lastUnix = Math.max(...dayNumbers);
-  const timeSpan = Math.max(nextZonedDay(firstDay) - firstDay, lastUnix - firstDay);
-  // Model points and forecast-now are exact instants, unlike the calendar-day observation buckets.
-  const xOf = (unix: number) => CHART_STYLE.left + ((unix - firstDay) / timeSpan) * (CHART_STYLE.right - CHART_STYLE.left);
-  const values = [...linePoints.map((point) => point.meanR), ...trendLine.map((point) => point.value)];
-  const rawMin = Math.min(0, ...values);
-  const rawMax = Math.max(0, ...values);
-  const pad = rawMax - rawMin < 1e-9 ? 0.5 : (rawMax - rawMin) * 0.08;
-  const yMin = rawMin - pad;
-  const yMax = rawMax + pad;
-  const yOf = (value: number) => CHART_STYLE.bottom - ((value - yMin) / (yMax - yMin)) * (CHART_STYLE.bottom - CHART_STYLE.top);
-  const allDays = calendarDays(firstDay, zonedDayStart(lastUnix));
-  const labelStep = Math.max(1, Math.ceil((allDays.length - 1) / 8));
-  const labeledDays = allDays.filter((_, index) => index % labelStep === 0 || index === allDays.length - 1);
-  const gridLevels: number[] = [];
-  for (let level = Math.ceil(yMin); level <= Math.floor(yMax); level += 1) {
-    if (level !== 0) gridLevels.push(level);
-  }
-  const dividerX = dividerDay === null ? null : Math.min(Math.max(xOf(dividerDay), CHART_STYLE.left), CHART_STYLE.right);
-  return <svg data-testid="study-horizon-chart" viewBox={`0 0 ${CHART_STYLE.width} ${CHART_STYLE.height}`} role="img" aria-label="Матожидание: ретроспектива исследования и live-сетапы" className="w-full rounded-md border border-input/60">
+    if (segment.length) segments.push(segment);
+    return segments.map((line, index) => line.length > 1
+      ? <polyline key={index} data-testid={`study-${kind}-objective-line`} fill="none" stroke={CHART_STYLE.trend} strokeWidth={2} strokeDasharray={kind === "original" ? "6 4" : undefined} points={path(line)} />
+      : <circle key={index} data-testid={`study-${kind}-objective-point`} cx={x(line[0]!.atUnix)} cy={y(line[0]!.value)} r={2} fill={CHART_STYLE.trend} />);
+  };
+  const endpoint = (points: typeof original, kind: "original" | "combined") => {
+    const lastPoint = points.at(-1);
+    return lastPoint?.value == null ? null : <text data-testid={`study-${kind}-end-value`} x={x(lastPoint.atUnix)} y={Math.max(y(lastPoint.value) - (kind === "original" ? 8 : -16), CHART_STYLE.top + 12)} textAnchor="end" fontSize={11} fill={CHART_STYLE.trend}>{formatRisk(lastPoint.value)}</text>;
+  };
+  return <svg data-testid="study-horizon-chart" data-cutoff={series.snapshot.observationCutoff} data-snapshot-id={series.snapshot.snapshotId} data-objective={series.objective.trendMode} data-method={series.originalProjection.method ?? undefined}
+    viewBox={`0 0 ${CHART_STYLE.width} ${CHART_STYLE.height}`} role="img" aria-label="Матожидание: Исходная модель (пунктир), Модель по всем данным (сплошная) и реально выпущенные сетапы" className="w-full rounded-md border border-input/60">
     <rect width={CHART_STYLE.width} height={CHART_STYLE.height} fill={CHART_STYLE.background} />
     <text x={CHART_STYLE.width / 2} y={28} textAnchor="middle" fontSize={14} fill={CHART_STYLE.foreground}>Динамика матожидания: ретроспектива и live</text>
-    {allDays.map((dayUnix) => <line key={`grid-${dayUnix}`} className="grid-day" data-grid-day={dayUnix} x1={xOf(dayUnix)} y1={CHART_STYLE.top} x2={xOf(dayUnix)} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.grid} strokeWidth={1} />)}
-    {labeledDays.map((dayUnix) => <text key={`date-${dayUnix}`} className="date" x={xOf(dayUnix)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{zonedDateLabel(dayUnix)}</text>)}
-    {gridLevels.map((level) => <g key={`level-${level}`}>
-      <line x1={CHART_STYLE.left} y1={yOf(level)} x2={CHART_STYLE.right} y2={yOf(level)} stroke={CHART_STYLE.grid} strokeWidth={1} />
-      <text x={CHART_STYLE.left - 8} y={yOf(level) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>{level} R</text>
-    </g>)}
-    <line x1={CHART_STYLE.left} y1={yOf(0)} x2={CHART_STYLE.right} y2={yOf(0)} stroke={CHART_STYLE.axis} strokeWidth={1.5} />
-    <text x={CHART_STYLE.left - 8} y={yOf(0) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>0 R</text>
-    {trendLine.length > 1 && <polyline data-testid="forecast-line" fill="none" stroke={CHART_STYLE.trend} strokeWidth={2} data-method={series.trend.method ?? undefined} points={trendLine.map((point) => `${xOf(point.dayUnix)},${yOf(point.value)}`).join(" ")} />}
-    {trendLine.length > 1 && (() => {
-      const endX = xOf(nowUnix);
-      const endY = yOf(trendLine.at(-1)!.value);
-      const anchor = endX > CHART_STYLE.right - 60 ? "end" : endX < CHART_STYLE.left + 60 ? "start" : "middle";
-      return <text data-testid="forecast-now-value" x={endX} y={Math.max(endY - 8, CHART_STYLE.top + 12)} textAnchor={anchor} fontSize={11} fontWeight={600} fill={CHART_STYLE.trend}>{formatRisk(trendLine.at(-1)!.value)}</text>;
-    })()}
-    {linePoints.length > 1 && <polyline data-testid="expectancy-line" fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={linePoints.map((point) => `${xOf(point.dayUnix)},${yOf(point.meanR)}`).join(" ")} />}
-    {past.map((point) => <circle key={`past-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={zonedDateLabel(point.dayUnix)} data-phase="past" data-closed={point.tpCount + point.slCount} data-mean-r={point.meanR.toFixed(2)}>
-      <title>{`${zonedDateLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · ретроспектива`}</title>
-    </circle>)}
-    {livePoints.map((point) => <circle key={`live-${point.dayUnix}`} cx={xOf(point.dayUnix)} cy={yOf(point.meanR)} r={3} fill={point.meanR >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={zonedDateLabel(point.dayUnix)} data-phase="live" data-closed={point.closedCount} data-mean-r={point.meanR.toFixed(2)}>
-      <title>{`${zonedDateLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title>
-    </circle>)}
-    {dividerDay !== null && releaseMean !== null && <circle key="release" cx={xOf(dividerDay)} cy={yOf(releaseMean)} r={4} fill={releaseMean >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative} data-day={zonedDateLabel(dividerDay)} data-phase="release" data-closed={releaseClosed} data-mean-r={releaseMean.toFixed(2)}>
-      <title>{`День выпуска исследования: ${formatRisk(releaseMean)} · закрытых ${releaseClosed}`}</title>
-    </circle>}
-    {dividerX !== null && <g data-divider-day={dividerDay}>
-      <line x1={dividerX} y1={CHART_STYLE.top} x2={dividerX} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.axis} strokeWidth={1.5} strokeDasharray="3 4" />
-      <text x={dividerX > CHART_STYLE.width / 2 ? dividerX - 6 : dividerX + 6} y={45} textAnchor={dividerX > CHART_STYLE.width / 2 ? "end" : "start"} fontSize={11} fill={CHART_STYLE.axis}>Старт исследования</text>
-    </g>}
+    {days.map((day, index) => <g key={day} data-grid-day={day}><line x1={x(day)} x2={x(day)} y1={CHART_STYLE.top} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.grid} />{(index % step === 0 || index === days.length - 1) && <text x={x(day)} y={CHART_STYLE.bottom + 16} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>{zonedDateLabel(day)}</text>}</g>)}
+    {levels.map((level) => <g key={level}><line x1={CHART_STYLE.left} x2={CHART_STYLE.right} y1={y(level)} y2={y(level)} stroke={CHART_STYLE.grid} /><text x={CHART_STYLE.left - 8} y={y(level) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>{level} R</text></g>)}
+    <line x1={CHART_STYLE.left} x2={CHART_STYLE.right} y1={y(0)} y2={y(0)} stroke={CHART_STYLE.axis} /><text x={CHART_STYLE.left - 8} y={y(0) + 4} textAnchor="end" fontSize={11} fill={CHART_STYLE.axis}>0 R</text>
+    <g aria-label="Исходная модель (пунктир)">{curve(original, "original")}{endpoint(original, "original")}</g>
+    <g aria-label="Модель по всем данным (сплошная)">{curve(combined, "combined")}{endpoint(combined, "combined")}</g>
+    {observed.length > 1 && <polyline data-testid="study-observed-line" fill="none" stroke={CHART_STYLE.line} strokeWidth={2} points={path(observed.map((point) => ({ atUnix: point.dayUnix, value: point.meanR! })))} />}
+    {observed.map((point) => <circle key={point.dayUnix} data-phase="observed" data-day={zonedDateLabel(point.dayUnix)} data-closed={point.closedCount} data-sum-r={point.sumR} data-mean-r={point.meanR} cx={x(point.dayUnix)} cy={y(point.meanR!)} r={3} fill={point.meanR! >= 0 ? CHART_STYLE.positive : CHART_STYLE.negative}><title>{`${zonedDateLabel(point.dayUnix)}: ${formatRisk(point.meanR)} · закрытых ${point.closedCount}`}</title></circle>)}
+    <g data-divider-day={startDay}><line x1={x(startDay)} x2={x(startDay)} y1={CHART_STYLE.top} y2={CHART_STYLE.bottom} stroke={CHART_STYLE.axis} strokeDasharray="3 4" /><text x={x(startDay)} y={45} textAnchor="middle" fontSize={11} fill={CHART_STYLE.axis}>Старт исследования</text></g>
   </svg>;
 }
 
@@ -301,15 +251,12 @@ function paramFieldLabel(fields: Algorithm["fields"], key: string): string {
   return field.unit === "" ? field.label : `${field.label} (${field.unit})`;
 }
 
-function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { studyId: number | null; algorithmId: string; fields: Algorithm["fields"]; meta: SetupsAnalyticsStudyMeta | undefined; onClose: () => void }) {
-  // The dialog is keyed by study ID: preserve its opening-time endpoint through display-setting changes.
-  const [nowUnix] = useState(() => Math.floor(Date.now() / 1000));
+function StudyDetailsDialog({ studyId, fields, meta, onClose }: { studyId: number | null; fields: Algorithm["fields"]; meta: SetupsAnalyticsStudyMeta | undefined; onClose: () => void }) {
   const [study, setStudy] = useState<OptimizationStudy | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [series, setSeries] = useState<StudyExpectancySeries | null>(null);
+  const [series, setSeries] = useState<IssuedStudyExpectancy | null>(null);
   const [chartError, setChartError] = useState<string | null>(null);
-  // Keep the bounded raw response so a timezone change can regroup a mounted chart without refitting.
-  const [live, setLive] = useState<SetupsAnalyticsSetup[] | null>(null);
+  const [evaluating, setEvaluating] = useState(false);
 
   useEffect(() => {
     if (studyId === null) return;
@@ -321,51 +268,31 @@ function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { s
   }, [studyId]);
 
   useEffect(() => {
-    if (studyId === null || study === null) return;
+    if (studyId === null) return;
     const controller = new AbortController();
-    const startedUnix = Math.floor(Date.parse(study.createdAt) / 1000);
-    const fromUnix = Number.isFinite(startedUnix) && startedUnix > 0
-      ? Math.floor(startedUnix / DAY_SECONDS) * DAY_SECONDS
-      : Math.floor(Date.now() / 1000 / DAY_SECONDS) * DAY_SECONDS - 30 * DAY_SECONDS;
+    // Full actually-issued study cohort, independent of the page's date/search
+    // filters. GET pins identity; POST evaluates only that exact saved snapshot.
     void (async () => {
-      let outcomes: DailyOutcome[];
       try {
-        const value = await fetchSetupsAnalytics(algorithmId, fromUnix, Math.floor(Date.now() / 1000), [studyId], controller.signal);
-        // The server model still consumes UTC-day aggregates; only the displayed raw trades regroup.
-        outcomes = dailyOutcomes(value.setups, (unix) => Math.floor(unix / DAY_SECONDS) * DAY_SECONDS);
-        if (!controller.signal.aborted) setLive(value.setups);
-      } catch (cause) {
-        if (!controller.signal.aborted) setChartError(`Не удалось получить live-исходы для графика: ${errorText(cause)}`);
-        return;
-      }
-      try {
-        const series = await fetchStudyExpectancy(studyId, outcomes.map((point) => ({ dayUnix: point.dayUnix, meanR: point.meanR, closedCount: point.closedCount })), controller.signal);
-        if (!controller.signal.aborted) setSeries(series);
+        const saved = await fetchIssuedStudyExpectancy(studyId, {}, controller.signal);
+        if (controller.signal.aborted) return;
+        setSeries(saved);
+        if (saved.combinedProjection.availability.status !== "unavailable" || saved.combinedProjection.availability.reason !== "issued_projection_not_evaluated") return;
+        setEvaluating(true);
+        const evaluated = await evaluateIssuedStudyExpectancy(saved, controller.signal);
+        if (!controller.signal.aborted) setSeries(evaluated);
       } catch (cause) {
         if (!controller.signal.aborted) setChartError(errorText(cause));
+      } finally {
+        if (!controller.signal.aborted) setEvaluating(false);
       }
     })();
     return () => controller.abort();
-  }, [studyId, study, algorithmId]);
-
-  const dividerDay = (() => {
-    if (study !== null) {
-      const startedUnix = Math.floor(Date.parse(study.createdAt) / 1000);
-      if (Number.isFinite(startedUnix) && startedUnix > 0) return zonedDayStart(startedUnix);
-    }
-    return series !== null ? zonedDayStart(series.observationCutoff) : null;
-  })();
+  }, [studyId]);
 
   const best = study?.result?.best ?? null;
-  const trendMode = best?.trendMode ?? study?.spec.trendMode;
-  const forecastPair = study?.forecastBest ?? null;
-  const meanPair = best === null ? null : bestMeanPair(best.matrix);
-  const pairKindLabel = trendMode === "blend" ? "Лучшая blend-пара" : trendMode === undefined || trendMode === "mean" ? "Лучшая mean-пара" : "Лучшая forecast-пара";
-  const pair = trendMode === "blend" || trendMode === "forecast"
-    ? forecastPair !== null
-      ? { text: `TP ${forecastPair.tpPct}% / SL ${forecastPair.slPct}% · ${formatSignedR(forecastPair.forecastR)}` }
-      : meanPair !== null ? { text: `TP ${meanPair.tpPct}% / SL ${meanPair.slPct}% · ${formatSignedR(meanPair.meanR)}` } : null
-    : meanPair !== null ? { text: `TP ${meanPair.tpPct}% / SL ${meanPair.slPct}% · ${formatSignedR(meanPair.meanR)}` } : null;
+  const pair = series?.recommendedPair;
+  const objective = series?.objective;
   const score = best?.score ?? study?.progress.bestScore ?? null;
 
   return <Dialog open={studyId !== null} onOpenChange={(open) => { if (!open) onClose(); }}>
@@ -380,7 +307,7 @@ function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { s
         <StudyStatusBadge status={study.status} />
         <dl className="grid gap-2 text-sm sm:grid-cols-2">
           <div><dt className="text-muted-foreground">Лучший score</dt><dd className="tabular-nums">{score === null ? "—" : formatSignedR(score)}</dd></div>
-          <div><dt className="text-muted-foreground">{pairKindLabel}</dt><dd className="tabular-nums">{pair === null ? "Не сохранено" : pair.text}</dd></div>
+          <div><dt className="text-muted-foreground">Рекомендованная пара исследования</dt><dd className="tabular-nums">{pair == null ? "Не сохранено" : `TP ${pair.tpPct}% / SL ${pair.slPct}%`}</dd></div>
         </dl>
         <div>
           <h4 className="font-medium">Полные параметры алгоритма</h4>
@@ -406,7 +333,15 @@ function StudyDetailsDialog({ studyId, algorithmId, fields, meta, onClose }: { s
         <h4 className="font-medium">Динамика матожидания: ретроспектива и live</h4>
         {chartError !== null && <p role="alert" className="text-sm text-muted-foreground">{chartError}</p>}
         {chartError === null && series === null && <p className="text-sm text-muted-foreground">Загрузка графика…</p>}
-        {series !== null && chartError === null && <StudyHorizonChart series={series} live={dailyOutcomes(live ?? [])} dividerDay={dividerDay} nowUnix={nowUnix} />}
+        {evaluating && <p role="status" className="text-sm text-muted-foreground">Вычисление диагностической модели готового снимка…</p>}
+        {series !== null && <>
+          <p className="text-sm" data-testid="issued-study-recipe">{objective == null ? "Исходный рецепт не сохранён" : `Сохранённый objective: ${objective.trendMode}${objective.trendMode === "blend" ? ` · λ ${objective.trendBlendLambda}` : ""} · ${forecastRecipeLabel(objective.forecast ?? undefined, objective.trendBendDays)}`}</p>
+          <p className="text-xs text-muted-foreground">Фиксированный cutoff: {localTime(series.snapshot.observationCutoff)} · снимок #{series.snapshot.snapshotId}. Реально выпущенные сетапы этого исследования; не post-study replay.</p>
+          <StudyHorizonChart series={series} />
+          <div aria-label="Легенда модельных линий" className="flex flex-wrap gap-4 text-xs text-muted-foreground"><span>Исходная модель · жёлтый пунктир</span><span>Модель по всем данным · жёлтая сплошная</span></div>
+          <p className="text-xs text-muted-foreground">Исходный артефакт: {series.originalSource.artifactId ?? "недоступен"} · study identity: {series.originalSource.studyIdentity}. Выпущенных сетапов: {series.issuedSource.setupCount}; закрытых: {series.issuedSource.closedCount ?? "недоступно"}. Научные сутки: raw signal close UTC; observed: entry UTC.</p>
+          {([ ["Выпущенные сетапы", series.issuedSource], ["Исходная модель", series.originalProjection], ["Модель по всем данным", series.combinedProjection] ] as const).map(([label, source]) => <p key={label} className="text-xs text-muted-foreground">{label}: {source.availability.status === "available" ? "доступно" : `недоступно — ${source.availability.reason}`}</p>)}
+        </>}
       </div>
     </DialogContent>}
   </Dialog>;
@@ -504,6 +439,7 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
   const [modelState, setModelState] = useState<{ key: string; value: SetupsProjection | null; error: string | null } | null>(null);
   const [runningRequest, setRunningRequest] = useState<string | null>(null);
   const [hideGateFailed, setHideGateFailed] = useState(true);
+  const [observedMetric, setObservedMetric] = useState<ObservedMetric>("mean");
   const [failure, setFailure] = useState<{ key: string; message: string } | null>(null);
   const calculateRef = useRef<AbortController | null>(null);
   const restoredSelection = useRef<ReadonlySet<number> | null>(initialSelectedStudies());
@@ -758,7 +694,7 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
   const modelLabel = shared.settings?.trendMode === "mean" ? "Модель M · среднее"
     : `${shared.settings?.trendMode === "blend" ? `Модель B · смесь M/F, λ ${shared.settings.trendBlendLambda ?? "0.7"}` : "Модель F"} · ${shared.settings?.forecast?.method === "decayed_probability" ? "Вероятность TP с памятью" : "Тренд дневной суммы R"}`;
 
-  return <section aria-label="Аналитика выпущенных сетапов" className="grid min-w-0 gap-4">
+  return <section aria-label="Аналитика выпущенных сетапов" className="grid w-full min-w-0 max-w-full gap-4">
     <Card>
       <CardContent className="flex flex-wrap items-end gap-3">
         {unified && <Field label="Инструмент, биржа или алгоритм" className="w-full max-w-sm">
@@ -781,7 +717,6 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
           {refreshControl}
           <Button variant="outline" disabled={savingSearch || !preferencesReady} onClick={() => { setSavingSearch(true); void savePreference("setupFilter", search).then(() => setSearchMessage("Фильтр сохранён в базе сигналов.")).catch((cause) => setSearchMessage(errorText(cause))).finally(() => setSavingSearch(false)); }}>Сохранить фильтр</Button>
           <Button asChild variant="outline"><a href={`${PLATFORM_URL}/v1/export/setups.csv`}>Экспорт CSV (без фильтра)</a></Button>
-          <label className="flex items-center gap-2 text-sm text-muted-foreground"><Switch checked={hideGateFailed} onCheckedChange={setHideGateFailed} /> Скрыть сетапы, которые не прошли гейт</label>
           <p className="w-full text-xs text-muted-foreground">Численная оценка — только пригодные адаптивные рекомендации, не все строки истории. CSV всегда содержит всю сохранённую live-историю без фильтров экрана. Снимок фиксирован; новый расчёт запускается вручную.</p>
         </>}
         {studiesStatus === "loading" && <Spinner label="Загрузка исследований…" />}
@@ -795,7 +730,9 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
       {algorithmId !== "" && <Button variant="outline" disabled={studiesState === "loading"} onClick={() => setStudiesRevision((value) => value + 1)}>Повторить загрузку исследований</Button>}
     </Alert>}
     {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
-    <div className="flex min-w-0 justify-end"><SharedForecastControls /></div>
+    {/* Decorative CSS triangle uses the existing accessible Radix button/state.
+        Keep the controls mounted: disclosure never owns settings or a model effect. */}
+    <div data-testid="setups-model-controls" className="flex w-full min-w-0 max-w-full justify-end [&>section]:w-full [&>section]:min-w-0 [&_[data-slot=collapsible-trigger]]:before:h-0 [&_[data-slot=collapsible-trigger]]:before:w-0 [&_[data-slot=collapsible-trigger]]:before:shrink-0 [&_[data-slot=collapsible-trigger]]:before:border-y-4 [&_[data-slot=collapsible-trigger]]:before:border-l-[6px] [&_[data-slot=collapsible-trigger]]:before:border-y-transparent [&_[data-slot=collapsible-trigger]]:before:border-l-current [&_[data-slot=collapsible-trigger]]:before:content-[''] [&_[data-slot=collapsible-trigger][aria-expanded=true]]:before:rotate-90"><SharedForecastControls /></div>
     {running && <Spinner label="Выполняется расчёт исходов сетапов…" />}
     {result && <Card>
       <CardContent className="grid gap-4">
@@ -818,8 +755,9 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
         </div>
         {modelError && <p role="status" className="text-sm text-warning">Модель недоступна: {modelError}</p>}
         {modelRequest?.request && modelState?.key !== modelKey && <p role="status" className="text-xs text-muted-foreground">Загрузка модели готового снимка…</p>}
-        <p className="text-xs text-muted-foreground">Точки — дневные средние закрытых сделок. Прямая/перегиб обучаются сервером на дневной сумме R, не на средних точках и не на текущей странице таблицы. Вероятность TP с памятью использует общий evaluator. Изменение модели не обновляет исходы, End или cutoff.</p>
-        <DailyOutcomesChart setups={result.setups} range={result.range} projection={projection} modelLabel={modelLabel} />
+        <Field label="Наблюдаемые результаты" className="w-64 max-w-full">{(control) => <Select {...control} value={observedMetric} onChange={(event) => setObservedMetric(event.target.value === "sum" ? "sum" : "mean")}><option value="mean">Среднее R за день</option><option value="sum">Сумма R за день</option></Select>}</Field>
+        <p className="text-xs text-muted-foreground">Точки — {observedMetric === "sum" ? "дневные суммы R" : "дневные средние"} закрытых сделок. Переключатель меняет только отображение. Прямая/перегиб обучаются сервером на дневной сумме R, не на средних точках и не на текущей странице таблицы. Вероятность TP с памятью использует общий evaluator. Изменение модели не обновляет исходы, End или cutoff.</p>
+        <DailyOutcomesChart setups={result.setups} range={result.range} projection={projection} modelLabel={modelLabel} observedMetric={observedMetric} />
         {result.studies.length > 0 && <div className="grid gap-2">
           <h3 className="text-sm font-semibold text-muted-foreground">Исследования-основы</h3>
           <div className="overflow-x-auto rounded-md border border-input/60">
@@ -867,7 +805,7 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
           </div>)}
       </CardContent>
     </Card>}
-    {unified && <Card><CardContent><SetupHistoryTable filter={historyFilter} revision={outcomesRevision} /></CardContent></Card>}
+    {unified && <Card><CardContent className="grid min-w-0 gap-3"><div data-testid="setups-history-controls" className="flex w-full min-w-0 justify-end"><label className="flex items-center gap-2 text-sm text-muted-foreground"><Switch checked={hideGateFailed} onCheckedChange={setHideGateFailed} /> Скрыть сетапы, которые не прошли гейт</label></div><SetupHistoryTable filter={historyFilter} revision={outcomesRevision} /></CardContent></Card>}
     <StudyPickerDialog
       open={pickerOpen}
       studies={studiesMeta}
@@ -876,6 +814,6 @@ export function SetupsAnalyticsPanel({ initialLoad, refreshControl, outcomesRevi
       onClose={() => setPickerOpen(false)}
       onApply={() => { setSelectedStudies(pickerSelection.size === studiesMeta.length ? null : new Set(pickerSelection)); setResult(null); setPickerOpen(false); }}
     />
-    <StudyDetailsDialog key={detailStudyId ?? "none"} studyId={detailStudyId} algorithmId={algorithmId} fields={(algorithms ?? []).find((algorithm) => algorithm.id === algorithmId)?.fields ?? []} meta={detailMeta} onClose={() => setDetailStudyId(null)} />
+    <StudyDetailsDialog key={detailStudyId ?? "none"} studyId={detailStudyId} fields={(algorithms ?? []).find((algorithm) => algorithm.id ===algorithmId)?.fields ?? []} meta={detailMeta} onClose={() => setDetailStudyId(null)} />
   </section>;
 }

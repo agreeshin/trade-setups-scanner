@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 mod forecast_view;
 mod study_metrics;
+mod study_projection;
 
 const MAX_ANALYTICS_SETUPS: i64 = 5000;
 const ANALYTICS_HORIZON_MINUTES: i64 = 10_080;
@@ -1408,6 +1409,12 @@ pub fn setups_analytics_router(state: Arc<AnalyticsState>) -> Router {
         .route(
             "/v1/setups/analytics/study-expectancy/{studyId}",
             post(setups_analytics_study_expectancy),
+        )
+        .route(
+            "/v1/setups/analytics/study-expectancy/{studyId}/projection",
+            get(study_projection::read)
+                .post(study_projection::evaluate)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
         )
         .with_state(state)
 }
