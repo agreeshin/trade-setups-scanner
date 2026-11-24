@@ -1,5 +1,28 @@
 # План разработки продукта
 
+### 25 ноября 2026 — Решение 51: видимость исследований и контролы аналитики
+
+- **in_progress / цель:** выполнить новое поручение владельца после PRD-first checkpoint. Ночная автономная работа и поэтапные commit/push разрешены MAIN; после всех исправлений и проверок — **новый** maintenance-safe app-only rollout сначала medved, затем TV. Реализация, проверки и этот новый rollout ещё не выполнены; прежние evidence ниже не переименовываются в их приёмку.
+- **completed / PRD:** решение51 зафиксировано в `docs/prd/PRD.md`, `analytics.md`, `ux.md`, `decisions.md`; текущий дочерний scope — только эти документы и PLAN, без application code, тестов, commit/push и production-операций.
+- **pending / medved и «Алгоритмы»:** доказательно диагностировать/исправить отсутствие запущенного continuous-исследования в списке; отдельно проверить фактический непрерывный пересчёт МО после исследования. В модале post-study сетапов добавить справа сверху gate Switch default ON; скрытие только `gate_failed`, без изменения totals/набора и без новых GET-side расчётов.
+- **pending / «Сетапы»:** явный треугольник раскрытия, стабильная ширина страницы; независимый дневной observed mean/sumR selector; gate Switch справа непосредственно над списком, не в верхних фильтрах. ID-график использует сохранённые mean/forecast/blend, method/recipe/version/settings/λ своего исследования: dashed sealed original и solid combined с **реально выпущенными сетапами**, не post-study replay.
+- **pending / «Аналитика»:** сохраняемые TP/SL-оси списками через запятую действительно управляют матрицами SHORT/LONG; треугольник раскрытия и центрированные заголовки. Endpoint label TP-memory и конец линии на последней сделке, не now; X-даты DD.MM; тег первого/последнего сетапа выбранного набора в timezone/формате интерфейса. Проверить/исправить date selectors и chart timezone при прежних exact-minute/legacy UTC границах; frozen science/history/settings исследований не переинтерпретировать.
+- **pending / приёмка и новый rollout:** целевые regression/UX проверки всех пунктов, затем свежие baseline/проверенная backup/manual guard/owned maintenance drain-resume; по умолчанию полный drained, без нового разрешения interrupt. Сохранить studies/generations/frozen inputs/start/cutoff/исходный deadline/retries, конфигурацию/историю и текущий план загрузки. Без Stop/Start/reset и рестартов PostgreSQL/market-data. До owned resume доказать health/auth/history, восстановление и численное продвижение research/каждого incumbent live; исходно закрытый admission не открывать, stopped не запускать.
+- **in_progress / отдельная эксплуатационная ветка решения50:** текущая приёмка/resume уже начатого medved cutover разрешается своим владельцем отдельно. Не повторять его drain/build/cutover/resume и не считать его новым rollout решения51; актуальные факты восстановления MAIN принимает из этой ветки, не из исторических pending ниже.
+
+#### Curator WIP — активное решение 51
+
+| Lane / Owner | Scope | Status / Acceptance |
+|---|---|---|
+| docs / текущий bounded-владелец | Только PRD/analytics/UX/decisions и активный PLAN | completed: контракт51 и полномочия записаны до feature-кода; без code/tests/Git/production |
+| MAIN / интеграция | Назначение доступных source-владельцев, проверки, поэтапная публикация | in_progress: исторические специалисты обнаружены, но resume из текущего parent отклонён `task_session_not_direct_child`; не считать их запущенными. Source ownership назначается MAIN без дублирования работ |
+| medved / видимость continuous и Algorithms actual | Две отдельные диагностики и post-study gate Switch | pending: доказать причины, исправить в рамках51; IDs/history/retries не сбрасывать |
+| web / Setups и Analytics | Контролы, геометрия, сохранённый objective и разные источники двух study-графиков | pending: выполнять по PRD51; наличие старого кода/тестов не считать новой приёмкой |
+| ops / текущая ветка50 | Только окончание уже начатой medved acceptance/resume | in_progress: отдельный владелец/исходное обслуживание, без повторного cutover; docs-поручение production не меняет |
+| MAIN + sole ops / новый rollout51 | После всех проверок medved → TV, app-only и сохранение текущих работ | pending: свежие ownership/backup/manual guards и numeric progression, затем только собственный resume |
+
+Ниже сохранены исторические срезы и их исходные статусы. Старые Curator WIP, callbacks и разрешения не являются текущими назначениями решения51 и не запускаются автоматически.
+
 ### 24 ноября 2026 - Recommendation parity, две study-линии и точный период Analytics
 
 - **in_progress / цель:** пункты владельца 1–4 реализованы и локально приняты; выполняются commit/push и затем hot deploy полного актуального app-набора на medved и TV с сохранением текущих исследований. Решение50 зафиксировано в PRD до source. PostgreSQL/market-data/история не перезапускаются; Stop/Start/reset и прерывание manual RAM-only работ не разрешены.
