@@ -182,6 +182,8 @@ export interface AnalyticsQueryParams {
   clusterGapHours?: number;
   fromDay?: string;
   toDay?: string;
+  fromUnix?: number;
+  toUnix?: number;
   tpPct?: number;
   slPct?: number;
   timeShiftMinutes?: number;
@@ -190,6 +192,14 @@ export interface AnalyticsQueryParams {
 }
 
 function toQuery(params: AnalyticsQueryParams): URLSearchParams {
+  const exact = params.fromUnix !== undefined || params.toUnix !== undefined;
+  if (exact && (params.month !== undefined || params.fromDay !== undefined || params.toDay !== undefined)) {
+    throw new Error("Точный диапазон нельзя смешивать с month/fromDay/toDay.");
+  }
+  if (exact && (!Number.isSafeInteger(params.fromUnix) || !Number.isSafeInteger(params.toUnix) || params.fromUnix! >= params.toUnix!
+    || params.fromUnix! % 60 !== 0 || params.toUnix! % 60 !== 0)) {
+    throw new Error("Укажите корректный точный диапазон fromUnix < toUnix.");
+  }
   const search = new URLSearchParams({ set: params.set });
   if (params.forecast !== undefined) search.set("forecast", JSON.stringify(params.forecast));
   if (params.observationCutoff !== undefined) search.set("observationCutoff", String(params.observationCutoff));
@@ -200,9 +210,10 @@ function toQuery(params: AnalyticsQueryParams): URLSearchParams {
   if (params.month !== undefined) search.set("month", params.month);
   if (params.setupMaturity !== undefined) search.set("setupMaturity", String(params.setupMaturity));
   if (params.clusterGapHours !== undefined) search.set("clusterGapHours", String(params.clusterGapHours));
-  if (params.month !== undefined) search.set("month", params.month);
   if (params.fromDay !== undefined) search.set("fromDay", params.fromDay);
   if (params.toDay !== undefined) search.set("toDay", params.toDay);
+  if (params.fromUnix !== undefined) search.set("fromUnix", String(params.fromUnix));
+  if (params.toUnix !== undefined) search.set("toUnix", String(params.toUnix));
   if (params.tpPct !== undefined) search.set("tpPct", String(params.tpPct));
   if (params.slPct !== undefined) search.set("slPct", String(params.slPct));
   if (params.timeShiftMinutes !== undefined) search.set("timeShiftMinutes", String(params.timeShiftMinutes));

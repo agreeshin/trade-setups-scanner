@@ -36,11 +36,13 @@ import {
   type TradeRow,
 } from "../lib/analytics-api";
 import {
+  allAnalyticsRange, monthAnalyticsRange, normalizeAnalyticsTimeRange, requireAnalyticsRange,
+  type AnalyticsTimeRange as TimeRangeValue, type AnalyticsPeriod,
   type AnalyticsSectionKey,
   type AnalyticsUserSettings,
 } from "../lib/analytics-settings";
 import { updateSharedAnalyticsSettings, useSharedAnalyticsSettings } from "../lib/analytics-settings-store";
-import { effectiveTimezone, formatUnix, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
+import { effectiveTimezone, formatUnix, interfaceSettings, parseZonedDateTimeInput, subscribeInterfaceSettings, zonedDateTimeInput } from "../lib/datetime-format";
 import { buildDailyExpectancy, buildDailyExpectancyModel, observedDailyPoints, type ObservedDailyMode, type DailyExpectancyPoint } from "../lib/daily-expectancy";
 import { buildForecastRecipe, forecastRecipeLabel, type ForecastRecipeDraft } from "../lib/forecast-recipe";
 import { buildObservedForecastDays } from "../lib/forecast-observations";
@@ -106,7 +108,7 @@ interface MatrixSectionProps {
   clusterize: boolean;
   maturity: number;
   clusterGapHours: number | null;
-  setBounds: { from: string; to: string } | null;
+  setBounds: AnalyticsPeriod | null;
   initial?: Record<string, unknown> | undefined;
   reportState?: ((snapshot: Record<string, unknown>) => void) | undefined;
   onCommit?: (() => void) | undefined;
@@ -118,15 +120,15 @@ function MatrixSection({
   gradientMinDefault, gradientMaxDefault, clusterize, maturity, clusterGapHours, setBounds,
   initial, reportState, onCommit, runToken, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff, scope, onScopeChange,
 }: MatrixSectionProps) {
-  const { timeRange, timeShiftInput, considerPriceChange, priceChangeInput } = scope;
-  const setTimeRange = (value: TimeRangeValue) => onScopeChange({ ...scope, timeRange: value });
+  const { timeRange, persistedTimeRange, timeShiftInput, considerPriceChange, priceChangeInput } = scope;
+  const setTimeRange = (value: TimeRangeValue) => onScopeChange({ ...scope, timeRange: value, persistedTimeRange: value });
   const [gradientMinDraft, setGradientMinDraft] = useState(() => savedNumber(initial?.gradientMin, gradientMinDefault));
   const [gradientMaxDraft, setGradientMaxDraft] = useState(() => savedNumber(initial?.gradientMax, gradientMaxDefault));
   const [gradientMin, setGradientMin] = useState(() => savedNumber(initial?.gradientMin, gradientMinDefault));
   const [gradientMax, setGradientMax] = useState(() => savedNumber(initial?.gradientMax, gradientMaxDefault));
   const [cells, setCells] = useState<Map<string, MatrixCellRef>>(new Map());
   const [resultIdentity, setResultIdentity] = useState<string | null>(null);
-  const modelIdentity = JSON.stringify({ setId, direction, timeRange: timeRangeParams(timeRange), shift: appliedTimeShift(scope), gate: appliedPriceGate(scope),
+  const modelIdentity = JSON.stringify({ setId, direction, timeRange, shift: appliedTimeShift(scope), gate: appliedPriceGate(scope),
     clusterize, ...(clusterize ? { maturity, clusterGapHours } : {}),
     mode: trendMode, bend: trendBendDays, forecast, lambda: trendBlendLambda, cutoff: forecast ? observationCutoff : undefined });
   const currentIdentity = useRef(modelIdentity);
@@ -147,8 +149,8 @@ function MatrixSection({
   }, [modelIdentity]);
 
   useEffect(() => {
-    reportState?.({ timeRange, timeShiftInput, considerPriceChange, priceChangeInput, gradientMin, gradientMax });
-  }, [reportState, timeRange, timeShiftInput, considerPriceChange, priceChangeInput, gradientMin, gradientMax]);
+    reportState?.({ timeRange: persistedTimeRange, timeShiftInput, considerPriceChange, priceChangeInput, gradientMin, gradientMax });
+  }, [reportState, persistedTimeRange, timeShiftInput, considerPriceChange, priceChangeInput, gradientMin, gradientMax]);
 
   const totalCells = tpLevels.length * slLevels.length;
 
@@ -166,6 +168,7 @@ function MatrixSection({
     setPendingCell(null);
     const stale = () => runIdRef.current !== runId || currentIdentity.current !== modelIdentity;
     try {
+    requireAnalyticsRange(timeRange);
     const recipe = forecast !== undefined && trendMode !== "mean" ? buildForecastRecipe(forecast) : undefined;
     const lambda = Number(trendBlendLambda);
     if (trendMode === "blend" && !isTrendBlendLambda(lambda)) throw new Error("Доля прогноза λ: 0.05–0.95 с шагом 0.01.");
@@ -328,64 +331,24 @@ function MatrixSection({
   </section>;
 }
 
-function utcDayOf(unix: number): string {
-  return new Date(unix * 1000).toISOString().slice(0, 10);
-}
-
-function monthDayBounds(month: string): { from: string; to: string } {
-  const [year, monthNumber] = month.split("-").map(Number);
-  const lastDay = new Date(Date.UTC(year ?? 0, monthNumber ?? 0, 0)).toISOString().slice(0, 10);
-  return { from: `${month}-01`, to: lastDay };
-}
-
-/** Time filter state shared by every section: month selector synced with a date pair. */
-interface TimeRangeValue {
-  mode: "all" | "month" | "custom";
-  month: string;
-  fromDay: string | null;
-  toDay: string | null;
-}
-
 interface AnalyticsSelectionScope {
   timeRange: TimeRangeValue;
+  /** Retain the loaded representation until an explicit range edit. */
+  persistedTimeRange: unknown;
   timeShiftInput: string;
   considerPriceChange: boolean;
   priceChangeInput: string;
 }
-function restoreSelectionScope(saved?: Record<string, unknown>): AnalyticsSelectionScope {
-  return { timeRange: normalizeTimeRange(saved?.timeRange), timeShiftInput: savedString(saved?.timeShiftInput, "0"),
+function restoreSelectionScope(saved?: Record<string, unknown>, period: AnalyticsPeriod | null = null): AnalyticsSelectionScope {
+  const timeRange = normalizeAnalyticsTimeRange(saved?.timeRange, period);
+  return { timeRange, persistedTimeRange: saved?.timeRange ?? timeRange, timeShiftInput: savedString(saved?.timeShiftInput, "0"),
     considerPriceChange: saved?.considerPriceChange === true, priceChangeInput: savedString(saved?.priceChangeInput, "0") };
 }
 const appliedTimeShift = (scope: AnalyticsSelectionScope) => Math.max(0, Math.round(parseNumberInput(scope.timeShiftInput) ?? 0));
 const appliedPriceGate = (scope: AnalyticsSelectionScope) => scope.considerPriceChange ? parseNumberInput(scope.priceChangeInput) ?? 0 : null;
 
-function timeRangeParams(value: TimeRangeValue): { month?: string; fromDay?: string; toDay?: string } {
-  if (value.mode === "month") return { month: value.month };
-  if (value.mode === "custom" && value.fromDay !== null && value.toDay !== null && value.fromDay !== "" && value.toDay !== "") {
-    return { fromDay: value.fromDay, toDay: value.toDay };
-  }
-  return {};
-}
-
-function timeRangeBounds(value: TimeRangeValue, setBounds: { from: string; to: string } | null): { from: string; to: string } | null {
-  if (value.mode === "custom") {
-    return value.fromDay !== null && value.toDay !== null && value.fromDay !== "" && value.toDay !== "" ? { from: value.fromDay, to: value.toDay } : null;
-  }
-  if (value.mode === "month") return monthDayBounds(value.month);
-  return setBounds;
-}
-
-/** Restores a saved time range from an untrusted JSON payload. */
-function normalizeTimeRange(raw: unknown): TimeRangeValue {
-  if (raw === null || typeof raw !== "object") return { mode: "all", month: "all", fromDay: null, toDay: null };
-  const value = raw as Partial<TimeRangeValue>;
-  if (value.mode === "month" && typeof value.month === "string" && /^\d{4}-\d{2}$/.test(value.month)) {
-    return { mode: "month", month: value.month, fromDay: null, toDay: null };
-  }
-  if (value.mode === "custom" && typeof value.fromDay === "string" && typeof value.toDay === "string") {
-    return { mode: "custom", month: "custom", fromDay: value.fromDay, toDay: value.toDay };
-  }
-  return { mode: "all", month: "all", fromDay: null, toDay: null };
+function timeRangeParams(value: TimeRangeValue): Partial<AnalyticsPeriod> {
+  return { ...(value.fromUnix !== null ? { fromUnix: value.fromUnix } : {}), ...(value.toUnix !== null ? { toUnix: value.toUnix } : {}) };
 }
 
 function savedString(raw: unknown, fallback: string): string {
@@ -396,10 +359,10 @@ function savedNumber(raw: unknown, fallback: number): number {
   return typeof raw === "number" && Number.isFinite(raw) ? raw : fallback;
 }
 
-/** Month selector + date pair: month choice auto-fills the dates, manual dates set the dash. */
+/** Reuses Runs' configured-zone datetime inputs; exact instants own the selection. */
 function TimeRangeControls({ setId, setBounds, value, onChange, onCommit }: {
   setId: string;
-  setBounds: { from: string; to: string } | null;
+  setBounds: AnalyticsPeriod | null;
   value: TimeRangeValue;
   onChange: (next: TimeRangeValue) => void;
   onCommit?: (() => void) | undefined;
@@ -415,9 +378,15 @@ function TimeRangeControls({ setId, setBounds, value, onChange, onCommit }: {
   // The selected month must exist as an option even before the fetched list arrives,
   // otherwise the browser cannot apply the controlled value and falls back to «Всё время».
   const monthOptions = value.mode === "month" && !months.includes(value.month) ? [value.month, ...months] : months;
-  const auto = value.mode === "month" ? monthDayBounds(value.month) : value.mode === "all" ? setBounds : null;
-  const fromValue = value.mode === "custom" ? (value.fromDay ?? "") : (auto?.from ?? "");
-  const toValue = value.mode === "custom" ? (value.toDay ?? "") : (auto?.to ?? "");
+  const timezone = effectiveTimezone();
+  const [draft, setDraft] = useState<{ field: "fromUnix" | "toUnix"; text: string; range: TimeRangeValue; timezone: string } | null>(null);
+  const fieldValue = (field: "fromUnix" | "toUnix") => draft?.field === field && draft.range === value && draft.timezone === timezone
+    ? draft.text : value[field] === null ? "" : zonedDateTimeInput(value[field]);
+  const edit = (field: "fromUnix" | "toUnix", text: string) => {
+    const parsed = parseZonedDateTimeInput(text);
+    const range: TimeRangeValue = { ...value, mode: "custom", month: "custom", [field]: Number.isFinite(parsed) ? Math.floor(parsed / 60) * 60 : null };
+    setDraft({ field, text, range, timezone }); onChange(range);
+  };
   return <>
     <Field label="Период" className="w-44">
       {(control) => <Select
@@ -426,10 +395,10 @@ function TimeRangeControls({ setId, setBounds, value, onChange, onCommit }: {
         onChange={(event) => {
           const next = event.target.value;
           if (next === "all") {
-            onChange({ mode: "all", month: "all", fromDay: null, toDay: null });
+            setDraft(null); onChange(allAnalyticsRange(setBounds));
             onCommit?.();
           } else if (next !== "custom") {
-            onChange({ mode: "month", month: next, fromDay: null, toDay: null });
+            setDraft(null); onChange(monthAnalyticsRange(next));
             onCommit?.();
           }
         }}
@@ -439,12 +408,13 @@ function TimeRangeControls({ setId, setBounds, value, onChange, onCommit }: {
         <option value="custom" disabled>—</option>
       </Select>}
     </Field>
-    <Field label="С даты" className="w-40">
-      {(control) => <Input {...control} type="date" value={fromValue} onBlur={() => onCommit?.()} onChange={(event) => onChange({ mode: "custom", month: "custom", fromDay: event.target.value, toDay: toValue })} />}
+    <Field label="С даты" className="w-64">
+      {(control) => <Input {...control} type="datetime-local" step={60} value={fieldValue("fromUnix")} onBlur={() => onCommit?.()} onChange={(event) => edit("fromUnix", event.target.value)} />}
     </Field>
-    <Field label="По дату" className="w-40">
-      {(control) => <Input {...control} type="date" value={toValue} onBlur={() => onCommit?.()} onChange={(event) => onChange({ mode: "custom", month: "custom", fromDay: fromValue, toDay: event.target.value })} />}
+    <Field label="По дату" className="w-64">
+      {(control) => <Input {...control} type="datetime-local" step={60} value={fieldValue("toUnix")} onBlur={() => onCommit?.()} onChange={(event) => edit("toUnix", event.target.value)} />}
     </Field>
+    <p className="self-center text-xs text-muted-foreground">{timezone} · начало включено, конец исключён</p>
   </>;
 }
 
@@ -590,20 +560,18 @@ interface TradesSectionProps {
   forecast: ForecastRecipeDraft | undefined;
   trendBlendLambda: string;
   observationCutoff: number;
-  setPeriod: { fromUnix: number; toUnix: number } | null;
   setId: string;
   description: string;
   direction: "short" | "long";
   clusterize: boolean;
   maturity: number;
   clusterGapHours: number | null;
-  setBounds: { from: string; to: string } | null;
   initial?: Record<string, unknown> | undefined;
   reportState?: ((snapshot: Record<string, unknown>) => void) | undefined;
   onCommit?: (() => void) | undefined;
 }
 
-function TradesSection({ setId, description, direction, clusterize, maturity, clusterGapHours, setBounds, initial, reportState, onCommit, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff, setPeriod, scope }: TradesSectionProps) {
+function TradesSection({ setId, description, direction, clusterize, maturity, clusterGapHours, initial, reportState, onCommit, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff, scope }: TradesSectionProps) {
   const [tpInput, setTpInput] = useState(() => savedString(initial?.tpInput, "4"));
   const [slInput, setSlInput] = useState(() => savedString(initial?.slInput, "4"));
   const { timeRange } = scope;
@@ -637,7 +605,7 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
     } : {}),
     ...(gate !== null ? { priceChangePct: gate } : {}),
   }), [setId, direction, tpInput, slInput, shift, timeRange, clusterize, maturity, clusterGapHours, gate]);
-  const paramsKey = JSON.stringify({ ...params, observationCutoff });
+  const paramsKey = JSON.stringify({ ...params, timeRange, observationCutoff });
   const currentParamsKey = useRef(paramsKey);
   const [displayParamsKey, setDisplayParamsKey] = useState(paramsKey);
   if (displayParamsKey !== paramsKey) {
@@ -660,6 +628,7 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
     setProgress({ done: 0, total: 0 });
     const stale = () => controller.signal.aborted || runIdRef.current !== runId || currentParamsKey.current !== paramsKey;
     try {
+      requireAnalyticsRange(timeRange);
       const selection = await fetchAnalyticsSetups(params, controller.signal);
       if (stale()) return;
       const setups = selection.setups;
@@ -700,18 +669,13 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
     } finally {
       if (runIdRef.current === runId && currentParamsKey.current === paramsKey) { setRunning(false); runRequest.current = null; }
     }
-  }, [params, paramsKey]);
+  }, [params, paramsKey, timeRange]);
 
-  const effectiveDays = timeRangeBounds(timeRange, setBounds);
-  const effectiveFromDay = effectiveDays?.from;
-  const effectiveToDay = effectiveDays?.to;
+  const { fromUnix, toUnix } = timeRange;
   const scopedRows = useMemo(() => {
-    if (resultParamsKey !== paramsKey) return [];
-    if (effectiveFromDay === undefined || effectiveToDay === undefined) return rows;
-    const from = Math.floor(new Date(`${effectiveFromDay}T00:00:00Z`).getTime() / 1000);
-    const to = Math.floor(new Date(`${effectiveToDay}T23:59:59Z`).getTime() / 1000);
-    return rows.filter((row) => row.setup.closeTimeUnix >= from && row.setup.closeTimeUnix <= to);
-  }, [rows, effectiveFromDay, effectiveToDay, resultParamsKey, paramsKey]);
+    if (resultParamsKey !== paramsKey || fromUnix === null || toUnix === null) return [];
+    return rows.filter((row) => row.setup.closeTimeUnix >= fromUnix && row.setup.closeTimeUnix < toUnix);
+  }, [rows, fromUnix, toUnix, resultParamsKey, paramsKey]);
   const visibleRows = useMemo(() => scopedRows.filter((row) => row.status !== "price_change_filtered"), [scopedRows]);
 
   const deposit = useMemo(() => {
@@ -741,10 +705,9 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
   }, [visibleRows]);
 
   const dailyPoints = useMemo(() => buildDailyExpectancy(visibleRows), [visibleRows]);
-  const chartOriginUnix = effectiveDays !== null ? Date.parse(`${effectiveDays.from}T00:00:00Z`) / 1000 : dailyPoints[0]?.dayStartUnix ?? 0;
-  const chartFromUnix = timeRange.mode === "all" && setPeriod ? setPeriod.fromUnix : chartOriginUnix;
-  // Set bounds are inclusive raw-signal timestamps; the model API uses [from,to).
-  const chartToUnix = timeRange.mode === "all" && setPeriod ? setPeriod.toUnix + 1 : effectiveToDay ? Date.parse(`${effectiveToDay}T00:00:00Z`) / 1000 + 86400 : (dailyPoints.at(-1)?.dayStartUnix ?? chartFromUnix) + 86400;
+  const chartFromUnix = fromUnix ?? 0;
+  const chartToUnix = toUnix ?? chartFromUnix;
+  const chartOriginUnix = Math.floor(chartFromUnix / 86400) * 86400;
   const activeCutoff = forecast !== undefined && trendMode !== "mean";
   const retainFutureCohorts = forecast?.method !== "decayed_probability";
   const modelPopulation = useMemo(() => {
@@ -970,15 +933,17 @@ export function AnalyticsPage() {
   // Seed once before mounting section forms. Keep-alive forecast edits thereafter
   // come directly from the shared owner, never from this bootstrap snapshot.
   if (!hydrated && settingsState === "ready" && settings !== null && setsState !== "loading") {
-    setSetId(settings.setId !== null && sets.some((item) => item.setId === settings.setId) ? settings.setId : sets[0]?.setId ?? "");
+    const selected = sets.find((item) => item.setId === settings.setId) ?? sets[0];
+    const period = selected?.fromUnix != null && selected.toUnix != null ? { fromUnix: selected.fromUnix, toUnix: selected.toUnix } : null;
+    setSetId(selected?.setId ?? "");
     setClusterize(settings.clusterize);
     setMaturityDraft(settings.maturity);
     setMaturity(settings.maturity);
     setClusterGapInput(settings.clusterGapInput);
     setAutoCalc(settings.autoCalc);
     setSavedSettings(settings);
-    setShortScope(restoreSelectionScope(settings.sections["short-matrix"]));
-    setLongScope(restoreSelectionScope(settings.sections["long-matrix"]));
+    setShortScope(restoreSelectionScope(settings.sections["short-matrix"], period));
+    setLongScope(restoreSelectionScope(settings.sections["long-matrix"], period));
     if (settings.autoCalc) setRunToken(1);
     setHydrated(true);
   }
@@ -1047,9 +1012,8 @@ export function AnalyticsPage() {
 
   const appliedClusterGapHours = parseNumberInput(clusterGapInput);
   const activeSet = sets.find((set) => set.setId === setId);
-  const setPeriod = useMemo(() => activeSet?.fromUnix != null && activeSet.toUnix != null ? { fromUnix: activeSet.fromUnix, toUnix: activeSet.toUnix } : null, [activeSet]);
   const setBounds = activeSet?.fromUnix != null && activeSet?.toUnix != null
-    ? { from: utcDayOf(activeSet.fromUnix), to: utcDayOf(activeSet.toUnix) }
+    ? { fromUnix: activeSet.fromUnix, toUnix: activeSet.toUnix }
     : null;
 
   return <section aria-labelledby="analytics-heading" className="grid gap-4">
@@ -1063,7 +1027,16 @@ export function AnalyticsPage() {
           <div className="flex flex-wrap items-end gap-3">
             <Field label="Набор сетапов" className="w-full max-w-md">
               {(control) => (
-                <Select {...control} searchable searchPlaceholder="Найти набор сетапов" value={setId} disabled={setsState !== "ready"} onChange={(event) => { setSetId(event.target.value); onSettingsCommit(); }}>
+                <Select {...control} searchable searchPlaceholder="Найти набор сетапов" value={setId} disabled={setsState !== "ready"} onChange={(event) => {
+                  const selected = sets.find((item) => item.setId === event.target.value);
+                  const period = selected?.fromUnix != null && selected.toUnix != null ? { fromUnix: selected.fromUnix, toUnix: selected.toUnix } : null;
+                  for (const update of [setShortScope, setLongScope]) update((previous) => {
+                    if (previous.timeRange.mode !== "all") return previous;
+                    const timeRange = allAnalyticsRange(period);
+                    return { ...previous, timeRange, persistedTimeRange: timeRange };
+                  });
+                  setSetId(event.target.value); onSettingsCommit();
+                }}>
                   {sets.length === 0 && <option value="">Нет завершённых запусков</option>}
                   {hydrated && sets.map((set) => <option key={set.setId} value={set.setId}>{set.label}</option>)}
                 </Select>
@@ -1174,14 +1147,13 @@ export function AnalyticsPage() {
       <TradesSection
         scope={shortScope}
         trendBendDays={trendBendDays}
-        trendMode={trendMode} forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff} setPeriod={setPeriod}
+        trendMode={trendMode} forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff}
         setId={setId}
         description="SHORT: построчные сделки — вход по close свечи через time-shift, закрытие по TP или SL за 7 дней. Сначала показываются кешированные строки, недостающие досчитываются."
         direction="short"
         clusterize={clusterize}
         maturity={maturity}
         clusterGapHours={appliedClusterGapHours}
-        setBounds={setBounds}
         initial={savedSettings?.sections["short-trades"]}
         reportState={reportShortTrades}
         onCommit={() => onSettingsCommit(false)}
@@ -1214,14 +1186,13 @@ export function AnalyticsPage() {
       <TradesSection
         scope={longScope}
         trendBendDays={trendBendDays}
-        trendMode={trendMode} forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff} setPeriod={setPeriod}
+        trendMode={trendMode} forecast={forecast} trendBlendLambda={trendBlendLambda} observationCutoff={observationCutoff}
         setId={setId}
         description="LONG: построчные закрытия по уровням TP/SL с ценой входа, временем касания и результатом в рисках."
         direction="long"
         clusterize={clusterize}
         maturity={maturity}
         clusterGapHours={appliedClusterGapHours}
-        setBounds={setBounds}
         initial={savedSettings?.sections["long-trades"]}
         reportState={reportLongTrades}
         onCommit={() => onSettingsCommit(false)}

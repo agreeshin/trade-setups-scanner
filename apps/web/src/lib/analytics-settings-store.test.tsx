@@ -2,6 +2,7 @@ import { StrictMode, type PropsWithChildren } from "react";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { loadSharedAnalyticsSettings, saveSharedAnalyticsSettings, updateSharedAnalyticsSettings, useSharedAnalyticsSettings } from "./analytics-settings-store";
+import { applyInterfaceSettings } from "./datetime-format";
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 const original = { setId: "run-12", trendMode: "forecast", trendBendDays: "14", trendBlendLambda: "0.7",
@@ -21,7 +22,7 @@ beforeEach(() => {
     return Promise.resolve(method === "PUT" ? put(body!) : get());
   }));
 });
-afterEach(async () => { cleanup(); await Promise.resolve(); vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(async () => { cleanup(); await Promise.resolve(); vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); applyInterfaceSettings({ timezone: "auto" }); });
 const settle = async (ms = 0) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
 const puts = () => calls.filter((call) => call.method === "PUT");
 
@@ -37,6 +38,24 @@ it("shares one load and one forecast owner across StrictMode/keep-alive consumer
   expect(puts()).toHaveLength(1);
   expect(puts()[0]?.body).toMatchObject({ trendMode: "blend", trendBlendLambda: "0.4", sections: original.sections, futureRoot: original.futureRoot });
   expect(two.result.current.saveStatus).toBe("saved");
+});
+
+it.each([
+  { mode: "custom", month: "custom", fromDay: "2026-03-08", toDay: "2026-03-08" },
+  { mode: "month", month: "2026-03", fromDay: null, toDay: null },
+])("preserves untouched legacy $mode range fields when shared forecast and other settings are saved", async (timeRange) => {
+  applyInterfaceSettings({ timezone: "America/New_York" });
+  const sections = { ...original.sections, "short-matrix": { timeRange, timeShiftInput: "0" } };
+  get = () => json({ settings: { ...original, sections } });
+  const owner = renderHook(useSharedAnalyticsSettings); await settle();
+  expect(owner.result.current.settings?.sections["short-matrix"]?.timeRange).toEqual(timeRange);
+  act(() => updateSharedAnalyticsSettings({ trendMode: "blend", trendBlendLambda: "0.4" })); await settle(800);
+  expect(puts()).toHaveLength(1);
+  expect(puts()[0]?.body).toMatchObject({ trendMode: "blend", trendBlendLambda: "0.4", sections });
+  act(() => updateSharedAnalyticsSettings({ clusterGapInput: "9", sections: { "short-matrix": { gradientMin: -0.1 } } })); await settle(800);
+  expect(puts()).toHaveLength(2);
+  expect(puts()[1]?.body).toMatchObject({ clusterGapInput: "9", trendBlendLambda: "0.4",
+    sections: { ...sections, "short-matrix": { ...sections["short-matrix"], gradientMin: -0.1 } } });
 });
 
 it("serializes PUTs and ignores an older save ACK/refetch while a newer control edit is queued", async () => {

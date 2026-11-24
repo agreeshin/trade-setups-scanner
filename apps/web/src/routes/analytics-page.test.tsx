@@ -1,4 +1,4 @@
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AnalyticsPage } from "./analytics-page";
@@ -9,6 +9,7 @@ import type { ForecastCurveRequest, ForecastCurveResponse } from "../lib/forecas
 import { forecastFixture } from "../../test/forecast-fixture";
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); applyInterfaceSettings({ timezone: "auto" }); });
+beforeEach(() => { applyInterfaceSettings({ timezone: "UTC" }); });
 
 const setFixture = {
   setId: "run-12", kind: "run", numericId: 12, label: "#12 · Утренний прогон",
@@ -154,6 +155,128 @@ function stubFetch(options: StubOptions = {}) {
   return calls;
 }
 
+it("shares exact partial-day minute bounds across matrix, cell and forecast, includes start and excludes end without hidden calculation", async () => {
+  applyInterfaceSettings({ timezone: "America/New_York", time24: false });
+  const fromUnix = Date.parse("2026-03-08T06:30:00Z") / 1000;
+  const toUnix = Date.parse("2026-03-08T07:30:00Z") / 1000;
+  const rows = [utcTrade("2026-03-08T06:29:00Z", -1, 0), utcTrade("2026-03-08T06:30:00Z", 1, 1),
+    utcTrade("2026-03-08T07:29:00Z", 1, 2), utcTrade("2026-03-08T07:30:00Z", -1, 3)];
+  const calls = stubFetch({ tradeRows: rows, savedSettings: { trendMode: "mean", forecast: { method: "decayed_probability", version: 1, halfLifeDays: 14, kappa: 4, priorPolicy: "gross_break_even" },
+    sections: { "short-matrix": { timeRange: { mode: "custom", fromUnix: fromUnix + 37, toUnix: toUnix + 59 } } } } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2026-03-08T01:30");
+  expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2026-03-08T03:30");
+  expect(screen.getAllByLabelText("С даты")[0]!.closest('[data-slot="date-control"]')).toHaveTextContent("01:30 AM");
+  expect(screen.getAllByLabelText("По дату")[0]!.closest('[data-slot="date-control"]')).toHaveTextContent("03:30 AM");
+  expect(calls.some((call) => call.path.includes("/trades") || call.path.includes("/matrix-grid"))).toBe(false);
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByText("Матожидание: +1.00R по 2 закрытым");
+  expect(screen.queryByText("UTC0USDT")).not.toBeInTheDocument();
+  expect(screen.getByText("UTC1USDT")).toBeInTheDocument();
+  expect(screen.queryByText("UTC3USDT")).not.toBeInTheDocument();
+  const scoped = calls.filter((call) => ["/v1/analytics/matrix-grid", "/v1/analytics/setups", "/v1/analytics/trades"].includes(call.path));
+  expect(scoped).toHaveLength(3);
+  for (const call of scoped) {
+    const query = new URLSearchParams(call.search);
+    expect(query.get("fromUnix")).toBe(String(fromUnix)); expect(query.get("toUnix")).toBe(String(toUnix));
+    expect(query.has("fromDay") || query.has("month")).toBe(false);
+  }
+  await waitFor(() => expect(calls.some((call) => call.path === "/v1/analytics/forecast")).toBe(true));
+  const graph = JSON.parse(calls.find((call) => call.path === "/v1/analytics/forecast")!.body!) as ForecastCurveRequest;
+  expect(graph.fromUnix).toBe(fromUnix); expect(graph.toUnix).toBe(toUnix);
+  const count = scoped.length;
+  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2026-03-08T01:31" } });
+  fireEvent.blur(screen.getAllByLabelText("С даты")[0]!);
+  expect(screen.getAllByLabelText("Период")[0]).toHaveValue("custom");
+  await waitFor(() => expect(calls.some((call) => call.method === "PUT")).toBe(true), { timeout: 3000 });
+  expect(calls.filter((call) => ["/v1/analytics/matrix-grid", "/v1/analytics/setups", "/v1/analytics/trades"].includes(call.path))).toHaveLength(count);
+  const saved = JSON.parse(calls.find((call) => call.method === "PUT")!.body!) as { sections: Record<string, { timeRange?: unknown }> };
+  expect(saved.sections["short-matrix"]!.timeRange).toEqual({ mode: "custom", month: "custom", fromUnix: fromUnix + 60, toUnix });
+  expect(screen.queryByText("UTC1USDT")).not.toBeInTheDocument();
+});
+
+it.each([
+  { mode: "custom", month: "custom", fromDay: "2026-03-08", toDay: "2026-03-08" },
+  { mode: "month", month: "2026-03", fromDay: null, toDay: null },
+])("preserves legacy $mode fields on unrelated saves and persists exact bounds only after a range edit", async (legacy) => {
+  applyInterfaceSettings({ timezone: "America/New_York" });
+  const fromUnix = Date.parse(legacy.mode === "month" ? "2026-03-01T00:00:00Z" : "2026-03-08T00:00:00Z") / 1000;
+  const toUnix = Date.parse(legacy.mode === "month" ? "2026-04-01T00:00:00Z" : "2026-03-09T00:00:00Z") / 1000;
+  const rows = [utcTrade(new Date((fromUnix + 60) * 1000).toISOString(), 1, 0), utcTrade(new Date((fromUnix + 120) * 1000).toISOString(), -1, 1)];
+  const calls = stubFetch({ tradeRows: rows, savedSettings: { forecast: { method: "decayed_probability", version: 1, halfLifeDays: 14, kappa: 4, priorPolicy: "gross_break_even" },
+    sections: { "short-matrix": { timeRange: legacy }, "long-matrix": { timeRange: legacy } } } });
+  render(<><AnalyticsPage /><SharedForecastControls /></>); await screen.findByText("#12 · Утренний прогон");
+  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue(legacy.mode === "month" ? "2026-02-28T19:00" : "2026-03-07T19:00");
+  expect(screen.getAllByLabelText("По дату")[0]).toHaveValue(legacy.mode === "month" ? "2026-03-31T20:00" : "2026-03-08T20:00");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  const first = new URLSearchParams(calls.find((call) => call.path === "/v1/analytics/matrix-grid")!.search);
+  expect(first.get("fromUnix")).toBe(String(fromUnix)); expect(first.get("toUnix")).toBe(String(toUnix));
+  act(() => { applyInterfaceSettings({ timezone: "Pacific/Auckland", time24: false }); });
+  const localFrom = legacy.mode === "month" ? "2026-03-01T13:00" : "2026-03-08T13:00";
+  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue(localFrom);
+  expect(screen.getAllByLabelText("По дату")[0]).toHaveValue(legacy.mode === "month" ? "2026-04-01T13:00" : "2026-03-09T13:00");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  const second = new URLSearchParams(calls.filter((call) => call.path === "/v1/analytics/matrix-grid").at(-1)!.search);
+  expect(second.toString()).toBe(first.toString());
+  await act(async () => { await new Promise((resolve) => { setTimeout(resolve, 850); }); });
+  expect(calls.some((call) => call.method === "PUT" || call.path.includes("/trades") || call.path === "/v1/analytics/setups")).toBe(false);
+
+  const puts = () => calls.filter((call) => call.method === "PUT");
+  const savedRange = (index: number, direction = "short") => (JSON.parse(puts()[index]!.body!) as { sections: Record<string, { timeRange: unknown }> }).sections[`${direction}-matrix`]!.timeRange;
+  const shared = within(screen.getByRole("region", { name: "Общий прогноз Analytics и Сетапов" }));
+  fireEvent.click(shared.getByRole("button", { name: "Прогноз" }));
+  await waitFor(() => expect(puts()).toHaveLength(1), { timeout: 3000 });
+  expect(savedRange(0)).toEqual(legacy); expect(savedRange(0, "long")).toEqual(legacy);
+  fireEvent.change(screen.getAllByLabelText("Time-shift, мин")[0]!, { target: { value: "7" } });
+  fireEvent.blur(screen.getAllByLabelText("Time-shift, мин")[0]!);
+  await waitFor(() => expect(puts()).toHaveLength(2), { timeout: 3000 });
+  expect(savedRange(1)).toEqual(legacy); expect(savedRange(1, "long")).toEqual(legacy);
+  expect(JSON.parse(puts()[1]!.body!) as unknown).toMatchObject({ trendMode: "forecast", sections: { "short-matrix": { timeShiftInput: "7" } } });
+
+  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: localFrom.replace(":00", ":01") } });
+  fireEvent.blur(screen.getAllByLabelText("С даты")[0]!);
+  expect(screen.getAllByLabelText("Период")[0]).toHaveValue("custom");
+  await waitFor(() => expect(puts()).toHaveLength(3), { timeout: 3000 });
+  expect(savedRange(2)).toEqual({ mode: "custom", month: "custom", fromUnix: fromUnix + 60, toUnix });
+  expect(savedRange(2, "long")).toEqual(legacy);
+  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid")).toHaveLength(2);
+  expect(calls.some((call) => call.path.includes("/trades") || call.path === "/v1/analytics/setups" || call.path === "/v1/analytics/forecast")).toBe(false);
+  const beforeCalculation = calls.length;
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await waitFor(() => expect(calls.some((call) => call.path === "/v1/analytics/forecast")).toBe(true));
+  const scoped = calls.slice(beforeCalculation).filter((call) => ["/v1/analytics/matrix-grid", "/v1/analytics/setups", "/v1/analytics/trades"].includes(call.path));
+  expect(scoped).toHaveLength(3);
+  for (const call of scoped) {
+    const query = new URLSearchParams(call.search);
+    expect(query.get("fromUnix")).toBe(String(fromUnix + 60)); expect(query.get("toUnix")).toBe(String(toUnix));
+    for (const field of ["month", "fromDay", "toDay"]) expect(query.has(field)).toBe(false);
+  }
+  const graph = JSON.parse(calls.find((call) => call.path === "/v1/analytics/forecast")!.body!) as ForecastCurveRequest;
+  expect(graph.fromUnix).toBe(fromUnix + 60); expect(graph.toUnix).toBe(toUnix);
+}, 15_000);
+
+it("fences a late matrix and list response after a same-day one-minute scope edit without starting another request", async () => {
+  const pending: { matrix?: (response: Response) => void; trades?: (response: Response) => void } = {};
+  const calls = stubFetch({ interceptMatrixGrid: () => new Promise<Response>((resolve) => { pending.matrix = resolve; }),
+    interceptTradeRows: () => new Promise<Response>((resolve) => { pending.trades = resolve; }) });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!); // Matrix is now “Остановить”; the remaining calculate button is the cell.
+  await waitFor(() => expect(pending.trades).toBeDefined());
+  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2023-11-14T00:01" } });
+  await act(async () => {
+    pending.matrix!(new Response(JSON.stringify({ items: fullShortGrid, ...selectionMetrics })));
+    pending.trades!(new Response(JSON.stringify({ items: [{ setup: setupA, status: "tp", riskReturn: 1 }], cachedCount: 1 })));
+    await Promise.resolve();
+  });
+  expect(screen.queryByText("0.17")).not.toBeInTheDocument(); expect(screen.queryByText("BTCUSDT")).not.toBeInTheDocument();
+  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid")).toHaveLength(1);
+  expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(1);
+  expect(calls.some((call) => call.path.startsWith("/v1/analytics/trades/"))).toBe(false);
+});
+
 const fullShortGrid = shortLevels.flatMap((tp) => shortLevels.map((sl) => matrixCell(tp, sl, tp === 6 && sl === 6 ? 0.17 : 0.05)));
 const fullLongGrid = longTpLevels.flatMap((tp) => longSlLevels.map((sl) => matrixCell(tp, sl, -0.3)));
 
@@ -217,9 +340,9 @@ it("uses one matrix-owned selection per direction, ignores conflicting legacy li
       const query = new URLSearchParams(call.search);
       expect(query.get("timeShiftMinutes")).toBe(direction === "short" ? "7" : "9");
       expect(query.get("priceChangePct")).toBe(direction === "short" ? "0" : "-1.25");
-      expect(query.get("month")).toBe(direction === "short" ? "2024-01" : null);
-      expect(query.get("fromDay")).toBe(direction === "long" ? "2024-01-02" : null);
-      expect(query.get("toDay")).toBe(direction === "long" ? "2024-01-03" : null);
+      expect(query.get("fromUnix")).toBe(String(Date.parse(direction === "short" ? "2024-01-01T00:00:00Z" : "2024-01-02T00:00:00Z") / 1000));
+      expect(query.get("toUnix")).toBe(String(Date.parse(direction === "short" ? "2024-02-01T00:00:00Z" : "2024-01-04T00:00:00Z") / 1000));
+      for (const key of ["month", "fromDay", "toDay"]) expect(query.has(key)).toBe(false);
       expect(query.has("setupMaturity")).toBe(false);
       if (call.path !== "/v1/analytics/matrix-grid") {
         expect(query.get("tpPct")).toBe(direction === "short" ? "6" : "8");
@@ -266,8 +389,8 @@ it("computes matrices only after the button press and honours subsections", asyn
   expect(screen.getByRole("checkbox", { name: "Авторасчёт матриц" })).not.toBeChecked();
   expect(screen.queryByRole("button", { name: "Сохранить настройки" })).not.toBeInTheDocument();
   expect(screen.getAllByLabelText("Период")[0]).toHaveValue("all");
-  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2023-11-14");
-  expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2023-11-15");
+  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2023-11-14T00:00");
+  expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2023-11-16T00:00");
   expect(screen.getByRole("heading", { name: "Среднее матожидание сетапов" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "Расчёт ячейки" })).toBeInTheDocument();
   expect(screen.queryByRole("heading", { name: "Кеш аналитики" })).not.toBeInTheDocument();
@@ -358,19 +481,23 @@ it("syncs the month selector with the date pair", async () => {
   await screen.findByText("#12 · Утренний прогон");
   await waitFor(() => expect(screen.getAllByLabelText<HTMLSelectElement>("Период").every((select) => [...select.options].some((option) => option.value === "2024-02"))).toBe(true));
   fireEvent.change(screen.getAllByLabelText("Период")[0]!, { target: { value: "2024-01" } });
-  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2024-01-01");
-  expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2024-01-31");
+  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2024-01-01T00:00");
+  expect(screen.getAllByLabelText("По дату")[0]).toHaveValue("2024-02-01T00:00");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
   await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument());
-  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid").every((call) => call.search.includes("month=2024-01") && !call.search.includes("fromDay")));
+  const monthQuery = new URLSearchParams(calls.find((call) => call.path === "/v1/analytics/matrix-grid")!.search);
+  expect(monthQuery.get("fromUnix")).toBe(String(Date.parse("2024-01-01T00:00:00Z") / 1000));
+  expect(monthQuery.get("toUnix")).toBe(String(Date.parse("2024-02-01T00:00:00Z") / 1000));
+  expect(monthQuery.has("month")).toBe(false);
 
-  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2024-01-10" } });
+  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2024-01-10T12:35" } });
   expect(screen.getAllByLabelText("Период")[0]).toHaveValue("custom");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
   await waitFor(() => expect(screen.getByText("Ячеек: 196 / 196")).toBeInTheDocument());
-  const customCalls = calls.filter((call) => call.path === "/v1/analytics/matrix-grid" && call.search.includes("fromDay=2024-01-10"));
-  expect(customCalls.length).toBeGreaterThan(0);
-  expect(customCalls.every((call) => call.search.includes("toDay=2024-01-31") && !call.search.includes("month="))).toBe(true);
+  const custom = new URLSearchParams(calls.filter((call) => call.path === "/v1/analytics/matrix-grid").at(-1)!.search);
+  expect(custom.get("fromUnix")).toBe(String(Date.parse("2024-01-10T12:35:00Z") / 1000));
+  expect(custom.get("toUnix")).toBe(monthQuery.get("toUnix"));
+  expect(custom.has("month") || custom.has("fromDay")).toBe(false);
 }, 10_000);
 
 it("restores saved analytics settings and autosaves on commit", async () => {
@@ -392,7 +519,7 @@ it("restores saved analytics settings and autosaves on commit", async () => {
   expect(screen.getByLabelText("Разрыв кластера, ч")).toHaveValue("12");
   expect(screen.getByRole("checkbox", { name: "Кластеризовать сетапы" })).not.toBeChecked();
   expect(screen.getAllByLabelText("Период")[0]).toHaveValue("2024-01");
-  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2024-01-01");
+  expect(screen.getAllByLabelText("С даты")[0]).toHaveValue("2024-01-01T00:00");
   expect(screen.getAllByLabelText("Time-shift, мин")[0]).toHaveValue("5");
   expect(screen.getAllByLabelText("Смещение цены, %")[0]).toHaveValue("1.5");
   expect(screen.getAllByLabelText("Красный при")[0]).toHaveValue("-0.1");
@@ -484,14 +611,16 @@ it("shows the empty state when no finished runs exist", async () => {
   expect(await screen.findByText("Нет наборов для аналитики")).toBeInTheDocument();
 });
 
-it("filters trades by the display date range", async () => {
-  stubFetch();
+it("rejects reversed exact ranges without starting matrix or list calculation", async () => {
+  const calls = stubFetch();
   render(<AnalyticsPage />);
   await screen.findByText("#12 · Утренний прогон");
-  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2124-01-01" } });
+  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2124-01-01T00:00" } });
   expect(screen.getAllByLabelText("Период")[0]).toHaveValue("custom");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
-  expect(await screen.findByText(/Сделок: 2 \/ 2/)).toBeInTheDocument();
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  expect(screen.getAllByText("Укажите корректные даты: конец диапазона должен быть позже начала.")).toHaveLength(2);
+  expect(calls.some((call) => call.path.includes("/matrix-grid") || call.path.includes("/setups") || call.path.includes("/trades"))).toBe(false);
   expect(screen.queryByText("BTCUSDT")).not.toBeInTheDocument();
 }, 10_000);
 
@@ -675,7 +804,7 @@ it("updates the chart mean and TP/(TP+SL) win rate for only the visible period",
   const heading = screen.getByRole("heading", { name: /^Дневное матожидание в рисках/ });
   expect(heading).toHaveTextContent("Среднее МО: +1.00R · Винрейт: 66.7%");
   expect(within(heading).getByLabelText("Среднее МО за период")).toHaveClass("text-success");
-  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2026-01-04" } });
+  fireEvent.change(screen.getAllByLabelText("С даты")[0]!, { target: { value: "2026-01-04T00:00" } });
   expect(screen.queryByRole("img", { name: "Дневное матожидание в рисках" })).not.toBeInTheDocument();
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
   const updated = await screen.findByRole("heading", { name: /^Дневное матожидание в рисках/ });
