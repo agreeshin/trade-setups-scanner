@@ -71,7 +71,8 @@ fn evaluate(artifact: &ExpectancyArtifact, objective: ExpectancyObjective, actua
     if !actual.daily.iter().any(|p| p.tp_count > 0 || p.sl_count > 0) { return Err("post_study_no_closed_outcomes"); }
     let original = artifact.daily.as_ref().ok_or("original_series_unavailable")?;
     // Keep original scientific setup-count weights (not display archive's closed
-    // counts). New cohorts carry count(*) over their owned emitted dataset.
+    // counts). New cohorts use the same recipe-dependent price-gate selection;
+    // unclosed/no_data rows still carry weight, never a fabricated zero R.
     // Merge a shared UTC day BEFORE fitting, never fit two independent curves or
     // average their means. IANA observed geometry is an independent projection.
     let mut days = BTreeMap::<i64, UtcDailyInput>::new();
@@ -102,6 +103,9 @@ fn evaluate(artifact: &ExpectancyArtifact, objective: ExpectancyObjective, actua
     // as original provenance; all arrays die with this bounded detail request.
     let mut source = artifact.source.clone();
     source.provenance.observation_cutoff = actual.cutoff;
+    // Actual signal closes include C (runtime::emitted uses <= C), whereas
+    // artifact provenance uses [from,to). C+1 includes the UTC bucket at an
+    // exact-midnight C without advancing the model's observation cutoff.
     source.provenance.to_unix = actual.cutoff.checked_add(1).ok_or("combined_cutoff_invalid")?.max(source.provenance.to_unix);
     let diagnostic = build_expectancy_artifact(ExpectancyInput {
         source, selected_cell: Some(SelectedCellInput { raw_r: Some((q*tp as f64-sl as f64)/closed as f64), tp_count: tp, sl_count: sl }),
@@ -133,6 +137,69 @@ mod tests {
         ExpectancyObjective { version: 1, trend_mode: mode, trend_bend_days: bend,
             trend_blend_lambda: TrendBlendLambda::try_from(0.3).unwrap(), forecast: recipe }
     }
+    #[allow(dead_code, unused_imports)]
+    mod golden_fixture { include!("../../tests/fixtures/combined_projection.rs"); }
+
+    #[test]
+    fn combined_split_matches_one_shot_canonical_evaluator_for_every_objective() {
+        for recipe in [None, Some(ForecastRecipe::engineering_baseline()),
+            Some(ForecastRecipe::Trend { version: 1, bend_days: TrendBendDays::Linear }),
+            Some(ForecastRecipe::Trend { version: 1, bend_days: TrendBendDays::Seven })] {
+            for mode in [TrendMode::Mean, TrendMode::Forecast, TrendMode::Blend] {
+                let g = golden_fixture::golden(mode, recipe);
+                let before = g.original.to_json().unwrap();
+                let model = project(Some(&g.original), g.objective, Ok(PublishedActual {
+                    daily: &g.actual_daily, cutoff: g.cutoff, revision: 1, job_id: "golden" }));
+                assert!(matches!(model.availability, DisplayAvailability::Available), "{recipe:?}/{mode:?}: {model:?}");
+                let expected = g.one_shot.objective_series(g.objective).unwrap();
+                assert_eq!(model.method.as_deref(), Some(expected.method));
+                assert_eq!(model.points.len(), expected.curve.len());
+                for (point, (at, value)) in model.points.iter().zip(expected.curve) {
+                    assert_eq!(point.at_unix, at);
+                    match (point.value, value) {
+                        (Some(actual), Some(expected)) => assert!((actual-expected).abs()<1e-10, "{recipe:?}/{mode:?} at {at}"),
+                        (None, None) => {}, _ => panic!("availability differs"),
+                    }
+                }
+                assert!((model.points.last().unwrap().value.unwrap()-g.canonical_decision).abs()<1e-10,
+                    "diagnostic endpoint must match optimizer matrix decision, not just another artifact");
+                assert_eq!(g.original.to_json().unwrap(), before);
+                let split_day = g.split.div_euclid(86400)*86400;
+                assert!(g.original.daily.as_ref().unwrap().iter().any(|p|p.day_start_unix==split_day));
+                assert!(g.actual_daily.iter().any(|p|p.day_start_unix==split_day));
+                // This fixture must catch the former count(*) bug, not merely
+                // exercise a dataset where gate weights happen to cancel.
+                if mode == TrendMode::Forecast && recipe.is_none() {
+                    let mut wrong = g.actual_daily.clone();
+                    for row in g.actual_rows.iter().filter(|r|r["status"]=="gate_failed") {
+                        let day = row["setupTimeUnix"].as_i64().unwrap().div_euclid(86400)*86400;
+                        if let Some(p) = wrong.iter_mut().find(|p|p.day_start_unix==day) { p.row_count += 1; }
+                    }
+                    let wrong = project(Some(&g.original), g.objective, Ok(PublishedActual {
+                        daily: &wrong, cutoff: g.cutoff, revision: 1, job_id: "wrong-weights" }));
+                    assert!((wrong.points.last().unwrap().value.unwrap()-g.canonical_decision).abs()>1e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn combined_inclusive_midnight_cutoff_keeps_boundary_bucket_without_advancing_endpoint() {
+        let artifact = fixture(None);
+        let cutoff = (artifact.source.provenance.observation_cutoff.div_euclid(86400)+1)*86400;
+        let at_boundary = UtcDailyInput { day_start_unix: cutoff, row_count: 1, tp_count: 1, sl_count: 0,
+            mean_r: Some(artifact.source.tp_pct/artifact.source.sl_pct) };
+        let model = project(Some(&artifact), objective(TrendMode::Mean, None), Ok(PublishedActual {
+            daily: &[at_boundary], cutoff, revision: 1, job_id: "midnight" }));
+        assert!(matches!(model.availability, DisplayAvailability::Available), "{model:?}");
+        assert_eq!(model.observation_cutoff, Some(cutoff));
+        assert_eq!(model.points.last().unwrap().at_unix, cutoff as f64);
+        let after = UtcDailyInput { day_start_unix: cutoff+86400, ..at_boundary };
+        assert!(matches!(project(Some(&artifact), objective(TrendMode::Mean, None), Ok(PublishedActual {
+            daily: &[after], cutoff, revision: 1, job_id: "after" })).availability,
+            DisplayAvailability::Unavailable { reason } if reason=="combined_daily_invalid"));
+    }
+
     fn actual_day(artifact: &ExpectancyArtifact) -> UtcDailyInput {
         let day = artifact.daily.as_ref().unwrap().last().unwrap().day_start_unix;
         let q = artifact.source.tp_pct / artifact.source.sl_pct;

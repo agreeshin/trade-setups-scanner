@@ -101,11 +101,17 @@ async fn seed(pool: &PgPool, start: i64) -> i64 {
 
 struct Market {
     start: i64,
+    ready: AtomicBool,
+    ready_calls: AtomicUsize,
     hold: AtomicBool,
     fail: AtomicBool,
     calls: AtomicUsize,
     stop: CancellationToken,
     release: tokio::sync::Notify,
+}
+async fn ready(State(m): State<Arc<Market>>) -> StatusCode {
+    m.ready_calls.fetch_add(1, Ordering::SeqCst);
+    if m.ready.load(Ordering::SeqCst) { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }
 }
 async fn candles(
     State(m): State<Arc<Market>>,
@@ -168,13 +174,15 @@ async fn fixture(
     }
     let market = Arc::new(Market {
         start,
+        ready: AtomicBool::new(true),
+        ready_calls: AtomicUsize::new(0),
         hold: AtomicBool::new(false),
         fail: AtomicBool::new(false),
         calls: AtomicUsize::new(0),
         stop: CancellationToken::new(),
         release: tokio::sync::Notify::new(),
     });
-    let md=Router::new().route("/v1/instruments",get(||async {Json(json!({"instruments":[{"id":1,"exchange":"fixture","category":"linear","symbol":"FIX","status":"trading"}]}))})).route("/v1/candles",get(candles)).with_state(market.clone());
+    let md=Router::new().route("/ready",get(ready)).route("/v1/instruments",get(||async {Json(json!({"instruments":[{"id":1,"exchange":"fixture","category":"linear","symbol":"FIX","status":"trading"}]}))})).route("/v1/candles",get(candles)).with_state(market.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -219,6 +227,33 @@ async fn http_body(app: &Router, method: &str, path: &str, body: Value) -> (Stat
     let status = response.status();
     let data = response.into_body().collect().await.unwrap().to_bytes();
     (status, serde_json::from_slice(&data).unwrap())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated local TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn market_readiness_precedes_claim_and_ready_recovery_preserves_the_queued_job() {
+    isolated(|pool| async move {
+        let start = chrono::Utc::now().timestamp().div_euclid(60)*60-600;
+        let id = seed(&pool,start).await; let (app,state,market,server) = fixture(&pool,start).await;
+        market.ready.store(false,Ordering::SeqCst);
+        let (status,queued) = http(&app,"POST",&format!("/v1/optimization-studies/{id}/actual/refresh")).await;
+        assert_eq!(status,StatusCode::ACCEPTED,"{queued}");
+        let head = db::get(&pool,"admin",id).await.unwrap().unwrap();
+        let runtime = start_actual_runtime(state,2).await.unwrap();
+        // Observe two actual rejected readiness calls, not an arbitrary sleep.
+        // At least the first response has been consumed before the second call.
+        tokio::time::timeout(Duration::from_secs(5),async {while market.ready_calls.load(Ordering::SeqCst)<2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }}).await.expect("runtime must probe market readiness while a job is queued");
+        assert_eq!(db::get(&pool,"admin",id).await.unwrap().unwrap(),head,"not-ready must not claim or replace the accepted revision");
+        assert_eq!(market.calls.load(Ordering::SeqCst),0,"no candles before readiness");
+        market.ready.store(true,Ordering::SeqCst);
+        let completed = wait(&pool,id,"completed").await;
+        assert_eq!(completed["revision"],head["revision"]); assert_eq!(completed["job_id"],head["job_id"]);
+        assert_eq!(completed["observed_through_unix"],head["observed_through_unix"]);
+        assert!(market.calls.load(Ordering::SeqCst)>0);
+        runtime.stop().await; market.stop.cancel(); server.abort(); let _ = server.await;
+    }).await;
 }
 
 #[tokio::test]
@@ -847,7 +882,8 @@ async fn exact_display_original_only_weighted_merge_and_refresh_preservation_wir
     assert_eq!(display["historical"]["availability"]["status"],"available");assert_eq!(display["historical"]["complete"],true);assert_eq!(display["historical"]["fidelity"],"native_original");assert_eq!(display["historical"]["rawReplayAvailable"],false);
     assert!(db::get(&pool,"admin",id).await.unwrap().is_none(),"GET must not admit replay");
     let identity:String=sqlx::query_scalar("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1").bind(id).fetch_one(&pool).await.unwrap();
-    let source=json!({"algorithmId":"price_volume_spike","algorithmVersion":"1.1.1","params":spec["algorithmParams"],"startUnix":start as f64+0.25,"instruments":spec["instruments"]});
+    let source=json!({"algorithmId":"price_volume_spike","algorithmVersion":"1.1.1","params":spec["algorithmParams"],"startUnix":start as f64+0.25,"instruments":spec["instruments"],
+        "tpPct":10.0,"slPct":10.0,"objective":original["originalObjective"]});
     let limits=setups_db::admission::ReplayAdmissionLimits::default();
     let admit=|job:&'static str|db::Request{owner:"admin",study:id,job,start:chrono::DateTime::from_timestamp(start,250_000_000).unwrap(),cutoff:start+7200,source:&source,identity:&identity,work:60,limits:&limits};
     assert!(matches!(db::admit(&pool,admit("display-first")).await.unwrap(),db::Admission::Created(_)));
@@ -866,6 +902,18 @@ async fn exact_display_original_only_weighted_merge_and_refresh_preservation_wir
     assert_eq!(combined["observationCutoff"],start+7200);assert_eq!(combined["fittedOnPostStudyData"],true);
     assert!(combined["points"].as_array().unwrap().iter().all(|p|p["value"].as_f64()==Some(0.2)),"all-data mean is horizontal; never average the two period means");
     for key in ["originalObjective","originalEndpoint","projection","executionStartedAt"] {assert_eq!(completed["report"][key],report[key],"original model field {key} changed");}
+    let saved_source:Value=sqlx::query_scalar("select source from study_actualizations where owner_id='admin' and study_id=$1").bind(id).fetch_one(&pool).await.unwrap();
+    sqlx::query("update study_actualizations set source=jsonb_set(jsonb_set(source,'{tpPct}','20'::jsonb),'{slPct}','20'::jsonb) where owner_id='admin' and study_id=$1")
+        .bind(id).execute(&pool).await.unwrap();
+    let mismatched_before:Value=sqlx::query_scalar("select to_jsonb(a) from study_actualizations a where owner_id='admin' and study_id=$1").bind(id).fetch_one(&pool).await.unwrap();
+    let (status,mismatched)=http(&app,"GET",&zoned).await;assert_eq!(status,StatusCode::OK,"{mismatched}");
+    assert_eq!(mismatched["report"]["display"]["actual"]["availability"]["status"],"unavailable");
+    assert_eq!(mismatched["report"]["display"]["actual"]["reason"],"post_study_pair_mismatch");
+    assert_eq!(mismatched["report"]["display"]["daily"],original["display"]["daily"],"different TP/SL outcomes must not enter the observed all-data line");
+    assert_eq!(mismatched["report"]["combinedProjection"]["availability"]["reason"],"post_study_pair_mismatch");
+    assert_eq!(mismatched["originalReport"],*original);
+    assert_eq!(sqlx::query_scalar::<_,Value>("select to_jsonb(a) from study_actualizations a where owner_id='admin' and study_id=$1").bind(id).fetch_one(&pool).await.unwrap(),mismatched_before,"mismatch GET must remain read-only");
+    sqlx::query("update study_actualizations set source=$2 where owner_id='admin' and study_id=$1").bind(id).bind(saved_source).execute(&pool).await.unwrap();
     let (_,old_completed)=http(&app,"GET",&path).await;assert_eq!(old_completed["report"],report,"without timeZone saved wire report stays untouched");assert!(old_completed.get("originalReport").is_none());
     assert_eq!(old_completed["lastSetupAt"],completed["lastSetupAt"]);
     assert!(matches!(db::admit(&pool,admit("display-replacement")).await.unwrap(),db::Admission::Created(_)));
@@ -881,6 +929,135 @@ async fn exact_display_original_only_weighted_merge_and_refresh_preservation_wir
     if let Ok(path)=std::env::var("STUDY_DISPLAY_WIRE_PATH") {std::fs::write(path,serde_json::to_vec_pretty(&json!({"before":before,"completed":completed,"queued":queued,"running":running,"failed":failed})).unwrap()).unwrap();}
     market.stop.cancel();server.abort();let _=server.await;
 }).await;
+}
+
+#[path = "fixtures/combined_projection.rs"]
+mod combined_golden;
+
+async fn seed_combined_golden(pool: &PgPool, g: &combined_golden::Golden) -> (i64, i64, Value, String) {
+    let id = seed(pool, g.split).await;
+    let mut spec = serde_json::to_value(&g.spec).unwrap();
+    spec["toUnix"] = json!(g.split);
+    let mut result: Value = sqlx::query_scalar("select result from optimization_studies where id=$1").bind(id).fetch_one(pool).await.unwrap();
+    let metrics = g.original.selected_cell.as_ref().unwrap();
+    let series = g.original.objective_series(g.objective).unwrap();
+    let best = &mut result["best"];
+    best["params"] = spec["algorithmParams"].clone();
+    best["analytics"] = json!({"clusterEnabled":false,"clusterGapMinutes":null,"timeShiftMinutes":1,"priceChangePct":1.0,"setupMaturity":0.0,"horizonMinutes":3});
+    best["provenance"]["snapshotHash"] = json!(g.original.source.provenance.snapshot_hash);
+    best["observationCutoff"] = json!(g.split);
+    best["matrix"][0] = json!({"tpPct":10.0,"slPct":5.0,"riskExpectancy":series.decision_r.as_ref(),
+        "meanRiskExpectancy":metrics.raw_r.as_ref(),"forecastRiskExpectancy":series.forecast_r.as_ref(),
+        "avgMovePct":metrics.raw_r.as_ref().map(|r|r*5.0),"closedCount":metrics.closed_count,"tpCount":metrics.tp_count,"slCount":metrics.sl_count,
+        "unclosedCount":0,"noDataCount":0,"priceChangeFilteredCount":0});
+    sqlx::query("update optimization_studies set spec=$2,result=$3 where id=$1").bind(id).bind(&spec).bind(result).execute(pool).await.unwrap();
+    let mut original = g.original.clone();
+    original.source.study_id = id.to_string(); original.source.derived_snapshot_id = format!("{id:064x}");
+    original.validate().unwrap();
+    let artifact: i64 = sqlx::query_scalar("insert into study_expectancy_artifacts(artifact_key,owner_id,source_generation_id,source_study_id,source_slot_id,calculation_version,tp_pct,sl_pct,identity,numerical_snapshot) values($1,'admin',777,$2,1,$3,10,5,'{}',$4) returning id")
+        .bind(&original.source.derived_snapshot_id).bind(id).bind(original.calculation_version.to_string()).bind(json!(original)).fetch_one(pool).await.unwrap();
+    let identity: String = sqlx::query_scalar("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1").bind(id).fetch_one(pool).await.unwrap();
+    let source = json!({"algorithmId":"price_volume_spike","algorithmVersion":"1.1.1","params":spec["algorithmParams"],
+        "startUnix":g.split,"instruments":spec["instruments"],"tpPct":10.0,"slPct":5.0,"objective":g.objective});
+    (id, artifact, source, identity)
+}
+
+async fn publish_combined_fixture(pool: &PgPool, id: i64, g: &combined_golden::Golden, source: &Value, identity: &str, job: &str, rows: &[Value], report: &Value) {
+    let limits = setups_db::admission::ReplayAdmissionLimits::default();
+    assert!(matches!(db::admit(pool, db::Request { owner:"admin", study:id, job, start:chrono::DateTime::from_timestamp(g.split,0).unwrap(),
+        cutoff:g.cutoff, source, identity, work:60, limits:&limits }).await.unwrap(), db::Admission::Created(_)));
+    let job = db::claim(pool,2).await.unwrap().unwrap(); let batch = db::create_batch(pool,&job).await.unwrap().unwrap();
+    assert!(db::append(pool,&job,batch,db::InstrumentOutput { exchange:"fixture",category:"linear",symbol:"FIX",
+        emitted:&json!([]),rows,quality:&json!({}) }).await.unwrap());
+    let count = |status| rows.iter().filter(|r|r["status"]==status).count();
+    let tp = count("tp"); let sl = count("sl");
+    assert!(db::finish(pool,&job,report,&json!({"total":rows.len(),"closed":tp+sl,"tp":tp,"sl":sl,
+        "gateFailed":count("gate_failed"),"unclosed":count("unclosed"),"noData":count("no_data"),
+        "meanR":(tp+sl>0).then(||(2.0*tp as f64-sl as f64)/(tp+sl) as f64)})).await.unwrap());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated local TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn combined_display_canonical_golden_and_repeatable_revision_snapshot() {
+    isolated(|pool| async move {
+        use setups_domain::{forecast::ForecastRecipe, trend::{TrendMode, TrendBendDays}};
+        for (recipe_index, recipe) in [None, Some(ForecastRecipe::engineering_baseline()),
+            Some(ForecastRecipe::Trend { version:1,bend_days:TrendBendDays::Linear }),
+            Some(ForecastRecipe::Trend { version:1,bend_days:TrendBendDays::Seven })].into_iter().enumerate() {
+            for mode in [TrendMode::Mean, TrendMode::Forecast, TrendMode::Blend] {
+                let g = combined_golden::golden(mode, recipe);
+                let (id, artifact, source, identity) = seed_combined_golden(&pool,&g).await;
+                let (app,state,market,server) = fixture(&pool,g.split).await;
+                let path = format!("/v1/optimization-studies/{id}/actual?timeZone=UTC");
+                let (status,before) = http(&app,"GET",&path).await; assert_eq!(status,StatusCode::OK,"{before}");
+                assert!(before["originalReport"].is_object(),"{before}");
+                let mut report = before["originalReport"].clone(); report["observedThroughUnix"] = json!(g.cutoff);
+                let job_id = format!("golden-{recipe_index}-{}", match mode {
+                    TrendMode::Mean => "mean",
+                    TrendMode::Forecast => "forecast",
+                    TrendMode::Blend => "blend",
+                });
+                publish_combined_fixture(&pool,id,&g,&source,&identity,&job_id,&g.actual_rows,&report).await;
+                let immutable: Value = sqlx::query_scalar("select jsonb_build_object('study',to_jsonb(s),'artifact',to_jsonb(a),'actual',to_jsonb(h)) from optimization_studies s join study_expectancy_artifacts a on a.source_study_id=s.id join study_actualizations h on h.study_id=s.id where s.id=$1").bind(id).fetch_one(&pool).await.unwrap();
+                let (status,completed) = http(&app,"GET",&path).await; assert_eq!(status,StatusCode::OK,"{completed}");
+                let model = &completed["report"]["combinedProjection"];
+                assert_eq!(model["availability"]["status"],"available","{recipe:?}/{mode:?}: {model}");
+                assert_eq!(model["revision"],completed["revision"]); assert_eq!(model["jobId"],completed["jobId"]);
+                assert_eq!(model["observationCutoff"],g.cutoff);
+                let expected = g.one_shot.objective_series(g.objective).unwrap();
+                assert_eq!(model["method"],expected.method);
+                let points = model["points"].as_array().unwrap(); assert_eq!(points.len(),expected.curve.len());
+                for (p,(at,value)) in points.iter().zip(&expected.curve) {
+                    assert_eq!(p["atUnix"].as_f64(),Some(*at));
+                    match (p["value"].as_f64(),value) { (Some(a),Some(b))=>assert!((a-b).abs()<1e-10), (None,None)=>{}, _=>panic!("different availability") }
+                }
+                assert!((points.last().unwrap()["value"].as_f64().unwrap()-g.canonical_decision).abs()<1e-10);
+                assert_eq!(completed["originalReport"],before["originalReport"]);
+                let snapshot = setups_db::study_display::display_snapshot(&pool,"admin",id,"UTC",
+                    Some(chrono::DateTime::from_timestamp(g.split,0).unwrap()),Some(artifact),Some(&identity)).await.unwrap();
+                assert_eq!(snapshot.actual_utc_daily,g.actual_daily,"SQL scientific population must match canonical capture, including gate-only/null/split days");
+                let after: Value = sqlx::query_scalar("select jsonb_build_object('study',to_jsonb(s),'artifact',to_jsonb(a),'actual',to_jsonb(h)) from optimization_studies s join study_expectancy_artifacts a on a.source_study_id=s.id join study_actualizations h on h.study_id=s.id where s.id=$1").bind(id).fetch_one(&pool).await.unwrap();
+                assert_eq!(after,immutable,"GET must not persist/refit/publicize anything");
+
+                if recipe.is_none() && mode == TrendMode::Forecast {
+                    // Pause the reader AFTER it has read actual head N, but BEFORE
+                    // it reads cohorts. Replace and publish N+1 on another session.
+                    // The barrier exists only in this disposable database.
+                    sqlx::raw_sql("alter function study_local_day_start(text,date) rename to fixture_day_start; create function study_local_day_start(zone text,local_day date) returns bigint language plpgsql volatile as $$begin if current_setting('application_name')='combined_race_reader' then perform pg_advisory_xact_lock(73100043);end if;return fixture_day_start(zone,local_day);end$$;").execute(&pool).await.unwrap();
+                    let reader = PgPoolOptions::new().max_connections(2).connect_with((*pool.connect_options()).clone()
+                        .application_name("combined_race_reader")).await.unwrap();
+                    let reader_app = study_actual_router(Arc::new(ReplayState { pool:reader.clone(),auth:state.auth.clone(),
+                        market_url:state.market_url.clone(),market_key:state.market_key.clone(),limits:state.limits }));
+                    let mut held = pool.begin().await.unwrap(); sqlx::query("select pg_advisory_xact_lock(73100043)").execute(&mut *held).await.unwrap();
+                    let read_path = path.clone(); let pending = tokio::spawn(async move {http(&reader_app,"GET",&read_path).await});
+                    tokio::time::timeout(Duration::from_secs(3),async {loop {
+                        let waiting: bool = sqlx::query_scalar("select exists(select 1 from pg_stat_activity where datname=current_database() and application_name='combined_race_reader' and wait_event_type='Lock')").fetch_one(&pool).await.unwrap();
+                        if waiting {break;} tokio::time::sleep(Duration::from_millis(10)).await;
+                    }}).await.expect("reader must reach after-head barrier");
+                    // A signal exactly AT the inclusive midnight cutoff also
+                    // exercises the C+1 provenance adapter through real SQL.
+                    let replacement = [json!({"setupTimeUnix":g.cutoff-3600,"entryTimeUnix":g.cutoff-3540,"status":"sl","riskReturn":-1.0}),
+                        json!({"setupTimeUnix":g.cutoff,"entryTimeUnix":null,"status":"no_data","riskReturn":null})];
+                    publish_combined_fixture(&pool,id,&g,&source,&identity,"golden-next",&replacement,&report).await;
+                    held.rollback().await.unwrap();
+                    let (status,old) = pending.await.unwrap(); assert_eq!(status,StatusCode::OK,"{old}");
+                    assert_eq!(old,completed,"MVCC must keep head N, its deleted cohorts and the N projection together");
+                    let (status,next) = http(&app,"GET",&path).await; assert_eq!(status,StatusCode::OK,"{next}");
+                    assert_eq!(next["revision"],2); assert_eq!(next["jobId"],"golden-next");
+                    assert_eq!(next["report"]["combinedProjection"]["availability"]["status"],"available");
+                    assert_eq!(next["report"]["combinedProjection"]["revision"],2);
+                    assert_eq!(next["report"]["combinedProjection"]["jobId"],"golden-next");
+                    assert_eq!(next["report"]["combinedProjection"]["points"].as_array().unwrap().last().unwrap()["atUnix"],json!(g.cutoff as f64));
+                    assert_ne!(next["report"]["combinedProjection"]["points"],model["points"]);
+                    assert_eq!(next["originalReport"],before["originalReport"]);
+                    reader.close().await;
+                    sqlx::raw_sql("drop function study_local_day_start(text,date);alter function fixture_day_start(text,date) rename to study_local_day_start").execute(&pool).await.unwrap();
+                }
+                assert_eq!(market.calls.load(Ordering::SeqCst),0);
+                market.stop.cancel(); server.abort(); let _ = server.await;
+            }
+        }
+    }).await;
 }
 
 #[tokio::test]

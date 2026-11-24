@@ -419,8 +419,16 @@ async fn candle_page(
     client: &MarketDataClient,
     query: &CandlesQuery,
 ) -> Result<CandlesResponse, &'static str> {
+    market_request(|| client.candles(query, Duration::from_secs(30))).await
+}
+
+async fn market_request<T, F, Fut>(mut request: F) -> Result<T, &'static str>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, MdClientError>>,
+{
     for attempt in 0..MARKET_REQUEST_ATTEMPTS {
-        match client.candles(query, Duration::from_secs(30)).await {
+        match request().await {
             Ok(page) => {
                 if attempt > 0 {
                     eprintln!("study_actual event=market_data_request_recovered retries={attempt}");
@@ -457,6 +465,9 @@ mod request_tests {
 
     async fn fixture(
         failures: usize,
+        path: &'static str,
+        status: StatusCode,
+        body: &'static str,
     ) -> (
         MarketDataClient,
         Arc<AtomicUsize>,
@@ -464,12 +475,15 @@ mod request_tests {
     ) {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
-        let app = Router::new().route("/v1/candles", get(move || {
+        let app = Router::new().route(path, get(move || {
             let count = count.clone();
             async move {
                 let call = count.fetch_add(1, Ordering::SeqCst);
                 if call < failures {
-                    return (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response();
+                    return (status, body).into_response();
+                }
+                if path == "/v1/instruments" {
+                    return Json(json!({"instruments":[{"id":1,"exchange":"fixture","category":"linear","symbol":"FIX","status":"trading"}]})).into_response();
                 }
                 Json(json!({"candles":[{"openTimeUnix":60,"open":"1","high":"1","low":"1","close":"1","volume":"0","quoteTurnover":"0"}],"nextCursorUnix":null})).into_response()
             }
@@ -498,7 +512,13 @@ mod request_tests {
 
     #[tokio::test]
     async fn transient_market_failure_retries_then_returns_the_same_page() {
-        let (client, calls, server) = fixture(1).await;
+        let (client, calls, server) = fixture(
+            1,
+            "/v1/candles",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready",
+        )
+        .await;
         let page = candle_page(&client, &query()).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(page.candles.len(), 1);
@@ -508,13 +528,111 @@ mod request_tests {
 
     #[tokio::test]
     async fn persistent_market_failure_exhausts_the_bounded_budget() {
-        let (client, calls, server) = fixture(MARKET_REQUEST_ATTEMPTS).await;
-        assert_eq!(
-            candle_page(&client, &query()).await,
-            Err("study_actual_market_data_unavailable")
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), MARKET_REQUEST_ATTEMPTS);
-        server.abort();
+        for path in ["/v1/candles", "/v1/instruments"] {
+            let (client, calls, server) = fixture(
+                MARKET_REQUEST_ATTEMPTS,
+                path,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "not ready",
+            )
+            .await;
+            assert_eq!(
+                request_len(&client, path).await,
+                Err("study_actual_market_data_unavailable")
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 4);
+            server.abort();
+        }
+    }
+
+    async fn request_len(client: &MarketDataClient, path: &str) -> Result<usize, &'static str> {
+        if path == "/v1/instruments" {
+            market_request(|| client.instruments())
+                .await
+                .map(|rows| rows.len())
+        } else {
+            candle_page(client, &query())
+                .await
+                .map(|page| page.candles.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_and_candles_retry_only_transient_http_responses() {
+        for path in ["/v1/candles", "/v1/instruments"] {
+            for status in [408, 425, 429, 500, 502, 503, 504, 599] {
+                let (client, calls, server) =
+                    fixture(1, path, StatusCode::from_u16(status).unwrap(), "temporary").await;
+                assert_eq!(request_len(&client, path).await, Ok(1), "{path} {status}");
+                assert_eq!(calls.load(Ordering::SeqCst), 2, "{path} {status}");
+                server.abort();
+            }
+            let empty = if path == "/v1/instruments" {
+                r#"{"instruments":[]}"#
+            } else {
+                r#"{"candles":[],"nextCursorUnix":null}"#
+            };
+            for (status, body, expected) in [
+                (400, "invalid", Err("study_actual_market_data_unavailable")),
+                (
+                    401,
+                    "unauthorized",
+                    Err("study_actual_market_data_unavailable"),
+                ),
+                (
+                    403,
+                    "forbidden",
+                    Err("study_actual_market_data_unavailable"),
+                ),
+                (404, "absent", Err("study_actual_market_data_unavailable")),
+                (200, "not JSON", Err("study_actual_market_data_unavailable")),
+                (200, "{}", Err("study_actual_market_data_unavailable")),
+                (200, empty, Ok(0)),
+            ] {
+                let (client, calls, server) =
+                    fixture(1, path, StatusCode::from_u16(status).unwrap(), body).await;
+                assert_eq!(
+                    request_len(&client, path).await,
+                    expected,
+                    "{path} {status} {body}"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "{path} {status} {body}");
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn network_error_retries_without_changing_the_result() {
+        let mut calls = 0;
+        let result = market_request(|| {
+            calls += 1;
+            std::future::ready(if calls == 1 {
+                Err(MdClientError::Network("fixture disconnect".into()))
+            } else {
+                Ok(42)
+            })
+        })
+        .await;
+        assert_eq!(result, Ok(42));
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_pending_request_drops_it_without_another_attempt() {
+        let stop = CancellationToken::new();
+        let calls = AtomicUsize::new(0);
+        let request = market_request(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            stop.cancel();
+            std::future::pending::<Result<(), MdClientError>>()
+        });
+        tokio::select! {
+            biased;
+            result = request => panic!("pending request completed: {result:?}"),
+            _ = stop.cancelled() => {}
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -733,10 +851,7 @@ async fn compute(
         return Err("study_actual_algorithm_version_unavailable");
     }
     let client = MarketDataClient::new(&state.market_url, &state.market_key);
-    let catalog = client
-        .instruments()
-        .await
-        .map_err(|_| "study_actual_market_data_unavailable")?;
+    let catalog = market_request(|| client.instruments()).await?;
     let batch = db::create_batch(&state.pool, job)
         .await
         .map_err(|_| "study_actual_storage_unavailable")?

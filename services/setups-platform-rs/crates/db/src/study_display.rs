@@ -523,8 +523,13 @@ pub async fn display_snapshot(pool:&PgPool,owner:&str,study:i64,zone:&str,start:
         decode_days(rows)?
     }else{vec![]};
     let actual_utc_daily=if let Some(row)=published {
-        let rows=sqlx::query("select floor(signal_close_unix/86400.0)::bigint*86400 as day_start_unix,count(*)::bigint rows,count(*) filter(where row_data->>'status'='tp')::bigint tp,count(*) filter(where row_data->>'status'='sl')::bigint sl,avg((row_data->>'riskReturn')::float8) filter(where row_data->>'status' in ('tp','sl')) mean_r from study_actual_setups where owner_id=$1 and study_id=$2 and revision=$3 group by 1 order by 1 limit 3662")
-            .bind(owner).bind(study).bind(row["revision"].as_i64().ok_or_else(||invalid("invalid_revision"))?).fetch_all(&mut *tx).await?;
+        // Match optimizer::SelectedDailyCapture: forecast/explicit-recipe
+        // populations exclude price-gate failures, but retain unclosed/no_data
+        // setup weights. Legacy mean capture alone includes filtered rows.
+        let objective = &row["sourceFacts"]["objective"];
+        let include_gate_failed = objective["trendMode"] == "mean" && objective["forecast"].is_null();
+        let rows=sqlx::query("select floor(signal_close_unix/86400.0)::bigint*86400 as day_start_unix,count(*)::bigint rows,count(*) filter(where row_data->>'status'='tp')::bigint tp,count(*) filter(where row_data->>'status'='sl')::bigint sl,avg((row_data->>'riskReturn')::float8) filter(where row_data->>'status' in ('tp','sl')) mean_r from study_actual_setups where owner_id=$1 and study_id=$2 and revision=$3 and ($4 or row_data->>'status'<>'gate_failed') group by 1 order by 1 limit 3662")
+            .bind(owner).bind(study).bind(row["revision"].as_i64().ok_or_else(||invalid("invalid_revision"))?).bind(include_gate_failed).fetch_all(&mut *tx).await?;
         if rows.len()>3661 {return Err(invalid("daily_resource_limit"));}
         rows.into_iter().map(|r| Ok(setups_domain::expectancy::UtcDailyInput {
             day_start_unix:r.try_get("day_start_unix")?,row_count:u64::try_from(r.try_get::<i64,_>("rows")?).map_err(|_|invalid("invalid_counts"))?,

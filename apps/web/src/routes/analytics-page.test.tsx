@@ -277,6 +277,104 @@ it("fences a late matrix and list response after a same-day one-minute scope edi
   expect(calls.some((call) => call.path.startsWith("/v1/analytics/trades/"))).toBe(false);
 });
 
+it("keeps the published matrix and list for exact range B when range A resolves last after a one-minute edit", async () => {
+  const fromUnix = Date.parse("2026-01-04T11:30:00Z") / 1000;
+  const toUnix = Date.parse("2026-01-04T12:30:00Z") / 1000;
+  const current = utcTrade("2026-01-04T12:00:00Z", 1, 0);
+  const stale = { ...current, status: "sl", riskReturn: -1 };
+  const pending: { matrix?: (response: Response) => void; trades?: (response: Response) => void } = {};
+  let matrixAttempts = 0; let tradeAttempts = 0;
+  const calls = stubFetch({ tradeRows: [current], shortBulk: [matrixCell(4, 4, 0.42)], savedSettings: { trendMode: "mean",
+    sections: { "short-matrix": { timeRange: { mode: "custom", fromUnix, toUnix } } } },
+    interceptMatrixGrid: () => ++matrixAttempts === 1 ? new Promise<Response>((resolve) => { pending.matrix = resolve; }) : undefined,
+    interceptTradeRows: () => ++tradeAttempts === 1 ? new Promise<Response>((resolve) => { pending.trades = resolve; }) : undefined });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  const panel = within(screen.getByRole("tabpanel"));
+  const [matrixButton, listButton] = panel.getAllByRole("button", { name: "Рассчитать" });
+  await userEvent.click(matrixButton!);
+  await userEvent.click(listButton!);
+  await waitFor(() => { expect(pending.matrix).toBeDefined(); expect(pending.trades).toBeDefined(); });
+
+  fireEvent.change(panel.getByLabelText("С даты"), { target: { value: "2026-01-04T11:31" } });
+  fireEvent.blur(panel.getByLabelText("С даты"));
+  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid")).toHaveLength(1);
+  expect(calls.filter((call) => call.path === "/v1/analytics/trades")).toHaveLength(1);
+  await userEvent.click(matrixButton!);
+  expect(await panel.findByText("0.42")).toBeVisible();
+  await userEvent.click(listButton!);
+  expect(await panel.findByText("Матожидание: +1.00R по 1 закрытым")).toBeVisible();
+  expect(panel.getByText(current.setup.symbol)).toBeVisible();
+  expect(panel.queryByRole("button", { name: "Остановить" })).not.toBeInTheDocument();
+
+  await act(async () => {
+    pending.matrix!(new Response(JSON.stringify({ items: [matrixCell(4, 4, 9.99)], ...selectionMetrics })));
+    pending.trades!(new Response(JSON.stringify({ items: [stale], cachedCount: 1 })));
+    await Promise.resolve();
+  });
+  expect(panel.getByText("0.42")).toBeVisible();
+  expect(panel.getByText(current.setup.symbol)).toBeVisible();
+  expect(panel.getByText("Матожидание: +1.00R по 1 закрытым")).toBeVisible();
+  expect(panel.queryByText("9.99")).not.toBeInTheDocument();
+  expect(panel.queryByText("Матожидание: -1.00R по 1 закрытым")).not.toBeInTheDocument();
+  for (const path of ["/v1/analytics/matrix-grid", "/v1/analytics/setups", "/v1/analytics/trades"]) {
+    const requests = calls.filter((call) => call.path === path);
+    expect(requests).toHaveLength(2);
+    expect(requests.map((call) => {
+      const query = new URLSearchParams(call.search);
+      return [query.get("fromUnix"), query.get("toUnix")];
+    })).toEqual([[String(fromUnix), String(toUnix)], [String(fromUnix + 60), String(toUnix)]]);
+  }
+  expect(calls.some((call) => call.path.startsWith("/v1/analytics/trades/"))).toBe(false);
+});
+
+it("blocks the edited matrix auto-run for a Berlin DST-gap boundary and uses only the completed exact pair without a list auto-run", async () => {
+  applyInterfaceSettings({ timezone: "Europe/Berlin" });
+  const fromUnix = Date.parse("2026-03-29T00:30:00Z") / 1000;
+  const toUnix = Date.parse("2026-03-29T01:30:00Z") / 1000;
+  const calls = stubFetch({ shortBulk: [matrixCell(4, 4, 0.42)], savedSettings: { autoCalc: true, trendMode: "mean",
+    sections: { "short-matrix": { timeRange: { mode: "custom", fromUnix, toUnix } } } } });
+  const matrixCalls = () => calls.filter((call) => call.path === "/v1/analytics/matrix-grid"
+    && new URLSearchParams(call.search).get("direction") === "short");
+  const listCalls = () => calls.filter((call) => call.path === "/v1/analytics/setups" || call.path.startsWith("/v1/analytics/trades"));
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  const panel = within(screen.getByRole("tabpanel"));
+  expect(screen.getByRole("checkbox", { name: "Авторасчёт матриц" })).toBeChecked();
+  expect(await panel.findByText("0.42")).toBeVisible();
+  expect(matrixCalls()).toHaveLength(1);
+  expect(panel.getByLabelText("С даты")).toHaveValue("2026-03-29T01:30");
+  expect(panel.getByLabelText("По дату")).toHaveValue("2026-03-29T03:30");
+
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    fireEvent.change(panel.getByLabelText("С даты"), { target: { value: "2026-03-29T02:30" } });
+    fireEvent.blur(panel.getByLabelText("С даты"));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    // The shared debounce also runs LONG; only the edited SHORT scope is invalid.
+    expect(matrixCalls()).toHaveLength(1);
+    expect(listCalls()).toHaveLength(0);
+    expect(panel.queryByText("0.42")).not.toBeInTheDocument();
+    expect(panel.getByRole("alert")).toHaveTextContent("Укажите корректные даты: конец диапазона должен быть позже начала.");
+
+    fireEvent.change(panel.getByLabelText("С даты"), { target: { value: "2026-03-29T03:31" } });
+    fireEvent.blur(panel.getByLabelText("С даты"));
+    fireEvent.change(panel.getByLabelText("По дату"), { target: { value: "2026-03-29T03:47" } });
+    fireEvent.blur(panel.getByLabelText("По дату"));
+    expect(matrixCalls()).toHaveLength(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(matrixCalls()).toHaveLength(2);
+    const query = new URLSearchParams(matrixCalls()[1]!.search);
+    expect(query.get("fromUnix")).toBe(String(Date.parse("2026-03-29T01:31:00Z") / 1000));
+    expect(query.get("toUnix")).toBe(String(Date.parse("2026-03-29T01:47:00Z") / 1000));
+    for (const field of ["month", "fromDay", "toDay"]) expect(query.has(field)).toBe(false);
+    expect(panel.getByText("0.42")).toBeVisible();
+    expect(panel.queryByRole("alert")).not.toBeInTheDocument();
+    expect(listCalls()).toHaveLength(0);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(matrixCalls()).toHaveLength(2);
+    expect(listCalls()).toHaveLength(0);
+  } finally { vi.useRealTimers(); }
+});
+
 const fullShortGrid = shortLevels.flatMap((tp) => shortLevels.map((sl) => matrixCell(tp, sl, tp === 6 && sl === 6 ? 0.17 : 0.05)));
 const fullLongGrid = longTpLevels.flatMap((tp) => longSlLevels.map((sl) => matrixCell(tp, sl, -0.3)));
 

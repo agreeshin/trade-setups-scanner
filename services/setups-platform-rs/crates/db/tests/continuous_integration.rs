@@ -248,31 +248,87 @@ async fn study_recommended_pair_reads_original_generation_not_current_profile_or
         frozen_spec["trendMode"] = json!("blend");
         let best = json!({"trendMode":"blend","score":0.9,"matrix":[
             {"tpPct":18,"slPct":6,"forecastRiskExpectancy":1.08,"meanRiskExpectancy":0.53},
-            {"tpPct":20,"slPct":6,"forecastRiskExpectancy":1.02,"meanRiskExpectancy":0.42}
+            {"tpPct":20,"slPct":6,"forecastRiskExpectancy":1.02,"meanRiskExpectancy":0.42},
+            {"tpPct":14,"slPct":4,"forecastRiskExpectancy":0.92,"meanRiskExpectancy":0.32}
         ]});
         let selected = json!({"tpPct":20,"slPct":6,"rawR":0.42,"meanR":0.1,"forecastR":1.02,"blendR":0.84});
         let result = json!({"best":best,"selectedCell":selected,"recommendation":{
             "tpPct":20,"slPct":6,"rawR":0.42,"searchForecast":{"cellR":1.02,"blend":{"cellR":0.84}}
         }});
+        // Both study-local fallbacks are valid but conflict with the original
+        // generation's 20/6: study selectedCell is 14/4, forecast maximum is 18/6.
+        let study_result = json!({"best":best,"selectedCell":{
+            "tpPct":14,"slPct":4,"rawR":0.32,"meanR":0.1,"forecastR":0.92,"blendR":0.74
+        }});
         sqlx::query("update optimization_studies set spec=$2,result=$3 where id=$1")
-            .bind(profile.study_id).bind(&frozen_spec).bind(json!({"best":best})).execute(&pool).await.unwrap();
+            .bind(profile.study_id).bind(&frozen_spec).bind(&study_result).execute(&pool).await.unwrap();
         sqlx::query("update continuous_generations set spec=$2,result=$3 where id=$1")
             .bind(profile.generation_id).bind(&frozen_spec).bind(&result).execute(&pool).await.unwrap();
         // Mutable current slot values must not influence historical detail.
         sqlx::query("update continuous_slots set selected_cell=$2 where id=$1")
             .bind(profile.slot_id).bind(json!({"tpPct":99,"slPct":1,"rawR":9})).execute(&pool).await.unwrap();
-        let study = optimization::get(&pool, profile.study_id).await.unwrap().unwrap();
-        let before = serde_json::to_value(&study).unwrap();
-        let pair = optimization::get_recommended_pair(&pool, &study).await.unwrap().unwrap();
+        let original = optimization::get(&pool, profile.study_id).await.unwrap().unwrap();
+        let before = serde_json::to_value(&original).unwrap();
+        let pair = optimization::get_recommended_pair(&pool, &original).await.unwrap().unwrap();
         assert_eq!(json!(pair),json!({"tpPct":20.0,"slPct":6.0,"meanR":0.42,"forecastR":1.02,"decisionR":0.84,"adaptiveAccepted":true}));
-        assert_eq!(optimization::forecast_best_pair(study.result.as_ref(), &study.spec).unwrap().tp_pct,18.0);
-        assert_eq!(serde_json::to_value(optimization::get(&pool,profile.study_id).await.unwrap().unwrap()).unwrap(),before);
+        let forecast = optimization::forecast_best_pair(original.result.as_ref(), &original.spec).unwrap();
+        assert_eq!((forecast.tp_pct,forecast.sl_pct),(18.0,6.0));
+
+        // Advance both current pointers to a coherent, separately completed
+        // study/generation with a third valid recommendation, 24/8.
+        let next_generation = generation(&pool, OWNER, ALGORITHM, profile.slot_id, "completed").await;
+        let next_study_id = study(&pool, OWNER, ALGORITHM, "completed", Some(next_generation), Some(profile.slot_id)).await;
+        let next_selected = json!({"tpPct":24,"slPct":8,"rawR":0.6,"meanR":0.6,"forecastR":1.2,"blendR":1.02});
+        let next_result = json!({"best":{"trendMode":"blend","score":1.02,"matrix":[
+            {"tpPct":24,"slPct":8,"forecastRiskExpectancy":1.2,"meanRiskExpectancy":0.6}
+        ]},"selectedCell":next_selected,"recommendation":{
+            "tpPct":24,"slPct":8,"rawR":0.6,"searchForecast":{"cellR":1.2,"blend":{"cellR":1.02}}
+        }});
+        sqlx::query("update optimization_studies set spec=$2,result=$3 where id=$1")
+            .bind(next_study_id).bind(&frozen_spec).bind(&next_result).execute(&pool).await.unwrap();
+        sqlx::query("update continuous_generations set study_id=$2,spec=$3,result=$4,accepted=true,phase='completed' where id=$1")
+            .bind(next_generation).bind(next_study_id).bind(&frozen_spec).bind(&next_result).execute(&pool).await.unwrap();
+        sqlx::query("update continuous_slots set active_generation_id=$2,study_id=$3,selected_cell=$4,mean_expectancy=0.6 where id=$1")
+            .bind(profile.slot_id).bind(next_generation).bind(next_study_id).bind(&next_selected).execute(&pool).await.unwrap();
+        sqlx::query("update adaptive_profiles set accepted_generation_id=$2 where id=$1")
+            .bind(profile.slot_id).bind(next_generation).execute(&pool).await.unwrap();
+        sqlx::query("update continuous_processes set active_generation_id=$3,active_study_id=$4 where owner_id=$1 and algorithm_id=$2")
+            .bind(OWNER).bind(ALGORITHM).bind(next_generation).bind(next_study_id).execute(&pool).await.unwrap();
+        assert_eq!(sqlx::query_as::<_,(Option<i64>,i64)>("select s.active_generation_id,p.accepted_generation_id from continuous_slots s join adaptive_profiles p using(id) where s.id=$1")
+            .bind(profile.slot_id).fetch_one(&pool).await.unwrap(),(Some(next_generation),next_generation));
+        let current = optimization::get(&pool, next_study_id).await.unwrap().unwrap();
+        assert_eq!(json!(optimization::get_recommended_pair(&pool,&current).await.unwrap().unwrap()),
+            json!({"tpPct":24.0,"slPct":8.0,"meanR":0.6,"forecastR":1.2,"decisionR":1.02,"adaptiveAccepted":true}));
+        let original = optimization::get(&pool, profile.study_id).await.unwrap().unwrap();
+        assert_eq!(original.continuous_generation_id,Some(profile.generation_id));
+        assert_eq!(optimization::get_recommended_pair(&pool,&original).await.unwrap(),Some(pair),
+            "new current slot/profile generations cannot replace the original recommendation");
+        assert_eq!(serde_json::to_value(&original).unwrap(),before);
         let saved: Value = sqlx::query_scalar("select result from continuous_generations where id=$1")
             .bind(profile.generation_id).fetch_one(&pool).await.unwrap();
         assert_eq!(saved,result,"GET projection cannot rewrite the frozen handoff");
         sqlx::query("update continuous_generations set result=jsonb_set(result,'{recommendation,rawR}','0.53') where id=$1")
             .bind(profile.generation_id).execute(&pool).await.unwrap();
-        assert!(optimization::get_recommended_pair(&pool,&study).await.is_err(),"same-identity metric conflict must not be hidden");
+        assert!(optimization::get_recommended_pair(&pool,&original).await.is_err(),"same-identity metric conflict must not be hidden");
+
+        // Model a legacy completed result without either persisted choice. Keep
+        // best/spec identical so this is unavailability, not a source mismatch.
+        sqlx::query("update continuous_generations set result=$2::jsonb-'selectedCell'-'recommendation' where id=$1")
+            .bind(profile.generation_id).bind(&result).execute(&pool).await.unwrap();
+        let unavailable = optimization::get(&pool, profile.study_id).await.unwrap().unwrap();
+        assert_eq!(unavailable.result.as_ref(),Some(&study_result),"tempting study-local fallbacks must remain present");
+        assert_eq!(optimization::forecast_best_pair(unavailable.result.as_ref(),&unavailable.spec),Some(forecast));
+        assert_eq!(optimization::get_recommended_pair(&pool,&unavailable).await.unwrap(),None,
+            "missing original selection cannot fall back to study selection, forecast maximum or current generation");
+
+        // A retained, fully populated failed generation also cannot satisfy the
+        // completed-generation lookup, even though every fallback is available.
+        sqlx::query("update continuous_generations set result=$2,status='failed',phase='failed',accepted=false where id=$1")
+            .bind(profile.generation_id).bind(&result).execute(&pool).await.unwrap();
+        let unavailable = optimization::get(&pool, profile.study_id).await.unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&unavailable).unwrap(),before);
+        assert_eq!(optimization::get_recommended_pair(&pool,&unavailable).await.unwrap(),None,
+            "a non-completed original generation cannot supply or redirect the recommendation");
     }).await;
 }
 
