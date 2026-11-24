@@ -22,7 +22,7 @@ const json = (value: unknown, status = 200) => new Response(JSON.stringify(value
 let actual: StudyActualDetail;
 let selectedStudy: OptimizationStudy;
 let read: (timeZone: string) => Response | Promise<Response>;
-let page: (offset: number) => Response | Promise<Response>;
+let page: (offset: number, hideGateFailed: boolean) => Response | Promise<Response>;
 const requests: { path: string; method: string; signal?: AbortSignal | null }[] = [];
 const settle = async (ms = 0) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
 const listButton = () => screen.getByRole("button", { name: "Посмотреть список сетапов после исследования" });
@@ -42,7 +42,10 @@ beforeEach(() => {
     if (path === "/v1/optimization-studies/49/actual/refresh") {
       actual = { ...studyActualFixture(49, { status: "queued", stage: "queued", revision: 2, jobId: "actual-49-2" }), report: null, originalReport: originalReportFixture() }; return Promise.resolve(json(actual, 202));
     }
-    if (path.includes("/actual/setups?")) return Promise.resolve(page(Number(new URL(path, "http://localhost").searchParams.get("offset"))));
+    if (path.includes("/actual/setups?")) {
+      const query = new URL(path, "http://localhost").searchParams;
+      return Promise.resolve(page(Number(query.get("offset")), query.get("hideGateFailed") !== "false"));
+    }
     return Promise.resolve(json({}, 404));
   }));
 });
@@ -256,12 +259,85 @@ it("opens a second modal using all ten existing Analytics columns/cells and only
   const dialog = screen.getByRole("dialog", { name: "Сетапы после исследования #49" });
   expect(within(dialog).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual(["Инструмент", "Время сетапа", "Вход", "TP", "SL", "Закрытие", "Цена закрытия", "Результат", "Статус", "Исследование"]);
   const table = within(dialog).getByRole("table", { name: "Сетапы после исследования" });
+  const gateSwitch = within(dialog).getByRole("switch", { name: "Скрыть сетапы, которые не прошли гейт" });
+  expect(gateSwitch).toBeChecked();
+  expect(gateSwitch).toHaveAttribute("data-slot", "switch");
+  const filterBar = gateSwitch.closest("label")!.parentElement!;
+  expect(filterBar).toHaveClass("flex", "justify-end");
+  expect(filterBar.nextElementSibling).toBe(table.parentElement);
   expect(within(table).getAllByRole("row")).toHaveLength(51);
   const cells = within(within(table).getAllByRole("row")[1]!).getAllByRole("cell");
   expect(cells.map((cell) => cell.textContent)).toEqual(["ACTUAL1USDT", formatUnix(actualSetupFixture().setupTimeUnix), "100", "90", "105", formatUnix(actualSetupFixture().closeTimeUnix!), "90", "+2.00R", "TP", "№49"]);
   expect(cells[3]).toHaveClass("text-success"); expect(cells[4]).toHaveClass("text-danger"); expect(cells[7]).toHaveClass("text-success");
-  expect(pageCalls()).toHaveLength(1); expect(pageCalls()[0]?.path).toContain("revision=1&offset=0&limit=50");
+  expect(pageCalls()).toHaveLength(1); expect(pageCalls()[0]?.path).toContain("revision=1&offset=0&limit=50&hideGateFailed=true");
   expect(table.closest("div")).toHaveClass("overflow-x-auto"); expect(dialog).toHaveClass("min-w-0");
+});
+
+it("resets a later-page offset on toggle and discards its late prior-filter response", async () => {
+  let resolveOld: (response: Response) => void = () => { throw new Error("old page not requested"); };
+  page = (offset, hideGateFailed) => {
+    if (offset === 50) return new Promise<Response>((resolve) => { resolveOld = resolve; });
+    return json({ studyId: 49, jobId: actual.jobId, revision: actual.revision, retrospective: true,
+      total: hideGateFailed ? 60 : 90, limit: 50, offset,
+      setups: [hideGateFailed ? actualSetupFixture(1) : { ...actualSetupFixture(2), status: "gate_failed", riskReturn: null }] });
+  };
+  modal(); await settle(); fireEvent.click(listButton()); await settle();
+  fireEvent.click(screen.getByRole("button", { name: "Следующая страница сетапов" })); await settle();
+  const pending = pageCalls().at(-1)!;
+  const gateSwitch = screen.getByRole("switch", { name: "Скрыть сетапы, которые не прошли гейт" });
+  fireEvent.click(gateSwitch); await settle();
+  expect(gateSwitch).not.toBeChecked(); expect(pending.signal?.aborted).toBe(true);
+  expect(pageCalls().at(-1)?.path).toContain("offset=0&limit=50&hideGateFailed=false");
+  expect(screen.getByText("Всего сетапов: 90. Страница 1 из 2")).toBeInTheDocument();
+  expect(screen.getByText("ACTUAL2USDT")).toBeInTheDocument();
+  await act(async () => { resolveOld(json({ studyId: 49, jobId: actual.jobId, revision: 1, retrospective: true,
+    total: 60, offset: 50, limit: 50, setups: [actualSetupFixture(99)] })); await Promise.resolve(); });
+  expect(screen.queryByText("ACTUAL99USDT")).not.toBeInTheDocument();
+  expect(screen.getByText("ACTUAL2USDT")).toBeInTheDocument();
+  fireEvent.click(gateSwitch); await settle();
+  expect(pageCalls().at(-1)?.path).toContain("offset=0&limit=50&hideGateFailed=true");
+  expect(screen.getByText("ACTUAL1USDT")).toBeInTheDocument(); expect(screen.queryByText("ACTUAL2USDT")).not.toBeInTheDocument();
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+});
+
+it("fences a late prior-filter response even when both requests have offset zero", async () => {
+  let resolveOld: (response: Response) => void = () => { throw new Error("old filter not requested"); };
+  page = (offset, hideGateFailed) => hideGateFailed ? new Promise<Response>((resolve) => { resolveOld = resolve; })
+    : json({ studyId: 49, jobId: actual.jobId, revision: 1, retrospective: true, total: 1, limit: 50, offset,
+      setups: [{ ...actualSetupFixture(2), status: "gate_failed", riskReturn: null }] });
+  modal(); await settle(); fireEvent.click(listButton()); await settle();
+  const old = pageCalls()[0]!;
+  fireEvent.click(screen.getByRole("switch", { name: "Скрыть сетапы, которые не прошли гейт" })); await settle();
+  expect(old.signal?.aborted).toBe(true); expect(screen.getByText("ACTUAL2USDT")).toBeInTheDocument();
+  await act(async () => { resolveOld(json({ studyId: 49, jobId: actual.jobId, revision: 1, retrospective: true,
+    total: 1, offset: 0, limit: 50, setups: [actualSetupFixture(1)] })); await Promise.resolve(); });
+  expect(screen.getByText("ACTUAL2USDT")).toBeInTheDocument(); expect(screen.queryByText("ACTUAL1USDT")).not.toBeInTheDocument();
+  expect(pageCalls()).toHaveLength(2);
+});
+
+it("shows an empty filtered population for all gate failures without changing published science or summary", async () => {
+  actual = { ...actual, meanR: null, lastSetupAt: "2026-11-20T17:45:00Z",
+    counts: { total: 3, closed: 0, tp: 0, sl: 0, gateFailed: 3, unclosed: 0, noData: 0 } };
+  const published = structuredClone(actual);
+  page = (offset, hideGateFailed) => json({ studyId: 49, jobId: actual.jobId, revision: 1, retrospective: true,
+    total: hideGateFailed ? 0 : 3, limit: 50, offset,
+    setups: hideGateFailed ? [] : [1, 2, 3].map((id) => ({ ...actualSetupFixture(id), status: "gate_failed", riskReturn: null })) });
+  modal(); await settle();
+  const chart = screen.getByTestId("study-actual-chart").outerHTML;
+  fireEvent.click(listButton()); await settle();
+  expect(screen.getByText("Нет сетапов, соответствующих фильтру.")).toBeInTheDocument();
+  expect(screen.getByText("Всего сетапов: 0. Страница 1 из 1")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Следующая страница сетапов" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("switch", { name: "Скрыть сетапы, которые не прошли гейт" })); await settle();
+  expect(screen.getByText("Всего сетапов: 3. Страница 1 из 1")).toBeInTheDocument();
+  expect(screen.getAllByText("Гейт не пройден")).toHaveLength(3);
+  fireEvent.click(within(screen.getByRole("dialog", { name: "Сетапы после исследования #49" })).getByRole("button", { name: "Закрыть" })); await settle();
+  expect(screen.getByText("0/3")).toBeInTheDocument(); expect(screen.getByText("Нет закрытых сделок")).toBeInTheDocument();
+  expect(screen.getByLabelText("Последний включённый сетап")).toHaveTextContent("20.11.2026, 17:45:00");
+  expect(screen.getByTestId("study-actual-chart").outerHTML).toBe(chart); expect(actual).toEqual(published);
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
+  fireEvent.click(listButton()); await settle();
+  expect(screen.getByRole("switch", { name: "Скрыть сетапы, которые не прошли гейт" })).toBeChecked();
 });
 
 it("replaces pages rather than accumulating them even for 100000 rows, and restores focus after closing the second modal", async () => {

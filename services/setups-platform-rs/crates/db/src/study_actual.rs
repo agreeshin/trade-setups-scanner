@@ -563,17 +563,48 @@ pub async fn page(
     offset: i64,
     limit: i64,
 ) -> Result<Option<Vec<Value>>, DbError> {
+    // Existing internal callers retain the unfiltered row-only contract.
+    Ok(
+        filtered_page(pool, owner, study, revision, offset, limit, false)
+            .await?
+            .map(|page| page.setups),
+    )
+}
+
+pub struct SetupPage {
+    pub job_id: String,
+    /// Display population only; never the saved report totals.
+    pub total: i64,
+    pub setups: Vec<Value>,
+}
+
+pub async fn filtered_page(
+    pool: &PgPool,
+    owner: &str,
+    study: i64,
+    revision: i64,
+    offset: i64,
+    limit: i64,
+    hide_gate_failed: bool,
+) -> Result<Option<SetupPage>, DbError> {
     let mut tx = pool.begin().await?;
     sqlx::query("set transaction isolation level repeatable read, read only")
         .execute(&mut *tx)
         .await?;
-    let valid:bool=sqlx::query_scalar("select exists(select 1 from study_actualizations where owner_id=$1 and study_id=$2 and revision=$3 and status='completed')")
-        .bind(owner).bind(study).bind(revision).fetch_one(&mut *tx).await?;
-    if !valid {
+    let job_id: Option<String> = sqlx::query_scalar("select job_id from study_actualizations where owner_id=$1 and study_id=$2 and revision=$3 and status='completed'")
+        .bind(owner).bind(study).bind(revision).fetch_optional(&mut *tx).await?;
+    let Some(job_id) = job_id else {
         return Ok(None);
-    }
-    let rows=sqlx::query_scalar("select row_data||jsonb_build_object('id',id) from study_actual_setups where owner_id=$1 and study_id=$2 and revision=$3 order by signal_close_unix desc,instrument_key,id limit $4 offset $5")
-        .bind(owner).bind(study).bind(revision).bind(limit.clamp(1,100)).bind(offset.max(0)).fetch_all(&mut *tx).await?;
+    };
+    // IS DISTINCT FROM preserves missing/null outcomes: only saved gate_failed is hidden.
+    let total = sqlx::query_scalar("select count(*) from study_actual_setups where owner_id=$1 and study_id=$2 and revision=$3 and (not $4 or row_data->>'status' is distinct from 'gate_failed')")
+        .bind(owner).bind(study).bind(revision).bind(hide_gate_failed).fetch_one(&mut *tx).await?;
+    let setups = sqlx::query_scalar("select row_data||jsonb_build_object('id',id) from study_actual_setups where owner_id=$1 and study_id=$2 and revision=$3 and (not $4 or row_data->>'status' is distinct from 'gate_failed') order by signal_close_unix desc,instrument_key,id limit $5 offset $6")
+        .bind(owner).bind(study).bind(revision).bind(hide_gate_failed).bind(limit.clamp(1,100)).bind(offset.max(0)).fetch_all(&mut *tx).await?;
     tx.commit().await?;
-    Ok(Some(rows))
+    Ok(Some(SetupPage {
+        job_id,
+        total,
+        setups,
+    }))
 }

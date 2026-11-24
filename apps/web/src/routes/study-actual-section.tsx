@@ -6,6 +6,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Pagination } from "../components/ui/pagination";
 import { Separator } from "../components/ui/separator";
 import { Spinner } from "../components/ui/spinner";
+import { Switch } from "../components/ui/switch";
 import { formatIsoDateTime, interfaceSettings, subscribeInterfaceSettings } from "../lib/datetime-format";
 import { forecastRecipeLabel } from "../lib/forecast-recipe";
 import { getStudyActualSetups, isStudyActualPending, STUDY_ACTUAL_PAGE_SIZE, StudyActualApiError, type StudyActualDetail, type StudyActualSetupPage } from "../lib/study-actual-api";
@@ -16,18 +17,20 @@ import { useStudyActualDetail } from "./use-study-actual-detail";
 
 function ActualSetupsDialog({ actual, onClose, onInvalidated, returnFocus }: { actual: StudyActualDetail; onClose: () => void; onInvalidated: () => void; returnFocus: () => void }) {
   const [offset, setOffset] = useState(0);
-  const [page, setPage] = useState<StudyActualSetupPage | null>(null);
+  const [hideGateFailed, setHideGateFailed] = useState(true);
+  const [page, setPage] = useState<{ identity: string; value: StudyActualSetupPage } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
-  const visible = page?.offset === offset ? page : null;
+  const identity = `${actual.studyId}:${actual.revision}:${actual.jobId}:${offset}:${hideGateFailed}`;
+  const visible = page?.identity === identity ? page.value : null;
   useEffect(() => {
     let request: AbortController | undefined;
     const load = () => {
       request?.abort(); setPage(null); setError(null);
       if (document.visibilityState === "hidden") return;
       const controller = new AbortController(); request = controller;
-      void getStudyActualSetups(actual.studyId, actual.revision, actual.jobId!, offset, controller.signal).then((next) => {
-        if (!controller.signal.aborted) setPage(next);
+      void getStudyActualSetups(actual.studyId, actual.revision, actual.jobId!, offset, controller.signal, hideGateFailed).then((next) => {
+        if (!controller.signal.aborted) setPage({ identity, value: next });
       }).catch((cause) => {
         if (controller.signal.aborted) return;
         if (cause instanceof StudyActualApiError && cause.code === "study_actual_revision_changed") { onInvalidated(); return; }
@@ -37,15 +40,18 @@ function ActualSetupsDialog({ actual, onClose, onInvalidated, returnFocus }: { a
     const visibility = () => { request?.abort(); if (document.visibilityState !== "hidden") load(); };
     load(); document.addEventListener("visibilitychange", visibility);
     return () => { request?.abort(); document.removeEventListener("visibilitychange", visibility); };
-  }, [actual.studyId, actual.revision, actual.jobId, offset, retry, onInvalidated]);
+  }, [actual.studyId, actual.revision, actual.jobId, offset, hideGateFailed, identity, retry, onInvalidated]);
   return <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
     <DialogContent className="max-w-[96rem]" onCloseAutoFocus={(event) => { event.preventDefault(); returnFocus(); }}>
       <DialogHeader><DialogTitle>Сетапы после исследования #{actual.studyId}</DialogTitle><DialogDescription>Новое историческое воспроизведение · ревизия {actual.revision}. Только сохранённый набор после фактического старта исследования, не выпущенные live-уведомления.</DialogDescription></DialogHeader>
+      <div className="flex justify-end">
+        <label className="flex items-center gap-2 text-sm text-muted-foreground"><Switch checked={hideGateFailed} onCheckedChange={(checked) => { setHideGateFailed(checked); setOffset(0); }} /> Скрыть сетапы, которые не прошли гейт</label>
+      </div>
       {error && <Alert variant="destructive" role="alert">{error}<Button type="button" variant="outline" onClick={() => setRetry((value) => value + 1)}>Повторить загрузку сетапов</Button></Alert>}
       {!visible && !error && <Spinner label="Загрузка сетапов после исследования" />}
       {visible && <>
         <SetupOutcomesTable label="Сетапы после исследования" setups={visible.setups} />
-        {visible.total === 0 && <p className="text-sm text-muted-foreground">Нет сетапов в периоде.</p>}
+        {visible.total === 0 && <p className="text-sm text-muted-foreground">{hideGateFailed ? "Нет сетапов, соответствующих фильтру." : "Нет сетапов в периоде."}</p>}
         <Pagination page={Math.floor(offset / STUDY_ACTUAL_PAGE_SIZE) + 1} pages={Math.max(1, Math.ceil(visible.total / STUDY_ACTUAL_PAGE_SIZE))}
           onPrev={() => setOffset(Math.max(0, offset - STUDY_ACTUAL_PAGE_SIZE))} onNext={() => setOffset(offset + STUDY_ACTUAL_PAGE_SIZE)}
           prevDisabled={offset === 0} nextDisabled={offset + STUDY_ACTUAL_PAGE_SIZE >= visible.total}

@@ -80,6 +80,14 @@ mod tests {
             ("GET", "/v1/optimization-studies/1/actual/setups?revision=1"),
             (
                 "GET",
+                "/v1/optimization-studies/1/actual/setups?revision=1&hideGateFailed=false",
+            ),
+            (
+                "GET",
+                "/v1/optimization-studies/1/actual/setups?revision=1&hideGateFailed=invalid",
+            ),
+            (
+                "GET",
                 "/v1/optimization-studies/actual/continuous?algorithmId=price_volume_spike",
             ),
             (
@@ -100,6 +108,74 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn setups_query_is_strict_and_rejected_before_any_database_read() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused_test")
+            .unwrap();
+        let app = study_actual_router(Arc::new(ReplayState {
+            pool,
+            auth: Arc::new(crate::SessionAuth::new(&["fixture-key".into()])),
+            market_url: "http://127.0.0.1:1".into(),
+            market_key: "fixture".into(),
+            limits: Default::default(),
+        }));
+        for query in [
+            "",
+            "revision=0",
+            "revision=-1",
+            "revision=1&offset=-1",
+            "revision=1&limit=0",
+            "revision=1&limit=101",
+            "revision=1&limit=bad",
+            "revision=1&revision=2",
+            "revision=1&ownerId=foreign",
+            "revision=1&hideGateFailed=true&hideGateFailed=false",
+            "revision=1&hide_gate_failed=false",
+            "revision=9223372036854775808",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(
+            [
+                "", "1", "0", "TRUE", "False", "yes", "null", "%20true", "false%20",
+            ]
+            .into_iter()
+            .map(|value| format!("revision=1&hideGateFailed={value}")),
+        ) {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/v1/optimization-studies/1/actual/setups?{query}"))
+                        .header("x-api-key", "fixture-key")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["error"],
+                "invalid_query"
+            );
+        }
+        for (query, expected) in [
+            ("revision=1", true),
+            ("revision=1&hideGateFailed=true", true),
+            ("revision=1&hideGateFailed=false", false),
+        ] {
+            let Query(parsed) =
+                Query::<SetupsQuery>::try_from_uri(&format!("/?{query}").parse().unwrap()).unwrap();
+            assert_eq!(parsed.hide_gate_failed, expected);
+            assert_eq!((parsed.revision, parsed.offset, parsed.limit), (1, 0, 50));
         }
     }
 }
@@ -337,40 +413,63 @@ async fn refresh(
         }
     }
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetupsQuery {
+    revision: i64,
+    #[serde(default)]
+    offset: i64,
+    #[serde(default = "default_page_limit")]
+    limit: i64,
+    #[serde(default = "default_hide_gate_failed")]
+    hide_gate_failed: bool,
+}
+fn default_page_limit() -> i64 {
+    50
+}
+fn default_hide_gate_failed() -> bool {
+    true
+}
 async fn setups(
     State(state): State<Arc<ReplayState>>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-    Query(q): Query<HashMap<String, String>>,
+    query: Result<Query<SetupsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = guard_auth(&state.auth, &headers, false) {
         return e;
     }
-    if let Err(e) = owns(&state, id).await {
-        return e;
-    }
-    let parse =
-        |key: &str, default: i64| q.get(key).map(|s| s.parse::<i64>()).unwrap_or(Ok(default));
-    let (Ok(revision), Ok(offset), Ok(limit)) =
-        (parse("revision", 0), parse("offset", 0), parse("limit", 50))
-    else {
+    let Ok(Query(q)) = query else {
         return error(StatusCode::BAD_REQUEST, "invalid_query");
     };
+    let SetupsQuery {
+        revision,
+        offset,
+        limit,
+        hide_gate_failed,
+    } = q;
     if revision <= 0 || offset < 0 || !(1..=100).contains(&limit) {
         return error(StatusCode::BAD_REQUEST, "invalid_query");
     }
-    // Page metadata and rows share a repeatable snapshot inside DB; total comes from the same revision.
-    match db::page(&state.pool, "admin", id, revision, offset, limit).await {
-        Ok(Some(rows)) => {
-            let head = match db::get(&state.pool, "admin", id).await {
-                Ok(Some(v)) if v["revision"] == revision && v["status"] == "completed" => v,
-                _ => return error(StatusCode::CONFLICT, "study_actual_revision_changed"),
-            };
-            reply(
-                StatusCode::OK,
-                json!({"studyId":id,"jobId":head["job_id"],"revision":revision,"retrospective":true,"total":head["totals"]["total"],"limit":limit,"offset":offset,"setups":rows}),
-            )
-        }
+    if let Err(e) = owns(&state, id).await {
+        return e;
+    }
+    // Job identity, filtered count and rows all belong to the same published snapshot.
+    match db::filtered_page(
+        &state.pool,
+        "admin",
+        id,
+        revision,
+        offset,
+        limit,
+        hide_gate_failed,
+    )
+    .await
+    {
+        Ok(Some(page)) => reply(
+            StatusCode::OK,
+            json!({"studyId":id,"jobId":page.job_id,"revision":revision,"retrospective":true,"total":page.total,"limit":limit,"offset":offset,"setups":page.setups}),
+        ),
         Ok(None) => error(StatusCode::CONFLICT, "study_actual_revision_changed"),
         Err(_) => error(
             StatusCode::INTERNAL_SERVER_ERROR,

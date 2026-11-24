@@ -297,8 +297,8 @@ function parseSetup(value: unknown, studyId: number): StudyActualSetup {
     closeTimeUnix: value.closeTimeUnix as number | null, closePrice: value.closePrice as number | null,
     riskReturn: value.riskReturn as number | null, status: value.status as SetupsAnalyticsStatus };
 }
-export async function getStudyActualSetups(studyId: number, revision: number, jobId: string, offset: number, signal: AbortSignal): Promise<StudyActualSetupPage> {
-  const query = new URLSearchParams({ revision: String(revision), offset: String(offset), limit: String(STUDY_ACTUAL_PAGE_SIZE) });
+export async function getStudyActualSetups(studyId: number, revision: number, jobId: string, offset: number, signal: AbortSignal, hideGateFailed = true): Promise<StudyActualSetupPage> {
+  const query = new URLSearchParams({ revision: String(revision), offset: String(offset), limit: String(STUDY_ACTUAL_PAGE_SIZE), hideGateFailed: String(hideGateFailed) });
   const body = await requestBody(studyId, { signal }, `/setups?${query}`);
   if (!record(body) || body.studyId !== studyId || body.revision !== revision || body.jobId !== jobId) {
     throw new StudyActualApiError("Результат исследования обновился. Загрузите текущую ревизию.", 409, "study_actual_revision_changed");

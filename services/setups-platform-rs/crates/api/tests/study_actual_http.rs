@@ -229,6 +229,149 @@ async fn http_body(app: &Router, method: &str, path: &str, body: Value) -> (Stat
     (status, serde_json::from_slice(&data).unwrap())
 }
 
+async fn publish_setup_page_fixture(app: &Router, pool: &PgPool, id: i64, rows: &[Value]) -> Value {
+    let path = format!("/v1/optimization-studies/{id}/actual");
+    assert_eq!(
+        http(app, "POST", &format!("{path}/refresh")).await.0,
+        StatusCode::ACCEPTED
+    );
+    let job = db::claim(pool, 2).await.unwrap().unwrap();
+    assert_eq!(job.study, id);
+    let batch = db::create_batch(pool, &job).await.unwrap().unwrap();
+    assert!(
+        db::append(
+            pool,
+            &job,
+            batch,
+            db::InstrumentOutput {
+                exchange: "fixture",
+                category: "linear",
+                symbol: "FIX",
+                emitted: &json!([]),
+                rows,
+                quality: &json!({}),
+            }
+        )
+        .await
+        .unwrap()
+    );
+    let count = |status| rows.iter().filter(|row| row["status"] == status).count();
+    let (tp, sl) = (count("tp"), count("sl"));
+    assert!(db::finish(pool, &job, &json!({"sealedReport":"unchanged"}), &json!({
+        "total": rows.len(), "closed": tp + sl, "tp": tp, "sl": sl, "gateFailed": count("gate_failed"),
+        "unclosed": count("unclosed"), "noData": count("no_data"), "meanR": (tp + sl > 0).then(|| (tp as f64 - sl as f64) / (tp + sl) as f64),
+    })).await.unwrap());
+    http(app, "GET", &path).await.1
+}
+
+#[tokio::test]
+#[ignore = "requires isolated local TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn setup_list_gate_filter_counts_before_paging_is_readonly_and_keeps_published_totals() {
+    isolated(|pool| async move {
+        let start = chrono::Utc::now().timestamp().div_euclid(60) * 60 - 600;
+        let id = seed(&pool, start).await;
+        let (app, state, market, server) = fixture(&pool, start).await;
+        let statuses = ["gate_failed", "tp", "sl", "unclosed", "no_data"];
+        let mut rows: Vec<_> = (0..130).map(|i| json!({"setupTimeUnix":start + i, "status":statuses[i as usize % 5], "sentinel":i})).collect();
+        // Only an explicit saved gate failure is excluded, not WATCH/missing/null outcomes.
+        rows.extend([json!({"setupTimeUnix":start + 130,"status":"watch","sentinel":130}),
+            json!({"setupTimeUnix":start + 131,"status":null,"sentinel":131}),
+            json!({"setupTimeUnix":start + 132,"sentinel":132})]);
+        let published = publish_setup_page_fixture(&app, &pool, id, &rows).await;
+        let failed_id = seed(&pool, start).await;
+        let failures: Vec<_> = (0..65).map(|i| json!({"setupTimeUnix":start + i,"status":"gate_failed"})).collect();
+        let all_failed = publish_setup_page_fixture(&app, &pool, failed_id, &failures).await;
+        let foreign = seed(&pool, start).await;
+        sqlx::query("update optimization_studies set owner_id='foreign' where id=$1").bind(foreign).execute(&pool).await.unwrap();
+        let readonly = PgPoolOptions::new().max_connections(3).connect_with(
+            (*pool.connect_options()).clone().options([("default_transaction_read_only", "on")]),
+        ).await.unwrap();
+        let reader = study_actual_router(Arc::new(ReplayState {
+            pool: readonly.clone(), auth: state.auth.clone(), market_url: state.market_url.clone(),
+            market_key: state.market_key.clone(), limits: state.limits,
+        }));
+        async fn snapshot(pool: &PgPool) -> Value {
+            sqlx::query_scalar("select jsonb_build_object('studies',(select jsonb_agg(to_jsonb(s) order by id) from optimization_studies s),'heads',(select jsonb_agg(to_jsonb(a)||jsonb_build_object('xmin',a.xmin::text) order by study_id) from study_actualizations a),'rows',(select jsonb_agg(to_jsonb(s)||jsonb_build_object('xmin',s.xmin::text) order by id) from study_actual_setups s),'runs',(select jsonb_agg(to_jsonb(r) order by id) from replay_runs r),'batches',(select jsonb_agg(to_jsonb(b) order by id) from replay_batches b))")
+                .fetch_one(pool).await.unwrap()
+        }
+        let before = snapshot(&pool).await;
+        let path = format!("/v1/optimization-studies/{id}/actual/setups?revision=1");
+        for (suffix, hidden) in [("", true), ("&hideGateFailed=true", true), ("&hideGateFailed=false", false)] {
+            let expected: Vec<_> = rows.iter().rev().filter(|row| !hidden || row["status"] != "gate_failed").map(|row| row["sentinel"].clone()).collect();
+            let mut received = Vec::new();
+            for offset in [0, 50, 100, 150] {
+                let (status, page) = http(&reader, "GET", &format!("{path}{suffix}&limit=50&offset={offset}")).await;
+                assert_eq!(status, StatusCode::OK, "{page}");
+                assert_eq!(page["total"], expected.len());
+                assert_eq!(page["jobId"], published["jobId"]); assert_eq!(page["revision"], 1);
+                assert_eq!(page["offset"], offset); assert_eq!(page["limit"], 50);
+                let page_rows = page["setups"].as_array().unwrap();
+                assert_eq!(page_rows.len(), expected.len().saturating_sub(offset as usize).min(50));
+                assert!(page_rows.iter().all(|row| !hidden || row["status"] != "gate_failed"));
+                received.extend(page_rows.iter().map(|row| row["sentinel"].clone()));
+            }
+            assert_eq!(received, expected, "filter must run before offset/limit, preserving order without holes/duplicates");
+        }
+        let failed_path = format!("/v1/optimization-studies/{failed_id}/actual");
+        let (status, empty) = http(&reader, "GET", &format!("{failed_path}/setups?revision=1")).await;
+        assert_eq!(status, StatusCode::OK); assert_eq!(empty["total"], 0); assert_eq!(empty["setups"], json!([]));
+        let (status, restored) = http(&reader, "GET", &format!("{failed_path}/setups?revision=1&hideGateFailed=false")).await;
+        assert_eq!(status, StatusCode::OK); assert_eq!(restored["total"], 65); assert_eq!(restored["setups"].as_array().unwrap().len(), 50);
+        assert_eq!(http(&reader, "GET", &failed_path).await.1, all_failed);
+        assert_eq!(all_failed["counts"]["total"], 65); assert_eq!(all_failed["counts"]["gateFailed"], 65);
+        assert_eq!(all_failed["counts"]["closed"], 0); assert!(all_failed["meanR"].is_null());
+        assert_eq!(http(&reader, "GET", &format!("/v1/optimization-studies/{id}/actual")).await.1, published);
+        for missing in [foreign, 9_999_999] {
+            assert_eq!(http(&reader, "GET", &format!("/v1/optimization-studies/{missing}/actual/setups?revision=1")).await.0, StatusCode::NOT_FOUND);
+        }
+        assert_eq!(http(&reader, "GET", &format!("{path}&hideGateFailed=false&revision=2")).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(http(&reader, "GET", &format!("/v1/optimization-studies/{id}/actual/setups?revision=2")).await.0, StatusCode::CONFLICT);
+        assert_eq!(snapshot(&pool).await, before, "GETs cannot rewrite study science, stored outcomes, reports, totals, jobs or row versions");
+        assert_eq!(market.calls.load(Ordering::SeqCst), 0);
+        readonly.close().await; market.stop.cancel(); server.abort(); let _ = server.await;
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated local TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn setup_list_gate_filter_job_count_and_rows_share_repeatable_revision_snapshot() {
+    isolated(|pool| async move {
+        let start = chrono::Utc::now().timestamp().div_euclid(60) * 60 - 600;
+        let id = seed(&pool, start).await;
+        let (app, state, market, server) = fixture(&pool, start).await;
+        let rows: Vec<_> = (0..130).map(|i| json!({"setupTimeUnix":start + i,"status":if i % 2 == 0 {"gate_failed"} else {"tp"},"sentinel":i})).collect();
+        publish_setup_page_fixture(&app, &pool, id, &rows).await;
+        let path = format!("/v1/optimization-studies/{id}/actual/setups?revision=1&offset=50");
+        let (status, expected) = http(&app, "GET", &path).await; assert_eq!(status, StatusCode::OK);
+        sqlx::raw_sql("alter table study_actual_setups rename to fixture_actual_setups;create function fixture_page_barrier() returns boolean language plpgsql volatile as $$begin if current_setting('application_name')='actual_page_reader' then perform pg_advisory_xact_lock(73100051);end if;return true;end$$;create view study_actual_setups as select s.* from fixture_actual_setups s where fixture_page_barrier();").execute(&pool).await.unwrap();
+        let reader = PgPoolOptions::new().max_connections(2).connect_with((*pool.connect_options()).clone()
+            .application_name("actual_page_reader").options([("default_transaction_read_only", "on")])).await.unwrap();
+        let reader_app = study_actual_router(Arc::new(ReplayState {
+            pool:reader.clone(), auth:state.auth.clone(), market_url:state.market_url.clone(), market_key:state.market_key.clone(), limits:state.limits,
+        }));
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("select pg_advisory_xact_lock(73100051)").execute(&mut *held).await.unwrap();
+        let old_path = path.clone();
+        let pending = tokio::spawn(async move { http(&reader_app, "GET", &old_path).await });
+        tokio::time::timeout(Duration::from_secs(3), async { loop {
+            let waiting: bool = sqlx::query_scalar("select exists(select 1 from pg_stat_activity where datname=current_database() and application_name='actual_page_reader' and wait_event_type='Lock')").fetch_one(&pool).await.unwrap();
+            if waiting { break; } tokio::time::sleep(Duration::from_millis(10)).await;
+        }}).await.expect("reader must reach count after capturing revision/job head");
+        let replacement = [json!({"setupTimeUnix":start+200,"status":"sl","sentinel":"replacement"})];
+        let published = publish_setup_page_fixture(&app, &pool, id, &replacement).await;
+        held.rollback().await.unwrap();
+        let (status, old) = pending.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{old}"); assert_eq!(old, expected, "head, filtered count, and deleted rows must stay together in snapshot N");
+        let (status, invalidated) = http(&app, "GET", &path).await;
+        assert_eq!(status, StatusCode::CONFLICT); assert_eq!(invalidated["error"], "study_actual_revision_changed");
+        let (status, current) = http(&app, "GET", &format!("/v1/optimization-studies/{id}/actual/setups?revision=2")).await;
+        assert_eq!(status, StatusCode::OK); assert_eq!(current["total"], 1); assert_eq!(current["jobId"], published["jobId"]);
+        assert_ne!(current["jobId"], old["jobId"]); assert_eq!(current["setups"][0]["sentinel"], "replacement");
+        assert_eq!(market.calls.load(Ordering::SeqCst), 0);
+        reader.close().await; market.stop.cancel(); server.abort(); let _ = server.await;
+    }).await;
+}
+
 #[tokio::test]
 #[ignore = "requires isolated local TEST_DATABASE_URL ending _test with CREATEDB"]
 async fn market_readiness_precedes_claim_and_ready_recovery_preserves_the_queued_job() {

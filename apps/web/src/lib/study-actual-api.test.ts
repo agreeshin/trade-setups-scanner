@@ -257,8 +257,20 @@ it("requests exactly one revision/job-pinned 50-row page and accepts a real null
   const page = { studyId: 49, jobId: "actual-49-1", revision: 1, retrospective: true, total: 100000, limit: 50, offset: 50, setups: [actualSetupFixture(51)] };
   const fetch = vi.fn().mockResolvedValue(json(page)); vi.stubGlobal("fetch", fetch);
   expect(await getStudyActualSetups(49, 1, "actual-49-1", 50, new AbortController().signal)).toEqual(page);
-  expect(fetch.mock.calls[0]?.[0]).toBe("/v1/optimization-studies/49/actual/setups?revision=1&offset=50&limit=50");
+  expect(fetch.mock.calls[0]?.[0]).toBe("/v1/optimization-studies/49/actual/setups?revision=1&offset=50&limit=50&hideGateFailed=true");
+  expect((fetch.mock.calls[0]?.[1] as RequestInit).method).toBeUndefined();
+  expect((fetch.mock.calls[0]?.[1] as RequestInit).body).toBeUndefined();
   expect(fetch).toHaveBeenCalledOnce();
+});
+
+it("explicitly sends false to include gate failures without a write", async () => {
+  const page = { studyId: 49, jobId: "actual-49-1", revision: 1, retrospective: true, total: 176, limit: 50, offset: 0,
+    setups: [{ ...actualSetupFixture(), status: "gate_failed", riskReturn: null }] };
+  const fetch = vi.fn().mockResolvedValue(json(page)); vi.stubGlobal("fetch", fetch);
+  expect(await getStudyActualSetups(49, 1, "actual-49-1", 0, new AbortController().signal, false)).toEqual(page);
+  expect(fetch.mock.calls[0]?.[0]).toBe("/v1/optimization-studies/49/actual/setups?revision=1&offset=0&limit=50&hideGateFailed=false");
+  expect((fetch.mock.calls[0]?.[1] as RequestInit).method).toBeUndefined();
+  expect((fetch.mock.calls[0]?.[1] as RequestInit).body).toBeUndefined();
 });
 
 it.each([{ revision: 2 }, { jobId: "other-job" }, { studyId: 50 }])("rejects an artifact-page identity mismatch: %j", async (patch) => {
