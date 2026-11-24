@@ -1157,6 +1157,8 @@ fn set_dto(info: &setups_db::analytics::AnalyticsSetInfo) -> Value {
         "category": info.category,
         "symbol": info.symbol,
         "setupCount": info.setup_count,
+        "firstSetupAt": info.first_setup_at,
+        "lastSetupAt": info.last_setup_at,
         "fromUnix": info.from_unix,
         "toUnix": info.to_unix,
         "createdAt": info.created_at,

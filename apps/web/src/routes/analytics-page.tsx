@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AnalyticsTrendControls } from "../components/analytics-trend-controls";
-import { AnalyticsForecastChart, DailyCalendarGrid, DailyObservedControls } from "../components/analytics-forecast-chart";
+import { AnalyticsForecastChart, analyticsDayTick, DailyCalendarGrid, DailyObservedControls } from "../components/analytics-forecast-chart";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -37,21 +37,18 @@ import {
 } from "../lib/analytics-api";
 import {
   allAnalyticsRange, monthAnalyticsRange, normalizeAnalyticsTimeRange, requireAnalyticsRange,
+  parseAnalyticsAxis, restoreAnalyticsAxisInput, SHORT_MATRIX_LEVELS, LONG_TP_LEVELS, LONG_SL_LEVELS,
   type AnalyticsTimeRange as TimeRangeValue, type AnalyticsPeriod,
   type AnalyticsSectionKey,
   type AnalyticsUserSettings,
 } from "../lib/analytics-settings";
 import { updateSharedAnalyticsSettings, useSharedAnalyticsSettings } from "../lib/analytics-settings-store";
-import { effectiveTimezone, formatUnix, interfaceSettings, parseZonedDateTimeInput, subscribeInterfaceSettings, zonedDateTimeInput } from "../lib/datetime-format";
+import { effectiveTimezone, formatUnix, interfaceSettings, nextZonedDay, parseZonedDateTimeInput, subscribeInterfaceSettings, zonedDateTimeInput, zonedDayStart } from "../lib/datetime-format";
 import { buildDailyExpectancy, buildDailyExpectancyModel, observedDailyPoints, type ObservedDailyMode, type DailyExpectancyPoint } from "../lib/daily-expectancy";
 import { buildForecastRecipe, forecastRecipeLabel, type ForecastRecipeDraft } from "../lib/forecast-recipe";
 import { buildObservedForecastDays } from "../lib/forecast-observations";
 import type { ForecastCurveRequest } from "../lib/forecast-api";
 import { isTrendBlendLambda } from "../lib/optimization-api";
-
-const SHORT_MATRIX_LEVELS = Array.from({ length: 14 }, (_, index) => 4 + index * 2);
-const LONG_TP_LEVELS = [1, 2, 3, ...SHORT_MATRIX_LEVELS, 35, 40, 45, 50, 60];
-const LONG_SL_LEVELS = [0.1, 0.25, 0.5, 1, 2, 3, ...SHORT_MATRIX_LEVELS, 35, 40, 45, 50, 60];
 
 function parseNumberInput(value: string): number | null {
   const normalized = value.trim().replace(",", ".");
@@ -116,19 +113,28 @@ interface MatrixSectionProps {
 }
 
 function MatrixSection({
-  setId, description, direction, tpLevels, slLevels, enablePriceChange,
+  setId, description, direction, tpLevels: defaultTpLevels, slLevels: defaultSlLevels, enablePriceChange,
   gradientMinDefault, gradientMaxDefault, clusterize, maturity, clusterGapHours, setBounds,
   initial, reportState, onCommit, runToken, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff, scope, onScopeChange,
 }: MatrixSectionProps) {
   const { timeRange, persistedTimeRange, timeShiftInput, considerPriceChange, priceChangeInput } = scope;
   const setTimeRange = (value: TimeRangeValue) => onScopeChange({ ...scope, timeRange: value, persistedTimeRange: value });
+  const [tpAxisInput, setTpAxisInput] = useState(() => restoreAnalyticsAxisInput(initial?.tpAxisInput, defaultTpLevels));
+  const [slAxisInput, setSlAxisInput] = useState(() => restoreAnalyticsAxisInput(initial?.slAxisInput, defaultSlLevels));
+  const [tpAxisEdited, setTpAxisEdited] = useState(false);
+  const [slAxisEdited, setSlAxisEdited] = useState(false);
+  const axes = useMemo(() => {
+    try { return { tp: parseAnalyticsAxis(tpAxisInput, "TP"), sl: parseAnalyticsAxis(slAxisInput, "SL"), error: null }; }
+    catch (cause) { return { tp: [], sl: [], error: cause instanceof Error ? cause.message : "Некорректные оси матрицы." }; }
+  }, [tpAxisInput, slAxisInput]);
+  const tpLevels = axes.tp, slLevels = axes.sl;
   const [gradientMinDraft, setGradientMinDraft] = useState(() => savedNumber(initial?.gradientMin, gradientMinDefault));
   const [gradientMaxDraft, setGradientMaxDraft] = useState(() => savedNumber(initial?.gradientMax, gradientMaxDefault));
   const [gradientMin, setGradientMin] = useState(() => savedNumber(initial?.gradientMin, gradientMinDefault));
   const [gradientMax, setGradientMax] = useState(() => savedNumber(initial?.gradientMax, gradientMaxDefault));
   const [cells, setCells] = useState<Map<string, MatrixCellRef>>(new Map());
   const [resultIdentity, setResultIdentity] = useState<string | null>(null);
-  const modelIdentity = JSON.stringify({ setId, direction, timeRange, shift: appliedTimeShift(scope), gate: appliedPriceGate(scope),
+  const modelIdentity = JSON.stringify({ setId, direction, tpLevels, slLevels, axesError: axes.error, timeRange, shift: appliedTimeShift(scope), gate: appliedPriceGate(scope),
     clusterize, ...(clusterize ? { maturity, clusterGapHours } : {}),
     mode: trendMode, bend: trendBendDays, forecast, lambda: trendBlendLambda, cutoff: forecast ? observationCutoff : undefined });
   const currentIdentity = useRef(modelIdentity);
@@ -149,8 +155,10 @@ function MatrixSection({
   }, [modelIdentity]);
 
   useEffect(() => {
-    reportState?.({ timeRange: persistedTimeRange, timeShiftInput, considerPriceChange, priceChangeInput, gradientMin, gradientMax });
-  }, [reportState, persistedTimeRange, timeShiftInput, considerPriceChange, priceChangeInput, gradientMin, gradientMax]);
+    reportState?.({ ...(tpAxisEdited ? { tpAxisInput } : initial && "tpAxisInput" in initial ? { tpAxisInput: initial.tpAxisInput } : {}),
+      ...(slAxisEdited ? { slAxisInput } : initial && "slAxisInput" in initial ? { slAxisInput: initial.slAxisInput } : {}),
+      timeRange: persistedTimeRange, timeShiftInput, considerPriceChange, priceChangeInput, gradientMin, gradientMax });
+  }, [reportState, initial, tpAxisEdited, slAxisEdited, tpAxisInput, slAxisInput, persistedTimeRange, timeShiftInput, considerPriceChange, priceChangeInput, gradientMin, gradientMax]);
 
   const totalCells = tpLevels.length * slLevels.length;
 
@@ -168,6 +176,7 @@ function MatrixSection({
     setPendingCell(null);
     const stale = () => runIdRef.current !== runId || currentIdentity.current !== modelIdentity;
     try {
+    if (axes.error) throw new Error(axes.error);
     requireAnalyticsRange(timeRange);
     const recipe = forecast !== undefined && trendMode !== "mean" ? buildForecastRecipe(forecast) : undefined;
     const lambda = Number(trendBlendLambda);
@@ -203,7 +212,7 @@ function MatrixSection({
         setPendingCell(null);
       }
     }
-  }, [setId, direction, timeRange, clusterize, maturity, clusterGapHours, tpLevels, slLevels, totalCells, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff, modelIdentity]);
+  }, [setId, direction, axes.error, timeRange, clusterize, maturity, clusterGapHours, tpLevels, slLevels, totalCells, trendBendDays, trendMode, forecast, trendBlendLambda, observationCutoff, modelIdentity]);
 
   const appliedShift = Math.max(0, Math.round(parseNumberInput(timeShiftInput) ?? 0));
   const appliedPriceChange = enablePriceChange && considerPriceChange ? (parseNumberInput(priceChangeInput) ?? 0) : null;
@@ -221,7 +230,7 @@ function MatrixSection({
   const commitGradientMax = () => { setGradientMax(gradientMaxDraft); onCommit?.(); };
 
   return <section className="grid min-w-0 gap-4">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-center gap-2 text-center">
         <h2 className="text-lg font-semibold">{trendMode === "blend" ? "Смесь среднего и прогноза" : trendMode === "forecast" ? forecast?.method === "decayed_probability" ? "Прогноз матожидания" : "Прогноз матожидания по тренду" : "Среднее матожидание сетапов"}</h2>
         <InfoNote>{description}</InfoNote>
         <InfoNote>{trendMode === "mean" ? "Ячейка — матожидание в единицах риска: среднее движение по закрытым сделкам / SL. «—» — нет закрытых сделок." : forecast?.method === "decayed_probability" ? "Матрица показывает decisionR выбранного режима. Подсказка отдельно содержит среднее M, чистый прогноз F, реальные закрытия, prior и cutoff. Prior не выполняет минимум реальных закрытий." : "Прогноз — сглаженный уровень МО на последней дате с закрытыми сделками, без экстраполяции. Подсказка содержит SE и 95% неопределённость уровня, не будущей сделки."} Спорная свеча считается Stop Loss. Цвет жирных значений интерполируется от красного к зелёному между порогами ползунков.</InfoNote>
@@ -247,6 +256,15 @@ function MatrixSection({
           : <Button disabled={setId === ""} onClick={() => { void run(appliedShift, appliedPriceChange); }}>Рассчитать</Button>}
         {progress.total > 0 && <Badge variant={progress.done >= progress.total ? "success" : "info"}>Ячеек: {progress.done} / {progress.total}</Badge>}
       </div>
+      <div className="flex flex-wrap items-end gap-3">
+        <Field label="Уровни TP, %" className="w-80 max-w-full" hint="Строки матрицы. Через запятую; дроби через точку. До 64 уровней, 0.000001–100%.">
+          {(control) => <Input {...control} value={tpAxisInput} maxLength={4096} aria-invalid={axes.error !== null} onChange={(event) => { setTpAxisEdited(true); setTpAxisInput(event.target.value); }} onBlur={() => onCommit?.()} />}
+        </Field>
+        <Field label="Уровни SL, %" className="w-80 max-w-full" hint="Столбцы матрицы. Порядок сохраняется; повторы недопустимы. До 4096 ячеек.">
+          {(control) => <Input {...control} value={slAxisInput} maxLength={4096} aria-invalid={axes.error !== null} onChange={(event) => { setSlAxisEdited(true); setSlAxisInput(event.target.value); }} onBlur={() => onCommit?.()} />}
+        </Field>
+      </div>
+      {axes.error && <p role="alert" className="text-sm text-danger">{axes.error}</p>}
       <div className="flex flex-wrap items-center gap-6 text-sm">
         <label className="flex items-center gap-2">
           <span className="text-muted-foreground">Красный при ≤</span>
@@ -283,7 +301,7 @@ function MatrixSection({
           <span className="tabular-nums">{gradientMaxDraft.toFixed(2)}</span>
         </label>
       </div>
-      {error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
+      {error && error !== axes.error && <Alert variant="destructive" role="alert"><AlertDescription>{error}</AlertDescription></Alert>}
       {metrics !== null && resultIdentity === modelIdentity && (
         <div className="flex flex-wrap gap-2 text-xs">
           <Badge>{clusterize ? "После кластеризации" : "Сетапов"}: {metrics.totalMatchingSetups}</Badge>
@@ -482,11 +500,17 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
   const yMin = Math.min(0, ...values);
   const yMax = Math.max(1, ...values);
   const yRange = yMax - yMin;
-  const firstX = model.points[0]!.x;
-  const xRange = model.points[model.points.length - 1]!.x - firstX;
-  const xForDay = (x: number) => left + (xRange === 0 ? plotWidth / 2 : ((x - firstX) / xRange) * plotWidth);
-  // Map only the displayed calendar date of each original bucket instant. Neither
-  // daily aggregates nor fine server-curve coordinates are shifted or refitted.
+  const displayFrom = zonedDayStart(model.points[0]!.dayStartUnix);
+  const displayTo = zonedDayStart(model.points[model.points.length - 1]!.dayStartUnix);
+  const xForUnix = (at: number) => left + (displayFrom === displayTo ? plotWidth / 2 : (at - displayFrom) / (displayTo - displayFrom) * plotWidth);
+  // Piecewise calendar projection only. Fine UTC solver coordinates keep their
+  // within-day fraction while local presentation days may last 23/25 hours.
+  const xForDay = (coordinate: number) => {
+    const at = model.originUnix + coordinate * 86400;
+    const utcStart = Math.floor(at / 86400) * 86400;
+    const localStart = zonedDayStart(utcStart);
+    return xForUnix(localStart + (at - utcStart) / 86400 * (nextZonedDay(localStart) - localStart));
+  };
   const xForTrend = (day: number) => xForDay(day - model.originUnix / 86400);
   const timezone = effectiveTimezone();
   const yForValue = (value: number) => top + ((yMax - value) / yRange) * plotHeight;
@@ -499,6 +523,7 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
     <div className="grid gap-2">
     <h3 className="text-sm font-medium">Дневное матожидание в рисках · Среднее МО: <span aria-label="Среднее МО за период" className={displayedMean !== null && displayedMean > 0 ? "text-success" : displayedMean !== null && displayedMean < 0 ? "text-danger" : "text-muted-foreground"}>{displayedMean === null ? "—" : fittedLabel(displayedMean)}</span> · Винрейт: <span aria-label="Винрейт за период">{displayedWinRate === null ? "—" : `${displayedWinRate.toFixed(1)}%`}</span></h3>
     <DailyObservedControls value={observedMode} onChange={onObservedModeChange} />
+    <p className="text-xs text-muted-foreground">Исходные UTC-когорты показаны в календаре {effectiveTimezone()} без пересчёта: это не точная локальная группировка исходов.</p>
     <p className="text-xs text-muted-foreground">Точки: {observedMode === "mean" ? "среднее R закрытых сделок дня" : "сумма R закрытых сделок дня"}. Модель: {forecast?.method === "trend_sum_r" ? "тренд дневной суммы R, не результата одной сделки" : "тренд среднего по дням"}. {trendMode === "mean" ? "Основная линия M: среднее за период." : trendMode === "blend" ? `Основная линия B: смесь M/F, λ ${trendBlendLambda}.` : "Основная линия F: чистый прогноз."}</p>
     {projection && <p className="text-xs text-muted-foreground">Чистый F: <span aria-label="Чистый прогноз тренда">{projection.forecastR === null ? "—" : fittedLabel(projection.forecastR)}</span> · decisionR: <span aria-label="Метрика решения тренда">{projection.decisionR === null ? "—" : fittedLabel(projection.decisionR)}</span></p>}
     {(modelInput.error ?? current?.error) && <p role="status" className="text-xs text-danger">Не удалось рассчитать тренд: {modelInput.error ?? current?.error}</p>}
@@ -516,8 +541,7 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
           <text className="fill-muted-foreground text-[10px]" x={left - 10} y={yForValue(value) + 4} textAnchor="end">{formatRisk(value)}</text>
         </g>
       ))}
-      <DailyCalendarGrid fromUnix={model.points[0]!.dayStartUnix} toUnix={model.points[model.points.length - 1]!.dayStartUnix}
-        x={(atUnix) => xForDay((atUnix - model.originUnix) / 86400)} top={top} bottom={height - bottom} />
+      <DailyCalendarGrid local fromUnix={displayFrom} toUnix={displayTo} x={xForUnix} top={top} bottom={height - bottom} />
       {model.segments.map((segment, index) => segment.length > 1
         ? <polyline key={index} className="fill-none stroke-primary stroke-2" points={segment.map((point) => `${xForDay(point.x)},${yForValue(point.riskExpectancy!)}`).join(" ")} /> : null)}
       {trend !== null ? <>
@@ -542,7 +566,7 @@ function DailyExpectancyChart({ items, originUnix, meanRisk, winRate, trendBendD
                 <title>{`${formatUnix(item.dayStartUnix, { time: false })} (${timezone}): ${observedMode === "sum" ? "сумма " : ""}${formatRisk(item.riskExpectancy)}, закрыто ${item.closedCount}, TP ${item.tpCount}, SL ${item.slCount}, из кеша ${item.cachedCount}/${item.computedCount}`}</title>
               </circle>
             ) : null}
-            {showLabel ? <text className="fill-muted-foreground text-[10px]" x={x} y={height - 26} textAnchor="middle">{formatUnix(item.dayStartUnix, { time: false })}</text> : null}
+            {showLabel ? <text aria-label={formatUnix(item.dayStartUnix, { time: false })} className="fill-muted-foreground text-[10px]" x={x} y={height - 26} textAnchor="middle">{analyticsDayTick(item.dayStartUnix)}<title>{formatUnix(item.dayStartUnix, { time: false })}</title></text> : null}
           </g>
         );
       })}
@@ -742,7 +766,7 @@ function TradesSection({ setId, description, direction, clusterize, maturity, cl
   const chartScopeKey = JSON.stringify([paramsKey, trendMode, forecast, trendBendDays, trendBlendLambda]);
 
   return <section className="grid min-w-0 gap-4">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-center gap-2 text-center">
         <h2 className="text-lg font-semibold">Расчёт ячейки</h2>
         <InfoNote>{description}</InfoNote>
       </div>
@@ -853,7 +877,7 @@ function AnalyticsCacheCard() {
   };
 
   return <section className="grid min-w-0 gap-4">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-center gap-2 text-center">
         <h2 className="text-lg font-semibold">Кеш аналитики</h2>
         <InfoNote>Кеш результатов хранится в БД платформы рядом с сетапами. Догрузка истории не сбрасывает его автоматически; очистка удаляет только кеш аналитики, не трогая запуски, сетапы и рыночные данные.</InfoNote>
       </div>
@@ -1046,6 +1070,10 @@ export function AnalyticsPage() {
               <div className="flex flex-wrap gap-2 text-xs self-center">
                 <Badge>Сетапов: {activeSet.setupCount}</Badge>
                 <Badge>{activeSet.exchange} · {activeSet.category}{activeSet.symbol === null ? "" : ` · ${activeSet.symbol}`}</Badge>
+                <Badge aria-label="Даты первого и последнего сетапа" title={`Raw signal close всего набора · ${effectiveTimezone()}`}>
+                  {activeSet.firstSetupAt != null && activeSet.lastSetupAt != null
+                    ? `${formatUnix(activeSet.firstSetupAt, { time: false })} — ${formatUnix(activeSet.lastSetupAt, { time: false })}` : "Даты сетапов: —"}
+                </Badge>
               </div>
             )}
             <label className="flex items-center gap-2 text-sm self-center">
@@ -1098,7 +1126,7 @@ export function AnalyticsPage() {
         </div>
         <Separator />
         <div className="grid gap-3">
-          <div className="flex items-center gap-2"><h3 className="text-sm font-semibold text-muted-foreground">Матожидание и модель прогноза</h3>
+          <div className="flex flex-wrap items-center justify-center gap-2 text-center"><h3 className="text-sm font-semibold text-muted-foreground">Матожидание и модель прогноза</h3>
           <InfoNote>Режим mean по умолчанию. Среднее M, чистый прогноз F и decisionR смеси различаются. Probability использует только наблюдавшиеся TP/SL и единый cutoff C; за C продолжение плоское. Прежний trend доступен отдельно для сравнения; его fitted endpoint не является probability-моделью или третьей компонентой смеси. Ретроспективная кривая не доказывает OOS-качество.</InfoNote></div>
           <AnalyticsTrendControls scope="analytics" mode={trendMode} bend={trendBendDays}
             forecast={forecast} onForecastChange={(next) => { updateSharedAnalyticsSettings({ forecast: next, ...(next.method !== "decayed_probability" ? { trendBendDays: next.bendDays } : {}) }); onSettingsCommit(true, false); }}

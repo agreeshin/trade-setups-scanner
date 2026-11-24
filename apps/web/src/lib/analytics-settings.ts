@@ -72,6 +72,32 @@ export function requireAnalyticsRange(value: AnalyticsTimeRange): AnalyticsPerio
 
 export type AnalyticsSectionKey = "short-matrix" | "short-trades" | "long-matrix" | "long-trades";
 
+export const SHORT_MATRIX_LEVELS = Array.from({ length: 14 }, (_, index) => 4 + index * 2);
+export const LONG_TP_LEVELS = [1, 2, 3, ...SHORT_MATRIX_LEVELS, 35, 40, 45, 50, 60];
+export const LONG_SL_LEVELS = [0.1, 0.25, 0.5, 1, 2, 3, ...SHORT_MATRIX_LEVELS, 35, 40, 45, 50, 60];
+
+/** Same domain/budget as matrix-grid: 64 levels per axis, at most 4096 cells.
+ * Commas separate levels; decimal fractions use a dot, never an ambiguous comma. */
+export function parseAnalyticsAxis(raw: string, name: "TP" | "SL"): number[] {
+  const parts = raw.split(",");
+  if (raw.length > 4096 || parts.length > 64 || parts.some((part) => !/^(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(part.trim()))) {
+    throw new Error(`${name}: укажите от 1 до 64 уровней через запятую; десятичный разделитель — точка.`);
+  }
+  const values = parts.map((part) => Number(part.trim()));
+  if (values.some((value) => !Number.isFinite(value) || value < 0.000001 || value > 100)) {
+    throw new Error(`${name}: каждый уровень должен быть конечным числом от 0.000001 до 100%.`);
+  }
+  if (new Set(values).size !== values.length) {
+    throw new Error(`${name}: повторяющиеся уровни недопустимы (например, 1 и 1.0). Уберите повторы; порядок уровней сохраняется.`);
+  }
+  return values;
+}
+
+/** Only absent fields get defaults. Invalid persisted drafts must stay visible. */
+export function restoreAnalyticsAxisInput(raw: unknown, defaults: number[]): string {
+  return raw === undefined ? defaults.join(", ") : typeof raw === "string" ? raw : `Некорректное сохранённое значение: ${JSON.stringify(raw)}`;
+}
+
 /** Analytics tab settings document stored under the platform `settings` key "web-analytics". */
 export interface AnalyticsUserSettings {
   setId: string | null;

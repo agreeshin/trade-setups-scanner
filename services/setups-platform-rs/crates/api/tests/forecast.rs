@@ -164,43 +164,148 @@ struct TestDb {
 }
 
 #[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL ending _test with CREATEDB"]
+async fn analytics_set_signal_extrema_are_actual_persisted_values_not_execution_bounds() {
+    let fixture = TestDb::new().await;
+    let pool = fixture.pool.clone();
+    let outcome = tokio::spawn(async move {
+        let mut runs = Vec::new();
+        for setups in [json!([]), json!([{"closeTimeUnix": 600}]),
+            json!([{"closeTimeUnix": 3600}, {"closeTimeUnix": 1200}, {"closeTimeUnix": 2400}])] {
+            let id: i32 = sqlx::query_scalar("insert into replay_runs(exchange_code,category,symbol,algorithm_id,algorithm_version,params,from_ts,to_ts,status,setups) values('bybit','linear','FIXTUREUSDT','price_volume_spike','1.1.1','{}',to_timestamp(0),to_timestamp(864000),'done',$1) returning id")
+                .bind(setups).fetch_one(&pool).await.unwrap();
+            runs.push(id);
+        }
+        let batch: i32 = sqlx::query_scalar("insert into replay_batches(exchange_code,category,algorithm_id,algorithm_version,params,from_ts,to_ts,instrument_count) values('bybit','linear','price_volume_spike','1.1.1','{}',to_timestamp(0),to_timestamp(864000),2) returning id")
+            .fetch_one(&pool).await.unwrap();
+        for setups in [json!([{"closeTimeUnix": 7200}, {"closeTimeUnix": 300}]), json!([{"closeTimeUnix": 9000}])] {
+            sqlx::query("insert into replay_runs(batch_id,exchange_code,category,symbol,algorithm_id,algorithm_version,params,from_ts,to_ts,status,setups) values($1,'bybit','linear','FIXTUREUSDT','price_volume_spike','1.1.1','{}',to_timestamp(0),to_timestamp(864000),'done',$2)")
+                .bind(batch).bind(setups).execute(&pool).await.unwrap();
+        }
+        let app = analytics_router(state(pool, "http://127.0.0.1:1"));
+        let (status, response) = request(&app, "GET", "/v1/analytics/sets", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let sets = response["sets"].as_array().unwrap();
+        for (id, first, last, count) in [(format!("run-{}", runs[0]), None, None, 0),
+            (format!("run-{}", runs[1]), Some(600), Some(600), 1),
+            (format!("run-{}", runs[2]), Some(1200), Some(3600), 3),
+            (format!("batch-{batch}"), Some(300), Some(9000), 3)] {
+            let set = sets.iter().find(|set| set["setId"] == id).unwrap();
+            assert_eq!(set["firstSetupAt"], json!(first));
+            assert_eq!(set["lastSetupAt"], json!(last));
+            assert_eq!(set["setupCount"], count);
+            assert_eq!(set["fromUnix"], 0);
+            assert_eq!(set["toUnix"], 864000);
+        }
+    }).await;
+    fixture.cleanup().await;
+    outcome.expect("extrema assertions after isolated database cleanup");
+}
+
+#[tokio::test]
 async fn trend_projection_wire_fixture_omission_identity_nulls_and_blend_endpoint() {
-    let pool = PgPoolOptions::new().connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test").unwrap();
-    let app = analytics_router(state(pool,"http://127.0.0.1:1"));
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused_test")
+        .unwrap();
+    let app = analytics_router(state(pool, "http://127.0.0.1:1"));
     let points = json!([{"day":0,"value":0,"weight":2},{"day":1,"value":2,"weight":1}]);
-    let (status, legacy) = request(&app,"POST","/v1/analytics/trend",json!({"points":points})).await;
-    assert_eq!(status,StatusCode::OK);
+    let (status, legacy) = request(
+        &app,
+        "POST",
+        "/v1/analytics/trend",
+        json!({"points":points}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     let expected_trend = json!({"method":"linear","start":{"day":0.0,"value":0.0,"se":null},
         "end":{"day":1.0,"value":2.0,"se":null},"endpointSe":null,"curve":[
         {"day":0.0,"value":0.0,"se":null},{"day":0.25,"value":0.5,"se":null},
         {"day":0.5,"value":1.0,"se":null},{"day":0.75,"value":1.5,"se":null},{"day":1.0,"value":2.0,"se":null}]});
-    assert_eq!(legacy,json!({"trend":expected_trend}),"omitting projection keeps the exact old response shape");
+    assert_eq!(
+        legacy,
+        json!({"trend":expected_trend}),
+        "omitting projection keeps the exact old response shape"
+    );
     let projection = json!({"forecast":{"method":"trend_sum_r","version":1,"bendDays":"linear"},
         "meanR":0.4,"trendMode":"blend","trendBlendLambda":0.7});
-    let (status, projected) = request(&app,"POST","/v1/analytics/trend",json!({"points":points,"trendBendDays":"linear","projection":projection})).await;
-    assert_eq!(status,StatusCode::OK);
-    assert_eq!(projected["trend"],expected_trend);
-    for key in ["forecast","meanR","trendMode","trendBlendLambda"] { assert_eq!(projected["projection"][key],projection[key]); }
-    assert_eq!(projected["projection"]["forecastR"],2.0);
-    let decision=projected["projection"]["decisionR"].as_f64().unwrap();
-    assert!((decision-1.52).abs()<1e-12);
-    assert_eq!(projected["projection"]["curve"].as_array().unwrap().last().unwrap()["value"],projected["projection"]["decisionR"]);
+    let (status, projected) = request(
+        &app,
+        "POST",
+        "/v1/analytics/trend",
+        json!({"points":points,"trendBendDays":"linear","projection":projection}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(projected["trend"], expected_trend);
+    for key in ["forecast", "meanR", "trendMode", "trendBlendLambda"] {
+        assert_eq!(projected["projection"][key], projection[key]);
+    }
+    assert_eq!(projected["projection"]["forecastR"], 2.0);
+    let decision = projected["projection"]["decisionR"].as_f64().unwrap();
+    assert!((decision - 1.52).abs() < 1e-12);
+    assert_eq!(
+        projected["projection"]["curve"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["value"],
+        projected["projection"]["decisionR"]
+    );
     let (status, single) = request(&app,"POST","/v1/analytics/trend",json!({"points":[{"day":9,"value":null,"weight":1}],
         "projection":{"forecast":{"method":"trend","version":1,"bendDays":"linear"},"meanR":0.4,"trendMode":"mean"}})).await;
-    assert_eq!(status,StatusCode::OK); assert!(single["trend"].is_null());
-    assert_eq!(single["projection"]["curve"],json!([{"day":9.0,"value":0.4}]));
+    assert_eq!(status, StatusCode::OK);
+    assert!(single["trend"].is_null());
+    assert_eq!(
+        single["projection"]["curve"],
+        json!([{"day":9.0,"value":0.4}])
+    );
     assert!(single["projection"]["forecastR"].is_null());
     assert!(single["projection"].get("trendBlendLambda").is_none());
-    for (field,value) in [("meanR",json!("NaN")),("meanR",json!(true)),("trendBlendLambda",json!(0.0)),
-        ("trendBlendLambda",json!(1.0)),("trendBlendLambda",json!(0.701)),("forecast",json!({"method":"trend_sum_r","version":2,"bendDays":"linear"})),
-        ("forecast",json!({"method":"unknown","version":1,"bendDays":"linear"})),
-        ("forecast",json!({"method":"decayed_probability","version":1,"halfLifeDays":14,"kappa":10,"priorPolicy":"gross_break_even"})),
-        ("forecast",json!({"method":"trend_sum_r","version":1,"bendDays":"7"}))] {
-        let mut bad=projection.clone(); bad[field]=value;
-        let response=app.clone().oneshot(Request::builder().method("POST").uri("/v1/analytics/trend")
-            .header("x-api-key","fixture-key").header("content-type","application/json")
-            .body(Body::from(json!({"points":points,"projection":bad}).to_string())).unwrap()).await.unwrap();
-        assert!(response.status().is_client_error(),"{field}: {}",response.status());
+    for (field, value) in [
+        ("meanR", json!("NaN")),
+        ("meanR", json!(true)),
+        ("trendBlendLambda", json!(0.0)),
+        ("trendBlendLambda", json!(1.0)),
+        ("trendBlendLambda", json!(0.701)),
+        (
+            "forecast",
+            json!({"method":"trend_sum_r","version":2,"bendDays":"linear"}),
+        ),
+        (
+            "forecast",
+            json!({"method":"unknown","version":1,"bendDays":"linear"}),
+        ),
+        (
+            "forecast",
+            json!({"method":"decayed_probability","version":1,"halfLifeDays":14,"kappa":10,"priorPolicy":"gross_break_even"}),
+        ),
+        (
+            "forecast",
+            json!({"method":"trend_sum_r","version":1,"bendDays":"7"}),
+        ),
+    ] {
+        let mut bad = projection.clone();
+        bad[field] = value;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/analytics/trend")
+                    .header("x-api-key", "fixture-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"points":points,"projection":bad}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "{field}: {}",
+            response.status()
+        );
     }
 }
 impl TestDb {

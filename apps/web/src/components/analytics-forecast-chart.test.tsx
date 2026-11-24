@@ -1,178 +1,151 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
-import { AnalyticsForecastChart } from "./analytics-forecast-chart";
-import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS } from "../lib/datetime-format";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { AnalyticsForecastChart, DailyCalendarGrid } from "./analytics-forecast-chart";
+import { applyInterfaceSettings, DEFAULT_INTERFACE_SETTINGS, zonedDayStart } from "../lib/datetime-format";
 import type { DailyExpectancyPoint } from "../lib/daily-expectancy";
-import type { ForecastCurveRequest } from "../lib/forecast-api";
-import { forecastFixture } from "../../test/forecast-fixture";
+import type { ForecastCurveRequest, ForecastCurveResponse } from "../lib/forecast-api";
+import { forecastFixture, withDisplayCurve } from "../../test/forecast-fixture";
 
-afterEach(() => {
-  cleanup();
-  vi.restoreAllMocks();
-  vi.unstubAllGlobals();
-  applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS);
-});
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS); });
 
-const fromUnix = Date.parse("2026-01-01T00:00:00Z") / 1000;
-const cutoff = Date.parse("2026-01-03T00:30:00Z") / 1000;
-const days: DailyExpectancyPoint[] = [0, 1].map((offset) => ({
-  day: `2026-01-0${offset + 1}`, dayStartUnix: fromUnix + offset * 86400,
-  riskExpectancy: offset === 0 ? 1 : -1, closedCount: 1, tpCount: offset === 0 ? 1 : 0,
-  slCount: offset === 0 ? 0 : 1, computedCount: 1, cachedCount: 1,
+const fromUnix = Date.parse("2025-12-31T00:00:00Z") / 1000;
+const cutoff = Date.parse("2026-01-15T00:30:00Z") / 1000;
+const days: DailyExpectancyPoint[] = [0, 1, 4].map((offset, index) => ({
+  day: new Date((fromUnix + offset * 86400) * 1000).toISOString().slice(0, 10), dayStartUnix: fromUnix + offset * 86400,
+  riskExpectancy: index === 1 ? -1 : 1, closedCount: 1, tpCount: index === 1 ? 0 : 1,
+  slCount: index === 1 ? 1 : 0, computedCount: 1, cachedCount: 1,
 }));
 const request: ForecastCurveRequest = {
   forecast: { method: "decayed_probability", version: 1, halfLifeDays: 14, kappa: 10, priorPolicy: "gross_break_even" },
-  trendMode: "blend", trendBlendLambda: 0.7, q: 1, fromUnix, toUnix: fromUnix + 2 * 86400,
+  trendMode: "blend", trendBlendLambda: 0.7, q: 1, fromUnix, toUnix: fromUnix + 10 * 86400,
   observationCutoff: cutoff, atUnix: cutoff + 86400,
   daily: days.map((day) => ({ dayStartUnix: day.dayStartUnix, tpCount: day.tpCount, slCount: day.slCount })),
 };
+const mock = (response: ForecastCurveResponse) => {
+  const fetch = vi.fn<typeof globalThis.fetch>(() => Promise.resolve(new Response(JSON.stringify(response))));
+  vi.stubGlobal("fetch", fetch); return fetch;
+};
+const observedCircles = (chart: HTMLElement) => [...chart.querySelectorAll("circle")].filter((circle) => circle.querySelector("title")?.textContent?.includes("TP "));
 
-function mockBrowserTimezone() {
+it.each(["mean", "forecast", "blend"] as const)("labels the final selected %s scalar on the last signal day, not cutoff/now, without changing scientific inputs", async (mode) => {
+  applyInterfaceSettings({ timezone: "UTC" });
+  const input = { ...request, trendMode: mode };
+  const response = forecastFixture(input);
+  const fetch = mock(response);
+  render(<AnalyticsForecastChart request={input} days={days} />);
+  const label = await screen.findByTestId("forecast-endpoint-label");
+  expect(label).toHaveTextContent(`${response.decisionR} R`);
+  expect(label).toHaveAttribute("data-canonical-at-unix", String(cutoff));
+  expect(label).toHaveAttribute("data-signal-day-unix", String(days.at(-1)!.dayStartUnix));
+  expect(label).toHaveAttribute("x", "732");
+  expect(label).toHaveAccessibleName(expect.stringContaining(mode === "mean" ? "M:" : mode === "forecast" ? "F:" : "B:"));
+  expect(screen.queryByTestId("forecast-flat-future")).not.toBeInTheDocument();
+  expect(screen.queryByTestId("blend-flat-future")).not.toBeInTheDocument();
+  expect(screen.queryByTestId("forecast-cutoff")).not.toBeInTheDocument();
+  const line = screen.getByTestId(mode === "forecast" ? "forecast-model-curve" : "forecast-blend-curve");
+  expect(line.getAttribute("points")!.split(" ").at(-1)!.split(",")[0]).toBe("732");
+  expect(Number(label.getAttribute("y"))).toBeGreaterThan(0);
+  expect(JSON.parse(fetch.mock.calls[0]![1]!.body as string)).toEqual(input);
+  expect(input.observationCutoff).toBe(cutoff);
+  expect(response.curve.at(-1)!.atUnix).toBe(cutoff);
+  expect(screen.getByLabelText("Чистый прогноз модели")).toHaveTextContent("0.4 R");
+});
+
+it.each([
+  { timezone: "America/New_York", ticks: ["30.12", "31.12", "03.01"], first: "30.12.2025" },
+  { timezone: "Asia/Kathmandu", ticks: ["31.12", "01.01", "04.01"], first: "31.12.2025" },
+])("uses DD.MM across the year with full accessible/tooltip dates in $timezone, and re-presents without refetch", async ({ timezone, ticks, first }) => {
   const DateTimeFormat = Intl.DateTimeFormat;
   vi.spyOn(Intl, "DateTimeFormat").mockImplementation(function (locales, options) { return new DateTimeFormat(locales, { ...options, timeZone: options?.timeZone ?? "Asia/Tokyo" }); });
-  expect(Intl.DateTimeFormat().resolvedOptions().timeZone).toBe("Asia/Tokyo");
-}
-
-it("uses the configured calendar across midnight and updates mounted labels without shifting or refetching the model", async () => {
-  mockBrowserTimezone();
-  applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "America/New_York" });
-  const response = forecastFixture(request);
-  // Fine model samples are deliberately not UTC or local midnights.
-  response.curve = response.curve.map((point, index) => ({ ...point, atUnix: [fromUnix + 12345, fromUnix + 90123, cutoff][index]! }));
-  response.blendCurve = response.blendCurve!.map((point, index) => ({ ...point, atUnix: response.curve[index]!.atUnix }));
-  const fetch = vi.fn<typeof globalThis.fetch>(() => Promise.resolve(new Response(JSON.stringify(response))));
-  vi.stubGlobal("fetch", fetch);
+  applyInterfaceSettings({ timezone });
+  const fetch = mock(forecastFixture(request));
   render(<AnalyticsForecastChart request={request} days={days} />);
   const curve = await screen.findByTestId("forecast-model-curve");
-  const chart = screen.getByRole("img", { name: "Дневное матожидание и вероятностная модель" });
-  const circles = [...chart.querySelectorAll("circle")];
-  expect(screen.getByText(/Cutoff C:/)).toHaveTextContent("Cutoff C: 02.01.2026, 19:30:00 (America/New_York)");
-  expect(chart).toHaveTextContent("Дата исходного сигнала (America/New_York)");
-  expect(chart.querySelector("desc")).toHaveTextContent("календарными подписями America/New_York без пересчёта агрегатов");
-  expect(circles.map((point) => point.querySelector("title")?.textContent)).toEqual([
-    "31.12.2025 (America/New_York): 1 R, TP 1, SL 0",
-    "01.01.2026 (America/New_York): -1 R, TP 0, SL 1",
-  ]);
-  expect([...chart.querySelectorAll('text[y="273"]')].map((label) => label.textContent)).toEqual(["31.12.2025", "01.01.2026"]);
-  expect([...chart.querySelectorAll("title")].some((title) => title.textContent?.includes(" UTC:"))).toBe(false);
-  const posted = JSON.parse(fetch.mock.calls[0]![1]!.body as string) as ForecastCurveRequest;
-  expect(posted).toEqual(request);
-  const expectedX = (atUnix: number) => 66 + (atUnix - fromUnix) / (request.atUnix! - fromUnix) * 666;
-  expect(curve.getAttribute("points")!.split(" ").map((point) => Number(point.split(",")[0]))).toEqual(response.curve.map((point) => expectedX(point.atUnix)));
-  expect(circles.map((point) => Number(point.getAttribute("cx")))).toEqual(days.map((day) => expectedX(day.dayStartUnix)));
-  const geometry = () => [curve.getAttribute("points"), screen.getByTestId("forecast-blend-curve").getAttribute("points"),
-    screen.getByTestId("forecast-cutoff").getAttribute("x1"), screen.getByTestId("forecast-flat-future").getAttribute("x1"),
-    screen.getByTestId("forecast-flat-future").getAttribute("x2"), ...circles.map((point) => point.getAttribute("cx"))];
-  const before = geometry();
-  act(() => { applyInterfaceSettings({ timezone: "Pacific/Auckland", dateOrder: "mdy", dateSeparator: "/", yearDigits: 2, time24: false }); });
-  expect(screen.getByRole("img", { name: "Дневное матожидание и вероятностная модель" })).toBe(chart);
-  expect(screen.getByText(/Cutoff C:/)).toHaveTextContent("Cutoff C: 01/03/26, 01:30:00 PM (Pacific/Auckland)");
-  expect(chart).toHaveTextContent("Дата исходного сигнала (Pacific/Auckland)");
-  expect(circles[0]?.querySelector("title")).toHaveTextContent("01/01/26 (Pacific/Auckland): 1 R, TP 1, SL 0");
-  expect(geometry()).toEqual(before);
+  const chart = screen.getByRole("img");
+  const labels = [...chart.querySelectorAll('text[y="273"]')];
+  expect(labels.map((label) => label.firstChild?.textContent)).toEqual(ticks);
+  expect(labels[0]).toHaveAccessibleName(first);
+  expect(labels[0]!.querySelector("title")).toHaveTextContent(first);
+  expect(observedCircles(chart)[0]!.querySelector("title")).toHaveTextContent(`${first} (${timezone})`);
+  const before = curve.getAttribute("points");
+  act(() => { applyInterfaceSettings({ timezone: "Asia/Kathmandu", dateOrder: "ymd", dateSeparator: "-", yearDigits: 4 }); });
+  expect(screen.getByRole("img")).toBe(chart);
+  expect(observedCircles(chart)[0]!.querySelector("title")).toHaveTextContent("2025-12-31 (Asia/Kathmandu)");
+  expect(curve.getAttribute("points")).toBe(before); // No DST in this period.
+  expect(JSON.parse(fetch.mock.calls[0]![1]!.body as string)).toEqual(request);
   expect(fetch).toHaveBeenCalledTimes(1);
 });
 
 it.each([
-  { name: "dense", offsets: Array.from({ length: 16 }, (_, index) => index) },
-  { name: "sparse", offsets: [0, 5, 15] },
-])("draws every calendar day behind the $name observed series independently of date labels", async ({ offsets }) => {
-  applyInterfaceSettings({ ...DEFAULT_INTERFACE_SETTINGS, timezone: "America/New_York" });
-  const observed = offsets.map((offset): DailyExpectancyPoint => {
-    const dayStartUnix = fromUnix + offset * 86400;
-    const value = offset === 5 ? null : offset % 2 === 0 ? 1 : -1;
-    return { day: new Date(dayStartUnix * 1000).toISOString().slice(0, 10), dayStartUnix,
-      riskExpectancy: value, closedCount: value === null ? 0 : 1,
-      tpCount: value === 1 ? 1 : 0, slCount: value === -1 ? 1 : 0, computedCount: 1, cachedCount: 1 };
-  });
-  const chartRequest: ForecastCurveRequest = { ...request, toUnix: fromUnix + 16 * 86400,
-    observationCutoff: fromUnix + 16 * 86400, atUnix: fromUnix + 17 * 86400,
+  { start: "2026-03-08T00:00:00Z", hours: 23 },
+  { start: "2026-11-01T00:00:00Z", hours: 25 },
+])("uses DST-safe New York presentation days ($hours hours), never local midnights as API cohorts", async ({ start, hours }) => {
+  applyInterfaceSettings({ timezone: "America/New_York" });
+  const first = Date.parse(start) / 1000;
+  const observed = [0, 1, 2].map((offset) => ({ ...days[0]!, day: `day-${offset}`, dayStartUnix: first + offset * 86400 }));
+  const input = { ...request, fromUnix: first, toUnix: first + 3 * 86400, observationCutoff: first + 4 * 86400, atUnix: first + 5 * 86400,
     daily: observed.map((point) => ({ dayStartUnix: point.dayStartUnix, tpCount: point.tpCount, slCount: point.slCount })) };
-  const fetch = vi.fn<typeof globalThis.fetch>(() => Promise.resolve(new Response(JSON.stringify(forecastFixture(chartRequest)))));
-  vi.stubGlobal("fetch", fetch);
-  render(<AnalyticsForecastChart request={chartRequest} days={observed} />);
-  const curve = await screen.findByTestId("forecast-model-curve");
-  const chart = screen.getByRole("img", { name: "Дневное матожидание и вероятностная модель" });
+  const fetch = mock(forecastFixture(input));
+  render(<AnalyticsForecastChart request={input} days={observed} />);
+  await screen.findByTestId("forecast-model-curve");
+  const chart = screen.getByRole("img");
   const grid = within(chart).getByTestId("daily-calendar-grid");
   const lines = [...grid.querySelectorAll("line")];
-  const expectedX = (offset: number) => 66 + offset / 17 * 666;
-  expect(lines).toHaveLength(18);
-  expect(lines.map((line) => Number(line.getAttribute("data-day-start-unix")))).toEqual(Array.from({ length: 18 }, (_, index) => fromUnix + index * 86400));
-  expect(lines.map((line) => Number(line.getAttribute("x1")))).toEqual(Array.from({ length: 18 }, (_, index) => expectedX(index)));
-  for (const line of lines) {
-    expect(line.getAttribute("x2")).toBe(line.getAttribute("x1"));
-    expect(line).toHaveAttribute("y1", "30"); expect(line).toHaveAttribute("y2", "244");
-  }
-  const circles = [...chart.querySelectorAll("circle")];
-  const finite = observed.filter((point) => point.riskExpectancy !== null);
-  expect(circles).toHaveLength(finite.length);
-  finite.forEach((point, index) => {
-    const line = grid.querySelector(`line[data-day-start-unix="${point.dayStartUnix}"]`)!;
-    expect(circles[index]!.getAttribute("cx")).toBe(line.getAttribute("x1"));
-  });
-  expect(circles.some((circle) => circle.getAttribute("cx") === lines[5]!.getAttribute("x1"))).toBe(false);
-  expect(chart.querySelectorAll('text[y="273"]')).toHaveLength(offsets.length > 7 ? 6 : offsets.length);
-  expect(grid.compareDocumentPosition(chart.querySelector("polyline")!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
-  const geometry = [curve.getAttribute("points"), ...lines.map((line) => line.getAttribute("x1")), ...circles.map((circle) => circle.getAttribute("cx"))];
-  act(() => { applyInterfaceSettings({ timezone: "Pacific/Auckland" }); });
-  expect([curve.getAttribute("points"), ...[...grid.querySelectorAll("line")].map((line) => line.getAttribute("x1")), ...[...chart.querySelectorAll("circle")].map((circle) => circle.getAttribute("cx"))]).toEqual(geometry);
-  expect(JSON.parse(fetch.mock.calls[0]![1]!.body as string)).toEqual(chartRequest);
-  expect(fetch).toHaveBeenCalledTimes(1);
+  const boundaries = lines.map((line) => Number(line.getAttribute("data-day-start-unix")));
+  expect(boundaries).toEqual(observed.map((point) => zonedDayStart(point.dayStartUnix)));
+  expect((boundaries[2]! - boundaries[1]!) / 3600).toBe(hours);
+  observedCircles(chart).forEach((circle, index) => expect(circle.getAttribute("cx")).toBe(lines[index]!.getAttribute("x1")));
+  expect(JSON.parse(fetch.mock.calls[0]![1]!.body as string)).toEqual(input);
+  expect(input.daily.every((point) => point.dayStartUnix % 86400 === 0)).toBe(true);
+  expect(boundaries.some((day) => day % 86400 !== 0)).toBe(true);
 });
 
-it("keeps a long future grid bounded with a daily SVG tile instead of truncating days or adding observations", async () => {
-  const chartRequest = { ...request, atUnix: fromUnix + 4000 * 86400 };
-  const fetch = vi.fn<typeof globalThis.fetch>(() => Promise.resolve(new Response(JSON.stringify(forecastFixture(chartRequest)))));
-  vi.stubGlobal("fetch", fetch);
-  render(<AnalyticsForecastChart request={chartRequest} days={days} />);
-  await screen.findByTestId("forecast-model-curve");
-  const chart = screen.getByRole("img", { name: "Дневное матожидание и вероятностная модель" });
-  const grid = within(chart).getByTestId("daily-calendar-grid");
-  expect(grid.querySelectorAll("line")).toHaveLength(0);
-  const tile = grid.querySelector("pattern")!;
-  expect(tile).toHaveAttribute("patternUnits", "userSpaceOnUse");
-  expect(tile).toHaveAttribute("x", "66");
-  expect(Number(tile.getAttribute("width"))).toBeCloseTo(666 / 4000, 12);
-  expect(tile.getAttribute("viewBox")).toBe(`0 0 ${tile.getAttribute("width")} 214`);
-  expect(grid.querySelector("rect")).toHaveAttribute("fill", `url(#${tile.id})`);
-  expect(grid.querySelector("rect")).toHaveAttribute("width", "666");
-  expect(grid.querySelectorAll("*").length).toBeLessThan(6);
-  expect(chart.querySelectorAll("circle")).toHaveLength(days.length);
-  expect(JSON.parse(fetch.mock.calls[0]![1]!.body as string)).toEqual(chartRequest);
-  expect(fetch).toHaveBeenCalledTimes(1);
-});
-
-it("resolves auto to the browser timezone for calendar labels", async () => {
-  mockBrowserTimezone();
-  applyInterfaceSettings(DEFAULT_INTERFACE_SETTINGS);
-  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(forecastFixture(request))))));
+it("preserves unavailable/null model gaps without zero substitution or a bridge, and does not label a missing endpoint", async () => {
+  const response = forecastFixture(request);
+  response.curve[1]!.forecastR = null; response.blendCurve![1]!.decisionR = null;
+  mock(withDisplayCurve(request, response));
   render(<AnalyticsForecastChart request={request} days={days} />);
-  await screen.findByTestId("forecast-model-curve");
-  const chart = screen.getByRole("img", { name: "Дневное матожидание и вероятностная модель" });
-  expect(chart).toHaveTextContent("Дата исходного сигнала (Asia/Tokyo)");
-  expect(screen.getByText(/Cutoff C:/)).toHaveTextContent("Cutoff C: 03.01.2026, 09:30:00 (Asia/Tokyo)");
-  expect(within(chart).getByText("01.01.2026", { selector: "text" })).toBeInTheDocument();
+  await screen.findByTestId("forecast-endpoint-label");
+  expect(screen.queryByTestId("forecast-model-curve")).not.toBeInTheDocument();
+  expect(screen.getAllByTestId("forecast-model-point")).toHaveLength(2);
+  expect(screen.queryByTestId("forecast-blend-curve")).not.toBeInTheDocument();
+  expect(screen.getAllByTestId("forecast-blend-point")).toHaveLength(2);
+  cleanup();
+  const unavailable = forecastFixture(request);
+  unavailable.estimate = { status: "unavailable", reason: "no_closed_outcomes" };
+  unavailable.meanR = null; unavailable.forecastR = null; unavailable.decisionR = null;
+  unavailable.curve.forEach((point) => { point.forecastR = null; });
+  unavailable.blendCurve!.forEach((point) => { point.decisionR = null; });
+  unavailable.flatFuture.forecastR = null; unavailable.flatFuture.decisionR = null;
+  mock(withDisplayCurve(request, unavailable));
+  render(<AnalyticsForecastChart request={request} days={days} />);
+  await screen.findByText(/Прогноз недоступен: нет наблюдавшихся/);
+  expect(screen.queryByTestId("forecast-endpoint-label")).not.toBeInTheDocument();
+  expect(screen.queryByTestId("forecast-model-point")).not.toBeInTheDocument();
 });
 
-it("publishes observations and model together without dropping the previous curve during same-scope progress", async () => {
-  const nextDays = [...days, { ...days[0]!, day: "2026-01-03", dayStartUnix: fromUnix + 2 * 86400 }];
+it("retains the accepted complete display while a same-scope iteration fits, and observed sum does not refetch", async () => {
+  const nextDays = [...days, { ...days[0]!, day: "next", dayStartUnix: fromUnix + 5 * 86400 }];
   const nextRequest = { ...request, daily: nextDays.map((day) => ({ dayStartUnix: day.dayStartUnix, tpCount: day.tpCount, slCount: day.slCount })) };
   let finish: ((response: Response) => void) | undefined;
-  const fetch = vi.fn<typeof globalThis.fetch>()
-    .mockResolvedValueOnce(new Response(JSON.stringify(forecastFixture(request))))
+  const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValueOnce(new Response(JSON.stringify(forecastFixture(request))))
     .mockImplementationOnce(() => new Promise<Response>((resolve) => { finish = resolve; }));
   vi.stubGlobal("fetch", fetch);
   const view = render(<AnalyticsForecastChart retainWhileLoading request={request} days={days} />);
   const curve = await screen.findByTestId("forecast-model-curve");
-  const chart = screen.getByRole("img", { name: "Дневное матожидание и вероятностная модель" });
-  const before = chart.innerHTML;
+  const chart = screen.getByRole("img"); const before = chart.innerHTML;
   view.rerender(<AnalyticsForecastChart retainWhileLoading request={nextRequest} days={nextDays} />);
   await waitFor(() => expect(finish).toBeDefined());
-  expect(screen.getByTestId("forecast-model-curve")).toBe(curve);
-  expect(chart.innerHTML).toBe(before);
-  expect(screen.getByText(/Показана предыдущая завершённая итерация/)).toBeInTheDocument();
-  await act(async () => { finish!(new Response(JSON.stringify(forecastFixture(nextRequest)))); await Promise.resolve(); });
-  await waitFor(() => expect(chart.querySelectorAll("circle")).toHaveLength(3));
-  expect(screen.getByTestId("forecast-model-curve")).toBe(curve);
-  expect(screen.queryByText(/Показана предыдущая завершённая итерация/)).not.toBeInTheDocument();
+  expect(screen.getByTestId("forecast-model-curve")).toBe(curve); expect(chart.innerHTML).toBe(before);
+  act(() => { finish!(new Response(JSON.stringify(forecastFixture(nextRequest)))); });
+  await waitFor(() => expect(observedCircles(chart)).toHaveLength(4));
+  fireEvent.change(screen.getByLabelText("Фактический ряд по дням"), { target: { value: "sum" } });
+  expect(fetch).toHaveBeenCalledTimes(2);
+});
+
+it("keeps the legacy long UTC grid bounded with a tile", () => {
+  render(<svg><DailyCalendarGrid fromUnix={0} toUnix={4000 * 86400} x={(at) => at / 86400} top={0} bottom={100} /></svg>);
+  const grid = screen.getByTestId("daily-calendar-grid");
+  expect(grid.querySelectorAll("line")).toHaveLength(0); expect(grid.querySelector("pattern")).toHaveAttribute("width", "1");
+  expect(grid.querySelectorAll("*").length).toBeLessThan(6);
 });

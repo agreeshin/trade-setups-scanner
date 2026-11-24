@@ -35,6 +35,8 @@ export interface ForecastCurveResponse {
   forecastR: number | null;
   decisionR: number | null;
   curve: { atUnix: number; forecastR: number | null }[];
+  /** Presentation-only cohort coordinates. atUnix/values remain canonical UTC. */
+  displayCurve?: { signalDayUnix: number; atUnix: number; forecastR: number | null; decisionR: number | null }[];
   blendCurve?: { atUnix: number; decisionR: number | null }[];
   flatFuture: { fromUnix: number; toUnix: number; forecastR: number | null; decisionR: number | null };
   provenance: { kind: "supplied_closed_outcomes"; availability: "asserted_at_cutoff" };
@@ -70,6 +72,13 @@ function validResponse(value: unknown, request: ForecastCurveRequest): value is 
     && response.provenance?.kind === "supplied_closed_outcomes" && response.provenance.availability === "asserted_at_cutoff"
     && Array.isArray(response.curve) && response.curve.length <= 3662
     && response.curve.every((point, index, all) => point !== null && Number.isSafeInteger(point.atUnix) && point.atUnix <= request.observationCutoff && metric(point.forecastR) && (index === 0 || point.atUnix >= all[index - 1]!.atUnix))
+    && (response.displayCurve === undefined || Array.isArray(response.displayCurve) && response.displayCurve.length === response.curve.length
+      && response.displayCurve.length === request.daily.length && response.displayCurve.every((point, index) => point !== null
+        && point.signalDayUnix === request.daily[index]!.dayStartUnix && point.atUnix === response.curve![index]!.atUnix
+        && point.forecastR === response.curve![index]!.forecastR && metric(point.decisionR)
+        && point.decisionR === (request.trendMode === "mean" ? response.meanR : request.trendMode === "forecast" ? point.forecastR : response.blendCurve?.[index]?.decisionR))
+      && (response.displayCurve.length === 0 || response.displayCurve.at(-1)!.atUnix === request.observationCutoff
+        && response.displayCurve.at(-1)!.forecastR === response.forecastR && response.displayCurve.at(-1)!.decisionR === response.decisionR))
     && (response.blendCurve === undefined || (Array.isArray(response.blendCurve) && response.blendCurve.length <= 3662
       && response.blendCurve.every((point, index, all) => point !== null && Number.isSafeInteger(point.atUnix) && point.atUnix <= request.observationCutoff && metric(point.decisionR) && (index === 0 || point.atUnix >= all[index - 1]!.atUnix))))
     // A blend scalar is not evidence of its chart. Never show only generic F

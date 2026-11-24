@@ -1,10 +1,23 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { allAnalyticsRange, monthAnalyticsRange, normalizeAnalyticsTimeRange, requireAnalyticsRange } from "./analytics-settings";
+import { allAnalyticsRange, monthAnalyticsRange, normalizeAnalyticsTimeRange, requireAnalyticsRange, parseAnalyticsAxis, SHORT_MATRIX_LEVELS, LONG_TP_LEVELS, LONG_SL_LEVELS } from "./analytics-settings";
 import { applyInterfaceSettings, parseZonedDateTimeInput, zonedDateTimeInput } from "./datetime-format";
 import { fetchAnalyticsSetups, fetchMatrixCell, fetchMatrixCells, fetchMatrixGrid, fetchTradeRow, fetchTradeRows } from "./analytics-api";
 
 afterEach(() => { vi.unstubAllGlobals(); applyInterfaceSettings({ timezone: "auto" }); });
 const unix = (iso: string) => Date.parse(iso) / 1000;
+
+it("validates bounded independent TP/SL axes, rejects numeric duplicates and preserves order/defaults", () => {
+  expect(parseAnalyticsAxis(" 8, 2.5, .25, 1e-6 ", "TP")).toEqual([8, 2.5, 0.25, 0.000001]);
+  expect(() => parseAnalyticsAxis("1,1.0", "TP")).toThrow("повторяющиеся");
+  expect(() => parseAnalyticsAxis(".25,2.5e-1", "SL")).toThrow("повторяющиеся");
+  expect(SHORT_MATRIX_LEVELS).toEqual(Array.from({ length: 14 }, (_, index) => 4 + index * 2));
+  expect(LONG_TP_LEVELS).toHaveLength(22); expect(LONG_SL_LEVELS).toHaveLength(25);
+  for (const raw of ["", " ", ",", "4,", "4,,6", "NaN", "Infinity", "-1", "0", "100.1", "0.0000009", "0x10", "1e999", "4;6", Array.from({ length: 65 }, (_, index) => index + 1).join(","), "1".repeat(4097)]) {
+    expect(() => parseAnalyticsAxis(raw, "SL"), raw).toThrow("SL:");
+  }
+  const max = Array.from({ length: 64 }, (_, index) => index + 1).join(",");
+  expect(parseAnalyticsAxis(max, "TP").length * parseAnalyticsAxis(max, "SL").length).toBe(4096);
+});
 
 it.each(["America/New_York", "Pacific/Auckland", "Asia/Kathmandu"])("migrates legacy UTC days and months without mutating their source in %s", (timezone) => {
   applyInterfaceSettings({ timezone });

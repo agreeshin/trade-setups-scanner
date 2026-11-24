@@ -53,7 +53,7 @@ export function AnalyticsTrendControls({ mode, bend, onModeChange, onBendChange,
       </Field>}
     </div>
     {showRecipe && probability && <Collapsible className="grid gap-2">
-      <CollapsibleTrigger type="button" className="text-sm">Расширенные настройки модели</CollapsibleTrigger>
+      <CollapsibleTrigger type="button" className="group text-sm">{scope === "analytics" && <svg aria-hidden="true" data-testid="model-disclosure-triangle" viewBox="0 0 12 12" className="size-3 shrink-0 fill-current transition-transform group-data-[state=open]:rotate-90"><path d="M 3 1 L 10 6 L 3 11 Z" /></svg>}Расширенные настройки модели</CollapsibleTrigger>
       <CollapsibleContent className="grid gap-3 sm:grid-cols-2">
         <Field label="Сила prior κ" hint="Конечное число больше 0. Сила регуляризации, не число реально закрытых сделок.">
           {(control) => <Input {...control} type="number" min={0} step="any" value={probability.kappa} onChange={(event) => onForecastChange?.({ ...probability, kappa: event.target.value })} />}

@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { fetchForecastCurve, type ForecastCurveRequest } from "./forecast-api";
 import { fetchDailyTrend, fetchMatrixCell, fetchMatrixCells, fetchMatrixGrid, type TrendProjectionRequest } from "./analytics-api";
-import { forecastFixture } from "../../test/forecast-fixture";
+import { forecastFixture, withDisplayCurve } from "../../test/forecast-fixture";
 
 afterEach(() => vi.unstubAllGlobals());
 const day = Date.parse("2026-01-01T00:00:00Z") / 1000;
@@ -39,9 +39,22 @@ it("accepts nullable historical prefixes and gaps while retaining an available s
   const response = forecastFixture(request);
   response.curve[0]!.forecastR = null;
   response.blendCurve![0]!.decisionR = null;
+  withDisplayCurve(request, response);
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(response))));
   expect(await fetchForecastCurve(request, new AbortController().signal)).toMatchObject({ forecastR: 0.4, decisionR: 0.52,
-    curve: [{ atUnix: day, forecastR: null }, { atUnix: day + 86400 * 2, forecastR: 0.15 }, { atUnix: request.observationCutoff, forecastR: 0.4 }] });
+    curve: [{ atUnix: day + 86400, forecastR: null }, { atUnix: request.observationCutoff, forecastR: 0.4 }] });
+});
+
+it.each(["day", "instant", "value", "objective", "length", "scalar"])("rejects an incompatible additive display projection %s without rewriting canonical input", async (change) => {
+  const response = forecastFixture(request);
+  if (change === "day") response.displayCurve![0]!.signalDayUnix += 3600;
+  if (change === "instant") response.displayCurve![0]!.atUnix += 1;
+  if (change === "value") response.displayCurve![0]!.forecastR = 0;
+  if (change === "objective") response.displayCurve![0]!.decisionR = 0;
+  if (change === "length") response.displayCurve!.pop();
+  if (change === "scalar") { response.forecastR = 0.9; response.flatFuture.forecastR = 0.9; }
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(response))));
+  await expect(fetchForecastCurve(request, new AbortController().signal)).rejects.toThrow("несовместимую");
 });
 
 it.each(["missing", "lambda", "endpoint", "timestamp"])("rejects an available blend scalar with %s objective-specific graph data, not showing a generic F chart", async (change) => {
@@ -62,6 +75,7 @@ it("accepts all-null model curves as unavailable evidence, not as a broken respo
   response.curve = response.curve.map((point) => ({ ...point, forecastR: null }));
   response.blendCurve = response.blendCurve!.map((point) => ({ ...point, decisionR: null }));
   response.flatFuture.forecastR = null; response.flatFuture.decisionR = null;
+  withDisplayCurve(request, response);
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(response))));
   expect((await fetchForecastCurve(request, new AbortController().signal)).estimate).toEqual({ status: "unavailable", reason: "no_closed_outcomes" });
 });

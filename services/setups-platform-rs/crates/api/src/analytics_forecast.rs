@@ -123,12 +123,34 @@ pub(super) fn compute(request: ForecastRequest) -> Result<Value, String> {
     } else {
         None
     };
+    // Additive presentation coordinates: each prefix still has exactly its
+    // canonical UTC evaluation instant/value. The final F(C) belongs visually
+    // to the last included signal cohort, not to the clock/cutoff day.
+    let display_curve = model
+        .curve
+        .iter()
+        .zip(&request.daily)
+        .map(|(point, day)| {
+            let decision = decision_r(
+                request.trend_mode,
+                mean_r,
+                point.forecast_r,
+                request.trend_blend_lambda,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(
+                json!({"signalDayUnix": day.day_start_unix, "atUnix": point.at_unix,
+            "forecastR": point.forecast_r, "decisionR": decision}),
+            )
+        })
+        .collect::<Result<Vec<Value>, String>>()?;
     let mut response = json!({
         "forecast": request.forecast, "trendMode": request.trend_mode, "q": request.q,
         "fromUnix": request.from_unix, "toUnix": request.to_unix,
         "observationCutoff": request.observation_cutoff, "retrospective": true,
         "estimate": estimate, "meanR": mean_r, "forecastR": forecast_r, "decisionR": decision,
         "curve": model.curve,
+        "displayCurve": display_curve,
         "flatFuture": {"fromUnix": request.observation_cutoff, "toUnix": at,
             "forecastR": forecast_r, "decisionR": decision},
         "provenance": {"kind": "supplied_closed_outcomes", "availability": "asserted_at_cutoff"}
@@ -204,6 +226,48 @@ mod tests {
         assert_ne!(actual["decisionR"], actual["forecastR"]);
         assert_eq!(actual["blendCurve"].as_array().unwrap().len(), 2);
         assert_eq!(actual["retrospective"], true);
+    }
+    #[test]
+    fn display_projection_ends_on_last_signal_day_without_changing_canonical_model() {
+        for mode in [TrendMode::Mean, TrendMode::Forecast, TrendMode::Blend] {
+            let mut req = request();
+            req.trend_mode = mode;
+            req.to_unix = 259200;
+            req.observation_cutoff = 864000;
+            req.at_unix = Some(950400);
+            req.daily.insert(
+                0,
+                ProbabilityDay {
+                    day_start_unix: 0,
+                    tp_count: 0,
+                    sl_count: 0,
+                },
+            );
+            req.daily[1].day_start_unix = 86400;
+            req.daily[2].day_start_unix = 172800;
+            let core = probability_curve(&ProbabilityCurveRequest {
+                recipe: req.forecast,
+                q: req.q,
+                observation_cutoff: req.observation_cutoff,
+                daily: req.daily.clone(),
+            })
+            .unwrap();
+            let actual = compute(req).unwrap();
+            assert_eq!(actual["curve"], json!(core.curve));
+            assert_eq!(actual["estimate"], json!(core.estimate));
+            let display = actual["displayCurve"].as_array().unwrap();
+            assert_eq!(display.len(), 3);
+            assert_eq!(display.last().unwrap()["signalDayUnix"], 172800);
+            assert_eq!(display.last().unwrap()["atUnix"], 864000);
+            assert_eq!(display.last().unwrap()["forecastR"], actual["forecastR"]);
+            assert_eq!(display.last().unwrap()["decisionR"], actual["decisionR"]);
+            assert!(display[0]["forecastR"].is_null());
+            if mode != TrendMode::Mean {
+                assert!(display[0]["decisionR"].is_null());
+            }
+            assert_eq!(actual["flatFuture"]["fromUnix"], 864000);
+            assert_eq!(actual["flatFuture"]["toUnix"], 950400);
+        }
     }
     #[test]
     fn graph_rejects_bad_period_future_cohorts_and_unknown_contract_fields() {

@@ -581,20 +581,47 @@ pub struct AnalyticsSetInfo {
     pub setup_count: i64,
     pub from_unix: Option<i64>,
     pub to_unix: Option<i64>,
+    pub first_setup_at: Option<i64>,
+    pub last_setup_at: Option<i64>,
     pub created_at: String,
 }
 
 pub async fn list_analytics_sets(pool: &PgPool) -> Result<Vec<AnalyticsSetInfo>, DbError> {
     let batches = crate::runs::list_replay_batches(pool, 200).await?;
+    // Aggregate inside PostgreSQL for only the bounded selector page. Do not
+    // materialize child setup arrays or confuse replay bounds with signals.
+    let batch_extrema = sqlx::query(
+        "select r.batch_id, min((s.value->>'closeTimeUnix')::bigint) as first_setup_at, \
+         max((s.value->>'closeTimeUnix')::bigint) as last_setup_at from replay_runs r \
+         cross join lateral jsonb_array_elements(case when jsonb_typeof(r.setups) = 'array' \
+         then r.setups else '[]'::jsonb end) s(value) \
+         where r.batch_id = any($1) group by r.batch_id",
+    )
+    .bind(
+        batches
+            .iter()
+            .filter(|b| b.status == "done")
+            .map(|b| b.id as i32)
+            .collect::<Vec<_>>(),
+    )
+    .fetch_all(pool)
+    .await?;
     let standalone = sqlx::query(
-        "select id, name, exchange_code, category, symbol, algorithm_id, algorithm_version, params, \
+        "select r.id, r.name, r.exchange_code, r.category, r.symbol, r.algorithm_id, r.algorithm_version, r.params, \
+         r.from_ts, r.to_ts, r.created_at, e.* from (select id, name, exchange_code, category, symbol, algorithm_id, algorithm_version, params, \
          from_ts, to_ts, created_at, setups from replay_runs where batch_id is null \
-         and status = 'done' order by id desc limit 200",
+         and status = 'done' order by id desc limit 200) r cross join lateral \
+         (select count(*)::bigint as setup_count, min((s.value->>'closeTimeUnix')::bigint) as first_setup_at, \
+         max((s.value->>'closeTimeUnix')::bigint) as last_setup_at from jsonb_array_elements( \
+         case when jsonb_typeof(r.setups) = 'array' then r.setups else '[]'::jsonb end) s(value)) e",
     )
     .fetch_all(pool)
     .await?;
     let mut sets: Vec<AnalyticsSetInfo> = Vec::new();
     for batch in batches.iter().filter(|batch| batch.status == "done") {
+        let extrema = batch_extrema
+            .iter()
+            .find(|row| row.get::<i32, _>("batch_id") == batch.id as i32);
         sets.push(AnalyticsSetInfo {
             set_id: format!("batch-{}", batch.id),
             kind: SetKind::Batch,
@@ -609,14 +636,21 @@ pub async fn list_analytics_sets(pool: &PgPool) -> Result<Vec<AnalyticsSetInfo>,
             setup_count: batch.setup_count,
             from_unix: Some(batch.from_ts.timestamp()),
             to_unix: Some(batch.to_ts.timestamp()),
+            first_setup_at: extrema
+                .map(|row| row.try_get("first_setup_at"))
+                .transpose()?
+                .flatten(),
+            last_setup_at: extrema
+                .map(|row| row.try_get("last_setup_at"))
+                .transpose()?
+                .flatten(),
             created_at: batch
                 .created_at
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         });
     }
     for row in &standalone {
-        let setups: Value = row.try_get("setups")?;
-        let setup_count = setups.as_array().map_or(0, Vec::len) as i64;
+        let setup_count = row.try_get("setup_count")?;
         let id: i32 = row.try_get("id")?;
         let algorithm_version: Option<String> = row.try_get("algorithm_version")?;
         let from_ts: Option<DateTime<Utc>> = row.try_get("from_ts")?;
@@ -639,6 +673,8 @@ pub async fn list_analytics_sets(pool: &PgPool) -> Result<Vec<AnalyticsSetInfo>,
             setup_count,
             from_unix: from_ts.map(|value| value.timestamp()),
             to_unix: to_ts.map(|value| value.timestamp()),
+            first_setup_at: row.try_get("first_setup_at")?,
+            last_setup_at: row.try_get("last_setup_at")?,
             created_at: created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         });
     }

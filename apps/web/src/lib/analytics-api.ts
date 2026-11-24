@@ -82,6 +82,9 @@ export interface AnalyticsSet {
   category: string;
   symbol: string | null;
   setupCount: number;
+  /** Actual persisted signal-close extrema; never replay execution bounds. */
+  firstSetupAt?: number | null;
+  lastSetupAt?: number | null;
   fromUnix: number | null;
   toUnix: number | null;
   createdAt: string;

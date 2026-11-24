@@ -4,9 +4,9 @@ import userEvent from "@testing-library/user-event";
 import { AnalyticsPage } from "./analytics-page";
 import { SharedForecastControls } from "../components/shared-forecast-controls";
 import type { MatrixCellRef, TradeRow, TrendInput, TrendSummary, TrendProjectionRequest } from "../lib/analytics-api";
-import { applyInterfaceSettings } from "../lib/datetime-format";
+import { applyInterfaceSettings, zonedDayStart } from "../lib/datetime-format";
 import type { ForecastCurveRequest, ForecastCurveResponse } from "../lib/forecast-api";
-import { forecastFixture } from "../../test/forecast-fixture";
+import { forecastFixture, withDisplayCurve } from "../../test/forecast-fixture";
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); applyInterfaceSettings({ timezone: "auto" }); });
 beforeEach(() => { applyInterfaceSettings({ timezone: "UTC" }); });
@@ -15,6 +15,7 @@ const setFixture = {
   setId: "run-12", kind: "run", numericId: 12, label: "#12 · Утренний прогон",
   algorithmId: "price_volume_spike", algorithmVersion: "1.1.1", params: { priceGrowthPct: "2.5", windowMinutes: 30, volumeMultiplier: "3" },
   exchange: "bybit", category: "linear", symbol: "BTCUSDT", setupCount: 42, fromUnix: 1_700_000_000, toUnix: 1_700_086_400, createdAt: "2024-01-15T00:00:00Z",
+  firstSetupAt: 1_700_000_060 as number | null, lastSetupAt: 1_700_003_660 as number | null,
 };
 
 const setupA = { exchange: "bybit", category: "linear", symbol: "BTCUSDT", openTimeUnix: 1_700_000_000, closeTimeUnix: 1_700_000_060, closePrice: "100" };
@@ -154,6 +155,128 @@ function stubFetch(options: StubOptions = {}) {
   }));
   return calls;
 }
+
+it("uses the exact former axis defaults/dimensions without a write-back migration", async () => {
+  const calls = stubFetch();
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  expect(screen.getAllByLabelText("Уровни TP, %").map((input) => (input as HTMLInputElement).value)).toEqual([shortLevels.join(", "), longTpLevels.join(", ")]);
+  expect(screen.getAllByLabelText("Уровни SL, %").map((input) => (input as HTMLInputElement).value)).toEqual([shortLevels.join(", "), longSlLevels.join(", ")]);
+  const tables = screen.getAllByRole("table", { hidden: true });
+  expect(within(tables[0]!).getAllByRole("row", { hidden: true })).toHaveLength(15);
+  expect(within(tables[0]!).getAllByRole("cell", { hidden: true })).toHaveLength(196);
+  expect(within(tables[1]!).getAllByRole("cell", { hidden: true })).toHaveLength(550);
+  expect(calls.some((call) => call.method === "PUT")).toBe(false);
+  fireEvent.blur(screen.getByLabelText("Разрыв кластера, ч"));
+  await waitFor(() => expect(calls.some((call) => call.method === "PUT")).toBe(true), { timeout: 3000 });
+  const saved = JSON.parse(calls.find((call) => call.method === "PUT")!.body!) as { sections: Record<string, Record<string, unknown>> };
+  expect(saved.sections["short-matrix"]).not.toHaveProperty("tpAxisInput");
+  expect(saved.sections["long-matrix"]).not.toHaveProperty("slAxisInput");
+});
+
+it("persists custom axes in entered order, renders that actual matrix shape regardless of response order, and preserves shared settings", async () => {
+  const cells = [8, 4, 6].flatMap((tp) => [2, 1].map((sl) => matrixCell(tp, sl, tp / sl))).reverse();
+  const calls = stubFetch({ shortBulk: cells, savedSettings: { trendMode: "mean", unrelated: { enabled: true }, sections: {
+    "short-matrix": { tpAxisInput: "8, 4, 6", slAxisInput: "2, 1", custom: "keep" }, "short-trades": { tpInput: "9", slInput: "3" },
+  } } });
+  render(<><AnalyticsPage /><SharedForecastControls /></>); await screen.findByText("#12 · Утренний прогон");
+  const panel = within(screen.getByRole("tabpanel"));
+  const table = panel.getByRole("table");
+  const rows = within(table).getAllByRole("row");
+  expect(within(rows[0]!).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual(["TP \\ SL", "2%", "1%"]);
+  expect(rows.slice(1).map((row) => row.firstElementChild?.textContent)).toEqual(["8%", "4%", "6%"]);
+  expect(within(table).getAllByRole("cell")).toHaveLength(6);
+  expect(panel.getByLabelText("TP, %")).toHaveValue("9"); expect(panel.getByLabelText("SL, %")).toHaveValue("3");
+  await userEvent.click(panel.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  await panel.findByText("Ячеек: 6 / 6");
+  const query = new URLSearchParams(calls.find((call) => call.path === "/v1/analytics/matrix-grid")!.search);
+  expect(query.get("tpPct")).toBe("8,4,6"); expect(query.get("slPct")).toBe("2,1");
+  expect(within(rows[1]!).getAllByRole("cell").map((cell) => cell.textContent)).toEqual(["4.00", "8.00"]);
+  fireEvent.change(panel.getByLabelText("Уровни TP, %"), { target: { value: "6, 8" } });
+  fireEvent.blur(panel.getByLabelText("Уровни TP, %"));
+  await waitFor(() => expect(calls.filter((call) => call.method === "PUT")).toHaveLength(1), { timeout: 3000 });
+  expect(calls.filter((call) => call.path === "/v1/analytics/matrix-grid")).toHaveLength(1);
+  const shared = within(screen.getByRole("region", { name: "Общий прогноз Analytics и Сетапов" }));
+  fireEvent.click(shared.getByRole("button", { name: "Прогноз" }));
+  await waitFor(() => expect(calls.filter((call) => call.method === "PUT")).toHaveLength(2), { timeout: 3000 });
+  const saved = JSON.parse(calls.filter((call) => call.method === "PUT").at(-1)!.body!) as unknown;
+  expect(saved).toMatchObject({ unrelated: { enabled: true }, trendMode: "forecast", sections: {
+    "short-matrix": { tpAxisInput: "6, 8", slAxisInput: "2, 1", custom: "keep" }, "short-trades": { tpInput: "9", slInput: "3" },
+  } });
+  expect(calls.some((call) => call.path === "/v1/analytics/setups" || call.path.includes("/trades"))).toBe(false);
+});
+
+it.each(["", "1,1.0", "4,", "0", "100.1", "Infinity", "0x10", Array.from({ length: 65 }, (_, index) => index + 1).join(","), null])("keeps an invalid persisted axis %s visible and suppresses requests", async (invalid) => {
+  const calls = stubFetch({ savedSettings: { sections: { "short-matrix": { tpAxisInput: invalid, slAxisInput: "1" } } } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  const panel = within(screen.getByRole("tabpanel"));
+  const input = panel.getByLabelText("Уровни TP, %");
+  expect(input).toHaveValue(invalid ?? "Некорректное сохранённое значение: null");
+  expect(input).toHaveAttribute("aria-invalid", "true");
+  expect(panel.getByRole("alert")).toHaveTextContent("TP:");
+  await userEvent.click(panel.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  expect(calls.some((call) => call.path === "/v1/analytics/matrix-grid")).toBe(false);
+});
+
+it("fences a pending matrix response after an axis-only edit and autoCalc refreshes only matrices", async () => {
+  let release: ((response: Response) => void) | undefined;
+  let attempts = 0;
+  const calls = stubFetch({ savedSettings: { autoCalc: true, sections: { "short-matrix": { tpAxisInput: "8", slAxisInput: "2" }, "long-matrix": { tpAxisInput: "1", slAxisInput: "1" } } },
+    shortBulk: [matrixCell(4, 2, 0.42)], interceptMatrixGrid: (direction) => direction === "short" && ++attempts === 1 ? new Promise<Response>((resolve) => { release = resolve; }) : undefined });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await waitFor(() => expect(release).toBeDefined());
+  const panel = within(screen.getByRole("tabpanel"));
+  fireEvent.change(panel.getByLabelText("Уровни TP, %"), { target: { value: "4" } });
+  fireEvent.blur(panel.getByLabelText("Уровни TP, %"));
+  act(() => { release!(new Response(JSON.stringify({ items: [matrixCell(8, 2, 9.99)], ...selectionMetrics }))); });
+  expect(panel.queryByText("9.99")).not.toBeInTheDocument();
+  expect(await panel.findByText("0.42", {}, { timeout: 3000 })).toBeVisible();
+  const short = calls.filter((call) => call.path === "/v1/analytics/matrix-grid" && new URLSearchParams(call.search).get("direction") === "short");
+  expect(short.map((call) => new URLSearchParams(call.search).get("tpPct"))).toEqual(["8", "4"]);
+  expect(calls.some((call) => call.path === "/v1/analytics/setups" || call.path.includes("/trades"))).toBe(false);
+});
+
+it("keeps accessible disclosure semantics, explicitly shows its triangle and centers heading/help groups", async () => {
+  stubFetch({ savedSettings: { trendMode: "forecast", forecast: probabilityRecipe } });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  for (const name of ["Матожидание и модель прогноза", "Прогноз матожидания", "Расчёт ячейки"]) {
+    expect(screen.getByRole("heading", { name }).parentElement).toHaveClass("items-center", "justify-center", "text-center");
+  }
+  const trigger = screen.getByRole("button", { name: "Расширенные настройки модели" });
+  expect(trigger).toHaveAttribute("aria-expanded", "false");
+  expect(within(trigger).getByTestId("model-disclosure-triangle")).toHaveAttribute("aria-hidden", "true");
+  expect(screen.queryByLabelText("Сила prior κ")).not.toBeInTheDocument();
+  trigger.focus(); await userEvent.keyboard("{Enter}");
+  expect(trigger).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByLabelText("Сила prior κ")).toBeVisible();
+  expect(document.getElementById(trigger.getAttribute("aria-controls")!)).toContainElement(screen.getByLabelText("Сила prior κ"));
+  await userEvent.keyboard(" "); expect(trigger).toHaveAttribute("aria-expanded", "false");
+});
+
+it.each([false, true])("formats actual first-last signal extrema (single=$single) without refetching or mutating exact ranges", async (single) => {
+  const first = Date.parse("2026-01-01T01:00:00Z") / 1000;
+  const last = single ? first : Date.parse("2026-01-02T01:00:00Z") / 1000;
+  const fromUnix = first - 60, toUnix = last + 60;
+  const calls = stubFetch({ sets: [{ ...setFixture, firstSetupAt: first, lastSetupAt: last }], savedSettings: { sections: { "short-matrix": { timeRange: { mode: "custom", fromUnix, toUnix } } } } });
+  applyInterfaceSettings({ timezone: "America/New_York" });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  const tag = screen.getByLabelText("Даты первого и последнего сетапа");
+  expect(tag).toHaveTextContent(single ? "31.12.2025 — 31.12.2025" : "31.12.2025 — 01.01.2026");
+  const before = calls.length;
+  act(() => { applyInterfaceSettings({ timezone: "Asia/Kathmandu", dateOrder: "ymd", dateSeparator: "/" }); });
+  expect(tag).toHaveTextContent(single ? "2026/01/01 — 2026/01/01" : "2026/01/01 — 2026/01/02");
+  expect(calls).toHaveLength(before);
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[0]!);
+  const query = new URLSearchParams(calls.find((call) => call.path === "/v1/analytics/matrix-grid")!.search);
+  expect(query.get("fromUnix")).toBe(String(fromUnix)); expect(query.get("toUnix")).toBe(String(toUnix));
+  expect(calls.filter((call) => call.path === "/v1/analytics/sets")).toHaveLength(1);
+});
+
+it("does not invent first/last dates for an empty set despite nonempty execution bounds", async () => {
+  const calls = stubFetch({ sets: [{ ...setFixture, setupCount: 0, firstSetupAt: null, lastSetupAt: null }] });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  expect(screen.getByLabelText("Даты первого и последнего сетапа")).toHaveTextContent("Даты сетапов: —");
+  expect(calls.filter((call) => call.path === "/v1/analytics/sets")).toHaveLength(1);
+});
 
 it("shares exact partial-day minute bounds across matrix, cell and forecast, includes start and excludes end without hidden calculation", async () => {
   applyInterfaceSettings({ timezone: "America/New_York", time24: false });
@@ -750,6 +873,30 @@ function utcChartOptions(rows: TradeRow[]): StubOptions {
 }
 
 it.each([
+  { start: "2026-03-08T00:00:00Z", hours: 23 },
+  { start: "2026-11-01T00:00:00Z", hours: 25 },
+])("projects the trend chart onto $hours-hour New York display days without changing UTC solver inputs", async ({ start, hours }) => {
+  applyInterfaceSettings({ timezone: "America/New_York" });
+  const from = Date.parse(start) / 1000;
+  const rows = [0, 1, 2].map((offset) => utcTrade(new Date((from + offset * 86400 + 3600) * 1000).toISOString(), offset % 2 === 0 ? 1 : -1, offset));
+  const calls = stubFetch({ tradeRows: rows, sets: [{ ...setFixture, fromUnix: from, toUnix: from + 3 * 86400 }] });
+  render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
+  await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
+  await screen.findByTestId("trend-curve");
+  const chart = screen.getByRole("img");
+  const lines = [...within(chart).getByTestId("daily-calendar-grid").querySelectorAll("line")];
+  const boundaries = lines.map((line) => Number(line.getAttribute("data-day-start-unix")));
+  expect((boundaries[2]! - boundaries[1]!) / 3600).toBe(hours);
+  [...chart.querySelectorAll("circle")].forEach((circle, index) => expect(circle.getAttribute("cx")).toBe(lines[index]!.getAttribute("x1")));
+  const request = JSON.parse(calls.find((call) => call.path === "/v1/analytics/trend")!.body!) as { points: TrendInput[] };
+  expect(request.points.map((point) => point.day)).toEqual([0, 1, 2].map((offset) => from / 86400 + offset));
+  const count = calls.length;
+  act(() => { applyInterfaceSettings({ timezone: "Asia/Kathmandu" }); });
+  expect(calls).toHaveLength(count);
+  expect(boundaries).not.toEqual([...within(chart).getByTestId("daily-calendar-grid").querySelectorAll("line")].map((line) => Number(line.getAttribute("data-day-start-unix"))));
+});
+
+it.each([
   { timezone: "America/New_York", dates: ["31.12.2025", "03.01.2026", "09.01.2026"] },
   { timezone: "Pacific/Auckland", dates: ["01.01.2026", "04.01.2026", "10.01.2026"] },
 ])("maps unchanged UTC buckets to the configured calendar, not the browser zone ($timezone)", async ({ timezone, dates }) => {
@@ -773,9 +920,9 @@ it.each([
     `${dates[1]} (${timezone}): -1.00R, закрыто 1, TP 0, SL 1, из кеша 1/1`,
     `${dates[2]} (${timezone}): +2.00R, закрыто 1, TP 1, SL 0, из кеша 1/1`,
   ]);
-  expect([...chart.querySelectorAll('text[y="254"]')].map((label) => label.textContent)).toEqual(timezone === "America/New_York"
-    ? ["31.12.2025", "02.01.2026", "03.01.2026", "09.01.2026"]
-    : ["01.01.2026", "03.01.2026", "04.01.2026", "10.01.2026"]);
+  expect([...chart.querySelectorAll('text[y="254"]')].map((label) => label.firstChild?.textContent)).toEqual(timezone === "America/New_York"
+    ? ["31.12", "02.01", "03.01", "09.01"]
+    : ["01.01", "03.01", "04.01", "10.01"]);
   expect(chart.querySelector('polyline:not([data-testid])')?.getAttribute("points")?.split(" ")).toHaveLength(2); // Null day breaks the observed series, not the fitted curve.
   expect(await screen.findByLabelText("Начало тренда: +0.59R")).toHaveTextContent("+0.59R");
   expect(screen.getByLabelText("Конец тренда: +1.38R")).toHaveTextContent("+1.38R");
@@ -830,7 +977,7 @@ it.each([
   const grid = within(chart).getByTestId("daily-calendar-grid");
   const lines = [...grid.querySelectorAll("line")];
   expect(lines).toHaveLength(16);
-  expect(lines.map((line) => Number(line.getAttribute("data-day-start-unix")))).toEqual(Array.from({ length: 16 }, (_, offset) => first + offset * 86400));
+  expect(lines.map((line) => Number(line.getAttribute("data-day-start-unix")))).toEqual(Array.from({ length: 16 }, (_, offset) => zonedDayStart(first + offset * 86400)));
   expect(lines.map((line) => Number(line.getAttribute("x1")))).toEqual(Array.from({ length: 16 }, (_, offset) => 64 + offset / 15 * 672));
   for (const line of lines) {
     expect(line.getAttribute("x2")).toBe(line.getAttribute("x1"));
@@ -840,7 +987,7 @@ it.each([
   const closed = rows.filter((row) => row.riskReturn !== null);
   expect(circles).toHaveLength(closed.length);
   closed.forEach((row, index) => {
-    const line = grid.querySelector(`line[data-day-start-unix="${row.setup.closeTimeUnix}"]`)!;
+    const line = grid.querySelector(`line[data-day-start-unix="${zonedDayStart(row.setup.closeTimeUnix)}"]`)!;
     expect(circles[index]!.getAttribute("cx")).toBe(line.getAttribute("x1"));
   });
   expect(circles.some((circle) => circle.getAttribute("cx") === lines[5]!.getAttribute("x1"))).toBe(false);
@@ -1040,9 +1187,11 @@ it("keeps one seconds cutoff across matrix and graph and renders separate backen
   expect(screen.getByLabelText("Метрика решения")).toHaveTextContent("0.52 R");
   const mean = screen.getByTestId("period-mean");
   expect(mean.getAttribute("y1")).toBe(mean.getAttribute("y2"));
-  const flat = screen.getByTestId("forecast-flat-future");
-  expect(flat.getAttribute("y1")).toBe(flat.getAttribute("y2"));
-  expect(flat.getAttribute("x1")).toBe(screen.getByTestId("forecast-cutoff").getAttribute("x1"));
+  expect(screen.queryByTestId("forecast-flat-future")).not.toBeInTheDocument();
+  const endpoint = screen.getByTestId("forecast-endpoint-label");
+  expect(endpoint).toHaveTextContent("0.52 R");
+  expect(endpoint).toHaveAttribute("data-canonical-at-unix", String(probabilityCutoff));
+  expect(endpoint).toHaveAttribute("data-signal-day-unix", "1768003200");
   expect(screen.getByTestId("forecast-blend-curve").getAttribute("points")).not.toBe(curve.getAttribute("points"));
   expect(curve.getAttribute("points")!.split(" ")).toHaveLength(3);
   expect(screen.getByText(/Ретроспективная модельная оценка, не causal\/OOS/)).toBeInTheDocument();
@@ -1080,6 +1229,7 @@ it("shows unavailable probability with its reason, never a prior-only zero or a 
     const body: ForecastCurveResponse = { ...forecastFixture(request), estimate: { status: "unavailable", reason: "no_weighted_evidence" },
       meanR: null, forecastR: null, decisionR: null, curve: [], flatFuture: { fromUnix: request.observationCutoff, toUnix: request.atUnix!, forecastR: null, decisionR: null } };
     delete body.blendCurve;
+    delete body.displayCurve;
     return Promise.resolve(new Response(JSON.stringify(body)));
   } });
   render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
@@ -1111,23 +1261,17 @@ it("splits nullable forecast and blend history without zero points or bridges an
   vi.spyOn(Date, "now").mockReturnValue(probabilityCutoff * 1000);
   stubFetch({ ...probabilityOptions(), forecast: (request) => {
     const response = forecastFixture(request);
-    response.curve = [
-      { atUnix: request.fromUnix, forecastR: null }, { atUnix: request.fromUnix + 86400, forecastR: -0.2 },
-      { atUnix: request.fromUnix + 2 * 86400, forecastR: 0.15 }, { atUnix: request.fromUnix + 3 * 86400, forecastR: null },
-      { atUnix: request.observationCutoff, forecastR: 0.4 },
-    ];
+    response.curve[1]!.forecastR = null;
     response.blendCurve = response.curve.map((point) => ({ atUnix: point.atUnix, decisionR: point.forecastR === null ? null : 0.52 }));
-    return Promise.resolve(new Response(JSON.stringify(response)));
+    return Promise.resolve(new Response(JSON.stringify(withDisplayCurve(request, response))));
   } });
   render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
-  const curve = await screen.findByTestId("forecast-model-curve");
-  expect(curve.getAttribute("points")!.split(" ")).toHaveLength(2);
-  expect(screen.getByTestId("forecast-blend-curve").getAttribute("points")!.split(" ")).toHaveLength(2);
-  const point = screen.getByTestId("forecast-model-point");
-  const flat = screen.getByTestId("forecast-flat-future");
-  expect(point.getAttribute("cx")).toBe(flat.getAttribute("x1"));
-  expect(point.getAttribute("cy")).toBe(flat.getAttribute("y1"));
+  await screen.findByTestId("forecast-endpoint-label");
+  expect(screen.queryByTestId("forecast-model-curve")).not.toBeInTheDocument();
+  expect(screen.getAllByTestId("forecast-model-point")).toHaveLength(2);
+  expect(screen.queryByTestId("forecast-blend-curve")).not.toBeInTheDocument();
+  expect(screen.getAllByTestId("forecast-blend-point")).toHaveLength(2);
   expect(screen.getByLabelText("Чистый прогноз модели")).toHaveTextContent("0.4 R");
   expect(screen.getByLabelText("Метрика решения")).toHaveTextContent("0.52 R");
   expect(screen.queryByText(/Модель недоступна:/)).not.toBeInTheDocument();
@@ -1142,7 +1286,7 @@ it("renders all-null historical prefixes as no closed evidence, never a zero for
     response.curve = response.curve.map((point) => ({ ...point, forecastR: null }));
     response.blendCurve = response.blendCurve!.map((point) => ({ ...point, decisionR: null }));
     response.flatFuture.forecastR = null; response.flatFuture.decisionR = null;
-    return Promise.resolve(new Response(JSON.stringify(response)));
+    return Promise.resolve(new Response(JSON.stringify(withDisplayCurve(request, response))));
   } });
   render(<AnalyticsPage />); await screen.findByText("#12 · Утренний прогон");
   await userEvent.click(screen.getAllByRole("button", { name: "Рассчитать" })[1]!);
