@@ -662,6 +662,85 @@ impl LiveFixture {
     async fn close(self) {self.server.abort();let _=self.server.await;self.db.close().await;}
 }
 
+async fn assert_cold_start_restores_live(maintenance_paused: bool) {
+    use futures::FutureExt;
+
+    let label = if maintenance_paused {
+        "paused_cold_start"
+    } else {
+        "running_cold_start"
+    };
+    let Some(mut f) = LiveFixture::new(label, false).await else {
+        return;
+    };
+    let control = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(f.db.pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        f.runtime
+            .tick_at_on_pools(&f.db.pool, &control, &f.client, &AtomicBool::new(false), f.now)
+            .await
+            .unwrap();
+        let before = f.durable().await;
+        assert_eq!(before.1.as_ref().unwrap().state["nextOpenUnix"], f.now);
+        let maintenance = continuous::maintenance::set_paused(&f.db.pool, "admin", maintenance_paused)
+            .await
+            .unwrap();
+        assert_eq!(maintenance.state, if maintenance_paused { "drained" } else { "running" });
+        let profiles = serde_json::to_value(continuous::active_adaptive_slots(&f.db.pool, "admin").await.unwrap()).unwrap();
+        let process: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p where owner_id='admin' and algorithm_id='price_volume_spike'")
+            .fetch_one(&f.db.pool).await.unwrap();
+
+        // Discard every detector/ring and restore only from the same durable
+        // profile identity, live origin and cursor, like an app-only restart.
+        f.runtime = AdaptiveLiveRuntime::new(AdaptiveRuntimeLimits::default());
+        let target = f.now + 120;
+        f.market.journal.lock().unwrap().available_through = Some(target);
+        f.runtime
+            .tick_at_on_pools(&f.db.pool, &control, &f.client, &AtomicBool::new(false), target + 5)
+            .await
+            .expect("cold startup must restore live even while research/automatic admission is closed");
+        let after = f.durable().await;
+        assert_eq!(after.1.as_ref().unwrap().generation_id, f.generation);
+        assert_eq!(after.1.as_ref().unwrap().state["nextOpenUnix"], target);
+        assert_eq!(&after.0[..before.0.len()], before.0.as_slice(), "previous signals are immutable");
+        assert_eq!(after.0.len(), before.0.len() + 2, "both new minutes publish without a new floor or duplicate signals");
+        f.runtime
+            .tick_at_on_pools(&f.db.pool, &control, &f.client, &AtomicBool::new(false), target + 6)
+            .await
+            .unwrap();
+        assert_eq!(f.durable().await, after, "repeated startup polling must be idempotent");
+        assert_eq!(serde_json::to_value(continuous::active_adaptive_slots(&f.db.pool, "admin").await.unwrap()).unwrap(), profiles);
+        let retained: Value = sqlx::query_scalar("select to_jsonb(p) from continuous_processes p where owner_id='admin' and algorithm_id='price_volume_spike'")
+            .fetch_one(&f.db.pool).await.unwrap();
+        assert_eq!(retained, process, "live restoration must not touch research intent/retries/deadlines/history");
+        let maintenance = continuous::maintenance::status(&f.db.pool, "admin").await.unwrap();
+        assert_eq!(maintenance.admission_paused, maintenance_paused);
+        assert_eq!(maintenance.active_chains, 0);
+        if maintenance_paused {
+            assert!(continuous::scheduler::claim_owner(&f.db.pool, "cold-start-research-probe").await.unwrap().is_none());
+            assert!(setups_db::study_actual::continuous::next(&f.db.pool).await.unwrap().is_none());
+        }
+    }).catch_unwind().await;
+    control.close().await;
+    f.close().await;
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
+async fn paused_drained_cold_start_restores_existing_live_cohort() {
+    assert_cold_start_restores_live(true).await;
+}
+
+#[tokio::test]
+async fn running_cold_start_restores_existing_live_cohort() {
+    assert_cold_start_restores_live(false).await;
+}
+
 #[tokio::test]
 async fn current_live_repair_older_than_retained_baseline_rebuilds_without_research_revalidation() {
     let Some(mut f)=LiveFixture::new("oldrepair",true).await else {return;};
