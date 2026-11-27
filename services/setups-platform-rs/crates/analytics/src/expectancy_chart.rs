@@ -36,6 +36,7 @@ pub const PROBABILITY_RENDER_VERSION: u32 = 2;
 /// New objective-specific overlays only, never the legacy asset scanner.
 pub const OBJECTIVE_RENDER_VERSION_V1: u32 = 3;
 pub const OBJECTIVE_RENDER_VERSION: u32 = 4;
+pub const CURRENT_RENDER_VERSION: u32 = 5;
 pub const WIDTH: u32 = 900;
 pub const HEIGHT: u32 = 320;
 pub const MAX_PNG_BYTES: usize = 256 * 1024;
@@ -66,6 +67,7 @@ const MARKER_RADIUS: f64 = 5.0;
 enum ProjectionPresentation {
     V1,
     V2,
+    Current,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -280,6 +282,27 @@ pub fn render_png_with_objective_v2(
         OBJECTIVE_RENDER_VERSION,
         ProjectionPresentation::V2,
     )?)
+}
+
+/// Current per-study asset, evaluated once at its fixed source/refresh cutoff.
+/// No per-signal extension/overlay. Old renderer versions remain byte-stable.
+pub fn render_png_current(
+    artifact: &ExpectancyArtifact,
+    objective: ExpectancyObjective,
+    observed: &[UtcDailyPoint],
+) -> Result<Vec<u8>, RenderError> {
+    rasterize_svg(&render_svg_current(artifact, objective, observed)?)
+}
+
+pub fn render_svg_current(
+    artifact: &ExpectancyArtifact,
+    objective: ExpectancyObjective,
+    observed: &[UtcDailyPoint],
+) -> Result<String, RenderError> {
+    let value=artifact.objective_series(objective).map_err(RenderError::InvalidArtifact)?
+        .decision_r.as_ref().copied().ok_or(RenderError::NoFiniteDays)?;
+    render_svg_objective_presentation(artifact,objective,artifact.source.provenance.observation_cutoff,
+        value,Some(observed),CURRENT_RENDER_VERSION,ProjectionPresentation::Current)
 }
 
 pub fn render_png_objective_observed_v2(
@@ -1434,7 +1457,7 @@ fn render_svg_projection(
         &mut svg,
         points,
         geometry,
-        presentation == ProjectionPresentation::V2,
+        presentation != ProjectionPresentation::V1,
     )?;
     // Retrospective prefixes come only from the shared evaluator. Null prefixes
     // are not zeroes and break segments; no timestamp/label-availability claim
@@ -1461,18 +1484,25 @@ fn render_svg_projection(
             segment_start = end + 1;
         }
     }
-    write!(
-        svg,
-        r#"<line id="observation-cutoff" data-at-unix="{}" x1="{cutoff_x:.3}" y1="{TOP}" x2="{cutoff_x:.3}" y2="{BOTTOM}" stroke="{AXIS}" stroke-dasharray="3 4"/><text id="cutoff-label" x="{:.3}" y="62" text-anchor="end" font-size="11" fill="{AXIS}">C</text><line id="frozen-forecast" data-value="{saved_forecast_r}" x1="{cutoff_x:.3}" y1="{marker_y:.3}" x2="{marker_x:.3}" y2="{marker_y:.3}" stroke="{TREND}" stroke-width="2" stroke-dasharray="4 4"/>"#,
-        cutoff,
-        cutoff_x.clamp(LEFT + 12.0, RIGHT)
-    )?;
+    if presentation==ProjectionPresentation::Current {
+        let at=chrono::DateTime::<chrono::Utc>::from_timestamp(cutoff,0).ok_or(RenderError::InvalidGeometry)?;
+        write!(svg,r#"<line id="observation-cutoff" data-at-unix="{cutoff}" x1="{cutoff_x:.3}" y1="{TOP}" x2="{cutoff_x:.3}" y2="{BOTTOM}" stroke="{AXIS}" stroke-dasharray="3 4"/><text id="cutoff-label" x="872" y="49" text-anchor="end" font-size="11" fill="{AXIS}">Cutoff {} UTC</text>"#,at.format("%d.%m.%Y %H:%M"))?;
+    } else {
+        write!(
+            svg,
+            r#"<line id="observation-cutoff" data-at-unix="{}" x1="{cutoff_x:.3}" y1="{TOP}" x2="{cutoff_x:.3}" y2="{BOTTOM}" stroke="{AXIS}" stroke-dasharray="3 4"/><text id="cutoff-label" x="{:.3}" y="62" text-anchor="end" font-size="11" fill="{AXIS}">C</text><line id="frozen-forecast" data-value="{saved_forecast_r}" x1="{cutoff_x:.3}" y1="{marker_y:.3}" x2="{marker_x:.3}" y2="{marker_y:.3}" stroke="{TREND}" stroke-width="2" stroke-dasharray="4 4"/>"#,
+            cutoff,
+            cutoff_x.clamp(LEFT + 12.0, RIGHT)
+        )?;
+    }
     write_daily_points(&mut svg, points, geometry)?;
-    write!(
-        svg,
-        r#"<circle id="raw-close-marker" data-at-unix="{raw_signal_at}" data-forecast-r="{saved_forecast_r}" cx="{marker_x:.3}" cy="{marker_y:.3}" r="5" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="2"/>"#
-    )?;
-    if presentation == ProjectionPresentation::V2 {
+    if presentation!=ProjectionPresentation::Current {
+        write!(svg,r#"<circle id="raw-close-marker" data-at-unix="{raw_signal_at}" data-forecast-r="{saved_forecast_r}" cx="{marker_x:.3}" cy="{marker_y:.3}" r="5" fill="{TREND}" stroke="{BACKGROUND}" stroke-width="2"/>"#)?;
+    }
+    if presentation != ProjectionPresentation::V1 {
+        let marker_x=if presentation==ProjectionPresentation::Current {
+            model.curve.iter().rev().find(|p|p.1.is_some()).map(|p|geometry.x(p.0)).unwrap_or(marker_x)
+        }else{marker_x};
         let label = projection_label_box(marker_x, marker_y);
         write!(
             svg,

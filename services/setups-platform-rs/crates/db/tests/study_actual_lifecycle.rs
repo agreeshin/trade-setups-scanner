@@ -386,7 +386,7 @@ async fn manual_original_archive_terminal_is_atomic_idempotent_owned_and_shared_
             "analytics":{"clusterEnabled":true,"setupMaturity":1.0,"timeShiftMinutes":2,"horizonMinutes":3}}});
         let id:i64=sqlx::query_scalar("insert into optimization_studies(algorithm_id,status,spec,progress,owner_id,execution_started_at) values('price_volume_spike','running',$1,'{}','admin',to_timestamp($2)) returning id")
             .bind(&spec).bind(START as f64+30.25).fetch_one(&pool).await.unwrap();
-        let mut archive=ManualArchive{observation_cutoff:172800,tp_pct:8.0,sl_pct:4.0,kernel:"original-manual-close-1".into(),minutes:vec![
+        let mut archive=ManualArchive{observation_cutoff:172800,tp_pct:8.0,sl_pct:4.0,kernel:"original-manual-close-1".into(),model_daily:None,minutes:vec![
             OriginalMinute{signal_close_unix:86340,sum_r:2.0,closed_count:1,tp_count:1,sl_count:0},
             OriginalMinute{signal_close_unix:86460,sum_r:-1.0,closed_count:1,tp_count:0,sl_count:1},
         ]};
@@ -464,7 +464,7 @@ async fn manual_original_archive_ack_uses_jsonb_numeric_equality_without_rewriti
                 let spec=json!({"fromUnix":0,"toUnix":172800});
                 let id:i64=sqlx::query_scalar("insert into optimization_studies(algorithm_id,status,spec,progress,owner_id,execution_started_at) values('price_volume_spike',$1,$2,'{}','admin',to_timestamp($3)) returning id")
                     .bind(if cancelled {"cancel_requested"}else{"running"}).bind(&spec).bind(START as f64+30.25).fetch_one(&pool).await.unwrap();
-                let archive=ManualArchive {observation_cutoff:172800,tp_pct:8.0,sl_pct:4.0,kernel:"original-manual-close-1".into(),minutes:vec![
+                let archive=ManualArchive {observation_cutoff:172800,tp_pct:8.0,sl_pct:4.0,kernel:"original-manual-close-1".into(),model_daily:None,minutes:vec![
                     OriginalMinute {signal_close_unix:86340,sum_r:2.0,closed_count:1,tp_count:1,sl_count:0},
                     OriginalMinute {signal_close_unix:86460,sum_r:-1.0,closed_count:1,tp_count:0,sl_count:1},
                 ]};

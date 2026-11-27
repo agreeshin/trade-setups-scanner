@@ -154,6 +154,9 @@ impl AdaptiveStore for PgAdaptiveStore<'_> {
         let evidence=if setups.iter().any(|setup|setup.recommendation.get("expectancy").is_none()) {
             Some(super::enrichment::load(self.pool,&captured).await)
         }else{None};
+        if evidence.as_ref().is_some_and(|captured|captured.retryable_failure) {
+            return Err(invalid("expectancy storage temporarily unavailable; retry live admission"));
+        }
         let mut degraded=0usize;
         for setup in setups.iter_mut() {
             setup.recommendation["externalName"] = captured.external_name.clone().into();

@@ -132,6 +132,12 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Saved-source-only upgrade initialization precedes the first live
+    // admission. A large inactive history backlog cannot freeze null metrics
+    // for an active study whose canonical sources already exist.
+    setups_api::initialize_active_presentations(&continuous_pool).await.unwrap_or_else(|error|{
+        eprintln!("current study presentation startup failed: {error}");std::process::exit(1)
+    });
     let live_runtime = setups_worker::live::start_live_runtime(
         live_data_pool,
         live_control_pool,

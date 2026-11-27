@@ -688,7 +688,7 @@ fn evaluate_group_inner(
             };
             for index in indexes {
                 let before=minutes.as_ref().map(|capture| {
-                    let cell=&matrices[candidate_index][capture.cell_index];(cell.tp_count,cell.sl_count)
+                    let cell=&matrices[candidate_index][capture.cell_index];(cell.tp_count,cell.sl_count,cell.price_change_filtered_count)
                 });
                 if control.stopped()
                     || !accumulate_setup_with_daily(
@@ -707,11 +707,13 @@ fn evaluate_group_inner(
                 if let Some(capture)=minutes.as_deref_mut() {
                     let before=before.expect("capture counter snapshot");
                     let after=&matrices[candidate_index][capture.cell_index];
-                    capture.record(setups[index].close_time_unix,before,after)?;
+                    capture.record_model(setups[index].close_time_unix,(before.0,before.1),after,
+                        spec.trend_mode.is_mean() && spec.forecast.is_none() || after.price_change_filtered_count==before.2)?;
+                    capture.record(setups[index].close_time_unix,(before.0,before.1),after)?;
                     // Test-local fault injection runs only AFTER the real scalar
                     // outcome is stored, while this promotion is still incomplete.
                     #[cfg(test)]
-                    if (after.tp_count,after.sl_count)!=before {
+                    if (after.tp_count,after.sl_count)!=(before.0,before.1) {
                         if let Some(observer)=on_closed.as_deref_mut() {observer();}
                     }
                 }

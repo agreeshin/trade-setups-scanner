@@ -998,6 +998,25 @@ async fn compute(
         manifest.push(item);
         tokio::task::yield_now().await;
     }
+    let actual_counts=aggregate.value();
+    let presentation=match crate::study_presentation::original(&state.pool,&job.owner,job.study,&source).await {
+        Ok((original,observed,_))=>{
+            let include_gate=source.objective.trend_mode.is_mean() && source.objective.forecast.is_none();
+            let actual=days.iter().filter_map(|(&day,a)| {
+                let row_count=a.total-if include_gate {0}else{a.gate};
+                (row_count>0).then(||setups_domain::expectancy::UtcDailyInput{day_start_unix:day,row_count,tp_count:a.tp,sl_count:a.sl,mean_r:if a.tp+a.sl>0 {Some(a.sum/(a.tp+a.sl) as f64)}else{None}})
+            }).collect::<Vec<_>>();
+            let actual_observed=days.iter().map(|(&day,a)|Ok(setups_db::study_display::DisplayDay{day_unix:day,
+                date:setups_domain::expectancy::utc_date(day).map_err(|_|"study_actual_daily_invalid")?,sum_r:a.sum,
+                mean_r:if a.tp+a.sl>0{Some(a.sum/(a.tp+a.sl) as f64)}else{None},closed_count:a.tp+a.sl,tp_count:a.tp,sl_count:a.sl})).collect::<Result<Vec<_>,&'static str>>()?;
+            Some(crate::study_presentation::render_owned(&state.pool,||crate::study_presentation::prepare(
+                &job.owner,job.study,&source,&original,observed,&actual,actual_observed,job.cutoff,Some(job.revision),Some(&actual_counts))).await?)
+        },
+        // Expected legacy absence keeps the original post-only diagnostics
+        // usable. Corruption/transient storage failures never count as absence.
+        Err("original_outcomes_not_persisted"|"original_series_unavailable")=>None,
+        Err(code)=>return Err(code),
+    };
     let daily=days.into_iter().map(|(day,a)|json!({"dayUnix":day,"plotAtUnix":(day as f64).max(source.start_unix).min(job.cutoff as f64),"meanR":a.value()["meanR"],"closedCount":a.tp+a.sl,"tpCount":a.tp,"slCount":a.sl})).collect();
     let mut report = chart(&source, job.cutoff, daily);
     let expected_minutes = ((job.cutoff - first_signal_open(source.execution_started_at)).max(0)
@@ -1009,7 +1028,7 @@ async fn compute(
     totals["rawDetectedCount"] = json!(raw_total);
     totals["clusterExcludedCount"] = json!(excluded_total);
     if !db::progress(&state.pool,job,"publishing",&json!({"instrumentsTotal":source.instruments.len(),"instrumentsDone":source.instruments.len(),"rawDetectedCount":raw_total,"clusterExcludedCount":excluded_total,"evaluatedSetups":aggregate.total})).await.map_err(|_|"study_actual_storage_unavailable")? {return Err("study_actual_fence_lost");}
-    if !db::finish(&state.pool, job, &report, &totals)
+    if !db::finish_with_presentation(&state.pool, job, &report, &totals,presentation.as_ref())
         .await
         .map_err(|_| "study_actual_storage_unavailable")?
     {

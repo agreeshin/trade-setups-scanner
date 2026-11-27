@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 serde.workspace = true
 setups-domain.workspace = true
+chrono.workspace = true
 resvg = { version = "0.45.1", default-features = false, features = ["text"] }
 png = { version = "0.17.16", default-features = false }
 

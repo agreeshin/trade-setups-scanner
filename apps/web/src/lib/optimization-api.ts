@@ -1,5 +1,6 @@
 import { apiFetch } from "./platform-api";
 import { parseStudyActualSummary, type StudyActualSummary } from "./study-actual-api";
+import { parseCurrentStudyPresentation, type CurrentStudyPresentation } from "./study-presentation-api";
 import type { ForecastRecipe } from "./forecast-recipe";
 import type { TrendBendDays, TrendMode as AnalyticsTrendMode } from "./analytics-api";
 export type StudyTrendMode = AnalyticsTrendMode | "blend";
@@ -112,6 +113,8 @@ export interface OptimizationStudy {
   recommendedPair?: OptimizationRecommendedPair | null;
   /** Joined compact post-study job state; absent only on older servers. */
   actual?: StudyActualSummary | null;
+  /** Last complete PNG/statistics publication; replacement jobs do not clear it. */
+  currentPresentation?: CurrentStudyPresentation | null;
   createdAt: string;
   updatedAt: string;
   events: { at: string; kind: string; message: string }[];
@@ -135,6 +138,7 @@ export function summarizeOptimizationStudy(study: OptimizationStudy): Optimizati
     ...(study.manualControl !== undefined ? { manualControl: study.manualControl } : {}),
     createdAt: study.createdAt, updatedAt: study.updatedAt, bestScore: study.result?.best?.score ?? study.progress.bestScore ?? null,
     forecastBest: study.forecastBest ?? null,
+    ...(study.currentPresentation !== undefined ? { currentPresentation: study.currentPresentation === null ? null : parseCurrentStudyPresentation(study.currentPresentation) } : {}),
     ...(study.actual !== undefined ? { actual: study.actual === null ? null : parseStudyActualSummary(study.actual, study.id) } : {}) };
 }
 
@@ -176,21 +180,21 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   throw new OptimizationApiError(message, response.status, activeId);
 }
 
-function parseStudyControl<T extends OptimizationStudyAction>(study: T, expectedId?: number): T {
+function parseStudyControl<T extends OptimizationStudyAction & Pick<OptimizationStudy, "currentPresentation">>(study: T, expectedId?: number): T {
   const control = study?.manualControl;
   if (!study || !Number.isSafeInteger(study.id) || study.id <= 0 || (expectedId !== undefined && study.id !== expectedId)
     || !["queued", "running", "pausing", "paused", "cancel_requested", "completed", "cancelled", "failed"].includes(study.status)
     || (control != null && (typeof control !== "object" || !Number.isSafeInteger(control.revision) || control.revision < 0 || typeof control.supportsPause !== "boolean"))) {
     throw new OptimizationApiError("Сервер вернул неподдерживаемый статус исследования. Обновите статус перед выполнением команд.", 502);
   }
-  return study;
+  return study.currentPresentation == null ? study : { ...study, currentPresentation: parseCurrentStudyPresentation(study.currentPresentation) };
 }
 
 export async function listOptimizationStudies(algorithmId: string | undefined, signal: AbortSignal, limit = 1, offset = 0): Promise<OptimizationStudyPage> {
   const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
   if (algorithmId !== undefined) query.set("algorithmId", algorithmId);
   const page = await request<OptimizationStudyPage>(`/v1/optimization-studies?${query}`, { signal });
-  return { ...page, studies: page.studies.map((study) => { parseStudyControl(study); return study.actual == null ? study : { ...study, actual: parseStudyActualSummary(study.actual, study.id) }; }) };
+  return { ...page, studies: page.studies.map((value) => { const study = parseStudyControl(value); return study.actual == null ? study : { ...study, actual: parseStudyActualSummary(study.actual, study.id) }; }) };
 }
 export const getOptimizationStudy = async (id: number, signal: AbortSignal): Promise<OptimizationStudy> =>
   parseStudyControl(await request<OptimizationStudy>(`/v1/optimization-studies/${id}`, { signal }), id);

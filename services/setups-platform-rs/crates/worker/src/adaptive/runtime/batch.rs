@@ -32,6 +32,9 @@ impl BatchStore for PgBatchStore<'_> {
         let evidence=if indices.iter().any(|&i|scans[i].prepared.setups.iter().any(|setup|setup.recommendation.get("expectancy").is_none())) {
             Some(super::enrichment::load(self.pool,slot).await)
         }else{None};
+        if evidence.as_ref().is_some_and(|captured|captured.retryable_failure) {
+            return Err(invalid("expectancy storage temporarily unavailable; retry live admission"));
+        }
         let mut degraded=0usize;
         let mut writes=Vec::with_capacity(indices.len());
         for &index in indices {

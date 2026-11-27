@@ -27,6 +27,7 @@ pub use store::PgAdaptiveStore;
 pub use text::recommendation_message;
 pub use caption::{AdaptiveTelegramCaption, recommendation_telegram_caption};
 pub use enrichment::{AdaptiveExpectancySnapshot, ExpectancyOverlayKey};
+pub use caption::recommendation_current_telegram_caption;
 
 const HISTORY_PAGE_LIMIT:u32=5000;
 const IO_CONCURRENCY:usize=4;

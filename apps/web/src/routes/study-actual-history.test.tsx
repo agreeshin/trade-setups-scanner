@@ -93,7 +93,7 @@ it("shows the exact saved TP/SL levels from the same forecastBest cell as its fo
   rows[1] = { ...row(48), forecastBest: { forecastR: -0.126, meanR: 2.7, tpPct: 8.25, slPct: 2.5 } };
   surface(); await settle();
   const first = within(tableRow()).getAllByRole("cell");
-  expect(first).toHaveLength(11);
+  expect(first).toHaveLength(12);
   expect(first[6]).toHaveTextContent(/^TP 14.125% \/ SL 0.625%$/);
   expect(first[7]).toHaveTextContent(/^0.50 R$/); expect(first[8]).toHaveTextContent(/^0.88 R$/);
   const second = within(tableRow(48)).getAllByRole("cell");
@@ -383,7 +383,7 @@ it("does not infer legacy eligibility from completion status or invent missing e
   rows[0] = row(49, studyActualFixture(49, { eligibility: { eligible: false, reason: "execution_start_unavailable" } }));
   rows[1] = row(48, null); surface(); await settle();
   expect(screen.getByRole("button", { name: /исследования 49 недоступен: execution_start_unavailable/ })).toBeDisabled();
-  expect(screen.getByRole("button", { name: /исследования 48 недоступен/ })).toBeDisabled(); expect(posts()).toHaveLength(0);
+  expect(screen.getByRole("button", { name: /Расчёт после исследования 48 недоступен/ })).toBeDisabled(); expect(posts()).toHaveLength(0);
 });
 
 it("cleans up pending page polling and requests on unmount", async () => {
@@ -479,7 +479,7 @@ describe("displayed-page request ownership", () => {
     expect(pending).toHaveLength(1);
     fireEvent.click(next()); await settle();
     expect(pending[0]!.signal?.aborted).toBe(true); expect(pending).toHaveLength(2);
-    expect(table().querySelectorAll('[data-slot="skeleton"]')).toHaveLength(220);
+    expect(table().querySelectorAll('[data-slot="skeleton"]')).toHaveLength(240);
     expect(table()).toHaveAttribute("aria-busy", "true");
     expect(previous()).toBeDisabled(); expect(next()).toBeDisabled();
     expect(screen.queryByRole("button", { name: "Результат исследования 40" })).not.toBeInTheDocument();

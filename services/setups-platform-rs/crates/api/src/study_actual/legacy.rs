@@ -365,7 +365,7 @@ where P: FnMut(ReadRequest) -> F, F: Future<Output = Result<CandleInput>> {
     // timestamps are neither substituted nor required for this bounded proof.
     let result = LegacyCalculation { fidelity: if proof.is_some() { LegacyFidelity::VerifiedOriginalReconstruction } else { LegacyFidelity::ReconstructedUnproven },
         source_hash, input_hash, original_snapshot_hash: source.original_snapshot_hash.clone(), proof_hash, proof: proof.cloned(),
-        selected_minutes: ContinuousSelectedMinutes { version: core::CONTINUOUS_SELECTED_MINUTES_VERSION, evaluator: core::CONTINUOUS_SELECTED_MINUTES_EVALUATOR.into(),
+        selected_minutes: ContinuousSelectedMinutes { version: core::CONTINUOUS_SELECTED_MINUTES_VERSION, evaluator: core::CONTINUOUS_SELECTED_MINUTES_EVALUATOR.into(),model_daily:None,
             tp_pct: source.pair.tp_pct, sl_pct: source.pair.sl_pct, points: minutes.into_values().collect() }, daily, conservation, conservation_matched: matched, inputs };
     fingerprint(b"legacy-output-budget-v1\0", &result, limits.max_output_bytes)?;
     Ok(result)

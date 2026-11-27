@@ -94,6 +94,29 @@ pub(crate) fn evaluate(
     additional: &[UtcDailyInput],
     cutoff: i64,
 ) -> Result<ExpectancyObjectiveSeries, &'static str> {
+    let diagnostic=combined_artifact(artifact,objective,additional,cutoff)?;
+    let series = diagnostic
+        .objective_series(objective)
+        .map_err(|_| "combined_evaluation_unavailable")?;
+    if let MetricAvailability::Unavailable { reason } = series.decision_r {
+        return Err(match reason {
+            setups_domain::expectancy::ExpectancyUnavailableReason::InsufficientFiniteDays => {
+                "combined_insufficient_finite_days"
+            }
+            _ => "combined_objective_unavailable",
+        });
+    }
+    Ok(series)
+}
+
+/// Shared calculation used by persisted current presentation too. The returned
+/// copy has separate diagnostic ownership; sealed original inputs stay intact.
+pub(crate) fn combined_artifact(
+    artifact: &ExpectancyArtifact,
+    objective: ExpectancyObjective,
+    additional: &[UtcDailyInput],
+    cutoff: i64,
+) -> Result<ExpectancyArtifact, &'static str> {
     artifact.validate().map_err(|_| "original_model_invalid")?;
     objective
         .validate()
@@ -120,7 +143,7 @@ pub(crate) fn evaluate(
         .checked_add(1)
         .ok_or("combined_cutoff_invalid")?
         .max(source.provenance.to_unix);
-    let diagnostic = build_expectancy_artifact(ExpectancyInput {
+    build_expectancy_artifact(ExpectancyInput {
         source,
         selected_cell: Some(SelectedCellInput {
             raw_r: (closed > 0).then(|| (q * tp as f64 - sl as f64) / closed as f64),
@@ -130,17 +153,5 @@ pub(crate) fn evaluate(
         matrix_mean_r: None,
         daily: MetricAvailability::Available { value: days },
     })
-    .map_err(|_| "combined_evaluation_unavailable")?;
-    let series = diagnostic
-        .objective_series(objective)
-        .map_err(|_| "combined_evaluation_unavailable")?;
-    if let MetricAvailability::Unavailable { reason } = series.decision_r {
-        return Err(match reason {
-            setups_domain::expectancy::ExpectancyUnavailableReason::InsufficientFiniteDays => {
-                "combined_insufficient_finite_days"
-            }
-            _ => "combined_objective_unavailable",
-        });
-    }
-    Ok(series)
+    .map_err(|_| "combined_evaluation_unavailable")
 }

@@ -151,7 +151,9 @@ async fn load_source(
         Some(value) => json!({"status":"available","value":value}),
         None => json!({"status":"unavailable","reason":"saved_metric_unavailable"}),
     };
-    let endpoint = json!({"meanR":available(cell.mean_risk_expectancy.or(cell.risk_expectancy.filter(|_|spec.trend_mode.is_mean()))),"forecastR":available(cell.forecast_risk_expectancy.or(cell.risk_expectancy.filter(|_|spec.trend_mode==setups_domain::trend::TrendMode::Forecast))),"decisionR":available(cell.risk_expectancy),"atUnix":best.observation_cutoff});
+    let endpoint = json!({"meanR":available(cell.mean_risk_expectancy.or(cell.risk_expectancy.filter(|_|spec.trend_mode.is_mean()))),"forecastR":available(cell.forecast_risk_expectancy.or(cell.risk_expectancy.filter(|_|spec.trend_mode==setups_domain::trend::TrendMode::Forecast))),"decisionR":available(cell.risk_expectancy),"atUnix":best.observation_cutoff,
+        "counts":{"total":cell.closed_count+cell.unclosed_count+cell.no_data_count+cell.price_change_filtered_count,"closed":cell.closed_count,"tp":cell.tp_count,"sl":cell.sl_count,
+            "gateFailed":cell.price_change_filtered_count,"unclosed":cell.unclosed_count,"noData":cell.no_data_count}});
     let artifact_row=sqlx::query("select id,numerical_snapshot from study_expectancy_artifacts where owner_id=$1 and source_study_id=$2 and revision_key='original' and tp_pct=$3 and sl_pct=$4 order by id desc limit 1")
         .bind(owner).bind(study).bind(selected.tp_pct).bind(selected.sl_pct).fetch_optional(pool).await.map_err(|_|"study_actual_storage_unavailable")?;
     let artifact = artifact_row

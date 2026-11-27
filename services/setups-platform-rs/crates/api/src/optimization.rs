@@ -83,6 +83,7 @@ pub fn optimization_router(state: Arc<OptimizationState>) -> Router {
         .route("/v1/optimization-studies/{id}/cancel", post(cancel_study))
         .route("/v1/optimization-studies/{id}/pause",post(pause_study))
         .route("/v1/optimization-studies/{id}/play",post(play_study))
+        .route("/v1/optimization-studies/{id}/presentation.png",get(presentation_png))
         .route(
             "/v1/optimization-drafts/{algorithm}",
             get(get_draft)
@@ -106,6 +107,11 @@ fn record_response_with_pair(
     record: StudyRecord,
     recommended_pair: Option<db::RecommendedPair>,
 ) -> Response {
+    record_response_with_presentation(status,record,recommended_pair,setups_db::study_presentation::unavailable("study_presentation_not_initialized"))
+}
+fn record_response_with_presentation(
+    status:StatusCode,record:StudyRecord,recommended_pair:Option<db::RecommendedPair>,current_presentation:Value,
+) -> Response {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct StudyResponse {
@@ -113,9 +119,28 @@ fn record_response_with_pair(
         record: StudyRecord,
         forecast_best: Option<db::ForecastBestPair>,
         recommended_pair: Option<db::RecommendedPair>,
+        current_presentation: Value,
     }
     let forecast_best = db::forecast_best_pair(record.result.as_ref(), &record.spec);
-    (status, [("cache-control", "no-store")], Json(StudyResponse { record, forecast_best, recommended_pair })).into_response()
+    (status, [("cache-control", "no-store")], Json(StudyResponse { record, forecast_best, recommended_pair,current_presentation })).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresentationQuery {revision:i64}
+async fn presentation_png(
+    State(state):State<Arc<OptimizationState>>,headers:HeaderMap,Path(id):Path<i64>,
+    query:Result<Query<PresentationQuery>,QueryRejection>,
+) -> Response {
+    if let Err(error)=guard_auth(&state.auth,&headers,false) {return error;}
+    let Ok(Query(query))=query else{return response(StatusCode::BAD_REQUEST,json!({"error":"invalid_query"}));};
+    if id<=0 || query.revision<=0 {return response(StatusCode::BAD_REQUEST,json!({"error":"invalid_query"}));}
+    match setups_db::study_presentation::png(&state.pool,"admin",id,query.revision).await {
+        Ok(setups_db::study_presentation::Png::Available(png))=>([("content-type","image/png"),("cache-control","no-store")],png).into_response(),
+        Ok(setups_db::study_presentation::Png::Changed)=>response(StatusCode::CONFLICT,json!({"error":"study_presentation_revision_changed"})),
+        Ok(setups_db::study_presentation::Png::Unavailable)=>response(StatusCode::NOT_FOUND,json!({"error":"study_presentation_unavailable"})),
+        Err(error)=>internal_error("get_presentation_png",error),
+    }
 }
 
 fn internal_error(operation: &str, error: impl std::fmt::Display) -> Response {
@@ -401,7 +426,10 @@ async fn get_study(
     }
     match db::get(&state.pool, id).await {
         Ok(Some(record)) => match db::get_recommended_pair(&state.pool, &record).await {
-            Ok(pair) => record_response_with_pair(StatusCode::OK, record, pair),
+            Ok(pair) => match setups_db::study_presentation::summary(&state.pool,"admin",id).await {
+                Ok(current)=>record_response_with_presentation(StatusCode::OK,record,pair,current),
+                Err(error)=>internal_error("get_current_presentation",error),
+            },
             Err(error) => internal_error("get_recommended_pair", error),
         },
         Ok(None) => response(StatusCode::NOT_FOUND, json!({"error":"not_found"})),
@@ -1004,6 +1032,7 @@ async fn execute_inner(
     }
     let archive=archive.map(|archive|setups_db::study_display::ManualArchive {
         observation_cutoff:archive.observation_cutoff,tp_pct:archive.minutes.tp_pct,sl_pct:archive.minutes.sl_pct,
+        model_daily:archive.minutes.model_daily,
         kernel:archive.minutes.evaluator,minutes:archive.minutes.points.into_iter().map(|p|setups_db::study_display::OriginalMinute {
             signal_close_unix:p.signal_close_unix,sum_r:p.sum_r,closed_count:p.closed_count,tp_count:p.tp_count,sl_count:p.sl_count,
         }).collect(),
@@ -1058,7 +1087,7 @@ mod tests {
 
     fn terminal_archive() -> TerminalPayload {
         TerminalPayload{id:1,status:"completed",progress:json!({}),result:Some(json!({"best":{"score":1.0}})),error:None,events:json!([]),
-            archive:Some(setups_db::study_display::ManualArchive{observation_cutoff:120,tp_pct:8.0,sl_pct:4.0,kernel:"original-manual-close-1".into(),
+            archive:Some(setups_db::study_display::ManualArchive{observation_cutoff:120,tp_pct:8.0,sl_pct:4.0,kernel:"original-manual-close-1".into(),model_daily:None,
                 minutes:vec![setups_db::study_display::OriginalMinute{signal_close_unix:60,sum_r:2.0,closed_count:1,tp_count:1,sl_count:0}]})}
     }
 

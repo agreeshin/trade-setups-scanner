@@ -393,6 +393,50 @@ fn png_fixture() -> Vec<u8> {
     png
 }
 
+#[tokio::test]
+async fn current_admission_dispatch_owns_matching_png_and_caption_without_db_or_render_lane() {
+    use base64::{Engine as _,engine::general_purpose::STANDARD};
+    use serde_json::json;
+    use sha2::{Digest,Sha256};
+    let now=chrono::Utc::now().timestamp().div_euclid(60)*60;
+    let mut job=fixed_job(now);job.wire_version=2;job.slot_id=Some(2);job.generation_id=Some(3);job.config_revision=Some(1);job.fixed_config=None;
+    job.payload["recommendation"]=json!({"direction":"short","tpPct":14,"slPct":4,"rawR":0.32,"meanR":0.21,"robustScore":0.29,
+        "timeShiftMinutes":3,"priceChangePct":1,"clusterEnabled":false,"clusterGapMinutes":null,
+        "provenance":{"algorithmId":"price_volume_spike","algorithmVersion":"1.1.1","optimizerVersion":"fixture-v1","seed":42,
+            "snapshotHash":"original-current-fixture","capturedAt":"2026-11-12T00:00:00Z","fromUnix":now-86400,"toUnix":now-600,"observationCutoff":now-600},
+        "studyId":21,"generationId":3,"slotId":2,"ownerId":"admin","externalName":"Captured name","params":job.payload["raw"]["params"],
+        "rawSignalAt":now,"recommendedEntryAt":now+180});
+    let recommendation:setups_domain::AdaptiveRecommendationSnapshot=serde_json::from_value(job.payload["recommendation"].clone()).unwrap();
+    let objective=setups_domain::expectancy::ExpectancyObjective::from_recommendation(&recommendation).unwrap();
+    let png=png_fixture();let hash=format!("{:x}",Sha256::digest(&png));
+    job.payload["chartPresentation"]=json!(setups_db::study_presentation::PRESENTATION);
+    job.payload["studyPresentation"]=json!({"status":"available","pngBase64":STANDARD.encode(&png),"pngSha256":hash,
+        "snapshot":{"revision":2,"source":"actual","sourceRevision":4,"studyId":21,"generationId":3,"observationCutoff":now+120,
+            "selectedObjectiveR":0.42,"meanR":0.125,"tpPct":14,"slPct":4,"objective":objective,
+            "originalSnapshotHash":"original-current-fixture","pngSha256":hash}});
+    // No reachable DB and no ChartRenderLane: new dispatch is genuinely a
+    // read of already admitted bytes, including delayed raw<C admissions.
+    let pool=sqlx::postgres::PgPoolOptions::new().acquire_timeout(Duration::from_millis(20)).connect_lazy("postgres://localhost:1/no_database").unwrap();
+    let content=saved_presentation_with_lane(&pool,&job,None).await.unwrap();
+    assert_eq!(content.png.as_ref(),Some(&png));assert_eq!(content.unavailable_reason,None);
+    assert!(content.text.contains("📈 Прогноз матожидания торговли: +0.42 R"));
+    let footer=chrono::DateTime::from_timestamp(now-600,0).unwrap().format("%d.%m.%Y").to_string();
+    assert!(content.text.ends_with(&format!("Исследование №21 от {footer}")));
+    let rendered=render_v2_message(&job,now,content,true).unwrap();let admitted=rendered.body.clone();
+    let message=v2::RelayMessage::parse(&rendered.body,now).unwrap();assert_eq!(message.expires_at,job.expires_at_unix);assert_eq!(message.attachment.unwrap().decode_png().unwrap(),png);
+    // A new mutable current value is not consulted by this admitted payload.
+    let mut later=job.clone();later.payload["studyPresentation"]["snapshot"]["selectedObjectiveR"]=json!(-0.8);
+    assert_ne!(saved_presentation_with_lane(&pool,&later,None).await.unwrap().text,message.text);
+    let repeated=render_v2_message(&job,now+1,saved_presentation_with_lane(&pool,&job,None).await.unwrap(),true).unwrap();
+    assert_eq!(repeated.body,admitted);
+    let mut corrupt=job.clone();corrupt.payload["studyPresentation"]["pngSha256"]=json!("0".repeat(64));
+    let fallback=saved_presentation_with_lane(&pool,&corrupt,None).await.unwrap();assert!(fallback.png.is_none());assert_eq!(fallback.unavailable_reason,Some("png_hash_mismatch"));
+    let body=render_v2_message(&corrupt,now,fallback,true).unwrap();assert!(v2::RelayMessage::parse(&body.body,now).unwrap().attachment.is_none());
+    let mut missing=job;missing.payload["studyPresentation"]=json!({"status":"unavailable","reason":"original_outcomes_missing"});
+    let fallback=saved_presentation_with_lane(&pool,&missing,None).await.unwrap();assert!(fallback.png.is_none());assert!(!fallback.text.contains("матожидания торговли"));
+    pool.close().await;
+}
+
 fn presentation(text: &str, png: Option<Vec<u8>>) -> TelegramV2Presentation {
     TelegramV2Presentation {
         text: text.into(),
@@ -1738,6 +1782,22 @@ async fn observed_admission_regression(
         "legacy duplicate and lost ACK never relabel an admitted job"
     );
     row.symbol = "NEWADMITUSDT".into();
+    // New prospective admission opts into the independent current bundle;
+    // the legacy row above is deliberately kept byte-for-byte unchanged.
+    let study:i64=numeric.source.study_id.parse().unwrap();
+    let current_objective=setups_domain::expectancy::ExpectancyObjective::from_recommendation(
+        &serde_json::from_value::<setups_domain::AdaptiveRecommendationSnapshot>(row.recommendation.clone()).unwrap()).unwrap();
+    let artifact_id=row.recommendation["expectancy"]["artifactId"].as_i64().unwrap();
+    let observed=setups_db::study_display::original_observed(pool,&profile.owner_id,study,Some(artifact_id),"UTC").await.unwrap().unwrap();
+    let points=observed.utc_points(numeric.origin_unix).unwrap();
+    let current_png=setups_analytics::expectancy_chart::render_png_current(numeric,current_objective,&points).unwrap();
+    let source_identity:String=sqlx::query_scalar("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1")
+        .bind(study).fetch_one(pool).await.unwrap();
+    let snapshot=serde_json::json!({"revision":0,"source":"initial","sourceRevision":null,"studyId":study,"generationId":profile.generation_id,
+        "observationCutoff":numeric.source.provenance.observation_cutoff,"selectedObjectiveR":numeric.objective_series(current_objective).unwrap().decision_r.as_ref(),
+        "tpPct":numeric.source.tp_pct,"slPct":numeric.source.sl_pct,"objective":current_objective,"originalSnapshotHash":numeric.source.provenance.snapshot_hash});
+    assert!(setups_db::study_presentation::publish_initial(pool,&setups_db::study_presentation::Prepared{owner:profile.owner_id.clone(),study,source_identity,
+        snapshot,numerical:setups_db::expectancy::encode_artifact(numeric).unwrap(),png:current_png}).await.unwrap());
     let admitted = live::commit_adaptive_scan_cas(
         pool,
         &profile,
@@ -1760,7 +1820,7 @@ async fn observed_admission_regression(
     .unwrap();
     assert_eq!(
         first["payload"]["chartPresentation"],
-        live::outbox::OBSERVED_CHART_PRESENTATION
+        setups_db::study_presentation::PRESENTATION
     );
     let earliest: serde_json::Value = sqlx::query_scalar(
         "select payload from adaptive_notification_outbox where setup_id::bigint=$1",
@@ -1770,9 +1830,11 @@ async fn observed_admission_regression(
     .await
     .unwrap();
     assert_eq!(
-        earliest, first["payload"],
-        "the earliest durable payload and Telegram payload share the opt-in"
+        earliest["recommendation"], first["payload"]["recommendation"],
+        "Telegram presentation does not alter the saved original recommendation"
     );
+    assert_eq!(earliest["chartPresentation"],live::outbox::OBSERVED_CHART_PRESENTATION);
+    assert!(earliest.get("studyPresentation").is_none(),"WebPush does not own a PNG copy");
     assert!(
         !live::commit_adaptive_scan_cas(
             pool,
@@ -1825,11 +1887,9 @@ async fn observed_new_delivery(
     .unwrap()
     .unwrap();
     let points = archive.utc_points(numeric.origin_unix).unwrap();
-    let expected = setups_analytics::expectancy_chart::render_png_trend_observed(
-        numeric,
-        Default::default(),
-        &points,
-    )
+    let snapshot:setups_domain::AdaptiveRecommendationSnapshot=serde_json::from_value(job.payload["recommendation"].clone()).unwrap();
+    let objective=setups_domain::expectancy::ExpectancyObjective::from_recommendation(&snapshot).unwrap();
+    let expected = setups_analytics::expectancy_chart::render_png_current(numeric,objective,&points)
     .unwrap();
     let outcome = send_job_via(pool, worker, &job, &AtomicBool::new(false), &relay)
         .await
@@ -1856,8 +1916,8 @@ async fn observed_new_delivery(
         "new presentation is not the legacy cached PNG"
     );
     db::finish(pool, worker, &job, outcome).await.unwrap();
-    // Fault injection only in this disposable DB. A present corrupt archive
-    // fails opted-in jobs, while legacy contracts never consult that archive.
+    // Fault injection only in this disposable DB. New current dispatch owns its
+    // copied bytes; the old observed opt-in still validates its source archive.
     let ledger: serde_json::Value = sqlx::query_scalar(
         "select to_jsonb(o) from study_original_outcomes o where artifact_id=$1",
     )
@@ -1873,10 +1933,9 @@ async fn observed_new_delivery(
     let mut corrupt = ledger.clone();
     corrupt["payload_sha256"] = serde_json::json!("0".repeat(64));
     sqlx::query("insert into study_original_outcomes select * from jsonb_populate_record(null::study_original_outcomes,$1)").bind(corrupt).execute(pool).await.unwrap();
-    assert!(matches!(
-        saved_chart_png(pool, &job, Some(&relay.charts)).await,
-        Err("png_identity_mismatch")
-    ));
+    assert_eq!(saved_chart_png(pool,&job,Some(&relay.charts)).await.unwrap().unwrap(),expected);
+    let mut old_observed=job.clone();old_observed.payload["chartPresentation"]=serde_json::json!(setups_db::continuous::outbox::OBSERVED_CHART_PRESENTATION);
+    assert!(matches!(saved_chart_png(pool,&old_observed,Some(&relay.charts)).await,Err("png_identity_mismatch")));
     assert!(
         saved_chart_png(pool, legacy, Some(&relay.charts))
             .await

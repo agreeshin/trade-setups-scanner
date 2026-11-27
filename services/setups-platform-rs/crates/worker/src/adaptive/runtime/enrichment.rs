@@ -706,6 +706,7 @@ pub(super) struct CapturedExpectancy {
     pub artifact: Option<CapturedArtifact>,
     pub artifact_id: Option<i64>,
     pub invalid_evidence: bool,
+    pub retryable_failure: bool,
 }
 
 pub(super) async fn load(pool: &PgPool, slot: &ActiveAdaptiveSlot) -> CapturedExpectancy {
@@ -716,14 +717,15 @@ pub(super) async fn load(pool: &PgPool, slot: &ActiveAdaptiveSlot) -> CapturedEx
                 artifact: None,
                 artifact_id: None,
                 invalid_evidence: true,
+                retryable_failure: false,
             };
         }
     };
     let version = calculation_version(recipe).to_string();
-    // Production uses Tokio's multithread runtime. A bounded, non-cancellable
-    // capture validates once without monopolizing an async executor thread or
-    // detaching a validation job that could outlive its commit admission.
-    let capture = async {
+    // I/O MUST stay an ordinary async await: four borrowed persist futures are
+    // joined in one task and may own all three live-data connections. Nesting
+    // Handle::block_on here suspends their releases and self-starves the pool.
+    let mut captured = {
         let row = match read_artifact_row(pool, slot, recipe, &version).await {
             Err(error) => {
                 report_read_failed(slot, &error);
@@ -738,13 +740,6 @@ pub(super) async fn load(pool: &PgPool, slot: &ActiveAdaptiveSlot) -> CapturedEx
             Ok(Some(row)) => decode_validated_record(ReadValidatedRecord(row), slot),
             other => capture_result(other, slot),
         }
-    };
-    let mut captured = if tokio::runtime::Handle::current().runtime_flavor()
-        == tokio::runtime::RuntimeFlavor::MultiThread
-    {
-        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(capture))
-    } else {
-        capture.await
     };
     // Native post-chain capture stays on the original one-query path. Both
     // copies below belong to this commit only, with no live/profile RAM cache.
@@ -818,6 +813,7 @@ fn capture_result(
                 artifact: None,
                 artifact_id: None,
                 invalid_evidence: true,
+                retryable_failure: setups_db::continuous::recovery::is_transient(&error),
             };
         }
     };
@@ -826,6 +822,7 @@ fn capture_result(
             artifact: None,
             artifact_id: None,
             invalid_evidence: false,
+            retryable_failure: false,
         },
         Some(row) => decode_record(row, slot),
     }
@@ -844,11 +841,13 @@ fn decode_record(
             }),
             artifact_id: Some(id),
             invalid_evidence: false,
+            retryable_failure: false,
         },
         None => CapturedExpectancy {
             artifact: None,
             artifact_id: None,
             invalid_evidence: true,
+            retryable_failure: false,
         },
     }
 }
@@ -870,11 +869,13 @@ fn decode_validated_record(
             }),
             artifact_id: Some(id),
             invalid_evidence: false,
+            retryable_failure: false,
         },
         None => CapturedExpectancy {
             artifact: None,
             artifact_id: None,
             invalid_evidence: true,
+            retryable_failure: false,
         },
     }
 }
@@ -2080,7 +2081,7 @@ pub(super) mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
     async fn postgres_lookup_only_failure_still_commits_both_paths_but_real_cas_failure_is_not_adopted()
      {
         use futures::FutureExt;
@@ -2098,6 +2099,7 @@ pub(super) mod tests {
             .unwrap();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_millis(150))
             .connect_with(options.database(&name))
             .await
             .unwrap();
@@ -2172,7 +2174,7 @@ pub(super) mod tests {
             assert!(stream.runtime.cached_checkpoint(&stream.epoch,&stream.spec.key()).unwrap().is_none());
             let durable:Value=sqlx::query_scalar("select state from adaptive_live_checkpoints where slot_id=$1 and instrument_key=$2")
                 .bind(slot.slot_id).bind(key).fetch_one(&pool).await.unwrap();
-            assert_eq!(durable,serde_json::to_value(second_checkpoint).unwrap());
+            assert_eq!(durable,serde_json::to_value(&second_checkpoint).unwrap());
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups").fetch_one(&pool).await.unwrap(),2);
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_notification_outbox").fetch_one(&pool).await.unwrap(),2);
             // Restore optional storage, then exercise the real v3 committed-ID
@@ -2205,6 +2207,66 @@ pub(super) mod tests {
             assert_eq!(next.recommendation["expectancy"]["forecastR"]["status"],"available");
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups").fetch_one(&pool).await.unwrap(),2);
             assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from adaptive_notification_outbox").fetch_one(&pool).await.unwrap(),2);
+
+            // Four borrowed futures share ONE task, exactly like commit wave4.
+            // Three sibling operations retain the data lane's original three
+            // connections; only polling those siblings can release them.
+            for old_nested_wait in [true,false] {
+                let a=pool.acquire().await.unwrap();let b=pool.acquire().await.unwrap();let c=pool.acquire().await.unwrap();
+                let release=|connection:sqlx::pool::PoolConnection<sqlx::Postgres>|async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;drop(connection);
+                };
+                let lookup=async {
+                    if old_nested_wait {
+                        let captured=tokio::task::block_in_place(||tokio::runtime::Handle::current().block_on(load(&pool,&model_slot)));
+                        // The deliberately broken OLD branch can consume the
+                        // joined task's wake while blocked. Restore a fresh
+                        // wake so the diagnostic itself has bounded cleanup.
+                        tokio::task::yield_now().await;
+                        captured
+                    }else{load(&pool,&model_slot).await}
+                };
+                let (_,_,_,joined)=tokio::time::timeout(std::time::Duration::from_secs(2),async {
+                    tokio::join!(release(a),release(b),release(c),lookup)
+                }).await.expect("bounded pool3/join4 reproduction must release all connections");
+                if old_nested_wait {
+                    assert!(joined.artifact.is_none() && joined.retryable_failure,"old nested wait reproduces pool starvation, not absent source");
+                }else{
+                    assert_eq!(joined.artifact_id,Some(ids[1]));assert!(!joined.invalid_evidence && !joined.retryable_failure);
+                    let mut setup=next.clone();setup.recommendation.as_object_mut().unwrap().remove("expectancy");
+                    assert!(!attach(&model_slot,&instrument,&mut setup,joined.artifact.as_ref(),joined.artifact_id).unwrap());
+                    assert!(setup.recommendation["expectancy"]["tpCount"].as_u64().is_some());
+                    assert_eq!(setup.recommendation["expectancy"]["forecastR"]["status"],"available");
+                }
+            }
+
+            // Optional current-PNG corruption must not roll back the actual
+            // live CAS/checkpoint. Only this optional field degrades to text.
+            sqlx::raw_sql("drop trigger fixture_reject_setup on live_setups; drop function fixture_reject_setup();")
+                .execute(&pool).await.unwrap();
+            setups_db::telegram::set_config(&pool,0,true,"https://relay.example").await.unwrap();
+            let identity:String=sqlx::query_scalar("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1")
+                .bind(slot.study_id).fetch_one(&pool).await.unwrap();
+            let recommendation: setups_domain::AdaptiveRecommendationSnapshot=serde_json::from_value(first[0].recommendation.clone()).unwrap();
+            let objective=ExpectancyObjective::from_recommendation(&recommendation).unwrap();
+            let snapshot=json!({"revision":1,"source":"initial","sourceRevision":null,"observationCutoff":recommendation.provenance.observation_cutoff,
+                "tpPct":recommendation.tp_pct,"slPct":recommendation.sl_pct,"objective":objective,"originalSnapshotHash":recommendation.provenance.snapshot_hash});
+            sqlx::query("insert into study_current_presentations(study_id,owner_id,source_identity,snapshot,numerical,png,png_sha256) values($1,'admin',$2,$3,'{}',$4,$5)")
+                .bind(slot.study_id).bind(identity).bind(snapshot).bind(b"corrupt optional png".as_slice()).bind("0".repeat(64)).execute(&pool).await.unwrap();
+            let mut healthy=first[0].clone();healthy.raw.open_time_unix+=180;healthy.raw.close_time_unix+=180;
+            healthy.recommendation["rawSignalAt"]=json!(at+180);healthy.recommendation["recommendedEntryAt"]=json!(at+360);
+            healthy.recommendation.as_object_mut().unwrap().remove("expectancy");
+            let successor=checkpoint(at+180);
+            let pg=super::super::store::PgAdaptiveStore {pool:&pool,slot:&slot};
+            let mut setups=vec![healthy];
+            assert_eq!(pg.commit_page(&AdaptiveFence{owner_id:slot.owner_id.clone(),algorithm_id:slot.algorithm_id.clone(),slot_id:slot.slot_id,generation_id:slot.generation_id,config_revision:slot.config_revision},
+                &instrument,Some(&second_checkpoint),&successor,&mut setups).await.unwrap().unwrap().len(),1);
+            assert_eq!(super::super::store::load_checkpoint(&pool,slot.slot_id,&instrument).await.unwrap(),Some(successor));
+            let pending:Value=sqlx::query_scalar("select payload from telegram_delivery_outbox order by id desc limit 1").fetch_one(&pool).await.unwrap();
+            assert_eq!(pending["chartPresentation"],"study_current_v1");
+            assert_eq!(pending["studyPresentation"]["status"],"unavailable");
+            assert_eq!(pending["studyPresentation"]["reason"],"study_presentation_png_corrupt");
+            assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from live_setups").fetch_one(&pool).await.unwrap(),3);
         }).catch_unwind().await;
         pool.close().await;
         sqlx::query(&format!("drop database {name} with (force)"))

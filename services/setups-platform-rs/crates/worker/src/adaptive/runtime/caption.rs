@@ -86,6 +86,7 @@ impl CaptionBuilder {
 #[derive(Default)]
 struct Metrics {
     forecast_r: Option<f64>,
+    current: bool,
 }
 
 fn signed_r(value: f64) -> Result<String, WorkerError> {
@@ -133,6 +134,7 @@ pub fn recommendation_telegram_caption(
                             || saved.forecast_r.as_ref().copied(),
                             |objective| objective.decision_r.as_ref().copied(),
                         ),
+                        current: false,
                     },
                     if saved.image_key.is_none() {
                         Some("saved_chart_unavailable")
@@ -147,6 +149,27 @@ pub fn recommendation_telegram_caption(
     };
     let mut caption = format_caption(instrument, raw, &envelope, metrics)?;
     caption.enrichment_unavailable_reason = diagnostic;
+    Ok(caption)
+}
+
+/// Explicit prospective contract only. Its objective and PNG are an admission
+/// snapshot at fixed C, not a raw-signal forecast or a current-profile lookup.
+pub fn recommendation_current_telegram_caption(
+    instrument:&AdaptiveInstrument,raw:&SpikeSetup,value:&Value,current:&Value,
+) -> Result<AdaptiveTelegramCaption,WorkerError> {
+    let envelope:RecommendationEnvelope=serde_json::from_value(value.clone())?;
+    if value["rawSignalAt"].as_i64()!=Some(raw.close_time_unix) {return Err(invalid("current caption signal mismatch"));}
+    let expected=setups_domain::expectancy::ExpectancyObjective::from_recommendation(&envelope.snapshot)
+        .map_err(|_|invalid("current caption objective invalid"))?;
+    let snapshot=&current["snapshot"];
+    let valid=current["status"]=="available" && snapshot["revision"].as_i64().is_some_and(|r|r>0)
+        && snapshot["studyId"].as_i64()==Some(envelope.study_id) && snapshot["generationId"].as_i64()==Some(envelope.generation_id)
+        && snapshot["tpPct"].as_f64()==Some(envelope.snapshot.tp_pct) && snapshot["slPct"].as_f64()==Some(envelope.snapshot.sl_pct)
+        && snapshot["originalSnapshotHash"]==envelope.snapshot.provenance.snapshot_hash && snapshot["objective"]==serde_json::to_value(expected)?
+        && snapshot["observationCutoff"].as_i64().is_some_and(|c|c>=envelope.snapshot.provenance.observation_cutoff)
+        && snapshot["selectedObjectiveR"].as_f64().is_some_and(f64::is_finite);
+    let mut caption=format_caption(instrument,raw,&envelope,Metrics {forecast_r:valid.then(||snapshot["selectedObjectiveR"].as_f64()).flatten(),current:true})?;
+    if !valid {caption.enrichment_unavailable_reason=Some(if current["status"]=="unavailable" {"saved_chart_unavailable"}else{"invalid_saved_enrichment"});}
     Ok(caption)
 }
 
@@ -203,7 +226,7 @@ fn format_caption(
     out.plain(" USDT\n\n")?;
     if let Some(forecast) = metrics.forecast_r {
         out.plain(if forecast < 0.0 { "📉 " } else { "📈 " })?;
-        out.plain("Матожидание торговли: ")?;
+        out.plain(if metrics.current {"Прогноз матожидания торговли: "}else{"Матожидание торговли: "})?;
         out.code(&signed_r(forecast)?)?;
         out.plain("\n\n")?;
     }
@@ -286,6 +309,38 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn current_caption_uses_admitted_objective_and_original_footer_even_when_cutoff_is_after_signal() {
+        let (instrument,raw,value)=fixture();
+        let original=value.clone();
+        let legacy=recommendation_telegram_caption(&instrument,&raw,&value).unwrap();
+        let recommendation:setups_domain::AdaptiveRecommendationSnapshot=serde_json::from_value(value.clone()).unwrap();
+        let objective=setups_domain::expectancy::ExpectancyObjective::from_recommendation(&recommendation).unwrap();
+        let mut current=json!({"status":"available","snapshot":{"revision":2,"source":"actual","sourceRevision":7,
+            "studyId":42,"generationId":3,"observationCutoff":3*86400,"tpPct":14.0,"slPct":4.0,
+            "originalSnapshotHash":"fixture","objective":objective,"selectedObjectiveR":0.4}});
+        for (r,line) in [(0.4,"📈 Прогноз матожидания торговли: +0.40 R"),(-0.4,"📉 Прогноз матожидания торговли: -0.40 R"),
+            (0.0,"📈 Прогноз матожидания торговли: +0.00 R"),(-0.001,"📉 Прогноз матожидания торговли: -0.00 R")] {
+            current["snapshot"]["selectedObjectiveR"]=json!(r);
+            let caption=recommendation_current_telegram_caption(&instrument,&raw,&value,&current).unwrap();
+            assert!(caption.text.contains(line));assert_eq!(caption.enrichment_unavailable_reason,None);
+            assert!(caption.text.ends_with("Исследование №42 от 01.01.1970"));
+            assert!(caption.text.contains("TP = 14%, SL = 4%"));
+            v2::validate_entities(&caption.text,&caption.entities).unwrap();
+            assert!(caption.entities.iter().any(|entity|entity.kind==EntityKind::Code && entity_text(&caption,entity)==signed_r(r).unwrap()));
+        }
+        for (key,invalid) in [("tpPct",json!(15)),("generationId",json!(999)),("originalSnapshotHash",json!("other")),
+            ("observationCutoff",json!(85999)),("objective",json!({}))] {
+            let mut bad=current.clone();bad["snapshot"][key]=invalid;
+            let caption=recommendation_current_telegram_caption(&instrument,&raw,&value,&bad).unwrap();
+            assert_eq!(caption.enrichment_unavailable_reason,Some("invalid_saved_enrichment"));assert!(!caption.text.contains("матожидания торговли"));
+            assert!(caption.text.contains("Условия сделки:"));
+        }
+        assert_eq!(value,original);assert_eq!(recommendation_telegram_caption(&instrument,&raw,&value).unwrap(),legacy);
+        let mut wrong_raw=value.clone();wrong_raw["rawSignalAt"]=json!(raw.close_time_unix+60);
+        assert!(recommendation_current_telegram_caption(&instrument,&raw,&wrong_raw,&current).is_err());
     }
 
     #[test]

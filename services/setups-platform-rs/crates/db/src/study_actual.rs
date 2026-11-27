@@ -460,6 +460,12 @@ pub async fn finish(
     report: &Value,
     totals: &Value,
 ) -> Result<bool, DbError> {
+    finish_with_presentation(pool,job,report,totals,None).await
+}
+
+pub async fn finish_with_presentation(
+    pool:&PgPool,job:&Job,report:&Value,totals:&Value,presentation:Option<&crate::study_presentation::Prepared>,
+) -> Result<bool,DbError> {
     let mut tx = pool.begin().await?;
     crate::continuous::owner_lock(&mut tx, &job.owner).await?;
     sqlx::query("select 1 from study_actualizations where owner_id=$1 and study_id=$2 for update")
@@ -469,6 +475,14 @@ pub async fn finish(
         .await?;
     if !fence(&mut tx, job).await? {
         return Ok(false);
+    }
+    if let Some(presentation)=presentation {
+        if presentation.owner!=job.owner || presentation.study!=job.study || presentation.source_identity!=job.identity
+            || presentation.snapshot["source"]!="actual" || presentation.snapshot["sourceRevision"].as_i64()!=Some(job.revision)
+            || presentation.snapshot["observationCutoff"].as_i64()!=Some(job.cutoff) {
+            return Err(DbError::Json("study_presentation_actual_fence_mismatch".into()));
+        }
+        if !crate::study_presentation::publish_in(&mut tx,presentation).await? {return Ok(false);}
     }
     sqlx::query("update study_actualizations set status='completed',stage='completed',report=$5,totals=$6,reserved_bytes=0,completed_at=clock_timestamp() where owner_id=$1 and study_id=$2 and revision=$3 and token=$4")
         .bind(&job.owner).bind(job.study).bind(job.revision).bind(job.token).bind(report).bind(totals).execute(&mut *tx).await?;

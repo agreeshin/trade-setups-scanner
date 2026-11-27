@@ -734,7 +734,7 @@ fn run_engine(
         .map_err(|error| invalid(error.to_string()))?
         .len();
     let manual_archive_bytes = if mode.manual_minutes.is_some() {
-        crate::continuous::SelectedMinuteCapture::budget_bytes(limits.max_setups_per_candidate.min(100_000))
+        crate::continuous::SelectedMinuteCapture::manual_budget_bytes(spec,limits.max_setups_per_candidate.min(100_000))?
     } else { 0 };
     // Include bounded search identities/coordinates plus a retained incumbent
     // matrix in the working reservation, before allocating a Rayon pool.
@@ -1875,7 +1875,7 @@ mod tests {
     fn manual_archive_point_and_byte_boundaries_and_empty_pair_are_explicit() {
         use crate::continuous::SelectedMinuteCapture;
         let (spec,_)=manual_fixture();let pair=ContinuousCaptureCell{tp_pct:20.0,sl_pct:1.0};
-        let bytes=SelectedMinuteCapture::budget_bytes(6);
+        let bytes=SelectedMinuteCapture::manual_budget_bytes(&spec,6).unwrap();
         let mut limits=StudyLimits{max_setups_per_candidate:6,max_working_bytes:bytes-1,..Default::default()};
         assert_eq!(SelectedMinuteCapture::manual(&spec,pair,6,&limits).err(),Some(StudyError::ResourceLimit{
             resource:"manual_minute_working_bytes".into(),limit:bytes-1,requested:bytes}));
@@ -1892,7 +1892,7 @@ mod tests {
         assert_eq!(empty.evaluator,MANUAL_SELECTED_MINUTES_EVALUATOR);
         assert!(select_robust_cell(&matrix,&spec.tp_levels,&spec.sl_levels,1).unwrap().is_none(),"existing selector cannot admit an empty winner");
         let mut capture=SelectedMinuteCapture::manual(&spec,pair,6,&limits).unwrap();
-        for n in 0..6 {matrix[0].tp_count+=1;capture.record(spec.from_unix,(n,0),&matrix[0]).unwrap();}
+        for n in 0..6 {matrix[0].tp_count+=1;capture.record_model(spec.from_unix,(n,0),&matrix[0],true).unwrap();capture.record(spec.from_unix,(n,0),&matrix[0]).unwrap();}
         matrix[0].closed_count=6;
         assert!(matches!(capture.record(spec.from_unix,(5,0),&matrix[0]),Err(StudyError::ResourceLimit{limit:6,requested:7,..})));
         let archive=capture.finish(&matrix,&control).unwrap().unwrap();
@@ -1909,7 +1909,7 @@ mod tests {
         let requested=|error:StudyError|match error {StudyError::ResourceLimit{resource,requested,..}=>{assert_eq!(resource,"search_working_bytes");requested},error=>panic!("unexpected {error:?}")};
         let old=requested(run_study(&spec,&input,&limits,&CancelToken::new(),|_|{}).unwrap_err());
         let new=requested(run_study_with_original_minutes(&spec,&input,&limits,&CancelToken::new(),|_|{}).unwrap_err());
-        assert_eq!(new-old,2*SelectedMinuteCapture::budget_bytes(6));
+        assert_eq!(new-old,2*SelectedMinuteCapture::manual_budget_bytes(&spec,6).unwrap());
         let tight=StudyLimits{max_working_bytes:new,..limits.clone()};
         assert!(matches!(run_study_with_original_minutes(&spec,&input,&tight,&CancelToken::new(),|_|{}),Err(StudyError::ResourceLimit{resource,..}) if resource=="candidate_working_bytes"));
         let limits=StudyLimits{max_working_bytes:128*1024*1024,..limits};
@@ -1966,7 +1966,7 @@ mod tests {
         assert_eq!(crate::evaluate_candidate(&spec,&input,&candidate,&below,&token).unwrap_err(),StudyError::ResourceLimit{
             resource:"candidate_working_bytes".into(),limit:evaluator-1,requested:evaluator});
         let search=requested(run_study(&spec,&input,&tiny,&token,|_|{}).unwrap_err(),"search_working_bytes");
-        let archive=SelectedMinuteCapture::budget_bytes(6);
+        let archive=SelectedMinuteCapture::manual_budget_bytes(&spec,6).unwrap();
         let needed=search+2*archive+evaluator;
         let cap=StudyLimits{max_working_bytes:needed,..limits.clone()};
         let mut promotions=Vec::new();

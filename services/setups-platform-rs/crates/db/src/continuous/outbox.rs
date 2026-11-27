@@ -86,6 +86,8 @@ pub(super) async fn enqueue(
     sqlx::query("insert into adaptive_notification_outbox(setup_id,owner_id,algorithm_id,slot_id,generation_id,config_revision,raw_close_unix,expires_at,payload) values($1,$2,$3,$4,$5,$6,$7,to_timestamp($8),$9)")
         .bind(setup_id).bind(&profile.owner_id).bind(&profile.algorithm_id).bind(profile.slot_id).bind(profile.generation_id)
         .bind(profile.config_revision).bind(setup.setup.close_time_unix).bind(expiry as f64).bind(&payload).execute(&mut **tx).await?;
+    let mut telegram_payload=payload.clone();
+    telegram_payload["chartPresentation"]=json!(crate::study_presentation::PRESENTATION);
     crate::telegram::enqueue(
         tx,
         crate::telegram::Enqueue {
@@ -98,7 +100,7 @@ pub(super) async fn enqueue(
             fixed_config: None,
             raw_close_unix: setup.setup.close_time_unix,
             expires_at_unix: expiry,
-            payload: &payload,
+            payload: &telegram_payload,
         },
     )
     .await?;

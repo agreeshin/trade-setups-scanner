@@ -19,6 +19,7 @@ pub mod push;
 pub mod runs;
 pub mod study_actual;
 pub mod study_display;
+pub mod study_presentation;
 pub mod telegram;
 
 #[derive(Debug)]

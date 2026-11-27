@@ -240,6 +240,10 @@ pub struct ContinuousSelectedMinutes {
     /// Sorted unique signal-close instants, sparse and closed-only. Zero sum R
     /// with positive closed_count is an observed result, never a missing point.
     pub points: Vec<ContinuousSelectedMinute>,
+    /// New manual captures retain scientific setup-count weights separately
+    /// from the closed-only observed minute ledger. Old checkpoints stay valid.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub model_daily: Option<Vec<UtcDailyInput>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -357,6 +361,7 @@ pub(crate) struct SelectedMinuteCapture {
     capacity: usize,
     points: Vec<ContinuousSelectedMinute>,
     evaluator: &'static str,
+    model_daily: Option<SelectedDailyCapture>,
 }
 
 impl SelectedMinuteCapture {
@@ -386,6 +391,7 @@ impl SelectedMinuteCapture {
             capacity,
             points: Vec::with_capacity(capacity),
             evaluator: CONTINUOUS_SELECTED_MINUTES_EVALUATOR,
+            model_daily: None,
         })
     }
 
@@ -395,11 +401,29 @@ impl SelectedMinuteCapture {
         let (Some(tp),Some(sl))=(tp,sl) else {return Err(invalid("manual selected minute pair is outside original axes"));};
         if !(pair.tp_pct/pair.sl_pct).is_finite() {return Err(invalid("manual selected minute R must be finite"));}
         limit("selected_minute_points",capacity,limits.max_setups_per_candidate.min(100_000))?;
-        limit("manual_minute_working_bytes",Self::budget_bytes(capacity),limits.max_working_bytes)?;
-        Ok(Self{pair,cell_index:tp*spec.sl_levels.len()+sl,capacity,points:Vec::with_capacity(capacity),evaluator:MANUAL_SELECTED_MINUTES_EVALUATOR})
+        limit("manual_minute_working_bytes",Self::manual_budget_bytes(spec,capacity)?,limits.max_working_bytes)?;
+        let model_daily=SelectedDailyCapture::new(spec,pair,Self::budget_bytes(capacity),limits)?;
+        Ok(Self{pair,cell_index:tp*spec.sl_levels.len()+sl,capacity,points:Vec::with_capacity(capacity),evaluator:MANUAL_SELECTED_MINUTES_EVALUATOR,model_daily:Some(model_daily)})
     }
 
-    pub(crate) fn working_bytes(&self)->usize {Self::budget_bytes(self.capacity)}
+    pub(crate) fn working_bytes(&self)->usize {Self::budget_bytes(self.capacity).saturating_add(self.model_daily.as_ref().map_or(0,|daily|
+        daily.working_bytes().saturating_add(daily.days.len().saturating_mul(Self::JSON_POINT_BYTES)).saturating_add(Self::JSON_HEADER_BYTES)))}
+
+    /// The retained incumbent and its replacement each own both the original
+    /// minutes and scientific daily weights, including serialization scratch.
+    pub(crate) fn manual_budget_bytes(spec:&StudyRequest,capacity:usize)->Result<usize,StudyError> {
+        let origin=utc_midnight_unix(spec.from_unix).map_err(|_|invalid("invalid manual daily origin"))?;
+        let days=spec.to_unix.checked_sub(1).and_then(|last|last.checked_sub(origin))
+            .filter(|span|*span>=0).map(|span|(span/UTC_DAY_SECONDS+1) as usize).ok_or_else(||invalid("invalid manual daily period"))?;
+        limit("selected_daily_points",days,EXPECTANCY_MAX_POINTS)?;
+        Ok(Self::budget_bytes(capacity).saturating_add(days.saturating_mul(size_of::<DailyCaptureBucket>()+size_of::<UtcDailyInput>()+Self::JSON_POINT_BYTES))
+            .saturating_add(size_of::<SelectedDailyCapture>()+size_of::<ContinuousSelectedDaily>()+Self::JSON_HEADER_BYTES))
+    }
+
+    pub(crate) fn record_model(&mut self,signal:i64,before:(usize,usize),after:&MatrixCell,eligible:bool)->Result<(),StudyError> {
+        if eligible && let Some(daily)=&mut self.model_daily {daily.record(signal,before,after)?;}
+        Ok(())
+    }
 
     fn output_bytes(capacity: usize) -> usize {
         capacity.saturating_mul(Self::JSON_POINT_BYTES).saturating_add(Self::JSON_HEADER_BYTES)
@@ -474,12 +498,17 @@ impl SelectedMinuteCapture {
             return Err(invalid("selected minute capture violates R conservation"));
         }
         if control.stopped() { return Ok(None); }
+        let model_daily=match self.model_daily.take() {
+            Some(daily)=>match daily.finish(matrix,control)? {Some(daily)=>Some(daily.points),None=>return Ok(None)},
+            None=>None,
+        };
         Ok(Some(ContinuousSelectedMinutes {
             version: CONTINUOUS_SELECTED_MINUTES_VERSION,
             evaluator: self.evaluator.into(),
             tp_pct: self.pair.tp_pct,
             sl_pct: self.pair.sl_pct,
             points: self.points,
+            model_daily,
         }))
     }
 }

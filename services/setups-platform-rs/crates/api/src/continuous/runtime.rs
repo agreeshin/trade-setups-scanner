@@ -68,6 +68,7 @@ async fn run_expectancy_renderer(pool:PgPool,stop:CancellationToken) {
     while !stop.is_cancelled() {
         let started=Instant::now();
         let attempt=async {
+            if crate::study_presentation::initialize_next(&pool).await? {return Ok::<_,setups_db::DbError>(true);}
             let Some(job)=setups_db::expectancy::claim_render(&pool,&worker,expectancy_chart::RENDER_VERSION).await? else {return Ok::<_,setups_db::DbError>(false);};
             let bytes=serde_json::to_vec(&job.artifact.numerical_snapshot).map_err(|error|setups_db::DbError::Json(error.to_string()))?;
             let artifact=setups_domain::expectancy::ExpectancyArtifact::from_json(&bytes).map_err(|error|setups_db::DbError::Json(error.to_string()))?;
@@ -442,6 +443,7 @@ async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&Continuo
     let mut state=persistence.call("load",||recovery::load(pool,job,&identity)).await?;
     check_shutdown(shutdown)?;
     if let Some(gate)=state.gate {
+        initialize_presentation(pool,job).await?;
         if persistence.call("finalize",||db::finalize(pool,job,&gate.result,gate.accepted,gate.mean,gate.selected.as_ref())).await? {return Ok(());}
         return Err(interrupted());
     }
@@ -556,9 +558,16 @@ async fn run_chain(pool:&PgPool,job:&ChainJob,url:&str,key:&str,config:&Continuo
     let result=json!({"best":best,"selectedCell":selected,"meanExpectancy":mean,"analytics":evaluation,"recommendation":recommendation,"bootstrap":bootstrap,"setupSetId":format!("batch-{batch}")});
     let gate=recovery::Gate {result,accepted,mean,selected};
     if !persistence.call("gate",||recovery::save_gate_with_expectancy_minutes(pool,job,&identity,&gate,derived.as_ref().map(|(source,numerical)|(source,numerical)),minutes.as_deref())).await? {return Err(interrupted());}
+    initialize_presentation(pool,job).await?;
     check_shutdown(shutdown)?;
     if !persistence.call("finalize",||db::finalize(pool,job,&gate.result,gate.accepted,gate.mean,gate.selected.as_ref())).await? {return Err(interrupted());}
     Ok(())
+}
+
+async fn initialize_presentation(pool:&PgPool,job:&ChainJob)->Result<(),JobError> {
+    let identity:String=sqlx::query_scalar("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1 and owner_id=$2")
+        .bind(job.study_id).bind(&job.lease.owner_id).fetch_one(pool).await.map_err(database)?;
+    crate::study_presentation::initialize_study(pool,&job.lease.owner_id,job.study_id,&identity).await.map_err(persistence_error)
 }
 
 type DerivedExpectancy=(setups_db::expectancy::ArtifactIdentity,Value);

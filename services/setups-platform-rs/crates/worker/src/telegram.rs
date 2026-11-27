@@ -542,11 +542,10 @@ async fn saved_presentation_with_lane(
             .map_err(|_| ClientFailure::before("invalid_saved_payload"))?;
         let raw = serde_json::from_value(job.payload["raw"].clone())
             .map_err(|_| ClientFailure::before("invalid_saved_payload"))?;
-        let caption = crate::adaptive::recommendation_telegram_caption(
-            &instrument,
-            &raw,
-            &job.payload["recommendation"],
-        )
+        let current=job.payload["chartPresentation"]==setups_db::study_presentation::PRESENTATION;
+        let caption = if current {
+            crate::adaptive::recommendation_current_telegram_caption(&instrument,&raw,&job.payload["recommendation"],&job.payload["studyPresentation"])
+        }else{crate::adaptive::recommendation_telegram_caption(&instrument,&raw,&job.payload["recommendation"])}
         .map_err(|_| ClientFailure::before("invalid_saved_payload"))?;
         let chart = if caption.enrichment_unavailable_reason == Some("invalid_saved_enrichment") {
             Err("png_identity_mismatch")
@@ -587,6 +586,9 @@ async fn saved_chart_png(
     job: &TelegramJob,
     charts: Option<&ChartRenderLane>,
 ) -> Result<Option<Vec<u8>>, &'static str> {
+    if job.payload["chartPresentation"]==setups_db::study_presentation::PRESENTATION {
+        return saved_current_png(job);
+    }
     use setups_domain::{AdaptiveRecommendationSnapshot, expectancy::ExpectancyArtifact};
     let presentation = match job.payload.get("chartPresentation") {
         None => SavedChartPresentation::Legacy, // Preexisting queued payloads retain their exact old contract.
@@ -825,6 +827,28 @@ async fn saved_chart_png(
     {
         return Err("png_hash_mismatch");
     }
+    Ok(Some(png))
+}
+
+/// New admissions are self-contained. A later refresh, missing DB connection,
+/// archive cleanup or disabled render lane cannot change these frozen bytes.
+fn saved_current_png(job:&TelegramJob)->Result<Option<Vec<u8>>,&'static str> {
+    use base64::{Engine as _,engine::general_purpose::STANDARD};
+    use sha2::{Digest,Sha256};
+    let current=&job.payload["studyPresentation"];
+    if current["status"]!="available" {return Err("png_unavailable");}
+    let snapshot=&current["snapshot"];
+    if snapshot["studyId"]!=job.payload["recommendation"]["studyId"]
+        || snapshot["generationId"].as_i64()!=job.generation_id
+        || snapshot["observationCutoff"].as_i64().zip(job.payload["recommendation"]["provenance"]["observationCutoff"].as_i64()).is_none_or(|(c,original)|c<original)
+        || snapshot["revision"].as_i64().is_none_or(|r|r<=0) {return Err("png_identity_mismatch");}
+    let encoded=current["pngBase64"].as_str().ok_or("png_unavailable")?;
+    if encoded.len()>v2::MAX_PNG_BYTES.div_ceil(3)*4 {return Err("png_invalid");}
+    let png=STANDARD.decode(encoded).map_err(|_|"png_invalid")?;
+    if STANDARD.encode(&png)!=encoded || png.len()>v2::MAX_PNG_BYTES {return Err("png_invalid");}
+    let hash=format!("{:x}",Sha256::digest(&png));
+    if current["pngSha256"].as_str()!=Some(&hash) || snapshot["pngSha256"].as_str()!=Some(&hash) {return Err("png_hash_mismatch");}
+    v2::Attachment::from_png(&png).map_err(|_|"png_invalid")?;
     Ok(Some(png))
 }
 

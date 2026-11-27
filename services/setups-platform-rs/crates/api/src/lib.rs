@@ -16,6 +16,8 @@ pub mod resources;
 pub mod historical_expectancy;
 pub mod setups_analytics;
 mod expectancy_projection;
+mod study_presentation;
+pub use study_presentation::initialize_active_presentations;
 pub mod study_actual;
 mod study_actual_summary;
 pub mod telegram;

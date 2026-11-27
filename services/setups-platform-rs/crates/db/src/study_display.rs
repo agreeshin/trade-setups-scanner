@@ -33,6 +33,7 @@ pub struct ManualArchive {
     pub sl_pct:f64,
     pub kernel:String,
     pub minutes:Vec<OriginalMinute>,
+    pub model_daily:Option<Vec<setups_domain::expectancy::UtcDailyInput>>,
 }
 
 fn payload_hash(points:&[OriginalMinute])->Result<String,DbError> {
@@ -51,7 +52,7 @@ fn source_key(source:&Value)->Result<String,DbError> {
         }
     }
     let bytes=serde_json::to_vec(&canonical(source)).map_err(crate::json_error)?;
-    if bytes.len()>65536 {return Err(invalid("manual_source_resource_limit"));}
+    if bytes.len()>1024*1024 {return Err(invalid("manual_source_resource_limit"));}
     Ok(format!("{:x}",Sha256::digest(bytes)))
 }
 
@@ -87,10 +88,18 @@ fn manual_source_checked(owner:&str,study:i64,identity:&str,start:DateTime<Utc>,
     }
     if (tp,sl)!=(expected_tp,expected_sl) {return Err(invalid("manual_count_mismatch"));}
     }
-    Ok(json!({"version":1,"ownerId":owner,"studyId":study,"studyIdentity":identity,"executionStartedAt":start,
+    let mut source=json!({"version":1,"ownerId":owner,"studyId":study,"studyIdentity":identity,"executionStartedAt":start,
         "observationCutoff":a.observation_cutoff,"fromUnix":from,"toUnix":to,"tpPct":a.tp_pct,"slPct":a.sl_pct,
         "kernel":a.kernel,"provenance":best["provenance"],"analytics":best["analytics"],
-        "trendMode":best["trendMode"],"trendBendDays":best["trendBendDays"],"trendBlendLambda":best["trendBlendLambda"],"forecast":best["forecast"]}))
+        "trendMode":best["trendMode"],"trendBendDays":best["trendBendDays"],"trendBlendLambda":best["trendBlendLambda"],"forecast":best["forecast"]});
+    if let Some(days)=&archive.model_daily {
+        if days.len()>setups_domain::expectancy::EXPECTANCY_MAX_POINTS {return Err(invalid("manual_daily_resource_limit"));}
+        // UTC counts and means are independently checked on presentation build;
+        // the immutable payload retains the exact original scientific weights.
+        source["modelDaily"]=json!(days);
+        if serde_json::to_vec(&source).map_err(crate::json_error)?.len()>1024*1024 {return Err(invalid("manual_daily_resource_limit"));}
+    }
+    Ok(source)
 }
 
 /// Same transaction as the manual terminal scientific result. Re-entry after an
@@ -425,7 +434,7 @@ async fn original_observed_in(tx:&mut Transaction<'_,Postgres>,owner:&str,study:
         if row.try_get::<String,_>("study_identity")?!=row.try_get::<String,_>("current_identity")? || source_key(&source)?!=key
             || kernel!="original-manual-close-1" {return Err(invalid("archive_source_mismatch"));}
         let archive=ManualArchive{observation_cutoff:source["observationCutoff"].as_i64().ok_or_else(||invalid("manual_source_invalid"))?,
-            tp_pct:source["tpPct"].as_f64().ok_or_else(||invalid("manual_source_invalid"))?,sl_pct:source["slPct"].as_f64().ok_or_else(||invalid("manual_source_invalid"))?,kernel:kernel.clone(),minutes:vec![]};
+            tp_pct:source["tpPct"].as_f64().ok_or_else(||invalid("manual_source_invalid"))?,sl_pct:source["slPct"].as_f64().ok_or_else(||invalid("manual_source_invalid"))?,kernel:kernel.clone(),minutes:vec![],model_daily:source.get("modelDaily").map(|v|serde_json::from_value(v.clone())).transpose().map_err(crate::json_error)?};
         let check=manual_source_checked(owner,study,&row.try_get::<String,_>("current_identity")?,
             row.try_get::<Option<DateTime<Utc>>,_>("execution_started_at")?.ok_or_else(||invalid("manual_execution_start_missing"))?,
             &row.try_get::<Value,_>("spec")?,&row.try_get::<Option<Value>,_>("result")?.ok_or_else(||invalid("manual_winner_missing"))?,&archive,false)?;
@@ -463,7 +472,7 @@ async fn original_observed_in(tx:&mut Transaction<'_,Postgres>,owner:&str,study:
         if payload_hash(&points)?!=hash {return Err(invalid("archive_payload_corrupt"));}
         if let Some(numerical)=&numerical {validate_minute_ledger(numerical,&points,fidelity=="native_original")?;}
         if let Some(source)=manual {
-            let archive=ManualArchive{observation_cutoff:source["observationCutoff"].as_i64().ok_or_else(||invalid("manual_source_invalid"))?,tp_pct:source["tpPct"].as_f64().ok_or_else(||invalid("manual_source_invalid"))?,sl_pct:source["slPct"].as_f64().ok_or_else(||invalid("manual_source_invalid"))?,kernel,minutes:points};
+            let archive=ManualArchive{observation_cutoff:source["observationCutoff"].as_i64().ok_or_else(||invalid("manual_source_invalid"))?,tp_pct:source["tpPct"].as_f64().ok_or_else(||invalid("manual_source_invalid"))?,sl_pct:source["slPct"].as_f64().ok_or_else(||invalid("manual_source_invalid"))?,kernel,minutes:points,model_daily:source.get("modelDaily").map(|v|serde_json::from_value(v.clone())).transpose().map_err(crate::json_error)?};
             let start=row.try_get::<Option<DateTime<Utc>>,_>("execution_started_at")?.ok_or_else(||invalid("manual_execution_start_missing"))?;
             let current=row.try_get::<String,_>("current_identity")?;
             let check=manual_source(owner,study,&current,start,&row.try_get::<Value,_>("spec")?,&row.try_get::<Option<Value>,_>("result")?.ok_or_else(||invalid("manual_winner_missing"))?,&archive)?;

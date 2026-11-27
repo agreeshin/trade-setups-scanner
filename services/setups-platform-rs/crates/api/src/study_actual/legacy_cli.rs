@@ -99,7 +99,7 @@ pub fn summary(calculation:&LegacyCalculation,publication:Option<&OriginalPublic
         let options=parse(&args()).unwrap();let facts=TrustedAuditFacts{generation_id:options.generation_id,original_artifact_id:options.artifact_id,writer_audit_hash:options.writer_audit_hash.clone(),
             first_canonical_add_only_verified:true,canonical_ohlc_preserved_verified:true,historical_close_kernel_compatible_verified:true};
         let calculation=LegacyCalculation{fidelity:LegacyFidelity::VerifiedOriginalReconstruction,source_hash:"1".repeat(64),input_hash:"2".repeat(64),original_snapshot_hash:"3".repeat(64),proof_hash:Some("4".repeat(64)),proof:None,
-            selected_minutes:setups_optimizer::ContinuousSelectedMinutes{version:1,evaluator:setups_optimizer::CONTINUOUS_SELECTED_MINUTES_EVALUATOR.into(),tp_pct:1.0,sl_pct:1.0,points:vec![]},daily:vec![],conservation:vec![],conservation_matched:true,inputs:vec![]};
+            selected_minutes:setups_optimizer::ContinuousSelectedMinutes{version:1,evaluator:setups_optimizer::CONTINUOUS_SELECTED_MINUTES_EVALUATOR.into(),tp_pct:1.0,sl_pct:1.0,points:vec![],model_daily:None},daily:vec![],conservation:vec![],conservation_matched:true,inputs:vec![]};
         let pool=sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://fixture@127.0.0.1:1/never_connected_test").unwrap();
         assert_eq!(publish(&pool,&options,&calculation,&facts).await.unwrap_err(),"legacy_verified_publication_not_admitted");pool.close().await;
     }

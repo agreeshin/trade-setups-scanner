@@ -21,7 +21,7 @@ fn identity(job:&Job,config:&OptimizationConfig)->Value {
 }
 fn archive(archive:Option<core::ManualOriginalArchive>)->Option<setups_db::study_display::ManualArchive> {
     archive.map(|archive|setups_db::study_display::ManualArchive{observation_cutoff:archive.observation_cutoff,
-        tp_pct:archive.minutes.tp_pct,sl_pct:archive.minutes.sl_pct,kernel:archive.minutes.evaluator,
+        tp_pct:archive.minutes.tp_pct,sl_pct:archive.minutes.sl_pct,kernel:archive.minutes.evaluator,model_daily:archive.minutes.model_daily,
         minutes:archive.minutes.points.into_iter().map(|p|setups_db::study_display::OriginalMinute{
             signal_close_unix:p.signal_close_unix,sum_r:p.sum_r,closed_count:p.closed_count,tp_count:p.tp_count,sl_count:p.sl_count,
         }).collect()})
@@ -233,7 +233,15 @@ async fn terminal(pool:&PgPool,job:&Job,mut payload:TerminalPayload,stop:&Cancel
         if shutdown_deadline.is_some_and(|deadline|tokio::time::Instant::now()>=deadline){return;}
         let result=db::finish_fenced(pool,payload.id,Some(job.epoch),payload.status,&payload.progress,payload.result.as_ref(),payload.error.as_ref(),&payload.events,payload.archive.as_ref()).await;
         match result {
-            Ok(())=>{available.store(true,Ordering::SeqCst);return;},
+            Ok(())=>{
+                if payload.status=="completed" && payload.archive.is_some() {
+                    let identity=sqlx::query_scalar::<_,String>("select md5(spec::text||coalesce(result::text,'null')) from optimization_studies where id=$1").bind(payload.id).fetch_one(pool).await;
+                    if let Ok(identity)=identity && let Err(error)=crate::study_presentation::initialize_study(pool,&job.study.owner_id,payload.id,&identity).await {
+                        eprintln!("study_presentation event=manual_initial_deferred study_id={} cause={error}",payload.id);
+                    }
+                }
+                available.store(true,Ordering::SeqCst);return;
+            },
             Err(error)=>{
                 if error.to_string().contains("execution epoch lost"){return;}
                 if settle_archive_failure(&mut payload,&error){continue;}

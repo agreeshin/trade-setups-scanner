@@ -261,6 +261,7 @@ pub struct StudySummary {
     pub continuous_generation_id: Option<i64>,
     pub continuous_slot_id: Option<i64>,
     pub actual: Option<Value>,
+    pub current_presentation: Value,
     pub manual_control: Option<ManualControl>,
 }
 
@@ -304,6 +305,7 @@ pub async fn list(
           then page.progress->>'bestScore' else page.result#>>'{best,score}' end)::double precision as best_score, \
          coalesce(page.result#>'{best,trendMode}',page.spec->'trendMode') as forecast_mode, \
          winner.cell as best_forecast_cell, \
+         (select jsonb_build_object('snapshot',cp.snapshot,'error',cp.error) from study_current_presentations cp where cp.study_id=page.id and cp.owner_id=page.owner_id) current_presentation, \
           coalesce((select jsonb_build_object('study_id',page.id,'job_id',a.job_id,'request_origin',a.request_origin,'revision',a.revision,'status',a.status,'stage',a.stage,'totals',a.totals,'observed_through_unix',a.observed_through_unix,'error',a.error,'last_setup_close_unix',",
         crate::study_actual::LAST_SETUP_CLOSE_UNIX_SQL,
         ") from study_actualizations a where a.owner_id=page.owner_id and a.study_id=page.id), \
@@ -369,6 +371,11 @@ pub async fn list(
                 actual: Some(crate::study_actual::compact_summary(
                     &row.try_get::<Value, _>("actual")?,
                 )),
+                current_presentation: {
+                    let saved:Option<Value>=row.try_get("current_presentation")?;
+                    match saved {Some(saved)=>crate::study_presentation::metadata(saved.get("snapshot").filter(|v|!v.is_null()).cloned(),saved["error"].as_str().map(str::to_owned)),
+                        None=>crate::study_presentation::unavailable("study_presentation_not_initialized")}
+                },
             })
         })
         .collect::<Result<_, DbError>>()?;

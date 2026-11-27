@@ -769,10 +769,16 @@ pub(crate) async fn enqueue(
             .bind(source.setup_id).execute(&mut **tx).await?;
         return Ok(());
     }
+    let mut payload=source.payload.clone();
+    if payload["chartPresentation"]==crate::study_presentation::PRESENTATION {
+        let study=payload["recommendation"]["studyId"].as_i64().ok_or_else(||DbError::Json("study_presentation_missing_study".into()))?;
+        let generation=source.generation_id.ok_or_else(||DbError::Json("study_presentation_missing_generation".into()))?;
+        payload["studyPresentation"]=crate::study_presentation::freeze_in(tx,source.owner_id,study,generation,&payload["recommendation"],source.raw_close_unix).await?;
+    }
     sqlx::query("insert into telegram_delivery_outbox(setup_id,delivery_id,endpoint_url,settings_revision,owner_id,algorithm_id,slot_id,generation_id,config_revision,fixed_config,raw_close_unix,expires_at,payload,wire_version) select $1,'live:'||instance_id::text||':'||$1::text,$2,$3,$4,$5,$6,$7,$8,$9,$10,to_timestamp($11),$12,2 from telegram_delivery_budget where id=1")
         .bind(source.setup_id).bind(config.try_get::<String,_>("endpoint_url")?).bind(config.try_get::<i64,_>("revision")?).bind(source.owner_id).bind(source.algorithm_id)
         .bind(source.slot_id).bind(source.generation_id).bind(source.config_revision).bind(source.fixed_config).bind(source.raw_close_unix)
-        .bind(source.expires_at_unix as f64).bind(source.payload).execute(&mut **tx).await?;
+        .bind(source.expires_at_unix as f64).bind(&payload).execute(&mut **tx).await?;
     Ok(())
 }
 
