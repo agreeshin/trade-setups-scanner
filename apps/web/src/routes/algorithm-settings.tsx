@@ -144,7 +144,7 @@ function AlgorithmForm({ algorithm, optimization, onSaved, onActivity, continuou
         <InfoNote label="О самостоятельных адаптивных профилях">Профиль появляется только после полного принятого исследования. Stop/Play каждой строки не управляет исследованием. Research Stop и изменение очереди сохраняют профили, их рекомендации и историю. Кандидат инициализируется независимо, без повторной проверки исторического результата. Дата профиля — изменение состояния, не дата исследования.</InfoNote></div>
       <AdaptiveLive controller={profiles} />
       <Separator />
-      <AdaptiveProfiles algorithm={optimizerAlgorithm} controller={profiles} research={continuous} />
+      <AdaptiveProfiles algorithm={optimizerAlgorithm} controller={profiles} />
     </section>
     <Separator />
     <ContinuousResearch controller={continuous}>

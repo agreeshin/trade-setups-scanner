@@ -77,7 +77,7 @@ function SlotReadiness({ slot, invalid }: { slot: ContinuousSlot; invalid: boole
 function hasCurrentCandidate(slot: ContinuousSlot): boolean {
   // The server may retain attempt metadata after promotion; do not revive that candidate.
   if (slot.activeStatus === "active" && slot.activeGenerationId !== null && slot.pendingGenerationId === slot.activeGenerationId) return false;
-  return slot.pendingGenerationId != null || slot.pendingStatus != null;
+  return slot.pendingGenerationId != null;
 }
 
 function currentCandidateError(slot: ContinuousSlot): string | null {
@@ -100,11 +100,10 @@ function liveStatus(slot: ContinuousSlot): { label: string; variant: BadgeVarian
   return { label: "Нет действующего поколения", variant: "warning" };
 }
 
-function liveProblems(slot: ContinuousSlot, process: Pick<ContinuousProcess, "status" | "error"> | null, available: boolean, invalidCounts: boolean): string[] {
+function liveProblems(slot: ContinuousSlot, available: boolean, invalidCounts: boolean): string[] {
   // Render-local, at most seven bounded descriptions; no diagnostic history is retained.
   const problems: string[] = [];
   if (!available) problems.push("Актуальность снимка не подтверждена. Показано последнее известное состояние live.");
-  if (process?.status === "error") problems.push(`Ошибка непрерывного процесса (status=${process.status}): ${pendingErrorMessage(process.error) ?? "Описание ошибки не передано."}`);
   if (["error", "failed"].includes(slot.status) && !(slot.activeGenerationId !== null && slot.activeStatus === "active")
     && !(hasCurrentCandidate(slot) && slot.pendingStatus === "ready")) problems.push(`Техническая ошибка профиля (status=${slot.status}).`);
   if (slot.activeStatus === "error") problems.push("Ошибка действующего live (activeStatus=error).");
@@ -116,11 +115,11 @@ function liveProblems(slot: ContinuousSlot, process: Pick<ContinuousProcess, "st
   return problems;
 }
 
-function SlotIncumbent({ slot, process, available }: { slot: ContinuousSlot; process: Pick<ContinuousProcess, "status" | "error"> | null; available: boolean }) {
+function SlotIncumbent({ slot, available }: { slot: ContinuousSlot; available: boolean }) {
   const absent = slot.activeGenerationId === null;
   const status = liveStatus(slot);
   const invalidCounts = invalidReadinessCounts(slot.liveReadinessSummary);
-  const problems = liveProblems(slot, process, available, invalidCounts);
+  const problems = liveProblems(slot, available, invalidCounts);
   return <Tooltip content={<div className="grid gap-2">
     {problems.length > 0 && <Alert variant="destructive" role="alert" className="break-words">
       <ul aria-label="Проблемы адаптивного live" className="grid gap-1">{problems.map((problem) => <li key={problem}>{problem}</li>)}</ul>
@@ -152,18 +151,27 @@ function pendingErrorMessage(value: unknown): string | null {
   return "Сервер не передал текстовое описание ошибки.";
 }
 
-function SlotPending({ slot }: { slot: ContinuousSlot }) {
+function SlotPending({ slot }: { slot: AdaptiveProfile }) {
   const legacy = slot.pendingGenerationId === undefined && slot.pendingStatus === undefined;
   const current = hasCurrentCandidate(slot);
-  const absent = (slot.pendingGenerationId === null && slot.pendingStatus === null)
-    || (slot.activeGenerationId !== null && slot.activeStatus === "active" && slot.pendingGenerationId === slot.activeGenerationId);
+  const historicalExhausted = !current && slot.pendingGenerationId === null && slot.initializationStatus === "exhausted"
+    && (slot.pendingStatus === "error" || slot.pendingError != null);
+  const absent = !historicalExhausted && ((slot.pendingGenerationId === null && slot.pendingStatus === null)
+    || (slot.activeGenerationId !== null && slot.activeStatus === "active" && slot.pendingGenerationId === slot.activeGenerationId));
+  const historicalError = historicalExhausted ? pendingErrorMessage(slot.pendingError) : null;
   const error = currentCandidateError(slot);
   return <div className="grid gap-1 text-xs">
     {current && slot.pendingGenerationId != null && <span className="text-sm">Кандидат #{slot.pendingGenerationId}</span>}
     {current && slot.pendingStudyId != null && <span>Исследование кандидата #{slot.pendingStudyId}</span>}
-    {absent ? <span>Нет кандидата на замену</span> : slot.pendingStatus === "error" ? <span className="text-danger">Ошибка инициализации live</span>
+    {historicalExhausted ? <>
+      <span className="font-medium text-warning">Последний кандидат исчерпал попытки</span>
+      <span>Принятая версия: поколение #{slot.acceptedGenerationId} · попытки {slot.pendingAttempts}/{slot.attemptLimit}</span>
+      <span>Последнее изменение: {formatIsoDateTime(slot.updatedAt)}</span>
+      {slot.activeGenerationId === null && <span className="text-warning">Действующего live-поколения нет.</span>}
+      {historicalError && <p role="alert" className="text-warning">Последняя сохранённая ошибка: {historicalError}</p>}
+    </> : absent ? <span>Нет кандидата на замену</span> : slot.pendingStatus === "error" ? <span className="text-danger">Ошибка инициализации live</span>
       : <Badge variant={slot.pendingStatus === "warming" ? "info" : slot.pendingStatus === "ready" ? "success" : "neutral"}>{legacy ? "Статус инициализации live неизвестен (старый API)" : slot.pendingStatus ? Object.hasOwn(pendingStatuses, slot.pendingStatus) ? pendingStatuses[slot.pendingStatus] : `Состояние кандидата: ${slot.pendingStatus.slice(0, 120)}` : "Статус инициализации live неизвестен"}</Badge>}
-    {!legacy && !absent && <span>{slot.readinessFrontier === undefined ? "Граница готовности неизвестна" : slot.readinessFrontier === null ? "Граница готовности ещё не подтверждена" : `Граница готовности (закрытие минуты): ${closedTime(slot.readinessFrontier)}`}</span>}
+    {!legacy && current && <span>{slot.readinessFrontier === undefined ? "Граница готовности неизвестна" : slot.readinessFrontier === null ? "Граница готовности ещё не подтверждена" : `Граница готовности (закрытие минуты): ${closedTime(slot.readinessFrontier)}`}</span>}
     {error && <p role="alert" className="text-danger">Ошибка кандидата: {error}</p>}
   </div>;
 }
@@ -198,7 +206,7 @@ export function AdaptiveLive({ controller }: { controller: AdaptiveProfilesContr
   </div>;
 }
 
-export function AdaptiveProfiles({ algorithm, controller, research }: { algorithm: Algorithm; controller: AdaptiveProfilesController; research?: ContinuousController }) {
+export function AdaptiveProfiles({ algorithm, controller }: { algorithm: Algorithm; controller: AdaptiveProfilesController }) {
   const profiles = controller.page?.profiles ?? [];
   return <div className="grid min-w-0 gap-3">
     <div className="flex items-center justify-center gap-2 text-center"><h5 className="font-semibold">Адаптивные профили</h5><InfoNote label="О настроенных адаптивных профилях">Исследование принято — это готовность рекомендаций, а не live. Кандидат инициализируется независимо, без повторной проверки исторического результата. Сохранённое исследование относится к последнему полностью завершённому поколению после replay, аналитики и gate. Дата ниже — изменение состояния профиля, не дата исследования. Stop исследования и удаление порога из очереди сохраняют самостоятельный профиль.</InfoNote></div>
@@ -212,7 +220,7 @@ export function AdaptiveProfiles({ algorithm, controller, research }: { algorith
         <TableBody>{profiles.map((profile) => <TableRow key={profile.id}>
           <TableCell>{profile.minSetupsPerDay === 0 ? "0 · без частотного допуска" : profile.minSetupsPerDay}{!profile.inResearchQueue && <p className="text-xs text-muted-foreground">Вне исследовательской очереди</p>}</TableCell>
           <TableCell><SlotResearch slot={{ ...profile, finalizedGenerationId: profile.acceptedGenerationId, runningStudyId: null }} /></TableCell>
-          <TableCell><SlotIncumbent slot={profile} process={research?.process ?? null} available={controller.available} /></TableCell>
+          <TableCell><SlotIncumbent slot={profile} available={controller.available} /></TableCell>
           <TableCell><SlotPending slot={profile} /></TableCell>
           <TableCell><SlotMatrixMean slot={profile} /></TableCell>
           <TableCell>{profile.activeGenerationId !== null && profile.selectedCell ? <>{`${profile.direction?.toUpperCase() ?? ""} · TP ${profile.selectedCell.tpPct}% / SL ${profile.selectedCell.slPct}% · ${profile.selectedCell.rawR.toFixed(2)} R`}{profile.selectedCell.forecastR !== undefined && <p className="text-xs">Выбор по прогнозу: {profile.selectedCell.forecastR.toFixed(2)} R · score матрицы {profile.selectedCell.forecastMatrixR?.toFixed(2) ?? "—"} R</p>}</> : "Нет пригодного результата"}</TableCell>
@@ -330,7 +338,10 @@ export function ContinuousResearch({ controller, children }: { algorithm?: Algor
     {!controller.available && process && <p className="text-sm">Показан последний подтверждённый снимок; актуальность не подтверждена.</p>}
     {process && <>
       <p className="flex flex-wrap items-center gap-2 text-sm"><span>Ревизия конфигурации: {process.configRevision}{process.activeStudyId !== null ? ` · Исследование #${process.activeStudyId}` : ""}</span>{process.phase && <Badge variant={phaseVariant(process)}>{Object.hasOwn(phases, process.phase) ? phases[process.phase] : process.phase}</Badge>}</p>
-      {process.status === "error" && process.error && <Alert variant="destructive">{process.error.code}: {process.error.message}. Технический сбой не означает непрохождение допуска; прежний принятый профиль может сохраняться.</Alert>}
+      {process.status === "error" && <Alert variant="destructive" role="alert">{process.desiredRunning === true && process.activeStudyId === null
+        ? <>Непрерывное исследование остановлено после исчерпания автоматических попыток; активного исследования нет. {process.error ? <>Последняя сохранённая ошибка: {process.error.code}: {process.error.message}. </> : <>Описание последней ошибки не передано. </>}Эта запись относится к завершившейся попытке и сама по себе не означает, что источник недоступен сейчас. Для продолжения требуется явный повторный запуск.</>
+        : process.error ? <>{process.error.code}: {process.error.message}. Технический сбой не означает непрохождение допуска; прежний принятый профиль может сохраняться.</>
+          : <>Непрерывное исследование остановлено с ошибкой; описание ошибки не передано.</>}</Alert>}
       {process.config && <p className="text-sm">Очередь порогов: {process.config.minSetupsPerDay.join(", ")} · последние {process.config.lookbackDays} суток.{process.pendingConfig && <> Сохранено на следующее исследование: {process.pendingConfig.minSetupsPerDay.join(", ")} · последние {process.pendingConfig.lookbackDays} суток.</>}</p>}
     </>}
   </section>;

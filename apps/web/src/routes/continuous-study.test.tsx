@@ -38,7 +38,7 @@ function profileFixture(controller: ContinuousController): AdaptiveProfilesContr
 }
 // Compose the same independent surfaces for the retained badge/popup regression matrix.
 function ContinuousResearch({ algorithm, controller }: { algorithm: Algorithm; controller: ContinuousController }) {
-  return <><AdaptiveProfiles algorithm={algorithm} controller={profileFixture(controller)} research={controller} /><ResearchSummary controller={controller}><ContinuousControls algorithm={algorithm} controller={controller} /></ResearchSummary></>;
+  return <><AdaptiveProfiles algorithm={algorithm} controller={profileFixture(controller)} /><ResearchSummary controller={controller}><ContinuousControls algorithm={algorithm} controller={controller} /></ResearchSummary></>;
 }
 const requests: { path: string; method: string; body: unknown }[] = [];
 beforeEach(() => {
@@ -289,6 +289,16 @@ function profileController(patch: Partial<ContinuousSlot> = {}, processPatch: Pa
 }
 function profileView(patch: Partial<ContinuousSlot> = {}) {
   return <ContinuousResearch algorithm={algorithm} controller={profileController(patch)} />;
+}
+
+function adaptiveProfileView(profilePatch: Partial<AdaptiveProfile>, processPatch: Partial<ContinuousProcess> = {}) {
+  const research = profileController({}, processPatch);
+  const slot = research.process?.slots[0];
+  if (!slot) throw new Error("Expected adaptive profile fixture");
+  const controller = profileFixture(research);
+  if (!controller.page) throw new Error("Expected adaptive profile page fixture");
+  controller.page = { ...controller.page, profiles: [{ ...asProfile(slot), ...profilePatch }], total: 1 };
+  return <AdaptiveProfiles algorithm={algorithm} controller={controller} />;
 }
 
 it("labels the accepted winner from saved forecast fields even when the edited configuration has another metric", () => {
@@ -579,7 +589,7 @@ const liveStatusCases: { patch: Partial<ContinuousSlot>; label: string; color: "
   ...["error", "failed"].map((status) => ({ patch: { status, activeStatus: "active" as const }, label: "Активно", color: "success" as const })),
   ...["error", "failed"].map((status) => ({ patch: { status, activeGenerationId: null }, label: "Ошибка", color: "danger" as const, problem: true })),
   { patch: { activeStatus: "error" }, label: "Ошибка", color: "danger", problem: true },
-  { patch: { activeStatus: "active", pendingStatus: "error" }, label: "Активно", color: "success", problem: true },
+  { patch: { activeStatus: "active", pendingStatus: "error" }, label: "Активно", color: "success" },
   { patch: { activeStatus: "active", pendingGenerationId: 8, pendingError: { code: "initialization_error" } }, label: "Активно", color: "success", problem: true },
   { patch: { activeStatus: "active", pendingGenerationId: 8, pendingError: false }, label: "Активно", color: "success", problem: true },
   { patch: { activeStatus: "active", pendingGenerationId: null, pendingStatus: null, pendingError: { code: "old_error" } }, label: "Активно", color: "success" },
@@ -705,13 +715,13 @@ it("serializes research Stop confirmation and keeps a failed command visible wit
   expect(controller.stop).toHaveBeenCalledOnce();
 });
 
-it("clears process errors after recovery without repainting active slots or hiding current errors", () => {
+it("keeps process errors in research without repainting or contaminating active live profiles", () => {
   const controller = profileController({ activeStatus: "active", liveReadinessSummary: readinessSummary }, { status: "error", error: { code: "source_unavailable", message: "Связь с источником потеряна." } });
   const view = render(<ContinuousResearch algorithm={algorithm} controller={controller} />);
   expect(screen.getByRole("button", { name: /Действующее поколение #7/ }).querySelector('[data-slot="badge"]')).toHaveClass("text-success");
-  const alert = liveDetails().getByRole("alert");
-  expect(alert).toHaveClass("bg-danger/10");
-  expect(alert).toHaveTextContent("Ошибка непрерывного процесса (status=error): source_unavailable: Связь с источником потеряна.");
+  expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
+  const research = within(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" }));
+  expect(research.getByRole("alert")).toHaveTextContent("source_unavailable: Связь с источником потеряна.");
   for (const status of ["running", "stopped", "stopping"] as const) {
     view.rerender(<ContinuousResearch algorithm={algorithm} controller={profileController({ activeStatus: "active", liveReadinessSummary: readinessSummary }, { status, error: controller.process!.error })} />);
     expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
@@ -720,18 +730,19 @@ it("clears process errors after recovery without repainting active slots or hidi
 });
 it("explains process error status even without a server error description", () => {
   render(<ContinuousResearch algorithm={algorithm} controller={profileController({ activeStatus: "active" }, { status: "error" })} />);
-  expect(liveDetails().getByRole("alert")).toHaveTextContent("status=error");
-  expect(within(screen.getByRole("tooltip")).getByRole("alert")).toHaveTextContent("Описание ошибки не передано.");
+  expect(liveDetails().queryByRole("alert")).not.toBeInTheDocument();
+  expect(within(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" })).getByRole("alert")).toHaveTextContent("описание ошибки не передано");
 });
 it("lists all simultaneous problems with bounded server descriptions and no opaque payload dump", () => {
-  render(<ContinuousResearch algorithm={algorithm} controller={profileController({ status: "failed", activeStatus: "error", pendingStatus: "error",
+  render(<ContinuousResearch algorithm={algorithm} controller={profileController({ status: "failed", activeStatus: "error", pendingGenerationId: 8, pendingStatus: "error",
     pendingError: { code: "init_failed", message: "Инициализация недоступна. " + "y".repeat(1000), debug: "private-init-payload" },
     liveReadinessSummary: { ...readinessSummary, generationId: 8, readyInstruments: -1 } },
   { status: "error", error: { code: "source_error", message: "Источник недоступен. " + "x".repeat(1000) } }, { available: false })} />);
   const alert = liveDetails().getByRole("alert");
   const items = within(alert).getAllByRole("listitem");
-  expect(items).toHaveLength(7);
-  for (const problem of ["status=failed", "activeStatus=error", "init_failed", "status=error", "source_error", "поколению #8", "действующего поколения #7", "Некорректные числа готовности", "Актуальность снимка не подтверждена"]) expect(alert).toHaveTextContent(problem);
+  expect(items).toHaveLength(6);
+  for (const problem of ["status=failed", "activeStatus=error", "init_failed", "поколению #8", "действующего поколения #7", "Некорректные числа готовности", "Актуальность снимка не подтверждена"]) expect(alert).toHaveTextContent(problem);
+  expect(within(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" })).getByRole("alert")).toHaveTextContent("source_error");
   expect(items.every((item) => item.textContent.length < 500)).toBe(true);
   expect(alert).not.toHaveTextContent("private-init-payload");
   expect(alert).not.toHaveTextContent("x".repeat(301));
@@ -988,6 +999,34 @@ it("keeps the incumbent during a candidate error and renders only bounded public
   expect(screen.queryByText("Адаптивные сигналы этого профиля не формируются.")).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Остановить непрерывное исследование" })).toBeEnabled();
   expect(requests).toHaveLength(0);
+});
+it("shows an exhausted last candidate as history while keeping the incumbent active", () => {
+  render(adaptiveProfileView({ activeStatus: "active", acceptedGenerationId: 8, pendingGenerationId: null, pendingStatus: "error",
+    pendingError: { code: "adaptive_warmup_failed", message: "statement timeout" }, pendingAttempts: 3, attemptLimit: 3,
+    initializationStatus: "exhausted" }));
+  expect(screen.getByRole("cell", { name: /Действующее поколение #7/ })).toBeInTheDocument();
+  const history = screen.getByRole("cell", { name: /Последний кандидат исчерпал попытки/ });
+  expect(history).toHaveTextContent("Принятая версия: поколение #8 · попытки 3/3");
+  expect(within(history).getByRole("alert")).toHaveTextContent("adaptive_warmup_failed: statement timeout");
+  expect(history).not.toHaveTextContent("Ошибка кандидата:");
+  expect(screen.queryByText("Действующего live-поколения нет.")).not.toBeInTheDocument();
+});
+it("keeps an exhausted candidate warning prominent when no incumbent exists", () => {
+  render(adaptiveProfileView({ activeGenerationId: null, activeStatus: "inactive", selectedCell: null, acceptedGenerationId: 8,
+    pendingGenerationId: null, pendingStatus: "error", pendingError: "statement timeout", pendingAttempts: 3, attemptLimit: 3,
+    initializationStatus: "exhausted" }));
+  expect(screen.getByText("Действующего live-поколения нет.")).toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent("Последняя сохранённая ошибка: statement timeout");
+  expect(screen.queryByText(/Ошибка кандидата:/)).not.toBeInTheDocument();
+});
+it("labels an exhausted desired research process without claiming a current market-data outage", () => {
+  render(<ResearchSummary controller={profileController({}, { status: "error", desiredRunning: true, activeStudyId: null,
+    error: { code: "market_data_unavailable", message: "Не удалось прочитать API рыночных данных" } })} />);
+  const alert = within(screen.getByRole("region", { name: "Непрерывные исследования оптимальных параметров" })).getByRole("alert");
+  expect(alert).toHaveTextContent("Непрерывное исследование остановлено после исчерпания автоматических попыток");
+  expect(alert).toHaveTextContent("активного исследования нет");
+  expect(alert).toHaveTextContent("сама по себе не означает, что источник недоступен сейчас");
+  expect(alert).toHaveTextContent("Для продолжения требуется явный повторный запуск");
 });
 it("does not turn a first successful candidate into an active generation before promotion", () => {
   render(profileView({ activeGenerationId: null, activeStatus: "inactive", pendingGenerationId: 8, pendingStatus: "warming", readinessFrontier: null, pendingError: null, liveWatermark: null }));
